@@ -1,0 +1,45 @@
+# check=skip=SecretsUsedInArgOrEnv
+#
+# The check above is skipped for the build argument CREDENTIAL_ENCLAVE_RELEASE: it is the
+# release tag, and its name alone makes the build check take it for a secret.
+#
+# The local platform image (enclave.md 11.1, row 6): the node program as an ordinary process,
+# for development stacks. It listens on TCP 8080. There is no Nitro attestation in this image:
+# the attestation document is the unsigned local document of protocol.md 4.2.
+#
+#   docker build -f build/Dockerfile.local -t credential-enclave-local:dev .
+#
+# The builder is the image the enclave build uses, fixed by digest. It holds the C compiler and
+# the C library headers that the C parts of the `ring` crate need. The build runs natively on
+# linux/amd64 and linux/arm64: the Rust host target of this Alpine image is
+# {arch}-unknown-linux-musl, which links the program statically.
+FROM rust:1.98.1-alpine3.24@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f AS build
+
+# The release tag is compiled into the program and is part of the attestation binding.
+ARG CREDENTIAL_ENCLAVE_RELEASE=dev
+
+ENV CARGO_INCREMENTAL=0 \
+    TZ=UTC \
+    LC_ALL=C \
+    CREDENTIAL_ENCLAVE_RELEASE=${CREDENTIAL_ENCLAVE_RELEASE}
+
+WORKDIR /build
+COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
+COPY protocol protocol
+COPY enclave enclave
+COPY host host
+COPY verify verify
+
+# The build caches are kept per architecture: both architectures build into target/release.
+ARG TARGETARCH
+RUN --mount=type=cache,id=credential-enclave-registry,sharing=locked,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=credential-enclave-target-${TARGETARCH},sharing=locked,target=/build/target \
+    cargo build --release --locked -p credential-enclave \
+    && cp target/release/credential-enclave /credential-enclave
+
+FROM scratch
+# Names the repository of this image for the registry.
+LABEL org.opencontainers.image.source="https://github.com/pickle-com/credential-enclave"
+COPY --from=build /credential-enclave /credential-enclave
+EXPOSE 8080
+ENTRYPOINT ["/credential-enclave", "--platform", "local"]

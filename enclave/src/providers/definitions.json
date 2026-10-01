@@ -1,0 +1,177 @@
+{
+  "google_workspace": {
+    "client": "static",
+    "authorize": {"url": "https://accounts.google.com/o/oauth2/v2/auth", "fixed": [], "allowed": ["scope", "access_type", "prompt", "include_granted_scopes", "login_hint"], "key_param": ""},
+    "scope_param": "scope",
+    "scope_delimiter": " ",
+    "pkce": "S256",
+    "token": {"url": "https://oauth2.googleapis.com/token", "client_auth": "body", "body": "form", "headers": [], "bearer": "", "fixed": [], "ok_field": ""},
+    "token_container": "",
+    "revoke": {"url": "https://oauth2.googleapis.com/revoke", "client_auth": "none", "bearer": ""},
+    "inject": {"header": "Authorization", "prefix": "Bearer ", "paths": ["access_token"]},
+    "public": [
+      {"path": "scope", "type": "string", "max": 8192},
+      {"path": "expires_in", "type": "integer"},
+      {"path": "token_type", "type": "string", "max": 32}
+    ],
+    "id_token_claims": [
+      {"path": "sub", "type": "string", "max": 255},
+      {"path": "email", "type": "string", "max": 320},
+      {"path": "email_verified", "type": "boolean"},
+      {"path": "hd", "type": "string", "max": 255},
+      {"path": "name", "type": "string", "max": 256},
+      {"path": "picture", "type": "string", "max": 2048}
+    ],
+    "api": [
+      {"host": "gmail.googleapis.com", "prefixes": ["/gmail/v1/", "/upload/gmail/v1/"], "exact": []},
+      {"host": "www.googleapis.com", "prefixes": ["/calendar/v3/", "/drive/v3/", "/upload/drive/v3/", "/download/drive/v3/"], "exact": ["/oauth2/v3/userinfo"]},
+      {"host": "docs.googleapis.com", "prefixes": ["/v1/documents"], "exact": []},
+      {"host": "sheets.googleapis.com", "prefixes": ["/v4/spreadsheets"], "exact": [], "encoded_slash": true},
+      {"host": "slides.googleapis.com", "prefixes": ["/v1/presentations"], "exact": []},
+      {"host": "forms.googleapis.com", "prefixes": ["/v1/forms"], "exact": []},
+      {"host": "tasks.googleapis.com", "prefixes": ["/tasks/v1/"], "exact": []},
+      {"host": "meet.googleapis.com", "prefixes": ["/v2/"], "exact": []}
+    ]
+  },
+  "microsoft": {
+    "client": "static",
+    "authorize": {"url": "https://login.microsoftonline.com/common/oauth2/v2.0/authorize", "fixed": [], "allowed": ["scope", "prompt", "login_hint"], "key_param": ""},
+    "scope_param": "scope",
+    "scope_delimiter": " ",
+    "pkce": "S256",
+    "token": {"url": "https://login.microsoftonline.com/common/oauth2/v2.0/token", "client_auth": "body", "body": "form", "headers": [], "bearer": "", "fixed": [], "ok_field": ""},
+    "token_container": "",
+    "revoke": null,
+    "inject": {"header": "Authorization", "prefix": "Bearer ", "paths": ["access_token"]},
+    "public": [
+      {"path": "scope", "type": "string", "max": 8192},
+      {"path": "expires_in", "type": "integer"},
+      {"path": "ext_expires_in", "type": "integer"},
+      {"path": "token_type", "type": "string", "max": 32}
+    ],
+    "id_token_claims": [
+      {"path": "tid", "type": "string", "max": 64},
+      {"path": "oid", "type": "string", "max": 64},
+      {"path": "preferred_username", "type": "string", "max": 320}
+    ],
+    "api": [
+      {"host": "graph.microsoft.com", "prefixes": ["/v1.0/"], "exact": [], "denied": ["/v1.0/$batch"]}
+    ]
+  },
+  "slack": {
+    "client": "static",
+    "authorize": {"url": "https://slack.com/oauth/v2/authorize", "fixed": [], "allowed": ["user_scope"], "key_param": ""},
+    "scope_param": "user_scope",
+    "scope_delimiter": ",",
+    "pkce": "none",
+    "token": {"url": "https://slack.com/api/oauth.v2.access", "client_auth": "body", "body": "form", "headers": [], "bearer": "", "fixed": [], "ok_field": "ok"},
+    "token_container": "authed_user",
+    "revoke": null,
+    "inject": {"header": "Authorization", "prefix": "Bearer ", "paths": ["authed_user.access_token", "access_token"]},
+    "public": [
+      {"path": "team.id", "type": "string", "max": 32},
+      {"path": "team.name", "type": "string", "max": 256},
+      {"path": "enterprise.id", "type": "string", "max": 32},
+      {"path": "enterprise.name", "type": "string", "max": 256},
+      {"path": "app_id", "type": "string", "max": 32},
+      {"path": "is_enterprise_install", "type": "boolean"},
+      {"path": "authed_user.id", "type": "string", "max": 32},
+      {"path": "authed_user.scope", "type": "string", "max": 8192},
+      {"path": "authed_user.expires_in", "type": "integer"},
+      {"path": "authed_user.token_type", "type": "string", "max": 32}
+    ],
+    "id_token_claims": [],
+    "api": [
+      {"host": "slack.com", "prefixes": [], "exact": ["/api/conversations.list", "/api/conversations.history", "/api/conversations.replies", "/api/conversations.info", "/api/auth.test", "/api/search.messages", "/api/users.list", "/api/users.info", "/api/files.info", "/api/chat.postMessage", "/api/files.getUploadURLExternal", "/api/files.completeUploadExternal"]},
+      {"host": "files.slack.com", "prefixes": ["/files-pri/"], "exact": []}
+    ]
+  },
+  "notion": {
+    "client": "static",
+    "authorize": {"url": "https://api.notion.com/v1/oauth/authorize", "fixed": [["owner", "user"]], "allowed": [], "key_param": ""},
+    "scope_param": "",
+    "scope_delimiter": "",
+    "pkce": "none",
+    "token": {"url": "https://api.notion.com/v1/oauth/token", "client_auth": "basic", "body": "json", "headers": [["Notion-Version", "2025-09-03"]], "bearer": "", "fixed": [], "ok_field": ""},
+    "token_container": "",
+    "revoke": null,
+    "inject": {"header": "Authorization", "prefix": "Bearer ", "paths": ["access_token"]},
+    "public": [
+      {"path": "workspace_id", "type": "string", "max": 64},
+      {"path": "workspace_name", "type": "string", "max": 256},
+      {"path": "workspace_icon", "type": "string", "max": 2048},
+      {"path": "bot_id", "type": "string", "max": 64},
+      {"path": "duplicated_template_id", "type": "string", "max": 64},
+      {"path": "owner.type", "type": "string", "max": 32},
+      {"path": "owner.user.id", "type": "string", "max": 64},
+      {"path": "owner.user.name", "type": "string", "max": 256},
+      {"path": "owner.user.avatar_url", "type": "string", "max": 2048},
+      {"path": "owner.user.type", "type": "string", "max": 32},
+      {"path": "owner.user.person.email", "type": "string", "max": 320}
+    ],
+    "id_token_claims": [],
+    "api": [
+      {"host": "api.notion.com", "prefixes": ["/v1/pages", "/v1/blocks/", "/v1/databases/", "/v1/data_sources/"], "exact": ["/v1/search"]}
+    ]
+  },
+  "x": {
+    "client": "static",
+    "authorize": {"url": "https://x.com/i/oauth2/authorize", "fixed": [], "allowed": ["scope"], "key_param": ""},
+    "scope_param": "scope",
+    "scope_delimiter": " ",
+    "pkce": "S256",
+    "token": {"url": "https://api.x.com/2/oauth2/token", "client_auth": "basic", "body": "form", "headers": [], "bearer": "", "fixed": [], "ok_field": ""},
+    "token_container": "",
+    "revoke": {"url": "https://api.x.com/2/oauth2/revoke", "client_auth": "basic", "bearer": ""},
+    "inject": {"header": "Authorization", "prefix": "Bearer ", "paths": ["access_token"]},
+    "public": [
+      {"path": "scope", "type": "string", "max": 8192},
+      {"path": "expires_in", "type": "integer"},
+      {"path": "token_type", "type": "string", "max": 32}
+    ],
+    "id_token_claims": [],
+    "api": [
+      {"host": "api.x.com", "prefixes": ["/2/users", "/2/tweets", "/2/dm_events"], "exact": []}
+    ]
+  },
+  "link": {
+    "client": "static",
+    "authorize": {"url": "https://login.link.com/auth", "fixed": [], "allowed": ["scope"], "key_param": "key"},
+    "scope_param": "scope",
+    "scope_delimiter": " ",
+    "pkce": "S256",
+    "token": {"url": "https://login.link.com/auth/token", "client_auth": "body", "body": "form", "headers": [], "bearer": "publishable_key", "fixed": [], "ok_field": ""},
+    "token_container": "",
+    "revoke": {"url": "https://login.link.com/auth/revoke", "client_auth": "body", "bearer": "publishable_key"},
+    "inject": {"header": "Authorization", "prefix": "Bearer ", "paths": ["access_token"]},
+    "public": [
+      {"path": "scope", "type": "string", "max": 8192},
+      {"path": "expires_in", "type": "integer"},
+      {"path": "token_type", "type": "string", "max": 32}
+    ],
+    "id_token_claims": [],
+    "api": [
+      {"host": "api.link.com", "prefixes": ["/spend_requests"], "exact": ["/userinfo", "/payment-details", "/shipping_addresses"]}
+    ]
+  },
+  "granola": {
+    "client": "dynamic",
+    "authorize": {"url": "https://mcp-auth.granola.ai/oauth2/authorize", "fixed": [["resource", "https://mcp.granola.ai/mcp"]], "allowed": ["scope"], "key_param": ""},
+    "scope_param": "scope",
+    "scope_delimiter": " ",
+    "pkce": "S256",
+    "token": {"url": "https://mcp-auth.granola.ai/oauth2/token", "client_auth": "none", "body": "form", "headers": [], "bearer": "", "fixed": [["resource", "https://mcp.granola.ai/mcp"]], "ok_field": ""},
+    "token_container": "",
+    "revoke": null,
+    "inject": {"header": "Authorization", "prefix": "Bearer ", "paths": ["access_token"]},
+    "public": [
+      {"path": "scope", "type": "string", "max": 8192},
+      {"path": "expires_in", "type": "integer"},
+      {"path": "token_type", "type": "string", "max": 32}
+    ],
+    "id_token_claims": [],
+    "api": [
+      {"host": "mcp.granola.ai", "prefixes": [], "exact": ["/mcp"]}
+    ]
+  }
+}

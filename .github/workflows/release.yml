@@ -1,0 +1,178 @@
+# The release of a `v*` tag (enclave.md 11.2).
+#
+# check:     the checks of check.yml and `cargo audit`.
+# build-a:   build/build.sh on one machine.
+# build-b:   build/build.sh on another machine.
+# compare:   the two builds gave the same measurements. Without this there is no release.
+# publish:   the host image to ghcr.io, the GitHub release with the enclave image file and its
+#            measurements, and two attestations of the enclave image file: its build provenance,
+#            and the release statement whose predicate is measurements.json (protocol.md
+#            section 9).
+#
+# The enclave image file of the release, of the host image and of the attestations is the one
+# build-a made. build-b exists to show that the measurements do not depend on the machine.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the toolchain of rust-toolchain.toml
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal \
+            --component rustfmt --component clippy --no-self-update
+          rustc --version
+      - name: Formatting
+        run: cargo fmt --check
+      - name: Lints
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --locked
+      - name: The committed test vectors are the output of the generator
+        run: cargo run --locked -p credential-enclave-protocol --bin vectors -- --check
+      - name: The functions that read a secret and the callers of the sinks are the listed ones
+        run: scripts/secret-access.sh --check
+      - name: No dependency of Cargo.lock has a security advisory
+        run: |
+          cargo install cargo-audit --locked --version 0.22.2
+          cargo audit
+
+  build-a:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the enclave image file
+        run: build/build.sh eif
+      - name: The release of the build is the pushed tag
+        run: |
+          grep -q "\"release\": \"$GITHUB_REF_NAME\"" out/measurements.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: build-a
+          path: |
+            out/enclave.eif
+            out/measurements.json
+          if-no-files-found: error
+
+  build-b:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the enclave image file
+        run: build/build.sh eif
+      - name: The release of the build is the pushed tag
+        run: |
+          grep -q "\"release\": \"$GITHUB_REF_NAME\"" out/measurements.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: build-b
+          path: |
+            out/enclave.eif
+            out/measurements.json
+          if-no-files-found: error
+
+  compare:
+    needs: [build-a, build-b]
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: build-a
+          path: build-a
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: build-b
+          path: build-b
+      - name: Both builds gave the same measurements
+        run: |
+          cat build-a/measurements.json
+          if ! diff build-a/measurements.json build-b/measurements.json; then
+            echo "::error::build-a and build-b differ: the build is not reproducible"
+            exit 1
+          fi
+
+  publish:
+    needs: [check, compare]
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+      contents: write
+      attestations: write
+      packages: write
+    env:
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      HOST_IMAGE: ghcr.io/${{ github.repository }}/host:${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: build-a
+          path: out
+      - name: Build the host image around the enclave image file of build-a
+        run: build/build.sh host
+      - name: Log in to ghcr.io
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Push the host image
+        run: |
+          docker tag "credential-enclave-host:$TAG" "$HOST_IMAGE"
+          docker push "$HOST_IMAGE"
+      - name: Create the GitHub release
+        run: |
+          {
+            echo "The identity of this release is PCR0, PCR1 and PCR2:"
+            echo
+            echo '```json'
+            cat out/measurements.json
+            echo '```'
+          } > notes.md
+          gh release view "$TAG" >/dev/null 2>&1 ||
+            gh release create "$TAG" --verify-tag --title "$TAG" --notes-file notes.md
+          gh release upload "$TAG" --clobber out/enclave.eif out/measurements.json
+      - name: Attest the build provenance of the enclave image file
+        id: provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: out/enclave.eif
+      - name: Attest the release statement
+        id: statement
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: out/enclave.eif
+          predicate-type: https://pickle.com/credential-enclave/release/v1
+          predicate-path: out/measurements.json
+      - name: Attach the attestation bundles to the GitHub release
+        env:
+          PROVENANCE_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+          STATEMENT_BUNDLE: ${{ steps.statement.outputs.bundle-path }}
+        run: |
+          cp "$PROVENANCE_BUNDLE" provenance.sigstore.json
+          cp "$STATEMENT_BUNDLE" release-statement.sigstore.json
+          gh release upload "$TAG" --clobber provenance.sigstore.json release-statement.sigstore.json

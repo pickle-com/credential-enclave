@@ -1,0 +1,20 @@
+# The tools of the enclave image file assembly (enclave.md 11.1, row 3): `nitro-cli` and the
+# files it puts into every enclave image file (kernel, kernel command line, init, the NSM
+# driver, linuxkit).
+#
+# `build/build.sh` runs this image with the socket of the Docker daemon and calls
+#
+#   nitro-cli build-enclave --docker-uri {enclave image} --output-file enclave.eif
+#
+# The base image is fixed by digest. An Amazon Linux 2023 image reads packages from the
+# repository version it was released with, so the two packages below, fixed by name, version
+# and release, and everything they depend on are the same in every build. `build.sh` records
+# the SHA-256 of the kernel, the command line, init, the NSM driver and linuxkit in
+# `measurements.json`.
+FROM amazonlinux:2023@sha256:5b29412077a463b4a3a8fbc99a8cdf4b929f38a3ecc8dac10328d8f36b0099b8
+
+RUN dnf install -y --setopt=install_weak_deps=False \
+        aws-nitro-enclaves-cli-1.5.0-0.amzn2023 \
+        aws-nitro-enclaves-cli-devel-1.5.0-0.amzn2023 \
+    && dnf clean all \
+    && nitro-cli --version

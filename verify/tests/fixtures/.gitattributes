@@ -1,0 +1,3 @@
+# The fixtures are bytes: git converts no line end in them and shows no text diff of them.
+*.cbor binary
+*.nonce binary

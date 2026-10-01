@@ -1,0 +1,24 @@
+{
+  "release": "v1.0.0",
+  "git_commit": "7a7f628d991bc6646bafcc4a2a3fa4a424f74995",
+  "pcr0": "d11eea49deb3a47dd60db99c7017435722ea4aa13678097839054c00e330ada12c83412710f923b45167068e12aeaba7",
+  "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+  "pcr2": "a20b4116edfa4777b9a128025b2c77fd3bfa41e2aedf7710ed6e6b03eebf1110f99e486772ffb0e6a7b8c37070d814f8",
+  "inputs": {
+    "image/rust": "7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f",
+    "image/buildkit": "cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea",
+    "image/amazonlinux": "5b29412077a463b4a3a8fbc99a8cdf4b929f38a3ecc8dac10328d8f36b0099b8",
+    "file/rust-toolchain.toml": "0bf007546885bfdc84484863a3b2dd936a89627191998d987cd798759e3935f1",
+    "file/Cargo.toml": "76d9b8cd88d23bd4d8190491758383ffe2bba61de8ceea5a345ebbfec9e19805",
+    "file/Cargo.lock": "2b181eb4fd05fe887e3f2e8782903067f4fc2f52e0d4a42e98f58ad2887dae15",
+    "file/build/Dockerfile.enclave": "191ca13295a049ded512cf7c519a40fc51caeb1518c4d78cff405e404a4bf59e",
+    "file/build/Dockerfile.eif": "2f0e73b8cfef1397dcf56f5d9271c28e7b3b89495e84d496c15dfcfa6241cd8a",
+    "file/build/build.sh": "ef65fb3e9d469ea2b921b8f03ff88fba7916c77a8a1a27b4dab0d6fef4d085da",
+    "blob/bzImage": "210eda749c1308eb60671a579d24db5e8a3477cb7a247cf313c286b09fe2d857",
+    "blob/cmdline": "10d7d9dd205d4596d45997d17434f26207525f129d171a51f9859b1af9f4a07a",
+    "blob/init": "c4acb866e8925c171b43517f3a88a6989f5a2da3a6d3e6594f75bedc6d116a27",
+    "blob/linuxkit": "e57bb1779b348da7eae118a8e0a034d2aa4c28205c07db07dea8285ff206bb69",
+    "blob/nsm.ko": "6bd2b09422c2f2f58c6ecf1cfd55216bea9b99a6d591261a9eca40027291316b",
+    "binary/credential-enclave": "1bd8e38c59e4cb05446961dfc0eebea50398426d1aaff1b536bf082cff862686"
+  }
+}

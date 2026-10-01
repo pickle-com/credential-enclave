@@ -1,0 +1,15 @@
+# Every function of the node source that calls a sink (rule E2 of the egress policy,
+# docs/egress-policy.md). `scripts/secret-access.sh --check` compares the first four columns
+# with the source and fails when a call is missing here or no longer exists.
+#
+# Columns, separated by tabs: sink, file, function, calls, note (what holds at that call).
+#
+# K1 record::seal, K2 seal_transfer, K3 send_to_provider, K4 hand_out, K5 send_to_log_store.
+K1	enclave/src/oauth.rs	OauthPlaintext::seal	1	the plaintext is an OauthPlaintext: a token response the node received, an opened record, or the merge rules applied to those. The record keeps the kind the plaintext came from
+K2	enclave/src/api/peer.rs	run_export	1	the peer is a Peer, which only verify_peer creates: the same platform, on nitro the same measurement, and the same log store. The entry grant_transferred_out that names this peer is on the chain of every account of the transfer before, and the log store confirmed it: this call created it, or an earlier transfer of the same grant to the same peer did
+K2	enclave/src/attest.rs	Peer::seal_transfer	1	the one call of the node to the sealing function of the protocol crate: the keys it seals to are those of the verified peer
+K3	enclave/src/api/forward.rs	run	1	the destination is an address that passed check_address of the provider definition. The entry provider_request is on the chain before and the log store confirmed it, or the request is a GET without a body and shares the confirmed entry of an identical one of the last 300 seconds
+K3	enclave/src/api/revoke.rs	run	1	the destination is the revocation address of the provider definition. The entry connection_removed is on the chain before, and the log store confirmed it
+K3	enclave/src/oauth.rs	call_token_address	1	the destination is the token address of the provider definition. A refresh has its entry credential_refreshed on the chain before, and the log store confirmed it. An exchange has no entry yet: its entry connection_created is confirmed before the record leaves
+K4	enclave/src/api/release.rs	run	1	the record is a vault record and the field is one of its kind. The entry secret_released or totp_issued is on the chain before, and the log store confirmed it
+K5	enclave/src/log_store.rs	write_claims	1	what is written is an entry the node created and signed, as it stands on the chain of its account: its content is sealed to the log public key of the account. The destination is the log store of the operator configuration, which the binding of the attestation names. The credentials are those the operator domain gave

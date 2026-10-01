@@ -1,0 +1,43 @@
+[package]
+name = "credential-enclave"
+version = "1.0.0"
+description = "The credential enclave node program"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "credential-enclave"
+path = "src/main.rs"
+
+[dependencies]
+credential-enclave-protocol = { path = "../protocol" }
+axum = { version = "0.8", default-features = false }
+base64.workspace = true
+getrandom = "0.2"
+# The signature of a write to the log store (src/log_store.rs): HMAC-SHA256 of AWS Signature
+# Version 4. The crate is already part of the program as a dependency of the protocol crate.
+hmac.workspace = true
+hyper = { version = "1", features = ["client", "http1", "server"] }
+hyper-util = { version = "0.1", features = ["service", "tokio"] }
+# The search for a reflected credential in a provider response (src/provider_response.rs).
+# The crate is already part of the program as a dependency of its dependencies.
+memchr = "2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+url = "2"
+webpki-roots = "0.26"
+zeroize.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aws-nitro-enclaves-nsm-api = "0.5"
+tokio-vsock = "0.7"
+
+[dev-dependencies]
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"] }

@@ -1,0 +1,40 @@
+[package]
+name = "credential-enclave-protocol"
+version = "1.0.0"
+description = "Key, message and storage formats of the credential enclave (protocol v1)"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "credential_enclave_protocol"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vectors"
+path = "src/bin/vectors.rs"
+
+[dependencies]
+base64.workspace = true
+chacha20poly1305.workspace = true
+ed25519-dalek.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+hpke.workspace = true
+# The certificate chain and the signature of a Nitro attestation document (src/attestation.rs).
+# The same crates, with the same `ring` backend, verify TLS certificates in the node program.
+rustls-pki-types = { version = "1", features = ["std"] }
+webpki = { package = "rustls-webpki", version = "0.103.15", default-features = false, features = ["ring", "std"] }
+serde.workspace = true
+serde_json.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+x25519-dalek.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+# The certificate authority and the signing key of the attestation documents the tests build.
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"] }
+ring = "0.17"

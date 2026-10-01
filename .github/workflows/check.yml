@@ -1,0 +1,60 @@
+# The checks of every change (enclave.md 11.2).
+#
+# check:    formatting, lints, the tests of the workspace, that the committed test vectors
+#           are the output of the generator, and that the functions that read a secret are the
+#           ones egress/secret-access.tsv lists (rule E2 of docs/egress-policy.md).
+# measure:  builds the enclave image file of the pushed commit with build/build.sh and prints
+#           its measurements. A build of the same commit on another machine gives the same
+#           PCR0, PCR1 and PCR2.
+name: check
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the toolchain of rust-toolchain.toml
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal \
+            --component rustfmt --component clippy --no-self-update
+          rustc --version
+      - name: Formatting
+        run: cargo fmt --check
+      - name: Lints
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --locked
+      - name: The committed test vectors are the output of the generator
+        run: cargo run --locked -p credential-enclave-protocol --bin vectors -- --check
+      - name: The functions that read a secret and the callers of the sinks are the listed ones
+        run: scripts/secret-access.sh --check
+
+  measure:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the enclave image file
+        run: build/build.sh eif
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: measurements
+          path: out/measurements.json
+          if-no-files-found: error

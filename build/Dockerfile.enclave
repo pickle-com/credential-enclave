@@ -1,0 +1,46 @@
+# check=skip=SecretsUsedInArgOrEnv
+#
+# The check above is skipped for the build argument CREDENTIAL_ENCLAVE_RELEASE: it is the
+# release tag, and its name alone makes the build check take it for a secret.
+#
+# The enclave image (enclave.md 11.1, row 1): the node program as the only file of an image
+# built `FROM scratch`. `build/build.sh` builds this image and turns it into the enclave image
+# file (EIF) whose measurements identify a release. Do not build it by hand for a release: the
+# measurements depend on the arguments and on the exporter options that `build.sh` passes.
+#
+# Every input of the binary is fixed:
+#   - the builder image, by digest (Rust toolchain, C compiler, C library headers);
+#   - `rust-toolchain.toml` (the same Rust version as the builder image) and `Cargo.lock`;
+#   - the release profile of the workspace `Cargo.toml`;
+#   - the working directory, the path remapping and the environment below.
+# The build installs no package. The C parts of the `ring` crate need the headers of the C
+# library (`musl-dev`), which this builder image contains: the version is asserted below.
+FROM rust:1.98.1-alpine3.24@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f AS build
+
+# The release tag is compiled into the program and is part of the attestation binding.
+ARG CREDENTIAL_ENCLAVE_RELEASE=dev
+# The time of the commit. BuildKit also stamps the image with it.
+ARG SOURCE_DATE_EPOCH=0
+
+ENV CARGO_INCREMENTAL=0 \
+    TZ=UTC \
+    LC_ALL=C \
+    SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
+    CREDENTIAL_ENCLAVE_RELEASE=${CREDENTIAL_ENCLAVE_RELEASE} \
+    RUSTFLAGS="--remap-path-prefix=/build=/credential-enclave --remap-path-prefix=/usr/local/cargo=/cargo --remap-path-prefix=/usr/local/rustup=/rustup"
+
+RUN apk info -v | grep -qx 'musl-dev-1.2.6-r2' \
+    && test "$(rustc --version)" = "rustc 1.98.1 (48a229cea 2026-09-01)"
+
+WORKDIR /build
+COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
+COPY protocol protocol
+COPY enclave enclave
+COPY host host
+COPY verify verify
+
+RUN cargo build --release --locked --target x86_64-unknown-linux-musl -p credential-enclave
+
+FROM scratch
+COPY --from=build /build/target/x86_64-unknown-linux-musl/release/credential-enclave /credential-enclave
+ENTRYPOINT ["/credential-enclave", "--platform", "nitro"]
