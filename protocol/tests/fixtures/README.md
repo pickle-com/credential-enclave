@@ -1,8 +1,8 @@
-# Fixtures of the attestation tests
+# Fixtures of the attestation tests and of the release tests
 
-Test inputs of the tests in `protocol/src/attestation.rs`, `enclave/src/attest.rs`,
-`enclave/src/platform/nitro.rs` and `verify/src/`. Only tests read them: no built program
-contains them.
+Test inputs of the tests in `protocol/src/attestation.rs`, `protocol/src/release.rs`,
+`enclave/src/attest.rs`, `enclave/src/platform/nitro.rs`, `enclave/src/tests/peer.rs` and
+`verify/src/`. Only tests read them: no built program contains them.
 
 The certificate of a Nitro attestation document is valid for about three hours. The tests
 pass at any time because the verification validates the certificate chain at the time the
@@ -59,3 +59,20 @@ document states, not at the time of the machine.
 - Origin: made by the maintainers of this repository for these tests.
 - License: the license of this repository (Apache License 2.0).
 - SHA-256: `24d6b5c9f929a8063e17c5e94187d3fdc123ac4a847e24cc0ef54b6a7cd92639`
+
+## `rekor-entry-150000000.json`
+
+- What it is: the entry with the index 150,000,000 of the transparency log Rekor of
+  rekor.sigstore.dev, in the form of the `entry` of an endorsement (protocol.md 10.3): `body`
+  (a `hashedrekord` of version 0.0.1 of another signer, in standard base64), `integrated_time`
+  (1732051154, 2024-11-19T21:19:14Z), `log_index`, `log_id` and `signed_entry_timestamp`. The
+  key `uuid` is the identifier of the entry in the log. The tests verify the signed entry
+  timestamp with the log key of the node program (`enclave/release/rekor-key.pem`): this fixes
+  the bytes the log signs for an entry.
+- Origin: the response of `GET https://rekor.sigstore.dev/api/v1/log/entries?logIndex=150000000`.
+  `body` is the `body` of that response without a change. `integrated_time`, `log_index`,
+  `log_id` and `signed_entry_timestamp` are its `integratedTime`, `logIndex`, `logID` and
+  `verification.signedEntryTimestamp`.
+- License: the entry is a public record of the log. The file is under the license of this
+  repository (Apache License 2.0).
+- SHA-256: `c340515579e40b7305f1ad7a5c868291edcd589fd06de23f082bc82bfbf53954`

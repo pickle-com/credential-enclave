@@ -20,6 +20,7 @@ pub mod envelope;
 pub mod keys;
 pub mod log;
 pub mod record;
+pub mod release;
 pub mod secret;
 pub mod statement;
 pub mod totp;
@@ -97,6 +98,14 @@ pub mod limits {
     /// How long the log store keeps an entry from the moment a node writes it: 365 days. Until
     /// then nobody can delete the object or shorten its retention (7.6).
     pub const LOG_RETENTION_DAYS: u64 = 365;
+    /// Longest release statement, in bytes (10.3).
+    pub const RELEASE_STATEMENT_BYTES: usize = 16_384;
+    /// The notice period of a release: how old the entry of the transparency log must be, by
+    /// the clock of the giving node, before the statement it records counts (10.3).
+    pub const RELEASE_NOTICE_SECONDS: u64 = 0;
+    /// How far the time of an entry of the transparency log may lie after the clock of the
+    /// giving node: 300 seconds (10.3).
+    pub const RELEASE_ENTRY_AHEAD_SECONDS: u64 = 300;
 }
 
 /// The failure codes of protocol.md section 11. The variants and the codes correspond one to
