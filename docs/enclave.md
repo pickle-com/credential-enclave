@@ -34,13 +34,14 @@ credential-enclave/
 │   └── egress-policy.md          # what can leave a node, and what enforces it
 ├── protocol/                     # crate credential-enclave-protocol (library)
 │   ├── src/lib.rs                # purpose strings, constants, failure codes
-│   ├── src/{encoding,secret,keys,envelope,record,log,statement,totp,attestation,app}.rs
+│   ├── src/{encoding,secret,keys,envelope,record,log,statement,totp,attestation,release,app}.rs
 │   ├── src/aws-nitro-enclaves-root-g1.der   # the trust root of Nitro attestation documents
 │   ├── src/bin/vectors.rs        # the generator of the test vectors
 │   ├── tests/vectors.rs          # the library passes every committed vector
-│   ├── tests/fixtures/           # real Nitro attestation documents, an unrelated root certificate
+│   ├── tests/fixtures/           # real Nitro attestation documents, an unrelated root certificate, a real entry of the transparency log
 │   └── vectors.json              # the test vectors of protocol.md section 13
 ├── enclave/                      # crate credential-enclave (binary credential-enclave)
+│   ├── release/{release-key.pem,rekor-key.pem,predecessors.json}   # compiled into the node program (5.13, 11.1)
 │   ├── src/main.rs               # the argument, the choice of the platform, the start of the server
 │   ├── src/platform/mod.rs       # trait Platform (section 2)
 │   ├── src/platform/nitro.rs     # NSM attestation, vsock listener, vsock egress
@@ -50,7 +51,8 @@ credential-enclave/
 │   ├── src/api/mod.rs            # the router, the failure responses
 │   ├── src/api/responses.rs      # every response type (rule E3 of the egress policy)
 │   ├── src/api/{health,config,attestation,messages,status,oauth,refresh,revoke,forward,release,log,close,peer,log_store}.rs
-│   ├── src/attest.rs             # which peer a node accepts (same platform, same measurement)
+│   ├── src/attest.rs             # which peer a node accepts (same platform; same measurement, a later release with an endorsement, a predecessor)
+│   ├── src/lineage.rs            # the release key, the log key and the list of predecessors of the program (5.13)
 │   ├── src/providers/mod.rs      # the provider definitions: parsing, validation, the address check
 │   ├── src/providers/definitions.json
 │   ├── src/oauth.rs              # the authorization address, the token address call, the merge rules, the public fields
@@ -83,7 +85,7 @@ The crates and what they depend on, as their `Cargo.toml` files state it:
 
 | Crate | Output | Crates of this workspace | External crates |
 | --- | --- | --- | --- |
-| `credential-enclave-protocol` | Library `credential_enclave_protocol`, binary `vectors` | None | `base64` 0.22, `chacha20poly1305` 0.10, `ed25519-dalek` 2, `hkdf` 0.12, `hmac` 0.12, `hpke` 0.12, `rustls-pki-types` 1, `rustls-webpki` 0.103, `serde` 1, `serde_json` 1, `sha1` 0.10, `sha2` 0.10, `x25519-dalek` 2, `zeroize` 1 |
+| `credential-enclave-protocol` | Library `credential_enclave_protocol`, binary `vectors` | None | `base64` 0.22, `chacha20poly1305` 0.10, `ed25519-dalek` 2, `hkdf` 0.12, `hmac` 0.12, `hpke` 0.12, `ring` 0.17, `rustls-pki-types` 1, `rustls-webpki` 0.103, `serde` 1, `serde_json` 1, `sha1` 0.10, `sha2` 0.10, `x25519-dalek` 2, `zeroize` 1 |
 | `credential-enclave` | Binary `credential-enclave`: the node program | `credential-enclave-protocol` | `axum` 0.8, `base64`, `getrandom` 0.2, `hmac` 0.12, `hyper` 1, `hyper-util` 0.1, `memchr` 2, `rustls` 0.23, `serde`, `serde_json`, `sha2`, `tokio` 1, `tokio-rustls` 0.26, `url` 2, `webpki-roots` 0.26, `zeroize`. On Linux: `aws-nitro-enclaves-nsm-api` 0.5, `tokio-vsock` 0.7 |
 | `credential-enclave-host` | Binary `credential-enclave-host`: the host program | None | `http-body-util` 0.1, `hyper` 1, `hyper-util` 0.1, `serde`, `serde_json`, `tokio` 1. On Linux: `tokio-vsock` 0.7 |
 | `credential-enclave-verify` | Binary `credential-enclave-verify`: the verification tool | `credential-enclave-protocol` | `getrandom` 0.2, `rustls` 0.23, `serde_json`, `ureq` 2.12, `webpki-roots` 0.26 |
@@ -99,8 +101,11 @@ The crates and what they depend on, as their `Cargo.toml` files state it:
   That reader is the only reader of attestation documents: a verifier of a node, a node that
   verifies a peer, and a node that reads the time and its own measurement from its own documents
   use it.
+- The two ECDSA P-256 SHA-256 signatures of an endorsement (protocol.md 10.3) are verified with
+  `ring`, the crate that `rustls` and `rustls-webpki` use as their provider. The PEM of a public
+  key is read by code of the protocol crate.
 - Dependencies of tests only: `rcgen` 0.13 (the certificates of the provider stand-in and of the
-  attestation documents that tests build), `ring` 0.17, and the feature `test-util` of `tokio`.
+  attestation documents that tests build), and the feature `test-util` of `tokio`.
 - Every crate has `#![forbid(unsafe_code)]`: the source of this repository has no `unsafe` block
   (its dependencies are outside this rule).
 - The release profile is a build input of the measured binary: `opt-level = 3`, `lto = "fat"`,
@@ -123,6 +128,7 @@ reads a clock: randomness and time are arguments.
 | `log.rs` | The log entry, the chain hash, the head, the key of an entry in the log store |
 | `statement.rs` | The node statements: the challenge statement of an attestation response (protocol.md 4.2), and `oauth_begin` and `oauth_complete` (protocol.md 8.2) |
 | `totp.rs` | TOTP (RFC 6238, HMAC-SHA1, 6 digits, 30 seconds) |
+| `release.rs` | The delegation transfer to a later release (protocol.md 10.3): the release statement, the six checks of an endorsement (the statement, the log identifier, the signed entry timestamp, the body of the entry with the release key and its signature, the time of the entry, the order of the two releases), the order of release tags, the reader of a list of predecessors, the reader of the PEM of a public key. The release key and the log key are arguments |
 | `attestation.rs` | Reading and verifying attestation documents: the Nitro document (CBOR, COSE_Sign1, the certificate chain, the signature, the PCRs), the binding, the local document. It holds the trust root (AWS Nitro Enclaves Root-G1, DER) as a public constant. It returns what a document states and does not judge a measurement: which PCR values are acceptable is the decision of the caller |
 | `app.rs` | The app side of the protocol: the derivation of the account keys, the check of a challenge statement, sealing a command, opening log entries, verifying a chain. The node program does not call this module. The generator of the test vectors and the tests use it in the place of the app |
 | `bin/vectors.rs` | The generator of `protocol/vectors.json` (fixed seeds) |
@@ -167,6 +173,7 @@ struct Node {
     node: String,                    // b64u(signing public key)
     custody: Custody,                // the custody of the platform
     release: &'static str,           // the release tag compiled into the binary
+    lineage: Lineage,                // { release_key, log_key: the DER of the two public keys, predecessors: Vec<ReleaseMeasurement> } (5.13)
     started_ms: u64,
     closing: AtomicBool,
     config: RwLock<Option<Arc<OperatorConfig>>>,
@@ -629,13 +636,14 @@ in the clear, and no call hands the plaintext of a token out.
 ### 5.13 `POST /v1/peer/export`, `POST /v1/peer/import`
 
 ```json
-export {"peer":{the attestation response of the receiving node},"after":"","limit":1000}
+export {"peer":{the attestation response of the receiving node},"after":"","limit":1000,
+        "endorsement":{"statement":"...","entry":{"body":"...","integrated_time":0,"log_index":0,"log_id":"...","signed_entry_timestamp":"..."}}}
   -> {"envelope":{...}|null,"entries":[{"body":"...","sig":"..."}],"next":""}
 import {"peer":{the attestation response of the giving node},"envelope":{...}}
   -> {"imported":0,"entries":[{"body":"...","sig":"..."}]}
 ```
 
-The rules are those of protocol.md 10.1. What this document adds:
+The rules are those of protocol.md 10.1 and 10.3. What this document adds:
 
 - `peer` is the response of `POST /v1/attestation` of that peer, as it is (the nonce is a value
   that the caller chose, and the node does not look at it).
@@ -659,12 +667,31 @@ The rules are those of protocol.md 10.1. What this document adds:
   1 MiB limit of a JSON body, a page of 1,000 grants fits when a `user_id` is at most about 350
   bytes long (a `user_id` of the length of a UUID fits).
 - `attest.rs` decides which peer a node accepts: platform `nitro` by steps 1 to 5, 7, 8 and 10 of
-  protocol.md 4.3 (the one allowed measurement is that of `Platform::measurement()`, the trust
-  root is the DER of AWS Nitro Enclaves Root-G1 inside the binary, and the one allowed log store
-  is that of the node itself), platform `local` by parsing the `binding` of the local document of
-  4.2 and comparing its log store in the same way. A response of a platform that is not the
-  platform of the node, and a response whose binding names another log store than the node has
-  (or one where the node has none, or none where the node has one), is `peer_unverified`.
+  protocol.md 4.3 (the allowed measurements are those the call names, see the next three items,
+  the trust root is the DER of AWS Nitro Enclaves Root-G1 inside the binary, and the one allowed
+  log store is that of the node itself), platform `local` by parsing the `binding` of the local
+  document of 4.2 and comparing its log store in the same way. A response of a platform that is
+  not the platform of the node, and a response whose binding names another log store than the
+  node has (or one where the node has none, or none where the node has one), is `peer_unverified`.
+- export without `endorsement` (the key is absent or holds `null`): the one allowed measurement
+  is that of `Platform::measurement()`.
+- export with `endorsement`: the value is the endorsement of protocol.md 10.3, and the node makes
+  the seven checks of that section. The keys it checks with are the release key and the log key
+  inside the binary, the release it compares with is the release tag inside the binary, and the
+  time of check 5 is the node time (section 8) in seconds. The one allowed measurement is that of
+  the statement, with the `release` of the statement in the binding of the peer. The measurement
+  of the node itself is not allowed then, and a node of platform `local` accepts no peer. An
+  `endorsement` that is not a JSON object is `invalid_request`. An endorsement that lacks a key,
+  holds a value of another type or fails a check is `peer_unverified`: the response does not say
+  which check failed. A refused call creates no entry.
+- import: the allowed measurements are that of `Platform::measurement()` and those of the list of
+  predecessors inside the binary (`enclave/release/predecessors.json`), each of the list with the
+  `release` of its element in the binding of the peer. The call has no key for an endorsement: a
+  receiving node does not look at one.
+- The node reads the two keys and the list when it starts (`lineage.rs`). It does not start when a
+  key is not an ECDSA P-256 public key, or when the list fails the rules of protocol.md 10.3 (a
+  malformed list, an element whose release is not earlier than the release of the node, any
+  element for a node whose release is not a release tag).
 - export and the log store: the node hands a grant over only after the log store confirmed the
   entry `grant_transferred_out` of that grant for that peer (protocol.md 10.1, steps 4a to 5b).
   When the store does not confirm the entry of one account of the page, the call fails with
@@ -1024,13 +1051,13 @@ The output of the host program is its log: lines on the standard output, and the
 ## 10. Stages 2 and 3
 
 This section describes calls that the current release does not implement. The delegation transfer
-between nodes of the same release (5.13) is part of stage 1.
+between nodes of the same release and to a node of a later release (5.13) is part of stage 1.
 
 | Stage | Call | What it adds |
 | --- | --- | --- |
 | 2 | `POST /v1/peer/witness` | Witnessing (protocol.md 10.2). The backend carries the messages |
 | 2 | Step 7 of `forward` and of the other calls that create an entry | The node obtains a witness signature for every entry and acts after that. When no peer is alive, it continues without a witness, and the entry has no witness signature (the app counts such an entry as "not witnessed") |
-| 3 | `peer/export` | The node hands the delegation of an account over also when the measurement of the receiving node is not its own, if the list of allowed measurements that the grant of that account carries holds that value (the last item of protocol.md 10.1) |
+| 3 | `peer/export` | The node hands the delegation of an account over also when the measurement of the receiving node is neither its own nor that of an endorsed later release, if the list of allowed measurements that the grant of that account carries holds that value (the last item of protocol.md 10.1) |
 
 ## 11. Build and release
 
@@ -1062,6 +1089,18 @@ content of `out/measurements.json`) to the standard output, or the name of the h
 - The release tag is a build input: `build.sh` passes the git tag of the commit (`v*`, or `dev`
   for a commit without a tag) as `CREDENTIAL_ENCLAVE_RELEASE`, and the node program compiles that
   value in as a constant (the `release` of `binding`).
+- Three files of `enclave/release/` are build inputs: the node program compiles them in, so they
+  are part of the measurement (protocol.md 10.3). `release-key.pem` is the release key of the
+  operator and `rekor-key.pem` is the public key of the transparency log Rekor of
+  rekor.sigstore.dev, each an ECDSA P-256 public key as a SubjectPublicKeyInfo in PEM.
+  `predecessors.json` is the list of the releases whose nodes a node of this build takes
+  delegations from: `[{"release","pcr0","pcr1","pcr2"}]`, with the values of the
+  `measurements.json` of each of those releases. Every release of the list is earlier than the
+  release of the build. A build without a tag (`dev`) starts with the empty list only.
+- The endorsement of a release (protocol.md 10.3) is made outside this repository: the operator
+  signs the `measurements.json` of the release with the private half of the release key and
+  records the signature in the transparency log. This repository holds the public half only, and
+  no workflow of it creates an endorsement.
 - The identity of a release is PCR0, PCR1 and PCR2. The hash of the enclave image file is not the
   identity: the metadata section of the file holds the build time and is not measured.
 - The enclave image file is not signed (no PCR8, no certificate that expires).
@@ -1101,8 +1140,10 @@ place of every provider (`enclave/src/testing.rs`).
 | --- | --- | --- |
 | Formats | `protocol/tests/vectors.rs` | Every vector of `protocol/vectors.json` (protocol.md section 13), and that the committed file equals a fresh run of the generator |
 | Formats, per module | The unit tests of `protocol/src/` | Encodings, key derivation, the command envelope and its failure order, the record and its kinds, the log chain, the statements, TOTP, the failure codes |
+| Endorsement of a later release | The unit tests of `protocol/src/release.rs`, with `protocol/tests/fixtures/rekor-entry-150000000.json` | With keys the tests create: an endorsement that holds, and the refusal of another log identifier, of a signed entry timestamp over another body, time or index, of a body with a character outside the base64 alphabet, of a body with the hash of another statement, with another public key or with the signature of another key, of a statement with a missing or malformed value or of more than 16,384 bytes, of an entry time more than 300 seconds ahead, and of a release that is not later than the own release (the candidates `-rc.{n}` and an own release `dev` included). The form of a release tag and the order of releases. The signed entry timestamp of a real entry of Rekor verifies with the log key of the node program. The list of predecessors: a valid list, malformed elements, an element that is not earlier than the own release |
+| Keys and predecessors of the program | The unit tests of `enclave/src/lineage.rs` | The two keys of `enclave/release/` are ECDSA P-256 keys, the log key has the log identifier of Rekor, the list of the source is valid for the release of the crate version, and a node does not start with a malformed key or list |
 | Secret types | `protocol/src/secret.rs` | The `compile_fail` examples and the compile-time assertions of rule E1 (a secret cannot be serialized, formatted, dereferenced or compared, and the private keys of `NodeKeys` cannot be read), and that the `Debug` output of a secret never holds its bytes |
-| Attestation documents | The unit tests of `protocol/src/attestation.rs`, `enclave/src/attest.rs` and `enclave/src/platform/nitro.rs`, with the files of `protocol/tests/fixtures/` | The certificate chain and the signature of real Nitro attestation documents, the definite and the indefinite form of the payload, the refusal of another root, of a changed document, of other PCRs and of a debug-mode enclave |
+| Attestation documents | The unit tests of `protocol/src/attestation.rs`, `enclave/src/attest.rs` and `enclave/src/platform/nitro.rs`, with the files of `protocol/tests/fixtures/` | The certificate chain and the signature of real Nitro attestation documents, the definite and the indefinite form of the payload, the refusal of another root, of a changed document, of other PCRs and of a debug-mode enclave. A peer under the statement of a later release and a peer of a listed predecessor: accepted with the measurement and the release of the real document, refused with another release in the binding, with another PCR, with another log store, on the local platform, and as a debug-mode enclave |
 | Command processing | `enclave/src/tests/commands.rs` | The state transitions of sequences of grant and revoke: a challenge is used once and for 300 seconds, a command for another node or of another user, the range of the expiry, the custody of a grant, a revoke and an old envelope after it, a grant that was held back until after a revoke, replacement, an expired grant |
 | Records | `enclave/src/tests/records.rs` | A record of another account, of another key or of another custody does not open, and neither does a record with a changed field of its AAD. The kind of a record decides the fields that `release` hands out |
 | Log | `enclave/src/tests/log.rs` | The entry is on the chain before the provider is called (the provider stand-in looks at the head at the time of the call), merging, the limit of `unacked`, `ack`, the final heads of `close`, the times of the entries of a chain |
@@ -1110,7 +1151,7 @@ place of every provider (`enclave/src/testing.rs`).
 | Address check | The unit tests of `enclave/src/providers/mod.rs` | The refusals of section 7 (another host, a path outside the lists, a denied path in its spellings, dot segments, dot segments in front of a path parameter, encoded separators and separators that are encoded twice, a port, user information), and the validation of the definitions, including the rules for public fields |
 | OAuth | `enclave/src/tests/oauth.rs`, the unit tests of `enclave/src/oauth.rs` | Against the provider stand-in: exchange, refresh, the merge of a reconnect, the nested token place of slack and its `ok: false`, the public fields and the containment check, the closed vocabulary of `provider_error`, the kept response of a repeated refresh, a record of kind `oauth_imported` |
 | forward | `enclave/src/tests/forward.rs`, the unit tests of `enclave/src/provider_response.rs` and `enclave/src/egress.rs` | Header removal, the refusal of a header that overrides the method and of the batch address of Microsoft Graph, the injected credential, the entry of a GET request with a body, the whole path and the whole query in the entry of the longest address, redirects that are not followed, chunked responses, the body limit, the time limit, a response that reflects the credential (as it is, under percent escapes of up to three layers, in base64 and in hexadecimal) |
-| Delegation transfer | `enclave/src/tests/peer.rs` | The round trip of export and import between two nodes of the local platform, paging, the exclusion of expired grants and of accounts that revoked, a grant of another `sign_pk` is not replaced, the refusal of a changed envelope and of an envelope for another node, the entries `grant_transferred_out` and `grant_transferred_in`, a repeated export to the same peer without a new entry, the limit of 64 peers per grant |
+| Delegation transfer | `enclave/src/tests/peer.rs` | The round trip of export and import between two nodes of the local platform, paging, the exclusion of expired grants and of accounts that revoked, a grant of another `sign_pk` is not replaced, the refusal of a changed envelope and of an envelope for another node, the entries `grant_transferred_out` and `grant_transferred_in`, a repeated export to the same peer without a new entry, the limit of 64 peers per grant, an export with an endorsement that does not hold (it hands nothing over and leaves no entry, also for a peer the call without an endorsement accepts) |
 | Call surface | `enclave/src/tests/surface.rs` | `health`, the operator configuration, attestation and its challenge statement, the failure bodies, HTTP/1.1 over a real connection, and that the calls of the router are the calls of the table in section 4 of egress-policy.md |
 | Egress policy | `enclave/src/tests/canary.rs` | The canary test of egress-policy.md: every secret carries a distinct marker, the provider stand-in breaks its contract on purpose (reflected credentials, tokens in public fields, content and transfer codings, cookies, redirects), every call of the router is made in a success and in a failure, no marker appears in a response in any of the searched encodings, and a credential reaches only the addresses of its own provider. The one exception is the requested field of a successful `release`. Both nodes of the walk have a log store: no write to it carries a secret of the account, and of the credentials for it the session token reaches the log store alone and the secret access key no request |
 | Host program | The unit tests of `host/src/` | The relays, the allow list of the egress relay with the host of the log store, the operator configuration with the log store of the environment, the status surface and the shutdown call, against a stand-in for the node over in-memory pipes |

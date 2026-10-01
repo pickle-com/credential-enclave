@@ -57,7 +57,11 @@ operator domain (not trusted by the node)        node (AWS Nitro Enclave, memory
 
 A node writes nothing to disk. A node that restarts has new keys and no user keys. It takes the
 delegations from a living node of the same measurement and the same log store (`peer/export`,
-`peer/import`), or from the apps the next time they run.
+`peer/import`), or from the apps the next time they run. A node of a later release takes them
+from a living node of an earlier release with the same log store, when the earlier node verified
+that the operator's release key signed the measurements of the later release and that the public
+transparency log recorded the signature, and when the later release lists the earlier one as a
+predecessor.
 
 The log store is an Amazon S3 bucket with Object Lock. A node writes every log entry there
 itself, over TLS that ends inside the node, with a retention in compliance mode of 365 days, and
@@ -76,7 +80,7 @@ Each row holds for a node that runs this source inside a Nitro Enclave (see "How
 | Guarantee | The mechanism in the source | Where to read it |
 | --- | --- | --- |
 | A stored credential is a ciphertext under the user key | A record is encrypted with ChaCha20-Poly1305 under a key derived from the user key. Its AAD binds the record id, the account, the key, the custody, the kind and the provider. The node writes nothing to disk, and a credential leaves it for storage as a record only | [protocol.md](docs/protocol.md) section 6, `protocol/src/record.rs` |
-| The user key exists on the device of the account and in the memory of a node whose attestation the app verified, for at most 30 days per delegation. A node erases it when the delegation ends and when a revoke of the account reaches it, and a grant that was made before that revoke does not bring it back | The grant is sealed to the sealing key that the attestation document binds. A node shortens a grant to 30 days of its own clock, erases the user key when the grant ends or a revoke arrives, and hands user keys only to a node whose attestation it verified and whose measurement equals its own. A node refuses a grant whose challenge it issued before a revoke of that account: whoever carries a sealed grant cannot keep it and deliver it after the revoke | protocol.md sections 3, 5 and 10.1, `enclave/src/api/messages.rs`, `enclave/src/attest.rs` |
+| The user key exists on the device of the account and in the memory of a node whose attestation the app verified, for at most 30 days per delegation. A node erases it when the delegation ends and when a revoke of the account reaches it, and a grant that was made before that revoke does not bring it back | The grant is sealed to the sealing key that the attestation document binds. A node shortens a grant to 30 days of its own clock, erases the user key when the grant ends or a revoke arrives, and hands user keys only to a node whose attestation it verified and whose measurement is one of two: its own, or the measurement of a later release whose statement the operator's release key signed and the public transparency log recorded. Such a transfer is received only by a release that lists the giving release as a predecessor. A node refuses a grant whose challenge it issued before a revoke of that account: whoever carries a sealed grant cannot keep it and deliver it after the revoke | protocol.md sections 3, 5, 10.1 and 10.3, `enclave/src/api/messages.rs`, `enclave/src/attest.rs`, `protocol/src/release.rs` |
 | The OAuth token of a connection is issued to the node by the provider and used inside the node only. No call hands its plaintext out | The node creates the PKCE verifier and exchanges the authorization code itself, over TLS that ends inside it. `forward` puts the token into a request to an address of the compiled-in provider definitions. A secret is a type that cannot become a response, the functions that read a secret are a closed list, and `release` refuses a record that holds a token | [egress-policy.md](docs/egress-policy.md), `protocol/src/secret.rs`, `enclave/src/oauth.rs`, `egress/secret-access.tsv` |
 | A use of a credential has a log entry that only the account can read. The entry is created before the use, and for a new connection before its record leaves the node. Identical GET requests of one record within 300 seconds share one entry. A missing or changed entry in the storage of the operator shows in the app's verification of the chain | `forward`, `refresh`, `revoke-token`, `release`, the commands grant and revoke, and `peer/export` create their entry before the act: before the node calls the provider, hands the value out, changes the delegation or seals the user key to a peer. `oauth/complete` receives the token from the provider first and creates the entry `connection_created` before the record leaves the node: no part of an accepted token response leaves before that entry exists, and when a later step fails, the tokens are dropped inside the node and nothing leaves. `oauth/merge` calls no provider and creates no entry. An entry is sealed to the log key of the account, signed by the node, and chained per node and account. The node signs the end of each chain (the head), and the app verifies the stored entries against it | protocol.md section 7, `protocol/src/log.rs`, `enclave/src/state.rs` |
 | A use of a credential has an entry in the log store that nobody can delete for 365 days: not the operator, and not the root user of its AWS account. The entry is in the store before the use | A node writes each entry to its log store with `PUT`, over TLS that ends inside the node, with a retention in the compliance mode of S3 Object Lock until 365 days after the write. It calls the provider, hands the vault value out, hands the record of a new connection out, takes a user key or hands a grant to a peer only after the store answered that write with the status 200. It takes no other answer for a confirmation, also not the answer that an object of that key exists: the operator domain can write to the same bucket. The binding inside the attestation document names the bucket and its region, a node takes a log store once, and a node hands delegations only to a node of the same log store. A node inside an enclave refuses these acts while it has no log store or no credentials for it | protocol.md 7.6 and 4.1, enclave.md 5.14, `enclave/src/log_store.rs`, `enclave/src/tests/log_store.rs` |
@@ -90,7 +94,7 @@ every release has its log entry.
 
 ## What it does not guarantee
 
-The first eleven rows are the limits that section 5 of egress-policy.md states.
+The first twelve rows are the limits that section 5 of egress-policy.md states.
 
 | Limit | What it means |
 | --- | --- |
@@ -105,6 +109,9 @@ The first eleven rows are the limits that section 5 of egress-policy.md states.
 | The honesty of the app | The app holds the master key and verifies the attestation. The app is not open source yet. Until it is, "the app is honest" is an assumption: an app that is not the published one can leak the master key. Verifying the app is outside this repository |
 | Side channels | The size and the time of a response |
 | The log store | The guarantee of the log store rests on AWS: on S3 Object Lock in compliance mode, and on the AWS account of the operator, which holds the bucket. When that account is closed, the bucket goes with it. An object can be deleted when its retention ended, 365 days after the write. The operator domain carries the bytes between a node and the store and can stop them: the node then uses no credential (the calls end with `log_store_unavailable`), so stopping the store stops the service and hides no use. The store can hold more entries than there were acts: an entry whose act failed afterwards or never started is in the store like any other. The operator domain holds the credentials for the bucket and can add objects to it: an object is an entry of a node when its body verifies under the signing key of that node (protocol.md 7.6) |
+| The transfer to a later release | The operator can move the delegations of a node to a node of a later release: a release whose measurements it signs with its release key and publishes in the public transparency log (protocol.md 10.3). The later release is another program, and the user keys are then under the rules of its source. The notice period between the entry of the log and the transfer is zero: an account does not learn of a release before its delegation can move there. What stays is the record: every release that received delegations is permanently in the public log, with the hash of its measurements under the signature of the release key |
+| The transparency log | The honesty of the log rests on the operation of Sigstore Rekor. A node checks the signed entry timestamp of the log: the signature of the log key over the entry. It checks no inclusion proof and no checkpoint, so it does not show that the log kept the entry |
+| A change of the log key | A node holds one public key of the log, compiled into its program. When the log key changes, a node of an older release cannot check an endorsement made after the change and hands no delegation to the later release. The delegations of the later release then come from the apps |
 | Reading the log store | This repository holds the writer. That an account reads the store without passing through the operator domain, and compares it with what the operator domain stores, is the work of the app and is not shown by this source |
 | The log of a node that ended without its orderly shutdown | Such a node leaves no `final` head. The entries it wrote after the last point that the app verified cannot be checked against a head (protocol.md 7.4). The entries of its acts are in the log store: a node writes an entry there before the act. The witness signatures of stage 2 of the protocol are not implemented in this release |
 | What a credential fetches | The response of `forward` goes to the operator domain: the node protects the token, not the data that the token gives access to |
@@ -113,7 +120,8 @@ The first eleven rows are the limits that section 5 of egress-policy.md states.
 
 The guarantees rest on: the isolation and the attestation of AWS Nitro Enclaves, Object Lock of
 Amazon S3, the WebPKI roots compiled into the node binary, the algorithms of protocol.md section
-2, the API contract of each provider, and the honesty of the app.
+2, the API contract of each provider, the honesty of the app, the public transparency log
+(Sigstore Rekor), and the release key of the operator.
 
 ## How to verify
 
@@ -235,6 +243,8 @@ marker in every secret and searches every response for it.
 ```text
 protocol/    crate credential-enclave-protocol: the formats, the test vectors (vectors.json)
 enclave/     crate credential-enclave: the node program
+enclave/release/   compiled into the node program: the release key of the operator, the public
+             key of the transparency log, the list of predecessors (predecessors.json)
 host/        crate credential-enclave-host: the host program
 verify/      crate credential-enclave-verify: the verification tool
 egress/      the list of the functions that read a secret, the list of the callers of the sinks

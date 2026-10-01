@@ -23,7 +23,7 @@ The formats of this document are fixed for all stages. A stage is a part of the 
 | --- | --- |
 | 1 | Every item without a stage marker. The current release implements it |
 | 2 | Witness signatures (7.5, 10.2) |
-| 3 | The verification of release statements and of the public record by the app and by a node (section 9), the list of allowed measurements in a grant (4.5), the delegation transfer between releases (10.1) |
+| 3 | The verification of release statements and of the public record by the app and by a node (section 9), the list of allowed measurements in a grant (4.5), the delegation transfer to a release of that list (10.1) |
 | 4 | The sealed delivery of the authorization code (5.6) |
 
 An item marked stage 2, 3 or 4 is a field or a message that the current release does not use.
@@ -69,6 +69,7 @@ In the examples of this document, `v1.0.0` stands for the release tag of the nod
 | Record encryption | ChaCha20-Poly1305 (RFC 8439), a random nonce of 12 bytes | The output `ct` is the ciphertext followed by the 16-byte tag |
 | Chain | SHA-256 | |
 | TOTP | RFC 6238, HMAC-SHA1, 6 digits, 30 seconds | Only a node computes it |
+| Signature of a release statement, signed entry timestamp of the transparency log (10.3) | ECDSA P-256 with SHA-256, the signature in ASN.1 DER | Only a node verifies them. The two public keys are compiled into the node program |
 | Attestation | Per platform (section 4) | |
 
 The app performs every operation above with native functions of its binary, which call the
@@ -107,8 +108,9 @@ node                       = b64u(node signing public key)
   move to custody `enclave` open only under a key that was never handed to the operator.
 - Only a holder of the UK of a custody can create and open the records of that custody. The
   holders of a UK are the app (it derives the UK from MK), a node to which the app handed it with a
-  grant (until an expiry, in memory), and a node of the same measurement to which that node
-  transferred the delegation under the conditions of section 10. There is no other holder.
+  grant (until an expiry, in memory), and a node to which that node transferred the delegation
+  under the conditions of section 10: a node of the same measurement (10.1), or a node of a later
+  release (10.3). There is no other holder.
 - `key_id` is an 8-byte identifier for display and for early rejection. Where a binding is needed
   (statements, the comparison of a pending authorization with the grant, revocation), all 32 bytes
   of `sign_pk` are compared.
@@ -262,7 +264,7 @@ with the signing public key of that `binding` (4.2).
 
 | Stage | The app | A node (verification of a peer) |
 | --- | --- | --- |
-| 1, 2 | A constant list inside the signed program of the app (`[{release, pcr0, pcr1, pcr2}]`, each PCR as 96 lower-case hexadecimal characters). For every release of the enclave the list is changed and the program is signed again | Its own measurement, one element (it hands delegations to a node of the same release only) |
+| 1, 2 | A constant list inside the signed program of the app (`[{release, pcr0, pcr1, pcr2}]`, each PCR as 96 lower-case hexadecimal characters). For every release of the enclave the list is changed and the program is signed again | Its own measurement. A giving node also accepts the measurement of a later release whose endorsement it verified, and a receiving node also accepts the measurements of the list of predecessors inside its program (10.3) |
 | 3 | The app obtains it by verifying the release statements of the public record (section 9) | Its own measurement, and the list of allowed measurements that the grant of that account carries (the app verifies the release statements and writes the list into the grant) |
 
 ## 5. The commands an app sends to a node
@@ -752,7 +754,8 @@ response that is the empty string counts as absent (the old value stays).
 
 A node hands delegations to another node only after it verified that node by its attestation. The
 operator domain supplies the address of the peer and carries the messages (a node does not trust
-the carrier). The delegation transfer (10.1) is part of stage 1. Witnessing (10.2) is stage 2.
+the carrier). The delegation transfer (10.1) and the delegation transfer to a later release (10.3)
+are part of stage 1. Witnessing (10.2) is stage 2.
 
 ### 10.1 The delegation transfer
 
@@ -779,7 +782,7 @@ receiving node):
 | --- | --- | --- |
 | 1 | The node verifies the attestation response of the receiving node: platform `nitro` by 4.3 (without the nonce check), platform `local` by parsing `binding`. This gives the signing public key and the sealing public key of the receiving node | `peer_unverified` |
 | 2 | The platform of the receiving node is the platform of this node (nothing is handed to a node of another custody) | `peer_unverified` |
-| 3 | Platform `nitro`: PCR0, PCR1 and PCR2 of the receiving node all equal those of this node (delegations go to a node of the same release only. A PCR whose value is all zero is refused) | `peer_unverified` |
+| 3 | Platform `nitro`: PCR0, PCR1 and PCR2 of the receiving node all equal those of this node (without an endorsement, delegations go to a node of the same release only. A PCR whose value is all zero is refused). A call with an endorsement follows check 7 of 10.3 in the place of this step | `peer_unverified` |
 | 3a | The log store that the binding of the receiving node names is the log store of this node: the same bucket and the same region, or no `log` on both sides (delegations stay among nodes that write to the same log store) | `peer_unverified` |
 | 4 | The receiving node is not this node | `invalid_request` |
 | 4a | The node can write to its log store (7.6). A node of platform `local` without a log store passes | `log_store_unavailable` |
@@ -813,7 +816,7 @@ giving node and the envelope):
 
 | Step | Rule | Failure code |
 | --- | --- | --- |
-| 1 | The node verifies the attestation response of the giving node by the rules of steps 1 to 3a above | `peer_unverified` |
+| 1 | The node verifies the attestation response of the giving node by the rules of steps 1 to 3a above. In step 3 the measurement of the giving node is that of this node or that of a predecessor of this node (10.3) | `peer_unverified` |
 | 2 | The `to` of the envelope is the `node` of this node and its `from` is the giving node of step 1. The node opens the envelope with its sealing private key and verifies the signature with the signing public key of the giving node. `from` and `to` of the payload equal those of the envelope | `wrong_node`, `open_failed`, `bad_signature` |
 | 3 | For every grant: only a grant whose `custody` is the custody of the platform of this node and whose `not_after_ms > now` is looked at. A grant of an account whose revoke command this node accepted before is skipped (see below). When the account has no grant within its time, the node puts the grant into its memory and creates the log entry `grant_transferred_in`. When the account has a grant of the same `sign_pk` within its time, the larger `not_after_ms` stays (no entry). When the account has a grant of another `sign_pk`, the grant of the transfer is skipped | |
 
@@ -845,12 +848,14 @@ giving node and the envelope):
 - The app sends the revocation of a delegation to every living node: a node to which the app never
   handed a delegation can hold one that it took over. A node that accepted the revocation takes no
   transfer for that account (step 3 of the table above).
-- A transfer to a node of another release is stage 3: the app writes the list of the measurements
-  it verified against the public record into the grant (the device of the account decides which
-  releases may receive its key), and the giving node hands a delegation over when the measurement
-  of the receiving node is on the list of that account. In stages 1 and 2, a node of a new release
-  receives its delegations from the apps (the operator runs the nodes of the old release alongside
-  for that time).
+- A transfer to a node of a later release follows 10.3: the release key of the operator and the
+  public transparency log decide which release receives the delegations of a node.
+- A transfer to a node of another release under a rule of the account is stage 3: the app writes
+  the list of the measurements it verified against the public record into the grant (the device of
+  the account decides which releases may receive its key), and the giving node hands a delegation
+  over when the measurement of the receiving node is on the list of that account. In stages 1 and
+  2, a node of a new release that receives no delegation by 10.3 receives its delegations from the
+  apps (the operator runs the nodes of the old release alongside for that time).
 
 ### 10.2 Witnessing (stage 2)
 
@@ -863,6 +868,114 @@ response of the receiving node gave (it prevents a replay). The response is the 
 witness node accepts only a `seq` that is larger than the last `seq` it holds for that
 (node, account) pair.
 
+### 10.3 The delegation transfer to a later release
+
+Purpose: the delegations of the accounts stay when the operator replaces the nodes of one release
+with the nodes of a later release. A giving node hands delegations to a node of a later release
+when the release key of the operator signed the measurements of that release and the public
+transparency log Rekor (rekor.sigstore.dev) recorded that signature. A receiving node takes
+delegations from a node of a release that its own program lists as a predecessor. The payload, the
+envelope, the entries and the rules of the log store are those of 10.1. This section states which
+node of another release a node accepts.
+
+Three values are compiled into the node program, so they are part of its measurement:
+
+| Value | What it is |
+| --- | --- |
+| The release key | The public key of the operator whose signature over a release statement a giving node asks for: ECDSA P-256, as the DER of its SubjectPublicKeyInfo (91 bytes) |
+| The log key | The public key of the transparency log: ECDSA P-256, in the same form. The log identifier is the lower-case hexadecimal SHA-256 of that DER. For Rekor of rekor.sigstore.dev it is `c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d` |
+| The list of predecessors | `[{"release":"v1.1.0-rc.1","pcr0":"<96 hex>","pcr1":"<96 hex>","pcr2":"<96 hex>"}]`: the releases whose nodes a node of this program takes delegations from, each with its measurement |
+
+The release statement of this section is the exact bytes of the file `measurements.json` of the
+later release (enclave.md 11.1). It is not the in-toto statement of section 9. A node reads four
+keys of it: the string `release` and the strings `pcr0`, `pcr1` and `pcr2`. It does not read the
+other keys.
+
+The log entry: the operator signs the bytes of the statement with the release key (ECDSA P-256
+with SHA-256, the signature in ASN.1 DER) and records the signature in the log as an entry of the
+kind `hashedrekord`, version 0.0.1. The body of the entry is, after its standard base64 is
+decoded:
+
+```text
+{"apiVersion":"0.0.1","kind":"hashedrekord","spec":{
+   "data":{"hash":{"algorithm":"sha256","value":"<lower-case hex SHA-256 of the statement>"}},
+   "signature":{"content":"<standard base64 of the signature>",
+                "publicKey":{"content":"<standard base64 of the PEM of the release public key>"}}}}
+```
+
+The log returns the body with the time at which it took the entry, the index of the entry, its
+log identifier and the signed entry timestamp. The signed entry timestamp is the signature of the
+log key (ECDSA P-256 with SHA-256, ASN.1 DER) over the UTF-8 bytes of
+
+```text
+{"body":"<body>","integratedTime":<integrated_time>,"logID":"<log_id>","logIndex":<log_index>}
+```
+
+with the keys in this order, without white space, `<body>` as the standard base64 string the log
+returned, and the two integers in decimal.
+
+The endorsement is the value of the key `endorsement` of `peer/export`:
+
+```text
+endorsement = JSON {"statement": b64u(the bytes of the statement),
+                    "entry": {"body":"<standard base64, exactly as the log returned it>",
+                              "integrated_time":0,"log_index":0,
+                              "log_id":"<64 lower-case hexadecimal characters>",
+                              "signed_entry_timestamp":"<standard base64>"}}
+```
+
+The rules of the giving node (`peer/export` with `endorsement`). Every check must hold. The failure
+code of each of them is `peer_unverified`:
+
+| Check | Rule |
+| --- | --- |
+| 1 | The statement is at most 16,384 bytes long and is a JSON object whose `release` is a string and whose `pcr0`, `pcr1` and `pcr2` are 96 lower-case hexadecimal characters each. A statement that holds one of these four keys twice is refused |
+| 2 | `entry.log_id` equals the log identifier of the log key of the node |
+| 3 | `entry.body` consists only of the characters `A` to `Z`, `a` to `z`, `0` to `9`, `+`, `/` and `=`. `entry.signed_entry_timestamp`, decoded with standard base64, is a signature of the log key over the bytes above, built from `entry.body`, `entry.integrated_time`, the log identifier of check 2 and `entry.log_index` |
+| 4 | `entry.body`, decoded with standard base64, is a JSON object with `apiVersion` `"0.0.1"`, `kind` `"hashedrekord"` and `spec.data.hash.algorithm` `"sha256"`. Its `spec.data.hash.value` equals the lower-case hexadecimal SHA-256 of the statement. Its `spec.signature.publicKey.content`, decoded with standard base64 and then as PEM, gives DER bytes that equal the DER of the release key of the node. Its `spec.signature.content`, decoded with standard base64, is a signature of the release key over the bytes of the statement |
+| 5 | `entry.integrated_time` lies at most 300 seconds after the time of the node. The notice period is the age an entry must have before its statement counts: with a notice period above zero, `entry.integrated_time` plus the notice period is not after the time of the node, and the 300 seconds do not shorten the period. The notice period is 0 seconds |
+| 6 | The release of the statement is later than the release of the node, in the order below. A node whose own release is not a release tag (for example `dev`) accepts no endorsement |
+| 7 | The receiving node: its attestation response verifies by step 1 of 10.1 on platform `nitro`, and the platform of this node is `nitro` (a node of platform `local` accepts no endorsement). PCR0, PCR1 and PCR2 of its document equal those of the statement, not those of this node. No PCR is all zero. The `release` of its binding equals the `release` of the statement. Its binding names the log store of this node (step 3a of 10.1) |
+
+After check 7 the call continues with step 4 of 10.1. A call without `endorsement` follows 10.1.
+When `endorsement` is present, the checks above apply and step 3 of 10.1 does not: a node of the
+measurement of the giving node is not the node of the statement.
+
+The rule of the receiving node (`peer/import`): in step 1 of the receiving node of 10.1, the
+measurement of the giving node is accepted when PCR0, PCR1 and PCR2 equal those of this node, or
+when they equal those of one element of the list of predecessors and the `release` of the binding
+of the giving node equals the `release` of that element. The other steps are those of 10.1. A node
+reads the list once, when it starts. It does not start when the list is not a JSON array of such
+elements, when the `release` of an element is not a release tag or is not earlier than the release
+of the node, or when a PCR of an element is all zero. A node whose own release is not a release
+tag starts with the empty list only.
+
+The order of releases: a release tag is `v{major}.{minor}.{patch}` or
+`v{major}.{minor}.{patch}-rc.{n}`. Each number is decimal without a leading zero (a lone `0` is a
+number) and fits an unsigned 32-bit integer. Releases are ordered by major, then minor, then patch,
+each as a number. Of two releases with the same three numbers, the one with `-rc.{n}` is earlier
+than the one without, and of two with `-rc.{n}` the one with the smaller `n` is earlier. A text of
+any other form is not a release tag and has no place in the order.
+
+- A transfer between two releases goes from the earlier release to the later one. It takes place
+  when both programs agree: the giving node verified the endorsement of the later release, and the
+  program of the later release lists the giving release as a predecessor with the measurement of
+  the giving node.
+- A statement counts only with its entry in the public log. A release that received delegations
+  under this section has its statement hash, signed by the release key, in a log from which no
+  entry is removed.
+- The node verifies the signed entry timestamp: the statement of the log, signed with the log key,
+  that it took the entry at that time. The node does not verify an inclusion proof or a checkpoint
+  of the log. That the log holds every entry it signed a timestamp for rests on the operation of
+  Sigstore Rekor.
+- A node holds one log key. When the log signs its entries with another key, a node with the old
+  key verifies no endorsement made after that change and hands no delegation to a later release.
+  The nodes of the later release then receive their delegations from the apps (10.1).
+- An endorsement is a public value and has no end: a node of an earlier release accepts it for as
+  long as that node runs. The age of the entry is looked at in check 5 only.
+- The account sees the transfer on its chain as it sees every transfer: the entry
+  `grant_transferred_out` on the chain of the giving node names the receiving node (10.1).
+
 ## 11. All failure codes (node)
 
 | Code | Meaning |
@@ -870,7 +983,7 @@ witness node accepts only a `seq` that is larger than the last `seq` it holds fo
 | `invalid_request` | A violation of a form, a length or a required key. A call of a path that is not defined and a call with a method that is not allowed have this code too |
 | `unsupported_version` | `v` is not 1 (envelope, command, record) |
 | `wrong_node`, `open_failed`, `bad_signature`, `bad_challenge`, `bad_expiry`, `unsupported_policy`, `custody_mismatch` | Failures of command processing (5.3). `custody_mismatch` means that the `custody` of the grant is not the custody of the platform of that node |
-| `peer_unverified` | The attestation response of a peer does not verify, or its platform or its measurement is not that of this node (10.1) |
+| `peer_unverified` | The attestation response of a peer does not verify, or its platform, its measurement or its log store is not one this node accepts (10.1). The endorsement of a later release fails a check of 10.3 |
 | `user_mismatch` | The `user_id` of a command is not the account of the call (5.3). The `user_id` of a record is not the account of the call (section 6). The account of a pending authorization is not the account of the call |
 | `internal` | A failure of the platform (the attestation device, the random source). The call ends without changing anything |
 | `not_configured` | The operator configuration has not arrived yet |
@@ -903,6 +1016,9 @@ witness node accepts only a `seq` that is larger than the last `seq` it holds fo
 | Kept `refresh` responses per account | 16 (the most recent ones) |
 | Most accounts in one delegation transfer | 1,000 |
 | Most nodes that a node hands one grant to (10.1) | 64 |
+| Longest release statement (10.3) | 16,384 bytes |
+| Notice period of a release (10.3) | 0 seconds |
+| Longest time by which a log entry lies after the time of the node (10.3) | 300 seconds |
 | Most entries without a storage acknowledgement (per account) | 64 |
 | Retention of an object of the log store | 365 days from the node time of the write |
 | Body limit | 64 MiB (67,108,864 bytes) |
