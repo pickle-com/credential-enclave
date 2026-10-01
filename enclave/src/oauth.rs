@@ -9,8 +9,8 @@
 //! read a token.
 //!
 //! The kind of a record says where its token came from (rule E6 of the egress policy). A
-//! record of kind `oauth` holds a token this node, or a node of the same measurement, received
-//! from the token address itself. A record of kind `oauth_imported` holds a token the operator
+//! record of kind `oauth` holds a token this node, or another node that held the user key of
+//! the account, received from the token address itself. A record of kind `oauth_imported` holds a token the operator
 //! domain had before the device of the account encrypted it. The node keeps the two apart: a
 //! plaintext carries its kind from the record it was opened from to the record it is sealed
 //! into, a token response becomes kind `oauth` only, and `oauth/merge` takes kind `oauth`

@@ -1320,6 +1320,18 @@ mod tests {
         let mut endorsement = Endorsement::of("v1.2.0");
         endorsement.release_key.spki.push(0);
         assert_eq!(endorsement.result(), Err(EndorsementError::ReleaseKey));
+        // Also when the entry names the same bytes as its public key: the signature of the
+        // private key verifies under no key of that form.
+        endorsement.body = body_of(
+            &endorsement.statement,
+            &endorsement.release_key.pem(),
+            &endorsement.release_key.sign(&endorsement.statement),
+        );
+        endorsement.log_signs();
+        assert_eq!(
+            endorsement.result(),
+            Err(EndorsementError::ReleaseSignature)
+        );
         let mut endorsement = Endorsement::of("v1.2.0");
         endorsement.log_key.spki[26] = 0x02;
         endorsement.log_id = log_id(&endorsement.log_key.spki);
