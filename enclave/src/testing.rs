@@ -39,6 +39,7 @@ use crate::api;
 use crate::clock::Clock;
 use crate::egress::Egress;
 use crate::frame;
+use crate::lineage::{Lineage, LOG_KEY_PEM, RELEASE_KEY_PEM};
 use crate::platform::local::{kernel_random, local_document, system_time_ms};
 use crate::platform::{Listener, Measurement, Platform, PlatformError, Stream};
 use crate::providers::Definitions;
@@ -468,6 +469,9 @@ impl Forwarded {
     }
 }
 
+/// The release of a node under test. It is not a release tag (protocol.md 10.3).
+const RELEASE: &str = "v0.0.0-test";
+
 /// A node under test.
 pub struct Harness {
     pub node: Arc<Node>,
@@ -514,7 +518,10 @@ impl Harness {
                 clock,
                 definitions,
                 egress,
-                "v0.0.0-test",
+                RELEASE,
+                // The keys of the source. The release of the tests is not a release tag, so
+                // the node has no predecessor.
+                Lineage::read(RELEASE_KEY_PEM, LOG_KEY_PEM, b"[]", RELEASE).unwrap(),
                 limits,
             )
             .unwrap(),

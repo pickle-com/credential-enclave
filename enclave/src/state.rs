@@ -20,6 +20,7 @@ use crate::api::responses::Refreshed;
 use crate::api::ApiError;
 use crate::clock::Clock;
 use crate::egress::Egress;
+use crate::lineage::Lineage;
 use crate::log_store::LogStore;
 use crate::oauth::PkceVerifier;
 use crate::platform::{PlatformError, SharedPlatform};
@@ -507,6 +508,9 @@ pub struct Node {
     pub custody: Custody,
     /// The release tag compiled into the binary.
     pub release: &'static str,
+    /// The release key, the key of the transparency log and the predecessors of this
+    /// release (`crate::lineage`).
+    pub lineage: Lineage,
     pub started_ms: u64,
     pub closing: AtomicBool,
     pub config: RwLock<Option<Arc<OperatorConfig>>>,
@@ -547,6 +551,7 @@ impl Node {
         definitions: Definitions,
         egress: Egress,
         release: &'static str,
+        lineage: Lineage,
         limits: Limits,
     ) -> Result<Node, PlatformError> {
         // The signing seed is drawn first, then the sealing private key.
@@ -567,6 +572,7 @@ impl Node {
             keys,
             custody,
             release,
+            lineage,
             started_ms: clock.now_ms(),
             closing: AtomicBool::new(false),
             config: RwLock::new(None),

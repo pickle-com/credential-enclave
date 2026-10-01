@@ -1,5 +1,7 @@
-//! `POST /v1/peer/export` and `POST /v1/peer/import` (enclave.md 5.13, protocol.md 10.1): the
-//! delegations of a node move to another node of the same platform and measurement.
+//! `POST /v1/peer/export` and `POST /v1/peer/import` (enclave.md 5.13, protocol.md 10.1 and
+//! 10.3): the delegations of a node move to another node of the same platform and measurement,
+//! or to a node of a later release that the operator's release key signed and the public
+//! transparency log recorded.
 //!
 //! A node that restarts or is replaced starts without user keys. A node that is alive hands it
 //! the delegations it holds, so the accounts keep working without their apps. The operator
@@ -14,33 +16,75 @@
 //! binding names the log store it has itself (or none, when it has none). The giving node
 //! hands a grant over only after the log store confirmed the entry `grant_transferred_out` of
 //! that grant.
+//!
+//! A transfer between two releases goes one way, from the earlier release to the later one.
+//! The giving node asks for an endorsement of the later release (`endorsement` of
+//! `peer/export`). The receiving node takes delegations from the releases that its program
+//! lists as predecessors (`enclave/release/predecessors.json`).
 
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{Request, State};
 use axum::response::Response;
+use credential_enclave_protocol::encoding::b64u_decode;
 use credential_enclave_protocol::envelope::{TransferEnvelope, TransferGrant};
 use credential_enclave_protocol::keys::key_id;
+use credential_enclave_protocol::release::{verify_endorsement, LogEntry, ReleaseMeasurement};
 use credential_enclave_protocol::secret::Secret;
 use credential_enclave_protocol::{limits, ProtocolError};
 
 use super::responses::{Exported, Imported};
 use super::{invalid, json_ok, respond, ApiError, JsonBody};
-use crate::attest::{verify_peer, Peer};
+use crate::attest::{verify_peer, Accepted, Peer};
 use crate::log_store;
 use crate::state::{events, lock, Account, ActiveGrant, GrantState, Handover, Node};
 
-/// Steps 1 to 3 of protocol.md 10.1: the attestation response of the peer verifies, the peer
-/// runs on the platform of this node and, on nitro, has the measurement of this node, and
-/// its binding names the log store of this node.
-fn verified_peer(node: &Node, body: &JsonBody) -> Result<Peer, ApiError> {
+/// Steps 1 to 3a of protocol.md 10.1 under the rule `accepted`: the attestation response of
+/// the peer verifies, the peer runs on the platform of this node and, on nitro, has a
+/// measurement the rule names, and its binding names the log store of this node.
+fn verified_peer(node: &Node, body: &JsonBody, accepted: Accepted<'_>) -> Result<Peer, ApiError> {
     let response = body.object("peer")?;
     Ok(verify_peer(
         node.platform.name(),
-        node.platform.measurement().as_ref(),
+        accepted,
         node.log_store.id(),
         response,
     )?)
+}
+
+/// Checks 1 to 6 of the giving node (protocol.md 10.3): the release and the measurement that
+/// the statement of an endorsement states, when the release key of this program signed that
+/// statement, the transparency log of this program recorded the signature, and the release is
+/// later than the release of this node. Every failure is `peer_unverified`, also an
+/// endorsement that lacks a value or holds one of another type.
+fn endorsed_release(
+    node: &Node,
+    endorsement: &serde_json::Value,
+) -> Result<ReleaseMeasurement, ProtocolError> {
+    read_endorsed_release(node, endorsement).ok_or(ProtocolError::PeerUnverified)
+}
+
+fn read_endorsed_release(
+    node: &Node,
+    endorsement: &serde_json::Value,
+) -> Option<ReleaseMeasurement> {
+    let statement = b64u_decode(endorsement.get("statement")?.as_str()?).ok()?;
+    let entry = endorsement.get("entry")?;
+    let entry = LogEntry {
+        body: entry.get("body")?.as_str()?,
+        integrated_time: entry.get("integrated_time")?.as_u64()?,
+        log_index: entry.get("log_index")?.as_u64()?,
+        log_id: entry.get("log_id")?.as_str()?,
+        signed_entry_timestamp: entry.get("signed_entry_timestamp")?.as_str()?,
+    };
+    verify_endorsement(
+        &statement,
+        &entry,
+        &node.lineage.keys(),
+        node.release,
+        node.now_ms() / 1000,
+    )
+    .ok()
 }
 
 pub async fn export(State(node): State<Arc<Node>>, request: Request) -> Response {
@@ -70,6 +114,12 @@ pub async fn export(State(node): State<Arc<Node>>, request: Request) -> Response
 /// The call also works on a closing node: the orderly shutdown hands the delegations on before
 /// the node ends. An account whose `final` head was already signed is left out, because a
 /// final head promises that no entry follows it.
+///
+/// Without `endorsement` the peer is a node of the measurement of this node. With it, the peer
+/// is the node of a later release: the endorsement passes checks 1 to 6 of protocol.md 10.3,
+/// and the peer has the measurement and the release of its statement (check 7). The rule of
+/// the same measurement does not apply then. A node of the local platform accepts no peer
+/// under an endorsement.
 async fn run_export(node: &Node, request: Request) -> Result<Response, ApiError> {
     let body = JsonBody::read(request).await?;
     let after = body.text_or_empty("after")?;
@@ -82,8 +132,25 @@ async fn run_export(node: &Node, request: Request) -> Result<Response, ApiError>
             .min(limits::TRANSFER_GRANTS as u64),
     } as usize;
 
-    // 1 to 3
-    let peer = verified_peer(node, &body)?;
+    // 1 to 3a
+    let own = node.platform.measurement();
+    let peer = match body.get("endorsement") {
+        None => verified_peer(
+            node,
+            &body,
+            Accepted::Own {
+                measurement: own.as_ref(),
+                predecessors: &[],
+            },
+        )?,
+        Some(endorsement) => {
+            if !endorsement.is_object() {
+                return Err(invalid("endorsement"));
+            }
+            let later = endorsed_release(node, endorsement)?;
+            verified_peer(node, &body, Accepted::Later(&later))?
+        }
+    };
     // 4
     if peer.sign_public() == node.keys.sign_public() {
         return Err(ApiError::with_message(
@@ -253,13 +320,25 @@ pub async fn import(State(node): State<Arc<Node>>, request: Request) -> Response
 ///
 /// When the orderly shutdown starts while the call runs, it stops there and answers with what
 /// it took until then.
+///
+/// The peer is a node of the measurement of this node, or a node of a release that this
+/// program lists as a predecessor: its measurement is the measurement of an element of the
+/// list, and its binding names the release of that element (protocol.md 10.3).
 async fn run_import(node: &Node, request: Request) -> Result<Response, ApiError> {
     let body = JsonBody::read(request).await?;
     let envelope = body.object("envelope")?;
     node.ensure_open()?;
 
     // 1
-    let peer = verified_peer(node, &body)?;
+    let own = node.platform.measurement();
+    let peer = verified_peer(
+        node,
+        &body,
+        Accepted::Own {
+            measurement: own.as_ref(),
+            predecessors: &node.lineage.predecessors,
+        },
+    )?;
     // 2
     let envelope = TransferEnvelope::from_value(envelope)?;
     let transfer = peer.open_transfer(&node.keys, &envelope)?;

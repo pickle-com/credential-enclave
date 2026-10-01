@@ -958,3 +958,93 @@ async fn a_full_page_of_1000_grants_fits_one_import_call() {
     assert_eq!(imported["imported"], 5);
     assert_eq!(new.health().await["grants"], 1005);
 }
+
+/// The entry of the transparency log Rekor with the index 150,000,000, in the form of the
+/// `entry` of an endorsement. Its signed entry timestamp verifies with the log key of this
+/// program. It records the signature of another signer, not one of the release key.
+const REKOR_ENTRY: &str =
+    include_str!("../../../protocol/tests/fixtures/rekor-entry-150000000.json");
+
+#[tokio::test]
+async fn an_export_with_an_endorsement_hands_nothing_over_unless_the_endorsement_holds() {
+    let provider = quiet_provider().await;
+    let old = Harness::new(&provider);
+    let new = Harness::new(&provider);
+    let app = App::new("user-1", 1);
+    app.grant(&old).await;
+    let to = attestation(&new).await;
+
+    // An endorsement that is not a JSON object.
+    for endorsement in [json!("text"), json!([]), json!(1), json!(true)] {
+        let body = json!({"peer": to, "endorsement": endorsement});
+        assert_eq!(
+            code(&old.post("/v1/peer/export", body.clone()).await),
+            (400, "invalid_request"),
+            "{body}"
+        );
+    }
+
+    // An endorsement that does not hold. The peer is a node of the same program, which the
+    // call without an endorsement accepts: with an endorsement that rule does not apply.
+    let pcr = "ab".repeat(48);
+    let statement = b64u(
+        format!(r#"{{"release":"v9.0.0","pcr0":"{pcr}","pcr1":"{pcr}","pcr2":"{pcr}"}}"#)
+            .as_bytes(),
+    );
+    let entry: Value = serde_json::from_str(REKOR_ENTRY).unwrap();
+    let entry = json!({
+        "body": entry["body"],
+        "integrated_time": entry["integrated_time"],
+        "log_index": entry["log_index"],
+        "log_id": entry["log_id"],
+        "signed_entry_timestamp": entry["signed_entry_timestamp"],
+    });
+    let entry_with = |change: fn(&mut Value)| {
+        let mut entry = entry.clone();
+        change(&mut entry);
+        entry
+    };
+    for endorsement in [
+        json!({}),
+        json!({"statement": statement}),
+        json!({"entry": entry}),
+        json!({"statement": 1, "entry": entry}),
+        json!({"statement": "not base64url!", "entry": entry}),
+        json!({"statement": statement, "entry": "text"}),
+        json!({"statement": statement, "entry": entry_with(|entry| {
+            entry.as_object_mut().unwrap().remove("log_id");
+        })}),
+        json!({"statement": statement, "entry": entry_with(|entry| {
+            entry["integrated_time"] = json!("1732051154");
+        })}),
+        json!({"statement": statement, "entry": entry_with(|entry| {
+            entry["integrated_time"] = json!(-1);
+        })}),
+        json!({"statement": statement, "entry": entry_with(|entry| {
+            entry["log_index"] = json!(1.5);
+        })}),
+        json!({"statement": statement, "entry": entry_with(|entry| {
+            entry["body"] = json!(["text"]);
+        })}),
+        // A real entry of the log for a statement the release key did not sign, to a node
+        // of the local platform, from a node whose release is not a release tag.
+        json!({"statement": statement, "entry": entry}),
+    ] {
+        let body = json!({"peer": to, "endorsement": endorsement});
+        assert_eq!(
+            code(&old.post("/v1/peer/export", body.clone()).await),
+            (403, "peer_unverified"),
+            "{body}"
+        );
+    }
+    // No refused export left an entry.
+    assert_eq!(old.head_seq("user-1"), 1);
+
+    // `null` in the place of the endorsement is a call without one.
+    let (status, page) = old
+        .post("/v1/peer/export", json!({"peer": to, "endorsement": null}))
+        .await;
+    assert_eq!(status, 200, "{page}");
+    assert!(!page["envelope"].is_null());
+    assert_eq!(page["entries"].as_array().unwrap().len(), 1);
+}

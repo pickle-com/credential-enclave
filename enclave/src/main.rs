@@ -18,6 +18,7 @@ mod attest;
 mod clock;
 mod egress;
 mod frame;
+mod lineage;
 mod log_store;
 mod oauth;
 mod platform;
@@ -35,13 +36,15 @@ use std::sync::Arc;
 
 use clock::{Clock, CALIBRATION_INTERVAL};
 use egress::Egress;
+use lineage::Lineage;
 use platform::{PlatformError, SharedPlatform};
 use providers::Definitions;
 use state::{Limits, Node};
 
 /// The release tag of this build: the value of `CREDENTIAL_ENCLAVE_RELEASE` at compile time
 /// (the build passes the git tag), or `dev`. It is part of the binding that the attestation
-/// carries.
+/// carries, and it is the release that the order of releases compares with (protocol.md
+/// 10.3).
 const RELEASE: &str = match option_env!("CREDENTIAL_ENCLAVE_RELEASE") {
     Some(tag) if !tag.is_empty() => tag,
     _ => "dev",
@@ -98,6 +101,7 @@ async fn run(platform_name: &str) -> Result<(), PlatformError> {
         Definitions::embedded(),
         Egress::new(clock.clone()),
         RELEASE,
+        Lineage::embedded(RELEASE)?,
         Limits::default(),
     )?);
     let listener = platform.listen().await?;

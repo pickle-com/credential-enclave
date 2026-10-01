@@ -424,6 +424,7 @@ fn missing(key: &str) -> ApiError {
         "user_id" => "user_id is missing or invalid",
         "envelope" => "envelope is missing or invalid",
         "peer" => "peer is missing or invalid",
+        "endorsement" => "endorsement is missing or invalid",
         "after" => "after is missing or invalid",
         "nonce" => "nonce is missing or invalid",
         "record" => "record is missing or invalid",
