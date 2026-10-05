@@ -18,7 +18,7 @@ attest, and read here what a node does with a credential.
 An account is one user. The app is the iOS app of that account. The operator is the company that
 runs the service, and the operator domain is everything it runs outside a node: the backend, its
 storage, the host program, the network. A provider is a service whose credentials a node holds
-(Google, Microsoft, Slack, Notion, X, Link, Granola).
+(Google, Microsoft, Slack, Notion, X, Link, Granola, Mercury).
 
 ```text
 device of the account (the app)

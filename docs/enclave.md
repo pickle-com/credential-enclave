@@ -814,24 +814,24 @@ and `id_token_claims` are in 6.4, the rules for `api` in section 7.
 
 ### 6.2 The values of the definitions
 
-| | google_workspace | microsoft | slack | notion | x | link | granola |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| client | static | static | static | static | static | static | dynamic |
-| authorize url | `https://accounts.google.com/o/oauth2/v2/auth` | `https://login.microsoftonline.com/common/oauth2/v2.0/authorize` | `https://slack.com/oauth/v2/authorize` | `https://api.notion.com/v1/oauth/authorize` | `https://x.com/i/oauth2/authorize` | `https://login.link.com/auth` | `https://mcp-auth.granola.ai/oauth2/authorize` |
-| authorize fixed | None | None | None | `owner=user` | None | None | `resource=https://mcp.granola.ai/mcp` |
-| authorize allowed | `scope`, `access_type`, `prompt`, `include_granted_scopes`, `login_hint` | `scope`, `prompt`, `login_hint` | `user_scope` | None | `scope` | `scope` | `scope` |
-| key_param | None | None | None | None | None | `key` | None |
-| scope_param, delimiter | `scope`, space | `scope`, space | `user_scope`, `,` | None | `scope`, space | `scope`, space | `scope`, space |
-| pkce | S256 | S256 | none | none | S256 | S256 | S256 |
-| token url | `https://oauth2.googleapis.com/token` | `https://login.microsoftonline.com/common/oauth2/v2.0/token` | `https://slack.com/api/oauth.v2.access` | `https://api.notion.com/v1/oauth/token` | `https://api.x.com/2/oauth2/token` | `https://login.link.com/auth/token` | `https://mcp-auth.granola.ai/oauth2/token` |
-| token client_auth, body | body, form | body, form | body, form | basic, json | basic, form | body, form | none, form |
-| token headers | None | None | None | `Notion-Version: 2025-09-03` | None | None | None |
-| token bearer | None | None | None | None | None | `publishable_key` | None |
-| token fixed | None | None | None | None | None | None | `resource=https://mcp.granola.ai/mcp` |
-| ok_field | None | None | `ok` | None | None | None | None |
-| token_container | None | None | `authed_user` | None | None | None | None |
-| revoke | `https://oauth2.googleapis.com/revoke`, client_auth none | None | None | None | `https://api.x.com/2/oauth2/revoke`, client_auth basic | `https://login.link.com/auth/revoke`, client_auth body, bearer `publishable_key` | None |
-| inject paths | `access_token` | `access_token` | `authed_user.access_token`, `access_token` | `access_token` | `access_token` | `access_token` | `access_token` |
+| | google_workspace | microsoft | slack | notion | x | link | granola | mercury |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| client | static | static | static | static | static | static | dynamic | dynamic |
+| authorize url | `https://accounts.google.com/o/oauth2/v2/auth` | `https://login.microsoftonline.com/common/oauth2/v2.0/authorize` | `https://slack.com/oauth/v2/authorize` | `https://api.notion.com/v1/oauth/authorize` | `https://x.com/i/oauth2/authorize` | `https://login.link.com/auth` | `https://mcp-auth.granola.ai/oauth2/authorize` | `https://mcp.mercury.com/authorize` |
+| authorize fixed | None | None | None | `owner=user` | None | None | `resource=https://mcp.granola.ai/mcp` | `resource=https://mcp.mercury.com/mcp` |
+| authorize allowed | `scope`, `access_type`, `prompt`, `include_granted_scopes`, `login_hint` | `scope`, `prompt`, `login_hint` | `user_scope` | None | `scope` | `scope` | `scope` | `scope` |
+| key_param | None | None | None | None | None | `key` | None | None |
+| scope_param, delimiter | `scope`, space | `scope`, space | `user_scope`, `,` | None | `scope`, space | `scope`, space | `scope`, space | `scope`, space |
+| pkce | S256 | S256 | none | none | S256 | S256 | S256 | S256 |
+| token url | `https://oauth2.googleapis.com/token` | `https://login.microsoftonline.com/common/oauth2/v2.0/token` | `https://slack.com/api/oauth.v2.access` | `https://api.notion.com/v1/oauth/token` | `https://api.x.com/2/oauth2/token` | `https://login.link.com/auth/token` | `https://mcp-auth.granola.ai/oauth2/token` | `https://mcp.mercury.com/token` |
+| token client_auth, body | body, form | body, form | body, form | basic, json | basic, form | body, form | none, form | none, form |
+| token headers | None | None | None | `Notion-Version: 2025-09-03` | None | None | None | None |
+| token bearer | None | None | None | None | None | `publishable_key` | None | None |
+| token fixed | None | None | None | None | None | None | `resource=https://mcp.granola.ai/mcp` | `resource=https://mcp.mercury.com/mcp` |
+| ok_field | None | None | `ok` | None | None | None | None | None |
+| token_container | None | None | `authed_user` | None | None | None | None | None |
+| revoke | `https://oauth2.googleapis.com/revoke`, client_auth none | None | None | None | `https://api.x.com/2/oauth2/revoke`, client_auth basic | `https://login.link.com/auth/revoke`, client_auth body, bearer `publishable_key` | None | None |
+| inject paths | `access_token` | `access_token` | `authed_user.access_token`, `access_token` | `access_token` | `access_token` | `access_token` | `access_token` | `access_token` |
 
 Every definition injects the header `Authorization` with the prefix `Bearer `.
 
@@ -843,7 +843,7 @@ The public fields of the definitions (path: type, and the limit of a string in b
 | microsoft | `scope`: string 8192. `expires_in`: integer. `ext_expires_in`: integer. `token_type`: string 32 | `tid`: string 64. `oid`: string 64. `preferred_username`: string 320 |
 | slack | `team.id`: string 32. `team.name`: string 256. `enterprise.id`: string 32. `enterprise.name`: string 256. `app_id`: string 32. `is_enterprise_install`: boolean. `authed_user.id`: string 32. `authed_user.scope`: string 8192. `authed_user.expires_in`: integer. `authed_user.token_type`: string 32 | None |
 | notion | `workspace_id`: string 64. `workspace_name`: string 256. `workspace_icon`: string 2048. `bot_id`: string 64. `duplicated_template_id`: string 64. `owner.type`: string 32. `owner.user.id`: string 64. `owner.user.name`: string 256. `owner.user.avatar_url`: string 2048. `owner.user.type`: string 32. `owner.user.person.email`: string 320 | None |
-| x, link, granola | `scope`: string 8192. `expires_in`: integer. `token_type`: string 32 | None |
+| x, link, granola, mercury | `scope`: string 8192. `expires_in`: integer. `token_type`: string 32 | None |
 
 No definition has a list of allowed scopes (`scopes`): the consent page of the provider shows the
 requested scopes to the user, and the `api` list bounds the addresses that a token can reach.
@@ -921,6 +921,7 @@ value that the definition does not list does not leave the node.
 | x | `api.x.com` | Prefixes `/2/users`, `/2/tweets`, `/2/dm_events` |
 | link | `api.link.com` | Prefix `/spend_requests`. Exact `/userinfo`, `/payment-details`, `/shipping_addresses` |
 | granola | `mcp.granola.ai` | Exact `/mcp` |
+| mercury | `mcp.mercury.com` | Exact `/mcp` |
 
 The rules:
 
