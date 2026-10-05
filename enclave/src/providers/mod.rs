@@ -841,7 +841,7 @@ mod tests {
             .collect()
     }
 
-    const ROWS: [Row; 7] = [
+    const ROWS: [Row; 8] = [
         Row {
             name: "google_workspace",
             client: ClientKind::Static,
@@ -1052,6 +1052,29 @@ mod tests {
             public: COMMON,
             id_token_claims: &[],
         },
+        Row {
+            name: "mercury",
+            client: ClientKind::Dynamic,
+            authorize_url: "https://mcp.mercury.com/authorize",
+            authorize_fixed: &[("resource", "https://mcp.mercury.com/mcp")],
+            allowed: &["scope"],
+            key_param: "",
+            scope_param: "scope",
+            scope_delimiter: " ",
+            pkce: Pkce::S256,
+            token_url: "https://mcp.mercury.com/token",
+            client_auth: ClientAuth::None,
+            body: BodyFormat::Form,
+            token_headers: &[],
+            token_bearer: "",
+            token_fixed: &[("resource", "https://mcp.mercury.com/mcp")],
+            ok_field: "",
+            token_container: "",
+            revoke: None,
+            inject_paths: &["access_token"],
+            public: COMMON,
+            id_token_claims: &[],
+        },
     ];
 
     #[test]
@@ -1105,7 +1128,7 @@ mod tests {
     }
 
     /// The table of enclave.md section 7: provider, host, prefixes, exact paths.
-    const ADDRESSES: [(&str, &str, &[&str], &[&str]); 15] = [
+    const ADDRESSES: [(&str, &str, &[&str], &[&str]); 16] = [
         (
             "google_workspace",
             "gmail.googleapis.com",
@@ -1199,6 +1222,7 @@ mod tests {
             &["/userinfo", "/payment-details", "/shipping_addresses"],
         ),
         ("granola", "mcp.granola.ai", &[], &["/mcp"]),
+        ("mercury", "mcp.mercury.com", &[], &["/mcp"]),
     ];
 
     #[test]
@@ -1547,6 +1571,7 @@ mod tests {
             ("link", "https://api.link.com/spend_requests/lsrq_1"),
             ("link", "https://api.link.com/userinfo"),
             ("granola", "https://mcp.granola.ai/mcp"),
+            ("mercury", "https://mcp.mercury.com/mcp"),
         ];
         for (provider, address) in samples {
             for name in definitions.names() {
@@ -1567,6 +1592,9 @@ mod tests {
             ("link", "https://api.link.com/userinfo2"),
             ("granola", "https://mcp.granola.ai/mcp/other"),
             ("granola", "https://mcp-auth.granola.ai/oauth2/token"),
+            ("mercury", "https://mcp.mercury.com/mcp/other"),
+            ("mercury", "https://mcp.mercury.com/token"),
+            ("mercury", "https://mcp.mercury.com/register"),
             ("microsoft", "https://graph.microsoft.com/beta/me"),
             (
                 "microsoft",

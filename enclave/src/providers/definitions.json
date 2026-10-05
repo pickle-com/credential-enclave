@@ -173,5 +173,25 @@
     "api": [
       {"host": "mcp.granola.ai", "prefixes": [], "exact": ["/mcp"]}
     ]
+  },
+  "mercury": {
+    "client": "dynamic",
+    "authorize": {"url": "https://mcp.mercury.com/authorize", "fixed": [["resource", "https://mcp.mercury.com/mcp"]], "allowed": ["scope"], "key_param": ""},
+    "scope_param": "scope",
+    "scope_delimiter": " ",
+    "pkce": "S256",
+    "token": {"url": "https://mcp.mercury.com/token", "client_auth": "none", "body": "form", "headers": [], "bearer": "", "fixed": [["resource", "https://mcp.mercury.com/mcp"]], "ok_field": ""},
+    "token_container": "",
+    "revoke": null,
+    "inject": {"header": "Authorization", "prefix": "Bearer ", "paths": ["access_token"]},
+    "public": [
+      {"path": "scope", "type": "string", "max": 8192},
+      {"path": "expires_in", "type": "integer"},
+      {"path": "token_type", "type": "string", "max": 32}
+    ],
+    "id_token_claims": [],
+    "api": [
+      {"host": "mcp.mercury.com", "prefixes": [], "exact": ["/mcp"]}
+    ]
   }
 }

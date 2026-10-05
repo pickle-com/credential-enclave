@@ -335,7 +335,8 @@ mod tests {
                 "notion",
                 "x",
                 "link",
-                "granola"
+                "granola",
+                "mercury"
             ])
         );
         assert!(provider_names("[]").is_err());
@@ -409,6 +410,12 @@ mod tests {
                     "client_id": "",
                     "client_secret": "",
                     "redirect_uri": "https://api.example.test/api/integrations/granola/oauth/callback",
+                    "publishable_key": "",
+                },
+                "mercury": {
+                    "client_id": "",
+                    "client_secret": "",
+                    "redirect_uri": "https://api.example.test/api/integrations/mercury/oauth/callback",
                     "publishable_key": "",
                 },
             }
@@ -561,7 +568,7 @@ mod tests {
         assert_eq!(
             line,
             "operator configuration: client id set for google_workspace, link; \
-             not set for microsoft, slack, notion, x, granola"
+             not set for microsoft, slack, notion, x, granola, mercury"
         );
         assert_eq!(
             summary(&names(&["slack"]), &environment(&[])),
