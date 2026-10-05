@@ -1,6 +1,6 @@
 [package]
 name = "credential-enclave-protocol"
-version = "1.1.0"
+version = "1.2.0"
 description = "Key, message and storage formats of the credential enclave (protocol v1)"
 edition.workspace = true
 rust-version.workspace = true

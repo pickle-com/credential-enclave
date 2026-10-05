@@ -213,7 +213,7 @@ dependencies = [
 
 [[package]]
 name = "credential-enclave"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "aws-nitro-enclaves-nsm-api",
  "axum",
@@ -239,7 +239,7 @@ dependencies = [
 
 [[package]]
 name = "credential-enclave-host"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "http-body-util",
  "hyper",
@@ -252,7 +252,7 @@ dependencies = [
 
 [[package]]
 name = "credential-enclave-protocol"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "base64",
  "chacha20poly1305",
@@ -274,7 +274,7 @@ dependencies = [
 
 [[package]]
 name = "credential-enclave-verify"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "credential-enclave-protocol",
  "getrandom",

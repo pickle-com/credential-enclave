@@ -1,6 +1,6 @@
 [package]
 name = "credential-enclave-verify"
-version = "1.1.0"
+version = "1.2.0"
 description = "Verifies the attestation of the running nodes of the credential enclave against the measurements of a build"
 edition.workspace = true
 rust-version.workspace = true
