@@ -6,7 +6,8 @@
 //! closes. TLS ends inside the node: the relay sees ciphertext only.
 //!
 //! The relay connects to port 443 of the hosts the provider definitions name, to the host of
-//! the log store when the environment names one, and to nothing else. This list is a second
+//! the log store when the environment names one, and the two fixed Naver mail endpoints.
+//! This list is a second
 //! line: the node itself sends credentials only to the addresses of its definitions, which are
 //! part of the measured binary, and log entries only to its log store.
 
@@ -23,7 +24,7 @@ use crate::relay::{self, BoxFuture, Stream, VsockListener};
 
 /// The vsock port of the egress relay.
 pub const EGRESS_PORT: u32 = 8443;
-/// The only port the relay connects to.
+/// The port of the HTTP provider endpoints.
 pub const PROVIDER_PORT: u16 = 443;
 
 /// Longest DNS name.
@@ -118,10 +119,14 @@ impl Allowlist {
 
     /// True when the relay connects to `host:port`.
     pub fn allows(&self, host: &str, port: u16) -> bool {
-        port == PROVIDER_PORT && self.hosts.contains(host)
+        (port == PROVIDER_PORT && self.hosts.contains(host))
+            || matches!(
+                (host, port),
+                ("imap.naver.com", 993) | ("smtp.naver.com", 465)
+            )
     }
 
-    /// The number of hosts.
+    /// The number of HTTP hosts, excluding the two fixed mail endpoints.
     pub fn len(&self) -> usize {
         self.hosts.len()
     }

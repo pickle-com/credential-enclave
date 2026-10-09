@@ -84,7 +84,7 @@ impl TokenKind {
         match kind {
             Kind::Oauth => Some(TokenKind::Issued),
             Kind::OauthImported => Some(TokenKind::Imported),
-            Kind::VaultPassword | Kind::VaultTotp | Kind::VaultCard => None,
+            Kind::VaultPassword | Kind::VaultTotp | Kind::VaultCard | Kind::AppPassword => None,
         }
     }
 

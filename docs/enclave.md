@@ -1158,3 +1158,35 @@ place of every provider (`enclave/src/testing.rs`).
 | Host program | The unit tests of `host/src/` | The relays, the allow list of the egress relay with the host of the log store, the operator configuration with the log store of the environment, the status surface and the shutdown call, against a stand-in for the node over in-memory pipes |
 | Verification tool | The unit tests of `verify/src/`, `verify/tests/offline.rs`, with the files of `verify/tests/fixtures/` | The checks on a stored attestation document of a node of release v1.0.0 against the `measurements.json` of that release, the refusals, the report with the log store of a binding, and the exit status of the built tool |
 
+
+## Mail call surface
+
+GET /v1/health adds `mail_providers: ["naver_mail"]`. An absent field on an older release means
+no mail support. POST /v1/mail/verify, /v1/mail/read and /v1/mail/submit use the forward binary
+frame. Meta is `{user_id, record, context, request}`; only submit has payload bytes (ASCII SMTP
+MIME with CRLF). The response is the forward frame with `status`, `headers`, `entry` and body.
+
+Verify takes an empty request and returns JSON `{identity,node,statement}`. Read takes
+`action: folders|search|read`, optional `mailbox` (INBOX), `uid_validity`, `uid`, `before_uid`,
+`from`, `subject`, `since` (YYYY-MM-DD), and `limit` (1..50, default 20). Search returns
+`uid_validity`, messages with UID/size/base64 headers, and `next_uid`. Read requires UIDVALIDITY
+and UID and returns message/rfc822 bytes. A changed UIDVALIDITY returns frame status 409;
+a missing message 404; rejected authentication 401. Protocol/transport failures use fixed
+existing error codes. No provider transcript appears in a diagnostic.
+
+Submit takes `{recipients:[address,...]}` (1..50) and raw MIME as payload. Its From must equal
+the record account. It authenticates with SMTP, checks every recipient before DATA, dot-stuffs
+the payload, and returns JSON `{status:accepted|rejected,smtp_code}`. Accepted requires the
+final 250 after DATA. A dropped connection after DATA is provider_unreachable, not rejected.
+The backend owns the persistent submission intent and must never retry that unknown outcome.
+
+These calls require a configured log store. Both protocols have fixed destinations and TLS
+ends in the node. The parent egress relay additionally permits exactly those two host/port pairs.
+The mail module performs no persistent mailbox synchronization and stores no message body.
+
+Mail protocol input is bounded before the IMAP parser allocates response objects: verify,
+folder listing and search (including headers) accept at most 4 MiB of protocol input per
+connection. Reading one raw message allows the configured body limit plus 1 MiB for protocol
+overhead, while the returned message itself still has the body limit. A search whose UID set
+or headers exceeds this bound must be narrowed. Unknown IMAP login refusals remain provider
+failures; only AUTHENTICATIONFAILED classifies the application password as refused.

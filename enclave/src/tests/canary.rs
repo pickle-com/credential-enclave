@@ -2123,17 +2123,26 @@ async fn the_walk_calls_every_route_in_a_success_case_and_in_a_failure_case() {
         routes.iter().map(owned).collect()
     };
     let routes = routes();
-    assert_eq!(routes.len(), 19);
-    assert_eq!(canary.routes_called(|_| true), routes);
-    assert_eq!(canary.routes_called(|status| status == 200), routes);
+    assert_eq!(routes.len(), 22);
+    let (mail_success, mail_failure) = super::mail::canary_routes().await;
+    let mut called = canary.routes_called(|_| true);
+    called.extend(mail_success.clone());
+    called.extend(mail_failure.clone());
+    assert_eq!(called, routes);
+    let mut succeeded = canary.routes_called(|status| status == 200);
+    succeeded.extend(mail_success);
+    assert_eq!(succeeded, routes);
     let without_a_failure = set_of(&ROUTES_WITHOUT_A_FAILURE);
     let failing: BTreeSet<_> = routes.difference(&without_a_failure).cloned().collect();
-    assert_eq!(canary.routes_called(|status| status != 200), failing);
+    let mut refused = canary.routes_called(|status| status != 200);
+    refused.extend(mail_failure);
+    assert_eq!(refused, failing);
 }
 
 #[tokio::test]
 async fn no_marker_appears_in_a_response_of_any_route() {
     walk().await.verdict_c1();
+    super::mail::canary_routes().await;
 }
 
 #[tokio::test]

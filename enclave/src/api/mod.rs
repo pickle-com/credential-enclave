@@ -34,6 +34,7 @@ mod forward;
 mod health;
 mod log;
 mod log_store;
+mod mail;
 mod messages;
 mod oauth;
 mod peer;
@@ -75,6 +76,9 @@ fn routes() -> Vec<Route> {
         route(Method::POST, "/v1/refresh", refresh::refresh),
         route(Method::POST, "/v1/revoke-token", revoke::revoke_token),
         route(Method::POST, "/v1/forward", forward::forward),
+        route(Method::POST, "/v1/mail/verify", mail::verify),
+        route(Method::POST, "/v1/mail/read", mail::read),
+        route(Method::POST, "/v1/mail/submit", mail::submit),
         route(Method::POST, "/v1/release", release::release),
         route(Method::POST, "/v1/log/entries", log::entries),
         route(Method::POST, "/v1/log/ack", log::ack),

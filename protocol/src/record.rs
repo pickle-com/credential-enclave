@@ -43,6 +43,7 @@ pub enum UseMode {
 pub enum Kind {
     Oauth,
     OauthImported,
+    AppPassword,
     VaultPassword,
     VaultTotp,
     VaultCard,
@@ -50,9 +51,10 @@ pub enum Kind {
 
 impl Kind {
     /// Every kind.
-    pub const ALL: [Kind; 5] = [
+    pub const ALL: [Kind; 6] = [
         Kind::Oauth,
         Kind::OauthImported,
+        Kind::AppPassword,
         Kind::VaultPassword,
         Kind::VaultTotp,
         Kind::VaultCard,
@@ -63,6 +65,7 @@ impl Kind {
         match self {
             Kind::Oauth => "oauth",
             Kind::OauthImported => "oauth_imported",
+            Kind::AppPassword => "app_password",
             Kind::VaultPassword => "vault_password",
             Kind::VaultTotp => "vault_totp",
             Kind::VaultCard => "vault_card",
@@ -77,7 +80,9 @@ impl Kind {
     /// How a record of this kind is used.
     pub const fn use_mode(self) -> UseMode {
         match self {
-            Kind::Oauth | Kind::OauthImported | Kind::VaultTotp => UseMode::EnclaveUse,
+            Kind::Oauth | Kind::OauthImported | Kind::AppPassword | Kind::VaultTotp => {
+                UseMode::EnclaveUse
+            }
             Kind::VaultPassword | Kind::VaultCard => UseMode::Release,
         }
     }
@@ -478,6 +483,7 @@ mod tests {
         let table = [
             (Kind::Oauth, "oauth", UseMode::EnclaveUse),
             (Kind::OauthImported, "oauth_imported", UseMode::EnclaveUse),
+            (Kind::AppPassword, "app_password", UseMode::EnclaveUse),
             (Kind::VaultPassword, "vault_password", UseMode::Release),
             (Kind::VaultTotp, "vault_totp", UseMode::EnclaveUse),
             (Kind::VaultCard, "vault_card", UseMode::Release),

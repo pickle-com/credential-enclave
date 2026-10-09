@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Rule E2 of the egress policy (docs/egress-policy.md): the functions that read the bytes of a
-# secret are a closed list, and so are the functions that call one of the five sinks.
+# secret are a closed list, and so are the functions that call one of the seven sinks.
 #
 #   scripts/secret-access.sh           prints the two lists, as the source has them
 #   scripts/secret-access.sh --check   compares them with egress/secret-access.tsv and
@@ -43,7 +43,7 @@
 # egress/secret-access.tsv holds one line per function: file, function, uses, use, note. The
 # first three columns are what this script prints. `use` is one of:
 #
-#   K1 K2 K3 K4 K5   the function is that sink
+#   K1 K2 K3 K4 K5 K6 K7   the function is that sink
 #   in-node       the bytes are used inside the node: the result is a secret again, a public
 #                 key, a signature, a ciphertext, or the outcome of a check
 #   declassify    the result leaves in the clear and is one of the declassified values of
@@ -69,7 +69,9 @@ SINKS='K1 seal function
 K2 seal_transfer method
 K3 send_to_provider method
 K4 hand_out method
-K5 send_to_log_store method'
+K5 send_to_log_store method
+K6 imap method
+K7 smtp method'
 
 SINK_NAMES=$(printf '%s\n' "$SINKS" | cut -d ' ' -f 2 | paste -s -d '|' -)
 
@@ -290,7 +292,7 @@ case "${1:-}" in
         compare "$CALLER_LIST" 1-4 "$callers" "the functions that call a sink" || failed=1
         for use in $(grep -v '^#' "$ACCESS_LIST" | grep -v '^$' | cut -f 4 | LC_ALL=C sort -u); do
             case "$use" in
-                K1 | K2 | K3 | K4 | K5 | in-node | declassify) ;;
+                K1 | K2 | K3 | K4 | K5 | K6 | K7 | in-node | declassify) ;;
                 *)
                     fail "unknown use '$use' in $ACCESS_LIST"
                     failed=1

@@ -18,7 +18,7 @@ attest, and read here what a node does with a credential.
 An account is one user. The app is the iOS app of that account. The operator is the company that
 runs the service, and the operator domain is everything it runs outside a node: the backend, its
 storage, the host program, the network. A provider is a service whose credentials a node holds
-(Google, Microsoft, Slack, Notion, X, Link, Granola, Mercury).
+(Google, Microsoft, Slack, Notion, X, Link, Granola, Mercury, NAVER Mail).
 
 ```text
 device of the account (the app)
@@ -51,6 +51,7 @@ operator domain (not trusted by the node)        node (AWS Nitro Enclave, memory
 | User key | Derived from the master key | In memory, while a grant is in force | Never, for a node inside an enclave |
 | Node signing key, node sealing key | No | In memory, for the life of the process | Never |
 | OAuth token of a connection (record kind `oauth`) | Never | In memory, while a call uses it | Ciphertext only |
+| Mail application password (record kind `app_password`) | When the user enters it, encrypted on-device | In memory, while a fixed IMAP/SMTP call uses it | Ciphertext only |
 | Vault value (password, card number, CVC) | When the user enters it | In memory, while `release` runs | The ciphertext, and the value after `release` handed it out |
 | TOTP seed | When the user enters it | In memory, while `release` computes a code | Ciphertext only. `release` hands out the 6-digit code |
 | Log entry | Opens it with the log decryption key | Creates it, writes it to the log store before the act, keeps it until its storage is acknowledged | Stores it sealed. Cannot delete the copy in the log store for 365 days |
@@ -114,7 +115,7 @@ The first twelve rows are the limits that section 5 of egress-policy.md states.
 | A change of the log key | A node holds one public key of the log, compiled into its program. When the log key changes, a node of an older release cannot check an endorsement made after the change and hands no delegation to the later release. The delegations of the later release then come from the apps |
 | Reading the log store | This repository holds the writer. That an account reads the store without passing through the operator domain, and compares it with what the operator domain stores, is the work of the app and is not shown by this source |
 | The log of a node that ended without its orderly shutdown | Such a node leaves no `final` head. The entries it wrote after the last point that the app verified cannot be checked against a head (protocol.md 7.4). The entries of its acts are in the log store: a node writes an entry there before the act. The witness signatures of stage 2 of the protocol are not implemented in this release |
-| What a credential fetches | The response of `forward` goes to the operator domain: the node protects the token, not the data that the token gives access to |
+| What a credential fetches | The response of `forward` or a mail call goes to the operator domain: the node protects the token, not the data that the token gives access to |
 | Withdrawing a delegation | A revoke reaches a node through the operator domain. The app counts a delegation as withdrawn when every node that the operator domain lists as alive answered the revoke with its signed reply, and it shows a revoke without that reply as incomplete. The operator domain can leave a living node off that list: that node keeps the user key until its grant ends (at most 30 days). A use in that time is an entry on the chain of that node, and a node that is gone without a `final` head shows in the app as a part of the log that cannot be checked |
 | Availability | The operator can stop the service and delete what it stores in its own storage. A deleted or withheld log entry shows as a gap in the app's verification of the chain. It cannot delete an entry of the log store before the retention of that entry ended |
 
