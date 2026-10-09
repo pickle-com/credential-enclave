@@ -6,6 +6,7 @@ use std::{
     task::{Context, Poll},
 };
 
+use async_imap::imap_proto::{MailboxDatum, Response, Status};
 use async_imap::{Client, Session};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use credential_enclave_protocol::record::{Kind, Record};
@@ -226,14 +227,9 @@ impl AppPassword {
                     json!({"uid_validity": validity, "messages": [], "next_uid": null}),
                 ));
             }
-            let query = request.query(upper)?;
-            let mut uids: Vec<_> = session
-                .uid_search(query)
-                .await
-                .map_err(|_| MailError::Unavailable)?
-                .into_iter()
-                .collect();
+            let mut uids = search_uids(&mut session, request.query(upper)?).await?;
             uids.sort_unstable_by(|a, b| b.cmp(a));
+            uids.dedup();
             let more = uids.len() > request.limit;
             uids.truncate(request.limit);
             let next = if more { uids.last().copied() } else { None };
@@ -419,23 +415,83 @@ impl ReadMail {
         }
         Ok(())
     }
-    fn query(&self, upper: u32) -> Result<String, MailError> {
-        let mut query = format!("CHARSET UTF-8 UID 1:{upper}");
+    fn query(&self, upper: u32) -> Result<Vec<String>, MailError> {
+        let mut command = format!("UID SEARCH CHARSET UTF-8 UID 1:{upper}");
+        if let Some(since) = &self.since {
+            command.push_str(&format!(" SINCE {}", imap_date(since)?));
+        }
+        let mut pieces = Vec::new();
         for (name, value) in [("FROM", &self.from), ("SUBJECT", &self.subject)] {
             if let Some(value) = value {
                 if value.len() > 1024 || value.chars().any(char::is_control) {
                     return Err(MailError::Invalid);
                 }
-                query.push_str(&format!(
-                    " {name} \"{}\"",
-                    value.replace('\\', "\\\\").replace('"', "\\\"")
-                ));
+                // RFC 3501 4.3: quoted strings are 7-bit. UTF-8 uses a literal with
+                // a byte count, sent only after the server's continuation response.
+                command.push_str(&format!(" {name} {{{}}}", value.len()));
+                pieces.push(command);
+                command = value.clone();
             }
         }
-        if let Some(since) = &self.since {
-            query.push_str(&format!(" SINCE {}", imap_date(since)?));
+        pieces.push(command);
+        Ok(pieces)
+    }
+}
+
+async fn search_uids(
+    session: &mut Session<MailStream>,
+    pieces: Vec<String>,
+) -> Result<Vec<u32>, MailError> {
+    let mut pieces = pieces.into_iter();
+    let tag = session
+        .run_command(pieces.next().ok_or(MailError::Invalid)?)
+        .await
+        .map_err(|_| MailError::Unavailable)?;
+    for piece in pieces {
+        loop {
+            let response = session
+                .read_response()
+                .await
+                .map_err(|_| MailError::Unavailable)?
+                .ok_or(MailError::Unavailable)?;
+            match response.parsed() {
+                Response::Continue(_) => break,
+                Response::Done { .. }
+                | Response::Data {
+                    status: Status::Bye,
+                    ..
+                } => return Err(MailError::Unavailable),
+                _ => {}
+            }
         }
-        Ok(query)
+        session
+            .run_command_untagged(piece)
+            .await
+            .map_err(|_| MailError::Unavailable)?;
+    }
+    let mut uids = Vec::new();
+    loop {
+        let response = session
+            .read_response()
+            .await
+            .map_err(|_| MailError::Unavailable)?
+            .ok_or(MailError::Unavailable)?;
+        match response.parsed() {
+            Response::MailboxData(MailboxDatum::Search(values)) => {
+                uids.extend(values.iter().copied())
+            }
+            Response::Done {
+                tag: response_tag,
+                status: Status::Ok,
+                ..
+            } if *response_tag == tag => return Ok(uids),
+            Response::Done { .. }
+            | Response::Data {
+                status: Status::Bye,
+                ..
+            } => return Err(MailError::Unavailable),
+            _ => {}
+        }
     }
 }
 
@@ -569,7 +625,8 @@ impl Smtp {
     }
 }
 
-/// Caps total bytes read, including IMAP literals, before the protocol client buffers them.
+/// Caps bytes delivered to the protocol client. Its separate parser allocation is budgeted
+/// by the API because a declared literal can request a buffer before these bytes arrive.
 fn limited(stream: Stream, limit: usize) -> MailStream {
     let (read, write) = tokio::io::split(stream);
     MailStream(Box::new(tokio::io::join(read.take(limit as u64), write)))

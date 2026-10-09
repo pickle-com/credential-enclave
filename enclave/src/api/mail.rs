@@ -43,12 +43,20 @@ async fn run(node: &Node, request: Request, operation: &str) -> Result<Response,
         .acquire()
         .await
         .map_err(|_| ApiError::internal())?;
-    // The bound includes protocol buffers, MIME bytes and JSON/base64 construction.
+    // async-imap 0.12 caps its parser buffer at 512 MiB. It can reserve that from a
+    // literal declaration before the bounded stream reads the bytes, so account for it.
+    let parser_budget = if operation == "submit" {
+        0
+    } else {
+        512 * 1024 * 1024
+    };
+    // The bound also includes MIME bytes and JSON/base64 construction.
     // The same budget also admits HTTP forwarding; no separate unbounded mail pool exists.
     let reserve = node
         .limits
         .body_bytes
         .checked_mul(6)
+        .and_then(|v| v.checked_add(parser_budget))
         .and_then(|v| v.checked_add(META_LIMIT_BYTES * 2))
         .and_then(|v| u32::try_from(v).ok())
         .ok_or(ProtocolError::TooLarge)?;

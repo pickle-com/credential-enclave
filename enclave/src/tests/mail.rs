@@ -9,7 +9,7 @@ use hyper::body::Bytes;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{RootCertStore, ServerConfig};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
@@ -25,6 +25,7 @@ struct MailServer {
     roots: RootCertStore,
     passwords: Arc<Mutex<Vec<String>>>,
     submissions: Arc<Mutex<Vec<Vec<u8>>>>,
+    search_literals: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 impl MailServer {
@@ -61,6 +62,8 @@ impl MailServer {
         let address = listener.local_addr().unwrap();
         let passwords = Arc::new(Mutex::new(Vec::new()));
         let submissions = Arc::new(Mutex::new(Vec::new()));
+        let search_literals = Arc::new(Mutex::new(Vec::new()));
+        let literals = search_literals.clone();
         let captured = passwords.clone();
         let delivered = submissions.clone();
         tokio::spawn(async move {
@@ -71,6 +74,7 @@ impl MailServer {
                 let acceptor = acceptor.clone();
                 let captured = captured.clone();
                 let delivered = delivered.clone();
+                let literals = literals.clone();
                 tokio::spawn(async move {
                     let Ok(tls) = acceptor.accept(stream).await else {
                         return;
@@ -160,6 +164,24 @@ impl MailServer {
                             } else if command.starts_with("EXAMINE ") {
                                 reply.extend_from_slice(b"* 1 EXISTS\r\n* OK [UIDVALIDITY 42] valid\r\n* OK [UIDNEXT 8] next\r\n");
                             } else if command.starts_with("UID SEARCH") {
+                                assert!(command.is_ascii());
+                                let mut tail = command.to_string();
+                                while tail.ends_with('}') {
+                                    let count: usize = tail
+                                        .rsplit_once('{')
+                                        .unwrap()
+                                        .1
+                                        .trim_end_matches('}')
+                                        .parse()
+                                        .unwrap();
+                                    io.get_mut().write_all(b"+ send literal\r\n").await.unwrap();
+                                    let mut literal = vec![0; count];
+                                    io.read_exact(&mut literal).await.unwrap();
+                                    literals.lock().unwrap().push(literal);
+                                    tail.clear();
+                                    io.read_line(&mut tail).await.unwrap();
+                                    tail = tail.trim_end().to_string();
+                                }
                                 reply.extend_from_slice(b"* SEARCH 7\r\n");
                             } else if command.starts_with("UID FETCH") {
                                 let mut body = MESSAGE.to_vec();
@@ -201,6 +223,7 @@ impl MailServer {
             roots,
             passwords,
             submissions,
+            search_literals,
         }
     }
 
@@ -358,13 +381,17 @@ async fn search_and_read_preserve_mailbox_identity_and_mime() {
         &harness,
         &record,
         "read",
-        json!({"action":"search","subject":"회의","since":"2026-10-01","limit":1}),
+        json!({"action":"search","from":"friend@example.com","subject":"회의","since":"2026-10-01","limit":1}),
         b"",
     )
     .await;
     assert_eq!(meta["status"], 200);
     let page: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(page["uid_validity"], 42);
+    assert_eq!(
+        server.search_literals.lock().unwrap().as_slice(),
+        &[b"friend@example.com".to_vec(), "회의".as_bytes().to_vec()]
+    );
     assert_eq!(page["messages"][0]["uid"], 7);
     let (_, meta, body) = request(
         &harness,

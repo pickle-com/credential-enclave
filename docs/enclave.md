@@ -1184,9 +1184,14 @@ These calls require a configured log store. Both protocols have fixed destinatio
 ends in the node. The parent egress relay additionally permits exactly those two host/port pairs.
 The mail module performs no persistent mailbox synchronization and stores no message body.
 
-Mail protocol input is bounded before the IMAP parser allocates response objects: verify,
+Mail protocol input is bounded at the stream: verify,
 folder listing and search (including headers) accept at most 4 MiB of protocol input per
-connection. Reading one raw message allows the configured body limit plus 1 MiB for protocol
+connection. This is a byte-read bound; the API separately reserves the SDK parser maximum
+of 512 MiB because a server literal declaration can allocate ahead of the read. Reading one raw message allows the configured body limit plus 1 MiB for protocol
 overhead, while the returned message itself still has the body limit. A search whose UID set
 or headers exceeds this bound must be narrowed. Unknown IMAP login refusals remain provider
 failures; only AUTHENTICATIONFAILED classifies the application password as refused.
+
+FROM and SUBJECT search values use synchronizing UTF-8 literals with byte lengths, waiting
+for the server continuation before each literal (RFC 3501 sections 4.3 and 6.4.4). This avoids
+assuming that an IMAP server accepts non-ASCII quoted strings or supports LITERAL+.

@@ -430,6 +430,8 @@ pass the existing credential reflection check before the frame response. The pro
 assumption and the limits of E4 remain the same as for HTTP forwarding.
 
 All mail calls share the forward semaphore and body budget. A call reserves six body limits
-plus two metadata limits to cover protocol buffers, MIME and JSON/base64 copies, and has an
+plus two metadata limits to cover MIME and JSON/base64 copies. IMAP calls also reserve the
+512 MiB maximum parser buffer of async-imap 0.12, since a declared literal can allocate
+ahead of the bounded stream. Every call has an
 end-to-end 30 second deadline including admission. IMAP reads use EXAMINE and BODY.PEEK.
 SMTP performs one transaction; no transport failure triggers a second connection or submission.
