@@ -142,11 +142,12 @@ pub enum ProtocolError {
     TooLarge,
     LogBacklog,
     LogStoreUnavailable,
+    CapacityUnavailable,
 }
 
 impl ProtocolError {
     /// Every variant, in the order of protocol.md section 11.
-    pub const ALL: [ProtocolError; 30] = [
+    pub const ALL: [ProtocolError; 31] = [
         ProtocolError::InvalidRequest,
         ProtocolError::UnsupportedVersion,
         ProtocolError::WrongNode,
@@ -177,6 +178,7 @@ impl ProtocolError {
         ProtocolError::TooLarge,
         ProtocolError::LogBacklog,
         ProtocolError::LogStoreUnavailable,
+        ProtocolError::CapacityUnavailable,
     ];
 
     /// The code string of protocol.md section 11.
@@ -212,6 +214,7 @@ impl ProtocolError {
             ProtocolError::TooLarge => "too_large",
             ProtocolError::LogBacklog => "log_backlog",
             ProtocolError::LogStoreUnavailable => "log_store_unavailable",
+            ProtocolError::CapacityUnavailable => "capacity_unavailable",
         }
     }
 }
