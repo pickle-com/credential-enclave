@@ -1192,6 +1192,15 @@ overhead, while the returned message itself still has the body limit. A search w
 or headers exceeds this bound must be narrowed. Unknown IMAP login refusals remain provider
 failures; only AUTHENTICATIONFAILED classifies the application password as refused.
 
+Each mail call reserves six times the configured body limit plus two frame metadata limits;
+verify and read also reserve the 512 MiB parser bound. At the default 64 MiB body limit and
+1 MiB metadata limit, verify/read reserve 898 MiB each from the shared 2 GiB body budget.
+At most two can run concurrently when no other bodies occupy that budget. Two leave 252 MiB
+for HTTP forwarding and response bodies. The budget semaphore is FIFO: a third large mail
+reservation queued before a smaller HTTP reservation makes that HTTP call wait as well.
+The 30-second mail deadline includes this admission wait. The 64 forwarding slots are not a
+promise of 64 concurrent mail calls; capacity planning must include the body budget.
+
 FROM and SUBJECT search values use synchronizing UTF-8 literals with byte lengths, waiting
 for the server continuation before each literal (RFC 3501 sections 4.3 and 6.4.4). This avoids
 assuming that an IMAP server accepts non-ASCII quoted strings or supports LITERAL+.
