@@ -190,7 +190,9 @@ pub fn status_of(error: ProtocolError) -> StatusCode {
         ExchangeFailed | RefreshFailed | ProviderUnreachable | ResponseWithheld => {
             StatusCode::BAD_GATEWAY
         }
-        NotConfigured | Closing | LogStoreUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+        NotConfigured | Closing | LogStoreUnavailable | CapacityUnavailable => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
         Timeout => StatusCode::GATEWAY_TIMEOUT,
     }
 }
@@ -228,6 +230,7 @@ fn message_of(error: ProtocolError) -> &'static str {
         TooLarge => "a body is above the limit",
         LogBacklog => "too many log entries wait for a storage acknowledgement",
         LogStoreUnavailable => "the log store did not confirm the entry of this call",
+        CapacityUnavailable => "the call was not admitted; no provider request was sent",
     }
 }
 
@@ -535,7 +538,15 @@ mod tests {
                     "response_withheld",
                 ],
             ),
-            (503, &["not_configured", "closing", "log_store_unavailable"]),
+            (
+                503,
+                &[
+                    "not_configured",
+                    "closing",
+                    "log_store_unavailable",
+                    "capacity_unavailable",
+                ],
+            ),
             (504, &["timeout"]),
         ];
         let mut seen = 0;
