@@ -39,6 +39,23 @@ impl MailServer {
         imap_auth_reply: Option<&'static str>,
         smtp_recipient_reply: Option<&'static str>,
     ) -> Self {
+        Self::with_login_delay(
+            drop_after_data,
+            reflect_password,
+            imap_auth_reply,
+            smtp_recipient_reply,
+            std::time::Duration::ZERO,
+        )
+        .await
+    }
+
+    async fn with_login_delay(
+        drop_after_data: bool,
+        reflect_password: bool,
+        imap_auth_reply: Option<&'static str>,
+        smtp_recipient_reply: Option<&'static str>,
+        login_delay: std::time::Duration,
+    ) -> Self {
         let key = rcgen::KeyPair::generate().unwrap();
         let cert =
             rcgen::CertificateParams::new(vec!["imap.naver.com".into(), "smtp.naver.com".into()])
@@ -148,6 +165,7 @@ impl MailServer {
                             if command.starts_with("LOGIN ") {
                                 assert!(command.contains(PASSWORD));
                                 captured.lock().unwrap().push(PASSWORD.to_string());
+                                tokio::time::sleep(login_delay).await;
                                 if let Some(refusal) = imap_auth_reply {
                                     if io
                                         .get_mut()
@@ -444,5 +462,112 @@ async fn authentication_refusal_is_distinct_from_temporary_mail_failure() {
             "{meta}"
         );
         assert!(server.submissions.lock().unwrap().is_empty());
+    }
+}
+
+/// An opt-in timing experiment through the real router and TLS stand-ins. It records
+/// the effect of a queued mail request on an unrelated Google request without fixing
+/// that latency as an expected product behavior. No provider credential is used.
+#[tokio::test]
+#[ignore = "bounded mixed mail/HTTP admission experiment"]
+#[expect(
+    clippy::print_stdout,
+    reason = "The opt-in fixture probe emits timings, never credentials"
+)]
+async fn mixed_mail_and_google_admission_probe() {
+    use std::time::{Duration, Instant};
+
+    for cancel_queued_mail in [false, true] {
+        let server =
+            MailServer::with_login_delay(false, false, None, None, Duration::from_millis(800))
+                .await;
+        let (harness, app, record) = server.harness().await;
+        let harness = Arc::new(harness);
+        let google = app.record(
+            "oauth",
+            "google_workspace",
+            &json!({"token":{"access_token":"mixed-probe-token"},"obtained_ms":1}),
+        );
+        let google_meta = |field: &str| {
+            json!({
+                "user_id":app.user_id,"record":google,"method":"GET",
+                "url":format!("https://gmail.googleapis.com/gmail/v1/users/me/profile?fields={field}"),
+                "headers":[],"context":"cli:gog","timeout_ms":5000,
+            })
+        };
+        let start = Instant::now();
+        assert_eq!(
+            harness
+                .forward(google_meta("emailAddress"), b"")
+                .await
+                .unwrap()
+                .status,
+            200
+        );
+        let control_ms = start.elapsed().as_millis();
+        let spawn_mail = || {
+            let harness = harness.clone();
+            let record = record.clone();
+            tokio::spawn(async move {
+                request(&harness, &record, "read", json!({"action":"folders"}), b"").await
+            })
+        };
+        let first = spawn_mail();
+        let second = spawn_mail();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while server.passwords.lock().unwrap().len() < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("both admitted mail calls reached the TLS provider");
+        let queued = spawn_mail();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(server.passwords.lock().unwrap().len(), 2);
+        if cancel_queued_mail {
+            queued.abort();
+        }
+        let start = Instant::now();
+        let forwarded = harness
+            .forward(google_meta("messagesTotal"), b"")
+            .await
+            .unwrap();
+        let concurrent_ms = start.elapsed().as_millis();
+        assert_eq!(forwarded.status, 200);
+        for handle in [first, second] {
+            let (status, meta, _) = handle.await.unwrap();
+            assert_eq!((status, meta["status"].as_u64()), (200, Some(200)));
+        }
+        if cancel_queued_mail {
+            assert!(queued.await.unwrap_err().is_cancelled());
+        } else {
+            let (status, meta, _) = queued.await.unwrap();
+            assert_eq!((status, meta["status"].as_u64()), (200, Some(200)));
+        }
+        let start = Instant::now();
+        assert_eq!(
+            harness
+                .forward(google_meta("threadsTotal"), b"")
+                .await
+                .unwrap()
+                .status,
+            200
+        );
+        println!(
+            "{}",
+            json!({
+                "experiment":"mixed_mail_google_admission",
+                "provider":"local TLS stand-ins",
+                "imap_login_delay_ms":800,
+                "mail_calls_started":3,
+                "cancel_queued_mail":cancel_queued_mail,
+                "google_control_ms":control_ms,
+                "google_concurrent_ms":concurrent_ms,
+                "google_recovered_ms":start.elapsed().as_millis(),
+                "imap_logins_observed":server.passwords.lock().unwrap().len(),
+                "real_credentials":false,
+                "real_email_sent":false,
+            })
+        );
     }
 }
