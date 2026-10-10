@@ -38,7 +38,9 @@ pub fn open_record(
         (kind @ (Kind::VaultPassword | Kind::VaultTotp | Kind::VaultCard), plaintext) => {
             Ok(VaultRecord { kind, plaintext })
         }
-        (Kind::Oauth | Kind::OauthImported, _) => Err(ProtocolError::NotAllowed),
+        (Kind::Oauth | Kind::OauthImported | Kind::AppPassword, _) => {
+            Err(ProtocolError::NotAllowed)
+        }
     }
 }
 

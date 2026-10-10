@@ -437,6 +437,7 @@ caller, after the log entry of that release is on the chain.
 | --- | --- | --- | --- | --- |
 | `oauth` | The name of a provider (enclave.md section 6) | A node (`oauth/complete`: the node receives the token from the provider itself). `refresh` and `oauth/merge` write the record again | enclave-use: the token is used through `forward` only. No call hands the plaintext out | `{"token":{the token response of the provider, merged by the rules of section 8},"obtained_ms":n}`. A dynamically registered client (granola, mercury) also carries `"client_id"` |
 | `oauth_imported` | The name of a provider | The device of the account: the app encrypted a token that the operator domain held before it used a node. No call of a node creates a record of this kind | enclave-use: `forward`, `refresh` and `revoke-token` take the record by the same rules as kind `oauth`, and `refresh` writes the record again under the same kind. `oauth/merge` and `release` refuse it (`not_allowed`) | The form of kind `oauth` |
+| `app_password` | `naver_mail` | The app | enclave-use: mail calls only; no release | `{"username":"...","password":"..."}` |
 | `vault_password` | `vault` | The app | release: `release` hands the value out | `{"value":"..."}` |
 | `vault_totp` | `vault` | The app | enclave-use: the seed does not leave. `release` hands out only the code that the node computed | `{"value":"<base32 seed>"}` |
 | `vault_card` | `vault` | The app | release | `{"number":"...","cvc":"..."}` |
@@ -1051,3 +1052,18 @@ Of these, the tests of the app use `key_derivation`, `record`, `signed`, `log` a
 `attestation.local`. Opening a `command` and computing a `totp` code are the work of a node. The
 tests of the app open the envelopes that the app created themselves and check them.
 
+
+## Mail statements and records
+
+The mail record uses the same v1 record AAD and custody as every other credential record.
+The plaintext username is a Naver account id or naver.com address and password is the application
+password. Verification returns a statement signed with the `statement` purpose. Its body has
+`v=1`, `type=app_password_verified`, `node`, `user_id`, `provider=naver_mail`, `record_id`,
+`key_id`, the full `sign_pk`, `ciphertext_sha256` (base64url SHA-256 of the record.ct string's
+UTF-8 bytes), `identity` (canonical naver.com address) and `time_ms`. The app verifies the signer
+against its attested grant ledger and every binding against the record it created.
+
+`mail_request` is the encrypted log event for verification, reads and submission. It records
+`record_id`, `provider`, `operation`, typed `request`, `body_bytes`, `body_sha256` and `context`.
+The act starts only after the log store confirmed it. This is an attempted act, not a delivery
+receipt. Message content and application passwords are not in the event.

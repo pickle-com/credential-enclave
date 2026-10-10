@@ -276,6 +276,7 @@ impl Exchange {
 /// The TLS client of a node.
 pub struct Egress {
     connector: TlsConnector,
+    mail_connector: TlsConnector,
 }
 
 impl Egress {
@@ -301,9 +302,11 @@ impl Egress {
             .expect("the ring provider supports the default TLS versions")
             .with_root_certificates(roots)
             .with_no_client_auth();
+        let mail_connector = TlsConnector::from(Arc::new(config.clone()));
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
         Egress {
             connector: TlsConnector::from(Arc::new(config)),
+            mail_connector,
         }
     }
 
@@ -338,6 +341,32 @@ impl Egress {
             let _ = connection.await;
         });
         Ok(sender)
+    }
+
+    /// Fixed mail destinations. TLS and its trusted clock stay inside the node.
+    pub(crate) async fn open_mail(
+        &self,
+        platform: &dyn DynPlatform,
+        host: &str,
+        port: u16,
+    ) -> Result<crate::platform::Stream, EgressError> {
+        if !matches!(
+            (host, port),
+            ("imap.naver.com", 993) | ("smtp.naver.com", 465)
+        ) {
+            return Err(EgressError::Invalid);
+        }
+        let name = ServerName::try_from(host.to_string()).map_err(|_| EgressError::Invalid)?;
+        let stream = platform
+            .connect(host, port)
+            .await
+            .map_err(|_| EgressError::Unreachable)?;
+        let tls = self
+            .mail_connector
+            .connect(name, stream)
+            .await
+            .map_err(|_| EgressError::Unreachable)?;
+        Ok(Box::new(tls))
     }
 
     /// Connects to the provider, sends the request and returns the response head.

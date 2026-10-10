@@ -13,6 +13,7 @@ mod commands;
 mod forward;
 mod log;
 mod log_store;
+mod mail;
 mod oauth;
 mod peer;
 mod records;

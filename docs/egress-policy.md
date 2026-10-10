@@ -41,7 +41,7 @@ does not pass through the node.
 | The signing private key and the sealing private key of the node | Created inside the node at start |
 | A user key | The node opens the grant an app sealed to it, or the transfer a verified peer node sealed to it |
 | A record key | Derived from a user key |
-| The plaintext of a record: the token object of kind `oauth` and `oauth_imported`, a vault password, a TOTP seed, a card number, a CVC | The node opens a record |
+| The plaintext of a record: the token object of kind `oauth` and `oauth_imported`, an application password, a vault password, a TOTP seed, a card number, a CVC | The node opens a record |
 | The response of a token address, as a whole, accepted or refused | The node calls the token address of a provider |
 | A PKCE verifier | `oauth/begin` creates it |
 | The key material of an HPKE seal the node makes | The random source of the platform |
@@ -60,7 +60,7 @@ log store and is part of none, and neither appears in a response.
 | Channel | To | What |
 | --- | --- | --- |
 | C1 | The operator domain | The response of a call: status, headers, body |
-| C2 | A provider | A TLS connection that ends inside the node. Its destination is an address of the provider definitions. The operator domain sees TLS records only |
+| C2 | A provider | A TLS connection that ends inside the node. Its destination is an address of the provider definitions or one of the fixed Naver mail endpoints. The operator domain sees TLS records only |
 | C3 | The console | Exists in a debug-mode enclave only (its attestation has all-zero PCRs and an app refuses it). In any mode the node writes fixed strings of its source only |
 | C4 | The log store | A TLS connection that ends inside the node, to `{bucket}.s3.{region}.amazonaws.com` of the log store of the node. It carries log entries (class C below), the key of each (`user_id` E, the node identifier, `seq` and the chain hash P) and the credentials of the operator for the store. The operator domain sees TLS records only, and it can read the bucket |
 
@@ -120,7 +120,7 @@ functions that call it are of three kinds.
 
 | Kind | Meaning |
 | --- | --- |
-| A sink, K1 to K5 | The bytes leave the node, in the form the table below allows |
+| A sink, K1 to K7 | The bytes leave the node, in the form the table below allows |
 | In-node | The bytes are used inside the node. The result is a secret again, a public key, a signature, a ciphertext or the outcome of a check |
 | Declassify | The result leaves in the clear and is one of the values section 4 lists |
 
@@ -133,6 +133,8 @@ The five sinks:
 | K3 `Egress::send_to_provider` | Writes a request with a credential, a token request or a revocation request to a TLS connection | The request is addressed to a `Destination`, a type only the provider definitions create: an address that passed the address check of `forward`, the token address, or the revocation address. The certificate is verified against the WebPKI roots compiled into the binary. The node follows no redirect |
 | K4 `Selected::hand_out` | Puts one value of a vault record into the response of `release` | The record is of a vault kind and the field is one of that kind (E6). The function takes the log entry of the release as an argument: the entry is on the chain before the value leaves |
 | K5 `send_to_log_store` | Writes one log entry to the log store over a TLS connection, in a request signed with the credentials of the operator | What it takes is a signed entry (`Signed`: the body and the signature of the node, whose content is sealed to the log public key of the account), the parts of its key, and the credentials of the log store. No argument of it is a type that holds a user key, the plaintext of a record or a token: the secrets it reads are the two the operator domain gave. The destination is the log store of the operator configuration, a bucket name and a region name of a fixed form under `amazonaws.com`, and the certificate is verified against the WebPKI roots compiled into the binary |
+| K6 `AppPassword::imap` | Sends account name and application password through IMAP TLS | Only imap.naver.com:993, verified roots and trusted node clock; after grant and log-store confirmation |
+| K7 `AppPassword::smtp` | Sends account name and application password through SMTP TLS | Only smtp.naver.com:465 with the same verification and logging; one transaction, no retry after DATA |
 
 Fixed by: `scripts/secret-access.sh --check`, which the `check` and `release` workflows run.
 It lists every function of the node source that names `expose_secret` (for
@@ -264,6 +266,7 @@ and the tests of `enclave/src/oauth.rs`.
 | --- | --- | --- | --- |
 | `oauth` | The node: the response of the token address that `oauth/complete` received, and after that the results of `refresh` and `oauth/merge` | enclave-use | `forward`, `refresh`, `revoke-token`, `oauth/merge` |
 | `oauth_imported` | The device of the account: it encrypted a token the operator domain held before it used this node. The plaintext has the form of kind `oauth` | enclave-use. The operator domain knew this token once: the record does not say that its token never left a node. A new connection of the account gives a record of kind `oauth` | `forward`, `refresh`, `revoke-token` |
+| `app_password` | The device encrypts a NAVER application password and account name | enclave-use; authenticated identity is declassified after verification | `mail/verify`, `mail/read`, `mail/submit` |
 | `vault_password` | The device: the app encrypts what the user entered | release | `release`, field `password` |
 | `vault_totp` | The device | enclave-use: the seed stays, the code leaves as V | `release`, field `totp` |
 | `vault_card` | The device | release | `release`, fields `card_number`, `card_cvc` |
@@ -326,7 +329,7 @@ calls, and `egress/sink-callers.tsv` (the one caller of K1).
 
 | Call | The fields of a successful response and their classes |
 | --- | --- |
-| `GET /v1/health` | `node` P, `release` P, `platform` P, `custody` P, `started_ms` P, `time_ms` P, `configured` P, `closing` P, `accounts` P, `grants` P, `log_store` E and P (`bucket`, `region` and `credentials_expires_ms` E, `pending` P) |
+| `GET /v1/health` | `node` P, `release` P, `platform` P, `custody` P, `started_ms` P, `time_ms` P, `configured` P, `closing` P, `accounts` P, `grants` P, `mail_providers` P, `log_store` E and P (`bucket`, `region` and `credentials_expires_ms` E, `pending` P) |
 | `POST /v1/config` | `configured` P |
 | `POST /v1/attestation` | `v` P, `platform` P, `document` S (the platform signs the two public keys of the node, the release and the nonce of the caller), `node` P, `challenge` P, `release` P, `challenge_statement` S (its body: `type`, `node`, `challenge`, `time_ms` P, the nonce of the caller E) |
 | `POST /v1/messages` | `reply` S (its body: `type`, `ok`, `code`, `node`, `time_ms` P, `user_id`, `challenge`, `key_id`, `not_after_ms` D, `head` P), `entry` C, `grant` D |
@@ -337,6 +340,9 @@ calls, and `egress/sink-callers.tsv` (the one caller of K1).
 | `POST /v1/refresh` | `record` C, `public` R, P and D, `entry` C |
 | `POST /v1/revoke-token` | `revoked` R, `entry` C |
 | `POST /v1/forward` | `status` R, `headers` R, the body R, `entry` C |
+| `POST /v1/mail/verify` | `identity` D, `node` P, `statement` S (identity D, record bindings E/P), `entry` C, after E4 |
+| `POST /v1/mail/read` | `status` P, `headers` P, bounded provider mail data R, `entry` C, after E4 |
+| `POST /v1/mail/submit` | `status` P, `headers` P, submission status P, SMTP code R, `entry` C, after E4. A lost reply is not a rejection |
 | `POST /v1/release` | `value` V, `entry` C |
 | `POST /v1/log/entries` | `entries` C, `head` P |
 | `POST /v1/log/ack` | `unacked` P |
@@ -405,3 +411,27 @@ To read the source against this document: start with `protocol/src/secret.rs` (E
 `egress/secret-access.tsv` and the functions it names (E2), then
 `enclave/src/api/responses.rs` (E3), `enclave/src/oauth.rs` and
 `enclave/src/provider_response.rs` (E4, E5), and `enclave/src/vault.rs` (E6).
+
+## Mail credentials
+
+`app_password` of provider `naver_mail` is created on the device and is enclave-use only.
+`enclave/src/mail.rs` owns its plaintext. The authenticated account identity is declassified
+only after successful IMAP and SMTP authentication; verify binds it, the ciphertext digest,
+record id and account signing key in a node statement. OAuth forward/refresh and vault release
+refuse this kind. The three mail calls require a configured log store and confirm `mail_request`
+before authentication. The encrypted event holds the operation, request parameters and payload
+length/digest, never the application password or message body.
+
+The two mail authentication sinks are K6 (`AppPassword::imap`) and K7 (`AppPassword::smtp`).
+Both use `Egress::open_mail`, whose destination check admits only imap.naver.com:993 and
+smtp.naver.com:465. Certificate verification and the trusted clock stay inside the node.
+Protocol error text and authentication transcripts never become response bodies. Read results
+pass the existing credential reflection check before the frame response. The provider-contract
+assumption and the limits of E4 remain the same as for HTTP forwarding.
+
+All mail calls share the forward semaphore and body budget. A call reserves six body limits
+plus two metadata limits to cover MIME and JSON/base64 copies. IMAP calls also reserve the
+512 MiB maximum parser buffer of async-imap 0.12, since a declared literal can allocate
+ahead of the bounded stream. Every call has an
+end-to-end 30 second deadline including admission. IMAP reads use EXAMINE and BODY.PEEK.
+SMTP performs one transaction; no transport failure triggers a second connection or submission.

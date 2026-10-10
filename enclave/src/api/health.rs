@@ -27,6 +27,7 @@ pub async fn health(State(node): State<Arc<Node>>) -> Response {
         closing: node.closing.load(Ordering::SeqCst),
         accounts: node.account_count(),
         grants: node.grant_count(),
+        mail_providers: &["naver_mail"],
         log_store: node.log_store.id().map(|id| LogStoreState {
             bucket: id.bucket(),
             region: id.region(),

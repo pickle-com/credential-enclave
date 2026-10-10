@@ -33,7 +33,7 @@ async fn health_reports_the_node_in_the_key_order_of_5_1() {
                 "{{\"node\":\"{}\",\"release\":\"v0.0.0-test\",\"platform\":\"local\",",
                 "\"custody\":\"operator\",\"started_ms\":{},\"time_ms\":{},",
                 "\"configured\":false,\"closing\":false,\"accounts\":0,\"grants\":0,",
-                "\"log_store\":null}}"
+                "\"mail_providers\":[\"naver_mail\"],\"log_store\":null}}"
             ),
             harness.node.node, started_ms, time_ms
         )
@@ -343,6 +343,9 @@ async fn the_router_serves_the_calls_of_the_route_list_and_no_other() {
             "POST /v1/refresh",
             "POST /v1/revoke-token",
             "POST /v1/forward",
+            "POST /v1/mail/verify",
+            "POST /v1/mail/read",
+            "POST /v1/mail/submit",
             "POST /v1/release",
             "POST /v1/log/entries",
             "POST /v1/log/ack",

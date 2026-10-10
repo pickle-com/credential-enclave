@@ -141,8 +141,13 @@ impl Platform for TestPlatform {
 
     async fn connect(&self, host: &str, port: u16) -> Result<Stream, PlatformError> {
         lock(&self.connections).push((host.to_string(), port));
-        if port != 443 {
-            return Err(PlatformError("a provider connection goes to port 443"));
+        if port != 443
+            && !matches!(
+                (host, port),
+                ("imap.naver.com", 993) | ("smtp.naver.com", 465)
+            )
+        {
+            return Err(PlatformError("not a provider protocol destination"));
         }
         let address = lock(&self.routes)
             .get(host)
@@ -523,6 +528,33 @@ impl Harness {
                 // the node has no predecessor.
                 Lineage::read(RELEASE_KEY_PEM, LOG_KEY_PEM, b"[]", RELEASE).unwrap(),
                 limits,
+            )
+            .unwrap(),
+        );
+        Harness {
+            router: api::router(node.clone()),
+            node,
+            platform,
+        }
+    }
+
+    /// A node for non-HTTP protocol stand-ins, using the same local platform and router.
+    pub fn with_mail_roots(provider: &Provider, extra_roots: RootCertStore) -> Harness {
+        let platform = Arc::new(TestPlatform::default());
+        provider.route(&platform);
+        let clock = Arc::new(Clock::start(platform.as_ref()).unwrap());
+        let mut roots = provider.roots();
+        roots.roots.extend(extra_roots.roots);
+        let egress = Egress::with_test_roots(clock.clone(), roots);
+        let node = Arc::new(
+            Node::start(
+                platform.clone(),
+                clock,
+                Definitions::embedded(),
+                egress,
+                RELEASE,
+                Lineage::read(RELEASE_KEY_PEM, LOG_KEY_PEM, b"[]", RELEASE).unwrap(),
+                Limits::default(),
             )
             .unwrap(),
         );

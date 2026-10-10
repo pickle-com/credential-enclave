@@ -106,6 +106,8 @@ pub struct Health<'a> {
     pub accounts: usize,
     /// P: a count.
     pub grants: usize,
+    /// P: mail providers compiled into the measured program.
+    pub mail_providers: &'a [&'a str],
     /// E and P: the log store of the node, null when it has none.
     pub log_store: Option<LogStoreState<'a>>,
 }
