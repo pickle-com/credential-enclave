@@ -1003,6 +1003,7 @@ any other form is not a release tag and has no place in the order.
 | `too_large` | A body above the limit (64 MiB each for a request and a response) |
 | `log_backlog` | The entries of that account without a storage acknowledgement reached the limit (64) |
 | `log_store_unavailable` | The log store did not confirm the entry of the call, or the node cannot write to it: it has no log store in its configuration, or no credentials within their time (7.6). The act of the call did not take place. A repeated call can succeed |
+| `capacity_unavailable` | The mail call could not immediately reserve its slot or body budget. No credential was opened and no provider request was sent. A later call can succeed |
 
 ## 12. Constants
 

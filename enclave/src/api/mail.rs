@@ -37,12 +37,15 @@ async fn call(node: Arc<Node>, request: Request, operation: &'static str) -> Res
     )
 }
 
+fn admission_error(error: tokio::sync::TryAcquireError) -> ApiError {
+    match error {
+        tokio::sync::TryAcquireError::NoPermits => ProtocolError::CapacityUnavailable.into(),
+        tokio::sync::TryAcquireError::Closed => ApiError::internal(),
+    }
+}
+
 async fn run(node: &Node, request: Request, operation: &str) -> Result<Response, ApiError> {
-    let _slot = node
-        .forward_slots
-        .acquire()
-        .await
-        .map_err(|_| ApiError::internal())?;
+    let _slot = node.forward_slots.try_acquire().map_err(admission_error)?;
     // async-imap 0.12 caps its parser buffer at 512 MiB. It can reserve that from a
     // literal declaration before the bounded stream reads the bytes, so account for it.
     let parser_budget = if operation == "submit" {
@@ -63,9 +66,8 @@ async fn run(node: &Node, request: Request, operation: &str) -> Result<Response,
     let mut budget = node
         .body_budget
         .clone()
-        .acquire_many_owned(reserve)
-        .await
-        .map_err(|_| ApiError::internal())?;
+        .try_acquire_many_owned(reserve)
+        .map_err(admission_error)?;
     let frame_bytes =
         Bytes::from(read_body(request, 4 + META_LIMIT_BYTES + node.limits.body_bytes).await?);
     let (meta_value, payload) = frame::decode(&frame_bytes)?;

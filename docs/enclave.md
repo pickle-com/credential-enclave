@@ -264,7 +264,7 @@ struct Credentials { access_key_id: String, secret_access_key: Secret<String>, s
 | 429 | `log_backlog` |
 | 500 | `internal` |
 | 502 | `exchange_failed`, `refresh_failed`, `provider_unreachable`, `response_withheld` |
-| 503 | `not_configured`, `closing`, `log_store_unavailable` |
+| 503 | `not_configured`, `closing`, `log_store_unavailable`, `capacity_unavailable` |
 | 504 | `timeout` |
 
 A path that is not defined is 404, and a method that a path does not accept is 405. Both have the
@@ -1196,10 +1196,12 @@ Each mail call reserves six times the configured body limit plus two frame metad
 verify and read also reserve the 512 MiB parser bound. At the default 64 MiB body limit and
 1 MiB metadata limit, verify/read reserve 898 MiB each from the shared 2 GiB body budget.
 At most two can run concurrently when no other bodies occupy that budget. Two leave 252 MiB
-for HTTP forwarding and response bodies. The budget semaphore is FIFO: a third large mail
-reservation queued before a smaller HTTP reservation makes that HTTP call wait as well.
-The 30-second mail deadline includes this admission wait. The 64 forwarding slots are not a
-promise of 64 concurrent mail calls; capacity planning must include the body budget.
+for HTTP forwarding and response bodies. Mail takes both its forwarding slot and body
+reservation without waiting. Insufficient capacity returns HTTP 503 `capacity_unavailable`
+before reading the request body, opening a credential or calling the provider. No mail
+reservation enters the shared FIFO semaphore queue, so it cannot hold a smaller eligible
+HTTP call behind it. Admitted calls retain the 30-second deadline. The 64 forwarding slots
+are not a promise of 64 concurrent mail calls; capacity planning must include the body budget.
 
 FROM and SUBJECT search values use synchronizing UTF-8 literals with byte lengths, waiting
 for the server continuation before each literal (RFC 3501 sections 4.3 and 6.4.4). This avoids
