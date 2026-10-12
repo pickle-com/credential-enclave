@@ -205,6 +205,7 @@
     "revoke": null,
     "inject": [
       {"host": "api.github.com", "header": "Authorization", "prefix": "token ", "paths": ["access_token"]},
+      {"host": "uploads.github.com", "header": "Authorization", "prefix": "token ", "paths": ["access_token"]},
       {"host": "github.com", "header": "Authorization", "prefix": "", "basic_user": "x-access-token", "paths": ["access_token"]}
     ],
     "public": [
@@ -216,6 +217,7 @@
     "id_token_claims": [],
     "api": [
       {"host": "api.github.com", "prefixes": ["/user", "/users/", "/repos/", "/search/", "/orgs/", "/rate_limit"], "exact": ["/graphql"]},
+      {"host": "uploads.github.com", "prefixes": ["/repos/"], "exact": []},
       {"host": "github.com", "prefixes": [], "exact": [], "suffixes": ["/info/refs", "/git-upload-pack", "/git-receive-pack"]}
     ]
   }

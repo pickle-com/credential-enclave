@@ -718,6 +718,12 @@ impl Definition {
                 return fail("an invalid inject rule");
             }
         }
+        if let Some(position) = self.inject.iter().position(|rule| rule.host.is_empty()) {
+            // A rule without a host applies to every host: a rule after it would never be used.
+            if position + 1 != self.inject.len() {
+                return fail("an inject rule without a host that is not the last");
+            }
+        }
         if self
             .api
             .iter()
@@ -1227,6 +1233,13 @@ mod tests {
                     &["access_token"],
                 ),
                 (
+                    "uploads.github.com",
+                    "Authorization",
+                    "token ",
+                    "",
+                    &["access_token"],
+                ),
+                (
                     "github.com",
                     "Authorization",
                     "",
@@ -1305,7 +1318,7 @@ mod tests {
         &["/info/refs", "/git-upload-pack", "/git-receive-pack"],
     )];
 
-    const ADDRESSES: [(&str, &str, &[&str], &[&str]); 18] = [
+    const ADDRESSES: [(&str, &str, &[&str], &[&str]); 19] = [
         (
             "google_workspace",
             "gmail.googleapis.com",
@@ -1413,6 +1426,7 @@ mod tests {
             ],
             &["/graphql"],
         ),
+        ("github", "uploads.github.com", &["/repos/"], &[]),
         ("github", "github.com", &[], &[]),
     ];
 
@@ -1808,6 +1822,10 @@ mod tests {
                 "https://api.github.com/repos/pickle-com/interactive-character/pulls/1771",
             ),
             ("github", "https://api.github.com/graphql"),
+            (
+                "github",
+                "https://uploads.github.com/repos/pickle-com/interactive-character/releases/1/assets?name=a.zip",
+            ),
             ("github", "https://api.github.com/user/installations?per_page=100"),
             (
                 "github",
@@ -1845,6 +1863,7 @@ mod tests {
             ),
             ("github", "https://github.com/info/refs"),
             ("github", "https://api.github.com/gists"),
+            ("github", "https://uploads.github.com/user"),
             ("github", "https://api.github.com/graphql/more"),
             ("microsoft", "https://graph.microsoft.com/beta/me"),
             (
@@ -1931,6 +1950,20 @@ mod tests {
         let mut definition: serde_json::Value = serde_json::from_str(MINIMAL).unwrap();
         change(&mut definition);
         Definitions::parse(&serde_json::json!({"sample": definition}).to_string())
+    }
+
+    #[test]
+    fn an_inject_rule_without_a_host_is_alone_or_last() {
+        use serde_json::json;
+        let minimal: serde_json::Value = serde_json::from_str(MINIMAL).unwrap();
+        let host = minimal["api"][0]["host"].clone();
+        let every_host =
+            json!({"header": "Authorization", "prefix": "Bearer ", "paths": ["access_token"]});
+        let one_host = json!({"host": host, "header": "Authorization", "prefix": "token ", "paths": ["access_token"]});
+        assert!(with(|d| d["inject"] = json!([every_host.clone()])).is_ok());
+        assert!(with(|d| d["inject"] = json!([one_host.clone(), every_host.clone()])).is_ok());
+        // The rule for every host first: the rule after it would never be used.
+        assert!(with(|d| d["inject"] = json!([every_host.clone(), one_host.clone()])).is_err());
     }
 
     #[test]

@@ -836,9 +836,10 @@ The rules for `public` and `id_token_claims` are in 6.4, the rules for `api` in 
 | inject paths | `access_token` | `access_token` | `authed_user.access_token`, `access_token` | `access_token` | `access_token` | `access_token` | `access_token` | `access_token` | `access_token` (two rules: 6.1) |
 
 Every definition injects the header `Authorization`. The prefix is `Bearer ` everywhere but in
-github: there the rule of `api.github.com` has the prefix `token ` and the rule of `github.com`
-(the git smart HTTP addresses) is HTTP Basic with the user name `x-access-token` (a `Bearer` or
-`token` header is refused there by GitHub).
+github: there the rules of `api.github.com` and `uploads.github.com` have the prefix `token ` and
+the rule of `github.com` (the git smart HTTP addresses) is HTTP Basic with the user name
+`x-access-token` (a `Bearer` or `token` header is refused there by GitHub). A rule without a host
+applies to every host of the definition and must be the only rule or the last one.
 
 The public fields of the definitions (path: type, and the limit of a string in bytes):
 
@@ -866,6 +867,7 @@ The inject rules by host (6.1): every definition but github has one rule for eve
 | Provider | host | header | form |
 | --- | --- | --- | --- |
 | github | `api.github.com` | `Authorization` | `token {access_token}` |
+| github | `uploads.github.com` | `Authorization` | `token {access_token}` |
 | github | `github.com` | `Authorization` | `Basic base64(x-access-token:{access_token})` |
 
 ### 6.3 The call of the token address
@@ -936,6 +938,7 @@ value that the definition does not list does not leave the node.
 | granola | `mcp.granola.ai` | Exact `/mcp` |
 | mercury | `mcp.mercury.com` | Exact `/mcp` |
 | github | `api.github.com` | Prefixes `/user`, `/users/`, `/repos/`, `/search/`, `/orgs/`, `/rate_limit`. Exact `/graphql` |
+| | `uploads.github.com` | Prefix `/repos/` (the release asset uploads `/repos/{owner}/{repo}/releases/{id}/assets`) |
 | | `github.com` | Suffixes `/info/refs`, `/git-upload-pack`, `/git-receive-pack` (the git smart HTTP addresses `/{owner}/{repo}.git/info/refs`, `.../git-upload-pack`, `.../git-receive-pack`) |
 
 The rules:
