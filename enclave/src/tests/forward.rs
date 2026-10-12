@@ -149,6 +149,74 @@ async fn the_node_sets_the_credential_and_drops_the_headers_it_owns() {
 }
 
 #[tokio::test]
+async fn github_takes_basic_on_its_git_addresses_and_token_on_its_api() {
+    let provider = provider(|_| Reply::json(200, &json!({"ok": true}))).await;
+    let harness = Harness::configured(&provider).await;
+    let app = App::new("user-1", 1);
+    app.grant(&harness).await;
+    let record = app.record(
+        "oauth",
+        "github",
+        &json!({"token": {"access_token": "ghu_injected", "refresh_token": "ghr_1"}, "obtained_ms": 1}),
+    );
+    let git =
+        "https://github.com/pickle-com/interactive-character.git/info/refs?service=git-upload-pack";
+    harness
+        .forward(meta(&app, &record, "GET", git, json!([])), b"")
+        .await
+        .unwrap();
+    let api = "https://api.github.com/repos/pickle-com/interactive-character/pulls/1771";
+    harness
+        .forward(
+            meta(
+                &app,
+                &record,
+                "GET",
+                api,
+                json!([["Authorization", "token placeholder"]]),
+            ),
+            b"",
+        )
+        .await
+        .unwrap();
+    let seen = provider.seen();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].server_name, "github.com");
+    assert_eq!(
+        seen[0].target,
+        "/pickle-com/interactive-character.git/info/refs?service=git-upload-pack"
+    );
+    // base64("x-access-token:ghu_injected")
+    assert_eq!(
+        seen[0].header("authorization"),
+        Some("Basic eC1hY2Nlc3MtdG9rZW46Z2h1X2luamVjdGVk")
+    );
+    assert_eq!(seen[1].server_name, "api.github.com");
+    assert_eq!(seen[1].header("authorization"), Some("token ghu_injected"));
+    // The git address that pushes is reachable too, and the token address is not.
+    let push = "https://github.com/pickle-com/interactive-character/git-receive-pack";
+    assert!(harness
+        .forward(meta(&app, &record, "POST", push, json!([])), b"0000")
+        .await
+        .is_ok());
+    let (status, code) = failure(
+        harness
+            .forward(
+                meta(
+                    &app,
+                    &record,
+                    "POST",
+                    "https://github.com/login/oauth/access_token",
+                    json!([]),
+                ),
+                b"",
+            )
+            .await,
+    );
+    assert_eq!((status, code.as_str()), (403, "not_allowed"));
+}
+
+#[tokio::test]
 async fn every_method_of_the_list_is_sent_and_no_other() {
     let provider = quiet_provider().await;
     let (harness, app, record) = ready(&provider).await;

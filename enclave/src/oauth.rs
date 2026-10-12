@@ -45,7 +45,8 @@ use sha2::{Digest, Sha256};
 use crate::egress::{OutboundBody, OutboundHeader, OutboundRequest};
 use crate::provider_response::Forms;
 use crate::providers::{
-    BodyFormat, ClientAuth, Definition, Destination, FieldType, PublicField, Revoke, TOKEN_KEYS,
+    BodyFormat, ClientAuth, Definition, Destination, FieldType, Inject, PublicField, Revoke,
+    TOKEN_KEYS,
 };
 use crate::state::{open_for, GrantView, Node};
 
@@ -298,12 +299,19 @@ impl OauthPlaintext {
         }
     }
 
-    /// The credential `forward` injects: the token at the first path of the definition that
-    /// holds a non-empty string, and the header value made of the prefix and that token.
-    pub fn credential(&self, definition: &Definition) -> Option<Credential> {
-        let token = inject_token(definition, token_of(self.plaintext.expose_secret()))?;
+    /// The credential `forward` injects under one rule of the definition: the token at the first
+    /// path of the rule that holds a non-empty string, and the header value made of the prefix
+    /// and that token, or of HTTP Basic with the rule's user name and that token.
+    pub fn credential(&self, rule: &Inject) -> Option<Credential> {
+        let token = inject_token(rule, token_of(self.plaintext.expose_secret()))?;
+        let header = if rule.basic_user.is_empty() {
+            format!("{}{}", rule.prefix, token)
+        } else {
+            let pair = Secret::new(format!("{}:{token}", rule.basic_user));
+            format!("Basic {}", STANDARD.encode(pair.expose_secret().as_bytes()))
+        };
         Some(Credential {
-            header: Secret::new(format!("{}{}", definition.inject.prefix, token)),
+            header: Secret::new(header),
             token: Secret::new(token.to_string()),
         })
     }
@@ -775,7 +783,7 @@ impl ProviderError {
 
     /// The words a node hands on. The last one is a sentence with a space: the error text of
     /// the token address of Link.
-    pub const VOCABULARY: [&'static str; 38] = [
+    pub const VOCABULARY: [&'static str; 41] = [
         "invalid_request",
         "invalid_client",
         "invalid_grant",
@@ -813,6 +821,9 @@ impl ProviderError {
         "validation_error",
         "restricted_resource",
         "object_not_found",
+        "bad_refresh_token",
+        "bad_verification_code",
+        "incorrect_client_credentials",
         "refresh_token not found",
     ];
 
@@ -907,8 +918,8 @@ fn lookup<'a>(token: &'a Map<String, Value>, path: &str) -> Option<&'a Value> {
 
 /// The token `forward` injects for an `oauth` record: the non-empty string at the first of the
 /// paths of the definition.
-fn inject_token<'a>(definition: &Definition, token: &'a Map<String, Value>) -> Option<&'a str> {
-    definition.inject.paths.iter().find_map(|path| {
+fn inject_token<'a>(rule: &Inject, token: &'a Map<String, Value>) -> Option<&'a str> {
+    rule.paths.iter().find_map(|path| {
         lookup(token, path)
             .and_then(Value::as_str)
             .filter(|text| !text.is_empty())
@@ -1594,6 +1605,19 @@ pub mod tests {
         );
         assert_eq!(word(json!({"error": "", "code": "fallback"})), "other");
         assert_eq!(word(json!({"error": "invalid_grant "})), "other");
+        // The words of the token address of GitHub (a failure comes with status 200).
+        assert_eq!(
+            word(json!({"error": "bad_refresh_token"})),
+            "bad_refresh_token"
+        );
+        assert_eq!(
+            word(json!({"error": "bad_verification_code"})),
+            "bad_verification_code"
+        );
+        assert_eq!(
+            word(json!({"error": "incorrect_client_credentials"})),
+            "incorrect_client_credentials"
+        );
         assert_eq!(word(json!({"error": "INVALID_GRANT"})), "other");
         assert_eq!(
             word(json!({"error": "1//refresh-token-in-the-error-field"})),
@@ -1609,7 +1633,7 @@ pub mod tests {
             assert_eq!(word(json!({"error": listed})), listed);
             assert!(!listed.is_empty() && listed != "other");
         }
-        assert_eq!(ProviderError::VOCABULARY.len(), 38);
+        assert_eq!(ProviderError::VOCABULARY.len(), 41);
         assert_eq!(ProviderError::NONE.as_str(), "");
         assert_eq!(ProviderError::OTHER.as_str(), "other");
     }
@@ -1750,7 +1774,10 @@ pub mod tests {
         );
         assert_eq!(merged["team"], json!({"id": "T1", "name": "Team"}));
         let slack = definition("slack");
-        assert_eq!(inject_token(&slack, &merged), Some("xoxe.xoxp-new"));
+        assert_eq!(
+            inject_token(slack.inject_rule("slack.com").unwrap(), &merged),
+            Some("xoxe.xoxp-new")
+        );
         // A response that nests the tokens itself is merged into the same place, and a
         // response without expires_in removes the key from the container.
         let nested = object(
@@ -2052,33 +2079,42 @@ pub mod tests {
     fn the_injected_token_is_at_the_first_path_that_exists() {
         let slack = definition("slack");
         assert_eq!(
-            inject_token(&slack, &object(json!({"access_token": "xoxb"}))),
+            inject_token(
+                slack.inject_rule("slack.com").unwrap(),
+                &object(json!({"access_token": "xoxb"}))
+            ),
             Some("xoxb")
         );
         assert_eq!(
             inject_token(
-                &slack,
+                slack.inject_rule("slack.com").unwrap(),
                 &object(json!({"authed_user": {"access_token": "xoxp"}, "access_token": "xoxb"}))
             ),
             Some("xoxp")
         );
         assert_eq!(
-            inject_token(&slack, &object(json!({"authed_user": {"id": "U1"}}))),
+            inject_token(
+                slack.inject_rule("slack.com").unwrap(),
+                &object(json!({"authed_user": {"id": "U1"}}))
+            ),
             None
         );
         assert_eq!(
-            inject_token(&slack, &object(json!({"access_token": ""}))),
+            inject_token(
+                slack.inject_rule("slack.com").unwrap(),
+                &object(json!({"access_token": ""}))
+            ),
             None
         );
         // The credential is the token, and the header value is the prefix and the token.
         let (header, token) = issued(json!({"access_token": "xoxb-token"}))
-            .credential(&slack)
+            .credential(slack.inject_rule("slack.com").unwrap())
             .unwrap()
             .into_parts();
         assert_eq!(header.expose_secret(), "Bearer xoxb-token");
         assert_eq!(token.expose_secret(), "xoxb-token");
         assert!(issued(json!({"token_type": "Bearer"}))
-            .credential(&slack)
+            .credential(slack.inject_rule("slack.com").unwrap())
             .is_none());
     }
 

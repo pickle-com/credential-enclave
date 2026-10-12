@@ -100,13 +100,41 @@ pub struct Revoke {
     pub bearer: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+/// One rule of the credential header that `forward` sets. A definition has one rule, or one
+/// rule per host when the hosts of its `api` list take the token in different forms.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Inject {
+    /// The host this rule applies to. The empty string applies to every host of the definition.
+    #[serde(default)]
+    pub host: String,
     pub header: String,
+    /// The text in front of the token in the header value (`Bearer `, `token `). Empty when
+    /// `basic_user` is set.
     pub prefix: String,
+    /// When not empty, the header value is HTTP Basic: `Basic ` and the base64 of
+    /// `{basic_user}:{token}` (the git addresses of GitHub take the token only this way).
+    #[serde(default)]
+    pub basic_user: String,
     /// Dot-joined key paths into the token object. The first path that exists is used.
     pub paths: Vec<String>,
+}
+
+/// `inject` of a definition: one rule as an object, or a list of rules.
+fn one_or_many_rules<'de, D>(deserializer: D) -> Result<Vec<Inject>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(Inject),
+        Many(Vec<Inject>),
+    }
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(rule) => vec![rule],
+        OneOrMany::Many(rules) => rules,
+    })
 }
 
 /// The type of a public field.
@@ -145,6 +173,12 @@ pub struct ApiRule {
     pub host: String,
     pub prefixes: Vec<String>,
     pub exact: Vec<String>,
+    /// Path ends of this host that are allowed whatever comes before them: the git smart HTTP
+    /// addresses of GitHub (`/{owner}/{repo}.git/info/refs`, `.../git-upload-pack`,
+    /// `.../git-receive-pack`), whose front names a repository. A suffix starts with `/`, so it
+    /// matches at a segment boundary only.
+    #[serde(default)]
+    pub suffixes: Vec<String>,
     /// True when a path of this host may carry an encoded `/` (`%2F`, `%2f`). The host of
     /// such a rule takes a value with a `/` in it as one path segment.
     #[serde(default)]
@@ -156,9 +190,15 @@ pub struct ApiRule {
 }
 
 impl ApiRule {
-    /// True when `path` equals an exact path or lies under a prefix.
+    /// True when `path` equals an exact path, lies under a prefix, or ends with a suffix (with
+    /// at least one segment in front of it).
     pub fn allows(&self, path: &str) -> bool {
-        self.exact.iter().any(|exact| exact == path) || self.under_prefix(path)
+        self.exact.iter().any(|exact| exact == path)
+            || self.under_prefix(path)
+            || self
+                .suffixes
+                .iter()
+                .any(|suffix| path.len() > suffix.len() && path.ends_with(suffix.as_str()))
     }
 
     /// True when `path` lies under a prefix. A prefix that does not end with `/` matches at a
@@ -217,7 +257,9 @@ pub struct Definition {
     /// object of this name in a token response.
     pub token_container: String,
     pub revoke: Option<Revoke>,
-    pub inject: Inject,
+    /// The credential header rules: one for every host of `api`, or one for all.
+    #[serde(deserialize_with = "one_or_many_rules")]
+    pub inject: Vec<Inject>,
     /// The leaves of a token response that leave the node as public fields.
     pub public: Vec<PublicField>,
     /// The claims of the `id_token` that leave the node as public fields.
@@ -586,6 +628,14 @@ impl Definition {
             .any(|rule| rule.host == host && rule.allows(path))
     }
 
+    /// The credential header rule of a host: the first rule whose host is the empty string or
+    /// equals `host`. Every host of `api` has one (the validation of the definition).
+    pub fn inject_rule(&self, host: &str) -> Option<&Inject> {
+        self.inject
+            .iter()
+            .find(|rule| rule.host.is_empty() || rule.host == host)
+    }
+
     fn validate(&self, name: &str) -> Result<(), String> {
         let fail = |what: &str| Err(format!("{name}: {what}"));
         if !is_valid_name(name) {
@@ -654,8 +704,26 @@ impl Definition {
                 return fail("an invalid token header");
             }
         }
-        if !is_token(&self.inject.header) || self.inject.paths.is_empty() {
-            return fail("an invalid inject rule");
+        if self.inject.is_empty() {
+            return fail("no inject rule");
+        }
+        for rule in &self.inject {
+            if !is_token(&rule.header)
+                || rule.paths.is_empty()
+                || (!rule.basic_user.is_empty() && !rule.prefix.is_empty())
+                || (!rule.basic_user.is_empty()
+                    && (!is_token(&rule.basic_user) || rule.basic_user.contains(':')))
+                || (!rule.host.is_empty() && !self.api.iter().any(|api| api.host == rule.host))
+            {
+                return fail("an invalid inject rule");
+            }
+        }
+        if self
+            .api
+            .iter()
+            .any(|api| self.inject_rule(&api.host).is_none())
+        {
+            return fail("an api host without an inject rule");
         }
         // The public fields are leaves with a type and a limit (rule E4 of the egress policy).
         // A path that names a token, a path the node injects as a credential, a path listed
@@ -678,7 +746,10 @@ impl Definition {
                     || segments
                         .last()
                         .is_some_and(|last| TOKEN_KEYS.contains(last))
-                    || self.inject.paths.contains(&field.path)
+                    || self
+                        .inject
+                        .iter()
+                        .any(|rule| rule.paths.contains(&field.path))
                 {
                     return fail("an invalid public field");
                 }
@@ -698,10 +769,15 @@ impl Definition {
             if !is_host_name(&rule.host) || !hosts.insert(rule.host.as_str()) {
                 return fail("an invalid or repeated api host");
             }
-            if rule.prefixes.is_empty() && rule.exact.is_empty() {
+            if rule.prefixes.is_empty() && rule.exact.is_empty() && rule.suffixes.is_empty() {
                 return fail("an api host without paths");
             }
-            let paths = rule.prefixes.iter().chain(&rule.exact).chain(&rule.denied);
+            let paths = rule
+                .prefixes
+                .iter()
+                .chain(&rule.exact)
+                .chain(&rule.suffixes)
+                .chain(&rule.denied);
             for path in paths {
                 if !path.starts_with('/') || path.contains("//") || path.contains(['?', '#', '%']) {
                     return fail("an invalid api path");
@@ -802,13 +878,55 @@ mod tests {
         ok_field: &'static str,
         token_container: &'static str,
         revoke: Option<(&'static str, ClientAuth, &'static str)>,
-        inject_paths: &'static [&'static str],
+        inject: &'static [InjectRow],
         public: &'static [Leaf],
         id_token_claims: &'static [Leaf],
     }
 
     /// A public field of the table: its path, its type and its byte limit.
     type Leaf = (&'static str, FieldType, Option<usize>);
+
+    /// A credential header rule of the table: host, header, prefix, basic user, paths.
+    type InjectRow = (
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static [&'static str],
+    );
+
+    /// The one rule of every definition before github: `Authorization: Bearer {access_token}`
+    /// on every host.
+    const BEARER: &[InjectRow] = &[("", "Authorization", "Bearer ", "", &["access_token"])];
+
+    fn rules(inject: &[Inject]) -> Vec<(String, String, String, String, Vec<String>)> {
+        inject
+            .iter()
+            .map(|rule| {
+                (
+                    rule.host.clone(),
+                    rule.header.clone(),
+                    rule.prefix.clone(),
+                    rule.basic_user.clone(),
+                    rule.paths.clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn listed_rules(rows: &[InjectRow]) -> Vec<(String, String, String, String, Vec<String>)> {
+        rows.iter()
+            .map(|(host, header, prefix, basic_user, paths)| {
+                (
+                    host.to_string(),
+                    header.to_string(),
+                    prefix.to_string(),
+                    basic_user.to_string(),
+                    paths.iter().map(|path| path.to_string()).collect(),
+                )
+            })
+            .collect()
+    }
 
     const fn text(path: &'static str, max: usize) -> Leaf {
         (path, FieldType::String, Some(max))
@@ -841,7 +959,7 @@ mod tests {
             .collect()
     }
 
-    const ROWS: [Row; 8] = [
+    const ROWS: [Row; 9] = [
         Row {
             name: "google_workspace",
             client: ClientKind::Static,
@@ -867,7 +985,7 @@ mod tests {
             ok_field: "",
             token_container: "",
             revoke: Some(("https://oauth2.googleapis.com/revoke", ClientAuth::None, "")),
-            inject_paths: &["access_token"],
+            inject: BEARER,
             public: COMMON,
             id_token_claims: &[
                 text("sub", 255),
@@ -897,7 +1015,7 @@ mod tests {
             ok_field: "",
             token_container: "",
             revoke: None,
-            inject_paths: &["access_token"],
+            inject: BEARER,
             public: &[
                 text("scope", 8192),
                 integer("expires_in"),
@@ -929,7 +1047,13 @@ mod tests {
             ok_field: "ok",
             token_container: "authed_user",
             revoke: None,
-            inject_paths: &["authed_user.access_token", "access_token"],
+            inject: &[(
+                "",
+                "Authorization",
+                "Bearer ",
+                "",
+                &["authed_user.access_token", "access_token"],
+            )],
             public: &[
                 text("team.id", 32),
                 text("team.name", 256),
@@ -963,7 +1087,7 @@ mod tests {
             ok_field: "",
             token_container: "",
             revoke: None,
-            inject_paths: &["access_token"],
+            inject: BEARER,
             public: &[
                 text("workspace_id", 64),
                 text("workspace_name", 256),
@@ -998,7 +1122,7 @@ mod tests {
             ok_field: "",
             token_container: "",
             revoke: Some(("https://api.x.com/2/oauth2/revoke", ClientAuth::Basic, "")),
-            inject_paths: &["access_token"],
+            inject: BEARER,
             public: COMMON,
             id_token_claims: &[],
         },
@@ -1025,7 +1149,7 @@ mod tests {
                 ClientAuth::Body,
                 "publishable_key",
             )),
-            inject_paths: &["access_token"],
+            inject: BEARER,
             public: COMMON,
             id_token_claims: &[],
         },
@@ -1048,7 +1172,7 @@ mod tests {
             ok_field: "",
             token_container: "",
             revoke: None,
-            inject_paths: &["access_token"],
+            inject: BEARER,
             public: COMMON,
             id_token_claims: &[],
         },
@@ -1071,8 +1195,51 @@ mod tests {
             ok_field: "",
             token_container: "",
             revoke: None,
-            inject_paths: &["access_token"],
+            inject: BEARER,
             public: COMMON,
+            id_token_claims: &[],
+        },
+        Row {
+            name: "github",
+            client: ClientKind::Static,
+            authorize_url: "https://github.com/login/oauth/authorize",
+            authorize_fixed: &[],
+            allowed: &["prompt", "login"],
+            key_param: "",
+            scope_param: "",
+            scope_delimiter: "",
+            pkce: Pkce::S256,
+            token_url: "https://github.com/login/oauth/access_token",
+            client_auth: ClientAuth::Body,
+            body: BodyFormat::Form,
+            token_headers: &[("Accept", "application/json")],
+            token_bearer: "",
+            token_fixed: &[],
+            ok_field: "",
+            token_container: "",
+            revoke: None,
+            inject: &[
+                (
+                    "api.github.com",
+                    "Authorization",
+                    "token ",
+                    "",
+                    &["access_token"],
+                ),
+                (
+                    "github.com",
+                    "Authorization",
+                    "",
+                    "x-access-token",
+                    &["access_token"],
+                ),
+            ],
+            public: &[
+                text("scope", 8192),
+                integer("expires_in"),
+                integer("refresh_token_expires_in"),
+                text("token_type", 32),
+            ],
             id_token_claims: &[],
         },
     ];
@@ -1115,9 +1282,11 @@ mod tests {
                 )
             });
             assert_eq!(revoke, row.revoke, "{name}");
-            assert_eq!(definition.inject.header, "Authorization", "{name}");
-            assert_eq!(definition.inject.prefix, "Bearer ", "{name}");
-            assert_eq!(definition.inject.paths, row.inject_paths, "{name}");
+            assert_eq!(
+                rules(&definition.inject),
+                listed_rules(row.inject),
+                "{name}"
+            );
             assert_eq!(leaves(&definition.public), listed(row.public), "{name}");
             assert_eq!(
                 leaves(&definition.id_token_claims),
@@ -1128,7 +1297,15 @@ mod tests {
     }
 
     /// The table of enclave.md section 7: provider, host, prefixes, exact paths.
-    const ADDRESSES: [(&str, &str, &[&str], &[&str]); 16] = [
+    /// The path ends of enclave.md section 7: provider, host, suffixes. The one rule with a
+    /// list is that of the git addresses of GitHub.
+    const SUFFIXES: [(&str, &str, &[&str]); 1] = [(
+        "github",
+        "github.com",
+        &["/info/refs", "/git-upload-pack", "/git-receive-pack"],
+    )];
+
+    const ADDRESSES: [(&str, &str, &[&str], &[&str]); 18] = [
         (
             "google_workspace",
             "gmail.googleapis.com",
@@ -1223,6 +1400,20 @@ mod tests {
         ),
         ("granola", "mcp.granola.ai", &[], &["/mcp"]),
         ("mercury", "mcp.mercury.com", &[], &["/mcp"]),
+        (
+            "github",
+            "api.github.com",
+            &[
+                "/user",
+                "/users/",
+                "/repos/",
+                "/search/",
+                "/orgs/",
+                "/rate_limit",
+            ],
+            &["/graphql"],
+        ),
+        ("github", "github.com", &[], &[]),
     ];
 
     #[test]
@@ -1238,6 +1429,11 @@ mod tests {
                 .unwrap_or_else(|| panic!("{provider} {host}"));
             assert_eq!(rule.prefixes, *prefixes, "{provider} {host}");
             assert_eq!(rule.exact, *exact, "{provider} {host}");
+            let suffixes: &[&str] = SUFFIXES
+                .iter()
+                .find(|(name, suffix_host, _)| (*name, *suffix_host) == (*provider, *host))
+                .map_or(&[], |(_, _, suffixes)| suffixes);
+            assert_eq!(rule.suffixes, suffixes, "{provider} {host}");
             // One host takes an encoded `/` in a path: the values address of Google Sheets
             // carries a range, which may hold the `/` of a tab name, as one segment.
             assert_eq!(
@@ -1261,6 +1457,37 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn github_injects_basic_on_its_git_addresses_and_token_on_its_api() {
+        let github = embedded().get("github").unwrap().clone();
+        let api = github.inject_rule("api.github.com").unwrap();
+        assert_eq!(
+            (api.prefix.as_str(), api.basic_user.as_str()),
+            ("token ", "")
+        );
+        let git = github.inject_rule("github.com").unwrap();
+        assert_eq!(
+            (git.prefix.as_str(), git.basic_user.as_str()),
+            ("", "x-access-token")
+        );
+        assert!(github.inject_rule("example.com").is_none());
+        // A definition with one rule applies it to every host.
+        let google = google();
+        assert_eq!(google.inject.len(), 1);
+        assert!(google.inject_rule("gmail.googleapis.com").is_some());
+        // A suffix matches at a segment boundary with a repository in front of it only.
+        let rule = github
+            .api
+            .iter()
+            .find(|rule| rule.host == "github.com")
+            .unwrap();
+        assert!(rule.allows("/o/r.git/info/refs"));
+        assert!(rule.allows("/o/r/git-upload-pack"));
+        assert!(!rule.allows("/info/refs"));
+        assert!(!rule.allows("/o/r/xgit-upload-pack"));
+        assert!(!rule.allows("/o/r/git-upload-pack/"));
     }
 
     #[test]
@@ -1381,12 +1608,16 @@ mod tests {
                 if (name, rule.host.as_str()) == ("google_workspace", "sheets.googleapis.com") {
                     continue;
                 }
-                let path = rule
-                    .prefixes
-                    .first()
-                    .or(rule.exact.first())
-                    .unwrap()
-                    .trim_end_matches('/');
+                let path = match (
+                    rule.prefixes.first(),
+                    rule.exact.first(),
+                    rule.suffixes.first(),
+                ) {
+                    (Some(prefix), _, _) => prefix.trim_end_matches('/').to_string(),
+                    (None, Some(exact), _) => exact.clone(),
+                    (None, None, Some(suffix)) => format!("/o/r{suffix}"),
+                    (None, None, None) => unreachable!("a rule has a path"),
+                };
                 let address = format!("https://{}{path}/a%2Fb", rule.host);
                 assert_eq!(
                     definition.check_address(&address),
@@ -1572,6 +1803,17 @@ mod tests {
             ("link", "https://api.link.com/userinfo"),
             ("granola", "https://mcp.granola.ai/mcp"),
             ("mercury", "https://mcp.mercury.com/mcp"),
+            (
+                "github",
+                "https://api.github.com/repos/pickle-com/interactive-character/pulls/1771",
+            ),
+            ("github", "https://api.github.com/graphql"),
+            ("github", "https://api.github.com/user/installations?per_page=100"),
+            (
+                "github",
+                "https://github.com/pickle-com/interactive-character.git/info/refs?service=git-upload-pack",
+            ),
+            ("github", "https://github.com/pickle-com/interactive-character/git-receive-pack"),
         ];
         for (provider, address) in samples {
             for name in definitions.names() {
@@ -1595,6 +1837,15 @@ mod tests {
             ("mercury", "https://mcp.mercury.com/mcp/other"),
             ("mercury", "https://mcp.mercury.com/token"),
             ("mercury", "https://mcp.mercury.com/register"),
+            ("github", "https://github.com/login/oauth/access_token"),
+            ("github", "https://github.com/login/oauth/authorize"),
+            (
+                "github",
+                "https://github.com/pickle-com/interactive-character/releases/download/v1/a",
+            ),
+            ("github", "https://github.com/info/refs"),
+            ("github", "https://api.github.com/gists"),
+            ("github", "https://api.github.com/graphql/more"),
             ("microsoft", "https://graph.microsoft.com/beta/me"),
             (
                 "microsoft",

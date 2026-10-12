@@ -249,6 +249,7 @@ definition tests of `enclave/src/providers/mod.rs`, and the canary test.
   rate_limit_exceeded
   unauthorized internal_server_error rate_limited validation_error restricted_resource
   object_not_found
+  bad_refresh_token bad_verification_code incorrect_client_credentials
   "refresh_token not found"
   ```
 

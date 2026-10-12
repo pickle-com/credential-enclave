@@ -97,7 +97,7 @@ struct ClientVariables {
 
 /// The variables the host program reads, per provider of the definitions. A provider without a
 /// row has no client values of the operator (its clients are registered dynamically).
-const CLIENT_VARIABLES: [ClientVariables; 6] = [
+const CLIENT_VARIABLES: [ClientVariables; 7] = [
     ClientVariables {
         provider: "google_workspace",
         client_id: "GOOGLE_CLIENT_ID",
@@ -133,6 +133,12 @@ const CLIENT_VARIABLES: [ClientVariables; 6] = [
         client_id: "LINK_CLIENT_ID",
         client_secret: "LINK_CLIENT_SECRET",
         publishable_key: Some("STRIPE_PUBLISHABLE_KEY"),
+    },
+    ClientVariables {
+        provider: "github",
+        client_id: "GITHUB_CLIENT_ID",
+        client_secret: "GITHUB_CLIENT_SECRET",
+        publishable_key: None,
     },
 ];
 
@@ -336,7 +342,8 @@ mod tests {
                 "x",
                 "link",
                 "granola",
-                "mercury"
+                "mercury",
+                "github"
             ])
         );
         assert!(provider_names("[]").is_err());
@@ -416,6 +423,12 @@ mod tests {
                     "client_id": "",
                     "client_secret": "",
                     "redirect_uri": "https://api.example.test/api/integrations/mercury/oauth/callback",
+                    "publishable_key": "",
+                },
+                "github": {
+                    "client_id": "",
+                    "client_secret": "",
+                    "redirect_uri": "https://api.example.test/api/integrations/github/oauth/callback",
                     "publishable_key": "",
                 },
             }
@@ -568,7 +581,7 @@ mod tests {
         assert_eq!(
             line,
             "operator configuration: client id set for google_workspace, link; \
-             not set for microsoft, slack, notion, x, granola, mercury"
+             not set for microsoft, slack, notion, x, granola, mercury, github"
         );
         assert_eq!(
             summary(&names(&["slack"]), &environment(&[])),

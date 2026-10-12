@@ -104,7 +104,10 @@ fn caller_headers(
             return Err(ProtocolError::NotAllowed.into());
         }
         if DROPPED_HEADERS.contains(&lower.as_str())
-            || lower == definition.inject.header.to_ascii_lowercase()
+            || definition
+                .inject
+                .iter()
+                .any(|rule| lower == rule.header.to_ascii_lowercase())
         {
             continue;
         }
@@ -176,15 +179,19 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
         if !METHODS.contains(&method) {
             return Err(ProtocolError::NotAllowed.into());
         }
-        // 4: the credential header, then `Accept-Encoding: identity` (the node searches the
-        // response and does not decode it), then the headers of the caller.
+        // 4: the credential header of the rule of this host, then `Accept-Encoding: identity`
+        // (the node searches the response and does not decode it), then the headers of the
+        // caller.
+        let rule = definition
+            .inject_rule(target.host())
+            .ok_or(ProtocolError::NotAllowed)?;
         let (header_value, token) = opened
             .parse()?
-            .credential(definition)
+            .credential(rule)
             .ok_or(ProtocolError::RecordInvalid)?
             .into_parts();
         let mut headers = vec![
-            OutboundHeader::secret(&definition.inject.header, header_value),
+            OutboundHeader::secret(&rule.header, header_value),
             OutboundHeader::plain("accept-encoding", "identity"),
         ];
         headers.extend(caller_headers(&meta, definition)?);
