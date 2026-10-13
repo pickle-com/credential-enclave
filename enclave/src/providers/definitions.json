@@ -193,5 +193,32 @@
     "api": [
       {"host": "mcp.mercury.com", "prefixes": [], "exact": ["/mcp"]}
     ]
+  },
+  "github": {
+    "client": "static",
+    "authorize": {"url": "https://github.com/login/oauth/authorize", "fixed": [], "allowed": ["prompt", "login"], "key_param": ""},
+    "scope_param": "",
+    "scope_delimiter": "",
+    "pkce": "S256",
+    "token": {"url": "https://github.com/login/oauth/access_token", "client_auth": "body", "body": "form", "headers": [["Accept", "application/json"]], "bearer": "", "fixed": [], "ok_field": ""},
+    "token_container": "",
+    "revoke": null,
+    "inject": [
+      {"host": "api.github.com", "header": "Authorization", "prefix": "token ", "paths": ["access_token"]},
+      {"host": "uploads.github.com", "header": "Authorization", "prefix": "token ", "paths": ["access_token"]},
+      {"host": "github.com", "header": "Authorization", "prefix": "", "basic_user": "x-access-token", "paths": ["access_token"]}
+    ],
+    "public": [
+      {"path": "scope", "type": "string", "max": 8192},
+      {"path": "expires_in", "type": "integer"},
+      {"path": "refresh_token_expires_in", "type": "integer"},
+      {"path": "token_type", "type": "string", "max": 32}
+    ],
+    "id_token_claims": [],
+    "api": [
+      {"host": "api.github.com", "prefixes": ["/user", "/users/", "/repos/", "/search/", "/orgs/", "/rate_limit"], "exact": ["/graphql"]},
+      {"host": "uploads.github.com", "prefixes": ["/repos/"], "exact": []},
+      {"host": "github.com", "prefixes": [], "exact": [], "suffixes": ["/info/refs", "/git-upload-pack", "/git-receive-pack"]}
+    ]
   }
 }

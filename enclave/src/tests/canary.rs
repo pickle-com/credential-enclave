@@ -56,7 +56,7 @@ const EVENTS: [&str; 10] = [
 /// The closed vocabulary of `provider_error` (egress-policy.md E5). Beside these words a
 /// failure body carries `other` for any other string of the provider, and the empty string
 /// when the provider sent none.
-const PROVIDER_ERRORS: [&str; 38] = [
+const PROVIDER_ERRORS: [&str; 41] = [
     "invalid_request",
     "invalid_client",
     "invalid_grant",
@@ -94,6 +94,9 @@ const PROVIDER_ERRORS: [&str; 38] = [
     "validation_error",
     "restricted_resource",
     "object_not_found",
+    "bad_refresh_token",
+    "bad_verification_code",
+    "incorrect_client_credentials",
     "refresh_token not found",
 ];
 
@@ -113,10 +116,18 @@ const OAUTH_LEAVES: Leaves = &[
     ("token_type", Leaf::Text(32)),
 ];
 
+/// The public fields of github: the common leaves and the lifetime of the refresh token.
+const GITHUB_LEAVES: Leaves = &[
+    ("scope", Leaf::Text(8192)),
+    ("expires_in", Leaf::Integer),
+    ("refresh_token_expires_in", Leaf::Integer),
+    ("token_type", Leaf::Text(32)),
+];
+
 /// The public fields of every provider (egress-policy.md section 4): the leaves of the token
 /// object by their paths, then the claims of the `id_token`. Nothing else of a token response
 /// leaves a node.
-const PUBLIC: [(&str, Leaves, Leaves); 8] = [
+const PUBLIC: [(&str, Leaves, Leaves); 9] = [
     (
         "google_workspace",
         OAUTH_LEAVES,
@@ -180,6 +191,7 @@ const PUBLIC: [(&str, Leaves, Leaves); 8] = [
     ("link", OAUTH_LEAVES, &[]),
     ("granola", OAUTH_LEAVES, &[]),
     ("mercury", OAUTH_LEAVES, &[]),
+    ("github", GITHUB_LEAVES, &[]),
 ];
 
 impl Leaf {
@@ -977,8 +989,9 @@ mod fixture {
         }
 
         /// The places an address belongs to: the roles it has in the definitions. An `api`
-        /// rule covers its exact paths and the paths under its prefixes, where a prefix that
-        /// does not end with `/` ends at a segment boundary (enclave.md section 7).
+        /// rule covers its exact paths, the paths under its prefixes, where a prefix that
+        /// does not end with `/` ends at a segment boundary, and the paths that end with one
+        /// of its suffixes with at least one segment in front (enclave.md section 7).
         pub fn places(&self, server_name: &str, target: &str) -> Vec<Place> {
             let path = target.split('?').next().unwrap_or_default();
             // The objects of the log store: the keys of protocol.md 7.6.
@@ -1011,8 +1024,12 @@ mod fixture {
                 if revocation.is_some_and(|revoke| is(&revoke.url)) {
                     places.push(at(Role::Revocation, name));
                 }
+                let ends_with =
+                    |suffix: &String| path.len() > suffix.len() && path.ends_with(suffix.as_str());
                 if rules.any(|rule| {
-                    rule.exact.iter().any(|exact| exact == path) || rule.prefixes.iter().any(under)
+                    rule.exact.iter().any(|exact| exact == path)
+                        || rule.prefixes.iter().any(under)
+                        || rule.suffixes.iter().any(ends_with)
                 }) {
                     places.push(at(Role::Api, name));
                 }
@@ -1026,11 +1043,18 @@ mod fixture {
             rules
                 .iter()
                 .map(|rule| {
-                    let path = match (rule.exact.first(), rule.prefixes.first()) {
-                        (Some(exact), _) => exact.clone(),
-                        (None, Some(prefix)) if prefix.ends_with('/') => format!("{prefix}canary"),
-                        (None, Some(prefix)) => prefix.clone(),
-                        (None, None) => unreachable!("a rule has a path"),
+                    let path = match (
+                        rule.exact.first(),
+                        rule.prefixes.first(),
+                        rule.suffixes.first(),
+                    ) {
+                        (Some(exact), _, _) => exact.clone(),
+                        (None, Some(prefix), _) if prefix.ends_with('/') => {
+                            format!("{prefix}canary")
+                        }
+                        (None, Some(prefix), _) => prefix.clone(),
+                        (None, None, Some(suffix)) => format!("/canary/canary{suffix}"),
+                        (None, None, None) => unreachable!("a rule has a path"),
                     };
                     format!("https://{}{path}", rule.host)
                 })
