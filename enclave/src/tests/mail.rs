@@ -697,6 +697,10 @@ async fn mail_reservations_follow_the_operation() {
             mail::LISTING_INPUT_BYTES * 6 + frames,
         ),
         (
+            json!({"action":"search","uid_validity":42}),
+            mail::LISTING_INPUT_BYTES * 6 + frames,
+        ),
+        (
             json!({"action":"read","uid_validity":42,"uid":7}),
             mail::message_input_bytes(&harness.node.limits)
                 + harness.node.limits.body_bytes

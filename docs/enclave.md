@@ -1223,8 +1223,8 @@ A mail call reserves its request frame from the shared body budget before readin
 declared length, else the frame limit), and once the operation, the action and the payload are
 known, and before a credential is opened, resizes the reservation to the operation's amount.
 Verify, folder listing and search reserve six times the 4 MiB input bound (the parser
-buffer, the parsed rows, the base64 headers, the JSON and the frame) plus two frame metadata
-limits: 26 MiB at the 1 MiB metadata limit. Reading one raw message reserves its input bound
+buffer, which the parsed rows borrow, the base64 headers, the JSON and the frame) plus two
+frame metadata limits: 26 MiB at the 1 MiB metadata limit. Reading one raw message reserves its input bound
 plus the body limit (the parser buffer and the message copy) plus two metadata limits: 131 MiB
 at the default 64 MiB body limit. Submit reserves its payload plus two metadata limits. At the 2 GiB budget this admits about seventy listing calls or fifteen raw-message
 reads at once, bounded further by the 64 forwarding slots. Mail takes both its forwarding slot

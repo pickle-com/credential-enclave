@@ -72,7 +72,7 @@ fn resize(node: &Node, budget: &mut OwnedSemaphorePermit, keep: usize) -> Result
 ///
 /// | operation | input cap | held at once | reserve |
 /// | --- | --- | --- | --- |
-/// | verify, folders, search | 4 MiB | parser buffer, parsed rows, base64 headers, JSON, frame | cap × 6 + 2 × META |
+/// | verify, folders, search | 4 MiB | parser buffer (the parsed rows borrow it), base64 headers, JSON, frame | cap × 6 + 2 × META |
 /// | read | body limit + 1 MiB | parser buffer (≤ cap) and the message copy (≤ body limit) | cap + body limit + 2 × META |
 /// | submit | the request frame | the payload | payload + 2 × META |
 ///
