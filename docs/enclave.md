@@ -1208,21 +1208,29 @@ These calls require a configured log store. Both protocols have fixed destinatio
 ends in the node. The parent egress relay additionally permits exactly those two host/port pairs.
 The mail module performs no persistent mailbox synchronization and stores no message body.
 
-Mail protocol input is bounded at the stream: verify,
-folder listing and search (including headers) accept at most 4 MiB of protocol input per
-connection. This is a byte-read bound; the API separately reserves the SDK parser maximum
-of 512 MiB because a server literal declaration can allocate ahead of the read. Reading one raw message allows the configured body limit plus 1 MiB for protocol
-overhead, while the returned message itself still has the body limit. A search whose UID set
-or headers exceeds this bound must be narrowed. Unknown IMAP login refusals remain provider
+Mail protocol input is bounded at the stream: verify, folder listing and search (including
+headers) accept at most 4 MiB of protocol input per connection, and reading one raw message
+allows the configured body limit plus 1 MiB of protocol overhead, while the returned message
+itself still has the body limit. The same bound applies to a literal declaration before the
+protocol parser reads it: a server line that declares a literal (`{N}` CRLF) above the
+connection's bound ends the connection as a provider failure, because the SDK parser
+(async-imap 0.12) grows its buffer to a declared length with a zero-filled allocation of up to
+512 MiB before the octets arrive. With the guard, the parser buffer never exceeds the bound
+plus one 4 KiB block. A search whose UID set or headers exceeds the bound must be narrowed. Unknown IMAP login refusals remain provider
 failures; only AUTHENTICATIONFAILED classifies the application password as refused.
 
-Each mail call reserves six times the configured body limit plus two frame metadata limits;
-verify and read also reserve the 512 MiB parser bound. At the default 64 MiB body limit and
-1 MiB metadata limit, verify/read reserve 898 MiB each from the shared 2 GiB body budget.
-At most two can run concurrently when no other bodies occupy that budget. Two leave 252 MiB
-for HTTP forwarding and response bodies. Mail takes both its forwarding slot and body
-reservation without waiting. Insufficient capacity returns HTTP 503 `capacity_unavailable`
-before reading the request body, opening a credential or calling the provider. No mail
+A mail call reserves its request frame from the shared body budget before reading it (the
+declared length, else the frame limit), and once the operation, the action and the payload are
+known, and before a credential is opened, resizes the reservation to the operation's amount.
+Verify, folder listing and search reserve six times the 4 MiB input bound (the parser
+buffer, the parsed rows, the base64 headers, the JSON and the frame) plus two frame metadata
+limits: 26 MiB at the 1 MiB metadata limit. Reading one raw message reserves its input bound
+plus the body limit (the parser buffer and the message copy) plus two metadata limits: 131 MiB
+at the default 64 MiB body limit. Submit reserves its payload plus two metadata limits. At the 2 GiB budget this admits about seventy listing calls or fifteen raw-message
+reads at once, bounded further by the 64 forwarding slots. Mail takes both its forwarding slot
+and body reservation without waiting. Insufficient capacity returns HTTP 503 `capacity_unavailable`
+before a credential is opened or a provider is called; the request frame may already have been
+read under its own reservation. No mail
 reservation enters the shared FIFO semaphore queue, so it cannot hold a smaller eligible
 HTTP call behind it. Admitted calls retain the 30-second deadline. The 64 forwarding slots
 are not a promise of 64 concurrent mail calls; capacity planning must include the body budget.

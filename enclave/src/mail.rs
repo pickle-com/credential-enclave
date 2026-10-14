@@ -23,7 +23,17 @@ use zeroize::Zeroizing;
 
 use crate::platform::Stream;
 use crate::provider_response::{self, CheckedResponse};
-use crate::state::{open_for, GrantView, Node};
+use crate::state::{open_for, GrantView, Limits, Node};
+
+/// Protocol input a verify, folder listing or search connection accepts: 4 MiB. A UID set or
+/// headers above it end the connection; the search must be narrowed.
+pub(crate) const LISTING_INPUT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Protocol input a raw message read accepts: the body limit plus 1 MiB of protocol overhead.
+/// The returned message itself still has the body limit.
+pub(crate) fn message_input_bytes(limits: &Limits) -> usize {
+    limits.body_bytes + 1024 * 1024
+}
 
 /// Only the mail call opens this kind. Neither field implements response serialization.
 pub struct AppPassword {
@@ -176,7 +186,7 @@ impl AppPassword {
     }
 
     pub async fn verify(&self, node: &Node) -> Result<(), MailError> {
-        drop(self.imap(node, 4 * 1024 * 1024).await?);
+        drop(self.imap(node, LISTING_INPUT_BYTES).await?);
         drop(self.smtp(node).await?);
         Ok(())
     }
@@ -186,9 +196,9 @@ impl AppPassword {
         // A UID search can expand into a large set before pagination. Bound listing and
         // header input separately from a raw message, whose content has the frame limit.
         let response_bytes = if request.action == "read" {
-            node.limits.body_bytes + 1024 * 1024
+            message_input_bytes(&node.limits)
         } else {
-            4 * 1024 * 1024
+            LISTING_INPUT_BYTES
         };
         let mut session = self.imap(node, response_bytes).await?;
         if request.action == "folders" {
@@ -625,11 +635,100 @@ impl Smtp {
     }
 }
 
-/// Caps bytes delivered to the protocol client. Its separate parser allocation is budgeted
-/// by the API because a declared literal can request a buffer before these bytes arrive.
+/// Caps bytes delivered to the protocol client at `limit`, and refuses a literal declaration
+/// above `limit` before the client's parser reads it. async-imap 0.12 grows its parser buffer
+/// to a declared literal length with a zero-filled allocation (at most 512 MiB) before the
+/// octets arrive, so without the guard a server's declaration alone would commit that memory.
+/// With it, the parser buffer never exceeds `limit` plus one block, and the API reserves
+/// memory by `limit` instead of the parser maximum.
 fn limited(stream: Stream, limit: usize) -> MailStream {
     let (read, write) = tokio::io::split(stream);
-    MailStream(Box::new(tokio::io::join(read.take(limit as u64), write)))
+    let read = LiteralGuard {
+        inner: read.take(limit as u64),
+        bound: limit,
+        scan: LiteralScan::Text,
+    };
+    MailStream(Box::new(tokio::io::join(read, write)))
+}
+
+/// Where a scan of server bytes stands between literal declarations. RFC 3501 section 4.3:
+/// a literal is `{` digits `}` CRLF followed by that many octets, and a quoted string holds
+/// no CR or LF, so a declaration is recognized without tracking quoted strings. A line of
+/// text that ends in `{digits}` is read as a declaration here and by the protocol parser
+/// alike, so the two never disagree about where the octets are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LiteralScan {
+    /// Outside a declaration.
+    Text,
+    /// After `{`: the digits read so far.
+    Digits(u64),
+    /// After `}`: the declared length, expecting CR.
+    Closed(u64),
+    /// After CR: the declared length, expecting LF.
+    Cr(u64),
+    /// Inside the octets of a literal: those still to come.
+    Octets(u64),
+}
+
+impl LiteralScan {
+    /// Advances over `bytes`. `Err(length)` is a declaration above `bound`; the scan does not
+    /// continue past it.
+    pub(crate) fn feed(&mut self, bytes: &[u8], bound: usize) -> Result<(), u64> {
+        for &byte in bytes {
+            *self = match (*self, byte) {
+                (Self::Octets(remaining), _) if remaining > 1 => Self::Octets(remaining - 1),
+                (Self::Octets(_), _) => Self::Text,
+                (Self::Text, b'{') => Self::Digits(0),
+                (Self::Text, _) => Self::Text,
+                (Self::Digits(length), b'0'..=b'9') => Self::Digits(
+                    length
+                        .saturating_mul(10)
+                        .saturating_add(u64::from(byte - b'0')),
+                ),
+                (Self::Digits(length), b'}') => Self::Closed(length),
+                (Self::Closed(length), b'\r') => Self::Cr(length),
+                (Self::Cr(length), b'\n') => {
+                    if length > bound as u64 {
+                        return Err(length);
+                    }
+                    if length == 0 {
+                        Self::Text
+                    } else {
+                        Self::Octets(length)
+                    }
+                }
+                (Self::Digits(_) | Self::Closed(_) | Self::Cr(_), b'{') => Self::Digits(0),
+                (Self::Digits(_) | Self::Closed(_) | Self::Cr(_), _) => Self::Text,
+            };
+        }
+        Ok(())
+    }
+}
+
+/// The read half of a mail connection: every byte passes the literal scan before the
+/// protocol client sees it.
+struct LiteralGuard<R> {
+    inner: R,
+    bound: usize,
+    scan: LiteralScan,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for LiteralGuard<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let filled = buf.filled().len();
+        std::task::ready!(Pin::new(&mut this.inner).poll_read(cx, buf))?;
+        if this.scan.feed(&buf.filled()[filled..], this.bound).is_err() {
+            return Poll::Ready(Err(io::Error::other(
+                "a literal declaration above the response bound",
+            )));
+        }
+        Poll::Ready(Ok(()))
+    }
 }
 
 /// Debug never includes transport buffers or authentication bytes.

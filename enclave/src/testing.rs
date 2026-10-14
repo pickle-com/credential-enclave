@@ -538,8 +538,13 @@ impl Harness {
         }
     }
 
-    /// A node for non-HTTP protocol stand-ins, using the same local platform and router.
-    pub fn with_mail_roots(provider: &Provider, extra_roots: RootCertStore) -> Harness {
+    /// A node for non-HTTP protocol stand-ins with the given limits, using the same local
+    /// platform and router.
+    pub fn with_mail_roots(
+        provider: &Provider,
+        extra_roots: RootCertStore,
+        limits: Limits,
+    ) -> Harness {
         let platform = Arc::new(TestPlatform::default());
         provider.route(&platform);
         let clock = Arc::new(Clock::start(platform.as_ref()).unwrap());
@@ -554,7 +559,7 @@ impl Harness {
                 egress,
                 RELEASE,
                 Lineage::read(RELEASE_KEY_PEM, LOG_KEY_PEM, b"[]", RELEASE).unwrap(),
-                Limits::default(),
+                limits,
             )
             .unwrap(),
         );
