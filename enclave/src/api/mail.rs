@@ -4,19 +4,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Request, State};
+use axum::http::header::CONTENT_LENGTH;
 use axum::response::Response;
 use credential_enclave_protocol::encoding::{b64u, to_json};
 use credential_enclave_protocol::{purpose, ProtocolError};
 use hyper::body::Bytes;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use tokio::sync::OwnedSemaphorePermit;
 
 use super::responses::forward_frame;
 use super::{invalid, read_body, record_of, respond, ApiError, JsonBody};
 use crate::frame::{self, META_LIMIT_BYTES};
 use crate::log_store;
-use crate::mail::{AppPassword, MailData, MailError, ReadMail};
-use crate::state::{lock, Node};
+use crate::mail::{self, AppPassword, MailData, MailError, ReadMail};
+use crate::state::{lock, Limits, Node};
 
 pub async fn verify(State(node): State<Arc<Node>>, request: Request) -> Response {
     call(node, request, "verify").await
@@ -44,32 +46,75 @@ fn admission_error(error: tokio::sync::TryAcquireError) -> ApiError {
     }
 }
 
+/// Resizes the reservation to `keep` bytes without waiting: more is taken from the budget
+/// (`capacity_unavailable` when it is not free), less is given back.
+fn resize(node: &Node, budget: &mut OwnedSemaphorePermit, keep: usize) -> Result<(), ApiError> {
+    let held = budget.num_permits();
+    if keep > held {
+        let extra =
+            u32::try_from(keep - held).map_err(|_| ApiError::from(ProtocolError::TooLarge))?;
+        budget.merge(
+            node.body_budget
+                .clone()
+                .try_acquire_many_owned(extra)
+                .map_err(admission_error)?,
+        );
+    } else {
+        drop(budget.split(held - keep));
+    }
+    Ok(())
+}
+
+/// What a mail call holds in memory at once, by operation. The protocol input of a mail
+/// connection is capped at the stream, and a literal declaration above the cap is refused
+/// before the protocol parser allocates for it (`mail::LiteralGuard`), so the parser buffer
+/// is bounded by the cap and not by the parser's own maximum.
+///
+/// | operation | input cap | held at once | reserve |
+/// | --- | --- | --- | --- |
+/// | verify, folders, search | 4 MiB | parser buffer (the parsed rows borrow it), base64 headers, JSON, frame | cap × 6 + 2 × META |
+/// | read | body limit + 1 MiB | parser buffer (≤ cap) and the message copy (≤ body limit) | cap + body limit + 2 × META |
+/// | submit | the request frame | the payload | payload + 2 × META |
+///
+/// The request frame is read under a reservation of its declared length (the frame limit
+/// when none is declared); once the action and the payload are known, and before a
+/// credential is opened, the reservation is resized to the operation's amount.
+fn reservation(
+    limits: &Limits,
+    operation: &str,
+    action: Option<&str>,
+    payload_bytes: usize,
+) -> usize {
+    let frames = 2 * META_LIMIT_BYTES;
+    match (operation, action) {
+        ("submit", _) => payload_bytes + frames,
+        ("read", None | Some("read")) => {
+            mail::message_input_bytes(limits) + limits.body_bytes + frames
+        }
+        _ => mail::LISTING_INPUT_BYTES * 6 + frames,
+    }
+}
+
 async fn run(node: &Node, request: Request, operation: &str) -> Result<Response, ApiError> {
     let _slot = node.forward_slots.try_acquire().map_err(admission_error)?;
-    // async-imap 0.12 caps its parser buffer at 512 MiB. It can reserve that from a
-    // literal declaration before the bounded stream reads the bytes, so account for it.
-    let parser_budget = if operation == "submit" {
-        0
-    } else {
-        512 * 1024 * 1024
-    };
-    // The bound also includes MIME bytes and JSON/base64 construction.
+    let frame_limit = 4 + META_LIMIT_BYTES + node.limits.body_bytes;
+    let declared = request
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok());
+    if declared.is_some_and(|length| length > frame_limit) {
+        return Err(ProtocolError::TooLarge.into());
+    }
     // The same budget also admits HTTP forwarding; no separate unbounded mail pool exists.
-    let reserve = node
-        .limits
-        .body_bytes
-        .checked_mul(6)
-        .and_then(|v| v.checked_add(parser_budget))
-        .and_then(|v| v.checked_add(META_LIMIT_BYTES * 2))
-        .and_then(|v| u32::try_from(v).ok())
-        .ok_or(ProtocolError::TooLarge)?;
+    let reserve = u32::try_from(declared.unwrap_or(frame_limit))
+        .map_err(|_| ApiError::from(ProtocolError::TooLarge))?;
     let mut budget = node
         .body_budget
         .clone()
         .try_acquire_many_owned(reserve)
         .map_err(admission_error)?;
-    let frame_bytes =
-        Bytes::from(read_body(request, 4 + META_LIMIT_BYTES + node.limits.body_bytes).await?);
+    let frame_bytes = Bytes::from(read_body(request, frame_limit).await?);
     let (meta_value, payload) = frame::decode(&frame_bytes)?;
     drop(frame_bytes);
     if payload.len() > node.limits.body_bytes {
@@ -115,6 +160,16 @@ async fn run(node: &Node, request: Request, operation: &str) -> Result<Response,
     if operation != "submit" && !payload.is_empty() {
         return Err(invalid("mail payload"));
     }
+    resize(
+        node,
+        &mut budget,
+        reservation(
+            &node.limits,
+            operation,
+            read_request.as_ref().map(|read| read.action.as_str()),
+            payload.len(),
+        ),
+    )?;
 
     node.ensure_open()?;
     if node.log_store.id().is_none() {

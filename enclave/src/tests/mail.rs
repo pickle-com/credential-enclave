@@ -14,7 +14,9 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 use super::quiet_provider_and_log_store;
-use crate::frame;
+use crate::frame::{self, META_LIMIT_BYTES};
+use crate::mail::{self, LiteralScan};
+use crate::state::Limits;
 use crate::testing::{App, Harness};
 
 const PASSWORD: &str = "naver-secret-marker-2e7c06830e6f";
@@ -46,10 +48,13 @@ impl MailServer {
             smtp_recipient_reply,
             std::time::Duration::ZERO,
             None,
+            false,
         )
         .await
     }
 
+    /// `oversized_list`: the LIST reply declares a literal far above any input bound and
+    /// sends nothing after it.
     async fn with_login_delay(
         drop_after_data: bool,
         reflect_password: bool,
@@ -57,6 +62,7 @@ impl MailServer {
         smtp_recipient_reply: Option<&'static str>,
         login_delay: std::time::Duration,
         login_gate: Option<Arc<tokio::sync::Semaphore>>,
+        oversized_list: bool,
     ) -> Self {
         let key = rcgen::KeyPair::generate().unwrap();
         let cert =
@@ -184,6 +190,14 @@ impl MailServer {
                                     continue;
                                 }
                             } else if command.starts_with("LIST ") {
+                                if oversized_list {
+                                    let _ = io
+                                        .get_mut()
+                                        .write_all(b"* LIST () \"/\" {600000000}\r\n")
+                                        .await;
+                                    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                                    return;
+                                }
                                 reply.extend_from_slice(b"* LIST () \"/\" \"INBOX\"\r\n");
                             } else if command.starts_with("EXAMINE ") {
                                 reply.extend_from_slice(b"* 1 EXISTS\r\n* OK [UIDVALIDITY 42] valid\r\n* OK [UIDNEXT 8] next\r\n");
@@ -252,8 +266,12 @@ impl MailServer {
     }
 
     async fn harness(&self) -> (Harness, App, Value) {
+        self.harness_with_limits(Limits::default()).await
+    }
+
+    async fn harness_with_limits(&self, limits: Limits) -> (Harness, App, Value) {
         let provider = quiet_provider_and_log_store().await;
-        let harness = Harness::with_mail_roots(&provider, self.roots.clone());
+        let harness = Harness::with_mail_roots(&provider, self.roots.clone(), limits);
         harness.platform.route("imap.naver.com", self.address);
         harness.platform.route("smtp.naver.com", self.address);
         harness.use_log_store().await;
@@ -491,10 +509,25 @@ async fn mixed_mail_and_google_admission_probe() {
 async fn mixed_admission_scenario() -> Value {
     use std::time::{Duration, Instant};
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
-    let server =
-        MailServer::with_login_delay(false, false, None, None, Duration::ZERO, Some(gate.clone()))
-            .await;
-    let (harness, app, record) = server.harness().await;
+    let server = MailServer::with_login_delay(
+        false,
+        false,
+        None,
+        None,
+        Duration::ZERO,
+        Some(gate.clone()),
+        false,
+    )
+    .await;
+    // A budget that two folder listings fill: the third mail call is refused while the small
+    // HTTP calls still fit.
+    let listing = mail::LISTING_INPUT_BYTES * 6 + 2 * META_LIMIT_BYTES;
+    let (harness, app, record) = server
+        .harness_with_limits(Limits {
+            body_budget_bytes: 2 * listing + 1024 * 1024,
+            ..Limits::default()
+        })
+        .await;
     let harness = Arc::new(harness);
     let google = app.record(
         "oauth",
@@ -588,4 +621,112 @@ async fn mixed_admission_scenario() -> Value {
         "imap_logins_observed":server.passwords.lock().unwrap().len(),
         "real_credentials":false, "real_email_sent":false,
     })
+}
+
+#[test]
+fn literal_scan_refuses_a_declaration_above_the_bound() {
+    let accepted =
+        b"* LIST () \"/\" {5}\r\nhello\r\n* 1 FETCH (BODY[] {9}\r\n{99999}\r\n)\r\nA1 OK done\r\n";
+    for chunk in [1usize, 3, 7, accepted.len()] {
+        let mut scan = LiteralScan::Text;
+        for piece in accepted.chunks(chunk) {
+            scan.feed(piece, 9).unwrap();
+        }
+        assert_eq!(scan, LiteralScan::Text, "chunks of {chunk}");
+    }
+    let mut scan = LiteralScan::Text;
+    assert_eq!(scan.feed(accepted, 8), Err(9));
+    let mut scan = LiteralScan::Text;
+    scan.feed(b"* OK {12}x is text\r\n* OK {}\r\n{{3}\r\nabc", 3)
+        .unwrap();
+    assert_eq!(scan, LiteralScan::Text);
+    let mut scan = LiteralScan::Text;
+    assert_eq!(
+        scan.feed(b"* 1 FETCH (BODY[] {99999999999999999999999}\r\n", 64),
+        Err(u64::MAX)
+    );
+}
+
+#[tokio::test]
+async fn oversized_literal_declaration_is_refused_before_it_is_read() {
+    let server = MailServer::with_login_delay(
+        false,
+        false,
+        None,
+        None,
+        std::time::Duration::ZERO,
+        None,
+        true,
+    )
+    .await;
+    let (harness, _app, record) = server.harness().await;
+    let started = std::time::Instant::now();
+    let (status, meta, _) =
+        request(&harness, &record, "read", json!({"action":"folders"}), b"").await;
+    assert_eq!(
+        (status, meta["code"].as_str()),
+        (502, Some("provider_unreachable"))
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert_eq!(
+        harness.node.body_budget.available_permits(),
+        harness.node.limits.body_budget_bytes
+    );
+}
+
+#[tokio::test]
+async fn mail_reservations_follow_the_operation() {
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let server = MailServer::with_login_delay(
+        false,
+        false,
+        None,
+        None,
+        std::time::Duration::ZERO,
+        Some(gate.clone()),
+        false,
+    )
+    .await;
+    let (harness, _app, record) = server.harness().await;
+    let harness = Arc::new(harness);
+    let budget = harness.node.limits.body_budget_bytes;
+    let frames = 2 * META_LIMIT_BYTES;
+    for (params, expected) in [
+        (
+            json!({"action":"folders"}),
+            mail::LISTING_INPUT_BYTES * 6 + frames,
+        ),
+        (
+            json!({"action":"search","uid_validity":42}),
+            mail::LISTING_INPUT_BYTES * 6 + frames,
+        ),
+        (
+            json!({"action":"read","uid_validity":42,"uid":7}),
+            mail::message_input_bytes(&harness.node.limits)
+                + harness.node.limits.body_bytes
+                + frames,
+        ),
+    ] {
+        let seen = server.passwords.lock().unwrap().len();
+        let call = {
+            let harness = harness.clone();
+            let record = record.clone();
+            tokio::spawn(async move { request(&harness, &record, "read", params, b"").await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while server.passwords.lock().unwrap().len() == seen {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the call reached the blocked login");
+        assert_eq!(
+            budget - harness.node.body_budget.available_permits(),
+            expected
+        );
+        gate.add_permits(1);
+        let (status, _, _) = call.await.unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(harness.node.body_budget.available_permits(), budget);
+    }
 }
