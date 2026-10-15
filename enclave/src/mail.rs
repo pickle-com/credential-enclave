@@ -1,6 +1,7 @@
 //! Fixed Naver IMAP/SMTP operations. Authentication bytes only reach in-node TLS streams.
 
 use std::{
+    collections::BTreeMap,
     fmt, io,
     pin::Pin,
     task::{Context, Poll},
@@ -242,15 +243,31 @@ impl AppPassword {
                     .join(",");
                 let rows =
                     uid_fetch(&mut session, &set, "(UID RFC822.SIZE BODY.PEEK[HEADER])").await?;
+                let mut by_uid: BTreeMap<u32, (Option<u32>, Option<Vec<u8>>)> = BTreeMap::new();
                 for row in rows {
-                    let uid = row.uid.ok_or(MailError::Unavailable)?;
+                    let Some(uid) = row.uid else {
+                        continue;
+                    };
                     if !uids.contains(&uid) {
-                        return Err(MailError::Unavailable);
+                        continue;
                     }
-                    messages.push(json!({"uid": uid, "size": row.size, "headers_b64": STANDARD.encode(row.header.as_deref().unwrap_or_default())}));
+                    let entry = by_uid.entry(uid).or_insert((None, None));
+                    if row.size.is_some() {
+                        entry.0 = row.size;
+                    }
+                    if row.header.is_some() {
+                        entry.1 = row.header;
+                    }
                 }
-                messages
-                    .sort_by_key(|row| std::cmp::Reverse(row["uid"].as_u64().unwrap_or_default()));
+                for uid in &uids {
+                    if let Some((size, header)) = by_uid.get(uid) {
+                        messages.push(json!({
+                            "uid": uid,
+                            "size": size,
+                            "headers_b64": STANDARD.encode(header.as_deref().unwrap_or_default()),
+                        }));
+                    }
+                }
             }
             return Ok(MailData::Json(
                 json!({"uid_validity": validity, "messages": messages, "next_uid": next}),

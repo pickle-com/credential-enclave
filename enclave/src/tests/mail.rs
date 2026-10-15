@@ -247,6 +247,9 @@ impl MailServer {
                                 {
                                     let header =
                                         b"Subject: a test\r\nMessage-ID: <one@pickle.com>\r\n\r\n";
+                                    reply.extend_from_slice(
+                                        b"* 2 FETCH (FLAGS (\\Seen))\r\n* 3 FETCH (UID 99 FLAGS (\\Seen))\r\n",
+                                    );
                                     reply.extend_from_slice(format!("* 1 FETCH (UID 7 RFC822.SIZE {} BODY[HEADER] {{{}}}\r\n", body.len(), header.len()).as_bytes());
                                     reply.extend_from_slice(header);
                                     reply.extend_from_slice(b")\r\n");
