@@ -176,3 +176,18 @@ jobs:
           cp "$PROVENANCE_BUNDLE" provenance.sigstore.json
           cp "$STATEMENT_BUNDLE" release-statement.sigstore.json
           gh release upload "$TAG" --clobber provenance.sigstore.json release-statement.sigstore.json
+      - name: Export the published registry bytes for offline mirroring
+        run: |
+          go install github.com/google/go-containerregistry/cmd/crane@v0.21.7
+          CRANE="$(go env GOPATH)/bin/crane"
+          "$CRANE" digest "$HOST_IMAGE" > out/host-image.digest
+          "$CRANE" pull --format=oci "$HOST_IMAGE" out/host-image
+          tar -cf out/host-image.oci.tar -C out/host-image .
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: host-registry-image
+          path: |
+            out/host-image.oci.tar
+            out/host-image.digest
+          if-no-files-found: error
+          retention-days: 7
