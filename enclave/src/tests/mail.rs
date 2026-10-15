@@ -200,7 +200,17 @@ impl MailServer {
                                 }
                                 reply.extend_from_slice(b"* LIST () \"/\" \"INBOX\"\r\n");
                             } else if command.starts_with("EXAMINE ") {
-                                reply.extend_from_slice(b"* 1 EXISTS\r\n* OK [UIDVALIDITY 42] valid\r\n* OK [UIDNEXT 8] next\r\n");
+                                let uid_validity = if command == "EXAMINE \"INBOX\"" {
+                                    0
+                                } else {
+                                    42
+                                };
+                                reply.extend_from_slice(
+                                    format!(
+                                        "* 1 EXISTS\r\n* OK [UIDVALIDITY {uid_validity}] valid\r\n* OK [UIDNEXT 8] next\r\n"
+                                    )
+                                    .as_bytes(),
+                                );
                             } else if command.starts_with("UID SEARCH") {
                                 assert!(command.is_ascii());
                                 let mut tail = command.to_string();
@@ -221,29 +231,41 @@ impl MailServer {
                                     tail = tail.trim_end().to_string();
                                 }
                                 reply.extend_from_slice(b"* SEARCH 7\r\n");
-                            } else if command.starts_with("UID FETCH") {
+                            } else if command.starts_with("UID FETCH ") {
                                 let mut body = MESSAGE.to_vec();
                                 if reflect_password {
                                     body.extend_from_slice(PASSWORD.as_bytes());
                                 }
-                                if command.contains("BODY.PEEK[]") {
+                                if command.ends_with(" (UID BODY.PEEK[])") {
                                     reply.extend_from_slice(
                                         format!("* 1 FETCH (UID 7 BODY[] {{{}}}\r\n", body.len())
                                             .as_bytes(),
                                     );
                                     reply.extend_from_slice(&body);
                                     reply.extend_from_slice(b")\r\n");
-                                } else if command.contains("BODY.PEEK[HEADER]") {
+                                } else if command.ends_with(" (UID RFC822.SIZE BODY.PEEK[HEADER])")
+                                {
                                     let header =
                                         b"Subject: a test\r\nMessage-ID: <one@pickle.com>\r\n\r\n";
+                                    reply.extend_from_slice(
+                                        b"* 2 FETCH (FLAGS (\\Seen))\r\n* 3 FETCH (UID 99 FLAGS (\\Seen))\r\n",
+                                    );
                                     reply.extend_from_slice(format!("* 1 FETCH (UID 7 RFC822.SIZE {} BODY[HEADER] {{{}}}\r\n", body.len(), header.len()).as_bytes());
                                     reply.extend_from_slice(header);
                                     reply.extend_from_slice(b")\r\n");
-                                } else {
+                                } else if command.ends_with(" (UID RFC822.SIZE)") {
                                     reply.extend_from_slice(
                                         format!("* 1 FETCH (UID 7 RFC822.SIZE {})\r\n", body.len())
                                             .as_bytes(),
                                     );
+                                } else {
+                                    reply.extend_from_slice(
+                                        format!("{tag} BAD invalid fetch items\r\n").as_bytes(),
+                                    );
+                                    if io.get_mut().write_all(&reply).await.is_err() {
+                                        return;
+                                    }
+                                    continue;
                                 }
                             }
                             reply.extend_from_slice(format!("{tag} OK completed\r\n").as_bytes());
@@ -390,7 +412,7 @@ async fn reads_check_mailbox_generation_and_withhold_reflected_credentials() {
         &harness,
         &record,
         "read",
-        json!({"action":"read","uid":7,"uid_validity":42}),
+        json!({"action":"read","uid":7,"uid_validity":0}),
         b"",
     )
     .await;
@@ -429,7 +451,7 @@ async fn search_and_read_preserve_mailbox_identity_and_mime() {
     .await;
     assert_eq!(meta["status"], 200);
     let page: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(page["uid_validity"], 42);
+    assert_eq!(page["uid_validity"], 0);
     assert_eq!(
         server.search_literals.lock().unwrap().as_slice(),
         &[b"friend@example.com".to_vec(), "회의".as_bytes().to_vec()]
@@ -439,12 +461,46 @@ async fn search_and_read_preserve_mailbox_identity_and_mime() {
         &harness,
         &record,
         "read",
-        json!({"action":"read","uid":7,"uid_validity":42}),
+        json!({"action":"read","uid":7,"uid_validity":0}),
         b"",
     )
     .await;
     assert_eq!(meta["status"], 200);
     assert_eq!(body, MESSAGE);
+    let (_, meta, body) = request(
+        &harness,
+        &record,
+        "read",
+        json!({"action":"search","mailbox":"Sent Messages","limit":1}),
+        b"",
+    )
+    .await;
+    assert_eq!(meta["status"], 200);
+    let sent_page: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(sent_page["uid_validity"], 42);
+    assert_eq!(sent_page["messages"][0]["uid"], 7);
+    let (_, meta, body) = request(
+        &harness,
+        &record,
+        "read",
+        json!({"action":"read","mailbox":"Sent Messages","uid":7,"uid_validity":42}),
+        b"",
+    )
+    .await;
+    assert_eq!(meta["status"], 200);
+    assert_eq!(body, MESSAGE);
+    let (status, meta, _) = request(
+        &harness,
+        &record,
+        "read",
+        json!({"action":"read","uid":7}),
+        b"",
+    )
+    .await;
+    assert_eq!(
+        (status, meta["code"].as_str()),
+        (400, Some("invalid_request"))
+    );
 }
 
 #[tokio::test]
@@ -697,11 +753,11 @@ async fn mail_reservations_follow_the_operation() {
             mail::LISTING_INPUT_BYTES * 6 + frames,
         ),
         (
-            json!({"action":"search","uid_validity":42}),
+            json!({"action":"search","uid_validity":0}),
             mail::LISTING_INPUT_BYTES * 6 + frames,
         ),
         (
-            json!({"action":"read","uid_validity":42,"uid":7}),
+            json!({"action":"read","uid_validity":0,"uid":7}),
             mail::message_input_bytes(&harness.node.limits)
                 + harness.node.limits.body_bytes
                 + frames,

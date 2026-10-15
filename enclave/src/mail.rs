@@ -1,18 +1,20 @@
 //! Fixed Naver IMAP/SMTP operations. Authentication bytes only reach in-node TLS streams.
 
 use std::{
+    collections::BTreeMap,
     fmt, io,
     pin::Pin,
     task::{Context, Poll},
 };
 
-use async_imap::imap_proto::{MailboxDatum, Response, Status};
+use async_imap::imap_proto::{
+    AttributeValue, MailboxDatum, MessageSection, Response, SectionPath, Status,
+};
 use async_imap::{Client, Session};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use credential_enclave_protocol::record::{Kind, Record};
 use credential_enclave_protocol::secret::Secret;
 use credential_enclave_protocol::ProtocolError;
-use futures_util::TryStreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::{
@@ -202,25 +204,14 @@ impl AppPassword {
         };
         let mut session = self.imap(node, response_bytes).await?;
         if request.action == "folders" {
-            let names: Vec<_> = session
-                .list(None, Some("\"*\""))
-                .await
-                .map_err(|_| MailError::Unavailable)?
-                .try_collect()
-                .await
-                .map_err(|_| MailError::Unavailable)?;
-            return Ok(MailData::Json(
-                json!({"folders": names.iter().map(|name| json!({"name": name.name()})).collect::<Vec<_>>()}),
-            ));
+            let folders = list_folders(&mut session).await?;
+            return Ok(MailData::Json(json!({"folders": folders})));
         }
         let mailbox = session
             .examine(&request.mailbox)
             .await
             .map_err(|_| MailError::Unavailable)?;
-        let validity = mailbox
-            .uid_validity
-            .filter(|v| *v > 0)
-            .ok_or(MailError::Unavailable)?;
+        let validity = mailbox.uid_validity.ok_or(MailError::Unavailable)?;
         if request
             .uid_validity
             .is_some_and(|expected| expected != validity)
@@ -250,35 +241,41 @@ impl AppPassword {
                     .map(u32::to_string)
                     .collect::<Vec<_>>()
                     .join(",");
-                let rows: Vec<_> = session
-                    .uid_fetch(set, "UID RFC822.SIZE BODY.PEEK[HEADER]")
-                    .await
-                    .map_err(|_| MailError::Unavailable)?
-                    .try_collect()
-                    .await
-                    .map_err(|_| MailError::Unavailable)?;
+                let rows =
+                    uid_fetch(&mut session, &set, "(UID RFC822.SIZE BODY.PEEK[HEADER])").await?;
+                let mut by_uid: BTreeMap<u32, (Option<u32>, Option<Vec<u8>>)> = BTreeMap::new();
                 for row in rows {
-                    let uid = row.uid.ok_or(MailError::Unavailable)?;
+                    let Some(uid) = row.uid else {
+                        continue;
+                    };
                     if !uids.contains(&uid) {
-                        return Err(MailError::Unavailable);
+                        continue;
                     }
-                    messages.push(json!({"uid": uid, "size": row.size, "headers_b64": STANDARD.encode(row.header().unwrap_or_default())}));
+                    let entry = by_uid.entry(uid).or_insert((None, None));
+                    if row.size.is_some() {
+                        entry.0 = row.size;
+                    }
+                    if row.header.is_some() {
+                        entry.1 = row.header;
+                    }
                 }
-                messages
-                    .sort_by_key(|row| std::cmp::Reverse(row["uid"].as_u64().unwrap_or_default()));
+                for uid in &uids {
+                    if let Some((size, header)) = by_uid.get(uid) {
+                        messages.push(json!({
+                            "uid": uid,
+                            "size": size,
+                            "headers_b64": STANDARD.encode(header.as_deref().unwrap_or_default()),
+                        }));
+                    }
+                }
             }
             return Ok(MailData::Json(
                 json!({"uid_validity": validity, "messages": messages, "next_uid": next}),
             ));
         }
         let uid = request.uid.ok_or(MailError::Invalid)?;
-        let sizes: Vec<_> = session
-            .uid_fetch(uid.to_string(), "UID RFC822.SIZE")
-            .await
-            .map_err(|_| MailError::Unavailable)?
-            .try_collect()
-            .await
-            .map_err(|_| MailError::Unavailable)?;
+        let uid_set = uid.to_string();
+        let sizes = uid_fetch(&mut session, &uid_set, "(UID RFC822.SIZE)").await?;
         let size = sizes
             .iter()
             .find(|row| row.uid == Some(uid))
@@ -287,22 +284,16 @@ impl AppPassword {
         if size as usize > node.limits.body_bytes {
             return Err(MailError::TooLarge);
         }
-        let rows: Vec<_> = session
-            .uid_fetch(uid.to_string(), "UID BODY.PEEK[]")
-            .await
-            .map_err(|_| MailError::Unavailable)?
-            .try_collect()
-            .await
-            .map_err(|_| MailError::Unavailable)?;
+        let rows = uid_fetch(&mut session, &uid_set, "(UID BODY.PEEK[])").await?;
         let body = rows
-            .iter()
+            .into_iter()
             .find(|row| row.uid == Some(uid))
-            .and_then(|row| row.body())
+            .and_then(|row| row.body)
             .ok_or(MailError::Missing)?;
         if body.len() > node.limits.body_bytes {
             return Err(MailError::TooLarge);
         }
-        Ok(MailData::Raw(body.to_vec()))
+        Ok(MailData::Raw(body))
     }
 
     pub(crate) fn validate_submission(
@@ -418,9 +409,7 @@ impl ReadMail {
         if self.action == "search" {
             self.query(1)?;
         }
-        if self.action == "read"
-            && (self.uid.unwrap_or(0) == 0 || self.uid_validity.unwrap_or(0) == 0)
-        {
+        if self.action == "read" && (self.uid.unwrap_or(0) == 0 || self.uid_validity.is_none()) {
             return Err(MailError::Invalid);
         }
         Ok(())
@@ -445,6 +434,108 @@ impl ReadMail {
         }
         pieces.push(command);
         Ok(pieces)
+    }
+}
+
+async fn list_folders(session: &mut Session<MailStream>) -> Result<Vec<Value>, MailError> {
+    let tag = session
+        .run_command("LIST \"\" \"*\"")
+        .await
+        .map_err(|_| MailError::Unavailable)?;
+    let mut folders = Vec::new();
+    loop {
+        let response = session
+            .read_response()
+            .await
+            .map_err(|_| MailError::Unavailable)?
+            .ok_or(MailError::Unavailable)?;
+        match response.parsed() {
+            Response::MailboxData(MailboxDatum::List(data)) => {
+                folders.push(json!({"name": data.name.as_ref()}));
+            }
+            Response::Done {
+                tag: response_tag,
+                status: Status::Ok,
+                ..
+            } if *response_tag == tag => return Ok(folders),
+            Response::Done { .. }
+            | Response::Data {
+                status: Status::Bye,
+                ..
+            } => return Err(MailError::Unavailable),
+            _ => {}
+        }
+    }
+}
+
+struct FetchedMessage {
+    uid: Option<u32>,
+    size: Option<u32>,
+    header: Option<Vec<u8>>,
+    body: Option<Vec<u8>>,
+}
+
+async fn uid_fetch(
+    session: &mut Session<MailStream>,
+    set: &str,
+    items: &str,
+) -> Result<Vec<FetchedMessage>, MailError> {
+    let tag = session
+        .run_command(format!("UID FETCH {set} {items}"))
+        .await
+        .map_err(|_| MailError::Unavailable)?;
+    let mut rows = Vec::new();
+    loop {
+        let response = session
+            .read_response()
+            .await
+            .map_err(|_| MailError::Unavailable)?
+            .ok_or(MailError::Unavailable)?;
+        match response.parsed() {
+            Response::Fetch(_, attrs) => {
+                let mut row = FetchedMessage {
+                    uid: None,
+                    size: None,
+                    header: None,
+                    body: None,
+                };
+                for attr in attrs {
+                    match attr {
+                        AttributeValue::Uid(uid) => row.uid = Some(*uid),
+                        AttributeValue::Rfc822Size(size) => row.size = Some(*size),
+                        AttributeValue::BodySection {
+                            section: Some(SectionPath::Full(MessageSection::Header)),
+                            data: Some(header),
+                            ..
+                        }
+                        | AttributeValue::Rfc822Header(Some(header)) => {
+                            row.header = Some(header.to_vec());
+                        }
+                        AttributeValue::BodySection {
+                            section: None,
+                            data: Some(body),
+                            ..
+                        }
+                        | AttributeValue::Rfc822(Some(body)) => {
+                            row.body = Some(body.to_vec());
+                        }
+                        _ => {}
+                    }
+                }
+                rows.push(row);
+            }
+            Response::Done {
+                tag: response_tag,
+                status: Status::Ok,
+                ..
+            } if *response_tag == tag => return Ok(rows),
+            Response::Done { .. }
+            | Response::Data {
+                status: Status::Bye,
+                ..
+            } => return Err(MailError::Unavailable),
+            _ => {}
+        }
     }
 }
 
