@@ -965,7 +965,7 @@ mod tests {
             .collect()
     }
 
-    const ROWS: [Row; 9] = [
+    const ROWS: [Row; 10] = [
         Row {
             name: "google_workspace",
             client: ClientKind::Static,
@@ -1255,6 +1255,34 @@ mod tests {
             ],
             id_token_claims: &[],
         },
+        Row {
+            name: "smartthings",
+            client: ClientKind::Static,
+            authorize_url: "https://api.smartthings.com/oauth/authorize",
+            authorize_fixed: &[],
+            allowed: &["scope"],
+            key_param: "",
+            scope_param: "scope",
+            scope_delimiter: " ",
+            pkce: Pkce::None,
+            token_url: "https://auth-global.api.smartthings.com/oauth/token",
+            client_auth: ClientAuth::Basic,
+            body: BodyFormat::Form,
+            token_headers: &[],
+            token_bearer: "",
+            token_fixed: &[],
+            ok_field: "",
+            token_container: "",
+            revoke: None,
+            inject: BEARER,
+            public: &[
+                text("scope", 8192),
+                integer("expires_in"),
+                text("token_type", 32),
+                text("installed_app_id", 64),
+            ],
+            id_token_claims: &[],
+        },
     ];
 
     #[test]
@@ -1318,7 +1346,7 @@ mod tests {
         &["/info/refs", "/git-upload-pack", "/git-receive-pack"],
     )];
 
-    const ADDRESSES: [(&str, &str, &[&str], &[&str]); 19] = [
+    const ADDRESSES: [(&str, &str, &[&str], &[&str]); 20] = [
         (
             "google_workspace",
             "gmail.googleapis.com",
@@ -1428,6 +1456,12 @@ mod tests {
         ),
         ("github", "uploads.github.com", &["/repos/"], &[]),
         ("github", "github.com", &[], &[]),
+        (
+            "smartthings",
+            "api.smartthings.com",
+            &["/v1/devices", "/v1/locations", "/v1/capabilities"],
+            &[],
+        ),
     ];
 
     #[test]
@@ -1832,6 +1866,19 @@ mod tests {
                 "https://github.com/pickle-com/interactive-character.git/info/refs?service=git-upload-pack",
             ),
             ("github", "https://github.com/pickle-com/interactive-character/git-receive-pack"),
+            (
+                "smartthings",
+                "https://api.smartthings.com/v1/devices?locationId=6b3d1e2a&includeStatus=true",
+            ),
+            (
+                "smartthings",
+                "https://api.smartthings.com/v1/devices/0d1c4f2e/commands",
+            ),
+            ("smartthings", "https://api.smartthings.com/v1/locations"),
+            (
+                "smartthings",
+                "https://api.smartthings.com/v1/capabilities/switch/1",
+            ),
         ];
         for (provider, address) in samples {
             for name in definitions.names() {
@@ -1865,6 +1912,20 @@ mod tests {
             ("github", "https://api.github.com/gists"),
             ("github", "https://uploads.github.com/user"),
             ("github", "https://api.github.com/graphql/more"),
+            (
+                "smartthings",
+                "https://auth-global.api.smartthings.com/oauth/token",
+            ),
+            ("smartthings", "https://api.smartthings.com/oauth/token"),
+            (
+                "smartthings",
+                "https://api.smartthings.com/v1/installedapps/1",
+            ),
+            ("smartthings", "https://api.smartthings.com/v1/devicesx"),
+            (
+                "smartthings",
+                "https://api.smartthings.com/v1/scenes/5f2a/execute",
+            ),
             ("microsoft", "https://graph.microsoft.com/beta/me"),
             (
                 "microsoft",
