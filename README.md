@@ -1,17 +1,20 @@
 # credential-enclave
 
 This repository is the source of the program that holds and uses the credentials of Pickle
-accounts inside an AWS Nitro Enclave. It contains four things:
+accounts inside an AWS Nitro Enclave, and of the program that the Pickle apps run on the device
+side of the same protocol. It contains five things:
 
 | Part | What it is |
 | --- | --- |
 | The node program (`enclave/`) | The process inside the enclave. It holds the user key of an account for a limited time and, with that key, issues, opens, uses and records credentials |
 | The host program (`host/`) | The process in the parent pod. It starts the enclave and relays bytes to and from it. Nothing the node guarantees depends on it |
 | The protocol crate (`protocol/`) | The formats that the node and the app of an account share: keys, messages, records, the log, attestation documents |
-| The verification tool (`verify/`) | `credential-enclave-verify`: it fetches the attestation of the running nodes and compares it with the measurements of a build of this source |
+| The verification tool (`verify/`) | `credential-enclave-verify`: it fetches the attestation of the running nodes and compares it with the measurements of a build of this source, and it verifies the release proof of the secure program |
+| The secure program (`secure-program/`) | The JavaScript program that the apps run for the device side of the protocol: it creates the master key, verifies nodes, seals grants, encrypts records and reads the log. The backend serves a byte-identical copy to the apps, and a release build of an app loads it only with the release proof of a release of this repository ([secure-program/README.md](secure-program/README.md)) |
 
 A reader can build this source, compare the measurements of the build with what the running nodes
-attest, and read here what a node does with a credential.
+attest, read here what a node does with a credential, and read the program that the apps run with
+the master key.
 
 ## Structure
 
@@ -107,7 +110,7 @@ The first twelve rows are the limits that section 5 of egress-policy.md states.
 | The width of the address lists | The `api` lists of the definitions are path prefixes. A credential can reach every address under them |
 | `previous` of `oauth/merge` | Any record of kind `oauth` of the same account and provider is taken. The operator domain can choose to move the refresh token of one connection of a user into another connection of the same user and provider. That is a limit of integrity, not of confidentiality |
 | The freshness of a record | A node keeps no state about records. The operator domain stores them and can present an older record of an account, for example the one from before a refresh. That decides which token is used. It does not let anyone read one |
-| The honesty of the app | The app holds the master key and verifies the attestation. The app is not open source yet. Until it is, "the app is honest" is an assumption: an app that is not the published one can leak the master key. Verifying the app is outside this repository |
+| The honesty of the app | The app holds the master key and verifies the attestation. The app binary is not open source yet. The secure program that the app runs for this protocol is in this repository (`secure-program/`) and bound to the public record: a release build loads a served program only with the release proof of a release of this repository ([secure-program/README.md](secure-program/README.md)). What that does not show is that the binary runs the program unchanged: until the app is open source, "the app is honest" is an assumption, and an app that is not the published one can leak the master key. Verifying the app binary is outside this repository |
 | Side channels | The size and the time of a response |
 | The log store | The guarantee of the log store rests on AWS: on S3 Object Lock in compliance mode, and on the AWS account of the operator, which holds the bucket. When that account is closed, the bucket goes with it. An object can be deleted when its retention ended, 365 days after the write. The operator domain carries the bytes between a node and the store and can stop them: the node then uses no credential (the calls end with `log_store_unavailable`), so stopping the store stops the service and hides no use. The store can hold more entries than there were acts: an entry whose act failed afterwards or never started is in the store like any other. The operator domain holds the credentials for the bucket and can add objects to it: an object is an entry of a node when its body verifies under the signing key of that node (protocol.md 7.6) |
 | The transfer to a later release | The operator can move the delegations of a node to a node of a later release: a release whose measurements it signs with its release key and publishes in the public transparency log (protocol.md 10.3). The later release is another program, and the user keys are then under the rules of its source. The notice period between the entry of the log and the transfer is zero: an account does not learn of a release before its delegation can move there. What stays is the record: every release that received delegations is permanently in the public log, with the hash of its measurements under the signature of the release key |
@@ -226,6 +229,29 @@ target/release/credential-enclave-verify --url https://{api host} --measurements
 When `diff` prints nothing, your build of the tag is the published one. When the tool exits 0, the
 running nodes attest those measurements.
 
+### 4. Verify the secure program
+
+The apps run the device side of the protocol as a JavaScript program that this repository holds at
+`secure-program/secure-program.js` and that the backend of the operator serves to the apps. A
+release build of an app loads a served program only with the release proof of a release
+`secure-program-v{N}` of this repository: the statement of the release, signed by the release key
+and recorded in Rekor, with the inclusion proof of the entry ([docs/protocol.md](docs/protocol.md),
+"The secure program release").
+
+```bash
+git checkout secure-program-v{N}
+curl -L -O https://github.com/pickle-com/credential-enclave/releases/download/secure-program-v{N}/secure-program.release.json
+target/release/credential-enclave-verify program \
+  --source secure-program/secure-program.js --release secure-program.release.json
+```
+
+The tool runs the ten checks of the apps with the release key and the log key compiled into it and
+exits 0 with `program release secure-program-v{N}: version {N}, sha256 {hex}, log index {i}: ok`,
+or 1 with the code of the check that failed (`--help` lists the options). The encryption key
+screen of the app shows the version and the SHA-256 of the program it runs.
+[secure-program/README.md](secure-program/README.md) has the steps without the tool, and the
+limits.
+
 ## The egress policy
 
 [docs/egress-policy.md](docs/egress-policy.md) states which bytes can leave a node and what in the
@@ -248,11 +274,14 @@ enclave/release/   compiled into the node program: the release key of the operat
              key of the transparency log, the list of predecessors (predecessors.json)
 host/        crate credential-enclave-host: the host program
 verify/      crate credential-enclave-verify: the verification tool
+secure-program/   the secure program of the apps (the source of truth), the release statement
+             and monitor scripts, its README
 egress/      the list of the functions that read a secret, the list of the callers of the sinks
 scripts/     secret-access.sh: compares the source with the two lists
 build/       build.sh and the Dockerfiles of the reproducible build
 docs/        protocol.md, enclave.md, egress-policy.md
-.github/     the check and release workflows
+.github/     the check and release workflows, and the release and monitor workflows of the
+             secure program
 ```
 
 The toolchain is fixed by `rust-toolchain.toml` (Rust 1.98.1). The checks of every change:
@@ -282,6 +311,7 @@ curl http://127.0.0.1:8080/v1/health
 | [docs/protocol.md](docs/protocol.md) | The keys, the attestation, the commands of the app, the record, the log and the log store, the node statements, the delegation transfer, the failure codes, the test vectors |
 | [docs/enclave.md](docs/enclave.md) | The node program and the host program: the state of a node, every call, the write to the log store, the provider definitions, the address check, the build and the release |
 | [docs/egress-policy.md](docs/egress-policy.md) | What can leave a node, the rules E1 to E6, the class of every response field, the limits |
+| [secure-program/README.md](secure-program/README.md) | The secure program of the apps: what it is, what it never does, how a release is made and verified, its limits |
 
 ## License and security
 

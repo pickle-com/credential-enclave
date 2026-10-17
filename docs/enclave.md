@@ -66,8 +66,14 @@ credential-enclave/
 ├── host/                         # crate credential-enclave-host (binary credential-enclave-host)
 │   └── src/{main,launch,relay,egress,config,health,drain,http,testing}.rs
 ├── verify/                       # crate credential-enclave-verify (binary credential-enclave-verify)
-│   ├── src/{main,arguments,evaluate,fetch,render}.rs
-│   └── tests/{offline.rs,fixtures/}
+│   ├── src/{main,arguments,evaluate,fetch,render}.rs   # the attestation check
+│   ├── src/program.rs            # the subcommand program: the release proof of the secure program
+│   └── tests/{offline.rs,program.rs,fixtures/}
+├── secure-program/               # the secure program of the apps: protocol.md, "The secure program release"
+│   ├── secure-program.js         # the program (the source of truth; pickle-com/interactive-character vendors a byte-identical copy)
+│   ├── statement.py              # writes the release statement of a secure-program-v* tag
+│   ├── monitor.py                # compares the entries of the release key in the transparency log with the releases
+│   └── README.md
 ├── egress/
 │   ├── secret-access.tsv         # the functions that read a secret, and what each does with it
 │   └── sink-callers.tsv          # the functions that call a sink
@@ -78,7 +84,7 @@ credential-enclave/
 │   ├── Dockerfile.host           # the host image (nitro-cli, the host binary, enclave.eif)
 │   ├── Dockerfile.local          # the local platform image (the node binary as an ordinary process)
 │   └── build.sh                  # the single entry point of the build (prints the measurements as JSON)
-└── .github/workflows/{check.yml,release.yml}
+└── .github/workflows/{check.yml,release.yml,secure-program-release.yml,secure-program-monitor.yml}
 ```
 
 The crates and what they depend on, as their `Cargo.toml` files state it:
@@ -104,6 +110,12 @@ The crates and what they depend on, as their `Cargo.toml` files state it:
 - The two ECDSA P-256 SHA-256 signatures of an endorsement (protocol.md 10.3) are verified with
   `ring`, the crate that `rustls` and `rustls-webpki` use as their provider. The PEM of a public
   key is read by code of the protocol crate.
+- The verification tool verifies the ECDSA P-256 SHA-256 signatures of a secure program release
+  proof (protocol.md, "The secure program release": the release key over the statement, the log
+  key over the signed entry timestamp and over the checkpoint) with the `ring` provider of
+  `rustls`, which the tool carries for TLS, and reads PEM keys and computes SHA-256 with the
+  protocol crate (`verify/src/program.rs`). The subcommand adds no dependency: `Cargo.lock` is a
+  build input of the measured node program.
 - Dependencies of tests only: `rcgen` 0.13 (the certificates of the provider stand-in and of the
   attestation documents that tests build), and the feature `test-util` of `tokio`.
 - Every crate has `#![forbid(unsafe_code)]`: the source of this repository has no `unsafe` block
@@ -1147,10 +1159,14 @@ content of `out/measurements.json`) to the standard output, or the name of the h
 | --- | --- | --- |
 | `check.yml` | A push to any branch, a pull request | `check`: `cargo fmt --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, the vector check (`cargo run --locked -p credential-enclave-protocol --bin vectors -- --check`: the committed file equals the output of the generator), `scripts/secret-access.sh --check` (rule E2 of egress-policy.md). `measure` (on a push): `build/build.sh eif`, and `out/measurements.json` as the artifact `measurements` |
 | `release.yml` | The push of a `v*` tag | `check`: the checks above and `cargo audit` (no dependency of `Cargo.lock` has a security advisory). `build-a`, `build-b`: `build/build.sh eif` each, and the release of the build is the pushed tag. `compare`: the two `measurements.json` are equal, otherwise there is no release. `publish`: the host image around the enclave image file of `build-a` to `ghcr.io/pickle-com/credential-enclave/host:{tag}`, the GitHub release with `enclave.eif` and `measurements.json`, two attestations of the enclave image file (its build provenance, and the release statement of protocol.md section 9, whose predicate is `measurements.json`), and their bundles on the GitHub release (`provenance.sigstore.json`, `release-statement.sigstore.json`) |
+| `secure-program-release.yml` | The push of a `secure-program-v*` tag | `release`: `secure-program/statement.py` writes the release statement of the tag (protocol.md, "The secure program release"; the job fails when the version of `secure-program/secure-program.js` is not the N of the tag), creates the GitHub release of the tag with `secure-program.js` and `statement.json`, and attaches a build provenance attestation of the file (`secure-program-provenance.sigstore.json`). The signature of the release key and the entry of the transparency log are made outside this repository, by the operator on the machine that holds the release key, and uploaded to the same release as `secure-program.release.json` |
+| `secure-program-monitor.yml` | Every hour (`17 * * * *`), and `workflow_dispatch` | `monitor`: `secure-program/monitor.py` asks Rekor for every entry of the release key (`POST /api/v1/index/retrieve`) and compares the statement hash of each with the statements of the releases of this repository: of every `secure-program-v*` tag (the statement rebuilt from the file and the commit of the tag) and of every `v*` tag (the bytes of `measurements.json` of its GitHub release). An entry that no release explains, an entry of another key, or a log that cannot be read fails the job, and the job then opens the issue "Transparency log: entry of the release key without a matching release" with the report, or adds the report as a comment to the open one |
 
 - The runner is `ubuntu-24.04`, and every action is fixed by its commit SHA. The permissions of
   `publish` are `id-token: write`, `contents: write`, `attestations: write` and
-  `packages: write`.
+  `packages: write`. The permissions of `release` of `secure-program-release.yml` are
+  `contents: write`, `id-token: write` and `attestations: write`; those of `monitor` of
+  `secure-program-monitor.yml` are `contents: read` and `issues: write`.
 - GitHub records an attestation on the public Sigstore instance when the repository is public at
   the time of the run. An attestation of a run in a private repository is not on that public
   record. Its bundle is still attached to the GitHub release.
