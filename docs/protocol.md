@@ -1068,3 +1068,142 @@ against its attested grant ledger and every binding against the record it create
 `record_id`, `provider`, `operation`, typed `request`, `body_bytes`, `body_sha256` and `context`.
 The act starts only after the log store confirmed it. This is an attempted act, not a delivery
 receipt. Message content and application passwords are not in the event.
+
+## The secure program release
+
+The secure program (`secure-program/secure-program.js`) is the program of the app that implements
+the device side of this protocol: "the app" of sections 3 to 7 and 10.1. This repository is the
+source of truth of that file. The backend of the operator serves a byte-identical copy to the apps,
+and a release build of an app loads a served program only after it verified, on the device, that
+the program is the subject of a release statement signed by the release key of the operator and
+recorded in the public transparency log. This section states the release, the statement, the entry
+of the log, the release proof the backend hands the app, the keys, and the verification.
+
+### The release and its statement
+
+A release of the program is a tag `secure-program-v{N}` of this repository, where N is the value of
+the line `const VERSION = N;` of the file at that tag (the first such line in the file; a file
+without the line has the version 0). The release workflow refuses a tag whose N is not the version
+of the file. The tags `secure-program-v*` and the enclave release tags `v*` do not overlap.
+
+The release statement is one JSON object serialized to bytes by these rules:
+
+- Exactly seven keys, in this order: `kind`, `release`, `version`, `sha256`, `git_commit`,
+  `repository`, `path`.
+- No white space between tokens, characters outside ASCII escaped (the output of Python
+  `json.dumps(statement, separators=(",", ":"), ensure_ascii=True)`), followed by one LF (0x0A).
+  No other line break and no other white space.
+- `kind` is `"secure-program"`. `release` is the tag. `version` is the integer N, without a sign
+  and without a leading zero. `sha256` is the SHA-256 of the bytes of the file at the tag, 64
+  lower-case hexadecimal characters. `git_commit` is the commit the tag points to (an annotated tag
+  is peeled), 40 lower-case hexadecimal characters. `repository` is
+  `"pickle-com/credential-enclave"`. `path` is `"secure-program/secure-program.js"`.
+- At most 16,384 bytes, the limit of 10.3.
+
+```text
+{"kind":"secure-program","release":"secure-program-v27","version":27,"sha256":"<64 hex>","git_commit":"<40 hex>","repository":"pickle-com/credential-enclave","path":"secure-program/secure-program.js"}
+```
+
+`secure-program/statement.py` writes these bytes. The workflow `secure-program-release.yml`
+(enclave.md 11.2) runs it for the pushed tag and attaches the result to the GitHub release of the
+tag as `statement.json`, next to the file.
+
+A node does not take this statement for an endorsement of 10.3: check 1 of 10.3 requires `pcr0`,
+`pcr1` and `pcr2`, which this statement does not have. The two kinds of statement are signed by the
+same release key and do not mix.
+
+### The entry of the log
+
+The operator signs the bytes of the statement with the release key (ECDSA P-256 with SHA-256, the
+signature in ASN.1 DER) and records the signature in Rekor (rekor.sigstore.dev) as an entry of the
+kind `hashedrekord`, version 0.0.1: the body of 10.3, with the SHA-256 of the statement in
+`spec.data.hash.value`, the signature in `spec.signature.content` and the PEM of the release public
+key in `spec.signature.publicKey.content`. The log returns the body, the time at which it took the
+entry (`integratedTime`), the global index of the entry (`logIndex`), the log identifier (`logID`),
+the signed entry timestamp (the signature of the log key over the bytes stated in 10.3) and the
+inclusion proof: the index of the leaf in the active shard of the log (`inclusionProof.logIndex`,
+a value other than the global index), the size of the tree (`treeSize`), the root hash
+(`rootHash`), the hashes of the path from the leaf to the root (`hashes`) and the checkpoint, a
+signed note of that tree head (`checkpoint`).
+
+### The release proof
+
+The release proof is the JSON object the operator writes from the response of the log. The backend
+of the operator hands it to the app next to the program, and the same object is attached to the
+GitHub release of the tag as `secure-program.release.json`.
+
+```text
+{"statement": "<b64u of the bytes of the statement>",
+ "entry": {"body": "<standard base64, exactly as the log returned it>",
+           "integrated_time": <integer>, "log_index": <integer: the global index>,
+           "log_id": "<64 lower-case hexadecimal characters>",
+           "signed_entry_timestamp": "<standard base64>",
+           "inclusion_proof": {"log_index": <integer: the index in the shard>,
+                               "tree_size": <integer>,
+                               "root_hash": "<64 lower-case hexadecimal characters>",
+                               "hashes": ["<64 lower-case hexadecimal characters>", ...],
+                               "checkpoint": "<the checkpoint, exactly as the log returned it, its line breaks included>"}}}
+```
+
+### The keys
+
+Two values are compiled into the apps and into the verification tool of this repository
+(`credential-enclave-verify program`, `verify/src/program.rs`):
+
+| Value | What it is |
+| --- | --- |
+| The release key | The public key of the operator, the key of 10.3: `enclave/release/release-key.pem`. The apps hold the DER of its SubjectPublicKeyInfo |
+| The log key table | The public keys of the transparency log, by log identifier (the lower-case hexadecimal SHA-256 of the DER of the key, as in 10.3). The identifier `c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d` maps to `enclave/release/rekor-key.pem`. When the log signs with a new key, an app release adds a row; an app of an older build verifies no entry of the new key |
+
+### The verification
+
+The input is the bytes of the served program, the version the program declares (the
+`const VERSION = N;` line, 0 when the line is absent), the release proof, the release key and the
+log key table. The ten checks run in this order, and the first one that fails ends the
+verification with its code. An app logs a failure as `secure program rejected: release proof {code}`
+and does not load the program; the assembly of the backend refuses a bundle whose proof fails; the
+tool prints `program release: failed: {code}: {detail}`. No check reads a clock: the notice period
+is 0 seconds, as in 10.3. A decoding that fails (base64, UTF-8, JSON, hexadecimal) is a failure of
+the check that reads the value.
+
+| Check | Rule | Code |
+| --- | --- | --- |
+| 1 | The proof is a JSON object whose `statement` is a string and whose `entry` is an object | `proof_shape` |
+| 2 | `statement`, decoded from base64url without padding, is 1 to 16,384 bytes of UTF-8 that read as a JSON object with `kind` equal to `"secure-program"`, `version` an integer from 0 to 2^31 − 1, `sha256` 64 lower-case hexadecimal characters and `release` equal to `"secure-program-v"` followed by the decimal `version`. The other keys are not read | `statement_shape` |
+| 3 | The SHA-256 of the bytes of the program, in lower-case hexadecimal, equals `sha256` | `source_hash` |
+| 4 | The version the program declares equals `version` | `version_mismatch` |
+| 5 | `entry.log_id` is a key of the log key table. Its value is the log key of the checks below | `unknown_log` |
+| 6 | `entry.body` is a string of the characters `A` to `Z`, `a` to `z`, `0` to `9`, `+`, `/` and `=` that decodes to a JSON object with `apiVersion` `"0.0.1"`, `kind` `"hashedrekord"`, `spec.data.hash.algorithm` `"sha256"` and `spec.data.hash.value` equal to the lower-case hexadecimal SHA-256 of the statement bytes. `spec.signature.publicKey.content`, decoded from standard base64 and then read as PEM, gives the DER of the release key. `spec.signature.content` is a string, and `entry.integrated_time` and `entry.log_index` are integers | `entry_shape` |
+| 7 | `spec.signature.content`, decoded from standard base64, is an ASN.1 DER ECDSA signature of the release key over the statement bytes (SHA-256) | `release_signature` |
+| 8 | `entry.signed_entry_timestamp`, decoded from standard base64, is a signature of the log key over the UTF-8 bytes `{"body":"<entry.body>","integratedTime":<entry.integrated_time>,"logID":"<entry.log_id>","logIndex":<entry.log_index>}`: the keys in this order, no white space, the integers in decimal | `log_signature` |
+| 9 | `entry.inclusion_proof` is an object whose `log_index` and `tree_size` are integers (`tree_size` at least 1) and whose `root_hash` and every element of `hashes` are 64 lower-case hexadecimal characters. With `leaf = SHA-256(0x00 ∥ the decoded body)`, the path computation below ends with `sn = 0` and a root equal to `root_hash` | `inclusion_proof` |
+| 10 | `checkpoint` is a string that holds `"\n\n"`. The part before the first `"\n\n"`, split at `"\n"`, has at least three lines: the first is not empty (the origin of the log), the second is `tree_size` in decimal, and the third, decoded from standard base64, is the bytes of `root_hash`. Among the lines of the part after it, at least one starts with `"— "` (U+2014 and a space), continues as `{name} {base64}` with a non-empty name, and its base64 decodes to bytes whose first four equal the first four bytes of the SHA-256 of the DER of the log key and whose remainder is an ASN.1 DER ECDSA signature of the log key over the UTF-8 bytes of the part before the `"\n\n"` followed by one `"\n"` | `checkpoint` |
+
+The path computation of check 9 is that of RFC 6962 section 2.1.1:
+
+```text
+fn = inclusion_proof.log_index, sn = tree_size − 1, r = leaf
+for each p of hashes, in order:
+    if sn == 0: fail
+    if fn is odd or fn == sn:
+        r = SHA-256(0x01 ∥ p ∥ r)
+        while not (fn is odd or fn == 0): fn = fn >> 1, sn = sn >> 1
+    else:
+        r = SHA-256(0x01 ∥ r ∥ p)
+    fn = fn >> 1, sn = sn >> 1
+pass when sn == 0 and r == root_hash
+```
+
+### What the app requires
+
+An app runs the verification for a program that the backend served, in a release build. The
+program an app ships with is loaded without it, and a debug build loads a served program without
+it unless its verification lever is set. A served program also carries the deployment signatures
+of the operator (Ed25519, one per server target), which the app checks as before: the release
+proof is a second condition, not a replacement. An app that loaded a program shows the version and
+the SHA-256 of that program on its encryption key screen, so a user can compare them with a
+release of this repository.
+
+Three implementations run the same ten checks with the same codes: the apps (Swift on iOS, Kotlin
+on Android), the assembly of the backend of the operator (Python), and
+`credential-enclave-verify program` of this repository (Rust).

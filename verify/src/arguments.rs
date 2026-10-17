@@ -2,11 +2,14 @@
 
 use serde_json::Value;
 
+use crate::program::ProgramArguments;
+
 /// The text of `--help`, and what follows the message about an argument that is not understood.
 pub const USAGE: &str = "\
 usage:
   credential-enclave-verify --url https://{api host} [expected measurements] [--allow-local]
   credential-enclave-verify --document {file} --nonce {hex} [expected measurements]
+  credential-enclave-verify program --source {file} --release {file} [--release-key {pem}] [--log-key {pem}]...
 
 what is verified, one of:
   --url {address}        the running nodes: the tool sends
@@ -27,9 +30,17 @@ expected measurements, one of:
                          (no attestation verifies such a node)
   --help                 print this text
 
+program: verifies the release proof of the secure program (docs/protocol.md, the section The
+secure program release) with the ten checks of the apps:
+  --source {file}        the program file (secure-program/secure-program.js of the release)
+  --release {file}       the release proof (secure-program.release.json of the release)
+  --release-key {pem}    a release key in place of the compiled-in enclave/release/release-key.pem
+  --log-key {pem}        a log key in place of the compiled-in enclave/release/rekor-key.pem
+                         (may be given several times; the log id is the SHA-256 of the DER)
+
 exit status:
-  0  every node passed
-  1  at least one node failed
+  0  every node passed; program: the release proof holds
+  1  at least one node failed; program: a check failed (the output names its code)
   2  there is no result: the arguments, a file, the network, the HTTP status or the response
 ";
 
@@ -39,6 +50,8 @@ pub enum Command {
     /// `--help`.
     Help,
     Verify(Box<Arguments>),
+    /// `program ...`: the release proof of the secure program.
+    Program(Box<ProgramArguments>),
 }
 
 /// The arguments of a verification.
@@ -119,6 +132,9 @@ impl Measurements {
 
 /// Reads the command line (without the program name).
 pub fn parse(arguments: &[String]) -> Result<Command, String> {
+    if arguments.first().map(String::as_str) == Some("program") {
+        return parse_program(&arguments[1..]);
+    }
     let mut url = None;
     let mut document = None;
     let mut nonce = None;
@@ -217,6 +233,51 @@ pub fn parse(arguments: &[String]) -> Result<Command, String> {
         source,
         expected,
         allow_local,
+    })))
+}
+
+/// Reads the arguments of `program`: `--source` and `--release` once each, `--release-key` at
+/// most once, `--log-key` any number of times. `--name value` and `--name=value` are the same.
+fn parse_program(arguments: &[String]) -> Result<Command, String> {
+    let mut source = None;
+    let mut release = None;
+    let mut release_key = None;
+    let mut log_keys = Vec::new();
+    let mut rest = arguments.iter();
+    while let Some(argument) = rest.next() {
+        let (name, inline) = match argument.split_once('=') {
+            Some((name, value)) if name.starts_with("--") => (name, Some(value)),
+            _ => (argument.as_str(), None),
+        };
+        if name == "--help" || name == "-h" {
+            return Ok(Command::Help);
+        }
+        let value = match inline {
+            Some(value) => value.to_string(),
+            None => rest
+                .next()
+                .ok_or_else(|| format!("{name} needs a value"))?
+                .to_string(),
+        };
+        let slot = match name {
+            "--source" => &mut source,
+            "--release" => &mut release,
+            "--release-key" => &mut release_key,
+            "--log-key" => {
+                log_keys.push(value);
+                continue;
+            }
+            _ => return Err(format!("the argument {argument} is not known")),
+        };
+        if slot.replace(value).is_some() {
+            return Err(format!("{name} is given twice"));
+        }
+    }
+    Ok(Command::Program(Box::new(ProgramArguments {
+        source: source.ok_or("program needs --source")?,
+        release: release.ok_or("program needs --release")?,
+        release_key,
+        log_keys,
     })))
 }
 
