@@ -1,0 +1,38 @@
+# Every hour: every entry of the public transparency log that the release key signed must be the
+# statement of a release of this repository (an enclave release v* or a secure-program-v* release).
+# An entry that is not, or a log that cannot be read, opens an issue.
+name: secure-program-monitor
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: secure-program-monitor
+  cancel-in-progress: false
+jobs:
+  monitor:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Compare the entries of the release key with the releases of this repository
+        id: compare
+        run: python3 secure-program/monitor.py --repository "$GITHUB_REPOSITORY" --report report.md
+      - name: Open or update the issue
+        if: failure() && steps.compare.conclusion == 'failure'
+        run: |
+          title="Transparency log: entry of the release key without a matching release"
+          number=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
+          if [ -z "$number" ]; then
+            gh issue create --title "$title" --body-file report.md
+          else
+            gh issue comment "$number" --body-file report.md
+          fi

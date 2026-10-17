@@ -4,6 +4,7 @@
 //! credential-enclave-verify --url https://{api host} --measurements out/measurements.json
 //! credential-enclave-verify --url https://{api host} --pcr0 {hex} --pcr1 {hex} --pcr2 {hex}
 //! credential-enclave-verify --document {file} --nonce {hex} --measurements out/measurements.json
+//! credential-enclave-verify program --source secure-program/secure-program.js --release secure-program.release.json
 //! ```
 //!
 //! That the running nodes are the published source is verified in two halves. The first half
@@ -54,6 +55,7 @@
 mod arguments;
 mod evaluate;
 mod fetch;
+mod program;
 mod render;
 
 use std::io::Write;
@@ -119,6 +121,7 @@ fn run(arguments: &[String]) -> End {
             Ok(end) => end,
             Err(message) => End::no_result(&message),
         },
+        Ok(Command::Program(arguments)) => program::run(&arguments),
         Err(message) => End::no_result(&format!("{message}\n\n{USAGE}")),
     }
 }

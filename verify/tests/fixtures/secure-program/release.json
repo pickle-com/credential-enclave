@@ -1,0 +1,17 @@
+{
+  "statement": "eyJraW5kIjoic2VjdXJlLXByb2dyYW0iLCJyZWxlYXNlIjoic2VjdXJlLXByb2dyYW0tdjI3IiwidmVyc2lvbiI6MjcsInNoYTI1NiI6ImE0NjEwZjBhNzMyZTYzOWJiODE4ZmFkYzdhNTFiMzczYzY2MjlkNDJlNGQ2MDMzMzNjNDk0OWYwYmY3ZDUyZDAiLCJnaXRfY29tbWl0IjoiNzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3NyIsInJlcG9zaXRvcnkiOiJwaWNrbGUtY29tL2NyZWRlbnRpYWwtZW5jbGF2ZSIsInBhdGgiOiJzZWN1cmUtcHJvZ3JhbS9zZWN1cmUtcHJvZ3JhbS5qcyJ9Cg",
+  "entry": {
+    "body": "eyJhcGlWZXJzaW9uIjoiMC4wLjEiLCJraW5kIjoiaGFzaGVkcmVrb3JkIiwic3BlYyI6eyJkYXRhIjp7Imhhc2giOnsiYWxnb3JpdGhtIjoic2hhMjU2IiwidmFsdWUiOiIzZjVkZjYyODAzNTk2ODBmZjg4NDM0MDQ0MmQ5MWFmOGFkZTcxY2U0NjIxMWNhYzc0YjViNDFkYjFkYjM0NGNmIn19LCJzaWduYXR1cmUiOnsiY29udGVudCI6Ik1FVUNJUURMRVFudlB6bVVyNVJGaElnaXR6dmduSnNoQWVjekhaQ2ZPOFlOaEdEbGlRSWdFMjZ6Mkd4eVYyVEpzODVhVkRuVlBMMDlhRlk1WWRaNUxXaE1IWUtoZmdvPSIsInB1YmxpY0tleSI6eyJjb250ZW50IjoiTFMwdExTMUNSVWRKVGlCUVZVSk1TVU1nUzBWWkxTMHRMUzBLVFVacmQwVjNXVWhMYjFwSmVtb3dRMEZSV1VsTGIxcEplbW93UkVGUlkwUlJaMEZGYkhKMFJIb3phV3BtY0RrMVRDdFBTSEY0ZDJaQ1lXUnVibnBTTkFvcllrOHJkRTEyYW0wMlIweHBRU3M1ZGxFMFRWY3JibkV6TlU1TlYxbEpOVk5RYW5relJHMUdhWHAzT0ZkelNHaDFhMWhXVUZCaVVUQjNQVDBLTFMwdExTMUZUa1FnVUZWQ1RFbERJRXRGV1MwdExTMHRDZz09In19fX0=",
+    "integrated_time": 1792000000,
+    "log_index": 42,
+    "log_id": "4ee42dc6266ac1b77225b3f7395d6a5242e806c53b5aa062fc823725c53d9c5c",
+    "signed_entry_timestamp": "MEUCIQDqm8n7RGP0f3h8Vk5EBLKuSMp+L2Bu19Vc6xXx6dIAHgIgJMNxFpa0bZswd7gFwfW1CHwbr+71zTH7E+YG8IKBfVc=",
+    "inclusion_proof": {
+      "log_index": 0,
+      "tree_size": 1,
+      "root_hash": "575fc7d528682a6f6dba5f6c1a75698cea11377c7492c35b97ef3979633d9ca4",
+      "hashes": [],
+      "checkpoint": "rekor.test - 1\n1\nV1/H1ShoKm9tul9sGnVpjOoRN3x0ksNbl+85eWM9nKQ=\n\n— rekor.test TuQtxjBEAiAaTmsL3+CTj0Gx1nLyyKWHNi9A0YRTvbgdnaEcFLah5AIgIBDnp+uZ/2GbeXd26l1yX2C7aho3iUqpkbsOK6DDYxM=\n"
+    }
+  }
+}

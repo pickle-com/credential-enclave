@@ -1,0 +1,45 @@
+# The release of a secure-program-v* tag: the release statement (docs/protocol.md, "The secure
+# program release") and the GitHub release that carries the program and the statement. The
+# endorsement (the signature of the release key and the entry of the transparency log) is made
+# outside this repository and uploaded to the same release as secure-program.release.json.
+name: secure-program-release
+on:
+  push:
+    tags: ["secure-program-v*"]
+permissions: {}
+concurrency:
+  group: secure-program-release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The release statement of this tag
+        run: python3 secure-program/statement.py --tag "$TAG" --commit "$GITHUB_SHA" > statement.json
+      - name: Create the GitHub release with the program and the statement
+        run: |
+          { echo "Release statement:"; echo; echo '```json'; cat statement.json; echo '```'; } > notes.md
+          gh release view "$TAG" >/dev/null 2>&1 ||
+            gh release create "$TAG" --verify-tag --title "$TAG" --notes-file notes.md
+          gh release upload "$TAG" --clobber secure-program/secure-program.js statement.json
+      - name: Attest the build provenance of the program file
+        id: provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: secure-program/secure-program.js
+      - name: Attach the provenance bundle to the release
+        env:
+          PROVENANCE_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+        run: |
+          cp "$PROVENANCE_BUNDLE" secure-program-provenance.sigstore.json
+          gh release upload "$TAG" --clobber secure-program-provenance.sigstore.json
