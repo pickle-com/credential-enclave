@@ -48,6 +48,8 @@ use crate::state::{lock, Account, Node};
 
 /// Writes of one call that run at the same time.
 const WRITE_CONCURRENCY: usize = 32;
+/// Open connections to the log store that carry no write ([`IdleConnections`]).
+const IDLE_CONNECTIONS: usize = 32;
 /// Pending entries of one account at which a call that uses a credential creates no further
 /// entry before the store confirmed some of them ([`admit`]).
 pub const PENDING_ENTRIES: usize = 64;
@@ -271,7 +273,34 @@ pub struct LogStore {
     /// a verifier read there holds for as long as the node lives.
     id: OnceLock<LogStoreId>,
     credentials: RwLock<Option<Arc<Credentials>>>,
-    connections: Mutex<Vec<SendRequest<OnceBody>>>,
+    idle: IdleConnections,
+}
+
+/// The open HTTP/1.1 connections to the log store that carry no write, the most recently used
+/// last.
+#[derive(Default)]
+struct IdleConnections(Mutex<Vec<SendRequest<OnceBody>>>);
+
+impl IdleConnections {
+    /// The most recently used connection that is still open, once it is ready for a request.
+    async fn take(&self) -> Option<SendRequest<OnceBody>> {
+        loop {
+            let mut sender = lock(&self.0).pop()?;
+            if sender.ready().await.is_ok() {
+                return Some(sender);
+            }
+        }
+    }
+
+    /// Keeps a connection whose response has ended, while fewer than [`IDLE_CONNECTIONS`] are
+    /// kept.
+    fn put(&self, sender: SendRequest<OnceBody>) {
+        let mut connections = lock(&self.0);
+        connections.retain(|sender| !sender.is_closed());
+        if connections.len() < IDLE_CONNECTIONS {
+            connections.push(sender);
+        }
+    }
 }
 
 impl LogStore {
@@ -282,7 +311,7 @@ impl LogStore {
             required,
             id: OnceLock::new(),
             credentials: RwLock::new(None),
-            connections: Mutex::new(Vec::new()),
+            idle: IdleConnections::default(),
         }
     }
 
@@ -491,52 +520,36 @@ async fn write_claims(node: &Node, claims: &mut [Claim<'_>]) {
 /// operator. The connection goes to `{bucket}.s3.{region}.amazonaws.com`: TLS ends inside the
 /// node and the certificate is verified against the trust roots of the binary.
 ///
+/// The write goes over an idle connection when there is one. When that connection ends without
+/// a response, the write goes once more over a new connection: a `PUT` is idempotent (RFC 9110
+/// 9.2.2), and a repeated write adds a second version of the same object. A write over a new
+/// connection is not repeated.
+///
 /// The one confirmation is the status 200. Every other status, a failure of the connection
 /// and a write that takes longer than its time limit (5 seconds) are no confirmation.
 async fn send_to_log_store(node: &Node, writer: &Writer, user_id: &str, write: &Write) -> bool {
-    let exchange = async {
+    // One `PUT` of the entry: whether the store answered 200, or `None` when the connection
+    // ended without a response.
+    let put = |mut sender: SendRequest<OnceBody>| async move {
         let request = put_request(writer, &node.node, user_id, write, node.now_ms())?;
-        let (mut sender, pooled) = loop {
-            let pooled = lock(&node.log_store.connections).pop();
-            match pooled {
-                Some(mut sender) => {
-                    if sender.ready().await.is_ok() {
-                        break (sender, true);
-                    }
-                }
-                None => {
-                    break (
-                        node.egress
-                            .open(node.platform.as_ref(), &writer.id.host())
-                            .await
-                            .ok()?,
-                        false,
-                    );
-                }
-            }
-        };
-        let response = match sender.try_send_request(request).await {
-            Ok(response) => response,
-            Err(mut error) if pooled => {
-                // Hyper returns the request only if serialization to the connection never began.
-                let request = error.take_message()?;
-                sender = node
-                    .egress
-                    .open(node.platform.as_ref(), &writer.id.host())
-                    .await
-                    .ok()?;
-                sender.send_request(request).await.ok()?
-            }
-            Err(_) => return None,
-        };
+        let response = sender.send_request(request).await.ok()?;
         if response.body().is_end_stream() {
-            let mut connections = lock(&node.log_store.connections);
-            connections.retain(|sender| !sender.is_closed());
-            if connections.len() < WRITE_CONCURRENCY {
-                connections.push(sender);
-            }
+            node.log_store.idle.put(sender);
         }
         Some(response.status() == StatusCode::OK)
+    };
+    let exchange = async {
+        if let Some(sender) = node.log_store.idle.take().await {
+            if let Some(confirmed) = put(sender).await {
+                return Some(confirmed);
+            }
+        }
+        let sender = node
+            .egress
+            .open(node.platform.as_ref(), &writer.id.host())
+            .await
+            .ok()?;
+        put(sender).await
     };
     matches!(
         tokio::time::timeout(node.limits.log_write, exchange).await,

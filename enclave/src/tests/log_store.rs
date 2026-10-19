@@ -39,8 +39,10 @@ struct Script {
     refused: Vec<String>,
     /// The stand-in answers no write.
     silent: bool,
+    /// The stand-in closes the connection after each answer.
     close: bool,
-    disconnect: bool,
+    /// Writes the stand-in reads and answers by closing the connection without a response.
+    lost: usize,
     /// The stand-in answers a write after this pause.
     pause: Duration,
 }
@@ -81,8 +83,9 @@ async fn stand_in() -> (Provider, Store) {
             _ => Reply::json(200, &json!({"ok": true})),
         },
         move |seen| {
-            let script = lock(&script);
-            if script.disconnect {
+            let mut script = lock(&script);
+            if script.lost > 0 {
+                script.lost -= 1;
                 return Reply::Raw(Vec::new());
             }
             if script.silent {
@@ -1454,12 +1457,25 @@ async fn a_closed_log_connection_does_not_block_the_next_write() {
 }
 
 #[tokio::test]
-async fn a_write_with_a_lost_response_is_not_repeated_in_the_call() {
+async fn a_write_whose_idle_connection_ends_without_a_response_goes_over_a_new_connection() {
     let (provider, store) = stand_in().await;
     let (harness, app) = node_with_log_store(&provider).await;
-    lock(&store).disconnect = true;
+    lock(&store).lost = 1;
+    assert_eq!(release(&harness, &app, &password(&app)).await.0, 200);
+    let writes = writes(&provider);
+    assert_eq!(writes.len(), 3);
+    assert_eq!(seq_of(&writes[1]), seq_of(&writes[2]));
+    assert_eq!(harness.platform.connections().len(), 2);
+    assert_eq!(harness.health().await["log_store"]["pending"], 0);
+}
+
+#[tokio::test]
+async fn a_write_over_a_new_connection_is_not_repeated() {
+    let (provider, store) = stand_in().await;
+    let (harness, app) = node_with_log_store(&provider).await;
+    lock(&store).lost = 2;
     unavailable(&release(&harness, &app, &password(&app)).await);
-    assert_eq!(writes(&provider).len(), 2);
+    assert_eq!(writes(&provider).len(), 3);
     assert_eq!(harness.health().await["log_store"]["pending"], 1);
     confirm(&store);
     assert_eq!(release(&harness, &app, &password(&app)).await.0, 200);
