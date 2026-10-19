@@ -36,8 +36,9 @@ use credential_enclave_protocol::log::object_key;
 use credential_enclave_protocol::secret::Secret;
 use credential_enclave_protocol::{limits, ProtocolError};
 use hmac::{Hmac, Mac};
-use hyper::body::Bytes;
-use hyper::header::{HeaderValue, AUTHORIZATION, CONNECTION, CONTENT_LENGTH};
+use hyper::body::{Body, Bytes};
+use hyper::client::conn::http1::SendRequest;
+use hyper::header::{HeaderValue, AUTHORIZATION, CONTENT_LENGTH};
 use hyper::{Method, Request, StatusCode};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -270,6 +271,7 @@ pub struct LogStore {
     /// a verifier read there holds for as long as the node lives.
     id: OnceLock<LogStoreId>,
     credentials: RwLock<Option<Arc<Credentials>>>,
+    connections: Mutex<Vec<SendRequest<OnceBody>>>,
 }
 
 impl LogStore {
@@ -280,6 +282,7 @@ impl LogStore {
             required,
             id: OnceLock::new(),
             credentials: RwLock::new(None),
+            connections: Mutex::new(Vec::new()),
         }
     }
 
@@ -493,12 +496,46 @@ async fn write_claims(node: &Node, claims: &mut [Claim<'_>]) {
 async fn send_to_log_store(node: &Node, writer: &Writer, user_id: &str, write: &Write) -> bool {
     let exchange = async {
         let request = put_request(writer, &node.node, user_id, write, node.now_ms())?;
-        let mut sender = node
-            .egress
-            .open(node.platform.as_ref(), &writer.id.host())
-            .await
-            .ok()?;
-        let response = sender.send_request(request).await.ok()?;
+        let (mut sender, pooled) = loop {
+            let pooled = lock(&node.log_store.connections).pop();
+            match pooled {
+                Some(mut sender) => {
+                    if sender.ready().await.is_ok() {
+                        break (sender, true);
+                    }
+                }
+                None => {
+                    break (
+                        node.egress
+                            .open(node.platform.as_ref(), &writer.id.host())
+                            .await
+                            .ok()?,
+                        false,
+                    );
+                }
+            }
+        };
+        let response = match sender.try_send_request(request).await {
+            Ok(response) => response,
+            Err(mut error) if pooled => {
+                // Hyper returns the request only if serialization to the connection never began.
+                let request = error.take_message()?;
+                sender = node
+                    .egress
+                    .open(node.platform.as_ref(), &writer.id.host())
+                    .await
+                    .ok()?;
+                sender.send_request(request).await.ok()?
+            }
+            Err(_) => return None,
+        };
+        if response.body().is_end_stream() {
+            let mut connections = lock(&node.log_store.connections);
+            connections.retain(|sender| !sender.is_closed());
+            if connections.len() < WRITE_CONCURRENCY {
+                connections.push(sender);
+            }
+        }
         Some(response.status() == StatusCode::OK)
     };
     matches!(
@@ -559,7 +596,6 @@ fn put_request(
     }
     builder
         .header(AUTHORIZATION, authorization)
-        .header(CONNECTION, HeaderValue::from_static("close"))
         .body(OnceBody::new(Bytes::from(body)))
         .ok()
 }
@@ -808,7 +844,6 @@ mod tests {
                 ),
                 ("x-amz-security-token", "TOKEN"),
                 ("authorization", authorization),
-                ("connection", "close"),
             ]
         );
         // The request asks for no condition on the key: the store answers 200 only when it
@@ -816,7 +851,7 @@ mod tests {
         assert!(!request.headers().contains_key("if-none-match"));
         assert!(request.headers()[SECURITY_TOKEN].is_sensitive());
         assert!(!format!("{:?}", request.headers()).contains("TOKEN"));
-        // Every header but the length of the body and the header of the connection is
+        // Every header but the length of the body is
         // signed: signing the headers of the request again gives its `Authorization`.
         let signed: Vec<(&str, String)> = headers[1..8]
             .iter()
