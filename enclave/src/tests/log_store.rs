@@ -39,6 +39,8 @@ struct Script {
     refused: Vec<String>,
     /// The stand-in answers no write.
     silent: bool,
+    close: bool,
+    disconnect: bool,
     /// The stand-in answers a write after this pause.
     pause: Duration,
 }
@@ -80,6 +82,9 @@ async fn stand_in() -> (Provider, Store) {
         },
         move |seen| {
             let script = lock(&script);
+            if script.disconnect {
+                return Reply::Raw(Vec::new());
+            }
             if script.silent {
                 return Reply::Hang;
             }
@@ -92,6 +97,11 @@ async fn stand_in() -> (Provider, Store) {
                     b"",
                 ),
                 (false, status) => Reply::with_body(status, &[], b"<Error></Error>"),
+            };
+            let reply = if script.close {
+                reply
+            } else {
+                reply.keep_alive()
             };
             match script.pause.is_zero() {
                 true => reply,
@@ -204,7 +214,6 @@ fn assert_write_of(harness: &Harness, write: &Seen, entry: &Value) {
             "x-amz-object-lock-retain-until-date",
             "x-amz-security-token",
             "authorization",
-            "connection",
         ]
     );
     assert_eq!(write.header("content-type"), Some("application/json"));
@@ -222,7 +231,7 @@ fn assert_write_of(harness: &Harness, write: &Seen, entry: &Value) {
         write.header("x-amz-security-token"),
         Some(LOG_SESSION_TOKEN)
     );
-    assert_eq!(write.header("connection"), Some("close"));
+    assert_eq!(write.header("connection"), None);
     // The retention ends 365 days after the write: the same day and time one year later,
     // or the day before it when a leap day lies in between.
     let amz_date = write.header("x-amz-date").unwrap();
@@ -1410,4 +1419,79 @@ async fn calls_that_run_at_the_same_time_write_each_entry_once() {
     assert_eq!(seqs, [1, 2, 3, 4, 5]);
     let account = harness.node.account("user-1").unwrap();
     assert!(lock(&account).unconfirmed.is_empty());
+}
+
+#[tokio::test]
+async fn sequential_log_writes_share_one_tls_connection() {
+    let (provider, _store) = stand_in().await;
+    let (harness, app) = node_with_log_store(&provider).await;
+    for _ in 0..8 {
+        let (status, released) = release(&harness, &app, &password(&app)).await;
+        assert_eq!(status, 200, "{released}");
+    }
+    assert_eq!(writes(&provider).len(), 9);
+    assert_eq!(
+        harness
+            .platform
+            .connections()
+            .iter()
+            .filter(|(host, _)| host == LOG_HOST)
+            .count(),
+        1,
+    );
+}
+
+#[tokio::test]
+async fn a_closed_log_connection_does_not_block_the_next_write() {
+    let (provider, store) = stand_in().await;
+    lock(&store).close = true;
+    let (harness, app) = node_with_log_store(&provider).await;
+    for _ in 0..3 {
+        let (status, released) = release(&harness, &app, &password(&app)).await;
+        assert_eq!(status, 200, "{released}");
+    }
+    assert_eq!(writes(&provider).len(), 4);
+}
+
+#[tokio::test]
+async fn a_write_with_a_lost_response_is_not_repeated_in_the_call() {
+    let (provider, store) = stand_in().await;
+    let (harness, app) = node_with_log_store(&provider).await;
+    lock(&store).disconnect = true;
+    unavailable(&release(&harness, &app, &password(&app)).await);
+    assert_eq!(writes(&provider).len(), 2);
+    assert_eq!(harness.health().await["log_store"]["pending"], 1);
+    confirm(&store);
+    assert_eq!(release(&harness, &app, &password(&app)).await.0, 200);
+    assert_eq!(harness.health().await["log_store"]["pending"], 0);
+}
+
+#[tokio::test]
+async fn a_reused_connection_carries_the_current_credentials() {
+    let (provider, _store) = stand_in().await;
+    let (harness, app) = node_with_log_store(&provider).await;
+    let mut credentials = log_credentials(harness.node.now_ms() + 60_000);
+    credentials["session_token"] = json!("rotated-session-token");
+    assert_eq!(
+        harness
+            .post("/v1/log-store/credentials", credentials)
+            .await
+            .0,
+        200
+    );
+    assert_eq!(release(&harness, &app, &password(&app)).await.0, 200);
+    let writes = writes(&provider);
+    assert_eq!(
+        writes[0].header("x-amz-security-token"),
+        Some(LOG_SESSION_TOKEN)
+    );
+    assert_eq!(
+        writes[1].header("x-amz-security-token"),
+        Some("rotated-session-token")
+    );
+    assert_ne!(
+        writes[0].header("authorization"),
+        writes[1].header("authorization")
+    );
+    assert_eq!(harness.platform.connections().len(), 1);
 }

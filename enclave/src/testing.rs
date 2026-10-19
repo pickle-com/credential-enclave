@@ -206,6 +206,7 @@ impl Seen {
 pub enum Reply {
     /// The raw bytes of an HTTP/1.1 response.
     Raw(Vec<u8>),
+    KeepAlive(Duration, Vec<u8>),
     /// The raw bytes of an HTTP/1.1 response, sent after a pause.
     Late(Duration, Vec<u8>),
     /// No answer: the connection stays open and silent.
@@ -226,6 +227,17 @@ impl Reply {
     pub fn after(self, pause: Duration) -> Reply {
         match self {
             Reply::Raw(bytes) | Reply::Late(_, bytes) => Reply::Late(pause, bytes),
+            Reply::KeepAlive(_, bytes) => Reply::KeepAlive(pause, bytes),
+            Reply::Hang => Reply::Hang,
+        }
+    }
+
+    pub fn keep_alive(self) -> Reply {
+        match self {
+            Reply::Raw(bytes) => Reply::KeepAlive(Duration::ZERO, bytes),
+            Reply::Late(pause, bytes) | Reply::KeepAlive(pause, bytes) => {
+                Reply::KeepAlive(pause, bytes)
+            }
             Reply::Hang => Reply::Hang,
         }
     }
@@ -358,63 +370,74 @@ async fn serve_one(
         .server_name()
         .unwrap_or_default()
         .to_string();
-    let mut buffer = Vec::new();
-    let head_end = loop {
-        if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
-            break position + 4;
+    loop {
+        let mut buffer = Vec::new();
+        let head_end = loop {
+            if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position + 4;
+            }
+            let mut chunk = [0u8; 4096];
+            let read = tls.read(&mut chunk).await?;
+            if read == 0 {
+                return Ok(());
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+        };
+        let head = String::from_utf8_lossy(&buffer[..head_end]).to_string();
+        let mut lines = head.split("\r\n");
+        let mut request_line = lines.next().unwrap_or_default().split(' ');
+        let method = request_line.next().unwrap_or_default().to_string();
+        let target = request_line.next().unwrap_or_default().to_string();
+        let headers: Vec<(String, String)> = lines
+            .filter(|line| !line.is_empty())
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_string()))
+            .collect();
+        let length = headers
+            .iter()
+            .find(|(name, _)| name == "content-length")
+            .and_then(|(_, value)| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut body = buffer[head_end..].to_vec();
+        while body.len() < length {
+            let mut chunk = vec![0u8; 65536];
+            let read = tls.read(&mut chunk).await?;
+            if read == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..read]);
         }
-        let mut chunk = [0u8; 4096];
-        let read = tls.read(&mut chunk).await?;
-        if read == 0 {
-            return Ok(());
+        let seen = Seen {
+            server_name: server_name.clone(),
+            method,
+            target,
+            headers,
+            body,
+        };
+        lock(&recorded).push(seen.clone());
+        match handler(&seen) {
+            Reply::Raw(bytes) => {
+                tls.write_all(&bytes).await?;
+                tls.shutdown().await?;
+                return Ok(());
+            }
+            Reply::Late(pause, bytes) => {
+                tokio::time::sleep(pause).await;
+                tls.write_all(&bytes).await?;
+                tls.shutdown().await?;
+                return Ok(());
+            }
+            Reply::KeepAlive(pause, bytes) => {
+                tokio::time::sleep(pause).await;
+                tls.write_all(&bytes).await?;
+                tls.flush().await?;
+            }
+            Reply::Hang => {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                return Ok(());
+            }
         }
-        buffer.extend_from_slice(&chunk[..read]);
-    };
-    let head = String::from_utf8_lossy(&buffer[..head_end]).to_string();
-    let mut lines = head.split("\r\n");
-    let mut request_line = lines.next().unwrap_or_default().split(' ');
-    let method = request_line.next().unwrap_or_default().to_string();
-    let target = request_line.next().unwrap_or_default().to_string();
-    let headers: Vec<(String, String)> = lines
-        .filter(|line| !line.is_empty())
-        .filter_map(|line| line.split_once(':'))
-        .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_string()))
-        .collect();
-    let length = headers
-        .iter()
-        .find(|(name, _)| name == "content-length")
-        .and_then(|(_, value)| value.parse::<usize>().ok())
-        .unwrap_or(0);
-    let mut body = buffer[head_end..].to_vec();
-    while body.len() < length {
-        let mut chunk = vec![0u8; 65536];
-        let read = tls.read(&mut chunk).await?;
-        if read == 0 {
-            break;
-        }
-        body.extend_from_slice(&chunk[..read]);
     }
-    let seen = Seen {
-        server_name,
-        method,
-        target,
-        headers,
-        body,
-    };
-    lock(&recorded).push(seen.clone());
-    match handler(&seen) {
-        Reply::Raw(bytes) => {
-            tls.write_all(&bytes).await?;
-            tls.shutdown().await?;
-        }
-        Reply::Late(pause, bytes) => {
-            tokio::time::sleep(pause).await;
-            tls.write_all(&bytes).await?;
-            tls.shutdown().await?;
-        }
-        Reply::Hang => tokio::time::sleep(Duration::from_secs(3600)).await,
-    }
-    Ok(())
 }
 
 /// The bucket of the log store the tests name in the configuration of a node.
