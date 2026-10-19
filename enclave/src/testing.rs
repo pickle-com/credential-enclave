@@ -206,6 +206,8 @@ impl Seen {
 pub enum Reply {
     /// The raw bytes of an HTTP/1.1 response.
     Raw(Vec<u8>),
+    /// The raw bytes of an HTTP/1.1 response, sent after a pause, on a connection that stays
+    /// open for the next request.
     KeepAlive(Duration, Vec<u8>),
     /// The raw bytes of an HTTP/1.1 response, sent after a pause.
     Late(Duration, Vec<u8>),
@@ -232,6 +234,7 @@ impl Reply {
         }
     }
 
+    /// The same response, on a connection that stays open for the next request.
     pub fn keep_alive(self) -> Reply {
         match self {
             Reply::Raw(bytes) => Reply::KeepAlive(Duration::ZERO, bytes),
