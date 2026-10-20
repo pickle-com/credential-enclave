@@ -8,7 +8,10 @@ calls "the app": the device side of the credential protocol. It creates the mast
 the account keys from it (protocol.md section 3), verifies the attestation of enclave nodes
 (section 4), seals grants and revokes to a verified node (section 5), encrypts credential records
 (section 6), verifies and decrypts the credential log (section 7), keeps the ledger of the nodes
-that hold a grant, and transfers the master key between the devices of one account.
+that hold a grant, and transfers the master key between the devices of one account. Since version
+28 the program also reads the log store directly (protocol.md 7.4): the object version listing of
+the account's prefix is the index of completeness, and `LOG_CACHE_DAYS` is the window inside which
+an entry the backend does not serve counts as withheld.
 
 This file is the source of truth of the program. The repository `pickle-com/interactive-character`
 (the backend of the operator) vendors a byte-identical copy at `backend/assets/ui/secure-program.js`
