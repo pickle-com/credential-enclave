@@ -36,8 +36,9 @@ use credential_enclave_protocol::log::object_key;
 use credential_enclave_protocol::secret::Secret;
 use credential_enclave_protocol::{limits, ProtocolError};
 use hmac::{Hmac, Mac};
-use hyper::body::Bytes;
-use hyper::header::{HeaderValue, AUTHORIZATION, CONNECTION, CONTENT_LENGTH};
+use hyper::body::{Body, Bytes};
+use hyper::client::conn::http1::SendRequest;
+use hyper::header::{HeaderValue, AUTHORIZATION, CONTENT_LENGTH};
 use hyper::{Method, Request, StatusCode};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -47,6 +48,8 @@ use crate::state::{lock, Account, Node};
 
 /// Writes of one call that run at the same time.
 const WRITE_CONCURRENCY: usize = 32;
+/// Open connections to the log store that carry no write ([`IdleConnections`]).
+const IDLE_CONNECTIONS: usize = 32;
 /// Pending entries of one account at which a call that uses a credential creates no further
 /// entry before the store confirmed some of them ([`admit`]).
 pub const PENDING_ENTRIES: usize = 64;
@@ -270,6 +273,34 @@ pub struct LogStore {
     /// a verifier read there holds for as long as the node lives.
     id: OnceLock<LogStoreId>,
     credentials: RwLock<Option<Arc<Credentials>>>,
+    idle: IdleConnections,
+}
+
+/// The open HTTP/1.1 connections to the log store that carry no write, the most recently used
+/// last.
+#[derive(Default)]
+struct IdleConnections(Mutex<Vec<SendRequest<OnceBody>>>);
+
+impl IdleConnections {
+    /// The most recently used connection that is still open, once it is ready for a request.
+    async fn take(&self) -> Option<SendRequest<OnceBody>> {
+        loop {
+            let mut sender = lock(&self.0).pop()?;
+            if sender.ready().await.is_ok() {
+                return Some(sender);
+            }
+        }
+    }
+
+    /// Keeps a connection whose response has ended, while fewer than [`IDLE_CONNECTIONS`] are
+    /// kept.
+    fn put(&self, sender: SendRequest<OnceBody>) {
+        let mut connections = lock(&self.0);
+        connections.retain(|sender| !sender.is_closed());
+        if connections.len() < IDLE_CONNECTIONS {
+            connections.push(sender);
+        }
+    }
 }
 
 impl LogStore {
@@ -280,6 +311,7 @@ impl LogStore {
             required,
             id: OnceLock::new(),
             credentials: RwLock::new(None),
+            idle: IdleConnections::default(),
         }
     }
 
@@ -488,18 +520,36 @@ async fn write_claims(node: &Node, claims: &mut [Claim<'_>]) {
 /// operator. The connection goes to `{bucket}.s3.{region}.amazonaws.com`: TLS ends inside the
 /// node and the certificate is verified against the trust roots of the binary.
 ///
+/// The write goes over an idle connection when there is one. When that connection ends without
+/// a response, the write goes once more over a new connection: a `PUT` is idempotent (RFC 9110
+/// 9.2.2), and a repeated write adds a second version of the same object. A write over a new
+/// connection is not repeated.
+///
 /// The one confirmation is the status 200. Every other status, a failure of the connection
 /// and a write that takes longer than its time limit (5 seconds) are no confirmation.
 async fn send_to_log_store(node: &Node, writer: &Writer, user_id: &str, write: &Write) -> bool {
-    let exchange = async {
+    // One `PUT` of the entry: whether the store answered 200, or `None` when the connection
+    // ended without a response.
+    let put = |mut sender: SendRequest<OnceBody>| async move {
         let request = put_request(writer, &node.node, user_id, write, node.now_ms())?;
-        let mut sender = node
+        let response = sender.send_request(request).await.ok()?;
+        if response.body().is_end_stream() {
+            node.log_store.idle.put(sender);
+        }
+        Some(response.status() == StatusCode::OK)
+    };
+    let exchange = async {
+        if let Some(sender) = node.log_store.idle.take().await {
+            if let Some(confirmed) = put(sender).await {
+                return Some(confirmed);
+            }
+        }
+        let sender = node
             .egress
             .open(node.platform.as_ref(), &writer.id.host())
             .await
             .ok()?;
-        let response = sender.send_request(request).await.ok()?;
-        Some(response.status() == StatusCode::OK)
+        put(sender).await
     };
     matches!(
         tokio::time::timeout(node.limits.log_write, exchange).await,
@@ -559,7 +609,6 @@ fn put_request(
     }
     builder
         .header(AUTHORIZATION, authorization)
-        .header(CONNECTION, HeaderValue::from_static("close"))
         .body(OnceBody::new(Bytes::from(body)))
         .ok()
 }
@@ -808,7 +857,6 @@ mod tests {
                 ),
                 ("x-amz-security-token", "TOKEN"),
                 ("authorization", authorization),
-                ("connection", "close"),
             ]
         );
         // The request asks for no condition on the key: the store answers 200 only when it
@@ -816,7 +864,7 @@ mod tests {
         assert!(!request.headers().contains_key("if-none-match"));
         assert!(request.headers()[SECURITY_TOKEN].is_sensitive());
         assert!(!format!("{:?}", request.headers()).contains("TOKEN"));
-        // Every header but the length of the body and the header of the connection is
+        // Every header but the length of the body is
         // signed: signing the headers of the request again gives its `Authorization`.
         let signed: Vec<(&str, String)> = headers[1..8]
             .iter()
