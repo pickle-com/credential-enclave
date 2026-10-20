@@ -828,24 +828,24 @@ The rules for `public` and `id_token_claims` are in 6.4, the rules for `api` in 
 
 ### 6.2 The values of the definitions
 
-| | google_workspace | microsoft | slack | notion | x | link | granola | mercury | github |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| client | static | static | static | static | static | static | dynamic | dynamic | static |
-| authorize url | `https://accounts.google.com/o/oauth2/v2/auth` | `https://login.microsoftonline.com/common/oauth2/v2.0/authorize` | `https://slack.com/oauth/v2/authorize` | `https://api.notion.com/v1/oauth/authorize` | `https://x.com/i/oauth2/authorize` | `https://login.link.com/auth` | `https://mcp-auth.granola.ai/oauth2/authorize` | `https://mcp.mercury.com/authorize` | `https://github.com/login/oauth/authorize` |
-| authorize fixed | None | None | None | `owner=user` | None | None | `resource=https://mcp.granola.ai/mcp` | `resource=https://mcp.mercury.com/mcp` | None |
-| authorize allowed | `scope`, `access_type`, `prompt`, `include_granted_scopes`, `login_hint` | `scope`, `prompt`, `login_hint` | `user_scope` | None | `scope` | `scope` | `scope` | `scope` | `prompt`, `login` |
-| key_param | None | None | None | None | None | `key` | None | None | None |
-| scope_param, delimiter | `scope`, space | `scope`, space | `user_scope`, `,` | None | `scope`, space | `scope`, space | `scope`, space | `scope`, space | None |
-| pkce | S256 | S256 | none | none | S256 | S256 | S256 | S256 | S256 |
-| token url | `https://oauth2.googleapis.com/token` | `https://login.microsoftonline.com/common/oauth2/v2.0/token` | `https://slack.com/api/oauth.v2.access` | `https://api.notion.com/v1/oauth/token` | `https://api.x.com/2/oauth2/token` | `https://login.link.com/auth/token` | `https://mcp-auth.granola.ai/oauth2/token` | `https://mcp.mercury.com/token` | `https://github.com/login/oauth/access_token` |
-| token client_auth, body | body, form | body, form | body, form | basic, json | basic, form | body, form | none, form | none, form | body, form |
-| token headers | None | None | None | `Notion-Version: 2025-09-03` | None | None | None | None | `Accept: application/json` |
-| token bearer | None | None | None | None | None | `publishable_key` | None | None | None |
-| token fixed | None | None | None | None | None | None | `resource=https://mcp.granola.ai/mcp` | `resource=https://mcp.mercury.com/mcp` | None |
-| ok_field | None | None | `ok` | None | None | None | None | None | None |
-| token_container | None | None | `authed_user` | None | None | None | None | None | None |
-| revoke | `https://oauth2.googleapis.com/revoke`, client_auth none | None | None | None | `https://api.x.com/2/oauth2/revoke`, client_auth basic | `https://login.link.com/auth/revoke`, client_auth body, bearer `publishable_key` | None | None | None |
-| inject paths | `access_token` | `access_token` | `authed_user.access_token`, `access_token` | `access_token` | `access_token` | `access_token` | `access_token` | `access_token` | `access_token` (two rules: 6.1) |
+| | google_workspace | microsoft | slack | notion | x | link | granola | mercury | github | smartthings |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| client | static | static | static | static | static | static | dynamic | dynamic | static | static |
+| authorize url | `https://accounts.google.com/o/oauth2/v2/auth` | `https://login.microsoftonline.com/common/oauth2/v2.0/authorize` | `https://slack.com/oauth/v2/authorize` | `https://api.notion.com/v1/oauth/authorize` | `https://x.com/i/oauth2/authorize` | `https://login.link.com/auth` | `https://mcp-auth.granola.ai/oauth2/authorize` | `https://mcp.mercury.com/authorize` | `https://github.com/login/oauth/authorize` | `https://api.smartthings.com/oauth/authorize` |
+| authorize fixed | None | None | None | `owner=user` | None | None | `resource=https://mcp.granola.ai/mcp` | `resource=https://mcp.mercury.com/mcp` | None | None |
+| authorize allowed | `scope`, `access_type`, `prompt`, `include_granted_scopes`, `login_hint` | `scope`, `prompt`, `login_hint` | `user_scope` | None | `scope` | `scope` | `scope` | `scope` | `prompt`, `login` | `scope` |
+| key_param | None | None | None | None | None | `key` | None | None | None | None |
+| scope_param, delimiter | `scope`, space | `scope`, space | `user_scope`, `,` | None | `scope`, space | `scope`, space | `scope`, space | `scope`, space | None | `scope`, space |
+| pkce | S256 | S256 | none | none | S256 | S256 | S256 | S256 | S256 | none |
+| token url | `https://oauth2.googleapis.com/token` | `https://login.microsoftonline.com/common/oauth2/v2.0/token` | `https://slack.com/api/oauth.v2.access` | `https://api.notion.com/v1/oauth/token` | `https://api.x.com/2/oauth2/token` | `https://login.link.com/auth/token` | `https://mcp-auth.granola.ai/oauth2/token` | `https://mcp.mercury.com/token` | `https://github.com/login/oauth/access_token` | `https://auth-global.api.smartthings.com/oauth/token` |
+| token client_auth, body | body, form | body, form | body, form | basic, json | basic, form | body, form | none, form | none, form | body, form | basic, form |
+| token headers | None | None | None | `Notion-Version: 2025-09-03` | None | None | None | None | `Accept: application/json` | None |
+| token bearer | None | None | None | None | None | `publishable_key` | None | None | None | None |
+| token fixed | None | None | None | None | None | None | `resource=https://mcp.granola.ai/mcp` | `resource=https://mcp.mercury.com/mcp` | None | None |
+| ok_field | None | None | `ok` | None | None | None | None | None | None | None |
+| token_container | None | None | `authed_user` | None | None | None | None | None | None | None |
+| revoke | `https://oauth2.googleapis.com/revoke`, client_auth none | None | None | None | `https://api.x.com/2/oauth2/revoke`, client_auth basic | `https://login.link.com/auth/revoke`, client_auth body, bearer `publishable_key` | None | None | None | None |
+| inject paths | `access_token` | `access_token` | `authed_user.access_token`, `access_token` | `access_token` | `access_token` | `access_token` | `access_token` | `access_token` | `access_token` (two rules: 6.1) | `access_token` |
 
 Every definition injects the header `Authorization`. The prefix is `Bearer ` everywhere but in
 github: there the rules of `api.github.com` and `uploads.github.com` have the prefix `token ` and
@@ -863,6 +863,7 @@ The public fields of the definitions (path: type, and the limit of a string in b
 | notion | `workspace_id`: string 64. `workspace_name`: string 256. `workspace_icon`: string 2048. `bot_id`: string 64. `duplicated_template_id`: string 64. `owner.type`: string 32. `owner.user.id`: string 64. `owner.user.name`: string 256. `owner.user.avatar_url`: string 2048. `owner.user.type`: string 32. `owner.user.person.email`: string 320 | None |
 | x, link, granola, mercury | `scope`: string 8192. `expires_in`: integer. `token_type`: string 32 | None |
 | github | `scope`: string 8192. `expires_in`: integer. `refresh_token_expires_in`: integer. `token_type`: string 32 | None |
+| smartthings | `scope`: string 8192. `expires_in`: integer. `token_type`: string 32. `installed_app_id`: string 64 | None |
 
 No definition has a list of allowed scopes (`scopes`): the consent page of the provider shows the
 requested scopes to the user, and the `api` list bounds the addresses that a token can reach.
@@ -871,8 +872,8 @@ For a provider with `pkce` `S256`, the authorization code that passes through th
 operator is of no use outside the node, because the verifier never leaves the node. This rests on
 the token address of the provider: it must require the `code_verifier` of an authorization that
 carried a `code_challenge` (RFC 7636 section 4.6). That is part of the contract of a provider that
-section 1 of egress-policy.md assumes. The providers with `pkce` `none` (slack, notion) are a
-stated limit (section 5 of egress-policy.md).
+section 1 of egress-policy.md assumes. The providers with `pkce` `none` (slack, notion,
+smartthings) are a stated limit (section 5 of egress-policy.md).
 
 The inject rules by host (6.1): every definition but github has one rule for every host.
 
@@ -952,6 +953,7 @@ value that the definition does not list does not leave the node.
 | github | `api.github.com` | Prefixes `/user`, `/users/`, `/repos/`, `/search/`, `/orgs/`, `/rate_limit`. Exact `/graphql` |
 | | `uploads.github.com` | Prefix `/repos/` (the release asset uploads `/repos/{owner}/{repo}/releases/{id}/assets`) |
 | | `github.com` | Suffixes `/info/refs`, `/git-upload-pack`, `/git-receive-pack` (the git smart HTTP addresses `/{owner}/{repo}.git/info/refs`, `.../git-upload-pack`, `.../git-receive-pack`) |
+| smartthings | `api.smartthings.com` | Prefixes `/v1/devices`, `/v1/locations`, `/v1/capabilities` |
 
 The rules:
 
@@ -1076,7 +1078,7 @@ takes no argument, and it reads its configuration from environment variables.
 | Start | `nitro-cli run-enclave --eif-path /opt/credential-enclave/enclave.eif --cpu-count 2 --memory 4096 --enclave-cid 16`. When the start fails, the host program prints the ends of the `nitro-cli` log files and ends with a status that is not 0 |
 | Inbound relay | For every connection on TCP `0.0.0.0:8080` it opens a connection to vsock `16:8080` and moves the bytes in both directions. It does not read the bytes: the call surface of the node ends inside the enclave |
 | Egress relay | It listens on vsock port 8443. It reads the first line `CONNECT {host}:{port}\n`. When the host is on the allow list and the port is 443, it connects by TCP, answers `OK\n` and moves the bytes. Otherwise it sends `ERR\n` and closes. The allow list is the hosts of section 7, the hosts of the token addresses and the revocation addresses of 6.2 (the host program is built from the same definitions file), and the host of the log store, `{bucket}.s3.{region}.amazonaws.com`, when the two variables of the next row name one. TLS ends inside the node, so the relay sees ciphertext only. This list is a second line: the node itself sends a credential only to the addresses of its definitions, and log entries only to its log store |
-| Operator configuration | It reads the values of every provider from environment variables and calls `POST /v1/config` once the `health` call of the node answers. The variables: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `OUTLOOK_CLIENT_ID`, `OUTLOOK_CLIENT_SECRET`, `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `NOTION_CLIENT_ID`, `NOTION_CLIENT_SECRET`, `X_CLIENT_ID`, `X_CLIENT_SECRET`, `LINK_CLIENT_ID`, `LINK_CLIENT_SECRET`, `STRIPE_PUBLISHABLE_KEY`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, and `CHARACTER_API_BASE_URL` (the front of the callback address `{value}/api/integrations/{provider}/oauth/callback`). The configuration names every provider of the definitions: `redirect_uri` is always set, and a value without a variable is the empty string. `CREDENTIAL_ENCLAVE_LOG_BUCKET` and `CREDENTIAL_ENCLAVE_LOG_REGION` name the log store: when both are set and have the forms of protocol.md 4.1, the configuration carries them as `log_store`. When one is missing or has another form, the configuration carries no `log_store` and one line of the log says why. Without `CHARACTER_API_BASE_URL` no configuration is sent. A configuration that the node refuses is not sent again. The host program does not send the credentials for the log store: the backend sends them (5.14) |
+| Operator configuration | It reads the values of every provider from environment variables and calls `POST /v1/config` once the `health` call of the node answers. The variables: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `OUTLOOK_CLIENT_ID`, `OUTLOOK_CLIENT_SECRET`, `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `NOTION_CLIENT_ID`, `NOTION_CLIENT_SECRET`, `X_CLIENT_ID`, `X_CLIENT_SECRET`, `LINK_CLIENT_ID`, `LINK_CLIENT_SECRET`, `STRIPE_PUBLISHABLE_KEY`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `SMARTTHINGS_CLIENT_ID`, `SMARTTHINGS_CLIENT_SECRET`, and `CHARACTER_API_BASE_URL` (the front of the callback address `{value}/api/integrations/{provider}/oauth/callback`). The configuration names every provider of the definitions: `redirect_uri` is always set, and a value without a variable is the empty string. `CREDENTIAL_ENCLAVE_LOG_BUCKET` and `CREDENTIAL_ENCLAVE_LOG_REGION` name the log store: when both are set and have the forms of protocol.md 4.1, the configuration carries them as `log_store`. When one is missing or has another form, the configuration carries no `log_store` and one line of the log says why. Without `CHARACTER_API_BASE_URL` no configuration is sent. A configuration that the node refuses is not sent again. The host program does not send the credentials for the log store: the backend sends them (5.14) |
 | Status | TCP 9091: `GET /healthz` (200 when the round trip of the `health` call of the node succeeds within 2 seconds, 503 otherwise) and `GET /metrics` (the Prometheus text format). Four gauges: `credential_enclave_up` (1 when the `health` round trip succeeds, 0 when it fails), `credential_enclave_configured` (1 when `configured` of `health` is true), `credential_enclave_accounts` (`accounts` of `health`), `credential_enclave_started_timestamp_seconds` (`started_ms` of `health` in seconds) |
 | Sending the operator configuration again | Does not happen. The configuration is sent once at the start. To change a value, the pod is replaced |
 | Shutdown | On SIGTERM (or SIGINT) the host program calls `POST {CREDENTIAL_ENCLAVE_DRAIN_URL}` (the shutdown collection route of the backend): the body `{"pod": "<the value of CREDENTIAL_ENCLAVE_POD_NAME>"}`, the headers `Authorization: Bearer {CREDENTIAL_ENCLAVE_DRAIN_TOKEN}` and `Content-Type: application/json`. Inside that request the backend makes the calls of the orderly shutdown to the node (5.11, 5.13), through the inbound relay. The host program waits for the response (at most 100 seconds), then calls `nitro-cli terminate-enclave --all` and ends. When one of the three variables (`CREDENTIAL_ENCLAVE_DRAIN_URL`, `CREDENTIAL_ENCLAVE_DRAIN_TOKEN`, `CREDENTIAL_ENCLAVE_POD_NAME`) is missing, it ends the enclave without the collection |

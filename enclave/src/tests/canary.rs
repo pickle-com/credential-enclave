@@ -124,10 +124,19 @@ const GITHUB_LEAVES: Leaves = &[
     ("token_type", Leaf::Text(32)),
 ];
 
+/// The public fields of smartthings: the common leaves and the id of the installed app the
+/// authorization created.
+const SMARTTHINGS_LEAVES: Leaves = &[
+    ("scope", Leaf::Text(8192)),
+    ("expires_in", Leaf::Integer),
+    ("token_type", Leaf::Text(32)),
+    ("installed_app_id", Leaf::Text(64)),
+];
+
 /// The public fields of every provider (egress-policy.md section 4): the leaves of the token
 /// object by their paths, then the claims of the `id_token`. Nothing else of a token response
 /// leaves a node.
-const PUBLIC: [(&str, Leaves, Leaves); 9] = [
+const PUBLIC: [(&str, Leaves, Leaves); 10] = [
     (
         "google_workspace",
         OAUTH_LEAVES,
@@ -192,6 +201,7 @@ const PUBLIC: [(&str, Leaves, Leaves); 9] = [
     ("granola", OAUTH_LEAVES, &[]),
     ("mercury", OAUTH_LEAVES, &[]),
     ("github", GITHUB_LEAVES, &[]),
+    ("smartthings", SMARTTHINGS_LEAVES, &[]),
 ];
 
 impl Leaf {

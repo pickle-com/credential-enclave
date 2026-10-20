@@ -388,7 +388,7 @@ They do not show:
 | --- | --- |
 | The contract of a provider | A token that a provider sends at a place the definition does not list, in another form, or a second credential an API derives from the token and returns, is not found by the checks of E4 |
 | Consent outside the app | The OAuth application (client id and client secret) belongs to the operator. When a user consents on the authorization page outside the connect flow of the app, that authorization does not pass through a node and these rules do not reach it. The app continues its connect flow only after it verified the signature and the 32-byte `sign_pk` of the node statement (protocol.md 8.2) |
-| Providers without PKCE (`slack`, `notion`) | The authorization code passes through the callback of the operator domain, which also holds the client secret: the operator domain can exchange that code itself. With PKCE the verifier never leaves the node, so the code is of no use outside it |
+| Providers without PKCE (`slack`, `notion`, `smartthings`) | The authorization code passes through the callback of the operator domain, which also holds the client secret: the operator domain can exchange that code itself. With PKCE the verifier never leaves the node, so the code is of no use outside it |
 | A token of kind `oauth_imported` | The operator domain held it before the device encrypted it. From then on the node keeps it like any token. What happened to it before is outside these rules |
 | APIs that open a lasting access, and signed addresses | The guarantee ends with the log entry of the call |
 | The width of the address lists | The `api` lists of the definitions are path prefixes. A credential can reach every address under them |

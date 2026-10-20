@@ -97,7 +97,7 @@ struct ClientVariables {
 
 /// The variables the host program reads, per provider of the definitions. A provider without a
 /// row has no client values of the operator (its clients are registered dynamically).
-const CLIENT_VARIABLES: [ClientVariables; 7] = [
+const CLIENT_VARIABLES: [ClientVariables; 8] = [
     ClientVariables {
         provider: "google_workspace",
         client_id: "GOOGLE_CLIENT_ID",
@@ -138,6 +138,12 @@ const CLIENT_VARIABLES: [ClientVariables; 7] = [
         provider: "github",
         client_id: "GITHUB_CLIENT_ID",
         client_secret: "GITHUB_CLIENT_SECRET",
+        publishable_key: None,
+    },
+    ClientVariables {
+        provider: "smartthings",
+        client_id: "SMARTTHINGS_CLIENT_ID",
+        client_secret: "SMARTTHINGS_CLIENT_SECRET",
         publishable_key: None,
     },
 ];
@@ -343,7 +349,8 @@ mod tests {
                 "link",
                 "granola",
                 "mercury",
-                "github"
+                "github",
+                "smartthings"
             ])
         );
         assert!(provider_names("[]").is_err());
@@ -429,6 +436,12 @@ mod tests {
                     "client_id": "",
                     "client_secret": "",
                     "redirect_uri": "https://api.example.test/api/integrations/github/oauth/callback",
+                    "publishable_key": "",
+                },
+                "smartthings": {
+                    "client_id": "",
+                    "client_secret": "",
+                    "redirect_uri": "https://api.example.test/api/integrations/smartthings/oauth/callback",
                     "publishable_key": "",
                 },
             }
@@ -581,7 +594,7 @@ mod tests {
         assert_eq!(
             line,
             "operator configuration: client id set for google_workspace, link; \
-             not set for microsoft, slack, notion, x, granola, mercury, github"
+             not set for microsoft, slack, notion, x, granola, mercury, github, smartthings"
         );
         assert_eq!(
             summary(&names(&["slack"]), &environment(&[])),

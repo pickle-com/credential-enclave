@@ -220,5 +220,26 @@
       {"host": "uploads.github.com", "prefixes": ["/repos/"], "exact": []},
       {"host": "github.com", "prefixes": [], "exact": [], "suffixes": ["/info/refs", "/git-upload-pack", "/git-receive-pack"]}
     ]
+  },
+  "smartthings": {
+    "client": "static",
+    "authorize": {"url": "https://api.smartthings.com/oauth/authorize", "fixed": [], "allowed": ["scope"], "key_param": ""},
+    "scope_param": "scope",
+    "scope_delimiter": " ",
+    "pkce": "none",
+    "token": {"url": "https://auth-global.api.smartthings.com/oauth/token", "client_auth": "basic", "body": "form", "headers": [], "bearer": "", "fixed": [], "ok_field": ""},
+    "token_container": "",
+    "revoke": null,
+    "inject": {"header": "Authorization", "prefix": "Bearer ", "paths": ["access_token"]},
+    "public": [
+      {"path": "scope", "type": "string", "max": 8192},
+      {"path": "expires_in", "type": "integer"},
+      {"path": "token_type", "type": "string", "max": 32},
+      {"path": "installed_app_id", "type": "string", "max": 64}
+    ],
+    "id_token_claims": [],
+    "api": [
+      {"host": "api.smartthings.com", "prefixes": ["/v1/devices", "/v1/locations", "/v1/capabilities"], "exact": []}
+    ]
   }
 }
