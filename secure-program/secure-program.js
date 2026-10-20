@@ -46,6 +46,24 @@
   const LOG_STORE_OBJECTS = 100;
   const LOG_STORE_SEQ_DIGITS = 20;
   const LOG_STORE_TIMEOUT_MS = 20000;
+  // The object GETs of one presigned batch run at most this many at a time.
+  const LOG_STORE_FETCHES = 8;
+  // The nodes one verification run examines beyond the ledger (the node discovery listing). More
+  // unknown prefixes than this leave the run pending (the store state truncated).
+  const LOG_STORE_NODES = 16;
+  // An entry the store holds that the backend did not serve is judged withheld only once it is
+  // older than this: a storage the backend deferred (a database outage) catches up within it. The
+  // verification point stays before a younger entry and the next run looks at it again.
+  const LOG_WITHHELD_GRACE_MS = 3600000;
+  // Reads of the store that have kept failing for this long mark the log (attention): a pending
+  // the operator keeps up is not a verification that completes.
+  const LOG_STORE_STALE_MS = 3 * DAY_MS;
+  // The query keys a presigned listing address may carry besides the signature keys (X-Amz-...):
+  // the versions listing, its prefix and delimiter, the markers of the page, the page size (1000)
+  // and the encoding of the names in the response (url: the keys are decoded).
+  const LISTING_QUERY_KEYS = [
+    "versions", "prefix", "delimiter", "key-marker", "version-id-marker", "max-keys", "encoding-type",
+  ];
   // The entries of one later page of the log screen, the days of the recent summary, and the most
   // entries the summary reads.
   const LOG_SCREEN_PAGE = 50;
@@ -718,6 +736,9 @@
   function emptyLedger() {
     return {
       v: 1, revoked_ms: 0, resumed_ms: 0, ttl_days: GRANT_DAYS_MAX, ttl_set_ms: 0,
+      // The time the reads of the log store began to fail, 0 while they succeed (a run that
+      // completes with the store read clears it).
+      store_failing_ms: 0,
       nodes: Object.create(null),
     };
   }
@@ -755,6 +776,7 @@
     ledger.resumed_ms = whole(raw.resumed_ms);
     ledger.ttl_days = grantDays(raw.ttl_days);
     ledger.ttl_set_ms = whole(raw.ttl_set_ms);
+    ledger.store_failing_ms = whole(raw.store_failing_ms);
     const nodes = raw.nodes !== null && typeof raw.nodes === "object" ? raw.nodes : {};
     for (const id of Object.keys(nodes)) {
       const node = nodes[id];
@@ -773,6 +795,9 @@
         // delegation transfer) or store (found in the log store only: no grant of this app and no
         // traced transfer explains it).
         origin: node.origin === "store" ? "store" : "grant",
+        // For a node of origin store: the time an entry sealed to the key of this account was
+        // first verified on it (a delegation the app did not make), 0 otherwise.
+        unknown_ms: node.origin === "store" ? whole(node.unknown_ms) : 0,
       };
     }
     return ledger;
@@ -782,9 +807,10 @@
    *  granted_ms and not_after_ms of the side with the larger granted_ms, the checkpoint of the side
    *  with the larger checkpoint.seq, the final that is not null, the smaller non-zero gone_ms, the
    *  smaller first_ms, the non-empty sealing public key (with the platform and release of that
-   *  side), and the origin grant when either side has it. revoked_ms and resumed_ms are each the
-   *  larger value, and ttl_days is the value of the side with the larger ttl_set_ms (the one set
-   *  later). */
+   *  side), the origin grant when either side has it, and the smaller non-zero unknown_ms (0 when
+   *  the origin is grant). revoked_ms and resumed_ms are each the larger value, ttl_days is the
+   *  value of the side with the larger ttl_set_ms (the one set later), and store_failing_ms is the
+   *  smaller non-zero value. */
   function mergeLedger(a, b) {
     const merged = emptyLedger();
     merged.revoked_ms = Math.max(a.revoked_ms, b.revoked_ms);
@@ -792,6 +818,9 @@
     const later = b.ttl_set_ms > a.ttl_set_ms ? b : a;
     merged.ttl_days = later.ttl_days;
     merged.ttl_set_ms = later.ttl_set_ms;
+    merged.store_failing_ms = a.store_failing_ms === 0 || b.store_failing_ms === 0
+      ? Math.max(a.store_failing_ms, b.store_failing_ms)
+      : Math.min(a.store_failing_ms, b.store_failing_ms);
     for (const side of [a, b]) {
       for (const id of Object.keys(side.nodes)) {
         const node = side.nodes[id];
@@ -803,12 +832,16 @@
             not_after_ms: node.not_after_ms,
             checkpoint: { seq: node.checkpoint.seq, hash: node.checkpoint.hash },
             final: node.final === null ? null : { seq: node.final.seq, hash: node.final.hash },
-            gone_ms: node.gone_ms, origin: node.origin,
+            gone_ms: node.gone_ms, origin: node.origin, unknown_ms: node.unknown_ms,
           };
           continue;
         }
         kept.first_ms = Math.min(kept.first_ms, node.first_ms);
         if (kept.origin === "store" && node.origin !== "store") kept.origin = "grant";
+        if (node.unknown_ms !== 0 && (kept.unknown_ms === 0 || node.unknown_ms < kept.unknown_ms)) {
+          kept.unknown_ms = node.unknown_ms;
+        }
+        if (kept.origin !== "store") kept.unknown_ms = 0;
         // A node that entered through the tracing of a delegation transfer has an empty sealing
         // public key: the value of the side that verified the attestation is used.
         if (kept.seal_pk === "" && node.seal_pk !== "") {
@@ -1195,6 +1228,7 @@
       // transfer explains it, so it takes the shape of a traced node.
       if (known.origin === "store") {
         known.origin = "grant";
+        known.unknown_ms = 0;
         known.platform = node.platform;
         known.release = node.release;
         known.first_ms = Math.min(known.first_ms, whole(body.time_ms));
@@ -1207,6 +1241,7 @@
       sign_pk: to, seal_pk: "", platform: node.platform, release: node.release,
       first_ms: whole(body.time_ms), granted_ms: 0, not_after_ms: node.not_after_ms,
       checkpoint: { seq: 0, hash: ZERO_HASH }, final: null, gone_ms: 0, origin: "grant",
+      unknown_ms: 0,
     };
   }
 
@@ -1218,14 +1253,26 @@
 
   /** A failed read of the log store. kind is unreachable (a listing or an object could not be
    *  fetched or read), url_rejected (an address the backend handed out does not name the bucket of
-   *  this server target or the key, prefix and markers of the request), truncated (a listing went
-   *  on beyond LOG_STORE_PAGES pages) or disabled (the backend of this env has no log store). */
+   *  this server target or the key, prefix, markers and query of the request), truncated (a listing
+   *  went on beyond LOG_STORE_PAGES pages, or more unknown node prefixes than LOG_STORE_NODES) or
+   *  disabled (the backend of this env has no log store). */
   function storeFailure(kind) {
     return { log_store_failure: true, kind: kind };
   }
 
   function isStoreFailure(error) {
     return error !== null && typeof error === "object" && error.log_store_failure === true;
+  }
+
+  /** Records a store failure of this run in store (the state of the store reads of the run): the
+   *  refusal of a backend without a log store is absent for a debug build and refused for a release
+   *  build, any other failure is its kind. */
+  function storeFailed(store, error) {
+    if (error.kind === "disabled") {
+      store.state = native.deviceInfo().debug_build === true ? "absent" : "refused";
+    } else {
+      store.state = error.kind;
+    }
   }
 
   /** The host of the log store of this server target (the virtual-hosted S3 address), null when
@@ -1265,16 +1312,29 @@
     return { host: host, path: path, query: parseQuery(tail) };
   }
 
+  /** Whether the query of a presigned address carries only the keys allowed and the signature keys
+   *  (X-Amz-...). Any other key rejects the address: a key that changes what S3 lists or returns is
+   *  not one the backend may add. */
+  function queryKeysAccepted(query, allowed) {
+    return Object.keys(query).every(function (key) {
+      return allowed.indexOf(key) >= 0 || key.slice(0, 6) === "X-Amz-";
+    });
+  }
+
   /** Whether a listing address the backend handed out is called: https, the host of the log store
-   *  of this server target, the path "/", the query versions, the prefix expected, the delimiter "/"
-   *  for the node discovery listing and absent otherwise, and the markers the ones requested (absent
-   *  when none was requested). */
+   *  of this server target, the path "/", only the query keys of LISTING_QUERY_KEYS and the
+   *  signature, the query versions, the prefix expected, the delimiter "/" for the node discovery
+   *  listing and absent otherwise, the markers the ones requested (absent when none was requested),
+   *  a page size of 1000 when given and the encoding url when given. */
   function listingUrlAccepted(url, expected) {
     const parts = splitUrl(url);
     const host = logStoreHost();
     if (parts === null || host === null || parts.host !== host || parts.path !== "/") return false;
     const query = parts.query;
+    if (!queryKeysAccepted(query, LISTING_QUERY_KEYS)) return false;
     if (!("versions" in query) || query.prefix !== expected.prefix) return false;
+    if ("max-keys" in query && query["max-keys"] !== "1000") return false;
+    if ("encoding-type" in query && query["encoding-type"] !== "url") return false;
     if (expected.nodes ? query.delimiter !== "/" : "delimiter" in query) return false;
     if (expected.keyMarker === null
         ? "key-marker" in query
@@ -1290,12 +1350,13 @@
   }
 
   /** Whether an object address the backend handed out is called: the host of the log store, the
-   *  path of that key and the query versionId of that version. */
+   *  path of that key, the query versionId of that version and no other query key besides the
+   *  signature. */
   function objectUrlAccepted(url, key, versionId) {
     const parts = splitUrl(url);
     const host = logStoreHost();
     return parts !== null && host !== null && parts.host === host && parts.path === "/" + key &&
-      parts.query.versionId === versionId;
+      parts.query.versionId === versionId && queryKeysAccepted(parts.query, ["versionId"]);
   }
 
   /** One GET of the log store: {status, body}. A transport failure is unreachable. */
@@ -1336,26 +1397,40 @@
   }
 
   /** Reads a ListVersionsResult document of S3: whether the listing is truncated and the markers of
-   *  the next page, the versions {key, versionId, isLatest} and the common prefixes. Delete markers
-   *  are not read (a delete marker hides no preserved version from a listing of versions). null when
-   *  the document is not a ListVersionsResult. */
+   *  the next page, the versions {key, versionId, isLatest} and the common prefixes. When the
+   *  document declares the encoding url (the listing was requested with encoding-type url), the
+   *  keys, the common prefixes and the next key marker are percent-decoded. Delete markers are not
+   *  read (a delete marker hides no preserved version from a listing of versions). null when the
+   *  document is not a ListVersionsResult or a name does not decode. */
   function parseListVersions(xml) {
     if (typeof xml !== "string" || !/<ListVersionsResult[\s>]/.test(xml)) return null;
+    const top = xml.replace(/<(Version|DeleteMarker|CommonPrefixes)(?:\s[^>]*)?>[\s\S]*?<\/\1>/g, "");
+    const encoded = xmlField(top, "EncodingType") === "url";
+    function name(value) {
+      if (value === null || !encoded) return value;
+      try {
+        return decodeURIComponent(value.replace(/\+/g, " "));
+      } catch (error) {
+        return undefined;
+      }
+    }
     const versions = [];
     for (const block of xmlBlocks(xml, "Version")) {
-      const key = xmlField(block, "Key");
+      const key = name(xmlField(block, "Key"));
       const versionId = xmlField(block, "VersionId");
+      if (key === undefined) return null;
       if (key !== null && versionId !== null) {
         versions.push({ key: key, versionId: versionId, isLatest: xmlField(block, "IsLatest") === "true" });
       }
     }
     const prefixes = [];
     for (const block of xmlBlocks(xml, "CommonPrefixes")) {
-      const prefix = xmlField(block, "Prefix");
+      const prefix = name(xmlField(block, "Prefix"));
+      if (prefix === undefined) return null;
       if (prefix !== null) prefixes.push(prefix);
     }
-    const top = xml.replace(/<(Version|DeleteMarker|CommonPrefixes)(?:\s[^>]*)?>[\s\S]*?<\/\1>/g, "");
-    const nextKeyMarker = xmlField(top, "NextKeyMarker");
+    const nextKeyMarker = name(xmlField(top, "NextKeyMarker"));
+    if (nextKeyMarker === undefined) return null;
     const nextVersionIdMarker = xmlField(top, "NextVersionIdMarker");
     return {
       truncated: xmlField(top, "IsTruncated") === "true",
@@ -1519,6 +1594,28 @@
     return { body: value.body, sig: value.sig };
   }
 
+  /** The object versions of one presigned batch, fetched LOG_STORE_FETCHES at a time: a table from
+   *  key + "\n" + versionId to the signed value (null when that version cannot be read). A transport
+   *  failure is unreachable. */
+  async function fetchStoreObjects(urls) {
+    const names = Array.from(urls.keys());
+    const fetched = new Map();
+    let at = 0;
+    async function worker() {
+      while (at < names.length) {
+        const name = names[at];
+        at += 1;
+        fetched.set(name, await fetchStoreObject(urls.get(name)));
+      }
+    }
+    const workers = [];
+    for (let count = 0; count < Math.min(LOG_STORE_FETCHES, names.length); count += 1) {
+      workers.push(worker());
+    }
+    await Promise.all(workers);
+    return fetched;
+  }
+
   /** The entries the backend serves for one chain after the verification point, read page by page
    *  (LOG_PAGE entries each, within the budget left): get(afterSeq, seq, remaining) is the entry of
    *  that seq when the backend serves it, null otherwise. A page shorter than the limit asked is the
@@ -1643,8 +1740,15 @@
       }
       node.final = head;
     }
-    if (store.state === "verified" && nodeUsesStore(node)) {
-      return walkStore(ledger, node, id, head, budget, keys, store, outcome);
+    if (nodeUsesStore(node)) {
+      if (store.state === "verified") {
+        return walkStore(ledger, node, id, head, stored, budget, keys, store, outcome);
+      }
+      if (store.state !== "absent" && store.state !== "refused") {
+        // A read of the store failed earlier in this run: this chain waits for the next run.
+        outcome.state = "pending";
+        return outcome;
+      }
     }
     return walkBackend(node, id, head, stored, budget, keys, ledger, outcome);
   }
@@ -1718,16 +1822,32 @@
     return outcome;
   }
 
+  /** The time from which an entry the store holds and the backend did not serve counts as
+   *  withheld: the start of the cache window of the backend (LOG_CACHE_DAYS less one day before
+   *  now), moved back to the start of that window at the time the reads of the store began to fail
+   *  while no run has completed with the store read since (an entry the backend did not serve while
+   *  it kept the store unreadable does not age out of the judgement). */
+  function withheldSince(ledger, now) {
+    const window = (LOG_CACHE_DAYS - 1) * DAY_MS;
+    if (ledger.store_failing_ms === 0) return now - window;
+    return Math.min(now - window, ledger.store_failing_ms - window);
+  }
+
   /** The verification of one chain with the listing of the log store as the index of completeness
    *  (docs/protocol.md 7.4). Every seq after the verification point up to the last listed one must
    *  have an entry that verifies: the content comes from the backend when it serves it, otherwise
    *  from the object version of that key (the latest version first). A seq the listing lacks below
-   *  its end is a gap (missing). An entry the store holds inside the cache window of the backend
-   *  that the backend did not serve is withheld. An entry of a node found in the store only that
-   *  opens with the key of this account marks the node unknown. The head is a secondary check: a
-   *  head beyond the listing names entries the store has not confirmed yet (pending), a head whose
-   *  hash differs from the chain at its seq is a mismatch. */
-  async function walkStore(ledger, node, id, head, budget, keys, store, outcome) {
+   *  its end is a gap (missing). The end the node or the backend vouches for is the head when there
+   *  is one, otherwise the largest seq the backend stores: a seq beyond it none of whose versions
+   *  verifies is an object someone else put under the prefix and ends the walk without a mark, a
+   *  seq up to it with none is an entry that does not verify. An entry the store holds that the
+   *  backend did not serve is withheld when it is older than LOG_WITHHELD_GRACE_MS and inside the
+   *  window of withheldSince; a younger one leaves the run pending with the verification point
+   *  before it. For a node found in the store only, a prefix that is not a chain (a gap, an object
+   *  that does not verify) is left out. The head is a secondary check: a head beyond the listing,
+   *  and a backend that stores more than the listing shows, name entries the store has not
+   *  confirmed yet (pending); a head whose hash differs from the chain at its seq is a mismatch. */
+  async function walkStore(ledger, node, id, head, stored, budget, keys, store, outcome) {
     let cursor = node.checkpoint;
     if (head !== null &&
         (head.seq < cursor.seq || (head.seq === cursor.seq && !sameBytes(head.hash, cursor.hash)))) {
@@ -1739,7 +1859,7 @@
       index = await storeIndex(id, cursor.seq);
     } catch (error) {
       if (!isStoreFailure(error)) throw error;
-      store.state = error.kind;
+      storeFailed(store, error);
       outcome.state = "pending";
       return outcome;
     }
@@ -1748,11 +1868,16 @@
       outcome.state = "attention";
       return outcome;
     }
+    const knownEnd = head !== null ? head.seq : whole(stored.max_seq);
+    const discovered = node.origin === "store";
     const pages = chainPages(id);
     let urls = new Map();
+    let fetched = new Map();
     const context = purpose("log-entry") + "\n";
     const chainPrefix = utf8(purpose("log-chain") + "\n");
-    const recent = native.nowMs() - (LOG_CACHE_DAYS - 1) * DAY_MS;
+    const now = native.nowMs();
+    const recent = withheldSince(ledger, now);
+    const grace = now - LOG_WITHHELD_GRACE_MS;
     try {
       while (outcome.state === "verified" && cursor.seq < index.max) {
         if (outcome.checked >= budget) {
@@ -1762,6 +1887,7 @@
         const next = cursor.seq + 1;
         const candidates = index.entries.get(next);
         if (candidates === undefined) {
+          if (discovered) break;
           outcome.missing += nextListedSeq(index, next) - next;
           outcome.state = "attention";
           break;
@@ -1777,20 +1903,34 @@
           });
           for (const candidate of ordered) {
             const name = candidate.key + "\n" + candidate.versionId;
-            if (!urls.has(name)) urls = await storeObjectUrls(index, pages, next);
-            const url = urls.get(name);
-            if (url === undefined) continue;
-            const signed = await fetchStoreObject(url);
-            if (signed === null) continue;
+            if (!urls.has(name)) {
+              urls = await storeObjectUrls(index, pages, next);
+              fetched = await fetchStoreObjects(urls);
+            }
+            const signed = fetched.get(name);
+            if (signed === undefined || signed === null) continue;
             verified = verifiedEntry(signed, node, id, next, cursor, [candidate.hash], context, chainPrefix);
             if (verified !== null) break;
           }
-          if (verified !== null && whole(verified.body.time_ms) >= recent) outcome.withheld += 1;
         }
-        if (verified === null ||
-            (head !== null && next === head.seq && !sameBytes(verified.hash, head.hash))) {
+        if (verified === null) {
+          if (served === null && next > knownEnd) break;
           outcome.state = "attention";
           break;
+        }
+        if (head !== null && next === head.seq && !sameBytes(verified.hash, head.hash)) {
+          outcome.state = "attention";
+          break;
+        }
+        if (served === null) {
+          const time = whole(verified.body.time_ms);
+          if (time >= grace) {
+            // Too young to judge: the backend may still be storing it (deferred storage). The
+            // verification point stays before it and the next run looks at it again.
+            outcome.state = "pending";
+            break;
+          }
+          if (time >= recent) outcome.withheld += 1;
         }
         if (verified.body.key_id === keys.keyId) outcome.ours = true;
         followTransfer(ledger, node, verified.body, keys);
@@ -1799,10 +1939,12 @@
       }
     } catch (error) {
       if (!isStoreFailure(error)) throw error;
-      store.state = error.kind;
+      storeFailed(store, error);
       outcome.state = "pending";
     }
-    if (outcome.state === "verified" && (index.truncated || (head !== null && head.seq > index.max))) {
+    if (outcome.state === "verified" &&
+        (index.truncated || (head !== null && head.seq > index.max) ||
+         (!discovered && whole(stored.max_seq) > index.max))) {
       outcome.state = "pending";
     }
     node.checkpoint = cursor;
@@ -2132,7 +2274,7 @@
   // absent (a debug build whose backend has no log store) or pending (no run yet).
   let logState = {
     status: "pending", verified_ms: 0, unverified_nodes: 0, missing: 0, withheld: 0,
-    unknown_nodes: 0, store: "pending",
+    unknown_nodes: 0, store: "pending", store_failing_ms: 0,
   };
 
   function failureCode(error) {
@@ -2265,11 +2407,13 @@
             sign_pk: node.signPk, seal_pk: node.sealPk, platform: node.platform, release: node.release,
             first_ms: granted, granted_ms: granted, not_after_ms: grant.not_after_ms,
             checkpoint: { seq: 0, hash: ZERO_HASH }, final: null, gone_ms: 0, origin: "grant",
+            unknown_ms: 0,
           };
         } else {
           existing.granted_ms = granted;
           existing.not_after_ms = grant.not_after_ms;
           existing.origin = "grant";
+          existing.unknown_ms = 0;
         }
       } catch (error) {
         // A node that did not take the grant is not written to the ledger (the published state
@@ -2285,14 +2429,41 @@
     return { accepted: accepted, rejected: rejected, failed: failed };
   }
 
-  /** The log verification (docs/protocol.md 7.4): lists the nodes of the account in the log store
-   *  (a node the ledger does not know enters it with origin store), checks the chain of every node
-   *  of the ledger, computes the published state log and publishes it. The state is attention when
-   *  any node has a gap, a mismatch, a part that cannot be checked, an entry the backend withheld
-   *  inside its cache window, or an entry of a node no grant of this app explains, and when a release
-   *  build is refused the log store; otherwise pending when a chain has entries left to verify (the
-   *  budget of LOG_VERIFY_BATCH ran out, a listing has more pages, the store holds entries not
-   *  confirmed yet) or the store could not be read; otherwise verified. A run whose node discovery
+  /** The published state log of one run and its bookkeeping in the ledger: store_failing_ms starts
+   *  at the first run whose store reads failed and clears at a run that completed (not pending) with
+   *  the store read. The state is attention when any node has a gap, a mismatch, a part that cannot
+   *  be checked, an entry the backend withheld, or an entry of a node no grant of this app explains,
+   *  when a release build is refused the log store, and when the reads of the store have been
+   *  failing for LOG_STORE_STALE_MS; otherwise pending when a chain has entries left to verify or the
+   *  store could not be read in this run; otherwise verified. */
+  function publishLogState(ledger, store, counts, now) {
+    const unread = store.state !== "verified" && store.state !== "absent" && store.state !== "refused";
+    if (unread) {
+      if (ledger.store_failing_ms === 0) ledger.store_failing_ms = now;
+    } else if (store.state === "verified" && !counts.pending) {
+      ledger.store_failing_ms = 0;
+    }
+    const stale = unread && now - ledger.store_failing_ms >= LOG_STORE_STALE_MS;
+    saveLedger(ledger);
+    const attention = counts.unverified > 0 || counts.withheld > 0 || counts.unknown > 0 ||
+      store.state === "refused" || stale;
+    const status = attention ? "attention" : counts.pending || unread ? "pending" : "verified";
+    logState = {
+      status: status,
+      verified_ms: status === "pending" ? logState.verified_ms : now,
+      unverified_nodes: counts.unverified, missing: counts.missing, withheld: counts.withheld,
+      unknown_nodes: counts.unknown, store: store.state, store_failing_ms: ledger.store_failing_ms,
+    };
+    native.publish({ state: { log: logState } });
+    return logState;
+  }
+
+  /** The log verification (docs/protocol.md 7.4): lists the nodes of the account in the log store,
+   *  checks the chain of every node of the ledger and then of at most LOG_STORE_NODES nodes of the
+   *  listing the ledger does not know (a node found in the store only is kept in the ledger, with
+   *  origin store and unknown_ms, only when an entry sealed to the key of this account verified on
+   *  it: a delegation the app did not make, counted as unknown in every run until a traced transfer
+   *  explains the node), and publishes the state log (publishLogState). A run whose node discovery
    *  listing cannot be read verifies nothing (the verification points stay). */
   async function verifyAll(ledger, keys) {
     const listed = (await api("GET", "/api/secure/log/nodes")).json.nodes;
@@ -2303,34 +2474,28 @@
       }
     }
     const store = { state: "verified" };
+    const now = native.nowMs();
     let discovered = [];
     try {
       discovered = await discoverStoreNodes();
     } catch (error) {
       if (!isStoreFailure(error)) throw error;
-      if (error.kind === "disabled") {
-        // An env without a log store: a debug build verifies against the storage of the backend
-        // alone, a release build treats the refusal as attention.
-        store.state = native.deviceInfo().debug_build === true ? "absent" : "refused";
-      } else {
-        logState = {
-          status: "pending", verified_ms: logState.verified_ms, unverified_nodes: 0, missing: 0,
-          withheld: 0, unknown_nodes: 0, store: error.kind,
-        };
-        native.publish({ state: { log: logState } });
-        return logState;
+      storeFailed(store, error);
+      if (store.state !== "absent" && store.state !== "refused") {
+        return publishLogState(
+          ledger, store, { pending: true, unverified: 0, missing: 0, withheld: 0, unknown: 0 }, now
+        );
       }
     }
-    const now = native.nowMs();
-    for (const id of discovered) {
-      if (ledger.nodes[id] !== undefined) continue;
-      // A node the store holds that no grant of this app and no traced transfer explains: its
-      // entries are verified with its id as the signing public key, and an entry sealed to the key
-      // of this account marks the run.
+    // The nodes of the listing the ledger does not know: examined after the nodes of the ledger (the
+    // key order of the nodes object is the order of the queue), at most LOG_STORE_NODES in one run.
+    const unknownIds = discovered.filter(function (id) { return ledger.nodes[id] === undefined; });
+    const examined = unknownIds.slice(0, LOG_STORE_NODES);
+    for (const id of examined) {
       ledger.nodes[id] = {
         sign_pk: id, seal_pk: "", platform: "", release: "", first_ms: now, granted_ms: 0,
         not_after_ms: 0, checkpoint: { seq: 0, hash: ZERO_HASH }, final: null, gone_ms: now,
-        origin: "store",
+        origin: "store", unknown_ms: 0,
       };
     }
     let budget = LOG_VERIFY_BATCH;
@@ -2360,25 +2525,30 @@
         }
       }
     }
-    // A node found in the store only that holds entries sealed to this key is a delegation the
-    // app did not make and no verified transfer explained (a trace that reaches the node later in
-    // the run changes its origin before this count).
-    let unknown = 0;
+    if (unknownIds.length > examined.length && store.state === "verified") store.state = "truncated";
+    // A node found in the store only that holds an entry sealed to this key is a delegation the app
+    // did not make and no verified transfer explained (a trace that reaches the node later in the
+    // run changes its origin before this mark). The mark stays in the ledger; a node of the listing
+    // without such an entry is not kept (the next run examines it again).
     for (const id of ours) {
-      if (ledger.nodes[id].origin === "store") unknown += 1;
+      const node = ledger.nodes[id];
+      if (node !== undefined && node.origin === "store" && node.unknown_ms === 0) node.unknown_ms = now;
     }
-    saveLedger(ledger);
-    const attention = unverified > 0 || withheld > 0 || unknown > 0 || store.state === "refused";
-    const unread = store.state !== "verified" && store.state !== "absent" && store.state !== "refused";
-    const status = attention ? "attention" : pending || unread ? "pending" : "verified";
-    logState = {
-      status: status,
-      verified_ms: status === "pending" ? logState.verified_ms : native.nowMs(),
-      unverified_nodes: unverified, missing: missing, withheld: withheld, unknown_nodes: unknown,
-      store: store.state,
-    };
-    native.publish({ state: { log: logState } });
-    return logState;
+    let unknown = 0;
+    for (const id of Object.keys(ledger.nodes)) {
+      const node = ledger.nodes[id];
+      if (node.origin !== "store") continue;
+      if (node.unknown_ms !== 0) {
+        unknown += 1;
+      } else {
+        delete ledger.nodes[id];
+      }
+    }
+    return publishLogState(
+      ledger, store,
+      { pending: pending, unverified: unverified, missing: missing, withheld: withheld, unknown: unknown },
+      now
+    );
   }
 
   /** The migration of what was stored before the switch: the tokens of connections and the vault
@@ -3014,7 +3184,8 @@
     return {
       status: log.status, verified_ms: log.verified_ms, unverified_nodes: log.unverified_nodes,
       missing: log.missing, withheld: log.withheld, unknown_nodes: log.unknown_nodes, store: log.store,
-      has_more: page.has_more === true, summary: summary, days: displayDays(groups),
+      store_failing_ms: log.store_failing_ms, has_more: page.has_more === true,
+      archived: page.archived === true, summary: summary, days: displayDays(groups),
     };
   }
 
@@ -3054,7 +3225,9 @@
       logPagePlaces = logPagePlaces.concat([next]);
       publishLogPages();
     }
-    return { has_more: page.has_more === true, days: displayDays(groups) };
+    return {
+      has_more: page.has_more === true, archived: page.archived === true, days: displayDays(groups),
+    };
   }
 
   /** Setting the grant lifetime: days is an integer from 1 to 30 (or its decimal string). A grant
