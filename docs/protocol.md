@@ -558,23 +558,62 @@ body = UTF-8(JSON {"v":1,"type":"head","node":"...","user_id":"...","seq":0,"has
 
 ### 7.4 Verification (the app)
 
-For one (node, account) chain, the app starts from the signing public key of that node, which it
-keeps in its list of nodes, and from its last verified point `{seq, hash}`.
+For one (node, account) chain, the app starts from the signing public key of that node (the node
+identifier is that key), which it keeps in its list of nodes, and from its last verified point
+`{seq, hash}`.
 
-1. The app obtains a head. From a living node it requests one with a new nonce and checks the
+1. The app lists the log store (7.6): the nodes of the account (the common prefixes of
+   `v1/accounts/{user_id}/` with the delimiter `/`), and for each node the object versions after
+   the verified point (`ListObjectVersions` of the prefix `v1/accounts/{user_id}/{node}/` from the
+   key marker of the verified `seq`). The listing is the index of completeness: the keys name `seq`
+   and `entry_hash`. The app calls a presigned address the operator's backend hands out only when
+   it names the bucket of its server target and the path, prefix, key, markers and version of the
+   request, and carries no query key besides those of that request, the page size of 1,000, the
+   encoding `url` of the names (the app decodes them) and the signature; the responses come from
+   S3 over TLS and the operator domain cannot change them. The nodes of the listing that the list
+   of nodes does not know are examined after the known nodes, at most `LOG_STORE_NODES` of them in
+   one run (more leave the run pending).
+2. The app obtains a head. From a living node it requests one with a new nonce and checks the
    signature and the nonce. For a node that is gone it checks the signature of the `final` head
-   that the operator's backend stored.
-2. The app receives the entries in order, from the `seq` after the verified point to the `seq` of
-   the head. For every entry it checks the signature, `node`, `user_id`, that `seq` continues
-   without a gap, and that `prev` equals the `entry_hash` of the entry before it.
-3. When the `entry_hash` of the last entry equals the `hash` of the head, the app raises the
-   verified point to the head.
+   that the operator's backend stored. The head is a secondary check: a head whose `seq` lies
+   beyond the end of the listing, and a storage of the operator's backend that holds a larger
+   `seq` than the listing shows, name entries the store has not confirmed yet (the verification is
+   pending), a head whose `hash` differs from the chain at its `seq` is a mismatch.
+3. For every `seq` after the verified point up to the last listed one, the app takes the entry from
+   the storage of the operator's backend when it serves it, otherwise from the object version of
+   that key (the latest version first). It checks the node signature, `node`, `user_id`, that `seq`
+   continues without a gap, that `prev` equals the `entry_hash` of the entry before it, and that
+   `entry_hash` equals the hash of the key. The end the chain is vouched for up to is the `seq` of
+   the head when there is one, otherwise the largest `seq` the operator's storage holds: a `seq`
+   beyond it none of whose versions verifies is an object someone else put under the prefix (the
+   operator domain can write to the bucket) and ends the walk without a mark; a `seq` up to it
+   none of whose versions verifies is an entry that does not verify. The verified point moves to
+   the last entry that passed. An entry taken from the store that is younger than
+   `LOG_WITHHELD_GRACE_MS` leaves the verification pending with the verified point before it (the
+   backend may still be storing it); an older one inside the cache window of the operator's
+   storage (`LOG_CACHE_DAYS`) counts as withheld.
+4. A node of the listing that the list of nodes does not know is verified with its identifier as
+   the signing public key. When an entry sealed to the key of this account verifies on it, the node
+   enters the list of nodes with the origin `store` and marks the log in every run until a traced
+   transfer (`grant_transferred_out`) explains it. A prefix under which no chain verifies (a gap, or
+   an object that does not verify) is left out.
+5. A node of the platform `local` writes no entry to the store, and a build of the app whose
+   backend has no log store (a development backend) reads no store: for such a node the app
+   receives the entries from the storage of the backend in order up to the head and applies the
+   checks of step 3 without the key hash.
+6. The app keeps the time its reads of the store began to fail and clears it at a run that
+   completes with the store read. While it is set, an entry the store holds that the backend did
+   not serve counts as withheld when it was inside the cache window at that time, and reads that
+   have been failing for `LOG_STORE_STALE_MS` mark the log.
 
 | Result | Meaning |
 | --- | --- |
-| Everything passes | The entries that this node wrote for this account are stored without a gap up to the head |
-| Entries are missing, or the chain is broken | The stored log has an omission or a change |
-| A node that is gone has no `final` head | The part after the last verified point cannot be checked against a head (the node disappeared without its orderly shutdown). The entries of the acts of that node are in the log store all the same: a node writes an entry there before the act (7.6) |
+| Everything passes | Every entry the node wrote for this account is in the log store without a gap up to the end of the listing, and every entry inside the cache window of the operator's storage (`LOG_CACHE_DAYS`, section 12) was served by it |
+| A `seq` is missing from the listing below its end, or an entry up to the vouched end does not verify | The log has an omission or a change |
+| An entry inside the cache window is in the store but not in the storage of the operator, and it is older than `LOG_WITHHELD_GRACE_MS` | The operator's storage withheld an entry: the app shows it and marks the log |
+| A node appears in the listing that no grant of the app and no traced transfer explains, with an entry sealed to the key of this account | A node used the key of the account outside the delegations the app knows |
+| The store cannot be listed or read, an address the backend handed out is not one of the request, more unknown prefixes than `LOG_STORE_NODES` are listed, or a release build of the app is refused the store | The verification is pending (the app does not treat it as complete); the refusal of a release build marks the log, and reads that keep failing for `LOG_STORE_STALE_MS` mark the log |
+| A node that is gone has no `final` head | The end of its chain is the end of the listing (step 3). Without a log store (step 5) the part after the last verified point cannot be checked against a head |
 
 The authenticity of an entry that the app displays is checked with the node signature of that
 entry (the whole chain is not needed for this), and the content is opened with the log decryption
@@ -1023,6 +1062,12 @@ any other form is not a release tag and has no place in the order.
 | Longest time by which a log entry lies after the time of the node (10.3) | 300 seconds |
 | Most entries without a storage acknowledgement (per account) | 64 |
 | Retention of an object of the log store | 365 days from the node time of the write |
+| `LOG_CACHE_DAYS` (the app) | 14 days: the time for which the storage of the operator's backend keeps every entry. The app treats an entry inside this window that the store holds and the backend does not serve as withheld (7.4) |
+| `LOG_WITHHELD_GRACE_MS` (the app) | 1 hour: an entry taken from the store younger than this is not judged withheld yet; the verification stays pending before it (7.4) |
+| `LOG_STORE_STALE_MS` (the app) | 3 days: reads of the store that have been failing for this long mark the log (7.4) |
+| `LOG_STORE_NODES` (the app) | 16: the nodes of the listing the list of nodes does not know that one verification run examines |
+| Listing pages one verification run reads per node (the app) | 8 pages of 1,000 keys |
+| Object versions one verification run fetches at a time (the app) | 8 |
 | Body limit | 64 MiB (67,108,864 bytes) |
 | Longest `context` | 256 characters |
 
