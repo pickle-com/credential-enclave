@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use axum::extract::{Request, State};
 use axum::response::Response;
+use credential_enclave_protocol::log::EntryKind;
 use credential_enclave_protocol::ProtocolError;
 
 use super::responses::Revoked;
@@ -36,13 +37,12 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
     node.ensure_open()?;
     let config = node.operator_config()?;
     let account = node.account(user_id).ok_or(ProtocolError::GrantRequired)?;
-    log_store::admit(node, user_id, &account).await?;
-    let (entry, seq, call) = {
+    log_store::admit(node, &account).await?;
+    let (place, call) = {
         let mut account = lock(&account);
         node.ensure_open()?;
         let now_ms = node.now_ms();
         let grant = account.active(now_ms)?;
-        account.ensure_capacity()?;
         let opened = oauth::open_record(&grant, user_id, &record)?;
         let definition = node
             .definitions
@@ -72,26 +72,31 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
             )),
             _ => None,
         };
-        let entry = node.append_entry(
+        let place = node.create_event(
             &mut account,
             user_id,
             &grant.key_id,
             &grant.log_pk,
             now_ms,
-            &events::connection_removed(&record.id, &record.provider, call.is_some()),
+            EntryKind::Control,
+            events::connection_removed(&record.id, &record.provider, call.is_some()),
         )?;
-        (entry, account.head.seq, call)
+        (place, call)
     };
 
     // The revocation address is called only after the log store confirmed the entry.
-    log_store::confirm(node, user_id, &account, &[seq]).await?;
+    let log = log_store::commit(node, user_id, &account, &[(place, true)])
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(ApiError::internal)?;
     let revoked = match call {
         None => false,
         Some(request) => {
             let outcome = tokio::time::timeout(REVOKE_TIMEOUT, async {
                 let exchange = node
                     .egress
-                    .send_to_provider(node.platform.as_ref(), request)
+                    .send_to_provider(node.platform.as_ref(), None, request, node.now_ms())
                     .await
                     .ok()?;
                 Some(exchange.status)
@@ -100,5 +105,5 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
             matches!(outcome, Ok(Some(status)) if (200..300).contains(&status))
         }
     };
-    Ok(json_ok(&Revoked { revoked, entry }))
+    Ok(json_ok(&Revoked { revoked, log }))
 }

@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -23,6 +24,7 @@ use axum::Router;
 use credential_enclave_protocol::app::{self, AccountKeys};
 use credential_enclave_protocol::encoding::{b64u, b64u_decode, to_json, verify, Signed};
 use credential_enclave_protocol::keys::{Binding, Custody};
+use credential_enclave_protocol::log::{chain_prefix, parse_object_key, EntryParts, ParsedKey};
 use credential_enclave_protocol::record::{open_record, seal_record, Record};
 use credential_enclave_protocol::{limits, purpose};
 use hyper::body::Bytes;
@@ -55,6 +57,9 @@ use crate::state::{lock, Limits, Node};
 #[derive(Default)]
 pub struct TestPlatform {
     routes: Mutex<HashMap<String, SocketAddr>>,
+    /// Destinations of another port than 443: the log store endpoint of a node of the local
+    /// platform, reached over the plain byte pipe.
+    plain_routes: Mutex<HashMap<(String, u16), SocketAddr>>,
     measurement: Option<Measurement>,
     /// Values the random source hands out before it reads the kernel, one per draw.
     draws: Mutex<std::collections::VecDeque<Vec<u8>>>,
@@ -84,6 +89,12 @@ impl TestPlatform {
     /// Sends the connections to `host` to the stand-in at `address`.
     pub fn route(&self, host: &str, address: SocketAddr) {
         lock(&self.routes).insert(host.to_string(), address);
+    }
+
+    /// Sends the connections to `host:port` to the plain stand-in at `address` (the log store
+    /// endpoint of a node of the local platform).
+    pub fn route_at(&self, host: &str, port: u16, address: SocketAddr) {
+        lock(&self.plain_routes).insert((host.to_string(), port), address);
     }
 
     /// The host and the port of every provider connection the node asked for so far, in
@@ -141,6 +152,15 @@ impl Platform for TestPlatform {
 
     async fn connect(&self, host: &str, port: u16) -> Result<Stream, PlatformError> {
         lock(&self.connections).push((host.to_string(), port));
+        let plain = lock(&self.plain_routes)
+            .get(&(host.to_string(), port))
+            .copied();
+        if let Some(address) = plain {
+            let stream = TcpStream::connect(address)
+                .await
+                .map_err(|_| PlatformError("the plain stand-in refused the connection"))?;
+            return Ok(Box::new(stream));
+        }
         if port != 443
             && !matches!(
                 (host, port),
@@ -259,11 +279,53 @@ impl Reply {
 
 type Handler = Arc<dyn Fn(&Seen) -> Reply + Send + Sync>;
 
+/// The requests the stand-in is answering at one moment, and the most it answered at once.
+#[derive(Default)]
+struct InFlight {
+    now: AtomicUsize,
+    most: AtomicUsize,
+}
+
+/// One write the log store stand-in received: an object of the store, read back from the
+/// request target and the request body.
+#[derive(Clone, Debug)]
+pub struct Stored {
+    /// The `user_id` of the chain.
+    pub user_id: String,
+    /// The node of the chain.
+    pub node: String,
+    /// The key of the object (protocol.md 7.6).
+    pub key: String,
+    /// The key read by its shape.
+    pub parsed: ParsedKey,
+    /// The object: the signed entry.
+    pub entry: Value,
+}
+
+impl Stored {
+    /// The parts of a key of format 2.
+    pub fn parts(&self) -> &EntryParts {
+        match &self.parsed {
+            ParsedKey::V2(parts) => parts,
+            ParsedKey::V1 { .. } => panic!("a key of format 1 in the store of a node under test"),
+        }
+    }
+
+    /// The `seq` of the entry.
+    pub fn seq(&self) -> u64 {
+        match &self.parsed {
+            ParsedKey::V2(parts) => parts.seq,
+            ParsedKey::V1 { seq, .. } => *seq,
+        }
+    }
+}
+
 /// A provider stand-in: a TLS server on the loopback interface with a certificate for the
 /// given host names, signed by its own certificate authority.
 pub struct Provider {
     pub address: SocketAddr,
     seen: Arc<Mutex<Vec<Seen>>>,
+    in_flight: Arc<InFlight>,
     authority: CertificateDer<'static>,
     hosts: Vec<String>,
 }
@@ -310,8 +372,10 @@ impl Provider {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let seen = Arc::new(Mutex::new(Vec::new()));
+        let in_flight = Arc::new(InFlight::default());
         let handler: Handler = Arc::new(handler);
         let recorded = seen.clone();
+        let counted = in_flight.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -320,14 +384,16 @@ impl Provider {
                 let acceptor = acceptor.clone();
                 let handler = handler.clone();
                 let recorded = recorded.clone();
+                let counted = counted.clone();
                 tokio::spawn(async move {
-                    let _ = serve_one(acceptor, stream, handler, recorded).await;
+                    let _ = serve_one(acceptor, stream, handler, recorded, counted).await;
                 });
             }
         });
         Provider {
             address,
             seen,
+            in_flight,
             authority: authority.der().clone(),
             hosts: names,
         }
@@ -340,14 +406,59 @@ impl Provider {
         roots
     }
 
-    /// The requests received so far.
+    /// The requests received so far: those of the providers and those of the log store, in
+    /// the order they arrived.
     pub fn seen(&self) -> Vec<Seen> {
         lock(&self.seen).clone()
     }
 
-    /// The only request received so far.
+    /// The requests of the providers received so far: every request but the writes to the log
+    /// store.
+    pub fn requests(&self) -> Vec<Seen> {
+        self.seen()
+            .into_iter()
+            .filter(|seen| seen.server_name != LOG_HOST)
+            .collect()
+    }
+
+    /// The most requests the stand-in was answering at one moment: from the moment a request
+    /// was read to the moment its reply was written.
+    pub fn most_in_flight(&self) -> usize {
+        self.in_flight.most.load(Ordering::SeqCst)
+    }
+
+    /// The writes to the log store received so far, in the order they arrived: every `PUT`
+    /// whose target names an object under `v1/accounts/`, read back as an object of the store.
+    pub fn stored(&self) -> Vec<Stored> {
+        stored_of(&self.seen())
+    }
+
+    /// Waits until the log store received `count` writes.
+    pub async fn until_written(&self, count: usize) {
+        for _ in 0..1000 {
+            if self.stored().len() >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the log store did not receive {count} writes");
+    }
+
+    /// The objects of the chain of `user_id` on `node`, one per `seq` (the last write of a
+    /// `seq` when it was written more than once), in the order of `seq`.
+    pub fn chain(&self, user_id: &str, node: &str) -> Vec<Stored> {
+        let mut by_seq: std::collections::BTreeMap<u64, Stored> = Default::default();
+        for stored in self.stored() {
+            if stored.user_id == user_id && stored.node == node {
+                by_seq.insert(stored.seq(), stored);
+            }
+        }
+        by_seq.into_values().collect()
+    }
+
+    /// The only request of a provider received so far.
     pub fn only(&self) -> Seen {
-        let seen = self.seen();
+        let seen = self.requests();
         assert_eq!(seen.len(), 1, "expected exactly one provider request");
         seen[0].clone()
     }
@@ -360,19 +471,111 @@ impl Provider {
     }
 }
 
+/// The objects of the store among `seen`: every `PUT` whose target names an object under
+/// `v1/accounts/`.
+fn stored_of(seen: &[Seen]) -> Vec<Stored> {
+    seen.iter()
+        .filter(|seen| seen.method == "PUT")
+        .filter_map(|seen| {
+            let at = seen.target.find("v1/accounts/")?;
+            let key = seen.target[at..].to_string();
+            let mut names = key["v1/accounts/".len()..].splitn(3, '/');
+            let user_id = names.next()?.to_string();
+            let node = names.next()?.to_string();
+            let parsed = parse_object_key(&key, &chain_prefix(&user_id, &node))?;
+            Some(Stored {
+                user_id,
+                node,
+                key,
+                parsed,
+                entry: serde_json::from_slice(&seen.body).ok()?,
+            })
+        })
+        .collect()
+}
+
+/// A stand-in that speaks plain HTTP/1.1 on the loopback interface: the log store endpoint of
+/// a node of the local platform (enclave.md 5.14).
+pub struct PlainStore {
+    pub address: SocketAddr,
+    seen: Arc<Mutex<Vec<Seen>>>,
+}
+
+impl PlainStore {
+    /// Starts a plain stand-in that answers every request with `handler`.
+    pub async fn start(handler: impl Fn(&Seen) -> Reply + Send + Sync + 'static) -> PlainStore {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let handler: Handler = Arc::new(handler);
+        let recorded = seen.clone();
+        let in_flight = Arc::new(InFlight::default());
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let handler = handler.clone();
+                let recorded = recorded.clone();
+                let in_flight = in_flight.clone();
+                tokio::spawn(async move {
+                    let _ = serve_stream(stream, String::new(), handler, recorded, in_flight).await;
+                });
+            }
+        });
+        PlainStore { address, seen }
+    }
+
+    /// The requests received so far.
+    pub fn seen(&self) -> Vec<Seen> {
+        lock(&self.seen).clone()
+    }
+
+    /// The writes received so far, read back as objects of the store.
+    pub fn stored(&self) -> Vec<Stored> {
+        stored_of(&self.seen())
+    }
+}
+
 async fn serve_one(
     acceptor: TlsAcceptor,
     stream: TcpStream,
     handler: Handler,
     recorded: Arc<Mutex<Vec<Seen>>>,
+    in_flight: Arc<InFlight>,
 ) -> std::io::Result<()> {
-    let mut tls = acceptor.accept(stream).await?;
+    let tls = acceptor.accept(stream).await?;
     let server_name = tls
         .get_ref()
         .1
         .server_name()
         .unwrap_or_default()
         .to_string();
+    serve_stream(tls, server_name, handler, recorded, in_flight).await
+}
+
+/// Serves the requests of one connection, TLS or plain, until it ends.
+async fn serve_stream<IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    mut tls: IO,
+    server_name: String,
+    handler: Handler,
+    recorded: Arc<Mutex<Vec<Seen>>>,
+    in_flight: Arc<InFlight>,
+) -> std::io::Result<()> {
+    /// Counts one request from its reading to its reply, also when the connection ends.
+    struct Counted(Arc<InFlight>);
+    impl Counted {
+        fn start(in_flight: &Arc<InFlight>) -> Counted {
+            let now = in_flight.now.fetch_add(1, Ordering::SeqCst) + 1;
+            in_flight.most.fetch_max(now, Ordering::SeqCst);
+            Counted(in_flight.clone())
+        }
+    }
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            self.0.now.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
     loop {
         let mut buffer = Vec::new();
         let head_end = loop {
@@ -417,6 +620,7 @@ async fn serve_one(
             headers,
             body,
         };
+        let counted = Counted::start(&in_flight);
         lock(&recorded).push(seen.clone());
         match handler(&seen) {
             Reply::Raw(bytes) => {
@@ -440,6 +644,7 @@ async fn serve_one(
                 return Ok(());
             }
         }
+        drop(counted);
     }
 }
 
@@ -486,7 +691,8 @@ pub fn operator_config(definitions: &Definitions) -> Value {
 pub struct Forwarded {
     pub status: u16,
     pub headers: Vec<(String, String)>,
-    pub entry: Value,
+    /// The `log` object of the response: where the event of the request is.
+    pub log: Value,
     pub body: Vec<u8>,
 }
 
@@ -498,6 +704,61 @@ impl Forwarded {
             .find(|(header, _)| header == name)
             .map(|(_, value)| value.as_str())
     }
+}
+
+/// One result of a `forward/batch` call: the provider response of the request, or the failure
+/// code of the request, each with the `log` object of the request.
+#[derive(Clone, Debug)]
+pub struct BatchOutcome {
+    /// The status of the provider response, `None` for a failed request.
+    pub status: Option<u16>,
+    pub headers: Vec<(String, String)>,
+    /// The failure code of the request, `None` for a provider response.
+    pub error: Option<String>,
+    pub log: Value,
+    pub body: Vec<u8>,
+}
+
+/// The results of a `forward/batch` response frame: its meta lists them in the order of the
+/// requests, and its payload is their bodies one after another, `body_bytes` each.
+pub fn decode_batch(meta: &Value, payload: &[u8]) -> Vec<BatchOutcome> {
+    let mut at = 0usize;
+    let mut outcomes = Vec::new();
+    for result in meta["results"].as_array().unwrap() {
+        let length = result["body_bytes"].as_u64().unwrap_or(0) as usize;
+        let body = payload[at..at + length].to_vec();
+        at += length;
+        outcomes.push(BatchOutcome {
+            status: result["status"].as_u64().map(|status| status as u16),
+            headers: header_pairs(&result["headers"]),
+            error: result["error"].as_str().map(str::to_string),
+            log: result["log"].clone(),
+            body,
+        });
+    }
+    assert_eq!(
+        at,
+        payload.len(),
+        "the payload is the bodies of the results"
+    );
+    outcomes
+}
+
+fn header_pairs(value: &Value) -> Vec<(String, String)> {
+    value
+        .as_array()
+        .map(|pairs| {
+            pairs
+                .iter()
+                .map(|pair| {
+                    (
+                        pair[0].as_str().unwrap().to_string(),
+                        pair[1].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The release of a node under test. It is not a release tag (protocol.md 10.3).
@@ -609,8 +870,15 @@ impl Harness {
     /// Gives the node the operator configuration with the log store of the tests, and
     /// credentials for it that end in 12 hours.
     pub async fn use_log_store(&self) {
+        self.use_log_store_with(json!({"bucket": LOG_BUCKET, "region": LOG_REGION}))
+            .await;
+    }
+
+    /// [`Harness::use_log_store`] with the given `log_store` value of the configuration: the
+    /// bucket and the region of the tests, and an `endpoint` for a node of the local platform.
+    pub async fn use_log_store_with(&self, log_store: Value) {
         let mut config = operator_config(&self.node.definitions);
-        config["log_store"] = json!({"bucket": LOG_BUCKET, "region": LOG_REGION});
+        config["log_store"] = log_store;
         let (status, response) = self.post("/v1/config", config).await;
         assert_eq!(status, 200, "{response}");
         let expires_ms = self.node.now_ms() + 12 * 60 * 60 * 1000;
@@ -675,23 +943,32 @@ impl Harness {
         }
         assert_eq!(content_type, frame::CONTENT_TYPE);
         let (meta, body) = frame::decode(&bytes).unwrap();
-        let headers = meta["headers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|pair| {
-                (
-                    pair[0].as_str().unwrap().to_string(),
-                    pair[1].as_str().unwrap().to_string(),
-                )
-            })
-            .collect();
         Ok(Forwarded {
             status: meta["status"].as_u64().unwrap() as u16,
-            headers,
-            entry: meta["entry"].clone(),
+            headers: header_pairs(&meta["headers"]),
+            log: meta["log"].clone(),
             body: body.to_vec(),
         })
+    }
+
+    /// A `forward/batch` call. `meta` carries `requests` and `payload` their bodies one after
+    /// another. `Err` carries the status and the failure body.
+    pub async fn forward_batch(
+        &self,
+        meta: Value,
+        payload: &[u8],
+    ) -> Result<Vec<BatchOutcome>, (u16, Value)> {
+        let mut request = frame::encode_head(&meta);
+        request.extend_from_slice(payload);
+        let (status, content_type, bytes) =
+            self.send(Method::POST, "/v1/forward/batch", request).await;
+        if status != StatusCode::OK {
+            assert_eq!(content_type, "application/json");
+            return Err((status.as_u16(), serde_json::from_slice(&bytes).unwrap()));
+        }
+        assert_eq!(content_type, frame::CONTENT_TYPE);
+        let (meta, payload) = frame::decode(&bytes).unwrap();
+        Ok(decode_batch(&meta, &payload))
     }
 
     /// The node signing public key.
@@ -933,15 +1210,49 @@ impl App {
         serde_json::from_slice(&plaintext).unwrap()
     }
 
-    /// Verifies the node signature of an entry and opens its event with the log key.
-    pub fn event(&self, harness: &Harness, entry: &Value) -> Value {
+    /// Verifies the node signature of an entry of format 2 and opens its events with the log
+    /// key, in the order of their creation.
+    pub fn events(&self, harness: &Harness, entry: &Value) -> Vec<Value> {
         let signed: Signed = serde_json::from_value(entry.clone()).unwrap();
-        let body = verify(&harness.node_public(), purpose::LOG_ENTRY, &signed).unwrap();
-        serde_json::from_slice(&app::open_entry(&self.keys.log, &body).unwrap()).unwrap()
+        let body = verify(&harness.node_public(), purpose::LOG_ENTRY_V2, &signed).unwrap();
+        app::open_entry_v2(&self.keys.log, &body).unwrap()
     }
 
-    /// The body of an entry.
+    /// The one event of an entry that holds one event.
+    pub fn event(&self, harness: &Harness, entry: &Value) -> Value {
+        let mut events = self.events(harness, entry);
+        assert_eq!(events.len(), 1, "the entry holds one event");
+        events.pop().unwrap()
+    }
+
+    /// The body of an entry of format 2.
     pub fn entry_body(&self, harness: &Harness, entry: &Value) -> Value {
-        harness.verified(purpose::LOG_ENTRY, entry)
+        harness.verified(purpose::LOG_ENTRY_V2, entry)
+    }
+
+    /// The event a `log` object of a response names, read from the log store stand-in: the
+    /// event at `index` of the entry `seq` of this account on the node of `harness`.
+    pub fn logged(&self, harness: &Harness, provider: &Provider, log: &Value) -> Value {
+        let seq = log["seq"].as_u64().expect("the log object names an entry");
+        let index = log["index"]
+            .as_u64()
+            .expect("the log object names an event") as usize;
+        let stored = provider
+            .chain(&self.user_id, &harness.node.node)
+            .into_iter()
+            .find(|stored| stored.seq() == seq)
+            .unwrap_or_else(|| panic!("the entry {seq} is in the store"));
+        self.events(harness, &stored.entry).remove(index)
+    }
+
+    /// The events of the chain of this account on the node of `harness`, as the log store
+    /// stand-in received them: one row per entry in the order of `seq`, each row the events
+    /// of that entry in order.
+    pub fn stored_events(&self, harness: &Harness, provider: &Provider) -> Vec<Vec<Value>> {
+        provider
+            .chain(&self.user_id, &harness.node.node)
+            .iter()
+            .map(|stored| self.events(harness, &stored.entry))
+            .collect()
     }
 }

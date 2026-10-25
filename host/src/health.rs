@@ -2,7 +2,9 @@
 //!
 //! - `GET /healthz`: 200 when the `health` call of the node completes within 2 seconds, 503
 //!   otherwise. The probes of the pod read it.
-//! - `GET /metrics`: four gauges in the Prometheus text format, from the same call.
+//! - `GET /metrics`: four gauges in the Prometheus text format, from the same call, and the
+//!   seven series of the `log` object of the call (six counters and one gauge) when the node
+//!   answers with one.
 //!
 //! Every request makes one `health` call over a new connection to the node. Nothing is cached:
 //! an answer says what the node answered just now.
@@ -35,12 +37,27 @@ const TEXT: &str = "text/plain; charset=utf-8";
 const PROMETHEUS_TEXT: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 /// The values of the `health` call the host program reads (enclave.md 5.1). The response has
-/// more fields: they are not read.
+/// more fields: they are not read. `log` is absent in the response of a node of a release
+/// before v2.0.0.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct NodeHealth {
     pub configured: bool,
     pub accounts: u64,
     pub started_ms: u64,
+    #[serde(default)]
+    pub log: Option<LogCounts>,
+}
+
+/// The `log` object of the `health` call: counts since the node started.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct LogCounts {
+    pub entries: u64,
+    pub events: u64,
+    pub writes: u64,
+    pub write_failures: u64,
+    pub open_batches: u64,
+    pub batch_calls: u64,
+    pub batch_requests: u64,
 }
 
 /// Calls `GET /v1/health` of the node. `None` when the connection, the call or the reading of
@@ -65,14 +82,24 @@ pub async fn node_health(node: &dyn NodeConnector) -> Option<NodeHealth> {
         .flatten()
 }
 
-fn gauge(text: &mut String, name: &str, help: &str, value: std::fmt::Arguments<'_>) {
+fn series(text: &mut String, kind: &str, name: &str, help: &str, value: std::fmt::Arguments<'_>) {
     let _ = writeln!(text, "# HELP {name} {help}");
-    let _ = writeln!(text, "# TYPE {name} gauge");
+    let _ = writeln!(text, "# TYPE {name} {kind}");
     let _ = writeln!(text, "{name} {value}");
 }
 
+fn gauge(text: &mut String, name: &str, help: &str, value: std::fmt::Arguments<'_>) {
+    series(text, "gauge", name, help, value);
+}
+
+fn counter(text: &mut String, name: &str, help: &str, value: u64) {
+    series(text, "counter", name, help, format_args!("{value}"));
+}
+
 /// The metrics of one `health` call. A failed call gives `credential_enclave_up 0` alone: the
-/// three other gauges repeat values of the response, and there is none.
+/// other series repeat values of the response, and there is none. The seven series of the `log`
+/// object come after the four gauges, when the node answered with one. A counter restarts at 0
+/// when the node restarts (the started timestamp changes then).
 pub fn metrics(health: Option<&NodeHealth>) -> String {
     let mut text = String::new();
     gauge(
@@ -105,6 +132,51 @@ pub fn metrics(health: Option<&NodeHealth>) -> String {
             health.started_ms / 1000,
             health.started_ms % 1000
         ),
+    );
+    let Some(log) = &health.log else {
+        return text;
+    };
+    counter(
+        &mut text,
+        "credential_enclave_log_entries_total",
+        "Log entries the enclave node created since it started.",
+        log.entries,
+    );
+    counter(
+        &mut text,
+        "credential_enclave_log_events_total",
+        "Events in the log entries the enclave node created since it started.",
+        log.events,
+    );
+    counter(
+        &mut text,
+        "credential_enclave_log_store_writes_total",
+        "PUT requests the enclave node sent to its log store since it started.",
+        log.writes,
+    );
+    counter(
+        &mut text,
+        "credential_enclave_log_store_write_failures_total",
+        "PUT requests to the log store that the store did not confirm since the enclave node started.",
+        log.write_failures,
+    );
+    counter(
+        &mut text,
+        "credential_enclave_forward_batch_calls_total",
+        "forward/batch calls that passed the common front of the enclave node since it started.",
+        log.batch_calls,
+    );
+    counter(
+        &mut text,
+        "credential_enclave_forward_batch_requests_total",
+        "Provider requests in the forward/batch calls of the enclave node since it started.",
+        log.batch_requests,
+    );
+    gauge(
+        &mut text,
+        "credential_enclave_log_open_batches",
+        "Accounts of the enclave node whose open batch holds events at this moment.",
+        format_args!("{}", log.open_batches),
     );
     text
 }
@@ -194,14 +266,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_health_call_reads_three_values_and_ignores_the_others() {
+    async fn the_health_call_reads_four_values_and_ignores_the_others() {
         let node = FakeNode::answering(|_| (200, health_body(true, 7, 1_790_000_000_123)));
         assert_eq!(
             node_health(node.as_ref()).await,
             Some(NodeHealth {
                 configured: true,
                 accounts: 7,
-                started_ms: 1_790_000_000_123
+                started_ms: 1_790_000_000_123,
+                log: Some(LogCounts {
+                    entries: 70,
+                    events: 700,
+                    writes: 71,
+                    write_failures: 1,
+                    open_batches: 2,
+                    batch_calls: 3,
+                    batch_requests: 400,
+                }),
             })
         );
         let calls = node.calls();
@@ -211,7 +292,8 @@ mod tests {
             ("GET", "/v1/health")
         );
 
-        // Fields a later node adds do not change the reading.
+        // Fields a later node adds do not change the reading, and a node of a release before
+        // v2.0.0 answers without `log`.
         let node = FakeNode::answering(|_| {
             let body = r#"{"node":"n","custody":"enclave","grants":3,"configured":false,"accounts":0,"started_ms":5,"closing":true}"#;
             (200, body.to_string())
@@ -221,7 +303,8 @@ mod tests {
             Some(NodeHealth {
                 configured: false,
                 accounts: 0,
-                started_ms: 5
+                started_ms: 5,
+                log: None,
             })
         );
     }
@@ -256,11 +339,12 @@ mod tests {
     }
 
     #[test]
-    fn the_metrics_are_four_gauges_of_the_health_call() {
+    fn the_metrics_are_four_gauges_of_the_health_call_and_the_seven_series_of_its_log() {
         let health = NodeHealth {
             configured: true,
             accounts: 12,
             started_ms: 1_790_000_000_042,
+            log: None,
         };
         assert_eq!(
             metrics(Some(&health)),
@@ -281,11 +365,42 @@ mod tests {
             configured: false,
             accounts: 0,
             started_ms: 1000,
+            log: None,
         };
         let text = metrics(Some(&unconfigured));
         assert!(text.contains("\ncredential_enclave_configured 0\n"));
         assert!(text.contains("\ncredential_enclave_accounts 0\n"));
         assert!(text.contains("\ncredential_enclave_started_timestamp_seconds 1.000\n"));
+        assert!(!text.contains("credential_enclave_log_"));
+
+        // With the `log` object of a node of release v2.0.0 or later: six counters and one
+        // gauge after the four gauges.
+        let with_log = NodeHealth {
+            log: Some(LogCounts {
+                entries: 5,
+                events: 40,
+                writes: 6,
+                write_failures: 1,
+                open_batches: 2,
+                batch_calls: 3,
+                batch_requests: 35,
+            }),
+            ..health
+        };
+        let text = metrics(Some(&with_log));
+        assert!(text.starts_with("# HELP credential_enclave_up "));
+        assert!(text.contains(
+            "# HELP credential_enclave_log_entries_total Log entries the enclave node created since it started.\n\
+             # TYPE credential_enclave_log_entries_total counter\n\
+             credential_enclave_log_entries_total 5\n"
+        ));
+        assert!(text.contains("\n# TYPE credential_enclave_log_events_total counter\ncredential_enclave_log_events_total 40\n"));
+        assert!(text.contains("\n# TYPE credential_enclave_log_store_writes_total counter\ncredential_enclave_log_store_writes_total 6\n"));
+        assert!(text.contains("\n# TYPE credential_enclave_log_store_write_failures_total counter\ncredential_enclave_log_store_write_failures_total 1\n"));
+        assert!(text.contains("\n# TYPE credential_enclave_forward_batch_calls_total counter\ncredential_enclave_forward_batch_calls_total 3\n"));
+        assert!(text.contains("\n# TYPE credential_enclave_forward_batch_requests_total counter\ncredential_enclave_forward_batch_requests_total 35\n"));
+        assert!(text.ends_with("\n# TYPE credential_enclave_log_open_batches gauge\ncredential_enclave_log_open_batches 2\n"));
+        assert_eq!(text.matches("# TYPE ").count(), 11);
     }
 
     #[test]
@@ -331,6 +446,14 @@ mod tests {
         assert!(text.contains("\ncredential_enclave_accounts 3\n"), "{text}");
         assert!(
             text.contains("\ncredential_enclave_started_timestamp_seconds 1790000000.500\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\ncredential_enclave_log_entries_total 30\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\ncredential_enclave_log_open_batches 2\n"),
             "{text}"
         );
 

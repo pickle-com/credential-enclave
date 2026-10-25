@@ -31,8 +31,8 @@ mod attestation;
 mod close;
 mod config;
 mod forward;
+mod forward_batch;
 mod health;
-mod log;
 mod log_store;
 mod mail;
 mod messages;
@@ -76,12 +76,15 @@ fn routes() -> Vec<Route> {
         route(Method::POST, "/v1/refresh", refresh::refresh),
         route(Method::POST, "/v1/revoke-token", revoke::revoke_token),
         route(Method::POST, "/v1/forward", forward::forward),
+        route(
+            Method::POST,
+            "/v1/forward/batch",
+            forward_batch::forward_batch,
+        ),
         route(Method::POST, "/v1/mail/verify", mail::verify),
         route(Method::POST, "/v1/mail/read", mail::read),
         route(Method::POST, "/v1/mail/submit", mail::submit),
         route(Method::POST, "/v1/release", release::release),
-        route(Method::POST, "/v1/log/entries", log::entries),
-        route(Method::POST, "/v1/log/ack", log::ack),
         route(Method::POST, "/v1/close", close::close),
         route(Method::POST, "/v1/close/heads", close::heads),
         route(Method::POST, "/v1/peer/export", peer::export),
@@ -122,6 +125,7 @@ async fn unknown_route() -> Response {
         code: ProtocolError::InvalidRequest.code(),
         message: "no such call",
         provider: None,
+        index: None,
     }
     .into_response()
 }
@@ -132,6 +136,7 @@ async fn unknown_method() -> Response {
         code: ProtocolError::InvalidRequest.code(),
         message: "the call does not accept this method",
         provider: None,
+        index: None,
     }
     .into_response()
 }
@@ -170,6 +175,9 @@ pub struct ApiError {
     pub message: &'static str,
     /// `provider_status` and `provider_error` of `exchange_failed` and `refresh_failed`.
     pub provider: Option<(u16, ProviderError)>,
+    /// `index` of a failure of `forward/batch`: the request of the batch that failed the
+    /// checks before any event was created.
+    pub index: Option<usize>,
 }
 
 /// The status of a failure code (enclave.md section 4).
@@ -185,7 +193,6 @@ pub fn status_of(error: ProtocolError) -> StatusCode {
         GrantRequired | GrantRevoked | GrantExpired | KeyMismatch => StatusCode::CONFLICT,
         TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
         RecordInvalid => StatusCode::UNPROCESSABLE_ENTITY,
-        LogBacklog => StatusCode::TOO_MANY_REQUESTS,
         Internal => StatusCode::INTERNAL_SERVER_ERROR,
         ExchangeFailed | RefreshFailed | ProviderUnreachable | ResponseWithheld => {
             StatusCode::BAD_GATEWAY
@@ -228,7 +235,6 @@ fn message_of(error: ProtocolError) -> &'static str {
         Timeout => "the provider call timed out",
         ResponseWithheld => "the provider response was withheld by the egress policy",
         TooLarge => "a body is above the limit",
-        LogBacklog => "too many log entries wait for a storage acknowledgement",
         LogStoreUnavailable => "the log store did not confirm the entry of this call",
         CapacityUnavailable => "the call was not admitted; no provider request was sent",
     }
@@ -241,6 +247,7 @@ impl From<ProtocolError> for ApiError {
             code: error.code(),
             message: message_of(error),
             provider: None,
+            index: None,
         }
     }
 }
@@ -280,6 +287,14 @@ impl ApiError {
             ..ApiError::from(error)
         }
     }
+
+    /// The same failure, naming the request of a `forward/batch` call it is about.
+    pub fn indexed(error: ApiError, index: usize) -> ApiError {
+        ApiError {
+            index: Some(index),
+            ..error
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -291,6 +306,7 @@ impl IntoResponse for ApiError {
                 message: self.message,
                 provider_status: self.provider.map(|(status, _)| status),
                 provider_error: self.provider.map(|(_, error)| error.as_str()),
+                index: self.index,
             },
         )
     }
@@ -377,6 +393,11 @@ impl JsonBody {
         self.0.get(key).filter(|value| !value.is_null())
     }
 
+    /// The whole object.
+    pub fn as_value(&self) -> &serde_json::Value {
+        &self.0
+    }
+
     /// A required string.
     pub fn text(&self, key: &str) -> Result<&str, ApiError> {
         self.get(key)
@@ -455,8 +476,9 @@ fn missing(key: &str) -> ApiError {
         "url" => "url is missing or invalid",
         "headers" => "headers is missing or invalid",
         "timeout_ms" => "timeout_ms is missing or invalid",
-        "after_seq" => "after_seq is missing or invalid",
-        "seq" => "seq is missing or invalid",
+        "requests" => "requests is missing or invalid: 1 to 100 request objects",
+        "body_bytes" => "body_bytes of the requests do not add up to the payload",
+        "endpoint" => "endpoint is missing or invalid",
         "cursor" => "cursor is missing or invalid",
         "limit" => "limit is missing or invalid",
         _ => "a field is missing or invalid",
@@ -498,7 +520,7 @@ mod tests {
 
     #[test]
     fn every_code_has_the_status_of_section_4() {
-        let table: [(u16, &[&str]); 11] = [
+        let table: [(u16, &[&str]); 10] = [
             (
                 400,
                 &[
@@ -527,7 +549,6 @@ mod tests {
             ),
             (413, &["too_large"]),
             (422, &["record_invalid"]),
-            (429, &["log_backlog"]),
             (500, &["internal"]),
             (
                 502,

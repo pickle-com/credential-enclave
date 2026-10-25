@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use axum::extract::{Request, State};
 use axum::response::Response;
+use credential_enclave_protocol::log::EntryKind;
 use credential_enclave_protocol::ProtocolError;
 
 use super::responses::Refreshed;
@@ -35,14 +36,13 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
     node.ensure_open()?;
     let config = node.operator_config()?;
     let account = node.account(user_id).ok_or(ProtocolError::GrantRequired)?;
-    log_store::admit(node, user_id, &account).await?;
+    log_store::admit(node, &account).await?;
     let replay_key = refresh_key(&record);
-    let (grant, old, entry, seq, definition, credentials) = {
+    let (grant, old, place, definition, credentials) = {
         let mut account = lock(&account);
         node.ensure_open()?;
         let now_ms = node.now_ms();
         let grant = account.active(now_ms)?;
-        account.ensure_capacity()?;
         let opened = oauth::open_record(&grant, user_id, &record)?;
         // The record opened under the grant of this account: a kept response of this record
         // is the answer.
@@ -63,20 +63,25 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
                 "the record holds no refresh token",
             ));
         }
-        let entry = node.append_entry(
+        let place = node.create_event(
             &mut account,
             user_id,
             &grant.key_id,
             &grant.log_pk,
             now_ms,
-            &events::credential_refreshed(&record.id, &record.provider),
+            EntryKind::Use,
+            events::credential_refreshed(&record.id, &record.provider),
         )?;
-        (grant, old, entry, account.head.seq, definition, credentials)
+        (grant, old, place, definition, credentials)
     };
 
-    // The token address is called only after the log store confirmed the entry. The provider
-    // call runs outside the account lock.
-    log_store::confirm(node, user_id, &account, &[seq]).await?;
+    // The token address is called only after the log store confirmed the entry that holds the
+    // event. The provider call runs outside the account lock.
+    let log = log_store::commit(node, user_id, &account, &[(place, true)])
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(ApiError::internal)?;
     let refresh_token = old
         .refresh_token(&definition.token_container)
         .ok_or(ProtocolError::RecordInvalid)?;
@@ -116,7 +121,7 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
             &record.provider,
         ),
         public,
-        entry,
+        log,
     };
     lock(&account).keep_refresh(&grant, replay_key, now_ms, refreshed.clone());
     Ok(json_ok(&refreshed))

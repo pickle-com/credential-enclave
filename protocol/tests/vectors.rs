@@ -3,12 +3,13 @@
 
 use std::process::Command;
 
-use credential_enclave_protocol::app::{self, ChainError};
+use credential_enclave_protocol::app::{self, ChainError, IndexError};
 use credential_enclave_protocol::attestation::{read_binding, read_local_document, NodeBinding};
 use credential_enclave_protocol::encoding::{b64u, b64u_decode, verify, Signed};
 use credential_enclave_protocol::envelope::{self, Envelope, TransferEnvelope, TransferGrant};
 use credential_enclave_protocol::keys::{self, Custody, NodeKeys};
-use credential_enclave_protocol::log::{self, Head};
+use credential_enclave_protocol::log::{self, EntryKind, EntryParts, Head, ParsedKey};
+use credential_enclave_protocol::purpose;
 use credential_enclave_protocol::record::{open_record, record_aad, seal_record, Record};
 use credential_enclave_protocol::secret::Secret;
 use credential_enclave_protocol::totp::totp;
@@ -303,9 +304,170 @@ fn replies_statements_and_heads() {
     assert_eq!((valid, invalid), (8, 4));
 }
 
+/// The parts of the keys of a listing of the vector `log`, read back by their shape under the
+/// prefix of the chain.
+fn parsed_keys(vector: &Value, keys: &Value) -> Vec<EntryParts> {
+    let prefix = text(vector, "key_prefix");
+    keys.as_array()
+        .unwrap()
+        .iter()
+        .map(
+            |key| match log::parse_object_key(key.as_str().unwrap(), prefix) {
+                Some(ParsedKey::V2(parts)) => parts,
+                other => panic!("a key of format 2: {other:?}"),
+            },
+        )
+        .collect()
+}
+
 #[test]
 fn log_chain() {
     let vector = &vectors()["log"];
+    let node_public: [u8; 32] = array(vector, "node_sign_pk");
+    let log_private = StaticSecret::from(array::<32>(vector, "log_private"));
+    let user_id = text(vector, "user_id");
+    assert_eq!(
+        text(vector, "key_prefix"),
+        log::chain_prefix(user_id, text(vector, "node"))
+    );
+    assert_eq!(text(vector, "chain_prefix_text"), purpose::LOG_CHAIN_V2);
+    let checkpoint = Head {
+        seq: vector["checkpoint"]["seq"].as_u64().unwrap(),
+        hash: array(&vector["checkpoint"], "hash"),
+    };
+    let entries = vector["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 3);
+
+    // Content verification: every object verifies against its key and its predecessor, its
+    // key is the key the parts give, and it opens to its events.
+    let mut keys = Vec::new();
+    let mut cursor = checkpoint;
+    for entry in entries {
+        let carried = signed(&entry["entry"]);
+        let parts = parsed_keys(vector, &Value::Array(vec![entry["key"].clone()])).remove(0);
+        assert_eq!(parts.seq, entry["seq"].as_u64().unwrap());
+        assert_eq!(parts.time_ms, entry["time_ms"].as_u64().unwrap());
+        assert_eq!(parts.kind.letter().to_string(), text(entry, "kind"));
+        assert_eq!(u64::from(parts.count), entry["count"].as_u64().unwrap());
+        assert_eq!(parts.key_id, text(vector, "key_id"));
+        assert_eq!(b64u(&parts.body_hash), text(entry, "body_hash"));
+        assert_eq!(b64u(&parts.entry_hash), text(entry, "entry_hash"));
+        let body =
+            app::verify_entry_v2(&node_public, user_id, &parts, Some(&cursor), &carried).unwrap();
+        let body_bytes = verify(&node_public, purpose::LOG_ENTRY_V2, &carried).unwrap();
+        assert_eq!(body_bytes, text(entry, "body_text").as_bytes());
+        assert_eq!(log::body_hash(&body_bytes), parts.body_hash);
+        assert_eq!(
+            log::entry_hash_v2(&cursor.hash, &parts.body_hash, &parts.fields()),
+            parts.entry_hash
+        );
+        // The key of the vector writes the five parts of the hash input first.
+        assert!(text(entry, "key").contains(&format!("/{}-", parts.fields())));
+        let events = app::open_entry_v2(&log_private, &body_bytes).unwrap();
+        assert_eq!(events.len(), body.count as usize);
+        assert_eq!(
+            serde_json::to_string(&Value::Array(events)).unwrap(),
+            text(entry, "events_text")
+        );
+        cursor = Head {
+            seq: parts.seq,
+            hash: parts.entry_hash,
+        };
+        keys.push(parts);
+    }
+    assert!(vector["content_valid"].as_bool().unwrap());
+    let kinds: Vec<EntryKind> = keys.iter().map(|parts| parts.kind).collect();
+    assert_eq!(kinds, [EntryKind::Control, EntryKind::Use, EntryKind::Use]);
+    let counts: Vec<u32> = keys.iter().map(|parts| parts.count).collect();
+    assert_eq!(counts, [1, 3, 1]);
+
+    // Index verification: the keys alone reach the hash of the head, and of the final head.
+    let head = signed(&vector["head"]);
+    let nonce = text(vector, "head_nonce");
+    let verified = app::verify_index(
+        &node_public,
+        user_id,
+        &checkpoint,
+        &keys,
+        &head,
+        Some(nonce),
+    );
+    assert_eq!(verified.is_ok(), vector["index_valid"].as_bool().unwrap());
+    let end = verified.unwrap();
+    assert_eq!(end.seq, 3);
+    assert_eq!(b64u(&end.hash), text(&entries[2], "entry_hash"));
+    assert_eq!(
+        app::verify_index(
+            &node_public,
+            user_id,
+            &checkpoint,
+            &keys,
+            &signed(&vector["final_head"]),
+            None
+        ),
+        Ok(end)
+    );
+
+    // Without the key of the middle entry the listing has a gap.
+    let missing = &vector["missing_middle"];
+    let without_middle = parsed_keys(vector, &missing["keys"]);
+    assert_eq!(without_middle.len(), 2);
+    assert!(!missing["index_valid"].as_bool().unwrap());
+    assert_eq!(
+        app::verify_index(
+            &node_public,
+            user_id,
+            &checkpoint,
+            &without_middle,
+            &head,
+            Some(nonce)
+        ),
+        Err(IndexError::Gap {
+            seq: missing["gap_seq"].as_u64().unwrap()
+        })
+    );
+
+    // A forged key next to the genuine one of seq 2 (another body hash and a chain hash that
+    // is consistent with it): the keys alone cannot tell them apart, and the objects decide.
+    let forged = &vector["forged_key"];
+    let with_forged = parsed_keys(vector, &forged["keys"]);
+    assert_eq!(with_forged.len(), 4);
+    assert!(!forged["index_valid"].as_bool().unwrap());
+    let ambiguous = forged["ambiguous_seq"].as_u64().unwrap();
+    assert_eq!(
+        app::verify_index(
+            &node_public,
+            user_id,
+            &checkpoint,
+            &with_forged,
+            &head,
+            Some(nonce)
+        ),
+        Err(IndexError::Ambiguous { seq: ambiguous })
+    );
+    let cursor = Head {
+        seq: 1,
+        hash: keys[0].entry_hash,
+    };
+    let object = signed(&entries[1]["entry"]);
+    let candidates: Vec<&EntryParts> = with_forged
+        .iter()
+        .filter(|parts| parts.seq == ambiguous)
+        .collect();
+    assert_eq!(candidates.len(), 2);
+    for candidate in candidates {
+        let verifies =
+            app::verify_entry_v2(&node_public, user_id, candidate, Some(&cursor), &object).is_ok();
+        let genuine = candidate.body_hash == keys[1].body_hash;
+        assert_eq!(verifies, genuine);
+    }
+    assert!(forged["genuine_object_verifies"].as_bool().unwrap());
+    assert!(!forged["forged_key_object_verifies"].as_bool().unwrap());
+}
+
+#[test]
+fn log_chain_of_format_1() {
+    let vector = &vectors()["log_v1"];
     let node_public: [u8; 32] = array(vector, "node_sign_pk");
     let log_private = StaticSecret::from(array::<32>(vector, "log_private"));
     let user_id = text(vector, "user_id");
@@ -318,12 +480,7 @@ fn log_chain() {
     let mut stored = Vec::new();
     for entry in entries {
         let carried = signed(&entry["entry"]);
-        let body = verify(
-            &node_public,
-            credential_enclave_protocol::purpose::LOG_ENTRY,
-            &carried,
-        )
-        .unwrap();
+        let body = verify(&node_public, purpose::LOG_ENTRY, &carried).unwrap();
         assert_eq!(body, text(entry, "body_text").as_bytes());
         assert_eq!(b64u(&log::entry_hash(&body)), text(entry, "entry_hash"));
         assert_eq!(
@@ -382,12 +539,41 @@ fn log_chain() {
 #[test]
 fn log_entries_are_reproducible_from_their_seeds() {
     let all = vectors();
-    let vector = &all["log"];
     let command = &all["command"];
     let node = NodeKeys::from_random(
         &array(command, "node_sign_seed"),
         &array(command, "node_seal_private"),
     );
+
+    // Format 2: the entry and its key follow from the events, the seed and the chain before.
+    let vector = &all["log"];
+    assert_eq!(text(vector, "node"), node.node());
+    let mut head = Head::EMPTY;
+    for entry in vector["entries"].as_array().unwrap() {
+        let events: Vec<Value> = serde_json::from_str(text(entry, "events_text")).unwrap();
+        let kind = EntryKind::parse(text(entry, "kind").chars().next().unwrap()).unwrap();
+        let (created, next, parts) = log::append_batch(
+            &node,
+            &head,
+            text(vector, "user_id"),
+            text(vector, "key_id"),
+            &array(vector, "log_pk"),
+            entry["time_ms"].as_u64().unwrap(),
+            kind,
+            &events,
+            &Secret::new(array(entry, "hpke_seed")),
+        );
+        assert_eq!(created, signed(&entry["entry"]));
+        assert_eq!(next.seq, entry["seq"].as_u64().unwrap());
+        assert_eq!(
+            log::object_key_v2(text(vector, "user_id"), &node.node(), &parts),
+            text(entry, "key")
+        );
+        head = next;
+    }
+
+    // Format 1: the entry of the releases before v2.0.0 follows from the event and the seed.
+    let vector = &all["log_v1"];
     let mut head = Head::EMPTY;
     for entry in vector["entries"].as_array().unwrap() {
         let event: Value = serde_json::from_str(text(entry, "event_text")).unwrap();

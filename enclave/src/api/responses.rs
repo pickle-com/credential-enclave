@@ -32,7 +32,7 @@ use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::Response;
 use credential_enclave_protocol::encoding::{to_json, Signed};
-use credential_enclave_protocol::envelope::{ReplyHead, TransferEnvelope};
+use credential_enclave_protocol::envelope::TransferEnvelope;
 use credential_enclave_protocol::record::Record;
 use hyper::body::{Body as HttpBody, Bytes, Frame, SizeHint};
 use serde::Serialize;
@@ -73,15 +73,54 @@ operator_response!(
     Refreshed,
     Revoked,
     ForwardMeta,
+    ForwardBatchMeta,
     Released,
-    Entries,
-    Acknowledged,
     Closed,
     Heads,
     Exported,
     Imported,
     ErrorBody<'_>,
 );
+
+/// The `log` object of a response (enclave.md section 4): where the event of the call is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct LogRef {
+    /// P: the `seq` of the entry that holds the event.
+    pub seq: u64,
+    /// P: the index of the event in that entry.
+    pub index: u32,
+    /// P: true when this call created the event, false when it shares the event of an earlier
+    /// identical request.
+    pub created: bool,
+}
+
+/// One entry a `peer/export` or `peer/import` call created: the account and the `seq`.
+#[derive(Serialize)]
+pub struct AccountLogRef {
+    /// E
+    pub user_id: String,
+    /// P
+    pub seq: u64,
+}
+
+/// `log` of `GET /v1/health`: counts since the node started.
+#[derive(Serialize)]
+pub struct LogCounts {
+    /// P: entries the node created.
+    pub entries: u64,
+    /// P: the events in them.
+    pub events: u64,
+    /// P: PUT requests sent to the log store.
+    pub writes: u64,
+    /// P: those that were not confirmed.
+    pub write_failures: u64,
+    /// P: accounts whose open batch holds events at this moment.
+    pub open_batches: usize,
+    /// P: `forward/batch` calls that passed the common front.
+    pub batch_calls: u64,
+    /// P: the requests in them.
+    pub batch_requests: u64,
+}
 
 /// `GET /v1/health`.
 #[derive(Serialize)]
@@ -110,6 +149,8 @@ pub struct Health<'a> {
     pub mail_providers: &'a [&'a str],
     /// E and P: the log store of the node, null when it has none.
     pub log_store: Option<LogStoreState<'a>>,
+    /// P: the counts of the log.
+    pub log: LogCounts,
 }
 
 /// `log_store` of `GET /v1/health`.
@@ -166,8 +207,9 @@ pub struct Messages {
     /// S: the body holds P, E and D values (`type`, `ok`, `code`, `node`, `user_id`,
     /// `challenge`, `key_id`, `not_after_ms`, `head`, `time_ms`).
     pub reply: Signed,
-    /// C: sealed to the log public key of the account.
-    pub entry: Option<Signed>,
+    /// P: the entry and the index of the event the command created, null when it created
+    /// none.
+    pub log: Option<LogRef>,
     /// D: `state`, `key_id`, `custody`, `not_after_ms` of the grant.
     pub grant: GrantStatus,
 }
@@ -207,8 +249,8 @@ pub struct Complete {
     pub public: PublicFields,
     /// S
     pub statement: Signed,
-    /// C
-    pub entry: Signed,
+    /// P
+    pub log: LogRef,
 }
 
 /// `POST /v1/oauth/merge`.
@@ -228,8 +270,8 @@ pub struct Refreshed {
     pub record: Record,
     /// R, P and D
     pub public: PublicFields,
-    /// C
-    pub entry: Signed,
+    /// P
+    pub log: LogRef,
 }
 
 /// `POST /v1/revoke-token`.
@@ -237,8 +279,8 @@ pub struct Refreshed {
 pub struct Revoked {
     /// R: one bit, whether the revocation address answered with a 2xx status.
     pub revoked: bool,
-    /// C
-    pub entry: Signed,
+    /// P
+    pub log: LogRef,
 }
 
 /// The meta of a `POST /v1/forward` response frame. The payload of the frame is the provider
@@ -249,8 +291,41 @@ pub struct ForwardMeta {
     status: u16,
     /// R
     headers: Vec<(String, String)>,
-    /// C
-    entry: Option<Signed>,
+    /// P: the event of the request, null for a mail call that created no event of its own.
+    log: Option<LogRef>,
+}
+
+/// The meta of a `POST /v1/forward/batch` response frame. The payload of the frame is the
+/// provider bodies of the results one after another (R), `body_bytes` each.
+#[derive(Serialize)]
+pub struct ForwardBatchMeta {
+    results: Vec<BatchResultMeta>,
+}
+
+/// One result of a `forward/batch` call: the provider response of the request, or the failure
+/// code the request had.
+#[derive(Serialize)]
+pub struct BatchResultMeta {
+    /// R
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<u16>,
+    /// R
+    #[serde(skip_serializing_if = "Option::is_none")]
+    headers: Option<Vec<(String, String)>>,
+    /// P: a size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body_bytes: Option<usize>,
+    /// P: a code of the closed list of protocol.md section 11.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'static str>,
+    /// P
+    log: LogRef,
+}
+
+/// The outcome of one request of a `forward/batch` call.
+pub enum BatchResult {
+    Response(CheckedResponse, LogRef),
+    Failure(&'static str, LogRef),
 }
 
 /// `POST /v1/release`.
@@ -258,24 +333,8 @@ pub struct ForwardMeta {
 pub struct Released {
     /// V
     pub value: ReleasedValue,
-    /// C
-    pub entry: Signed,
-}
-
-/// `POST /v1/log/entries`.
-#[derive(Serialize)]
-pub struct Entries {
-    /// C
-    pub entries: Vec<Signed>,
-    /// P: the end of the chain.
-    pub head: ReplyHead,
-}
-
-/// `POST /v1/log/ack`.
-#[derive(Serialize)]
-pub struct Acknowledged {
-    /// P: a count.
-    pub unacked: usize,
+    /// P
+    pub log: LogRef,
 }
 
 /// `POST /v1/close`.
@@ -299,8 +358,8 @@ pub struct Heads {
 pub struct Exported {
     /// C: sealed to the sealing key of the verified peer (sink K2).
     pub envelope: Option<TransferEnvelope>,
-    /// C
-    pub entries: Vec<Signed>,
+    /// E and P: the entries `grant_transferred_out` this call created.
+    pub logs: Vec<AccountLogRef>,
     /// E: the `user_id` the listing continues after.
     pub next: String,
 }
@@ -310,8 +369,8 @@ pub struct Exported {
 pub struct Imported {
     /// P: a count.
     pub imported: usize,
-    /// C
-    pub entries: Vec<Signed>,
+    /// E and P: the entries `grant_transferred_in` this call created.
+    pub logs: Vec<AccountLogRef>,
 }
 
 /// The body of every failure.
@@ -327,6 +386,9 @@ pub struct ErrorBody<'a> {
     /// R: a word of the closed vocabulary of rule E5.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_error: Option<&'static str>,
+    /// P: the index of the request of a `forward/batch` call that the failure is about.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<usize>,
 }
 
 pub(super) fn json_bytes(status: StatusCode, body: Vec<u8>) -> Response {
@@ -381,21 +443,59 @@ impl HttpBody for FrameBody {
 }
 
 /// The 200 response of `forward`: the frame of a provider response that passed the checks of
-/// rule E4, and the entry of the request.
+/// rule E4, and the place of the event of the request.
 pub fn forward_frame(
     checked: CheckedResponse,
-    entry: Option<Signed>,
+    log: Option<LogRef>,
     budget: OwnedSemaphorePermit,
 ) -> Response {
     let (status, headers, body) = checked.into_parts();
     let head = frame::encode_head(&ForwardMeta {
         status,
         headers,
-        entry,
+        log,
     });
-    let remaining = (head.len() + body.len()) as u64;
+    frame_response(vec![Bytes::from(head), Bytes::from(body)], budget)
+}
+
+/// The 200 response of `forward/batch`: one frame whose meta lists the results in the order
+/// of the requests and whose payload is their bodies one after another.
+pub fn forward_batch_frame(results: Vec<BatchResult>, budget: OwnedSemaphorePermit) -> Response {
+    let mut metas = Vec::with_capacity(results.len());
+    let mut bodies = Vec::with_capacity(results.len());
+    for result in results {
+        match result {
+            BatchResult::Response(checked, log) => {
+                let (status, headers, body) = checked.into_parts();
+                metas.push(BatchResultMeta {
+                    status: Some(status),
+                    headers: Some(headers),
+                    body_bytes: Some(body.len()),
+                    error: None,
+                    log,
+                });
+                bodies.push(Bytes::from(body));
+            }
+            BatchResult::Failure(code, log) => metas.push(BatchResultMeta {
+                status: None,
+                headers: None,
+                body_bytes: None,
+                error: Some(code),
+                log,
+            }),
+        }
+    }
+    let head = frame::encode_head(&ForwardBatchMeta { results: metas });
+    let mut parts = Vec::with_capacity(1 + bodies.len());
+    parts.push(Bytes::from(head));
+    parts.extend(bodies);
+    frame_response(parts, budget)
+}
+
+fn frame_response(parts: Vec<Bytes>, budget: OwnedSemaphorePermit) -> Response {
+    let remaining = parts.iter().map(|part| part.len() as u64).sum();
     let frame_body = FrameBody {
-        parts: VecDeque::from([Bytes::from(head), Bytes::from(body)]),
+        parts: VecDeque::from(parts),
         remaining,
         _budget: budget,
     };

@@ -13,9 +13,12 @@ use zeroize::Zeroizing;
 use crate::encoding::{b64u, b64u_decode, to_json, verify, Signed};
 use crate::envelope::{hpke_open, hpke_seal, Envelope};
 use crate::keys::{hkdf_sha256, key_id, node_id, Custody};
-use crate::log::{entry_aad, entry_hash, EntryBody, Head, HeadBody};
+use crate::log::{
+    body_hash, entry_aad, entry_hash, entry_hash_v2, EntryBody, EntryBodyV1, EntryParts, Head,
+    HeadBody,
+};
 use crate::statement::ChallengeBody;
-use crate::{purpose, ProtocolError};
+use crate::{limits, purpose, ProtocolError};
 
 /// The keys an app derives from its master key (protocol.md section 3).
 pub struct AccountKeys {
@@ -201,10 +204,10 @@ pub fn seal_command(
     })
 }
 
-/// Opens the event of a log entry with the log decryption private key. `body` is the verified
-/// body of the entry.
+/// Opens the event of a log entry of format 1 with the log decryption private key. `body` is
+/// the verified body of the entry.
 pub fn open_entry(log_private: &StaticSecret, body: &[u8]) -> Result<Vec<u8>, ProtocolError> {
-    let entry: EntryBody =
+    let entry: EntryBodyV1 =
         serde_json::from_slice(body).map_err(|_| ProtocolError::InvalidRequest)?;
     if entry.v != 1 {
         return Err(ProtocolError::UnsupportedVersion);
@@ -221,6 +224,35 @@ pub fn open_entry(log_private: &StaticSecret, body: &[u8]) -> Result<Vec<u8>, Pr
     Ok(plaintext.to_vec())
 }
 
+/// Opens the events of a log entry of format 2 with the log decryption private key. `body` is
+/// the verified body of the entry. The plaintext is the JSON array of the events in the order
+/// of their creation; an array of another length than `count` is `invalid_request`.
+pub fn open_entry_v2(
+    log_private: &StaticSecret,
+    body: &[u8],
+) -> Result<Vec<serde_json::Value>, ProtocolError> {
+    let entry: EntryBody =
+        serde_json::from_slice(body).map_err(|_| ProtocolError::InvalidRequest)?;
+    if entry.v != 2 {
+        return Err(ProtocolError::UnsupportedVersion);
+    }
+    let enc = b64u_decode(&entry.enc)?;
+    let ct = b64u_decode(&entry.ct)?;
+    let plaintext = hpke_open(
+        log_private,
+        &enc,
+        purpose::LOG_ENTRY_SEAL_V2.as_bytes(),
+        &entry_aad(&entry.node, &entry.user_id, &entry.key_id, entry.seq),
+        &ct,
+    )?;
+    let events: Vec<serde_json::Value> =
+        serde_json::from_slice(&plaintext).map_err(|_| ProtocolError::InvalidRequest)?;
+    if events.len() != entry.count as usize {
+        return Err(ProtocolError::InvalidRequest);
+    }
+    Ok(events)
+}
+
 /// Why a chain failed the verification of protocol.md 7.4.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChainError {
@@ -234,8 +266,41 @@ pub enum ChainError {
     Incomplete,
 }
 
-/// Verifies one (node, account) chain from `checkpoint` up to `head` (protocol.md 7.4) and
-/// returns the new checkpoint.
+/// Verifies a head (protocol.md 7.3) for the chain of `user_id` on the node of
+/// `node_sign_public` and returns its `seq` and hash. `expected_nonce` is as in
+/// [`verify_chain`]. A head whose `seq` is behind the checkpoint does not verify.
+fn verified_head(
+    node_sign_public: &[u8; 32],
+    user_id: &str,
+    checkpoint: &Head,
+    head: &Signed,
+    expected_nonce: Option<&str>,
+) -> Result<Head, ChainError> {
+    let head_bytes = verify(node_sign_public, purpose::HEAD, head).map_err(|_| ChainError::Head)?;
+    let head_body: HeadBody = serde_json::from_slice(&head_bytes).map_err(|_| ChainError::Head)?;
+    let nonce_matches = match expected_nonce {
+        Some(nonce) => !head_body.is_final && head_body.nonce == nonce,
+        None => head_body.is_final && head_body.nonce.is_empty(),
+    };
+    if head_body.v != 1
+        || head_body.kind != "head"
+        || head_body.node != node_id(node_sign_public)
+        || head_body.user_id != user_id
+        || !nonce_matches
+        || head_body.seq < checkpoint.seq
+    {
+        return Err(ChainError::Head);
+    }
+    let hash = b64u_decode(&head_body.hash).map_err(|_| ChainError::Head)?;
+    let hash = <[u8; 32]>::try_from(hash.as_slice()).map_err(|_| ChainError::Head)?;
+    Ok(Head {
+        seq: head_body.seq,
+        hash,
+    })
+}
+
+/// Verifies one (node, account) chain of format 1 from `checkpoint` up to `head` (protocol.md
+/// 7.4, "Format 1") by its entries and returns the new checkpoint.
 ///
 /// `entries` are the stored entries that follow the checkpoint, in order. `expected_nonce` is
 /// the nonce the verifier sent to a live node. `None` verifies the `final` head of a node that
@@ -249,30 +314,14 @@ pub fn verify_chain(
     expected_nonce: Option<&str>,
 ) -> Result<Head, ChainError> {
     let node = node_id(node_sign_public);
-    let head_bytes = verify(node_sign_public, purpose::HEAD, head).map_err(|_| ChainError::Head)?;
-    let head_body: HeadBody = serde_json::from_slice(&head_bytes).map_err(|_| ChainError::Head)?;
-    let nonce_matches = match expected_nonce {
-        Some(nonce) => !head_body.is_final && head_body.nonce == nonce,
-        None => head_body.is_final && head_body.nonce.is_empty(),
-    };
-    if head_body.v != 1
-        || head_body.kind != "head"
-        || head_body.node != node
-        || head_body.user_id != user_id
-        || !nonce_matches
-        || head_body.seq < checkpoint.seq
-    {
-        return Err(ChainError::Head);
-    }
-    let head_hash = b64u_decode(&head_body.hash).map_err(|_| ChainError::Head)?;
-
+    let head = verified_head(node_sign_public, user_id, checkpoint, head, expected_nonce)?;
     let mut current = *checkpoint;
     let mut stored = entries.iter();
-    while current.seq < head_body.seq {
+    while current.seq < head.seq {
         let entry = stored.next().ok_or(ChainError::Incomplete)?;
         let body_bytes =
             verify(node_sign_public, purpose::LOG_ENTRY, entry).map_err(|_| ChainError::Broken)?;
-        let body: EntryBody =
+        let body: EntryBodyV1 =
             serde_json::from_slice(&body_bytes).map_err(|_| ChainError::Broken)?;
         if body.v != 1
             || body.node != node
@@ -287,18 +336,190 @@ pub fn verify_chain(
             hash: entry_hash(&body_bytes),
         };
     }
-    if current.hash.as_slice() != head_hash.as_slice() {
+    if current.hash != head.hash {
         return Err(ChainError::Broken);
     }
     Ok(current)
+}
+
+/// Why a chain of format 2 failed the index verification of protocol.md 7.4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexError {
+    /// The head does not verify: signature, `type`, `node`, `user_id`, nonce, `final`, or a
+    /// `seq` behind the checkpoint.
+    Head,
+    /// No key of this `seq` is listed while keys of later ones are: the stored log has a gap.
+    Gap { seq: u64 },
+    /// Keys of this `seq` are listed, but none of them follows the chain, or the chain does not
+    /// end at the hash of the head: the stored log was altered.
+    Broken { seq: u64 },
+    /// More than one key of this `seq` follows the chain. The operator domain can add objects
+    /// under any key, so the objects of these keys decide ([`verify_entry_v2`]).
+    Ambiguous { seq: u64 },
+    /// The listing ends before the `seq` of the head: stored entries are missing at the end.
+    Incomplete,
+}
+
+/// Verifies one (node, account) chain of format 2 from `checkpoint` up to `head` by the keys
+/// of a listing of the log store alone (protocol.md 7.4, index verification) and returns the
+/// new checkpoint.
+///
+/// `keys` are the parts of the keys listed under the prefix of the chain after the checkpoint,
+/// in any order; keys of other seqs are ignored. For every `seq` after the checkpoint up to the
+/// head, exactly one key must satisfy `entry_hash == entry_hash_v2(cursor.hash, body_hash,
+/// fields)` (the five parts of the key before its hashes are an input of the hash); the cursor
+/// then moves to its `entry_hash`. At the head the cursor must equal the hash of the head. A
+/// caller reads the object of a control key (`kind` c) with [`verify_entry_v2`] on top of this
+/// walk: this function does not tell the kinds apart.
+pub fn verify_index(
+    node_sign_public: &[u8; 32],
+    user_id: &str,
+    checkpoint: &Head,
+    keys: &[EntryParts],
+    head: &Signed,
+    expected_nonce: Option<&str>,
+) -> Result<Head, IndexError> {
+    let head = verified_head(node_sign_public, user_id, checkpoint, head, expected_nonce)
+        .map_err(|_| IndexError::Head)?;
+    let last_listed = keys.iter().map(|parts| parts.seq).max().unwrap_or(0);
+    let mut cursor = *checkpoint;
+    while cursor.seq < head.seq {
+        let seq = cursor.seq + 1;
+        let mut candidates = keys.iter().filter(|parts| parts.seq == seq).peekable();
+        if candidates.peek().is_none() {
+            return Err(match seq > last_listed {
+                true => IndexError::Incomplete,
+                false => IndexError::Gap { seq },
+            });
+        }
+        // A key counts once however many versions of its object the listing shows (a write the
+        // node repeated adds a version of the same key).
+        let mut following: Vec<&EntryParts> = Vec::new();
+        for parts in candidates {
+            if parts.entry_hash == entry_hash_v2(&cursor.hash, &parts.body_hash, &parts.fields())
+                && !following.contains(&parts)
+            {
+                following.push(parts);
+            }
+        }
+        let [next] = following[..] else {
+            return Err(match following.is_empty() {
+                true => IndexError::Broken { seq },
+                false => IndexError::Ambiguous { seq },
+            });
+        };
+        cursor = Head {
+            seq,
+            hash: next.entry_hash,
+        };
+    }
+    if cursor.hash != head.hash {
+        return Err(IndexError::Broken { seq: cursor.seq });
+    }
+    Ok(cursor)
+}
+
+/// Verifies the object of a key of format 2 (protocol.md 7.4, content verification): the
+/// signature of the node, the body fields `v`, `node`, `user_id`, `seq`, `kind`, `count`,
+/// `key_id` and `time_ms` against the parts of the key, `body_hash` against the body bytes,
+/// and `prev` against `cursor` when a cursor is given (the screen reads one entry without its
+/// predecessor and passes `None`). Returns the body. Every failure is `Broken`.
+pub fn verify_entry_v2(
+    node_sign_public: &[u8; 32],
+    user_id: &str,
+    parts: &EntryParts,
+    cursor: Option<&Head>,
+    entry: &Signed,
+) -> Result<EntryBody, ChainError> {
+    let body_bytes =
+        verify(node_sign_public, purpose::LOG_ENTRY_V2, entry).map_err(|_| ChainError::Broken)?;
+    let body: EntryBody = serde_json::from_slice(&body_bytes).map_err(|_| ChainError::Broken)?;
+    let count_fits = body.count >= 1 && body.count as usize <= limits::ENTRY_EVENTS;
+    if body.v != 2
+        || body.node != node_id(node_sign_public)
+        || body.user_id != user_id
+        || body.seq != parts.seq
+        || body.time_ms != parts.time_ms
+        || body.kind != parts.kind.letter().to_string()
+        || body.count != parts.count
+        || !count_fits
+        || body.key_id != parts.key_id
+        || body_hash(&body_bytes) != parts.body_hash
+        || cursor.is_some_and(|cursor| body.prev != b64u(&cursor.hash))
+    {
+        return Err(ChainError::Broken);
+    }
+    Ok(body)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::keys::NodeKeys;
-    use crate::log::signed_head;
+    use crate::log::{append_batch, signed_head, EntryKind};
+    use crate::secret::Secret;
     use crate::statement;
+    use serde_json::json;
+
+    #[test]
+    fn a_key_listed_twice_counts_once_and_a_forged_key_is_ambiguous() {
+        let node = NodeKeys::from_random(&[0x11; 32], &[0x22; 32]);
+        let account = derive_account_keys(&[0x33; 32]);
+        let events = [
+            json!({"t": "grant_accepted", "time_ms": 1, "not_after_ms": 2, "custody": "enclave"}),
+            json!({"t": "provider_request", "time_ms": 2}),
+        ];
+        let mut head = Head::EMPTY;
+        let mut keys = Vec::new();
+        for (index, kind) in [EntryKind::Control, EntryKind::Use].into_iter().enumerate() {
+            let (_, next, parts) = append_batch(
+                &node,
+                &head,
+                "user-1",
+                &account.key_id(),
+                &account.log_pk(),
+                1_000 * (index as u64 + 1),
+                kind,
+                &events[index..=index],
+                &Secret::new([index as u8 + 1; 32]),
+            );
+            keys.push(parts);
+            head = next;
+        }
+        let signed = signed_head(&node, "user-1", &head, "nonce", 5, false);
+        let public = node.sign_public();
+        // The listing shows two versions of the key of seq 2 (a write the node repeated): the
+        // key counts once.
+        let twice = [keys[0].clone(), keys[1].clone(), keys[1].clone()];
+        assert_eq!(
+            verify_index(
+                &public,
+                "user-1",
+                &Head::EMPTY,
+                &twice,
+                &signed,
+                Some("nonce")
+            ),
+            Ok(head)
+        );
+        // A key of seq 2 with another body hash and a consistent entry hash is a second
+        // candidate: the objects decide.
+        let mut forged = keys[1].clone();
+        forged.body_hash = body_hash(b"another body");
+        forged.entry_hash = entry_hash_v2(&keys[0].entry_hash, &forged.body_hash, &forged.fields());
+        let with_forged = [keys[0].clone(), keys[1].clone(), forged];
+        assert_eq!(
+            verify_index(
+                &public,
+                "user-1",
+                &Head::EMPTY,
+                &with_forged,
+                &signed,
+                Some("nonce")
+            ),
+            Err(IndexError::Ambiguous { seq: 2 })
+        );
+    }
 
     #[test]
     fn account_keys_use_four_distinct_derivations() {

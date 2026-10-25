@@ -11,6 +11,7 @@ use std::sync::Arc;
 use axum::extract::{Request, State};
 use axum::response::Response;
 use credential_enclave_protocol::encoding::b64u;
+use credential_enclave_protocol::log::EntryKind;
 use credential_enclave_protocol::{limits, statement, ProtocolError};
 
 use super::responses::{Begin, Complete, Merged};
@@ -171,11 +172,10 @@ async fn run_complete(node: &Node, request: Request) -> Result<Response, ApiErro
     let credentials = provider_credentials(definition, &config, &pending.provider)?;
     let account = node.account(user_id).ok_or(ProtocolError::GrantRequired)?;
     // An account at its limit of pending entries does not spend the authorization code.
-    log_store::admit(node, user_id, &account).await?;
+    log_store::admit(node, &account).await?;
     {
         let mut account = lock(&account);
         let grant = account.active(node.now_ms())?;
-        account.ensure_capacity()?;
         // The grant in force is the grant the authorization started under: all 32 bytes of
         // the account signing public key, not the 8-byte key_id (protocol.md 8.2).
         if grant.sign_pk != pending.sign_pk {
@@ -213,8 +213,8 @@ async fn run_complete(node: &Node, request: Request) -> Result<Response, ApiErro
     let public = plaintext.public_fields(definition, None)?;
     let id = node.random_public::<16>()?;
     let nonce = node.random_public::<12>()?;
-    // The record and its entry are created under the account lock.
-    let (record, entry, seq) = {
+    // The record and its event are created under the account lock.
+    let (record, place) = {
         let mut account = lock(&account);
         node.ensure_open()?;
         let grant = account.active(now_ms)?;
@@ -222,19 +222,24 @@ async fn run_complete(node: &Node, request: Request) -> Result<Response, ApiErro
             return Err(ProtocolError::KeyMismatch.into());
         }
         let record = plaintext.seal(&grant, &id, &nonce, user_id, &pending.provider);
-        let entry = node.append_entry(
+        let place = node.create_event(
             &mut account,
             user_id,
             &grant.key_id,
             &grant.log_pk,
             now_ms,
-            &events::connection_created(&record.id, &pending.provider, public.scope(definition)),
+            EntryKind::Control,
+            events::connection_created(&record.id, &pending.provider, public.scope(definition)),
         )?;
-        (record, entry, account.head.seq)
+        (record, place)
     };
     // The record leaves only after the log store confirmed the entry. When it does not, the
     // record is dropped here and the tokens with it: the connection is started again.
-    log_store::confirm(node, user_id, &account, &[seq]).await?;
+    let log = log_store::commit(node, user_id, &account, &[(place, true)])
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(ApiError::internal)?;
     let statement = statement::oauth_complete(
         &node.keys,
         user_id,
@@ -249,7 +254,7 @@ async fn run_complete(node: &Node, request: Request) -> Result<Response, ApiErro
         record,
         public,
         statement,
-        entry,
+        log,
     }))
 }
 

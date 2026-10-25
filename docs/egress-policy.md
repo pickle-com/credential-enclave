@@ -60,9 +60,9 @@ log store and is part of none, and neither appears in a response.
 | Channel | To | What |
 | --- | --- | --- |
 | C1 | The operator domain | The response of a call: status, headers, body |
-| C2 | A provider | A TLS connection that ends inside the node. Its destination is an address of the provider definitions or one of the fixed Naver mail endpoints. The operator domain sees TLS records only |
+| C2 | A provider | A TLS connection that ends inside the node. Its destination is an address of the provider definitions or one of the fixed Naver mail endpoints. A connection to a provider carries the requests of one account: the node keeps at most 8 idle connections per (account, host) for at most 30 seconds, and sends the requests of a forward batch at most 6 at a time. The operator domain sees TLS records only |
 | C3 | The console | Exists in a debug-mode enclave only (its attestation has all-zero PCRs and an app refuses it). In any mode the node writes fixed strings of its source only |
-| C4 | The log store | A TLS connection that ends inside the node, to `{bucket}.s3.{region}.amazonaws.com` of the log store of the node. It carries log entries (class C below), the key of each (`user_id` E, the node identifier, `seq` and the chain hash P) and the credentials of the operator for the store. The operator domain sees TLS records only, and it can read the bucket |
+| C4 | The log store | A TLS connection that ends inside the node, to `{bucket}.s3.{region}.amazonaws.com` of the log store of the node (a node of the local platform may write to the endpoint of its configuration instead). It carries log entries (class C below), the key of each (`user_id` E, the node identifier, `seq`, `time_ms`, the kind, the count, the hash of the body and the chain hash P, `key_id` E) and the credentials of the operator for the store. The node keeps at most 32 idle connections to the store. The operator domain sees TLS records only, and it can read the bucket |
 
 There is no other channel: the node writes no file and opens no other socket.
 
@@ -75,7 +75,7 @@ Every value on C1 is of exactly one of seven classes.
 | P, public | A constant of the source, the node clock, a count or a size, node randomness, a public key, a hash of public values | `release`, `node`, `expires_ms`, the node part of `state`, the end of a chain |
 | E, echo | A value the operator domain gave in the clear, in this call or in the operator configuration | `user_id`, `provider`, `operator_state`, the `params` inside the authorization address |
 | D, declassified | A value that came from a sealed input or from a secret and that the protocol makes public. Section 4 lists all of them | The `key_id` and the `not_after_ms` of a grant, the S256 challenge, `has_refresh_token` |
-| C, ciphertext | A ciphertext that holds secrets: a record (a key derived from the user key), a log entry (the log public key of the account), a transfer envelope (the sealing public key of a verified peer) | `record`, `entry`, `envelope` |
+| C, ciphertext | A ciphertext that holds secrets: a record (a key derived from the user key), a transfer envelope (the sealing public key of a verified peer). A log entry (sealed to the log public key of the account) is a ciphertext of this class that leaves on C4 only: no response carries one | `record`, `envelope` |
 | S, signature | A signature of the node signing key over values of the classes above, and the attestation document of the platform | `statement`, `challenge_statement`, `reply`, `head`, `document` |
 | V, vault release | One value of a vault record that `release` hands out, after its log entry is on the chain | `value` of `release` |
 | R, from a provider | A value a provider sent, after the checks of rule E4 | The response of `forward`, the public fields, `provider_status`, `provider_error`, `revoked` |
@@ -330,30 +330,34 @@ calls, and `egress/sink-callers.tsv` (the one caller of K1).
 
 | Call | The fields of a successful response and their classes |
 | --- | --- |
-| `GET /v1/health` | `node` P, `release` P, `platform` P, `custody` P, `started_ms` P, `time_ms` P, `configured` P, `closing` P, `accounts` P, `grants` P, `mail_providers` P, `log_store` E and P (`bucket`, `region` and `credentials_expires_ms` E, `pending` P) |
+| `GET /v1/health` | `node` P, `release` P, `platform` P, `custody` P, `started_ms` P, `time_ms` P, `configured` P, `closing` P, `accounts` P, `grants` P, `mail_providers` P, `log_store` E and P (`bucket`, `region` and `credentials_expires_ms` E, `pending` P), `log` P (seven counts) |
 | `POST /v1/config` | `configured` P |
 | `POST /v1/attestation` | `v` P, `platform` P, `document` S (the platform signs the two public keys of the node, the release and the nonce of the caller), `node` P, `challenge` P, `release` P, `challenge_statement` S (its body: `type`, `node`, `challenge`, `time_ms` P, the nonce of the caller E) |
-| `POST /v1/messages` | `reply` S (its body: `type`, `ok`, `code`, `node`, `time_ms` P, `user_id`, `challenge`, `key_id`, `not_after_ms` D, `head` P), `entry` C, `grant` D |
+| `POST /v1/messages` | `reply` S (its body: `type`, `ok`, `code`, `node`, `time_ms` P, `user_id`, `challenge`, `key_id`, `not_after_ms` D, `head` P), `log` P, `grant` D |
 | `POST /v1/status` | `head` S (its body: the end of the chain P, the nonce of the caller E, the node clock P), `grant` D |
 | `POST /v1/oauth/begin` | `authorization_url` P, E and D (the address of the definition, `client_id` and `redirect_uri` of the operator configuration, the parameters of the caller, the state, the S256 challenge), `state` P and E, `statement` S, `expires_ms` P |
-| `POST /v1/oauth/complete` | `record` C, `public` R, P and D, `statement` S, `entry` C |
+| `POST /v1/oauth/complete` | `record` C, `public` R, P and D, `statement` S, `log` P |
 | `POST /v1/oauth/merge` | `record` C, `public` R, P and D |
-| `POST /v1/refresh` | `record` C, `public` R, P and D, `entry` C |
-| `POST /v1/revoke-token` | `revoked` R, `entry` C |
-| `POST /v1/forward` | `status` R, `headers` R, the body R, `entry` C |
-| `POST /v1/mail/verify` | `identity` D, `node` P, `statement` S (identity D, record bindings E/P), `entry` C, after E4 |
-| `POST /v1/mail/read` | `status` P, `headers` P, bounded provider mail data R, `entry` C, after E4 |
-| `POST /v1/mail/submit` | `status` P, `headers` P, submission status P, SMTP code R, `entry` C, after E4. A lost reply is not a rejection |
-| `POST /v1/release` | `value` V, `entry` C |
-| `POST /v1/log/entries` | `entries` C, `head` P |
-| `POST /v1/log/ack` | `unacked` P |
+| `POST /v1/refresh` | `record` C, `public` R, P and D, `log` P |
+| `POST /v1/revoke-token` | `revoked` R, `log` P |
+| `POST /v1/forward` | `status` R, `headers` R, the body R, `log` P |
+| `POST /v1/forward/batch` | `results` P: one result per request, in order, each `status` R, `headers` R, `body_bytes` P and the body R, or `error` P; each with `log` P |
+| `POST /v1/mail/verify` | `identity` D, `node` P, `statement` S (identity D, record bindings E/P), `log` P, after E4 |
+| `POST /v1/mail/read` | `status` P, `headers` P, bounded provider mail data R, `log` P, after E4 |
+| `POST /v1/mail/submit` | `status` P, `headers` P, submission status P, SMTP code R, `log` P, after E4. A lost reply is not a rejection |
+| `POST /v1/release` | `value` V, `log` P |
 | `POST /v1/close` | `accounts` P |
 | `POST /v1/close/heads` | `heads` S, `next` E |
-| `POST /v1/peer/export` | `envelope` C (K2), `entries` C, `next` E |
-| `POST /v1/peer/import` | `imported` P, `entries` C |
+| `POST /v1/peer/export` | `envelope` C (K2), `logs` E and P (`user_id` E, `seq` P), `next` E |
+| `POST /v1/peer/import` | `imported` P, `logs` E and P (`user_id` E, `seq` P) |
 | `POST /v1/log-store/credentials` | `credentials_expires_ms` E |
 
-Every failure: `code` P, `message` P, `provider_status` R, `provider_error` R.
+The `log` object of a response is P: the `seq` of the entry that holds the event of the call,
+the index of the event in that entry, and whether the call created the event. No response
+carries an entry: the log store is the one place an entry is read from.
+
+Every failure: `code` P, `message` P, `provider_status` R, `provider_error` R, and `index` P
+(the request of a `forward/batch` call the failure is about).
 
 The declassified values, all of them:
 

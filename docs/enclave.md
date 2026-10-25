@@ -50,7 +50,7 @@ credential-enclave/
 │   ├── src/clock.rs              # node time (section 8)
 │   ├── src/api/mod.rs            # the router, the failure responses
 │   ├── src/api/responses.rs      # every response type (rule E3 of the egress policy)
-│   ├── src/api/{health,config,attestation,messages,status,oauth,refresh,revoke,forward,release,log,close,peer,log_store}.rs
+│   ├── src/api/{health,config,attestation,messages,status,oauth,refresh,revoke,forward,forward_batch,release,close,peer,log_store}.rs
 │   ├── src/attest.rs             # which peer a node accepts (same platform; same measurement, a later release with an endorsement, a predecessor)
 │   ├── src/lineage.rs            # the release key, the log key and the list of predecessors of the program (5.13)
 │   ├── src/providers/mod.rs      # the provider definitions: parsing, validation, the address check
@@ -58,9 +58,9 @@ credential-enclave/
 │   ├── src/oauth.rs              # the authorization address, the token address call, the merge rules, the public fields
 │   ├── src/vault.rs              # the vault kinds and the value `release` hands out
 │   ├── src/provider_response.rs  # the check of a provider response before `forward` returns it
-│   ├── src/egress.rs             # the TLS client (rustls), one HTTP/1.1 exchange per provider connection
-│   ├── src/log_store.rs          # the log store: the write of an entry, its signature, the pending entries (5.14)
-│   ├── src/frame.rs              # the frame of `forward` (5.8)
+│   ├── src/egress.rs             # the TLS client (rustls), the idle connections per (account, host), the node-wide bound of provider requests
+│   ├── src/log_store.rs          # the log store: the group commit, the write of an entry, its signature, the pending entries, the idle connections (5.14)
+│   ├── src/frame.rs              # the frame of `forward` (5.8) and of `forward/batch` (5.8b)
 │   ├── src/testing.rs            # tests only: the provider stand-in, the test platform and clock
 │   └── src/tests/                # tests only: the tests of the whole node (section 12)
 ├── host/                         # crate credential-enclave-host (binary credential-enclave-host)
@@ -137,12 +137,12 @@ reads a clock: randomness and time are arguments.
 | `keys.rs` | The custody mode, `node` and `key_id`, HKDF-SHA256, the derivation of the record key, the binding document, the name of a log store (`LogStoreId`: a bucket name and a region name of the forms of protocol.md 4.1) |
 | `envelope.rs` | The command envelope and the commands inside it (the checks 1 to 9 of protocol.md 5.3), the signed reply, the transfer envelope between nodes (protocol.md 10.1), and the single-shot HPKE seal and open |
 | `record.rs` | The credential record: the kinds and their use modes, the AAD, opening and creating |
-| `log.rs` | The log entry, the chain hash, the head, the key of an entry in the log store |
+| `log.rs` | The log entry of format 2 (one entry, one or more events) and of format 1 (read only), the two chain hashes, the head, the key of an entry in the log store and its parsing into the parts of either format |
 | `statement.rs` | The node statements: the challenge statement of an attestation response (protocol.md 4.2), and `oauth_begin` and `oauth_complete` (protocol.md 8.2) |
 | `totp.rs` | TOTP (RFC 6238, HMAC-SHA1, 6 digits, 30 seconds) |
 | `release.rs` | The delegation transfer to a later release (protocol.md 10.3): the release statement, the six checks of an endorsement (the statement, the log identifier, the signed entry timestamp, the body of the entry with the release key and its signature, the time of the entry, the order of the two releases), the order of release tags, the reader of a list of predecessors, the reader of the PEM of a public key. The release key and the log key are arguments |
 | `attestation.rs` | Reading and verifying attestation documents: the Nitro document (CBOR, COSE_Sign1, the certificate chain, the signature, the PCRs), the binding, the local document. It holds the trust root (AWS Nitro Enclaves Root-G1, DER) as a public constant. It returns what a document states and does not judge a measurement: which PCR values are acceptable is the decision of the caller |
-| `app.rs` | The app side of the protocol: the derivation of the account keys, the check of a challenge statement, sealing a command, opening log entries, verifying a chain. The node program does not call this module. The generator of the test vectors and the tests use it in the place of the app |
+| `app.rs` | The app side of the protocol: the derivation of the account keys, the check of a challenge statement, sealing a command, opening log entries, verifying a chain of format 2 from the keys of the listing (index verification) and from its entries (content verification), verifying a chain of format 1. The node program does not call this module. The generator of the test vectors and the tests use it in the place of the app |
 | `bin/vectors.rs` | The generator of `protocol/vectors.json` (fixed seeds) |
 
 ## 2. The platform layer
@@ -189,25 +189,30 @@ struct Node {
     started_ms: u64,
     closing: AtomicBool,
     config: RwLock<Option<Arc<OperatorConfig>>>,
-    log_store: LogStore,             // { required, id: OnceLock<LogStoreId>, credentials: RwLock<Option<Arc<Credentials>>> } (5.14)
+    log_store: LogStore,             // { required, id: OnceLock<LogStoreId>, endpoint: OnceLock<Option<LogStoreEndpoint>>, credentials: RwLock<Option<Arc<Credentials>>>, idle: IdleConnections } (5.14)
+    log_counters: LogCounters,       // { entries, events, writes, write_failures, batch_calls, batch_requests }: the counts of `log` of health (5.1)
     challenges: Mutex<Expiring<[u8; 16], u64>>,         // the issued challenges, each with its serial. Removed after 300 seconds or on use. At most 100,000
     serials: AtomicU64,                                 // the next serial: one count for the challenges the node issues and the revoke commands it accepts. It starts at 1 and only grows
     accounts: RwLock<HashMap<String, Arc<Mutex<Account>>>>,  // user_id -> the state of the account. One lock per account
     pending: Mutex<Expiring<String, PendingAuth>>,      // node_state -> the pending authorization (600 seconds, used once). At most 100,000
-    // and: the platform, the clock, the provider definitions, the TLS client, the limits of section 8
+    // and: the platform, the clock, the provider definitions, the TLS client (with the idle connections to the providers, 5.8), the limits of section 8
 }
 struct Account {
     grant: GrantState,               // None | Active { key_id, sign_pk, log_pk, custody, user_key, not_after_ms, exported_to } | Expired { key_id, not_after_ms } | Revoked { key_id, sign_pk }
     head: Head,                      // { seq, hash }. Without entries: seq 0 and a hash of 32 zero bytes
-    unacked: VecDeque<Entry>,        // the entries without a storage acknowledgement. A call that uses a credential stops at 64 (section 4)
-    unconfirmed: Vec<Unconfirmed>,   // the entries the log store has not confirmed: { seq, hash, entry, writing }. Empty on a node without a log store (5.14)
-    recent: HashMap<[u8; 32], Recent>,  // merge key -> { entry_ms, seq } of its entry. Removed after 300 seconds (the GET requests of forward that have no body)
+    open: OpenBatch,                 // the use events whose entry does not exist yet: { events: Vec<Value>, bytes, seq: Arc<OnceLock<u64>> (the cell that receives the seq of the entry when the batch is closed), key_id, log_pk }
+    writer: bool,                    // true while a call of this account writes to the log store (the writer of the group commit, protocol.md 7.1)
+    notify: Arc<Notify>,             // woken when a write of this account ended: the waiting calls look at their entries again
+    unconfirmed: Vec<Unconfirmed>,   // the entries the log store has not confirmed: { seq, key, entry, writing }. Empty on a node without a log store (5.14)
+    recent: HashMap<[u8; 32], Recent>,  // merge key -> { entry_ms, target: EventPlace } of its event. Removed after 300 seconds (the GET requests of forward that have no body)
     final_head: Option<Signed>,      // the final head that the orderly shutdown created (5.11)
     kept_refreshes: VecDeque<KeptRefresh>,  // the responses of the successful refresh calls of the last 3,600 seconds, at most 16 (5.7)
     last_entry_ms: u64,              // the time_ms of the last entry of the chain (section 8)
+    last_event_ms: u64,              // the time_ms of the last event created (section 8)
     revoked_here: bool,              // true once this node accepted a revoke command of the account (protocol.md 10.1)
     revoke_serial: u64,              // the serial of the last revoke command of the account that this node accepted, 0 when there is none (protocol.md 5.4)
 }
+enum EventPlace { Open { batch: Arc<OnceLock<u64>>, index: u32 }, Entry { seq: u64, index: u32 } }   // where the event of a call is: in an open batch (the cell of that batch, filled with the seq of its entry at the close), or in an entry
 struct KeptRefresh { key: [u8; 32], kept_ms: u64, response: Refreshed }   // key = SHA-256(the ct of the record that was sent)
 struct PendingAuth { user_id, key_id, sign_pk: [u8; 32], provider, code_verifier: Option<PkceVerifier>, client_id: String, redirect_uri: String, state: String, expires_ms }
 struct OperatorConfig { providers: HashMap<String, ProviderCredentials> }
@@ -228,6 +233,28 @@ struct Credentials { access_key_id: String, secret_access_key: Secret<String>, s
   `grant_transferred_out` that names it, at most 64 (protocol.md 10.1). A grant command, a
   revoke, the end of the grant and a transfer that puts a grant in place create a new state, and
   the list of a new grant is empty.
+- The open batch of an account holds use events in the order of their creation. It is closed into
+  an entry by the call that finds no writer, by the writer when its write ends and the batch is
+  not empty, when the next event would exceed 128 events or 1,048,576 bytes of plaintext, when
+  the next event is created under another key than the batch was opened under, and before a
+  control event is created. Closing happens inside the lock of the account: the `seq`, the seal,
+  the signature and the new end of the chain are assigned there, and the cell of the batch
+  receives the `seq`. The write runs outside the lock.
+- A call whose event is in the open batch waits on the notification of the account until the
+  entry that holds its event is confirmed (it acts), or its own write was not confirmed
+  (`log_store_unavailable`), or it waited for twice the time limit of a write
+  (`log_store_unavailable`), or the node is closing when it looks again (`closing`). A call that
+  wakes and finds no writer and its entry unconfirmed becomes the writer. A forward batch waits
+  for every entry that holds one of its events. A writer whose call ends before its write does
+  (the caller closed the connection) is no longer the writer: the account has no writer until the
+  next call, and its entries are pending entries.
+- The sweep of the node: a task that runs every 30 seconds (`log_store::keep_sweeping`) visits
+  every account, drops the merge keys whose window of 300 seconds passed (`recent`), and writes
+  the pending entries of the account again with the rules of a write (at most 32 at the same
+  time, over the idle connections). Without it, a pending entry of an account that makes no
+  further call would stay out of the store for as long as the account is idle, and a reader of
+  the store would take that gap for an omission; and the merge keys of an idle account would stay
+  in memory until its next call. The sweep ends when the orderly shutdown starts.
 - `unconfirmed` of an account holds the entries that the log store has not confirmed. `writing`
   is true while a call writes the entry. An entry of this list that no call writes is a pending
   entry (protocol.md 7.6). A call takes the entries it writes out of the pending state inside
@@ -244,12 +271,13 @@ struct Credentials { access_key_id: String, secret_access_key: Secret<String>, s
 - `user_key`, the opened plaintext of a record, `code_verifier`, `client_secret`, and the
   `secret_access_key` and the `session_token` of the log store are values of the secret types of
   `protocol/src/secret.rs`: their memory is overwritten with zeros when they are dropped.
-- The creation of an entry and the update of the head of one account happen inside the lock of
-  that account (the chain of one account does not fork). A provider call and a write to the log
-  store run outside the lock.
+- The creation of an event, the close of the open batch into an entry and the update of the head
+  of one account happen inside the lock of that account (the chain of one account does not fork).
+  A provider call and a write to the log store run outside the lock.
 - The kept responses of `refresh` (5.7): a kept response holds what the response held, which is a
-  record (a ciphertext), the public fields and a log entry. A revoke command, the expiry of the
-  grant, and a grant of another signing key drop the kept responses of the account.
+  record (a ciphertext), the public fields and the `log` object of the entry. A revoke command,
+  the expiry of the grant, and a grant of another signing key drop the kept responses of the
+  account.
 
 ## 4. The common rules of the call surface
 
@@ -258,8 +286,8 @@ struct Credentials { access_key_id: String, secret_access_key: Secret<String>, s
 - The caller is the operator domain (its backend processes). A node does not trust its caller: a
   decision rests on the grant of the account, on the AEAD authentication of a record and on the
   provider definitions, and on nothing else.
-- Bodies: `POST /v1/forward` takes and returns a frame (5.8). Every other body is
-  `application/json`.
+- Bodies: `POST /v1/forward` and `POST /v1/forward/batch` take and return a frame (5.8). Every
+  other body is `application/json`.
 - A success is 200. A failure is one of the statuses below with the body
   `{"code":"<code of protocol.md section 11>","message":"..."}`. `message` is a fixed string of the
   source. The failures `exchange_failed` and `refresh_failed` carry two more keys,
@@ -273,7 +301,6 @@ struct Credentials { access_key_id: String, secret_access_key: Secret<String>, s
 | 409 | `grant_required`, `grant_revoked`, `grant_expired`, `key_mismatch` |
 | 413 | `too_large` |
 | 422 | `record_invalid` |
-| 429 | `log_backlog` |
 | 500 | `internal` |
 | 502 | `exchange_failed`, `refresh_failed`, `provider_unreachable`, `response_withheld` |
 | 503 | `not_configured`, `closing`, `log_store_unavailable`, `capacity_unavailable` |
@@ -284,27 +311,33 @@ code `invalid_request`. `user_mismatch` is 400 also when the account of a record
 (protocol.md section 6). A JSON body is accepted up to 1 MiB, and a longer one is `too_large`. The
 responses of a node carry no `Date` header (it would be a value of the system clock).
 
-- The common front of the calls that use a credential (`forward`, `refresh`, `revoke-token`,
-  `release`, `oauth/complete`): (1) the node is not `closing`. (2) The operator configuration is
-  present (`release` is the exception). (3) The node can write to its log store, and the account
-  has fewer than 64 pending entries (5.14. A node of platform `local` without a log store
-  passes. An account the node holds no state of fails before this step, with `grant_required`).
-  (4) The grant of the account is Active and within its time. (5) `unacked` of the account is
-  below 64. (6) The node opens the record (protocol.md section 6. `oauth/complete` creates a
-  record and has no step 6). `oauth/merge` passes (1), (4) and (6) only (it creates no entry and
-  calls no provider). `oauth/begin` passes (1), (2) and (4).
-- A command (`messages`) is not stopped by the limits of (3) and (5): a revocation must always be
-  possible. The entries of commands and of delegation transfers can raise `unacked` above 64.
-- The entry, the log store and the act. A call that creates an entry writes it to the log store
-  and performs its act only after the store confirmed the entry (protocol.md 7.6 names the act of
-  every call). When the store does not confirm it, the call ends with `log_store_unavailable`
-  (503) and the act does not take place.
-- A call that creates an entry carries that entry in its response (`entry`). An entry whose
-  response did not reach the caller is fetched again with 5.10. That includes the cases in which
-  the log store did not confirm the entry, or the provider call failed after the entry was
-  created: the failure response carries no entry.
-- From step (4) of the front to the creation of the entry, a call runs inside the lock of the
-  account. So a call either fails on the state of the grant, or its entry is on the chain before
+- The common front of the calls that use a credential (`forward`, `forward/batch`, `refresh`,
+  `revoke-token`, `release`, `oauth/complete`, the mail calls): (1) the node is not `closing`. (2)
+  The operator configuration is present (`release` is the exception). (3) The node can write to
+  its log store, and the account has fewer than 64 pending entries (5.14. A node of platform
+  `local` without a log store passes. An account the node holds no state of fails before this
+  step, with `grant_required`). (4) The grant of the account is Active and within its time. (5)
+  The node opens the record (protocol.md section 6. `oauth/complete` creates a record and has no
+  step 5). `oauth/merge` passes (1), (4) and (5) only (it creates no event and calls no provider).
+  `oauth/begin` passes (1), (2) and (4).
+- A command (`messages`) is not stopped by the limit of (3): a revocation must always be possible.
+  The entries of commands and of delegation transfers can raise the pending entries of an account
+  above 64.
+- The event, the log store and the act. A call that creates an event puts it into the open batch
+  of the account or into a control entry of its own (protocol.md 7.1), and performs its act only
+  after the store confirmed the entry that holds the event (protocol.md 7.6 names the act of every
+  call). When the store does not confirm it, the call ends with `log_store_unavailable` (503) and
+  the act does not take place.
+- A call that creates an event carries in its response the object `log`: `{"seq": the seq of the
+  entry that holds the event, "index": the index of the event in that entry (0 based), "created":
+  true}`. A call that merges into an event of the open batch or of an earlier entry carries the
+  `log` object of that event with `"created": false`. A call that creates no event (`oauth/merge`,
+  a revoke of an account without a grant, a refused grant) carries null. A forward batch carries
+  one `log` object per request. The entry itself is not carried: the log store is the place an
+  entry is read from. A failure response carries no `log` object: the entry of a call whose
+  provider call failed after the event was created is on the chain all the same.
+- From step (4) of the front to the creation of the event, a call runs inside the lock of the
+  account. So a call either fails on the state of the grant, or its event is on the chain before
   the entry of a later revoke: a revoke that is answered before a call reaches this part leaves no
   request of that call behind it. The write to the log store and the act follow outside the lock.
 
@@ -313,10 +346,12 @@ responses of a node carry no `Date` header (it would be a value of the system cl
 ### 5.1 `GET /v1/health`, `POST /v1/config`
 
 ```json
-GET /v1/health -> {"node":"...","release":"v1.0.0","platform":"nitro","custody":"enclave","started_ms":0,"time_ms":0,"configured":true,"closing":false,"accounts":0,"grants":0,
-                   "log_store":{"bucket":"...","region":"...","credentials_expires_ms":0,"pending":0}|null}
+GET /v1/health -> {"node":"...","release":"v2.0.0","platform":"nitro","custody":"enclave","started_ms":0,"time_ms":0,"configured":true,"closing":false,"accounts":0,"grants":0,
+                   "mail_providers":["naver_mail"],
+                   "log_store":{"bucket":"...","region":"...","credentials_expires_ms":0,"pending":0}|null,
+                   "log":{"entries":0,"events":0,"writes":0,"write_failures":0,"open_batches":0,"batch_calls":0,"batch_requests":0}}
 POST /v1/config {"providers":{"google_workspace":{"client_id":"...","client_secret":"...","redirect_uri":"https://.../api/integrations/google_workspace/oauth/callback","publishable_key":""}, ...},
-                 "log_store":{"bucket":"...","region":"..."}}
+                 "log_store":{"bucket":"...","region":"...","endpoint":"http://host:port"}}
              -> {"configured":true}
 ```
 
@@ -325,13 +360,24 @@ POST /v1/config {"providers":{"google_workspace":{"client_id":"...","client_secr
   this value to see that a delegation transfer arrived).
 - `log_store` of `health` is null on a node without a log store. Otherwise it names the bucket
   and its region, the end of the credentials the node holds (`credentials_expires_ms`, 0 when it
-  holds none) and the number of accounts that have a pending entry (`pending`).
+  holds none) and the number of accounts that have a pending entry (`pending`). The endpoint of a
+  node of the local platform is not reported.
+- `log` of `health`: counts since the node started. `entries` is the number of entries the node
+  created, `events` the number of events in them, `writes` the number of `PUT` requests the node
+  sent to the log store, `write_failures` the number of those that were not confirmed,
+  `open_batches` the number of accounts whose open batch is not empty at this moment,
+  `batch_calls` the number of `forward/batch` calls that passed the common front, and
+  `batch_requests` the number of requests in them.
 - `log_store` of `config` names the log store of the node (protocol.md 4.1 gives the form of the
   two names. Another form is `invalid_request`). The key is optional. A node takes a log store
   once: a later configuration that names the same log store, or none, leaves it in place, and a
   configuration that names another one is `invalid_request` and changes nothing, also not the
   client values. From the call that named it, the binding of the attestation responses of the
-  node carries it as `log`.
+  node carries it as `log`. A node of the local platform also takes an optional `endpoint` in
+  `log_store` (5.14): an `http://host:port` or `https://host:port` origin it writes to in
+  path-style, set once with the log store. A node of the nitro platform refuses a configuration
+  with `endpoint` (`invalid_request`), and a value that is not such an origin is `invalid_request`
+  on both platforms.
 - The host program sends `config` after the boot. A repeated call replaces the whole
   configuration of the client values. A provider name that has no definition (section 6) and a `redirect_uri` that is
   not https are `invalid_request`. The local platform also accepts a `redirect_uri` that starts
@@ -360,16 +406,18 @@ nonce of the call. The field is present on both platforms.
 
 ```json
 {"user_id":"...","envelope":{...}}
--> {"reply":{"body":"...","sig":"..."},"entry":{"body":"...","sig":"..."}|null,"grant":{"state":"active","key_id":"...","custody":"enclave","not_after_ms":0}}
+-> {"reply":{"body":"...","sig":"..."},"log":{"seq":1,"index":0,"created":true}|null,"grant":{"state":"active","key_id":"...","custody":"enclave","not_after_ms":0}}
 ```
 
 The processing is that of protocol.md 5.3 and 5.4. A command that fails is answered with 200 as
 well, and `ok` of `reply` is false (the app receives a signed failure). That includes a grant
 that the node refuses with `log_store_unavailable`: before the challenge is used when the node
 cannot write to its log store, and after the entry `grant_accepted` was created when the store
-did not confirm it (`entry` of the response is null, and the entry is fetched with 5.10). The responses other than
-200 are a violation of the form of the call itself (`invalid_request`), `closing`, and a failure
-of the platform (`internal`). `grant` is the plaintext copy that the caller (the backend) reads:
+did not confirm it (`log` of the response is null, and the entry is a pending entry). `log` names
+the control entry the command created (a grant that was accepted, a revoke of an account with a
+grant) and is null for a command that created none. The responses other than 200 are a violation
+of the form of the call itself (`invalid_request`), `closing`, and a failure of the platform
+(`internal`). `grant` is the plaintext copy that the caller (the backend) reads:
 the state of the account that the call named, after the processing. `state` is `active`, `none` or
 `revoked`, and a grant whose time has passed is reported as `none`. `key_id`, `custody` and
 `not_after_ms` have values in the state `active` only, and `revoked` has `key_id` only. `custody`
@@ -423,7 +471,7 @@ authorization address.
 
 ```json
 complete {"user_id":"...","state":"...","code":"..."}
-      -> {"record":{...},"public":{...},"statement":{"body":"...","sig":"..."},"entry":{"body":"...","sig":"..."}}
+      -> {"record":{...},"public":{...},"statement":{"body":"...","sig":"..."},"log":{"seq":1,"index":0,"created":true}}
 merge    {"user_id":"...","record":{...},"previous":{...}}
       -> {"record":{...},"public":{...}}
 ```
@@ -444,10 +492,11 @@ complete:
 4. The node creates the record: a new `id`, kind `oauth`, the plaintext
    `{"token": the response, "obtained_ms": now}` (with `"client_id"` for a dynamically registered
    client). The public fields (6.4) are computed first: when they fail the containment check, the
-   call fails with `response_withheld`, and no record, no public field and no entry leaves.
-5. The node creates the entry `connection_created` and writes it to the log store. After the
-   store confirmed it, the node returns the record, the entry, the statement `oauth_complete` and
-   the public fields (6.4). When the store does not confirm the entry, the call fails with
+   call fails with `response_withheld`, and no record, no public field and no event leaves.
+5. The node creates the control entry `connection_created` (the open batch of the account is
+   closed before it) and writes it to the log store. After the store confirmed it, the node
+   returns the record, the `log` object of the entry, the statement `oauth_complete` and the
+   public fields (6.4). When the store does not confirm the entry, the call fails with
    `log_store_unavailable`: the record is dropped inside the node, and the pending authorization
    was used, so the connection is started again. A node that cannot write to its log store (it
    has none, or no credentials within their time) ends the call before step 1: the pending
@@ -457,25 +506,26 @@ complete:
 merge moves the `refresh_token` of the old record when, in a reconnect, the new response has none
 (protocol.md 8.3). The node opens both records (both are of kind `oauth`, otherwise `not_allowed`).
 Their providers must be equal (otherwise `invalid_request`). The node returns the new record,
-encrypted again under the `id` of the new record, and its public fields. merge creates no entry.
-It works without the operator configuration and is not stopped by the limit of `unacked`
+encrypted again under the `id` of the new record, and its public fields. merge creates no event.
+It works without the operator configuration and is not stopped by the limit of pending entries
 (section 4).
 
 ### 5.7 `POST /v1/refresh`, `POST /v1/revoke-token`
 
 ```json
-refresh      {"user_id":"...","record":{...},"context":"..."} -> {"record":{...},"public":{...},"entry":{...}}
-revoke-token {"user_id":"...","record":{...},"context":"..."} -> {"revoked":true,"entry":{...}}
+refresh      {"user_id":"...","record":{...},"context":"..."} -> {"record":{...},"public":{...},"log":{"seq":1,"index":0,"created":true}}
+revoke-token {"user_id":"...","record":{...},"context":"..."} -> {"revoked":true,"log":{"seq":1,"index":0,"created":true}}
 ```
 
 - Both calls take a record of kind `oauth` or `oauth_imported` (otherwise `not_allowed`).
 - refresh: when the token place of the plaintext of the record has no `refresh_token`, the call
-  fails with `record_invalid`, without an entry and without a provider call (on this code the
+  fails with `record_invalid`, without an event and without a provider call (on this code the
   backend marks the connection as one that needs a new authorization). When there is one, the node
-  creates the entry `credential_refreshed`, writes it to the log store, calls the token address
-  with `grant_type=refresh_token` after the store confirmed the entry, and creates the new record
-  of the same `id` and the same kind by the merge rules (protocol.md 8.3). When the provider refuses, the call fails with `refresh_failed`,
-  and the body carries `provider_status` and `provider_error`.
+  creates the use event `credential_refreshed` (into the open batch of the account), waits until
+  the store confirmed the entry that holds it (the group commit of section 3), calls the token
+  address with `grant_type=refresh_token` after that, and creates the new record of the same `id`
+  and the same kind by the merge rules (protocol.md 8.3). When the provider refuses, the call fails
+  with `refresh_failed`, and the body carries `provider_status` and `provider_error`.
 - `provider_error` is a word of a closed vocabulary, `other`, or the empty string. The node reads
   the error string of the provider response: when the response is a JSON object, a string `error`
   is that string. For an object `error` it is the string `code` of that object (else its string
@@ -487,17 +537,19 @@ revoke-token {"user_id":"...","record":{...},"context":"..."} -> {"revoked":true
 - The kept response of a refresh: a node keeps the response of a successful `refresh` for 3,600
   seconds, per account, the 16 most recent ones, under the SHA-256 of the `ct` of the record that
   was sent. A repeated `refresh` of the same record by the same account passes the common front
-  and the opening of the record, and then returns the kept response as it is: the node calls no
-  provider and creates no entry. A revoke command, the expiry of the grant, and a grant of another
-  signing key drop the kept responses. A response is not kept when the grant under which the
-  refresh ran is no longer in force at the end of the call. The reason for keeping a response: a
-  provider that rotates refresh tokens invalidates the old token at the first call, so a response
-  that never reached the caller would end the connection.
-- revoke-token: the node creates the entry `connection_removed` and writes it to the log store.
-  After the store confirmed it, the node calls the revocation address, when the definition has `revoke` and the plaintext of the record has a
-  token (`token` = the refresh token when there is one, else the access token, with its
-  `token_type_hint`. The time limit is 5 seconds). `provider_revoke` of the entry says whether the
-  node makes that call (protocol.md 7.2), and `revoked` of the response is the outcome of the
+  and the opening of the record, and then returns the kept response as it is (its `log` object
+  names the event of the first call): the node calls no provider and creates no event. A revoke
+  command, the expiry of the grant, and a grant of another signing key drop the kept responses. A
+  response is not kept when the grant under which the refresh ran is no longer in force at the
+  end of the call. The reason for keeping a response: a provider that rotates refresh tokens
+  invalidates the old token at the first call, so a response that never reached the caller would
+  end the connection.
+- revoke-token: the node creates the control entry `connection_removed` (the open batch of the
+  account is closed before it) and writes it to the log store. After the store confirmed it, the
+  node calls the revocation address, when the definition has `revoke` and the plaintext of the
+  record has a token (`token` = the refresh token when there is one, else the access token, with
+  its `token_type_hint`. The time limit is 5 seconds). `provider_revoke` of the event says whether
+  the node makes that call (protocol.md 7.2), and `revoked` of the response is the outcome of the
   call: one bit, true for a 2xx status. A provider without a revocation address and a failed
   revocation call are not errors: the response says `revoked: false`.
 
@@ -512,7 +564,7 @@ Content-Type: application/vnd.pickle.frame
 
 ```json
 request meta:  {"user_id":"...","record":{...},"method":"GET","url":"https://host/path?query","headers":[["name","value"],...],"context":"...","timeout_ms":30000}
-response meta: {"status":200,"headers":[["name","value"],...],"entry":{"body":"...","sig":"..."}|null}
+response meta: {"status":200,"headers":[["name","value"],...],"log":{"seq":1,"index":0,"created":true}|null}
 ```
 
 The payload of the request is the body to send to the provider. The payload of the response is the
@@ -538,26 +590,38 @@ of the processing:
    `authorization`, `proxy-authorization`, `cookie`, `host`, `content-length`,
    `transfer-encoding`, `connection`, `keep-alive`, `upgrade`, `te`, `trailer`, `expect`,
    `accept-encoding`.
-5. The merge decision (protocol.md 7.2): a GET request without a body shares the entry of an
-   identical one of the last 300 seconds. In case of a merge the call continues at step 8
-   without an entry of its own, once the log store confirmed the entry it shares: when that
-   entry is a pending entry, the call writes it again, and it fails with `log_store_unavailable`
-   when the store does not confirm it. A request with a body is never merged.
-6. The node creates the entry `provider_request` and raises the end of the chain. The entry
-   names the request that step 8 sends: its method, its host, its whole path and its whole
-   query, and the size and the SHA-256 of its body. The node writes the entry to the log store
-   and continues after the store confirmed it. Otherwise the call fails with
-   `log_store_unavailable` and no request is sent.
+5. The merge decision (protocol.md 7.2): a GET request without a body that matches an event of
+   the open batch or of an entry created less than 300 seconds before shares that event. In case
+   of a merge the call continues at step 8 without an event of its own, once the log store
+   confirmed the entry that holds the event: when that entry is a pending entry, the call writes
+   it again, and it fails with `log_store_unavailable` when the store does not confirm it. A
+   request with a body is never merged. The merge window of an account is cleared by a revoke, an
+   expiry and a grant of another key (protocol.md 7.2).
+6. The node creates the event `provider_request` (its `time_ms` is now) and puts it into the open
+   batch of the account. The event names the request that step 8 sends: its method, its host,
+   its whole path and its whole query, and the size and the SHA-256 of its body. When no writer
+   is active for the account, the call closes the batch into an entry and writes it (5.14);
+   otherwise it waits for the writer (section 3). The call continues when the store confirmed the
+   entry that holds its event. Otherwise the call fails with `log_store_unavailable` and no
+   request is sent.
 7. (Stage 2) The node obtains the witness signatures.
 8. The node assembles the request and sends it: `Host`, then `Content-Length` when there is a body
    or the method is `POST`, `PUT` or `PATCH`, then the credential header made by the injection
    rule of the definition, then `Accept-Encoding: identity`, then the headers of the caller, then
-   `Connection: close` (one request per provider connection). The node follows no redirect (a 3xx
-   response is returned as it is). A response with `Transfer-Encoding: chunked` is returned
-   decoded. The node sends no `TE` header, and a response under any other transfer coding fails
-   the check of step 10. The hop-by-hop headers of the response (`connection`, `keep-alive`,
-   `proxy-authenticate`, `proxy-authorization`, `te`, `trailer`, `transfer-encoding`, `upgrade`,
-   and the names that its `Connection` header lists), `Set-Cookie` and `Set-Cookie2` are left out.
+   `Connection: keep-alive`. The node keeps at most 8 idle connections per (account, host), each
+   for at most 30 seconds, and a request of an account goes over an idle connection of that
+   account and host when there is one. No connection carries requests of two accounts, and a
+   connection whose response said `Connection: close` is not kept. A request over an idle
+   connection that ends without a response goes once more over a new connection when its method
+   is `GET` or `HEAD`; a request of another method is not repeated (`provider_unreachable`:
+   whether the provider received it is unknown). Every provider request takes one of the 512
+   places of the node-wide bound of provider requests in flight (section 8). The node follows no
+   redirect (a 3xx response is returned as it is). A response with `Transfer-Encoding: chunked`
+   is returned decoded. The node sends no `TE` header, and a response under any other transfer
+   coding fails the check of step 10. The hop-by-hop headers of the response (`connection`,
+   `keep-alive`, `proxy-authenticate`, `proxy-authorization`, `te`, `trailer`,
+   `transfer-encoding`, `upgrade`, and the names that its `Connection` header lists),
+   `Set-Cookie` and `Set-Cookie2` are left out.
 9. The time limit is `timeout_ms` (`timeout`). A transport failure is `provider_unreachable`, and
    a response body above 64 MiB is `too_large`.
 10. The response check (rule E4 of egress-policy.md, `enclave/src/provider_response.rs`). A
@@ -569,7 +633,7 @@ of the processing:
     encoded more than once), and each reading is searched for the credential as it is, in base64
     or base64url (each of the three byte alignments, without padding) and in hexadecimal (lower
     or upper case). A form shorter than 8 bytes is not searched for. A failed check is
-    `response_withheld`: no part of the response leaves. The entry `provider_request` is already
+    `response_withheld`: no part of the response leaves. The event `provider_request` is already
     on the chain, because the request went to the provider.
 
 The value of the credential header: `inject.prefix` followed by the value at the first path of
@@ -580,14 +644,62 @@ The node does not judge the expiry of a token and does not refresh. The response
 (a 401 and the `ok: false` of slack included) goes back as it is, after the check of step 10.
 Refreshing (`refresh`) and calling again are the work of the backend.
 
+### 5.8b `POST /v1/forward/batch`
+
+Sends one to 100 provider requests of one record with the credential of the record injected, after
+one entry names them all. The frame is the frame of 5.8. Its meta is
+
+```json
+request meta:  {"user_id":"...","record":{...},"context":"...","timeout_ms":30000,
+                "requests":[{"method":"GET","url":"https://host/path?query","headers":[["name","value"],...],"body_bytes":0}, ...]}
+response meta: {"results":[{"status":200,"headers":[["name","value"],...],"body_bytes":0,"log":{"seq":1,"index":0,"created":true}}
+                           | {"error":"timeout","log":{"seq":1,"index":1,"created":true}}, ...]}
+```
+
+and its payload is the bodies of the requests one after another, in order, `body_bytes` each (a
+sum that is not the length of the payload is `invalid_request`). `timeout_ms` (1,000 to 120,000,
+30,000 when omitted) is the time the node gives the provider calls of the batch together, from the
+confirmation of the entry. `requests` holds 1 to 100 objects; another count is `invalid_request`.
+
+1. The common front of section 4, once for the call. The call takes one forward slot (section 8).
+2. For every request, in order: the method is one of the methods of 5.8 step 3, the address
+   passes the check of section 7, and the headers pass the rules of 5.8 step 4. The first request
+   that fails refuses the whole call: `not_allowed`, `invalid_request` or `record_invalid` with
+   the body `{"code": ..., "message": ..., "index": i}`. No event is created before every request
+   passed.
+3. Inside the account lock: for every request, in order, the merge decision of 5.8 step 5, then
+   the event `provider_request` (`time_ms` now) into the open batch when the request is not
+   merged. Two identical GET requests inside the batch share one event. The open batch is closed
+   when it reaches a cap (protocol.md 7.1), so the events of one batch may lie in two entries.
+   The call leaves the lock with the place of every request.
+4. The call waits until every entry that holds one of its events is confirmed (the group commit
+   of protocol.md 7.1: the call is the writer when none is active). When a write is not
+   confirmed, the call fails with `log_store_unavailable` and no request is sent.
+5. The grant is checked once more (a revoke the node accepted while the entry was written
+   refuses the call with `grant_revoked`: the entry stays on the chain and no request leaves).
+   The requests leave over the idle connections of (account, host) of 5.8 step 8, at most 6 at a
+   time (`FORWARD_BATCH_CONCURRENCY`), within the node-wide bound of 512 provider requests in
+   flight, until `timeout_ms` since the confirmation. Every response passes the checks of 5.8
+   step 10 one by one.
+6. The response frame: `results` in the order of the requests, and the payload is the bodies of
+   the results one after another. The `error` of one result is the failure code the same request
+   would have had as a single `forward` (`timeout`, `provider_unreachable`, `too_large`,
+   `response_withheld`); the other results are not affected, and the `log` object of a failed
+   request names its event all the same (the entry is on the chain). The bodies of the results
+   together stay under the body limit of 64 MiB: a response that would take their sum over it is
+   `too_large` and its body is not kept. The body budget of section 8 covers the bodies of the
+   batch as it covers the body of a single `forward`: the reservation of the request frame is
+   split among the requests by the length of their bodies, and the share of a request is free
+   once the request is on the wire, before its response body takes a share of its own.
+
 ### 5.9 `POST /v1/release`
 
 ```json
 {"user_id":"...","record":{...},"field":"password|totp|card_number|card_cvc","origin":"https://host","context":"..."}
--> {"value":"...","entry":{...}}
+-> {"value":"...","log":{"seq":1,"index":0,"created":true}}
 ```
 
-| Record kind | Allowed field | The value that is returned | Entry |
+| Record kind | Allowed field | The value that is returned | Event |
 | --- | --- | --- | --- |
 | `vault_password` | `password` | `value` of the plaintext | `secret_released` |
 | `vault_totp` | `totp` | The 6-digit code computed from the seed of the plaintext (RFC 6238, node time). The seed does not leave | `totp_issued` |
@@ -595,8 +707,8 @@ Refreshing (`refresh`) and calling again are the work of the backend.
 
 Any other pair of kind and field is `not_allowed`, and so is a record of kind `oauth` or
 `oauth_imported`: no call hands out the plaintext of a token. A plaintext without the field, and a
-seed that is not base32, are `record_invalid`. The entry is on the chain, and the log store
-confirmed it, before the value leaves the node.
+seed that is not base32, are `record_invalid`. The entry that holds the event is on the chain, and
+the log store confirmed it, before the value leaves the node.
 
 `origin` is an origin string `https://host` or `https://host:port` of at most 512 bytes (the node
 checks the form only). Whether that origin is the site of the vault item is decided by the backend,
@@ -605,22 +717,10 @@ configuration.
 
 ### 5.10 `POST /v1/log/entries`, `POST /v1/log/ack`
 
-```json
-entries {"user_id":"...","after_seq":0} -> {"entries":[{"body":"...","sig":"..."}],"head":{"seq":0,"hash":"..."}}
-ack     {"user_id":"...","seq":0}       -> {"unacked":0}
-```
-
-- A node keeps an entry it created in `unacked` until it receives the storage acknowledgement
-  (`ack`). `ack` removes the entries with a `seq` up to the given one. `entries` returns the
-  entries of `unacked` with a `seq` above `after_seq`.
-- The two calls do not look at the log store. `entries` returns an entry whether the log store
-  confirmed it or not, and `ack` does not end a pending entry: the node keeps a pending entry
-  until the store confirmed it (5.14).
-- The backend calls `ack` after it stored the entries in its database. An entry whose response was
-  lost is fetched again with `entries`.
-- The use of a credential of an account whose `unacked` reached 64 is refused with `log_backlog`:
-  a caller that uses credentials without storing the entries stops after 64 uses per account (and
-  before that, the verification of the app shows the omission).
+The calls `POST /v1/log/entries` and `POST /v1/log/ack` are not part of the call surface. A node
+answers them with 404 `invalid_request`, like every path that is not defined. The log store is the
+one place an entry is read from (protocol.md 7.6): no call hands an entry out, and no call takes an
+acknowledgement of its storage.
 
 ### 5.11 `POST /v1/close`, `POST /v1/close/heads`
 
@@ -635,9 +735,13 @@ the number of accounts that have a chain. `close/heads` returns the `final` head
 that has a chain, in the lexical order of `user_id` (`cursor` is the last `user_id` of the page
 before, and an empty `next` ends the listing). `close/heads` before `close` is `invalid_request`.
 A node creates the `final` head of an account once, and a repeated call returns the same head.
-`limit` is at least 1, and a value above 1,000 is read as 1,000.
-The entries that are left in `unacked` are fetched with `log/entries` first. The host program
-starts this sequence when it receives the termination signal (section 9).
+`limit` is at least 1, and a value above 1,000 is read as 1,000. `close/heads` closes the open
+batch of every account that has one, writes those entries with one round of writes (the pending
+entries of the same accounts along), and signs the final heads after that. An entry that round
+does not confirm stays a pending entry and the final head covers it. A call that passed the common
+front before `close` and waits for a write runs to its end: its event is on the chain, and the
+final head covers it. The host program starts this sequence when it receives the termination
+signal (section 9).
 
 ### 5.12 `POST /v1/seal`, `POST /v1/open`
 
@@ -650,9 +754,9 @@ in the clear, and no call hands the plaintext of a token out.
 ```json
 export {"peer":{the attestation response of the receiving node},"after":"","limit":1000,
         "endorsement":{"statement":"...","entry":{"body":"...","integrated_time":0,"log_index":0,"log_id":"...","signed_entry_timestamp":"..."}}}
-  -> {"envelope":{...}|null,"entries":[{"body":"...","sig":"..."}],"next":""}
+  -> {"envelope":{...}|null,"logs":[{"user_id":"...","seq":1}],"next":""}
 import {"peer":{the attestation response of the giving node},"envelope":{...}}
-  -> {"imported":0,"entries":[{"body":"...","sig":"..."}]}
+  -> {"imported":0,"logs":[{"user_id":"...","seq":1}]}
 ```
 
 The rules are those of protocol.md 10.1 and 10.3. What this document adds:
@@ -661,23 +765,25 @@ The rules are those of protocol.md 10.1 and 10.3. What this document adds:
   that the caller chose, and the node does not look at it).
 - `limit` of export is 1 to 1,000 (a larger value is read as 1,000). `after` is the `next` of the
   page before (the empty string for the first page). When a page has no grant to hand over,
-  `envelope` is null and `entries` is an empty list. An empty `next` ends the listing.
-- `entries` of export holds one entry for every grant of the page that the node hands to this
-  peer for the first time (protocol.md 10.1). A grant that the node handed to the same peer
-  before is in the envelope again and has no entry: a repeated call returns the envelope and an
-  empty `entries`. An account whose grant was handed to 64 other peers is not selected. It is
-  not in the envelope, it has no entry, and it does not count toward `limit`.
+  `envelope` is null and `logs` is an empty list. An empty `next` ends the listing.
+- `logs` of export names the control entry `grant_transferred_out` (its `user_id` and `seq`) of
+  every grant of the page that the node hands to this peer for the first time (protocol.md 10.1;
+  the open batch of such an account is closed before it). A grant that the node handed to the
+  same peer before is in the envelope again and has no new entry: a repeated call returns the
+  envelope and an empty `logs`. An account whose grant was handed to 64 other peers is not
+  selected. It is not in the envelope, it has no entry, and it does not count toward `limit`.
 - export works in the state `closing` too (the orderly shutdown hands the delegations over before
   the node ends). An account whose final head is already signed is skipped. So the order of the
-  orderly shutdown is `close`, `peer/export`, `log/entries`, `close/heads`. import is refused with
-  `closing` in the state `closing`, and when the shutdown starts during an import, the call
-  answers with what it took until then.
+  orderly shutdown is `close`, `peer/export`, `close/heads`. import is refused with `closing` in
+  the state `closing`, and when the shutdown starts during an import, the call answers with what
+  it took until then.
 - The pages of export: the node goes through the accounts in the order of `user_id` until `limit`
   grants are selected, and `next` is the last `user_id` it looked at (the last page can be empty).
   An omitted `limit` is 1,000 and an omitted `after` is the empty string. `imported` of import is
-  the number of grants that this call put in place (it equals the number of entries). Within the
-  1 MiB limit of a JSON body, a page of 1,000 grants fits when a `user_id` is at most about 350
-  bytes long (a `user_id` of the length of a UUID fits).
+  the number of grants that this call put in place (it equals the number of elements of `logs`,
+  the control entries `grant_transferred_in` the call created). Within the 1 MiB limit of a JSON
+  body, a page of 1,000 grants fits when a `user_id` is at most about 350 bytes long (a `user_id`
+  of the length of a UUID fits).
 - `attest.rs` decides which peer a node accepts: platform `nitro` by steps 1 to 5, 7, 8 and 10 of
   protocol.md 4.3 (the allowed measurements are those the call names, see the next three items,
   the trust root is the DER of AWS Nitro Enclaves Root-G1 inside the binary, and the one allowed
@@ -707,12 +813,17 @@ The rules are those of protocol.md 10.1 and 10.3. What this document adds:
 - export and the log store: the node hands a grant over only after the log store confirmed the
   entry `grant_transferred_out` of that grant for that peer (protocol.md 10.1, steps 4a to 5b).
   When the store does not confirm the entry of one account of the page, the call fails with
-  `log_store_unavailable` and the response carries no envelope and no entry. The entries the call
-  created are on their chains and are fetched with 5.10. The next call for the same peer creates
-  no entry for these accounts, so its `entries` are those of the grants it hands over for the
-  first time only.
-- import and the log store: the entries of an import are pending entries. The call does not write
-  to the log store and does not need credentials for it.
+  `log_store_unavailable` and the response carries no envelope and no `logs`. The entries the
+  call created are on their chains and wait for the store (pending entries). The next call for
+  the same peer creates no entry for these accounts, so its `logs` are those of the grants it
+  hands over for the first time only.
+- import and the log store: the grants are put in place first, and the call then writes the
+  entries `grant_transferred_in` it created in one round (the pending entries of the same
+  accounts along) when the node has credentials for its log store. The call does not need the
+  credentials: without them, and for an entry the store does not confirm, the entry is a pending
+  entry that the next write of the account on this node takes along, and the call succeeds all
+  the same. The round is what puts the chain of the receiving node into the store for an account
+  whose calls keep going to another node.
 - Both calls work without the operator configuration. On a node of platform `nitro`, the log
   store of that configuration is what makes a peer acceptable and an export possible.
 
@@ -747,8 +858,9 @@ The write of an entry (`enclave/src/log_store.rs`) is the request of protocol.md
 | Connection | The connection of every outbound call (`Egress::open`): the byte pipe of the platform to port 443 of `{bucket}.s3.{region}.amazonaws.com`, TLS that ends inside the node, the trust roots of `webpki-roots`, the certificate verified at node time. The node keeps at most 32 idle HTTP/1.1 connections to its log store: open connections that carry no write. A write takes the most recently used one. A connection carries one write at a time and is idle again only when its response has ended. A connection that closed or failed, or whose write was cancelled, is not kept |
 | Request | `PUT` of the object of protocol.md 7.6, signed with AWS Signature Version 4 (the service `s3`, the region of the bucket). Every header of the request except `Content-Length` is signed. The times of `x-amz-date` and of the retention are node time |
 | Confirmation | The status 200. The node reads no response body and follows no redirect. A write over an idle connection that ends without a response goes once more over a new connection: a `PUT` is idempotent (RFC 9110 9.2.2), and a repeated write adds a second version of the object (protocol.md 7.6). A write over a new connection is not repeated inside the call |
-| Time limit | 5 seconds for one write: the connection, the TLS handshake and the exchange |
-| Writes of one call | The entries the act of the call waits for, and the pending entries of the same accounts. At most 32 writes run at the same time, the entries an act waits for first. After a round in which a write was not confirmed, the call starts no further write |
+| Local endpoint | A node of platform `local` takes an optional `endpoint` in the `log_store` of its configuration (5.1): an `http://host:port` or `https://host:port` origin. With it, the node writes to `{endpoint}/{bucket}/{key}` (path-style) with the `Host` header of the endpoint and, when the scheme is `http`, over the plain byte pipe of the platform without TLS; the signature region is the region of the configuration and the signed headers are the same. A node of platform `nitro` refuses a configuration with `endpoint` (`invalid_request`). The binding carries the bucket and the region only |
+| Time limit | 5 seconds for one write: the connection, the TLS handshake and the exchange. A call that waits for the write of another call waits for at most twice this time |
+| Writes of one call | The entries the act of the call waits for, and the pending entries of the same accounts. At most 32 writes run at the same time, the entries an act waits for first. After a round in which a write was not confirmed, the call starts no further write. The group commit (protocol.md 7.1, section 3): one call of an account writes at a time, and the events of the calls that arrive meanwhile form the next entry |
 | The limit of pending entries | An account whose pending entries reached 64 gets no further entry from a call that uses a credential (step 3 of the common front): the call writes the pending entries again, goes on when fewer than 64 are left, and otherwise ends with `log_store_unavailable` without an entry. A command and a delegation transfer are not stopped by this limit |
 | Platform | A node of platform `nitro` requires a log store (protocol.md 7.6). A node of platform `local` keeps account of the entries it creates from the call of `config` that named its log store: the entries it created before are not written |
 
@@ -1021,13 +1133,19 @@ The rules:
   node does not use a time that the parent instance gives.
 - Node time does not decrease: the function that reads the time remembers the largest value it
   returned, and when a new correction gives a smaller value, it returns that largest value. The
-  `time_ms` values of the entries of one chain do not decrease with `seq` (the one place that
-  creates an entry never dates it before the entry in front of it), and an expiry that has passed
-  does not come back into force.
+  `time_ms` values of the entries of one chain do not decrease with `seq`, the `time_ms` values of
+  its events do not decrease with (`seq`, index), and no event is dated after its entry (the one
+  place that creates an event or closes a batch never dates it before the one in front of it),
+  and an expiry that has passed does not come back into force.
 - Randomness: the kernel random source.
-- Concurrency: at most 64 `forward` calls run at the same time (a semaphore). The bodies of a
-  request and of a response are held in memory, and each of them is `too_large` above 64 MiB. A
-  call that would raise the sum of the bodies in memory above 2 GiB waits until there is room.
+- Concurrency: at most 512 `forward` and `forward/batch` calls run at the same time (a semaphore; a
+  batch call takes one place, and holds it for the round trips of its requests, so the places
+  are not the bound of the throughput of a node: the provider requests in flight and the body
+  budget are). At most 512 provider requests of the node are in flight at once,
+  and a batch sends at most 6 of its requests at a time. The bodies of a request and of a
+  response are held in memory, and each of them is `too_large` above 64 MiB (for a batch, the
+  bodies of its results together). A call that would raise the sum of the bodies in memory above
+  2 GiB waits until there is room.
 - The size of the enclave: 2 vCPUs and 4,096 MiB of memory (constants of the host program).
 - Output: the node writes nothing to the standard output (a production enclave has no console).
   Diagnostic values leave through `health` and through the failure codes of the calls only. A
@@ -1040,11 +1158,17 @@ The limits, as the source states them:
 | Limit | Value |
 | --- | --- |
 | JSON body of a call | 1 MiB |
-| `meta` of a `forward` frame | 1 MiB |
-| Body of a provider request and of a provider response (`forward`) | 64 MiB each |
+| `meta` of a `forward` or `forward/batch` frame | 1 MiB |
+| Body of a provider request and of a provider response (`forward`); the bodies of the results of a `forward/batch` call together | 64 MiB each |
 | Sum of the bodies in memory | 2 GiB |
-| Concurrent `forward` calls | 64 |
-| `timeout_ms` of `forward` | 1,000 to 120,000, default 30,000 |
+| Concurrent `forward` and `forward/batch` calls | 512 |
+| Requests in one `forward/batch` call | 100 |
+| Requests of one `forward/batch` call in flight at once | 6 |
+| Provider requests of the node in flight at once | 512 |
+| Idle connections to one provider host for one account, and their idle time | 8, 30 seconds |
+| Events in one entry | 128 |
+| Plaintext of one entry | 1,048,576 bytes |
+| `timeout_ms` of `forward` and `forward/batch` | 1,000 to 120,000, default 30,000 |
 | Address of `forward` | 8,192 bytes |
 | Response of a token address | 1 MiB, time limit 15 seconds |
 | Call of a revocation address | Time limit 5 seconds |
@@ -1055,14 +1179,15 @@ The limits, as the source states them:
 | `origin` of `release` | 512 bytes |
 | Challenges a node keeps | 100,000 |
 | Pending authorizations a node keeps | 100,000 |
-| One write to the log store | Time limit 5 seconds |
+| One write to the log store | Time limit 5 seconds (a call that waits for the write of another call: twice that) |
 | Writes of one call to the log store at the same time | 32 |
+| Idle connections to the log store | 32 |
 | Pending entries of an account at which a call that uses a credential creates no further entry | 64 |
 | `access_key_id`, `secret_access_key`, `session_token` of the log store | 128 characters, 256 bytes, 8,192 bytes |
 
 The constants of the protocol (the lifetime of a grant, of a challenge and of a pending
 authorization, the merge window, the kept `refresh` responses, the page of a transfer, the nodes
-that one grant is handed to, the limit of `unacked`, the retention of an object of the log store,
+that one grant is handed to, the caps of an entry, the retention of an object of the log store,
 the longest `context`) are in protocol.md section 12.
 
 ## 9. The host program (`credential-enclave-host`)
@@ -1077,7 +1202,7 @@ takes no argument, and it reads its configuration from environment variables.
 | Inbound relay | For every connection on TCP `0.0.0.0:8080` it opens a connection to vsock `16:8080` and moves the bytes in both directions. It does not read the bytes: the call surface of the node ends inside the enclave |
 | Egress relay | It listens on vsock port 8443. It reads the first line `CONNECT {host}:{port}\n`. When the host is on the allow list and the port is 443, it connects by TCP, answers `OK\n` and moves the bytes. Otherwise it sends `ERR\n` and closes. The allow list is the hosts of section 7, the hosts of the token addresses and the revocation addresses of 6.2 (the host program is built from the same definitions file), and the host of the log store, `{bucket}.s3.{region}.amazonaws.com`, when the two variables of the next row name one. TLS ends inside the node, so the relay sees ciphertext only. This list is a second line: the node itself sends a credential only to the addresses of its definitions, and log entries only to its log store |
 | Operator configuration | It reads the values of every provider from environment variables and calls `POST /v1/config` once the `health` call of the node answers. The variables: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `OUTLOOK_CLIENT_ID`, `OUTLOOK_CLIENT_SECRET`, `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `NOTION_CLIENT_ID`, `NOTION_CLIENT_SECRET`, `X_CLIENT_ID`, `X_CLIENT_SECRET`, `LINK_CLIENT_ID`, `LINK_CLIENT_SECRET`, `STRIPE_PUBLISHABLE_KEY`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, and `CHARACTER_API_BASE_URL` (the front of the callback address `{value}/api/integrations/{provider}/oauth/callback`). The configuration names every provider of the definitions: `redirect_uri` is always set, and a value without a variable is the empty string. `CREDENTIAL_ENCLAVE_LOG_BUCKET` and `CREDENTIAL_ENCLAVE_LOG_REGION` name the log store: when both are set and have the forms of protocol.md 4.1, the configuration carries them as `log_store`. When one is missing or has another form, the configuration carries no `log_store` and one line of the log says why. Without `CHARACTER_API_BASE_URL` no configuration is sent. A configuration that the node refuses is not sent again. The host program does not send the credentials for the log store: the backend sends them (5.14) |
-| Status | TCP 9091: `GET /healthz` (200 when the round trip of the `health` call of the node succeeds within 2 seconds, 503 otherwise) and `GET /metrics` (the Prometheus text format). Four gauges: `credential_enclave_up` (1 when the `health` round trip succeeds, 0 when it fails), `credential_enclave_configured` (1 when `configured` of `health` is true), `credential_enclave_accounts` (`accounts` of `health`), `credential_enclave_started_timestamp_seconds` (`started_ms` of `health` in seconds) |
+| Status | TCP 9091: `GET /healthz` (200 when the round trip of the `health` call of the node succeeds within 2 seconds, 503 otherwise) and `GET /metrics` (the Prometheus text format). Four gauges: `credential_enclave_up` (1 when the `health` round trip succeeds, 0 when it fails), `credential_enclave_configured` (1 when `configured` of `health` is true), `credential_enclave_accounts` (`accounts` of `health`), `credential_enclave_started_timestamp_seconds` (`started_ms` of `health` in seconds). From the `log` object of `health`, when the node answers with one: the counters `credential_enclave_log_entries_total`, `credential_enclave_log_events_total`, `credential_enclave_log_store_writes_total`, `credential_enclave_log_store_write_failures_total`, `credential_enclave_forward_batch_calls_total`, `credential_enclave_forward_batch_requests_total`, and the gauge `credential_enclave_log_open_batches`. A counter restarts at 0 when the node restarts (the started timestamp changes) |
 | Sending the operator configuration again | Does not happen. The configuration is sent once at the start. To change a value, the pod is replaced |
 | Shutdown | On SIGTERM (or SIGINT) the host program calls `POST {CREDENTIAL_ENCLAVE_DRAIN_URL}` (the shutdown collection route of the backend): the body `{"pod": "<the value of CREDENTIAL_ENCLAVE_POD_NAME>"}`, the headers `Authorization: Bearer {CREDENTIAL_ENCLAVE_DRAIN_TOKEN}` and `Content-Type: application/json`. Inside that request the backend makes the calls of the orderly shutdown to the node (5.11, 5.13), through the inbound relay. The host program waits for the response (at most 100 seconds), then calls `nitro-cli terminate-enclave --all` and ends. When one of the three variables (`CREDENTIAL_ENCLAVE_DRAIN_URL`, `CREDENTIAL_ENCLAVE_DRAIN_TOKEN`, `CREDENTIAL_ENCLAVE_POD_NAME`) is missing, it ends the enclave without the collection |
 | local | The node program with `--platform local` runs alone, without the host program. Whatever starts it sends the operator configuration |
@@ -1187,15 +1312,16 @@ place of every provider (`enclave/src/testing.rs`).
 | Attestation documents | The unit tests of `protocol/src/attestation.rs`, `enclave/src/attest.rs` and `enclave/src/platform/nitro.rs`, with the files of `protocol/tests/fixtures/` | The certificate chain and the signature of real Nitro attestation documents, the definite and the indefinite form of the payload, the refusal of another root, of a changed document, of other PCRs and of a debug-mode enclave. A peer under the statement of a later release and a peer of a listed predecessor: accepted with the measurement and the release of the real document, refused with another release in the binding, with another PCR, with another log store, on the local platform, and as a debug-mode enclave |
 | Command processing | `enclave/src/tests/commands.rs` | The state transitions of sequences of grant and revoke: a challenge is used once and for 300 seconds, a command for another node or of another user, the range of the expiry, the custody of a grant, a revoke and an old envelope after it, a grant that was held back until after a revoke, replacement, an expired grant |
 | Records | `enclave/src/tests/records.rs` | A record of another account, of another key or of another custody does not open, and neither does a record with a changed field of its AAD. The kind of a record decides the fields that `release` hands out |
-| Log | `enclave/src/tests/log.rs` | The entry is on the chain before the provider is called (the provider stand-in looks at the head at the time of the call), merging, the limit of `unacked`, `ack`, the final heads of `close`, the times of the entries of a chain |
-| Log store | `enclave/src/tests/log_store.rs`, the unit tests of `enclave/src/log_store.rs` | Against a stand-in for Amazon S3 on the TLS server of the provider stand-in: the write of an entry arrives before the request to the provider, and with the key, the body, the headers and a signature that the test computes again from the request. A write the store does not confirm (a status other than 200, a 412 included, no connection, no answer within the time limit) stops the act of every call. A pending entry is written again with the next write of its account, and a request that shares an entry waits for it. The signed refusal of a grant, a revoke that erases the key whatever the store answers, the failure and the repetition of `peer/export`, the refusal of a peer of another log store, a node of the nitro platform without a log store or credentials, the limit of pending entries, calls that end before their write, calls that run at the same time. The idle connections: one connection for writes in a row, a connection the store closed, a write whose idle connection ends without a response, the current credentials over an idle connection. The signature against the examples of the AWS documentation |
+| Log | `enclave/src/tests/log.rs` | The entry is on the chain before the provider is called (the provider stand-in looks at the head at the time of the call), the group commit (the events that arrive during a write form the next entry; a merged GET waits for the entry of the event it shares; a control event closes the open batch and stands alone; the caps of 128 events and 1,048,576 bytes), the `log` object of every response, the chain verified from the keys of the store and its head (index and content verification, a gap, a changed key), the final heads of `close`, a final head that covers an open batch, the times of the events and entries of a chain |
+| Log store | `enclave/src/tests/log_store.rs`, the unit tests of `enclave/src/log_store.rs` | Against a stand-in for Amazon S3 on the TLS server of the provider stand-in: the write of an entry arrives before the request to the provider, under the key of format 2 whose seven parts the test computes again from the body, with the headers and a signature that the test computes again from the request. A write the store does not confirm (a status other than 200, a 412 included, no connection, no answer within the time limit) stops the act of every call, the writer and the calls that waited for it. A pending entry is written again with the next write of its account, and a request that shares an event waits for its entry. The signed refusal of a grant, a revoke that erases the key whatever the store answers, the failure and the repetition of `peer/export`, the refusal of a peer of another log store, a node of the nitro platform without a log store or credentials, the limit of pending entries, calls that end before their write (the account has no writer afterwards), calls that run at the same time form one entry and write each entry once. The idle connections: one connection for writes in a row, a connection the store closed, a write whose idle connection ends without a response, the current credentials over an idle connection. The local endpoint: a path-style write over plain HTTP with the host of the endpoint, refused on the nitro platform and for a value that is not an origin. The signature against the examples of the AWS documentation |
 | Address check | The unit tests of `enclave/src/providers/mod.rs` | The refusals of section 7 (another host, a path outside the lists, a denied path in its spellings, dot segments, dot segments in front of a path parameter, encoded separators and separators that are encoded twice, a port, user information), and the validation of the definitions, including the rules for public fields |
 | OAuth | `enclave/src/tests/oauth.rs`, the unit tests of `enclave/src/oauth.rs` | Against the provider stand-in: exchange, refresh, the merge of a reconnect, the nested token place of slack and its `ok: false`, the public fields and the containment check, the closed vocabulary of `provider_error`, the kept response of a repeated refresh, a record of kind `oauth_imported` |
-| forward | `enclave/src/tests/forward.rs`, the unit tests of `enclave/src/provider_response.rs` and `enclave/src/egress.rs` | Header removal, the refusal of a header that overrides the method and of the batch address of Microsoft Graph, the injected credential, the entry of a GET request with a body, the whole path and the whole query in the entry of the longest address, redirects that are not followed, chunked responses, the body limit, the time limit, a response that reflects the credential (as it is, under percent escapes of up to three layers, in base64 and in hexadecimal) |
-| Delegation transfer | `enclave/src/tests/peer.rs` | The round trip of export and import between two nodes of the local platform, paging, the exclusion of expired grants and of accounts that revoked, a grant of another `sign_pk` is not replaced, the refusal of a changed envelope and of an envelope for another node, the entries `grant_transferred_out` and `grant_transferred_in`, a repeated export to the same peer without a new entry, the limit of 64 peers per grant, an export with an endorsement that does not hold (it hands nothing over and leaves no entry, also for a peer the call without an endorsement accepts) |
-| Call surface | `enclave/src/tests/surface.rs` | `health`, the operator configuration, attestation and its challenge statement, the failure bodies, HTTP/1.1 over a real connection, and that the calls of the router are the calls of the table in section 4 of egress-policy.md |
+| forward | `enclave/src/tests/forward.rs`, the unit tests of `enclave/src/provider_response.rs` and `enclave/src/egress.rs` | Header removal, the refusal of a header that overrides the method and of the batch address of Microsoft Graph, the injected credential, the event of a GET request with a body, the whole path and the whole query in the event of the longest address, redirects that are not followed, chunked responses, the body limit, the time limit, a response that reflects the credential (as it is, under percent escapes of up to three layers, in base64 and in hexadecimal), the idle connections per (account, host): two accounts never share one, a connection is dropped after 30 seconds idle, a GET over an idle connection that ends without a response is sent once more and a POST is not |
+| forward/batch | `enclave/src/tests/forward_batch.rs` | One entry names every request before any leaves; a batch of 100 with 6 in flight; a request that fails the address check refuses the whole call with its index and creates no event; a merged request inside a batch shares the event; two entries when the open batch reaches its cap inside a batch; one failed request leaves the other results intact and keeps its `log` object; the bodies of the results together under the body limit; the results in the order of the requests; the bodies split by `body_bytes`; a batch of 0 or 101 requests is invalid |
+| Delegation transfer | `enclave/src/tests/peer.rs` | The round trip of export and import between two nodes of the local platform, paging, the exclusion of expired grants and of accounts that revoked, a grant of another `sign_pk` is not replaced, the refusal of a changed envelope and of an envelope for another node, the entries `grant_transferred_out` and `grant_transferred_in` (the `logs` of the responses and the objects of the store), a repeated export to the same peer without a new entry, the limit of 64 peers per grant, an export with an endorsement that does not hold (it hands nothing over and leaves no entry, also for a peer the call without an endorsement accepts) |
+| Call surface | `enclave/src/tests/surface.rs` | `health` with the counts of its `log` object, the operator configuration, attestation and its challenge statement, the failure bodies, HTTP/1.1 over a real connection, that `log/entries` and `log/ack` do not exist, and that the calls of the router are the calls of the table in section 4 of egress-policy.md |
 | Egress policy | `enclave/src/tests/canary.rs` | The canary test of egress-policy.md: every secret carries a distinct marker, the provider stand-in breaks its contract on purpose (reflected credentials, tokens in public fields, content and transfer codings, cookies, redirects), every call of the router is made in a success and in a failure, no marker appears in a response in any of the searched encodings, and a credential reaches only the addresses of its own provider. The one exception is the requested field of a successful `release`. Both nodes of the walk have a log store: no write to it carries a secret of the account, and of the credentials for it the session token reaches the log store alone and the secret access key no request |
-| Host program | The unit tests of `host/src/` | The relays, the allow list of the egress relay with the host of the log store, the operator configuration with the log store of the environment, the status surface and the shutdown call, against a stand-in for the node over in-memory pipes |
+| Host program | The unit tests of `host/src/` | The relays, the allow list of the egress relay with the host of the log store, the operator configuration with the log store of the environment, the status surface (the four gauges, and the seven series of the `log` object of `health`, which the answer of a node of a release before v2.0.0 does not have) and the shutdown call, against a stand-in for the node over in-memory pipes |
 | Verification tool | The unit tests of `verify/src/`, `verify/tests/offline.rs`, with the files of `verify/tests/fixtures/` | The checks on a stored attestation document of a node of release v1.0.0 against the `measurements.json` of that release, the refusals, the report with the log store of a binding, and the exit status of the built tool |
 
 
@@ -1204,7 +1330,7 @@ place of every provider (`enclave/src/testing.rs`).
 GET /v1/health adds `mail_providers: ["naver_mail"]`. An absent field on an older release means
 no mail support. POST /v1/mail/verify, /v1/mail/read and /v1/mail/submit use the forward binary
 frame. Meta is `{user_id, record, context, request}`; only submit has payload bytes (ASCII SMTP
-MIME with CRLF). The response is the forward frame with `status`, `headers`, `entry` and body.
+MIME with CRLF). The response is the forward frame with `status`, `headers`, `log` and body.
 
 Verify takes an empty request and returns JSON `{identity,node,statement}`. Read takes
 `action: folders|search|read`, optional `mailbox` (INBOX), `uid_validity`, `uid`, `before_uid`,
@@ -1243,13 +1369,13 @@ buffer, which the parsed rows borrow, the base64 headers, the JSON and the frame
 frame metadata limits: 26 MiB at the 1 MiB metadata limit. Reading one raw message reserves its input bound
 plus the body limit (the parser buffer and the message copy) plus two metadata limits: 131 MiB
 at the default 64 MiB body limit. Submit reserves its payload plus two metadata limits. At the 2 GiB budget this admits about seventy listing calls or fifteen raw-message
-reads at once, bounded further by the 64 forwarding slots. Mail takes both its forwarding slot
+reads at once, bounded further by the 512 forwarding slots. Mail takes both its forwarding slot
 and body reservation without waiting. Insufficient capacity returns HTTP 503 `capacity_unavailable`
 before a credential is opened or a provider is called; the request frame may already have been
 read under its own reservation. No mail
 reservation enters the shared FIFO semaphore queue, so it cannot hold a smaller eligible
-HTTP call behind it. Admitted calls retain the 30-second deadline. The 64 forwarding slots
-are not a promise of 64 concurrent mail calls; capacity planning must include the body budget.
+HTTP call behind it. Admitted calls retain the 30-second deadline. The 512 forwarding slots
+are not a promise of 512 concurrent mail calls; capacity planning must include the body budget.
 
 FROM and SUBJECT search values use synchronizing UTF-8 literals with byte lengths, waiting
 for the server continuation before each literal (RFC 3501 sections 4.3 and 6.4.4). This avoids

@@ -9,10 +9,10 @@ use credential_enclave_protocol::limits;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use super::{provider, quiet_provider};
+use super::{provider_with_log_store, quiet_provider, quiet_provider_and_log_store};
 use crate::providers::Definitions;
 use crate::state::Limits;
-use crate::testing::{operator_config, App, Harness, Reply};
+use crate::testing::{App, Harness, Reply};
 
 const PROFILE: &str = "https://gmail.googleapis.com/gmail/v1/users/me/profile";
 
@@ -34,12 +34,22 @@ fn meta(app: &App, record: &Value, method: &str, url: &str, headers: Value) -> V
     })
 }
 
+/// A node with the log store of the tests (the stand-in confirms every write), the app of an
+/// account that granted on it and a Google record of that account.
 async fn ready(provider: &crate::testing::Provider) -> (Harness, App, Value) {
-    let harness = Harness::configured(provider).await;
+    let harness = Harness::new(provider);
+    harness.use_log_store().await;
     let app = App::new("user-1", 1);
     app.grant(&harness).await;
     let record = google_record(&app);
     (harness, app, record)
+}
+
+/// An event without its `time_ms`, the node time of its creation.
+fn without_time(mut event: Value) -> Value {
+    assert!(event["time_ms"].as_u64().is_some(), "{event}");
+    event.as_object_mut().unwrap().remove("time_ms");
+    event
 }
 
 fn failure(outcome: Result<crate::testing::Forwarded, (u16, Value)>) -> (u16, String) {
@@ -63,7 +73,7 @@ fn assert_budget_is_free(harness: &Harness) {
 
 #[tokio::test]
 async fn the_node_sets_the_credential_and_drops_the_headers_it_owns() {
-    let provider = provider(|_| {
+    let provider = provider_with_log_store(|_| {
         Reply::with_body(
             200,
             &[("content-type", "application/json")],
@@ -128,13 +138,18 @@ async fn the_node_sets_the_credential_and_drops_the_headers_it_owns() {
         Some(body.len().to_string().as_str())
     );
     assert_eq!(seen.header("authorization"), Some("Bearer ya29.injected"));
-    assert_eq!(seen.header("connection"), Some("close"));
+    // The connection stays open for the next request of this account to this host.
+    assert_eq!(seen.header("connection"), Some("keep-alive"));
     // The node asks for an unencoded response, whatever the caller asked for: it searches the
     // response for the credential before it hands it on.
     assert_eq!(seen.header("accept-encoding"), Some("identity"));
 
-    // The entry describes the request and never holds the credential.
-    let event = app.event(&harness, &forwarded.entry);
+    // The event describes the request and never holds the credential.
+    assert_eq!(
+        forwarded.log,
+        json!({"seq": 2, "index": 0, "created": true})
+    );
+    let event = without_time(app.logged(&harness, &provider, &forwarded.log));
     assert_eq!(
         event,
         json!({
@@ -150,8 +165,9 @@ async fn the_node_sets_the_credential_and_drops_the_headers_it_owns() {
 
 #[tokio::test]
 async fn github_takes_basic_on_its_git_addresses_and_token_on_its_api() {
-    let provider = provider(|_| Reply::json(200, &json!({"ok": true}))).await;
-    let harness = Harness::configured(&provider).await;
+    let provider = provider_with_log_store(|_| Reply::json(200, &json!({"ok": true}))).await;
+    let harness = Harness::new(&provider);
+    harness.use_log_store().await;
     let app = App::new("user-1", 1);
     app.grant(&harness).await;
     let record = app.record(
@@ -179,7 +195,7 @@ async fn github_takes_basic_on_its_git_addresses_and_token_on_its_api() {
         )
         .await
         .unwrap();
-    let seen = provider.seen();
+    let seen = provider.requests();
     assert_eq!(seen.len(), 2);
     assert_eq!(seen[0].server_name, "github.com");
     assert_eq!(
@@ -218,7 +234,7 @@ async fn github_takes_basic_on_its_git_addresses_and_token_on_its_api() {
 
 #[tokio::test]
 async fn every_method_of_the_list_is_sent_and_no_other() {
-    let provider = quiet_provider().await;
+    let provider = quiet_provider_and_log_store().await;
     let (harness, app, record) = ready(&provider).await;
     for method in ["GET", "POST", "PUT", "PATCH", "DELETE"] {
         let forwarded = harness
@@ -226,13 +242,13 @@ async fn every_method_of_the_list_is_sent_and_no_other() {
             .await
             .unwrap();
         assert_eq!(forwarded.status, 200, "{method}");
-        let seen = provider.seen().last().unwrap().clone();
+        let seen = provider.requests().last().unwrap().clone();
         assert_eq!(seen.method, method);
         // A request without a body declares a length only for the methods that carry one.
         let expected = matches!(method, "POST" | "PUT" | "PATCH").then_some("0");
         assert_eq!(seen.header("content-length"), expected, "{method}");
     }
-    let sent = provider.seen().len();
+    let sent = provider.requests().len();
     let seq = harness.head_seq("user-1");
     for method in ["HEAD", "OPTIONS", "CONNECT", "TRACE", "get", "QUERY"] {
         assert_eq!(
@@ -245,13 +261,13 @@ async fn every_method_of_the_list_is_sent_and_no_other() {
             "{method}"
         );
     }
-    assert_eq!(provider.seen().len(), sent);
+    assert_eq!(provider.requests().len(), sent);
     assert_eq!(harness.head_seq("user-1"), seq);
 }
 
 #[tokio::test]
 async fn an_address_outside_the_definition_is_refused_before_anything_is_recorded_or_sent() {
-    let provider = quiet_provider().await;
+    let provider = quiet_provider_and_log_store().await;
     let (harness, app, record) = ready(&provider).await;
     for address in [
         "https://oauth2.googleapis.com/token",
@@ -302,14 +318,14 @@ async fn an_address_outside_the_definition_is_refused_before_anything_is_recorde
         ),
         (403, "not_allowed".to_string())
     );
-    assert!(provider.seen().is_empty());
+    assert!(provider.requests().is_empty());
     assert_eq!(harness.head_seq("user-1"), 1);
     assert_budget_is_free(&harness);
 }
 
 #[tokio::test]
 async fn malformed_headers_and_arguments_are_refused() {
-    let provider = quiet_provider().await;
+    let provider = quiet_provider_and_log_store().await;
     let (harness, app, record) = ready(&provider).await;
     for headers in [
         json!([["X Bad", "1"]]),
@@ -358,7 +374,7 @@ async fn malformed_headers_and_arguments_are_refused() {
         serde_json::from_slice::<Value>(&bytes).unwrap()["code"],
         "invalid_request"
     );
-    assert!(provider.seen().is_empty());
+    assert!(provider.requests().is_empty());
     assert_eq!(harness.head_seq("user-1"), 1);
 
     // The time limit is optional and the bounds are inclusive.
@@ -371,7 +387,7 @@ async fn malformed_headers_and_arguments_are_refused() {
 
 #[tokio::test]
 async fn a_header_that_overrides_the_method_is_refused() {
-    let provider = quiet_provider().await;
+    let provider = quiet_provider_and_log_store().await;
     let (harness, app, record) = ready(&provider).await;
     // A provider that reads such a header would carry out another method than the method of
     // the entry. The call is refused, whatever the case of the name and wherever it stands.
@@ -404,7 +420,7 @@ async fn a_header_that_overrides_the_method_is_refused() {
         }
     }
     // Nothing was sent and no entry was created.
-    assert!(provider.seen().is_empty());
+    assert!(provider.requests().is_empty());
     assert_eq!(harness.head_seq("user-1"), 1);
     assert_budget_is_free(&harness);
 
@@ -417,13 +433,17 @@ async fn a_header_that_overrides_the_method_is_refused() {
     let seen = provider.only();
     assert_eq!(seen.method, "POST");
     assert_eq!(seen.header("x-http-method-overrides"), Some("DELETE"));
-    assert_eq!(app.event(&harness, &forwarded.entry)["method"], "POST");
+    assert_eq!(
+        app.logged(&harness, &provider, &forwarded.log)["method"],
+        "POST"
+    );
 }
 
 #[tokio::test]
 async fn the_batch_address_of_microsoft_graph_is_refused() {
-    let provider = quiet_provider().await;
-    let harness = Harness::configured(&provider).await;
+    let provider = quiet_provider_and_log_store().await;
+    let harness = Harness::new(&provider);
+    harness.use_log_store().await;
     let app = App::new("user-1", 1);
     app.grant(&harness).await;
     let record = app.record(
@@ -453,17 +473,17 @@ async fn the_batch_address_of_microsoft_graph_is_refused() {
             "{address}"
         );
     }
-    assert!(provider.seen().is_empty());
+    assert!(provider.requests().is_empty());
     assert_eq!(harness.head_seq("user-1"), 1);
     assert_budget_is_free(&harness);
 
-    // The same request on its own address is sent, and its entry names it.
+    // The same request on its own address is sent, and its event names it.
     let address = "https://graph.microsoft.com/v1.0/me/messages/AAMkAD";
     let forwarded = harness
         .forward(meta(&app, &record, "DELETE", address, json!([])), b"")
         .await
         .unwrap();
-    let event = app.event(&harness, &forwarded.entry);
+    let event = app.logged(&harness, &provider, &forwarded.log);
     assert_eq!(
         (&event["method"], &event["host"], &event["path"]),
         (
@@ -476,8 +496,8 @@ async fn the_batch_address_of_microsoft_graph_is_refused() {
 }
 
 #[tokio::test]
-async fn a_get_request_with_a_body_always_has_its_own_entry() {
-    let provider = quiet_provider().await;
+async fn a_get_request_with_a_body_always_has_its_own_event() {
+    let provider = quiet_provider_and_log_store().await;
     let (harness, app, record) = ready(&provider).await;
     let address = format!("{PROFILE}?fields=emailAddress");
     let get = |payload: &'static [u8]| {
@@ -486,16 +506,18 @@ async fn a_get_request_with_a_body_always_has_its_own_entry() {
         async move { harness.forward(request, payload).await.unwrap() }
     };
 
-    // A GET without a body: its entry can be the target of a merge.
+    // A GET without a body: its event can be the target of a merge.
     let first = get(b"").await;
-    assert_eq!(app.event(&harness, &first.entry)["window_s"], 300);
+    assert_eq!(first.log, json!({"seq": 2, "index": 0, "created": true}));
+    assert_eq!(app.logged(&harness, &provider, &first.log)["window_s"], 300);
 
     // The same address with a body, inside the window. The merge key holds the address
-    // only, so such a request is never merged: its entry carries the size and the hash of
+    // only, so such a request is never merged: its event carries the size and the hash of
     // the body, and no window.
     let body: &[u8] = br#"{"query":"from:alice"}"#;
     let with_body = get(body).await;
-    let event = app.event(&harness, &with_body.entry);
+    assert_eq!(with_body.log["created"], true);
+    let event = without_time(app.logged(&harness, &provider, &with_body.log));
     assert_eq!(
         event,
         json!({
@@ -506,42 +528,50 @@ async fn a_get_request_with_a_body_always_has_its_own_entry() {
             "context": "cli:gog",
         })
     );
-    let seen = provider.seen().last().unwrap().clone();
+    let seen = provider.requests().last().unwrap().clone();
     assert_eq!((seen.method.as_str(), seen.body.as_slice()), ("GET", body));
 
-    // The same body again, and another body: an entry each.
+    // The same body again, and another body: an event each.
     let again = get(body).await;
+    assert_eq!(again.log["created"], true);
     assert_eq!(
-        app.event(&harness, &again.entry)["body_sha256"],
+        app.logged(&harness, &provider, &again.log)["body_sha256"],
         event["body_sha256"]
     );
     let other: &[u8] = br#"{"query":"from:bob"}"#;
     let changed = get(other).await;
     assert_eq!(
-        app.event(&harness, &changed.entry)["body_sha256"],
+        app.logged(&harness, &provider, &changed.log)["body_sha256"],
         b64u(&Sha256::digest(other))
     );
     // The grant, the first GET and the three requests with a body.
     assert_eq!(harness.head_seq("user-1"), 5);
 
-    // A GET without a body still shares the entry of the first one, and a request with a
+    // A GET without a body still shares the event of the first one, and a request with a
     // body opened no window for it.
-    assert_eq!(get(b"").await.entry, Value::Null);
+    assert_eq!(
+        get(b"").await.log,
+        json!({"seq": 2, "index": 0, "created": false})
+    );
     assert_eq!(harness.head_seq("user-1"), 5);
-    assert_eq!(provider.seen().len(), 5);
+    assert_eq!(provider.requests().len(), 5);
     let fresh = format!("{PROFILE}?fields=messagesTotal");
     let request = meta(&app, &record, "GET", &fresh, json!([]));
-    assert_ne!(
-        harness.forward(request.clone(), body).await.unwrap().entry,
-        Value::Null
+    assert_eq!(
+        harness.forward(request.clone(), body).await.unwrap().log["created"],
+        true
     );
     let unmerged = harness.forward(request, b"").await.unwrap();
-    assert_eq!(app.event(&harness, &unmerged.entry)["window_s"], 300);
+    assert_eq!(unmerged.log["created"], true);
+    assert_eq!(
+        app.logged(&harness, &provider, &unmerged.log)["window_s"],
+        300
+    );
 }
 
 #[tokio::test]
-async fn an_entry_carries_the_whole_path_and_the_whole_query() {
-    let provider = quiet_provider().await;
+async fn an_event_carries_the_whole_path_and_the_whole_query() {
+    let provider = quiet_provider_and_log_store().await;
     let (harness, app, record) = ready(&provider).await;
     // An address of 8,192 bytes, the longest that passes the address check.
     let front = "https://gmail.googleapis.com";
@@ -558,15 +588,16 @@ async fn an_entry_carries_the_whole_path_and_the_whole_query() {
         .await
         .unwrap();
 
-    // The entry names the request that was sent: nothing of the path or the query is cut.
-    let event = app.event(&harness, &forwarded.entry);
+    // The event names the request that was sent: nothing of the path or the query is cut.
+    let event = app.logged(&harness, &provider, &forwarded.log);
     assert_eq!(event["path"], path.as_str());
     assert_eq!(event["query"], query.as_str());
     assert_eq!(provider.only().target, format!("{path}?{query}"));
 
-    // The largest entry of a request: the query fills the address with a byte that JSON
+    // The largest event of a request: the query fills the address with a byte that JSON
     // writes as two, and the context holds 256 control characters, which JSON writes as six
-    // bytes each.
+    // bytes each. Fifty events of this size fit in the plaintext of one entry; a batch of
+    // more such requests is split at the cap of the open batch (two entries).
     let query = "\\".repeat(8192 - PROFILE.len() - 1);
     let mut request = meta(
         &app,
@@ -577,23 +608,12 @@ async fn an_entry_carries_the_whole_path_and_the_whole_query() {
     );
     request["context"] = json!("\u{1}".repeat(256));
     let largest = harness.forward(request, b"{}").await.unwrap();
-    let event = app.event(&harness, &largest.entry);
+    let event = app.logged(&harness, &provider, &largest.log);
     assert_eq!(event["query"], query.as_str());
     assert_eq!(event["context"], "\u{1}".repeat(256));
-    // An entry leaves in the meta of the response frame and in the response of
-    // `log/entries`. The harness read both frames within the limit of a frame meta, and the
-    // largest entry is a small part of that limit.
-    let entry_bytes = largest.entry.to_string().len();
-    assert!(entry_bytes < 40_000, "{entry_bytes}");
-    assert!(entry_bytes * 16 < crate::frame::META_LIMIT_BYTES);
-    let (status, listed) = harness
-        .post(
-            "/v1/log/entries",
-            json!({"user_id": "user-1", "after_seq": 1}),
-        )
-        .await;
-    assert_eq!(status, 200);
-    assert_eq!(listed["entries"], json!([forwarded.entry, largest.entry]));
+    let event_bytes = event.to_string().len();
+    assert!(event_bytes < 20_000, "{event_bytes}");
+    assert!(event_bytes * 50 < limits::ENTRY_PLAINTEXT_BYTES);
 
     // One byte more is no address of `forward`: nothing is sent and nothing is recorded.
     assert_eq!(
@@ -607,13 +627,13 @@ async fn an_entry_carries_the_whole_path_and_the_whole_query() {
         ),
         (403, "not_allowed".to_string())
     );
-    assert_eq!(provider.seen().len(), 2);
+    assert_eq!(provider.requests().len(), 2);
     assert_eq!(harness.head_seq("user-1"), 3);
 }
 
 #[tokio::test]
 async fn a_redirect_is_returned_and_not_followed() {
-    let provider = provider(|_| {
+    let provider = provider_with_log_store(|_| {
         Reply::with_body(
             302,
             &[
@@ -636,7 +656,7 @@ async fn a_redirect_is_returned_and_not_followed() {
     );
     assert_eq!(forwarded.body, b"moved");
     // One request only: the credential did not follow the redirect.
-    assert_eq!(provider.seen().len(), 1);
+    assert_eq!(provider.requests().len(), 1);
 }
 
 #[tokio::test]
@@ -665,7 +685,7 @@ async fn provider_answers_come_back_as_they_are() {
         ),
         Reply::Raw(b"HTTP/1.1 204 No Content\r\n\r\n".to_vec()),
     ]);
-    let provider = provider(move |_| answers.lock().unwrap().remove(0)).await;
+    let provider = provider_with_log_store(move |_| answers.lock().unwrap().remove(0)).await;
     let (harness, app, record) = ready(&provider).await;
     let call = |query: &'static str| {
         let request = meta(
@@ -704,7 +724,7 @@ async fn provider_answers_come_back_as_they_are() {
         .unwrap();
     assert_eq!(withheld.0, 502);
     assert_eq!(withheld.1["code"], "response_withheld");
-    assert!(withheld.1.get("entry").is_none());
+    assert!(withheld.1.get("log").is_none());
     assert_eq!(harness.head_seq("user-1"), before + 1);
     assert_budget_is_free(&harness);
 
@@ -716,7 +736,7 @@ async fn provider_answers_come_back_as_they_are() {
         "UNAUTHENTICATED"
     );
     // The node did not refresh and did not retry.
-    assert_eq!(provider.seen().len(), 3);
+    assert_eq!(provider.requests().len(), 3);
 
     let forwarded = call("n=4").await;
     assert_eq!(forwarded.status, 204);
@@ -751,7 +771,7 @@ async fn bodies_above_the_limit_are_too_large() {
         Reply::with_body(200, &[], &vec![b'b'; SMALL]),
         Reply::json(200, &json!({})),
     ]);
-    let provider = provider(move |_| answers.lock().unwrap().remove(0)).await;
+    let provider = provider_with_log_store(move |_| answers.lock().unwrap().remove(0)).await;
     let harness = Harness::with(
         &provider,
         Definitions::embedded(),
@@ -760,9 +780,7 @@ async fn bodies_above_the_limit_are_too_large() {
             ..Limits::default()
         },
     );
-    harness
-        .post("/v1/config", operator_config(&harness.node.definitions))
-        .await;
+    harness.use_log_store().await;
     let app = App::new("user-1", 1);
     app.grant(&harness).await;
     let record = google_record(&app);
@@ -794,21 +812,21 @@ async fn bodies_above_the_limit_are_too_large() {
         .await
         .unwrap();
     assert_eq!(forwarded.status, 200);
-    assert_eq!(provider.seen().last().unwrap().body.len(), SMALL);
-    let sent = provider.seen().len();
+    assert_eq!(provider.requests().last().unwrap().body.len(), SMALL);
+    let sent = provider.requests().len();
     let seq = harness.head_seq("user-1");
     assert_eq!(
         failure(harness.forward(post("n=5"), &vec![b'c'; SMALL + 1]).await),
         (413, "too_large".to_string())
     );
-    assert_eq!(provider.seen().len(), sent);
+    assert_eq!(provider.requests().len(), sent);
     assert_eq!(harness.head_seq("user-1"), seq);
     assert_budget_is_free(&harness);
 }
 
 #[tokio::test]
 async fn a_provider_that_does_not_answer_ends_in_a_timeout() {
-    let provider = provider(|_| Reply::Hang).await;
+    let provider = provider_with_log_store(|_| Reply::Hang).await;
     let (harness, app, record) = ready(&provider).await;
     let mut request = meta(&app, &record, "POST", PROFILE, json!([]));
     request["timeout_ms"] = json!(1000);
@@ -823,25 +841,18 @@ async fn a_provider_that_does_not_answer_ends_in_a_timeout() {
         "{elapsed:?}"
     );
 
-    // The request left the node, so its entry is on the chain. The caller fetches it.
-    assert_eq!(provider.seen().len(), 1);
+    // The request left the node, so its entry is on the chain and in the store.
+    assert_eq!(provider.requests().len(), 1);
     assert_eq!(harness.head_seq("user-1"), 2);
-    let (_, listed) = harness
-        .post(
-            "/v1/log/entries",
-            json!({"user_id": "user-1", "after_seq": 1}),
-        )
-        .await;
-    assert_eq!(
-        app.event(&harness, &listed["entries"][0])["t"],
-        "provider_request"
-    );
+    let events = app.stored_events(&harness, &provider);
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[1][0]["t"], "provider_request");
     assert_budget_is_free(&harness);
 }
 
 #[tokio::test]
 async fn a_provider_that_cannot_be_reached_is_unreachable() {
-    let provider = quiet_provider().await;
+    let provider = quiet_provider_and_log_store().await;
     let (harness, app, record) = ready(&provider).await;
     // Nothing listens at this address.
     harness
@@ -878,7 +889,7 @@ async fn a_provider_that_cannot_be_reached_is_unreachable() {
 
 #[tokio::test]
 async fn forward_needs_the_front_conditions() {
-    let provider = quiet_provider().await;
+    let provider = quiet_provider_and_log_store().await;
     let harness = Harness::new(&provider);
     let app = App::new("user-1", 1);
     let record = google_record(&app);
@@ -890,9 +901,7 @@ async fn forward_needs_the_front_conditions() {
         failure(harness.forward(request.clone(), b"").await),
         (503, "not_configured".to_string())
     );
-    harness
-        .post("/v1/config", operator_config(&harness.node.definitions))
-        .await;
+    harness.use_log_store().await;
     let stranger = App::new("user-2", 2);
     let theirs = google_record(&stranger);
     assert_eq!(
@@ -932,7 +941,7 @@ async fn forward_needs_the_front_conditions() {
         ),
         (404, "provider_unknown".to_string())
     );
-    assert!(provider.seen().is_empty());
+    assert!(provider.requests().is_empty());
 
     // The kinds of release v1.0.0 that this release does not know are not allowed.
     for (kind, plaintext) in [
@@ -959,7 +968,7 @@ async fn forward_needs_the_front_conditions() {
             "{kind}"
         );
     }
-    assert!(provider.seen().is_empty());
+    assert!(provider.requests().is_empty());
 
     // A record of kind `oauth_imported` (a token the device of the account encrypted) is used
     // by the same rules as a record of kind `oauth`.
@@ -986,7 +995,10 @@ async fn forward_needs_the_front_conditions() {
         provider.only().header("authorization"),
         Some("Bearer ntn_imported-access")
     );
-    assert_eq!(app.event(&harness, &forwarded.entry)["provider"], "notion");
+    assert_eq!(
+        app.logged(&harness, &provider, &forwarded.log)["provider"],
+        "notion"
+    );
 }
 
 #[tokio::test]
@@ -995,7 +1007,7 @@ async fn a_response_that_reflects_the_credential_is_withheld() {
     use base64::Engine;
     // The stand-in breaks the contract of an API: it sends the `Authorization` value of the
     // request back, in the body or in a header, as it is or encoded.
-    let provider = provider(|seen| {
+    let provider = provider_with_log_store(|seen| {
         let authorization = seen.header("authorization").unwrap_or_default().to_string();
         let token = authorization.trim_start_matches("Bearer ").to_string();
         match seen.target.rsplit('=').next().unwrap_or_default() {
@@ -1014,7 +1026,8 @@ async fn a_response_that_reflects_the_credential_is_withheld() {
         }
     })
     .await;
-    let harness = Harness::configured(&provider).await;
+    let harness = Harness::new(&provider);
+    harness.use_log_store().await;
     let app = App::new("user-1", 1);
     app.grant(&harness).await;
     let record = app.record(
@@ -1053,7 +1066,7 @@ async fn a_response_that_reflects_the_credential_is_withheld() {
             "{case}"
         );
         // The request went out, and its entry is on the chain.
-        assert_eq!(provider.seen().len(), index + 1);
+        assert_eq!(provider.requests().len(), index + 1);
         assert_eq!(harness.head_seq("user-1"), before + 1);
     }
     // A response without the credential comes back.
@@ -1071,5 +1084,157 @@ async fn a_response_that_reflects_the_credential_is_withheld() {
         .await
         .unwrap();
     assert_eq!(forwarded.body, br#"{"ok":true}"#);
+    assert_budget_is_free(&harness);
+}
+
+/// The connections of the node to the host of `PROFILE`, in the order they were opened.
+#[tokio::test]
+async fn two_calls_whose_responses_have_no_length_do_not_wait_for_each_other() {
+    // Each response declares no length, so each reserves the whole body limit of 1,000 bytes.
+    // The budget holds two request frames and one such response but not two frames and two
+    // responses: a call must give its frame back before its response asks for its share, or
+    // the two calls hold their frames and wait for each other until the time limit.
+    let provider = provider_with_log_store(|_| {
+        Reply::Raw(
+            b"HTTP/1.1 200 Status\r\ncontent-type: text/plain\r\ntransfer-encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n"
+                .to_vec(),
+        )
+        .after(Duration::from_millis(300))
+    })
+    .await;
+    let app = App::new("user-1", 1);
+    let record = google_record(&app);
+    let first = meta(&app, &record, "GET", PROFILE, json!([]));
+    let second = meta(
+        &app,
+        &record,
+        "GET",
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+        json!([]),
+    );
+    let frame = crate::frame::encode_head(&first).len();
+    let harness = Harness::with(
+        &provider,
+        Definitions::embedded(),
+        Limits {
+            body_bytes: 1_000,
+            body_budget_bytes: 2 * frame + 1_000 - 1,
+            ..Limits::default()
+        },
+    );
+    harness.use_log_store().await;
+    app.grant(&harness).await;
+    let started = Instant::now();
+    let (one, two) = tokio::join!(harness.forward(first, b""), harness.forward(second, b""));
+    assert_eq!(one.unwrap().status, 200);
+    assert_eq!(two.unwrap().status, 200);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_budget_is_free(&harness);
+}
+
+fn gmail_connections(harness: &Harness) -> usize {
+    harness
+        .platform
+        .connections()
+        .iter()
+        .filter(|(host, _)| host == "gmail.googleapis.com")
+        .count()
+}
+
+#[tokio::test]
+async fn requests_of_one_account_to_one_host_share_a_connection_and_accounts_do_not() {
+    let provider =
+        provider_with_log_store(|_| Reply::json(200, &json!({"ok": true})).keep_alive()).await;
+    let (harness, app, record) = ready(&provider).await;
+    let idle = |user_id: &str| {
+        harness
+            .node
+            .egress
+            .provider_idle
+            .idle_count(user_id, "gmail.googleapis.com")
+    };
+
+    // Three requests of one account in a row: one connection, kept idle between them.
+    for query in ["n=1", "n=2", "n=3"] {
+        let request = meta(
+            &app,
+            &record,
+            "GET",
+            &format!("{PROFILE}?{query}"),
+            json!([]),
+        );
+        assert_eq!(harness.forward(request, b"").await.unwrap().status, 200);
+    }
+    assert_eq!(gmail_connections(&harness), 1);
+    assert_eq!(idle("user-1"), 1);
+
+    // Another account to the same host: its own connection. The first account's connection
+    // stays idle for the first account.
+    let other = App::new("user-2", 2);
+    other.grant(&harness).await;
+    let theirs = google_record(&other);
+    let request = meta(&other, &theirs, "GET", &format!("{PROFILE}?n=4"), json!([]));
+    assert_eq!(harness.forward(request, b"").await.unwrap().status, 200);
+    assert_eq!(gmail_connections(&harness), 2);
+    assert_eq!((idle("user-1"), idle("user-2")), (1, 1));
+
+    // A connection idle for longer than 30 seconds is not used again.
+    harness.node.clock.advance(limits::PROVIDER_IDLE_MS + 1);
+    let request = meta(&app, &record, "GET", &format!("{PROFILE}?n=5"), json!([]));
+    assert_eq!(harness.forward(request, b"").await.unwrap().status, 200);
+    assert_eq!(gmail_connections(&harness), 3);
+    assert_eq!(idle("user-1"), 1);
+
+    // A response with `Connection: close` ends the connection: the next request opens one.
+    assert_eq!(provider.requests().len(), 5);
+    assert_budget_is_free(&harness);
+}
+
+#[tokio::test]
+async fn a_get_over_an_idle_connection_that_ends_without_a_response_is_sent_once_more() {
+    // The stand-in keeps the connection after the first answer, closes it without a response
+    // when the second request arrives over it, and answers every later request.
+    let answers = std::sync::Mutex::new(vec![
+        Reply::json(200, &json!({"n": 1})).keep_alive(),
+        Reply::Raw(Vec::new()),
+        Reply::json(200, &json!({"n": 3})).keep_alive(),
+        Reply::Raw(Vec::new()),
+    ]);
+    let provider = provider_with_log_store(move |_| {
+        let mut answers = answers.lock().unwrap();
+        match answers.is_empty() {
+            true => Reply::json(200, &json!({"ok": true})).keep_alive(),
+            false => answers.remove(0),
+        }
+    })
+    .await;
+    let (harness, app, record) = ready(&provider).await;
+
+    // The first GET opens the connection; the second goes over it, gets no response, and is
+    // sent once more over a new connection: the caller sees the answer of the third try.
+    let first = meta(&app, &record, "GET", &format!("{PROFILE}?n=1"), json!([]));
+    assert_eq!(
+        harness.forward(first, b"").await.unwrap().body,
+        br#"{"n":1}"#
+    );
+    let second = meta(&app, &record, "GET", &format!("{PROFILE}?n=2"), json!([]));
+    let forwarded = harness.forward(second, b"").await.unwrap();
+    assert_eq!(forwarded.body, br#"{"n":3}"#);
+    assert_eq!(gmail_connections(&harness), 2);
+    assert_eq!(provider.requests().len(), 3);
+    // Both tries are the same request, which one event names.
+    assert_eq!(forwarded.log["created"], true);
+    assert_eq!(harness.head_seq("user-1"), 3);
+
+    // A POST over an idle connection that ends without a response is not sent again: whether
+    // the provider received it is unknown.
+    let post = meta(&app, &record, "POST", &format!("{PROFILE}?n=4"), json!([]));
+    assert_eq!(
+        failure(harness.forward(post, b"{}").await),
+        (502, "provider_unreachable".to_string())
+    );
+    assert_eq!(gmail_connections(&harness), 2);
+    assert_eq!(provider.requests().len(), 4);
+    assert_eq!(harness.head_seq("user-1"), 4);
     assert_budget_is_free(&harness);
 }

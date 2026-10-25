@@ -51,6 +51,11 @@ impl CheckedResponse {
     pub fn into_parts(self) -> (u16, Vec<(String, String)>, Vec<u8>) {
         (self.status, self.headers, self.body)
     }
+
+    /// The length of the body.
+    pub fn body_len(&self) -> usize {
+        self.body.len()
+    }
 }
 
 /// Checks the response of a request that carried `credential` (the token without the prefix of

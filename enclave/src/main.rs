@@ -107,6 +107,7 @@ async fn run(platform_name: &str) -> Result<(), PlatformError> {
     )?);
     let listener = platform.listen().await?;
     tokio::spawn(keep_calibrating(platform, clock));
+    tokio::spawn(log_store::keep_sweeping(node.clone()));
     tokio::select! {
         _ = api::serve(listener, api::router(node)) => {}
         _ = terminated() => {}
