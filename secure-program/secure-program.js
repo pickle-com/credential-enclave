@@ -159,6 +159,13 @@
       pcr2: "2724b25256d100dbb5a6868d68e1d1dc219415c1a28f21e4a130ca14338466b102349e0737d5185fe34f89a666374639",
       log_store: true,
     },
+    {
+      release: "v2.0.0",
+      pcr0: "172a6fae5d3597949155d20d4934d73f8089c8c50b4d531e21369a36e417f8f188d8bd2eaee700ae9d4f4b796d6ed59e",
+      pcr1: "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+      pcr2: "cffa93aaef31b351d79341b30048a5028c863dcb3ec6bdb093870541c7f135733357261b63609fa512d59dc8e7a13de7",
+      log_store: true,
+    },
   ];
   // Measurements of builds that never ran in prod: builds made from commits that are not in the
   // history of the public repository (marked pre-), and releases of the public repository that went
