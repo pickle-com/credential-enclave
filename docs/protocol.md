@@ -634,7 +634,7 @@ The two verifications:
 | Verification | What it reads | When |
 | --- | --- | --- |
 | Index verification | The head, the keys of the listing, and the bodies of the control entries | Every synchronization (every 24 hours), and every time the log screen opens |
-| Content verification | The body of an entry: signature, `body_hash`, `prev`, the opening of the plaintext | The entries beyond the vouched end, the entries of format 1, the control entries, a `seq` with more than one candidate key that satisfies the chain equation, the entries the screen shows, and every entry when the user starts the full verification |
+| Content verification | The body of an entry: signature, `body_hash`, `prev`, the opening of the plaintext | The entries beyond the vouched end, the entries of format 1, the control entries, a `seq` with more than one candidate key that satisfies the chain equation, and the entries the screen shows |
 
 Index verification of a chain of format 2:
 
@@ -720,14 +720,6 @@ The authenticity of an entry the app displays is checked with the node signature
 with its key (`body_hash`), and its content is opened with the log decryption private key. The app
 does not open an entry whose `key_id` is not its own. It shows such an entry as part of a
 delegation of another key.
-
-The full verification: at the request of the user the app reads every entry of every chain from
-the smallest listed `seq` by content verification, counts the entries, the events and the expired
-entries (the `seq`s below the smallest listed one), and reports every entry that does not verify.
-It is the same check as the index verification with every body read; the `prev` of the first
-listed entry is not checked when entries before it expired. It keeps nothing of what it read on the
-device; the device keeps the result of its last run and starts another at most `LOG_FULL_INTERVAL_MS`
-after the start of the last one.
 
 ### 7.5 The witness signature (stage 2)
 
@@ -1196,7 +1188,6 @@ any other form is not a release tag and has no place in the order.
 | `LOG_GAP_GRACE_MS` (the app) | 3,600,000: a gap whose first key after it is younger than this leaves the chain pending, not attention (7.4) |
 | `LOG_SCREEN_EVENTS` (the app) | 50: the events of one further page of the log screen (the first page reads the events its definition asks for) |
 | `LOG_SUMMARY_DAYS`, `LOG_SUMMARY_STEP`, `LOG_SUMMARY_ENTRIES` (the app) | 7, 100, 1,000: the days of the summary of the log screen (the reads, sends and changes of the events of the entries of that window, counted once per device from their bodies and kept on the device as the summary tally), the entries one read of the screen counts before answering and each later step counts, and the most entries of the window the tally counts (the screen shows the counts with a plus while entries of the window are not counted) |
-| `LOG_FULL_INTERVAL_MS` (the app) | 3,600,000: the time after the start of a full verification before the device may start another |
 | `LOG_STORE_STALE_MS` (the app) | 3 days: reads of the store that have been failing for this long mark the log (7.4) |
 | `LOG_STORE_NODES` (the app) | 16: the nodes of the listing the list of nodes does not know that one verification run examines |
 | Listing pages one verification run reads per node (the app) | 8 pages of 1,000 keys |

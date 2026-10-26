@@ -80,10 +80,8 @@
   // before answering and each step of the count that goes on apart from the calls, the most entries
   // of the window the tally counts, the key of the tally in the device store, the events of one
   // later page, the keys one listing of the screen reads down a chain, the entries the screen keeps
-  // opened in a runtime, the objects whose addresses are requested along with the one being read,
-  // the objects the full verification reads at a time, the time after the start of a full
-  // verification before another may start, and the key of the last full verification in the device
-  // store.
+  // opened in a runtime, and the objects whose addresses are requested along with the one being
+  // read.
   const LOG_SUMMARY_DAYS = 7;
   const LOG_SUMMARY_STEP = 100;
   const LOG_SUMMARY_ENTRIES = 1000;
@@ -92,9 +90,6 @@
   const LOG_DISPLAY_LIST = 1000;
   const LOG_DISPLAY_ENTRIES = 1000;
   const LOG_DISPLAY_AHEAD = 10;
-  const LOG_FULL_FETCHES = 8;
-  const LOG_FULL_INTERVAL_MS = 3600000;
-  const LOG_FULL_STORE_KEY = "log_full";
   // The limit of the serialized node ledger (UTF-8, bytes).
   const LEDGER_LIMIT_BYTES = 65536;
   // The DER of the AWS Nitro Enclaves Root-G1 certificate (base64url). Its SHA-256 is
@@ -1699,27 +1694,6 @@
       return { signed: null, bytes: response.body.length };
     }
     return { signed: { body: value.body, sig: value.sig }, bytes: response.body.length };
-  }
-
-  /** The objects of several addresses (a table from name to address), fetched limit at a time: a
-   *  table from name to the result of fetchStoreObject. */
-  async function fetchStoreObjects(urls, limit) {
-    const names = Array.from(urls.keys());
-    const fetched = new Map();
-    let at = 0;
-    async function worker() {
-      while (at < names.length) {
-        const name = names[at];
-        at += 1;
-        fetched.set(name, await fetchStoreObject(urls.get(name)));
-      }
-    }
-    const workers = [];
-    for (let count = 0; count < Math.min(limit, names.length); count += 1) {
-      workers.push(worker());
-    }
-    await Promise.all(workers);
-    return fetched;
   }
 
   /** A reader of object versions of the store that requests addresses in batches: object(candidate,
@@ -3880,7 +3854,7 @@
    *  an env without a store) the screen reads nothing: the list is empty, the summary is the tally
    *  kept (null when there is none) and the state of the verification says why. The list of the
    *  places of the later pages becomes the one place of the second page (an empty list when there
-   *  is no more), and the state of the last full verification is published again (log_full). */
+   *  is no more). */
   async function readLog(args) {
     const textual = typeof args.limit === "string" && args.limit.trim() !== "";
     const given = textual ? Number(args.limit) : args.limit;
@@ -3908,7 +3882,6 @@
     const next = logPageAfter(first, 0, groups.length);
     logPagePlaces = next === null ? [] : [next];
     publishLogPages();
-    publishFull();
     return {
       status: log.status, verified_ms: log.verified_ms, unverified_nodes: log.unverified_nodes,
       missing: log.missing, expired: log.expired, unknown_nodes: log.unknown_nodes, store: log.store,
@@ -3958,192 +3931,6 @@
       publishLogPages();
     }
     return { has_more: page.has_more, days: displayDays(groups) };
-  }
-
-  // ---- The full verification ----
-
-  // The full verification in progress (null when none): the run the loop checks for a cancel, and
-  // the published state log_full {status, started_ms, finished_ms, finished_text, nodes_total,
-  // nodes_done, entries_total, entries_checked, events_checked, expired, bytes, failures: {signature,
-  // hash, open, missing}, failure, can_start}. The state of the last full verification of this
-  // device is kept in the device store (LOG_FULL_STORE_KEY) and published again in a new runtime:
-  // the log screen shows its result and whether another may start (can_start: none is running and
-  // LOG_FULL_INTERVAL_MS passed since the start of the last one).
-  let fullRun = null;
-  let fullState = null;
-
-  function loadFullState() {
-    const kept = native.storeGet(LOG_FULL_STORE_KEY);
-    if (kept === null) return null;
-    try {
-      const state = JSON.parse(kept);
-      if (state === null || typeof state !== "object" || typeof state.started_ms !== "number") return null;
-      // A run the end of its runtime stopped.
-      if (state.status === "running") state.status = "cancelled";
-      return state;
-    } catch (error) {
-      return null;
-    }
-  }
-
-  function saveFullState() {
-    native.storeSet(LOG_FULL_STORE_KEY, fullState === null ? null : JSON.stringify(fullState));
-  }
-
-  function fullCanStart(now) {
-    if (fullRun !== null) return false;
-    if (fullState === null) fullState = loadFullState();
-    return fullState === null || now - fullState.started_ms >= LOG_FULL_INTERVAL_MS;
-  }
-
-  function publishFull() {
-    const canStart = fullCanStart(native.nowMs());
-    if (fullState !== null) fullState.can_start = canStart;
-    native.publish({ state: { log_full: fullState } });
-  }
-
-  /** The index of a whole chain: every page of the listing of the node prefix. Throws a store
-   *  failure; stops (returning what it read) when the run was cancelled. */
-  async function storeIndexAll(id, run) {
-    const prefix = accountPrefix() + id + "/";
-    const index = { entries: new Map(), min: 0, max: 0 };
-    let keyMarker = prefix + seqDigits(0) + "-~";
-    let versionIdMarker = null;
-    for (;;) {
-      if (run.cancelled) return index;
-      const listing = await listStorePage(false, id, keyMarker, versionIdMarker);
-      for (const version of listing.versions) {
-        const parts = parseStoreKey(version.key, prefix);
-        if (parts === null) continue;
-        if (!index.entries.has(parts.seq)) index.entries.set(parts.seq, []);
-        index.entries.get(parts.seq).push({
-          key: version.key, versionId: version.versionId, isLatest: version.isLatest, parts: parts,
-        });
-        if (index.min === 0 || parts.seq < index.min) index.min = parts.seq;
-        if (parts.seq > index.max) index.max = parts.seq;
-      }
-      if (!listing.truncated || listing.nextKeyMarker === null) return index;
-      keyMarker = listing.nextKeyMarker;
-      versionIdMarker = listing.nextVersionIdMarker;
-    }
-  }
-
-  /** The full verification (docs/protocol.md 7.4): every entry of every chain of the account in the
-   *  store, from the smallest listed seq, read by content (signature, body hash, prev as the hash of
-   *  the entry before, the opening of the plaintext when the key_id is ours), LOG_STORE_OBJECTS
-   *  addresses per request and LOG_FULL_FETCHES objects at a time. The seqs below the smallest listed
-   *  one are expired; a seq absent between two listed ones is missing; an entry that does not verify
-   *  counts by what failed (the failure of its latest version). Nothing is kept on the device. The
-   *  loop runs apart from the procedure calls and ends at a cancel, at a store failure (failed) or
-   *  when every chain was read (done). */
-  async function fullVerificationLoop(ledger, keys, run) {
-    try {
-      const ids = await discoverStoreNodes();
-      fullState.nodes_total = ids.length;
-      publishFull();
-      for (const id of ids) {
-        const index = await storeIndexAll(id, run);
-        if (run.cancelled) break;
-        const seqs = Array.from(index.entries.keys()).sort(function (a, b) { return a - b; });
-        fullState.entries_total += seqs.length;
-        if (index.min > 1) fullState.expired += index.min - 1;
-        const signer = ledger.nodes[id] !== undefined ? ledger.nodes[id] : { sign_pk: id };
-        let cursor = index.min === 1 ? { seq: 0, hash: ZERO_HASH } : null;
-        for (let at = 0; at < seqs.length;) {
-          if (run.cancelled) break;
-          const batch = [];
-          const wanted = [];
-          while (at < seqs.length && wanted.length + index.entries.get(seqs[at]).length <= LOG_STORE_OBJECTS) {
-            batch.push(seqs[at]);
-            for (const candidate of index.entries.get(seqs[at])) wanted.push(candidate);
-            at += 1;
-          }
-          if (batch.length === 0) {
-            // A seq with more candidates than one request carries: its latest versions only.
-            const latest = index.entries.get(seqs[at]).slice(0, LOG_STORE_OBJECTS);
-            batch.push(seqs[at]);
-            for (const candidate of latest) wanted.push(candidate);
-            at += 1;
-          }
-          const urls = await storeObjectUrls(wanted);
-          const fetched = await fetchStoreObjects(urls, LOG_FULL_FETCHES);
-          for (const seq of batch) {
-            if (cursor !== null && seq !== cursor.seq + 1) {
-              fullState.failures.missing += seq - cursor.seq - 1;
-              cursor = null;
-            }
-            const candidates = index.entries.get(seq).slice().sort(function (a, b) {
-              return (b.isLatest ? 1 : 0) - (a.isLatest ? 1 : 0);
-            });
-            let verified = null;
-            let failure = "missing";
-            for (const candidate of candidates) {
-              const response = fetched.get(candidate.key + "\n" + candidate.versionId);
-              if (response === undefined) continue;
-              fullState.bytes += response.bytes;
-              if (response.signed === null) continue;
-              const checked = checkEntry(response.signed, signer, id, candidate.parts, cursor, keys);
-              if (checked.entry !== null) {
-                verified = checked.entry;
-                break;
-              }
-              if (failure === "missing") failure = checked.failure;
-            }
-            if (verified === null) {
-              fullState.failures[failure] += 1;
-              cursor = null;
-            } else {
-              fullState.entries_checked += 1;
-              fullState.events_checked += verified.events !== null ? verified.events.length
-                : verified.format === 2 ? verified.body.count : 1;
-              cursor = { seq: seq, hash: verified.hash };
-            }
-          }
-          publishFull();
-        }
-        if (run.cancelled) break;
-        fullState.nodes_done += 1;
-        publishFull();
-      }
-      const now = native.nowMs();
-      fullState.status = run.cancelled ? "cancelled" : "done";
-      fullState.finished_ms = now;
-      fullState.finished_text = formatTime(now, "time");
-    } catch (error) {
-      fullState.status = "failed";
-      fullState.finished_ms = native.nowMs();
-      fullState.failure = isStoreFailure(error) ? "log_store_" + error.kind : failureCode(error);
-    }
-    fullRun = null;
-    saveFullState();
-    publishFull();
-  }
-
-  /** Starts the full verification (when none is running and LOG_FULL_INTERVAL_MS passed since the
-   *  start of the last one of this device: otherwise too_soon) and returns the state log_full at
-   *  once; the loop goes on inside the runtime apart from the procedure calls and publishes its
-   *  progress. */
-  async function startFullVerification() {
-    if (fullRun !== null) return { log_full: fullState };
-    if (!fullCanStart(native.nowMs())) throw native.error("too_soon", "full verification");
-    const keys = await presentKeys();
-    const ledger = loadLedger();
-    fullRun = { cancelled: false };
-    fullState = {
-      status: "running", started_ms: native.nowMs(), finished_ms: 0, finished_text: "",
-      nodes_total: 0, nodes_done: 0, entries_total: 0, entries_checked: 0, events_checked: 0,
-      expired: 0, bytes: 0, failures: { signature: 0, hash: 0, open: 0, missing: 0 }, failure: "",
-    };
-    saveFullState();
-    publishFull();
-    fullVerificationLoop(ledger, keys, fullRun);
-    return { log_full: fullState };
-  }
-
-  /** Stops the full verification in progress: the loop ends after the batch it is reading. */
-  async function cancelFullVerification() {
-    if (fullRun !== null) fullRun.cancelled = true;
-    return { log_full: fullState };
   }
 
   /** Setting the grant lifetime: days is an integer from 1 to 30 (or its decimal string). A grant
@@ -4243,16 +4030,14 @@
   }
 
   /** An account end that erases the account records: deletes the master key item, the node ledger
-   *  (the keychain item and the device copy), the summary tally and the last full verification. */
+   *  (the keychain item and the device copy) and the summary tally. */
   async function eraseAccountKeys() {
     deleteMasterKey();
     native.keychainDelete(ledgerItem());
     native.keychainDelete(mailSetupItem());
     native.storeSet(LEDGER_STORE_KEY, null);
     native.storeSet(LOG_SUMMARY_STORE_KEY, null);
-    native.storeSet(LOG_FULL_STORE_KEY, null);
     summaryState = null;
-    fullState = null;
   }
 
   // ---- Serialization ----
@@ -4768,20 +4553,14 @@
         if (before !== null) openLogPage(before);
         return serial(function () { return readLogPage(args); });
       },
-      start_full_verification: function () { return serial(startFullVerification); },
-      cancel_full_verification: function () { return serial(cancelFullVerification); },
       set_grant_days: function (args) { return serial(function () { return setGrantDays(args); }); },
       set_delegation: function (args) { return serial(function () { return setDelegation(args); }); },
     },
     onEvent: function (name, payload) {
       if (name === "session_ready") {
         // A new runtime does not take over the transfer of the previous runtime (the secrets exist
-        // in the runtime only), nor a full verification in progress: the transfer state is cleared
-        // and the full verification state is the last one the device kept (a run in progress at
-        // the end of its runtime is cancelled).
+        // in the runtime only): the transfer state is cleared.
         resetTransfer();
-        fullState = null;
-        publishFull();
         return serial(sync);
       }
       if (name === "foreground") return serial(sync);
