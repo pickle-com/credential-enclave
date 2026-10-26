@@ -71,8 +71,21 @@ impl FakeNode {
 /// The `health` body of a node with the given values, in the form of enclave.md 5.1.
 pub fn health_body(configured: bool, accounts: u64, started_ms: u64) -> String {
     format!(
-        r#"{{"node":"n","release":"v1.0.0","platform":"nitro","started_ms":{started_ms},"time_ms":{},"configured":{configured},"closing":false,"accounts":{accounts}}}"#,
-        started_ms + 1000
+        concat!(
+            r#"{{"node":"n","release":"v2.0.0","platform":"nitro","started_ms":{started_ms},"time_ms":{time_ms},"#,
+            r#""configured":{configured},"closing":false,"accounts":{accounts},"grants":0,"#,
+            r#""mail_providers":["naver_mail"],"log_store":null,"#,
+            r#""log":{{"entries":{entries},"events":{events},"writes":{writes},"write_failures":1,"#,
+            r#""open_batches":2,"batch_calls":3,"batch_requests":{batch_requests}}}}}"#
+        ),
+        started_ms = started_ms,
+        time_ms = started_ms + 1000,
+        configured = configured,
+        accounts = accounts,
+        entries = accounts * 10,
+        events = accounts * 100,
+        writes = accounts * 10 + 1,
+        batch_requests = accounts * 100 / 2 + 50,
     )
 }
 

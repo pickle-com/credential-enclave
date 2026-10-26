@@ -33,7 +33,9 @@ async fn health_reports_the_node_in_the_key_order_of_5_1() {
                 "{{\"node\":\"{}\",\"release\":\"v0.0.0-test\",\"platform\":\"local\",",
                 "\"custody\":\"operator\",\"started_ms\":{},\"time_ms\":{},",
                 "\"configured\":false,\"closing\":false,\"accounts\":0,\"grants\":0,",
-                "\"mail_providers\":[\"naver_mail\"],\"log_store\":null}}"
+                "\"mail_providers\":[\"naver_mail\"],\"log_store\":null,",
+                "\"log\":{{\"entries\":0,\"events\":0,\"writes\":0,\"write_failures\":0,",
+                "\"open_batches\":0,\"batch_calls\":0,\"batch_requests\":0}}}}"
             ),
             harness.node.node, started_ms, time_ms
         )
@@ -49,6 +51,15 @@ async fn health_reports_the_node_in_the_key_order_of_5_1() {
     assert_eq!(health["configured"], true);
     assert_eq!(health["accounts"], 1);
     assert_eq!(health["grants"], 1);
+    // The counts of the log: the grant created one entry with one event. The node has no log
+    // store, so it sent no write.
+    assert_eq!(
+        health["log"],
+        json!({
+            "entries": 1, "events": 1, "writes": 0, "write_failures": 0, "open_batches": 0,
+            "batch_calls": 0, "batch_requests": 0,
+        })
+    );
 }
 
 #[tokio::test]
@@ -343,12 +354,11 @@ async fn the_router_serves_the_calls_of_the_route_list_and_no_other() {
             "POST /v1/refresh",
             "POST /v1/revoke-token",
             "POST /v1/forward",
+            "POST /v1/forward/batch",
             "POST /v1/mail/verify",
             "POST /v1/mail/read",
             "POST /v1/mail/submit",
             "POST /v1/release",
-            "POST /v1/log/entries",
-            "POST /v1/log/ack",
             "POST /v1/close",
             "POST /v1/close/heads",
             "POST /v1/peer/export",
@@ -373,8 +383,10 @@ async fn the_router_serves_the_calls_of_the_route_list_and_no_other() {
         let (status, _, _) = harness.send(other, path, Vec::new()).await;
         assert_eq!(status, 405, "{path}");
     }
-    // The two calls of release v1.0.0 that took and handed out a plaintext do not exist.
-    for path in ["/v1/seal", "/v1/open"] {
+    // The two calls of release v1.0.0 that took and handed out a plaintext, and the two calls
+    // of the releases before v2.0.0 that handed the log out and took its acknowledgement, do
+    // not exist.
+    for path in ["/v1/seal", "/v1/open", "/v1/log/entries", "/v1/log/ack"] {
         let (status, body) = harness.post(path, json!({"user_id": "user-1"})).await;
         assert_eq!(
             (status, body["code"].as_str()),

@@ -7,6 +7,7 @@ use axum::extract::{Request, State};
 use axum::http::header::CONTENT_LENGTH;
 use axum::response::Response;
 use credential_enclave_protocol::encoding::{b64u, to_json};
+use credential_enclave_protocol::log::EntryKind;
 use credential_enclave_protocol::{purpose, ProtocolError};
 use hyper::body::Bytes;
 use serde_json::json;
@@ -18,7 +19,7 @@ use super::{invalid, read_body, record_of, respond, ApiError, JsonBody};
 use crate::frame::{self, META_LIMIT_BYTES};
 use crate::log_store;
 use crate::mail::{self, AppPassword, MailData, MailError, ReadMail};
-use crate::state::{lock, Limits, Node};
+use crate::state::{events, lock, Limits, Node};
 
 pub async fn verify(State(node): State<Arc<Node>>, request: Request) -> Response {
     call(node, request, "verify").await
@@ -176,40 +177,34 @@ async fn run(node: &Node, request: Request, operation: &str) -> Result<Response,
         return Err(ProtocolError::NotConfigured.into());
     }
     let account = node.account(user).ok_or(ProtocolError::GrantRequired)?;
-    log_store::admit(node, user, &account).await?;
-    let (credentials, entry, seq, sign_pk, key_id) = {
+    log_store::admit(node, &account).await?;
+    let (credentials, place, sign_pk, key_id) = {
         let mut account = lock(&account);
         node.ensure_open()?;
-        let grant = account.active(node.now_ms())?;
-        account.ensure_capacity()?;
+        let now_ms = node.now_ms();
+        let grant = account.active(now_ms)?;
         let credentials = AppPassword::open(&grant, user, &record)?;
         if operation == "submit" {
             credentials
                 .validate_submission(&recipients, &payload)
                 .map_err(|_| invalid("mail submission"))?;
         }
-        let event = json!({
-            "t": "mail_request", "record_id": record.id, "provider": "naver_mail",
-            "operation": operation, "request": params, "body_bytes": payload.len(),
-            "body_sha256": b64u(&Sha256::digest(&payload)), "context": context,
-        });
-        let entry = node.append_entry(
+        let place = node.create_event(
             &mut account,
             user,
             &grant.key_id,
             &grant.log_pk,
-            node.now_ms(),
-            &event,
+            now_ms,
+            EntryKind::Use,
+            events::mail_request(&record.id, operation, &params, &payload, context),
         )?;
-        (
-            credentials,
-            entry,
-            account.head.seq,
-            grant.sign_pk,
-            grant.key_id,
-        )
+        (credentials, place, grant.sign_pk, grant.key_id)
     };
-    log_store::confirm(node, user, &account, &[seq]).await?;
+    let log = log_store::commit(node, user, &account, &[(place, true)])
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(ApiError::internal)?;
     let outcome = match operation {
         "verify" => credentials.verify(node).await.map(|()| {
             let identity = credentials.identity();
@@ -274,5 +269,5 @@ async fn run(node: &Node, request: Request, operation: &str) -> Result<Response,
         vec![("content-type".into(), content_type.into())],
         body,
     )?;
-    Ok(forward_frame(response, Some(entry), budget))
+    Ok(forward_frame(response, Some(log), budget))
 }

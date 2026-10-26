@@ -8,10 +8,14 @@ calls "the app": the device side of the credential protocol. It creates the mast
 the account keys from it (protocol.md section 3), verifies the attestation of enclave nodes
 (section 4), seals grants and revokes to a verified node (section 5), encrypts credential records
 (section 6), verifies and decrypts the credential log (section 7), keeps the ledger of the nodes
-that hold a grant, and transfers the master key between the devices of one account. Since version
-28 the program also reads the log store directly (protocol.md 7.4): the object version listing of
-the account's prefix is the index of completeness, and `LOG_CACHE_DAYS` is the window inside which
-an entry the backend does not serve counts as withheld.
+that hold a grant, and transfers the master key between the devices of one account. The program
+reads the log store directly (protocol.md 7.4): it verifies the log from the keys of the object
+version listing of the account's prefix up to the head a node signed (the index verification),
+reads the control entries and the entries it shows, and counts the summary of the last seven days
+of the log screen from the entries of that window (each read once per device and kept as the
+summary tally). The storage of the operator holds no entry. The absence of an entry older than 365
+days (the retention of its Object Lock) is expired, not an omission (protocol.md 7.4), and the
+lifecycle rule of the bucket removes entries at 400 days (7.6).
 
 This file is the source of truth of the program. The repository `pickle-com/interactive-character`
 (the backend of the operator) vendors a byte-identical copy at `backend/assets/ui/secure-program.js`

@@ -50,12 +50,18 @@ pub mod purpose {
     pub const STATEMENT: &str = "pickle.secure.v1.statement\n";
     /// Signature context of a challenge statement.
     pub const CHALLENGE: &str = "pickle.secure.v1.challenge\n";
-    /// HPKE info of a log entry.
+    /// HPKE info of a log entry of format 1 (the releases before v2.0.0).
     pub const LOG_ENTRY_SEAL: &str = "pickle.secure.v1.log-entry";
-    /// Signature context of a log entry.
+    /// Signature context of a log entry of format 1.
     pub const LOG_ENTRY: &str = "pickle.secure.v1.log-entry\n";
-    /// Prefix of the log chain hash.
+    /// Prefix of the log chain hash of format 1.
     pub const LOG_CHAIN: &str = "pickle.secure.v1.log-chain\n";
+    /// HPKE info of a log entry of format 2.
+    pub const LOG_ENTRY_SEAL_V2: &str = "pickle.secure.v2.log-entry";
+    /// Signature context of a log entry of format 2.
+    pub const LOG_ENTRY_V2: &str = "pickle.secure.v2.log-entry\n";
+    /// Prefix of the log chain hash of format 2: `SHA-256(prefix || prev || body_hash)`.
+    pub const LOG_CHAIN_V2: &str = "pickle.secure.v2.log-chain\n";
     /// Signature context of a head.
     pub const HEAD: &str = "pickle.secure.v1.head\n";
     /// Signature context of the account key registration (verified by the backend).
@@ -81,8 +87,28 @@ pub mod limits {
     pub const TRANSFER_GRANTS: usize = 1_000;
     /// Most nodes that one grant is handed to by the node that holds it (10.1).
     pub const TRANSFER_PEERS: usize = 64;
-    /// Entries per account that may wait for a storage acknowledgement.
-    pub const UNACKED_ENTRIES: usize = 64;
+    /// Most events in one entry of format 2 (7.1). An open batch is closed before it would
+    /// hold more.
+    pub const ENTRY_EVENTS: usize = 128;
+    /// Most bytes of the plaintext (the JSON array of the events) of one entry of format 2
+    /// (7.1).
+    pub const ENTRY_PLAINTEXT_BYTES: usize = 1_048_576;
+    /// Most requests in one `forward/batch` call (enclave.md 5.8b).
+    pub const FORWARD_BATCH_REQUESTS: usize = 100;
+    /// Requests of one `forward/batch` call that are in flight at the same time (enclave.md
+    /// 5.8b). The value keeps the rate at which a provider receives the requests of one
+    /// account at the rate of the callers before the batch existed.
+    pub const FORWARD_BATCH_CONCURRENCY: usize = 6;
+    /// Provider requests of a node that are in flight at the same time, over every call
+    /// (enclave.md section 8).
+    pub const PROVIDER_INFLIGHT: usize = 512;
+    /// Idle HTTP/1.1 connections a node keeps to its log store (enclave.md 5.14).
+    pub const LOG_STORE_IDLE_CONNECTIONS: usize = 32;
+    /// Idle connections a node keeps to one provider host for one account (enclave.md 5.8
+    /// step 8).
+    pub const PROVIDER_IDLE_CONNECTIONS: usize = 8;
+    /// How long an idle connection to a provider is kept: 30 seconds.
+    pub const PROVIDER_IDLE_MS: u64 = 30_000;
     /// Body limit of a provider request and of a provider response: 64 MiB.
     pub const BODY_BYTES: usize = 67_108_864;
     /// Longest `context` string, in characters.
@@ -98,6 +124,9 @@ pub mod limits {
     /// How long the log store keeps an entry from the moment a node writes it: 365 days. Until
     /// then nobody can delete the object or shorten its retention (7.6).
     pub const LOG_RETENTION_DAYS: u64 = 365;
+    /// The age at which the lifecycle rule of the log store removes an entry, and from which a
+    /// reader treats an absent entry as expired: 400 days (7.4, 7.6).
+    pub const LOG_EXPIRY_DAYS: u64 = 400;
     /// Longest release statement, in bytes (10.3).
     pub const RELEASE_STATEMENT_BYTES: usize = 16_384;
     /// The notice period of a release: how old the entry of the transparency log must be, by
@@ -140,14 +169,13 @@ pub enum ProtocolError {
     Timeout,
     ResponseWithheld,
     TooLarge,
-    LogBacklog,
     LogStoreUnavailable,
     CapacityUnavailable,
 }
 
 impl ProtocolError {
     /// Every variant, in the order of protocol.md section 11.
-    pub const ALL: [ProtocolError; 31] = [
+    pub const ALL: [ProtocolError; 30] = [
         ProtocolError::InvalidRequest,
         ProtocolError::UnsupportedVersion,
         ProtocolError::WrongNode,
@@ -176,7 +204,6 @@ impl ProtocolError {
         ProtocolError::Timeout,
         ProtocolError::ResponseWithheld,
         ProtocolError::TooLarge,
-        ProtocolError::LogBacklog,
         ProtocolError::LogStoreUnavailable,
         ProtocolError::CapacityUnavailable,
     ];
@@ -212,7 +239,6 @@ impl ProtocolError {
             ProtocolError::Timeout => "timeout",
             ProtocolError::ResponseWithheld => "response_withheld",
             ProtocolError::TooLarge => "too_large",
-            ProtocolError::LogBacklog => "log_backlog",
             ProtocolError::LogStoreUnavailable => "log_store_unavailable",
             ProtocolError::CapacityUnavailable => "capacity_unavailable",
         }
@@ -285,8 +311,8 @@ mod tests {
             "timeout",
             "response_withheld",
             "too_large",
-            "log_backlog",
             "log_store_unavailable",
+            "capacity_unavailable",
         ] {
             assert!(codes.contains(code), "missing code {code}");
         }

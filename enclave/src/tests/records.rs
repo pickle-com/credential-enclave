@@ -6,7 +6,7 @@ use credential_enclave_protocol::keys::Custody;
 use credential_enclave_protocol::totp::totp;
 use serde_json::{json, Value};
 
-use super::quiet_provider;
+use super::{quiet_provider, quiet_provider_and_log_store};
 use crate::testing::{App, Harness};
 
 async fn release(harness: &Harness, user_id: &str, record: &Value, field: &str) -> (u16, Value) {
@@ -26,6 +26,13 @@ async fn release(harness: &Harness, user_id: &str, record: &Value, field: &str) 
 
 fn code(outcome: &(u16, Value)) -> (u16, &str) {
     (outcome.0, outcome.1["code"].as_str().unwrap_or_default())
+}
+
+/// An event without its `time_ms`, the node time of its creation.
+fn without_time(mut event: Value) -> Value {
+    assert!(event["time_ms"].as_u64().is_some(), "{event}");
+    event.as_object_mut().unwrap().remove("time_ms");
+    event
 }
 
 #[tokio::test]
@@ -212,8 +219,9 @@ async fn every_tampered_field_of_a_record_fails_to_open() {
 
 #[tokio::test]
 async fn the_kind_of_a_record_decides_the_fields_it_releases() {
-    let provider = quiet_provider().await;
+    let provider = quiet_provider_and_log_store().await;
     let harness = Harness::new(&provider);
+    harness.use_log_store().await;
     let app = App::new("user-1", 1);
     app.grant(&harness).await;
     let password = app.record("vault_password", "vault", &json!({"value": "hunter2"}));
@@ -229,12 +237,16 @@ async fn the_kind_of_a_record_decides_the_fields_it_releases() {
         &json!({"token": {"access_token": "xoxp"}, "obtained_ms": 1}),
     );
 
-    // password
+    // password: the event forms entry 2, after the entry of the grant.
     let (status, released) = release(&harness, "user-1", &password, "password").await;
     assert_eq!(status, 200);
     assert_eq!(released["value"], "hunter2");
     assert_eq!(
-        app.event(&harness, &released["entry"]),
+        released["log"],
+        json!({"seq": 2, "index": 0, "created": true})
+    );
+    assert_eq!(
+        without_time(app.logged(&harness, &provider, &released["log"])),
         json!({
             "t": "secret_released", "record_id": password["id"], "kind": "vault_password",
             "field": "password", "origin": "https://site.example", "context": "browser:fill",
@@ -254,7 +266,7 @@ async fn the_kind_of_a_record_decides_the_fields_it_releases() {
     );
     assert!(!released.to_string().contains("JBSWY3DPEHPK3PXP"));
     assert_eq!(
-        app.event(&harness, &released["entry"]),
+        without_time(app.logged(&harness, &provider, &released["log"])),
         json!({
             "t": "totp_issued", "record_id": seed["id"],
             "origin": "https://site.example", "context": "browser:fill",
@@ -266,8 +278,9 @@ async fn the_kind_of_a_record_decides_the_fields_it_releases() {
     assert_eq!(number["value"], "4242424242424242");
     let (_, cvc) = release(&harness, "user-1", &card, "card_cvc").await;
     assert_eq!(cvc["value"], "123");
-    assert_eq!(app.event(&harness, &cvc["entry"])["field"], "card_cvc");
-    assert_eq!(app.event(&harness, &cvc["entry"])["kind"], "vault_card");
+    let event = app.logged(&harness, &provider, &cvc["log"]);
+    assert_eq!(event["field"], "card_cvc");
+    assert_eq!(event["kind"], "vault_card");
 
     // Every other pair of kind and field is refused, and nothing is recorded for it.
     let seq = harness.head_seq("user-1");

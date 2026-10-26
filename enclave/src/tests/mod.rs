@@ -11,6 +11,7 @@ use crate::testing::{Provider, Reply, Seen, LOG_HOST};
 mod canary;
 mod commands;
 mod forward;
+mod forward_batch;
 mod log;
 mod log_store;
 mod mail;
@@ -54,6 +55,14 @@ async fn quiet_provider() -> Provider {
 async fn quiet_provider_and_log_store() -> Provider {
     let quiet = |_: &Seen| Reply::json(200, &json!({"ok": true}));
     provider_and_log_store(quiet, quiet).await
+}
+
+/// A stand-in for every provider host that answers with `handler`, and for the log store,
+/// which confirms every write.
+async fn provider_with_log_store(
+    handler: impl Fn(&Seen) -> Reply + Send + Sync + 'static,
+) -> Provider {
+    provider_and_log_store(handler, |_| Reply::json(200, &json!({"ok": true}))).await
 }
 
 /// A stand-in for every provider host and for the log store of the tests. `handler` answers

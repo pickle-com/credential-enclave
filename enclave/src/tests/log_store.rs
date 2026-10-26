@@ -10,22 +10,24 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use credential_enclave_protocol::encoding::{b64u, b64u_decode, to_json};
+use credential_enclave_protocol::encoding::{b64u, b64u_decode, verify, Signed};
 use credential_enclave_protocol::keys::Custody;
-use credential_enclave_protocol::log::entry_hash;
+use credential_enclave_protocol::log::{
+    body_hash, entry_hash_v2, object_key_v2, EntryKind, EntryParts,
+};
 use credential_enclave_protocol::{limits, purpose};
 use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::provider_and_log_store;
-use crate::log_store::PENDING_ENTRIES;
+use crate::log_store::{self, PENDING_ENTRIES};
 use crate::platform::Measurement;
 use crate::providers::Definitions;
 use crate::state::{lock, Limits};
 use crate::testing::{
-    log_credentials, operator_config, App, Harness, Provider, Reply, Seen, LOG_BUCKET, LOG_HOST,
-    LOG_REGION, LOG_SECRET_ACCESS_KEY, LOG_SESSION_TOKEN,
+    log_credentials, operator_config, App, Harness, PlainStore, Provider, Reply, Seen, LOG_BUCKET,
+    LOG_HOST, LOG_REGION, LOG_SECRET_ACCESS_KEY, LOG_SESSION_TOKEN,
 };
 
 const MESSAGES: &str = "https://gmail.googleapis.com/gmail/v1/users/me/messages";
@@ -39,6 +41,10 @@ struct Script {
     refused: Vec<String>,
     /// The stand-in answers no write.
     silent: bool,
+    /// The stand-in closes the connection after each answer.
+    close: bool,
+    /// Writes the stand-in reads and answers by closing the connection without a response.
+    lost: usize,
     /// The stand-in answers a write after this pause.
     pause: Duration,
 }
@@ -79,7 +85,11 @@ async fn stand_in() -> (Provider, Store) {
             _ => Reply::json(200, &json!({"ok": true})),
         },
         move |seen| {
-            let script = lock(&script);
+            let mut script = lock(&script);
+            if script.lost > 0 {
+                script.lost -= 1;
+                return Reply::Raw(Vec::new());
+            }
             if script.silent {
                 return Reply::Hang;
             }
@@ -92,6 +102,11 @@ async fn stand_in() -> (Provider, Store) {
                     b"",
                 ),
                 (false, status) => Reply::with_body(status, &[], b"<Error></Error>"),
+            };
+            let reply = if script.close {
+                reply
+            } else {
+                reply.keep_alive()
             };
             match script.pause.is_zero() {
                 true => reply,
@@ -123,20 +138,6 @@ fn writes(provider: &Provider) -> Vec<Seen> {
 fn provider_requests(provider: &Provider) -> Vec<Seen> {
     let to_a_provider = |seen: &Seen| seen.server_name != LOG_HOST;
     provider.seen().into_iter().filter(to_a_provider).collect()
-}
-
-/// The request target of the object of an entry: the key of protocol.md 7.6, read from the
-/// body of the entry.
-fn target_of(harness: &Harness, entry: &Value) -> String {
-    let body = b64u_decode(entry["body"].as_str().unwrap()).unwrap();
-    let fields: Value = serde_json::from_slice(&body).unwrap();
-    format!(
-        "/v1/accounts/{}/{}/{:020}-{}",
-        fields["user_id"].as_str().unwrap(),
-        harness.node.node,
-        fields["seq"].as_u64().unwrap(),
-        b64u(&entry_hash(&body))
-    )
 }
 
 /// The `seq` in the target of a write.
@@ -183,13 +184,38 @@ fn signature_of(write: &Seen) -> String {
     hex(&hmac(&key, to_sign.as_bytes()))
 }
 
-/// Asserts that `write` is the write of `entry` in the form of protocol.md 7.6.
-fn assert_write_of(harness: &Harness, write: &Seen, entry: &Value) {
+/// Asserts that `write` is the write of the entry `seq` of the chain of `user_id` in the form
+/// of protocol.md 7.6: a `PUT` of a signed entry of this node under the key of format 2, whose
+/// seven parts the test computes again from the body of the object.
+fn assert_write_of(harness: &Harness, write: &Seen, user_id: &str, seq: u64) {
     assert_eq!(write.method, "PUT");
     assert_eq!(write.server_name, LOG_HOST);
-    assert_eq!(write.target, target_of(harness, entry));
-    // The object is the entry as the response of the call carries it.
-    assert_eq!(write.body, to_json(entry));
+    let entry: Signed = serde_json::from_slice(&write.body).unwrap();
+    let body_bytes = verify(&harness.node_public(), purpose::LOG_ENTRY_V2, &entry).unwrap();
+    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(body["v"], 2);
+    assert_eq!(body["node"], harness.node.node.as_str());
+    assert_eq!(body["user_id"], user_id);
+    assert_eq!(body["seq"], seq);
+    let prev: [u8; 32] = b64u_decode(body["prev"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let hash = body_hash(&body_bytes);
+    let mut parts = EntryParts {
+        seq,
+        time_ms: body["time_ms"].as_u64().unwrap(),
+        kind: EntryKind::parse(body["kind"].as_str().unwrap().chars().next().unwrap()).unwrap(),
+        count: body["count"].as_u64().unwrap() as u32,
+        key_id: body["key_id"].as_str().unwrap().to_string(),
+        body_hash: hash,
+        entry_hash: [0u8; 32],
+    };
+    parts.entry_hash = entry_hash_v2(&prev, &hash, &parts.fields());
+    assert_eq!(
+        write.target,
+        format!("/{}", object_key_v2(user_id, &harness.node.node, &parts))
+    );
     let digest = Sha256::digest(&write.body);
     assert_eq!(
         write.header_names(),
@@ -204,7 +230,6 @@ fn assert_write_of(harness: &Harness, write: &Seen, entry: &Value) {
             "x-amz-object-lock-retain-until-date",
             "x-amz-security-token",
             "authorization",
-            "connection",
         ]
     );
     assert_eq!(write.header("content-type"), Some("application/json"));
@@ -222,7 +247,7 @@ fn assert_write_of(harness: &Harness, write: &Seen, entry: &Value) {
         write.header("x-amz-security-token"),
         Some(LOG_SESSION_TOKEN)
     );
-    assert_eq!(write.header("connection"), Some("close"));
+    assert_eq!(write.header("connection"), None);
     // The retention ends 365 days after the write: the same day and time one year later,
     // or the day before it when a leap day lies in between.
     let amz_date = write.header("x-amz-date").unwrap();
@@ -327,14 +352,6 @@ fn unavailable(outcome: &(u16, Value)) {
     );
 }
 
-/// The entries of an account that wait for their storage acknowledgement, after `after_seq`.
-async fn entries_after(harness: &Harness, user_id: &str, after_seq: u64) -> Vec<Value> {
-    let body = json!({"user_id": user_id, "after_seq": after_seq});
-    let (status, listed) = harness.post("/v1/log/entries", body).await;
-    assert_eq!(status, 200);
-    listed["entries"].as_array().unwrap().clone()
-}
-
 /// The attestation response of a node, as the operator domain fetches it for another node.
 async fn attestation(harness: &Harness) -> Value {
     let (status, response) = harness
@@ -360,9 +377,8 @@ async fn the_log_store_confirms_the_entry_before_the_provider_is_called() {
     let record = google_record(&app);
 
     // The grant: its entry is in the store before the node answers.
-    let granted = entries_after(&harness, "user-1", 0).await;
     assert_eq!(writes(&provider).len(), 1);
-    assert_write_of(&harness, &writes(&provider)[0], &granted[0]);
+    assert_write_of(&harness, &writes(&provider)[0], "user-1", 1);
     assert!(provider_requests(&provider).is_empty());
 
     // forward: the write of the entry arrives, then the request to the provider.
@@ -370,18 +386,26 @@ async fn the_log_store_confirms_the_entry_before_the_provider_is_called() {
         .forward(get(&app, &record, MESSAGES), b"")
         .await
         .unwrap();
+    assert_eq!(
+        forwarded.log,
+        json!({"seq": 2, "index": 0, "created": true})
+    );
     let seen = provider.seen();
     assert_eq!(seen.len(), 3);
-    assert_write_of(&harness, &seen[1], &forwarded.entry);
+    assert_write_of(&harness, &seen[1], "user-1", 2);
     assert_eq!(seen[2].server_name, "gmail.googleapis.com");
     assert_eq!(seen[2].target, "/gmail/v1/users/me/messages");
 
     // refresh: the write, then the call of the token address.
     let (status, refreshed) = refresh(&harness, &app, &record).await;
     assert_eq!(status, 200, "{refreshed}");
+    assert_eq!(
+        refreshed["log"],
+        json!({"seq": 3, "index": 0, "created": true})
+    );
     let seen = provider.seen();
     assert_eq!(seen.len(), 5);
-    assert_write_of(&harness, &seen[3], &refreshed["entry"]);
+    assert_write_of(&harness, &seen[3], "user-1", 3);
     assert_eq!(
         (seen[4].server_name.as_str(), seen[4].target.as_str()),
         ("oauth2.googleapis.com", "/token")
@@ -390,27 +414,39 @@ async fn the_log_store_confirms_the_entry_before_the_provider_is_called() {
     // revoke-token: the write, then the call of the revocation address.
     let (status, revoked) = revoke_token(&harness, &app, &record).await;
     assert_eq!((status, &revoked["revoked"]), (200, &json!(true)));
+    assert_eq!(
+        revoked["log"],
+        json!({"seq": 4, "index": 0, "created": true})
+    );
     let seen = provider.seen();
     assert_eq!(seen.len(), 7);
-    assert_write_of(&harness, &seen[5], &revoked["entry"]);
+    assert_write_of(&harness, &seen[5], "user-1", 4);
     assert_eq!(seen[6].target, "/revoke");
 
     // release: the write, then the value in the response.
     let (status, released) = release(&harness, &app, &password(&app)).await;
     assert_eq!((status, &released["value"]), (200, &json!("hunter2")));
+    assert_eq!(
+        released["log"],
+        json!({"seq": 5, "index": 0, "created": true})
+    );
     let seen = provider.seen();
     assert_eq!(seen.len(), 8);
-    assert_write_of(&harness, &seen[7], &released["entry"]);
+    assert_write_of(&harness, &seen[7], "user-1", 5);
 
     // oauth/complete: the code is exchanged first, then the entry is written, and the record
     // leaves after that.
     let state = begin(&harness, &app).await;
     let (status, completed) = complete(&harness, &app, &state).await;
     assert_eq!(status, 200, "{completed}");
+    assert_eq!(
+        completed["log"],
+        json!({"seq": 6, "index": 0, "created": true})
+    );
     let seen = provider.seen();
     assert_eq!(seen.len(), 10);
     assert_eq!(seen[8].target, "/token");
-    assert_write_of(&harness, &seen[9], &completed["entry"]);
+    assert_write_of(&harness, &seen[9], "user-1", 6);
     assert_eq!(
         app.open(&completed["record"])["token"]["access_token"],
         "ya29.second-access"
@@ -468,13 +504,12 @@ async fn a_write_the_store_does_not_confirm_stops_the_act() {
     assert_eq!(exchanged.len(), 1);
     assert_eq!(exchanged[0].target, "/token");
 
-    // Each call left its entry on the chain: the caller fetches them, and they wait for the
-    // store.
+    // Each call left its entry on the chain and sent it to the store, which refused it: the
+    // entries wait for the store.
     assert_eq!(harness.head_seq("user-1"), 6);
-    let kinds: Vec<Value> = entries_after(&harness, "user-1", 1)
-        .await
+    let kinds: Vec<Value> = app.stored_events(&harness, &provider)[1..]
         .iter()
-        .map(|entry| app.event(&harness, entry)["t"].clone())
+        .map(|events| events[0]["t"].clone())
         .collect();
     assert_eq!(
         kinds,
@@ -565,16 +600,26 @@ async fn a_pending_entry_is_written_again_with_the_next_write_of_the_account() {
     confirm(&store);
     let (status, released) = release(&harness, &app, &vault).await;
     assert_eq!(status, 200);
-    assert_eq!(app.entry_body(&harness, &released["entry"])["seq"], 4);
+    assert_eq!(
+        released["log"],
+        json!({"seq": 4, "index": 0, "created": true})
+    );
     let written = writes(&provider)[before..].to_vec();
     let mut seqs: Vec<u64> = written.iter().map(seq_of).collect();
     seqs.sort();
     assert_eq!(seqs, [2, 3, 4]);
-    // What is written again is the entry that was created then, under its own key.
-    let pending = entries_after(&harness, "user-1", 1).await;
+    // What is written again is the entry that was created then, under its own key: the same
+    // bytes under the same target as the write the store refused.
     for write in &written {
-        let entry = &pending[seq_of(write) as usize - 2];
-        assert_write_of(&harness, write, entry);
+        assert_write_of(&harness, write, "user-1", seq_of(write));
+        let first = writes(&provider)
+            .into_iter()
+            .find(|earlier| seq_of(earlier) == seq_of(write))
+            .unwrap();
+        assert_eq!(
+            (first.target, first.body),
+            (write.target.clone(), write.body.clone())
+        );
     }
     assert_eq!(harness.health().await["log_store"]["pending"], 0);
     let account = harness.node.account("user-1").unwrap();
@@ -597,6 +642,42 @@ async fn a_pending_entry_is_written_again_with_the_next_write_of_the_account() {
     assert!(lock(&account).unconfirmed.is_empty());
     let all: Vec<u64> = writes(&provider).iter().map(seq_of).collect();
     assert_eq!(all.iter().filter(|seq| **seq == 5).count(), 3);
+}
+
+#[tokio::test]
+async fn the_sweep_of_the_node_writes_a_pending_entry_again_without_a_further_call() {
+    let (provider, store) = stand_in().await;
+    let (harness, app) = node_with_log_store(&provider).await;
+    let vault = password(&app);
+
+    // A release the store refuses: entry 2 is pending, and the account makes no further call.
+    refuse(&store, 500);
+    unavailable(&release(&harness, &app, &vault).await);
+    assert_eq!(harness.health().await["log_store"]["pending"], 1);
+    let before = writes(&provider).len();
+
+    // The sweep writes the pending entry again: the same entry under its own key, confirmed.
+    confirm(&store);
+    log_store::sweep(&harness.node).await;
+    let written = writes(&provider)[before..].to_vec();
+    assert_eq!(written.iter().map(seq_of).collect::<Vec<u64>>(), [2]);
+    assert_write_of(&harness, &written[0], "user-1", 2);
+    assert_eq!(harness.health().await["log_store"]["pending"], 0);
+    let account = harness.node.account("user-1").unwrap();
+    assert!(lock(&account).unconfirmed.is_empty());
+
+    // A store that still refuses leaves the entry pending for the next sweep; a sweep of an
+    // account without a pending entry writes nothing.
+    refuse(&store, 500);
+    unavailable(&release(&harness, &app, &vault).await);
+    log_store::sweep(&harness.node).await;
+    assert_eq!(harness.health().await["log_store"]["pending"], 1);
+    confirm(&store);
+    log_store::sweep(&harness.node).await;
+    assert_eq!(harness.health().await["log_store"]["pending"], 0);
+    let count = writes(&provider).len();
+    log_store::sweep(&harness.node).await;
+    assert_eq!(writes(&provider).len(), count);
 }
 
 #[tokio::test]
@@ -625,15 +706,12 @@ async fn a_request_that_shares_an_entry_waits_for_the_store_to_confirm_that_entr
         .forward(get(&app, &record, MESSAGES), b"")
         .await
         .unwrap();
-    assert_eq!((sent.status, &sent.entry), (200, &Value::Null));
+    assert_eq!(sent.status, 200);
+    assert_eq!(sent.log, json!({"seq": 2, "index": 0, "created": false}));
     assert_eq!(harness.head_seq("user-1"), 2);
     let written = writes(&provider)[before..].to_vec();
     assert_eq!(written.len(), 1);
-    assert_write_of(
-        &harness,
-        &written[0],
-        &entries_after(&harness, "user-1", 1).await[0],
-    );
+    assert_write_of(&harness, &written[0], "user-1", 2);
     let seen = provider.seen();
     assert_eq!(seen[seen.len() - 2].server_name, LOG_HOST);
     assert_eq!(seen[seen.len() - 1].server_name, "gmail.googleapis.com");
@@ -644,7 +722,7 @@ async fn a_request_that_shares_an_entry_waits_for_the_store_to_confirm_that_entr
         .forward(get(&app, &record, MESSAGES), b"")
         .await
         .unwrap();
-    assert_eq!(again.entry, Value::Null);
+    assert_eq!(again.log, json!({"seq": 2, "index": 0, "created": false}));
     assert_eq!(writes(&provider).len(), before);
     assert_eq!(provider_requests(&provider).len(), 2);
 }
@@ -675,17 +753,20 @@ async fn a_grant_is_put_in_place_only_after_the_store_confirmed_its_entry() {
     assert_eq!(reply["challenge"], attested.challenge.as_str());
     assert_eq!(reply["key_id"], app.keys.key_id().as_str());
     assert_eq!(reply["not_after_ms"], 0);
-    assert_eq!(response["entry"], Value::Null);
+    assert_eq!(response["log"], Value::Null);
     assert_eq!(response["grant"]["state"], "none");
     assert_eq!(harness.health().await["grants"], 0);
     assert_eq!(
         code(&release(&harness, &app, &password(&app)).await),
         (409, "grant_required")
     );
-    // The entry is on the chain, where the reply says the chain ends, and it waits.
+    // The entry is on the chain, where the reply says the chain ends, and it waits: the store
+    // saw the write it refused.
     assert_eq!(reply["head"]["seq"], 1);
-    let waiting = entries_after(&harness, "user-1", 0).await;
-    assert_eq!(app.event(&harness, &waiting[0])["t"], "grant_accepted");
+    assert_eq!(
+        app.stored_events(&harness, &provider)[0][0]["t"],
+        "grant_accepted"
+    );
     assert_eq!(harness.health().await["log_store"]["pending"], 1);
     // The challenge of that command is used.
     confirm(&store);
@@ -697,7 +778,10 @@ async fn a_grant_is_put_in_place_only_after_the_store_confirmed_its_entry() {
     let before = writes(&provider).len();
     let response = app.grant(&harness).await;
     assert_eq!(response["grant"]["state"], "active");
-    assert_eq!(app.entry_body(&harness, &response["entry"])["seq"], 2);
+    assert_eq!(
+        response["log"],
+        json!({"seq": 2, "index": 0, "created": true})
+    );
     let mut seqs: Vec<u64> = writes(&provider)[before..].iter().map(seq_of).collect();
     seqs.sort();
     assert_eq!(seqs, [1, 2]);
@@ -719,7 +803,11 @@ async fn a_revoke_erases_the_key_whatever_the_store_answers() {
         (&json!("revoke_reply"), &json!(true), &json!(""))
     );
     assert_eq!(
-        app.event(&harness, &response["entry"])["t"],
+        response["log"],
+        json!({"seq": 3, "index": 0, "created": true})
+    );
+    assert_eq!(
+        app.logged(&harness, &provider, &response["log"])["t"],
         "grant_revoked"
     );
     assert_eq!(response["grant"]["state"], "revoked");
@@ -783,12 +871,11 @@ async fn an_export_hands_a_grant_over_only_after_the_store_confirmed_its_entry()
     };
     assert_eq!((pending("alice"), pending("bob")), (0, 1));
     assert_eq!(old.health().await["log_store"]["pending"], 1);
-    // The entries are on the chains: the caller fetches them.
-    let waiting = entries_after(&old, "bob", 1).await;
-    assert_eq!(
-        bob.event(&old, &waiting[0]),
-        json!({"t": "grant_transferred_out", "to": new.node.node})
-    );
+    // The entries are on the chains, and the store saw the write of bob's that it refused.
+    let waiting = bob.stored_events(&old, &provider);
+    assert_eq!(waiting.len(), 2);
+    assert_eq!(waiting[1][0]["t"], "grant_transferred_out");
+    assert_eq!(waiting[1][0]["to"], new.node.node);
 
     // The same call while the store still refuses: no further entry, and no grant.
     unavailable(&export(&old, &to).await);
@@ -800,15 +887,16 @@ async fn an_export_hands_a_grant_over_only_after_the_store_confirmed_its_entry()
     let before = writes(&provider).len();
     let (status, exported) = export(&old, &to).await;
     assert_eq!(status, 200, "{exported}");
-    assert_eq!(exported["entries"], json!([]));
+    assert_eq!(exported["logs"], json!([]));
     assert_eq!((old.head_seq("alice"), old.head_seq("bob")), (2, 2));
     let written = writes(&provider)[before..].to_vec();
     assert_eq!(written.len(), 1);
-    assert_write_of(&old, &written[0], &waiting[0]);
+    assert_write_of(&old, &written[0], "bob", 2);
     assert_eq!(pending("bob"), 0);
 
-    // The receiving node takes both grants. Their entries wait there: it writes them with
-    // the next write of each account.
+    // The receiving node takes both grants and writes their entries in one round (it has
+    // credentials for the store): nothing waits there, and the next act of an account on that
+    // node continues its chain.
     let before = writes(&provider).len();
     let (status, imported) = import(&new, &from, &exported["envelope"]).await;
     assert_eq!(
@@ -816,20 +904,28 @@ async fn an_export_hands_a_grant_over_only_after_the_store_confirmed_its_entry()
         (200, &json!(2)),
         "{imported}"
     );
-    assert_eq!(writes(&provider).len(), before);
-    assert_eq!(new.health().await["log_store"]["pending"], 2);
+    let written = writes(&provider)[before..].to_vec();
+    assert_eq!(written.len(), 2);
+    let mut users: Vec<&str> = written
+        .iter()
+        .map(|write| write.target.split('/').nth(3).unwrap())
+        .collect();
+    users.sort();
+    assert_eq!(users, ["alice", "bob"]);
+    assert!(written.iter().all(|write| seq_of(write) == 1));
+    for write in &written {
+        assert!(write.target.contains(&format!("/{}/", new.node.node)));
+    }
+    assert_eq!(new.health().await["log_store"]["pending"], 0);
     let (status, released) = release(&new, &alice, &password(&alice)).await;
     assert_eq!(status, 200, "{released}");
-    let written = writes(&provider)[before..].to_vec();
-    let mut seqs: Vec<u64> = written.iter().map(seq_of).collect();
-    seqs.sort();
-    assert_eq!(seqs, [1, 2]);
-    for write in &written {
-        assert!(write
-            .target
-            .starts_with(&format!("/v1/accounts/alice/{}/", new.node.node)));
-    }
-    assert_eq!(new.health().await["log_store"]["pending"], 1);
+    let written = writes(&provider)[before + 2..].to_vec();
+    assert_eq!(written.len(), 1);
+    assert_eq!(seq_of(&written[0]), 2);
+    assert!(written[0]
+        .target
+        .starts_with(&format!("/v1/accounts/alice/{}/", new.node.node)));
+    assert_eq!(new.health().await["log_store"]["pending"], 0);
 
     // A grant that took the place of the one an entry was made for is not handed over under
     // that entry: the new grant gets its own.
@@ -843,9 +939,7 @@ async fn an_export_hands_a_grant_over_only_after_the_store_confirmed_its_entry()
     alice.grant(&old).await;
     let (status, exported) = export(&old, &to_third).await;
     assert_eq!(status, 200, "{exported}");
-    let entries = exported["entries"].as_array().unwrap();
-    assert_eq!(entries.len(), 1);
-    assert_eq!(alice.entry_body(&old, &entries[0])["seq"], 5);
+    assert_eq!(exported["logs"], json!([{"user_id": "alice", "seq": 5}]));
     assert_eq!((old.head_seq("alice"), old.head_seq("bob")), (5, 3));
 
     // A node whose credentials for the log store ended hands nothing over, before an entry
@@ -1152,21 +1246,11 @@ async fn an_account_collects_at_most_64_pending_entries_of_calls_that_use_a_cred
     let (harness, app) = node_with_log_store(&provider).await;
     let vault = password(&app);
     let account = harness.node.account("user-1").unwrap();
-    let acknowledge = || {
-        let harness = &harness;
-        async move {
-            let seq = harness.head_seq("user-1");
-            let body = json!({"user_id": "user-1", "seq": seq});
-            assert_eq!(harness.post("/v1/log/ack", body).await.0, 200);
-        }
-    };
 
-    // The store refuses every write. The caller stores the entries of the failed calls, so
-    // the limit of entries without a storage acknowledgement does not stop it.
+    // The store refuses every write.
     refuse(&store, 500);
     for _ in 0..PENDING_ENTRIES {
         unavailable(&release(&harness, &app, &vault).await);
-        acknowledge().await;
     }
     assert_eq!(lock(&account).pending_entries(), PENDING_ENTRIES);
     assert_eq!(harness.head_seq("user-1"), 1 + PENDING_ENTRIES as u64);
@@ -1206,16 +1290,11 @@ async fn a_call_at_the_limit_of_pending_entries_goes_on_once_the_store_made_room
     refuse(&store, 500);
     for _ in 0..PENDING_ENTRIES {
         unavailable(&release(&harness, &app, &vault).await);
-        let body = json!({"user_id": "user-1", "seq": harness.head_seq("user-1")});
-        assert_eq!(harness.post("/v1/log/ack", body).await.0, 200);
     }
     confirm(&store);
     let (status, released) = release(&harness, &app, &vault).await;
     assert_eq!((status, &released["value"]), (200, &json!("hunter2")));
-    assert_eq!(
-        app.entry_body(&harness, &released["entry"])["seq"],
-        2 + PENDING_ENTRIES as u64
-    );
+    assert_eq!(released["log"]["seq"], 2 + PENDING_ENTRIES as u64);
     assert!(lock(&account).unconfirmed.is_empty());
     // The call wrote the 64 pending entries first, and its own entry after the store took
     // them.
@@ -1241,10 +1320,12 @@ async fn a_call_that_ends_before_its_write_leaves_its_entry_pending() {
     assert!(tokio::time::timeout(Duration::from_millis(300), call)
         .await
         .is_err());
-    // Its entry is on the chain and no call writes it: it is a pending entry.
+    // Its entry is on the chain and no call writes it: it is a pending entry, and the account
+    // has no writer.
     assert_eq!(harness.head_seq("user-1"), 2);
     assert_eq!(lock(&account).unconfirmed.len(), 1);
     assert_eq!(lock(&account).pending_entries(), 1);
+    assert!(!lock(&account).writer);
 
     // The next write of the account takes it along.
     confirm(&store);
@@ -1321,7 +1402,7 @@ async fn a_revoke_that_is_accepted_while_a_grant_waits_for_the_store_stands() {
             (&json!("revoke_reply"), &json!(true))
         );
         // There was no grant to end: no entry, and nothing to write.
-        assert_eq!(response["entry"], Value::Null);
+        assert_eq!(response["log"], Value::Null);
     };
     let (response, ()) = tokio::join!(grant, revoke);
 
@@ -1336,7 +1417,7 @@ async fn a_revoke_that_is_accepted_while_a_grant_waits_for_the_store_stands() {
             &json!("bad_challenge")
         )
     );
-    assert_eq!(response["entry"], Value::Null);
+    assert_eq!(response["log"], Value::Null);
     assert_eq!(response["grant"]["state"], "revoked");
     assert_eq!(harness.health().await["grants"], 0);
     assert_eq!(
@@ -1375,7 +1456,7 @@ async fn a_revoke_that_is_accepted_while_an_export_waits_for_the_store_leaves_no
 
     // The store confirmed both entries, and the transfer carries the grant of bob alone.
     assert_eq!(status, 200, "{exported}");
-    assert_eq!(exported["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(exported["logs"].as_array().unwrap().len(), 2);
     confirm(&store);
     let (status, imported) = import(&new, &attestation(&old).await, &exported["envelope"]).await;
     assert_eq!(
@@ -1392,22 +1473,259 @@ async fn a_revoke_that_is_accepted_while_an_export_waits_for_the_store_leaves_no
 }
 
 #[tokio::test]
-async fn calls_that_run_at_the_same_time_write_each_entry_once() {
+async fn calls_that_run_at_the_same_time_form_one_entry_and_write_each_entry_once() {
     let (provider, store) = stand_in().await;
     let (harness, app) = node_with_log_store(&provider).await;
     let vault = password(&app);
     lock(&store).pause = Duration::from_millis(200);
 
-    // Four releases of one account at the same time: each call writes the entry it created
-    // and leaves the entries the others are writing to them.
+    // Four releases of one account at the same time: the first one writes its entry, the
+    // events of the three others form the next entry while that write runs, and one of them
+    // writes it. No entry is written twice.
     let call = || release(&harness, &app, &vault);
     let outcomes = tokio::join!(call(), call(), call(), call());
+    let mut logs = Vec::new();
     for outcome in [outcomes.0, outcomes.1, outcomes.2, outcomes.3] {
         assert_eq!((outcome.0, &outcome.1["value"]), (200, &json!("hunter2")));
+        logs.push((
+            outcome.1["log"]["seq"].as_u64().unwrap(),
+            outcome.1["log"]["index"].as_u64().unwrap(),
+        ));
     }
-    let mut seqs: Vec<u64> = writes(&provider).iter().map(seq_of).collect();
-    seqs.sort();
-    assert_eq!(seqs, [1, 2, 3, 4, 5]);
+    logs.sort();
+    assert_eq!(logs, [(2, 0), (3, 0), (3, 1), (3, 2)]);
+    let seqs: Vec<u64> = writes(&provider).iter().map(seq_of).collect();
+    assert_eq!(seqs, [1, 2, 3]);
+    let counts: Vec<u32> = provider
+        .chain("user-1", &harness.node.node)
+        .iter()
+        .map(|stored| stored.parts().count)
+        .collect();
+    assert_eq!(counts, [1, 1, 3]);
     let account = harness.node.account("user-1").unwrap();
     assert!(lock(&account).unconfirmed.is_empty());
+}
+
+#[tokio::test]
+async fn a_write_the_store_refuses_fails_the_writer_and_the_calls_that_waited_for_it() {
+    let (provider, store) = stand_in().await;
+    let (harness, app) = node_with_log_store(&provider).await;
+    let vault = password(&app);
+    *lock(&store) = Script {
+        status: 500,
+        pause: Duration::from_millis(300),
+        ..Script::default()
+    };
+
+    // The first release writes entry 2 and the store refuses it. The second release joined
+    // the open batch in that time: its event forms entry 3, it writes that entry (with the
+    // pending entry 2) once, and the store refuses that too. Both calls end without their
+    // value, and both entries wait.
+    let first = release(&harness, &app, &vault);
+    let second = async {
+        provider.until_written(2).await;
+        release(&harness, &app, &vault).await
+    };
+    let (first, second) = tokio::join!(first, second);
+    unavailable(&first);
+    unavailable(&second);
+    assert_eq!(harness.head_seq("user-1"), 3);
+    let account = harness.node.account("user-1").unwrap();
+    assert_eq!(lock(&account).pending_entries(), 2);
+    assert!(!lock(&account).writer);
+    let mut seqs: Vec<u64> = writes(&provider).iter().map(seq_of).collect();
+    seqs.sort();
+    assert_eq!(seqs, [1, 2, 2, 3]);
+
+    // The next write of the account takes both along.
+    confirm(&store);
+    let (status, released) = release(&harness, &app, &vault).await;
+    assert_eq!((status, &released["value"]), (200, &json!("hunter2")));
+    assert_eq!(released["log"]["seq"], 4);
+    assert!(lock(&account).unconfirmed.is_empty());
+    let mut seqs: Vec<u64> = writes(&provider)[4..].iter().map(seq_of).collect();
+    seqs.sort();
+    assert_eq!(seqs, [2, 3, 4]);
+}
+
+#[tokio::test]
+async fn a_local_endpoint_is_written_in_path_style_over_plain_http() {
+    let (provider, _store) = stand_in().await;
+    let plain = PlainStore::start(|_| Reply::with_body(200, &[], b"").keep_alive()).await;
+    let harness = Harness::new(&provider);
+    harness
+        .platform
+        .route_at("store.local", 9000, plain.address);
+    let log_store = json!({
+        "bucket": LOG_BUCKET, "region": LOG_REGION, "endpoint": "http://store.local:9000",
+    });
+    harness.use_log_store_with(log_store).await;
+    let app = App::new("user-1", 1);
+    app.grant(&harness).await;
+    assert_eq!(release(&harness, &app, &password(&app)).await.0, 200);
+
+    // The writes went to the endpoint over the plain byte pipe, in path-style, with the host
+    // of the endpoint, signed over that target and that host, and over one connection.
+    let seen = plain.seen();
+    assert_eq!(seen.len(), 2);
+    for (write, seq) in seen.iter().zip([1u64, 2]) {
+        assert_eq!(write.method, "PUT");
+        assert_eq!(
+            write.target,
+            format!(
+                "/{LOG_BUCKET}{}",
+                plain.stored()[seq as usize - 1]
+                    .key
+                    .strip_prefix("v1")
+                    .map(|rest| format!("/v1{rest}"))
+                    .unwrap()
+            )
+        );
+        assert!(write.target.starts_with(&format!(
+            "/{LOG_BUCKET}/v1/accounts/user-1/{}/",
+            harness.node.node
+        )));
+        assert_eq!(write.header("host"), Some("store.local:9000"));
+        assert_eq!(write.header("x-amz-object-lock-mode"), Some("COMPLIANCE"));
+        assert!(write
+            .header("authorization")
+            .unwrap()
+            .ends_with(&signature_of(write)));
+        assert_eq!(plain.stored()[seq as usize - 1].seq(), seq);
+    }
+    assert!(writes(&provider).is_empty());
+    assert_eq!(
+        harness.platform.connections(),
+        [("store.local".to_string(), 9000)]
+    );
+    // The health and the binding name the bucket and the region, not the endpoint.
+    let health = harness.health().await;
+    assert_eq!(health["log_store"]["bucket"], LOG_BUCKET);
+    assert_eq!(health["log_store"].get("endpoint"), None);
+
+    // A node of the nitro platform refuses a configuration with an endpoint, and a value that
+    // is not an `http://host:port` or `https://host:port` origin is refused on the local
+    // platform.
+    let measured = Harness::measured(
+        &provider,
+        Measurement {
+            pcrs: [[0xa0; 48], [0xa1; 48], [0xa2; 48]],
+        },
+    );
+    let mut config = operator_config(&measured.node.definitions);
+    config["log_store"] = json!({
+        "bucket": LOG_BUCKET, "region": LOG_REGION, "endpoint": "http://store.local:9000",
+    });
+    assert_eq!(
+        code(&measured.post("/v1/config", config).await),
+        (400, "invalid_request")
+    );
+    assert_eq!(measured.health().await["log_store"], Value::Null);
+    let local = Harness::new(&provider);
+    for endpoint in [
+        json!("store.local:9000"),
+        json!("ftp://store.local"),
+        json!("http://store.local/bucket"),
+        json!("http://user@store.local"),
+        json!(""),
+        json!(9000),
+    ] {
+        let mut config = operator_config(&local.node.definitions);
+        config["log_store"] =
+            json!({"bucket": LOG_BUCKET, "region": LOG_REGION, "endpoint": endpoint});
+        assert_eq!(
+            code(&local.post("/v1/config", config).await),
+            (400, "invalid_request"),
+            "{endpoint}"
+        );
+    }
+    assert_eq!(local.health().await["log_store"], Value::Null);
+}
+
+#[tokio::test]
+async fn sequential_log_writes_share_one_tls_connection() {
+    let (provider, _store) = stand_in().await;
+    let (harness, app) = node_with_log_store(&provider).await;
+    for _ in 0..8 {
+        let (status, released) = release(&harness, &app, &password(&app)).await;
+        assert_eq!(status, 200, "{released}");
+    }
+    assert_eq!(writes(&provider).len(), 9);
+    assert_eq!(
+        harness
+            .platform
+            .connections()
+            .iter()
+            .filter(|(host, _)| host == LOG_HOST)
+            .count(),
+        1,
+    );
+}
+
+#[tokio::test]
+async fn a_closed_log_connection_does_not_block_the_next_write() {
+    let (provider, store) = stand_in().await;
+    lock(&store).close = true;
+    let (harness, app) = node_with_log_store(&provider).await;
+    for _ in 0..3 {
+        let (status, released) = release(&harness, &app, &password(&app)).await;
+        assert_eq!(status, 200, "{released}");
+    }
+    assert_eq!(writes(&provider).len(), 4);
+}
+
+#[tokio::test]
+async fn a_write_whose_idle_connection_ends_without_a_response_goes_over_a_new_connection() {
+    let (provider, store) = stand_in().await;
+    let (harness, app) = node_with_log_store(&provider).await;
+    lock(&store).lost = 1;
+    assert_eq!(release(&harness, &app, &password(&app)).await.0, 200);
+    let writes = writes(&provider);
+    assert_eq!(writes.len(), 3);
+    assert_eq!(seq_of(&writes[1]), seq_of(&writes[2]));
+    assert_eq!(harness.platform.connections().len(), 2);
+    assert_eq!(harness.health().await["log_store"]["pending"], 0);
+}
+
+#[tokio::test]
+async fn a_write_over_a_new_connection_is_not_repeated() {
+    let (provider, store) = stand_in().await;
+    let (harness, app) = node_with_log_store(&provider).await;
+    lock(&store).lost = 2;
+    unavailable(&release(&harness, &app, &password(&app)).await);
+    assert_eq!(writes(&provider).len(), 3);
+    assert_eq!(harness.health().await["log_store"]["pending"], 1);
+    confirm(&store);
+    assert_eq!(release(&harness, &app, &password(&app)).await.0, 200);
+    assert_eq!(harness.health().await["log_store"]["pending"], 0);
+}
+
+#[tokio::test]
+async fn a_reused_connection_carries_the_current_credentials() {
+    let (provider, _store) = stand_in().await;
+    let (harness, app) = node_with_log_store(&provider).await;
+    let mut credentials = log_credentials(harness.node.now_ms() + 60_000);
+    credentials["session_token"] = json!("rotated-session-token");
+    assert_eq!(
+        harness
+            .post("/v1/log-store/credentials", credentials)
+            .await
+            .0,
+        200
+    );
+    assert_eq!(release(&harness, &app, &password(&app)).await.0, 200);
+    let writes = writes(&provider);
+    assert_eq!(
+        writes[0].header("x-amz-security-token"),
+        Some(LOG_SESSION_TOKEN)
+    );
+    assert_eq!(
+        writes[1].header("x-amz-security-token"),
+        Some("rotated-session-token")
+    );
+    assert_ne!(
+        writes[0].header("authorization"),
+        writes[1].header("authorization")
+    );
+    assert_eq!(harness.platform.connections().len(), 1);
 }

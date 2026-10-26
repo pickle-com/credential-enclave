@@ -8,7 +8,6 @@
 
 use std::fmt;
 
-use credential_enclave_protocol::encoding::Signed;
 use credential_enclave_protocol::record::{Kind, Record};
 use credential_enclave_protocol::secret::Secret;
 use credential_enclave_protocol::totp::totp;
@@ -104,9 +103,9 @@ impl Selected {
     }
 
     /// Hands the value out. This is sink K4 of the egress policy: the one place where a vault
-    /// value becomes part of a response. `entry` is the log entry of this release, which is on
-    /// the chain of the account before the value leaves.
-    pub fn hand_out(self, _entry: &Signed) -> ReleasedValue {
+    /// value becomes part of a response. The caller holds the `log` object of this release:
+    /// the entry that names it is on the chain of the account before the value leaves.
+    pub fn hand_out(self) -> ReleasedValue {
         ReleasedValue(self.value.expose_secret().clone())
     }
 }

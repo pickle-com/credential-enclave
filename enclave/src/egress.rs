@@ -16,11 +16,13 @@
 //! definitions create: the host of a request is one that passed the address check of
 //! `forward`, or the host of the token address or of the revocation address of a definition.
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
+use credential_enclave_protocol::limits;
 use credential_enclave_protocol::secret::Secret;
 use hyper::body::{Body, Bytes, Frame, Incoming, SizeHint};
 use hyper::client::conn::http1::SendRequest;
@@ -29,14 +31,19 @@ use hyper::{Method, Request, Uri};
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsConnector;
 
 use crate::clock::{Clock, TlsTime};
 use crate::platform::DynPlatform;
 use crate::providers::Destination;
+use crate::state::lock;
 
 /// The port of every provider address and of the log store.
 pub const PROVIDER_PORT: u16 = 443;
+
+/// Open connections to providers in total that carry no request, over every account.
+const IDLE_PROVIDER_CONNECTIONS_TOTAL: usize = 1024;
 
 /// Response headers that are not passed on: the headers that describe one connection
 /// (RFC 9110 7.6.1), and the cookie headers. A node drops the `Cookie` header of every request,
@@ -227,6 +234,15 @@ impl Body for OnceBody {
     }
 }
 
+/// Where the connection of an exchange goes back to when its response has ended: the idle
+/// connections of one account and host.
+struct Keep {
+    pool: Arc<ProviderConnections>,
+    user_id: String,
+    host: String,
+    now_ms: u64,
+}
+
 /// The head of a provider response. The body is read with [`Exchange::read_body`].
 pub struct Exchange {
     pub status: u16,
@@ -236,8 +252,14 @@ pub struct Exchange {
     /// The declared body length, when the response declares one.
     pub content_length: Option<u64>,
     body: Incoming,
-    // The connection stays open while the body is read.
-    _sender: SendRequest<OnceBody>,
+    /// The connection stays open while the body is read. When the body has ended and the
+    /// provider did not close the connection, it goes back to the idle connections of its
+    /// account and host.
+    sender: Option<SendRequest<OnceBody>>,
+    keep: Option<Keep>,
+    /// The share of the node-wide bound of provider requests in flight. Held until the
+    /// exchange is dropped.
+    _inflight: OwnedSemaphorePermit,
 }
 
 impl Exchange {
@@ -258,7 +280,10 @@ impl Exchange {
             let frame =
                 std::future::poll_fn(|context| Pin::new(&mut self.body).poll_frame(context)).await;
             match frame {
-                None => return Ok(collected),
+                None => {
+                    self.keep_connection();
+                    return Ok(collected);
+                }
                 Some(Err(_)) => return Err(EgressError::Unreachable),
                 Some(Ok(frame)) => {
                     if let Ok(data) = frame.into_data() {
@@ -271,12 +296,109 @@ impl Exchange {
             }
         }
     }
+
+    /// Puts the connection among the idle connections of its account and host, when the
+    /// response has ended on an open connection.
+    fn keep_connection(&mut self) {
+        if let (Some(keep), Some(sender)) = (self.keep.take(), self.sender.take()) {
+            if !sender.is_closed() {
+                keep.pool
+                    .put(&keep.user_id, &keep.host, sender, keep.now_ms);
+            }
+        }
+    }
+}
+
+/// The open connections to providers that carry no request, by account and host (enclave.md
+/// 5.8 step 8): at most [`limits::PROVIDER_IDLE_CONNECTIONS`] per account and host, each kept
+/// for at most [`limits::PROVIDER_IDLE_MS`], and at most [`IDLE_PROVIDER_CONNECTIONS_TOTAL`] in
+/// all. No connection carries the requests of two accounts.
+#[derive(Default)]
+pub struct ProviderConnections(Mutex<HashMap<(String, String), IdleSenders>>);
+
+/// The idle connections of one (account, host) pair, each with the node time it became idle,
+/// the most recently used last.
+type IdleSenders = Vec<(SendRequest<OnceBody>, u64)>;
+
+impl ProviderConnections {
+    /// The most recently used open connection of `user_id` to `host`, once it is ready for a
+    /// request. Connections idle for longer than the idle time are dropped.
+    async fn take(&self, user_id: &str, host: &str, now_ms: u64) -> Option<SendRequest<OnceBody>> {
+        loop {
+            let candidate = {
+                let mut pools = lock(&self.0);
+                let key = (user_id.to_string(), host.to_string());
+                let idle = pools.get_mut(&key)?;
+                idle.retain(|(sender, since_ms)| {
+                    !sender.is_closed()
+                        && now_ms < since_ms.saturating_add(limits::PROVIDER_IDLE_MS)
+                });
+                let candidate = idle.pop();
+                if idle.is_empty() {
+                    pools.remove(&key);
+                }
+                candidate
+            };
+            let (mut sender, _) = candidate?;
+            if sender.ready().await.is_ok() {
+                return Some(sender);
+            }
+        }
+    }
+
+    /// Keeps a connection of `user_id` to `host` whose response has ended. The oldest idle
+    /// connection of the pair leaves when the pair has its limit, and the oldest of all when
+    /// the node has its total.
+    fn put(&self, user_id: &str, host: &str, sender: SendRequest<OnceBody>, now_ms: u64) {
+        let mut pools = lock(&self.0);
+        pools.retain(|_, idle| {
+            idle.retain(|(sender, since_ms)| {
+                !sender.is_closed() && now_ms < since_ms.saturating_add(limits::PROVIDER_IDLE_MS)
+            });
+            !idle.is_empty()
+        });
+        let total: usize = pools.values().map(Vec::len).sum();
+        if total >= IDLE_PROVIDER_CONNECTIONS_TOTAL {
+            let oldest = pools
+                .iter()
+                .filter_map(|(key, idle)| idle.first().map(|(_, since)| (*since, key.clone())))
+                .min()
+                .map(|(_, key)| key);
+            if let Some(key) = oldest {
+                if let Some(idle) = pools.get_mut(&key) {
+                    idle.remove(0);
+                    if idle.is_empty() {
+                        pools.remove(&key);
+                    }
+                }
+            }
+        }
+        let idle = pools
+            .entry((user_id.to_string(), host.to_string()))
+            .or_default();
+        if idle.len() >= limits::PROVIDER_IDLE_CONNECTIONS {
+            idle.remove(0);
+        }
+        idle.push((sender, now_ms));
+    }
+
+    /// The number of idle connections of `user_id` to `host`.
+    #[cfg(test)]
+    pub fn idle_count(&self, user_id: &str, host: &str) -> usize {
+        lock(&self.0)
+            .get(&(user_id.to_string(), host.to_string()))
+            .map_or(0, Vec::len)
+    }
 }
 
 /// The TLS client of a node.
 pub struct Egress {
     connector: TlsConnector,
     mail_connector: TlsConnector,
+    /// The idle connections to providers.
+    pub provider_idle: Arc<ProviderConnections>,
+    /// The node-wide bound of provider requests in flight (enclave.md section 8).
+    inflight: Arc<Semaphore>,
 }
 
 impl Egress {
@@ -307,6 +429,8 @@ impl Egress {
         Egress {
             connector: TlsConnector::from(Arc::new(config)),
             mail_connector,
+            provider_idle: Arc::new(ProviderConnections::default()),
+            inflight: Arc::new(Semaphore::new(limits::PROVIDER_INFLIGHT)),
         }
     }
 
@@ -321,19 +445,44 @@ impl Egress {
         platform: &dyn DynPlatform,
         host: &str,
     ) -> Result<SendRequest<OnceBody>, EgressError> {
-        let server_name =
-            ServerName::try_from(host.to_string()).map_err(|_| EgressError::Invalid)?;
+        self.open_at(platform, host, PROVIDER_PORT, true).await
+    }
+
+    /// [`Egress::open`] to `host:port`, with TLS or, for the log store endpoint of a node of
+    /// the local platform only (enclave.md 5.14), over the plain byte pipe.
+    pub(crate) async fn open_at(
+        &self,
+        platform: &dyn DynPlatform,
+        host: &str,
+        port: u16,
+        tls: bool,
+    ) -> Result<SendRequest<OnceBody>, EgressError> {
         let stream = platform
-            .connect(host, PROVIDER_PORT)
+            .connect(host, port)
             .await
             .map_err(|_| EgressError::Unreachable)?;
+        if !tls {
+            return Egress::handshake(stream).await;
+        }
+        let server_name =
+            ServerName::try_from(host.to_string()).map_err(|_| EgressError::Invalid)?;
         let tls = self
             .connector
             .connect(server_name, stream)
             .await
             .map_err(|_| EgressError::Unreachable)?;
+        Egress::handshake(tls).await
+    }
+
+    /// The HTTP/1.1 handshake over an open byte stream: returns the sender of requests and
+    /// drives the connection on a task of its own until the sender is dropped or the other
+    /// side closes it.
+    async fn handshake<IO>(io: IO) -> Result<SendRequest<OnceBody>, EgressError>
+    where
+        IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         let (sender, connection) =
-            hyper::client::conn::http1::handshake::<_, OnceBody>(TokioIo::new(tls))
+            hyper::client::conn::http1::handshake::<_, OnceBody>(TokioIo::new(io))
                 .await
                 .map_err(|_| EgressError::Unreachable)?;
         tokio::spawn(async move {
@@ -369,21 +518,62 @@ impl Egress {
         Ok(Box::new(tls))
     }
 
-    /// Connects to the provider, sends the request and returns the response head.
+    /// Sends the request to the provider and returns the response head.
     ///
     /// The request carries `Host`, then `Content-Length` when it has a body or its method is
-    /// `POST`, `PUT` or `PATCH`, then the given headers, then `Connection: close`.
+    /// `POST`, `PUT` or `PATCH`, then the given headers, then `Connection: keep-alive`.
+    ///
+    /// With `account`, the request goes over an idle connection of that account to the host
+    /// when there is one, and its connection goes back to those idle connections when the
+    /// response has ended (enclave.md 5.8 step 8). A request over an idle connection that ends
+    /// without a response goes once more over a new connection when its method is `GET` or
+    /// `HEAD`; a request of another method is not repeated, because whether the provider
+    /// received it is unknown. Without `account` (the token address and the revocation
+    /// address) every request opens its own connection.
+    ///
+    /// Every request takes a share of the node-wide bound of provider requests in flight and
+    /// holds it until the exchange is dropped.
     pub async fn send_to_provider(
         &self,
         platform: &dyn DynPlatform,
+        account: Option<&str>,
         outbound: OutboundRequest,
+        now_ms: u64,
     ) -> Result<Exchange, EgressError> {
-        let request = build_request(&outbound)?;
-        let mut sender = self.open(platform, outbound.host()).await?;
-        let response = sender
-            .send_request(request)
+        let inflight = self
+            .inflight
+            .clone()
+            .acquire_owned()
             .await
             .map_err(|_| EgressError::Unreachable)?;
+        let host = outbound.host().to_string();
+        let idle = match account {
+            Some(user_id) => self.provider_idle.take(user_id, &host, now_ms).await,
+            None => None,
+        };
+        let repeatable = matches!(outbound.method.as_str(), "GET" | "HEAD");
+        let (sender, response) = match idle {
+            Some(mut sender) => match sender.send_request(build_request(&outbound)?).await {
+                Ok(response) => (sender, response),
+                Err(_) if repeatable => {
+                    let mut fresh = self.open(platform, &host).await?;
+                    let response = fresh
+                        .send_request(build_request(&outbound)?)
+                        .await
+                        .map_err(|_| EgressError::Unreachable)?;
+                    (fresh, response)
+                }
+                Err(_) => return Err(EgressError::Unreachable),
+            },
+            None => {
+                let mut fresh = self.open(platform, &host).await?;
+                let response = fresh
+                    .send_request(build_request(&outbound)?)
+                    .await
+                    .map_err(|_| EgressError::Unreachable)?;
+                (fresh, response)
+            }
+        };
         let (parts, body) = response.into_parts();
 
         // A node sends no `TE` header, so the one transfer coding a provider may apply is
@@ -409,15 +599,28 @@ impl Egress {
             .iter()
             .map(|name| name.to_string())
             .collect();
+        let mut provider_closes = false;
         for value in parts.headers.get_all(CONNECTION) {
             if let Ok(listed) = value.to_str() {
-                dropped.extend(
-                    listed
-                        .split(',')
-                        .map(|name| name.trim().to_ascii_lowercase()),
-                );
+                let names: Vec<String> = listed
+                    .split(',')
+                    .map(|name| name.trim().to_ascii_lowercase())
+                    .collect();
+                provider_closes |= names.iter().any(|name| name == "close");
+                dropped.extend(names);
             }
         }
+        // A connection the provider closes after this response is not kept: the sender is
+        // dropped with the exchange and the connection ends.
+        let keep = match account {
+            Some(user_id) if !provider_closes => Some(Keep {
+                pool: self.provider_idle.clone(),
+                user_id: user_id.to_string(),
+                host: host.clone(),
+                now_ms,
+            }),
+            _ => None,
+        };
         let mut content_length = None;
         let mut headers = Vec::with_capacity(parts.headers.len());
         for (name, value) in &parts.headers {
@@ -443,7 +646,9 @@ impl Egress {
             headers,
             content_length,
             body,
-            _sender: sender,
+            sender: Some(sender),
+            keep,
+            _inflight: inflight,
         })
     }
 }
@@ -492,7 +697,7 @@ fn build_request(outbound: &OutboundRequest) -> Result<Request<OnceBody>, Egress
         };
         builder = builder.header(name, value);
     }
-    builder = builder.header(CONNECTION, HeaderValue::from_static("close"));
+    builder = builder.header(CONNECTION, HeaderValue::from_static("keep-alive"));
     let body = match &outbound.body {
         _ if body_length == 0 => OnceBody(None),
         OutboundBody::Plain(bytes) => OnceBody(Some(bytes.clone())),
@@ -537,7 +742,7 @@ mod tests {
     }
 
     #[test]
-    fn a_request_carries_host_length_headers_and_connection_close() {
+    fn a_request_carries_host_length_headers_and_connection_keep_alive() {
         let built = build_request(&request("POST", "/v1/items?a=1", b"{}")).unwrap();
         assert_eq!(built.method(), Method::POST);
         assert_eq!(built.uri().to_string(), "/v1/items?a=1");
@@ -556,7 +761,7 @@ mod tests {
         assert_eq!(built.headers()[CONTENT_LENGTH], "2");
         assert!(built.headers()["authorization"].is_sensitive());
         assert!(!format!("{:?}", built.headers()).contains("Bearer token"));
-        assert_eq!(built.headers()[CONNECTION], "close");
+        assert_eq!(built.headers()[CONNECTION], "keep-alive");
     }
 
     #[test]

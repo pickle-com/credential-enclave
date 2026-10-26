@@ -4,7 +4,7 @@
 use credential_enclave_protocol::app;
 use credential_enclave_protocol::encoding::{b64u, b64u_decode};
 use credential_enclave_protocol::keys::{Custody, NodeKeys};
-use credential_enclave_protocol::log::entry_hash;
+use credential_enclave_protocol::log::{body_hash, entry_hash_v2};
 use credential_enclave_protocol::{limits, purpose};
 use serde_json::{json, Value};
 
@@ -36,10 +36,18 @@ fn password(app: &App) -> Value {
     app.record("vault_password", "vault", &json!({"value": "hunter2"}))
 }
 
+/// An event without its `time_ms`, the node time of its creation.
+fn without_time(mut event: Value) -> Value {
+    assert!(event["time_ms"].as_u64().is_some(), "{event}");
+    event.as_object_mut().unwrap().remove("time_ms");
+    event
+}
+
 #[tokio::test]
 async fn a_grant_is_accepted_recorded_and_answered_with_a_signed_reply() {
-    let provider = quiet_provider().await;
+    let provider = quiet_provider_and_log_store().await;
     let harness = Harness::new(&provider);
+    harness.use_log_store().await;
     let app = App::new("user-1", 1);
     let attested = app.attest(&harness).await;
     let not_after_ms = harness.node.now_ms() + limits::GRANT_MAX_MS;
@@ -59,19 +67,33 @@ async fn a_grant_is_accepted_recorded_and_answered_with_a_signed_reply() {
     assert_eq!(reply["not_after_ms"], not_after_ms);
     assert_eq!(reply["head"]["seq"], 1);
 
-    // The entry is the first of the chain and only the account can read it.
-    let entry = app.entry_body(&harness, &response["entry"]);
+    // The event forms the first entry of the chain, a control entry of one event, and only
+    // the account can read it. The entry is in the log store and nowhere else.
+    assert_eq!(
+        response["log"],
+        json!({"seq": 1, "index": 0, "created": true})
+    );
+    let chain = provider.chain("user-1", &harness.node.node);
+    assert_eq!(chain.len(), 1);
+    let entry = app.entry_body(&harness, &chain[0].entry);
+    assert_eq!(entry["v"], 2);
     assert_eq!(entry["seq"], 1);
     assert_eq!(entry["prev"], b64u(&[0u8; 32]));
     assert_eq!(entry["node"], harness.node.node.as_str());
     assert_eq!(entry["user_id"], "user-1");
     assert_eq!(entry["key_id"], app.keys.key_id().as_str());
+    assert_eq!((&entry["kind"], &entry["count"]), (&json!("c"), &json!(1)));
     assert_eq!(
-        app.event(&harness, &response["entry"]),
+        without_time(app.logged(&harness, &provider, &response["log"])),
         json!({"t": "grant_accepted", "not_after_ms": not_after_ms, "custody": "operator"})
     );
-    let body = b64u_decode(response["entry"]["body"].as_str().unwrap()).unwrap();
-    assert_eq!(reply["head"]["hash"], b64u(&entry_hash(&body)));
+    // The hash of the head is the entry hash of format 2: the chain hash over the empty
+    // predecessor, the hash of the body and the five parts of the key. The key of the object
+    // carries the same hash.
+    let body = b64u_decode(chain[0].entry["body"].as_str().unwrap()).unwrap();
+    let hash = entry_hash_v2(&[0u8; 32], &body_hash(&body), &chain[0].parts().fields());
+    assert_eq!(reply["head"]["hash"], b64u(&hash));
+    assert_eq!(chain[0].parts().entry_hash, hash);
 
     // The plaintext copy for the caller, the health count and the status call agree.
     assert_eq!(
@@ -128,7 +150,7 @@ async fn a_challenge_is_accepted_once_and_for_300_seconds() {
     assert_eq!(body["challenge"], attested.challenge.as_str());
     assert_eq!(body["key_id"], app.keys.key_id().as_str());
     assert_eq!(body["head"]["seq"], 1);
-    assert_eq!(replayed["entry"], Value::Null);
+    assert_eq!(replayed["log"], Value::Null);
     assert_eq!(replayed["grant"]["state"], "active");
     assert_eq!(harness.head_seq("user-1"), 1);
 
@@ -247,7 +269,7 @@ async fn a_command_of_another_user_is_refused() {
     assert_eq!(body["user_id"], "user-1");
     assert_eq!(body["challenge"], attested.challenge.as_str());
     assert_eq!(response["grant"]["state"], "none");
-    assert_eq!(response["entry"], Value::Null);
+    assert_eq!(response["log"], Value::Null);
     assert!(harness.node.account("user-1").is_none());
     assert!(harness.node.account("user-2").is_none());
 
@@ -258,8 +280,9 @@ async fn a_command_of_another_user_is_refused() {
 
 #[tokio::test]
 async fn a_grant_that_ended_is_refused_and_a_longer_one_is_shortened_to_30_days() {
-    let provider = quiet_provider().await;
+    let provider = quiet_provider_and_log_store().await;
     let harness = Harness::new(&provider);
+    harness.use_log_store().await;
     let app = App::new("user-1", 1);
 
     // An end that is not after the node time: refused.
@@ -274,7 +297,7 @@ async fn a_grant_that_ended_is_refused_and_a_longer_one_is_shortened_to_30_days(
         assert_eq!(body["challenge"], attested.challenge.as_str());
         assert_eq!(body["key_id"], app.keys.key_id().as_str());
         assert_eq!(response["grant"]["state"], "none");
-        assert_eq!(response["entry"], Value::Null);
+        assert_eq!(response["log"], Value::Null);
         // The challenge was used in step 12, before the expiry was checked in step 13.
         let again = app.send(&harness, envelope).await;
         assert_eq!(reply(&harness, &again)["code"], "bad_challenge");
@@ -292,7 +315,7 @@ async fn a_grant_that_ended_is_refused_and_a_longer_one_is_shortened_to_30_days(
     assert_eq!(body["not_after_ms"], not_after_ms);
 
     // An end beyond 30 days of node time is not refused: the node moves it to 30 days from
-    // its own time, and the reply, the entry and the plaintext copy carry the accepted end.
+    // its own time, and the reply, the event and the plaintext copy carry the accepted end.
     // (An app whose device clock is far ahead still delegates.)
     for beyond_ms in [1u64, 60_000, 365 * 24 * 60 * 60 * 1000] {
         let attested = app.attest(&harness).await;
@@ -311,7 +334,7 @@ async fn a_grant_that_ended_is_refused_and_a_longer_one_is_shortened_to_30_days(
             "{beyond_ms}"
         );
         assert_eq!(
-            app.event(&harness, &response["entry"]),
+            without_time(app.logged(&harness, &provider, &response["log"])),
             json!({"t": "grant_accepted", "not_after_ms": accepted, "custody": "operator"})
         );
         assert_eq!(response["grant"]["not_after_ms"], accepted);
@@ -351,7 +374,7 @@ async fn a_grant_of_another_custody_is_refused() {
     assert_eq!(body["key_id"], "");
     assert_eq!(body["not_after_ms"], 0);
     assert_eq!(body["head"], json!({"seq": 0, "hash": b64u(&[0u8; 32])}));
-    assert_eq!(response["entry"], Value::Null);
+    assert_eq!(response["log"], Value::Null);
     assert_eq!(response["grant"]["state"], "none");
     assert!(harness.node.account("user-1").is_none());
 
@@ -421,7 +444,7 @@ async fn a_node_of_custody_enclave_takes_the_user_key_of_that_custody_only() {
         })
     );
     assert_eq!(
-        app.event(&harness, &response["entry"]),
+        without_time(app.logged(&harness, &provider, &response["log"])),
         json!({"t": "grant_accepted", "not_after_ms": not_after_ms, "custody": "enclave"})
     );
     // Records under the two user keys of the same account: only the one of custody `enclave`
@@ -454,8 +477,9 @@ async fn a_node_of_custody_enclave_takes_the_user_key_of_that_custody_only() {
 
 #[tokio::test]
 async fn a_revoke_ends_the_delegation_and_an_old_envelope_does_not_bring_it_back() {
-    let provider = quiet_provider().await;
+    let provider = quiet_provider_and_log_store().await;
     let harness = Harness::new(&provider);
+    harness.use_log_store().await;
     let app = App::new("user-1", 1);
     let attested = app.attest(&harness).await;
     let not_after_ms = harness.node.now_ms() + limits::GRANT_MAX_MS;
@@ -476,12 +500,15 @@ async fn a_revoke_ends_the_delegation_and_an_old_envelope_does_not_bring_it_back
         json!({"state": "revoked", "key_id": app.keys.key_id(), "custody": "", "not_after_ms": 0})
     );
     assert_eq!(harness.health().await["grants"], 0);
-    // The entry is sealed to the log key of the grant that ended.
+    // The event forms entry 3 of its own, sealed to the log key of the grant that ended.
     assert_eq!(
-        app.event(&harness, &response["entry"]),
+        response["log"],
+        json!({"seq": 3, "index": 0, "created": true})
+    );
+    assert_eq!(
+        without_time(app.logged(&harness, &provider, &response["log"])),
         json!({"t": "grant_revoked"})
     );
-    assert_eq!(app.entry_body(&harness, &response["entry"])["seq"], 3);
 
     // The user key is gone: nothing opens any more.
     let (status, failure) = release(&harness, &app, &record).await;
@@ -506,7 +533,7 @@ async fn a_revoke_ends_the_delegation_and_an_old_envelope_does_not_bring_it_back
     // A second revoke is idempotent and creates no entry.
     let again = app.revoke(&harness).await;
     assert_eq!(reply(&harness, &again)["ok"], true);
-    assert_eq!(again["entry"], Value::Null);
+    assert_eq!(again["log"], Value::Null);
     assert_eq!(harness.head_seq("user-1"), 3);
 
     // A new grant replaces the revocation marker.
@@ -553,7 +580,7 @@ async fn a_grant_that_was_held_back_is_refused_after_a_revoke_of_the_account() {
     assert_eq!(body["not_after_ms"], 0);
     assert_eq!(body["head"]["seq"], 3);
     // No entry, and the account is as the revoke left it.
-    assert_eq!(late["entry"], Value::Null);
+    assert_eq!(late["log"], Value::Null);
     assert_eq!(
         late["grant"],
         json!({"state": "revoked", "key_id": app.keys.key_id(), "custody": "", "not_after_ms": 0})
@@ -584,12 +611,12 @@ async fn a_grant_that_was_held_back_is_refused_after_a_revoke_of_the_account() {
     let held_envelope = fresh.grant_envelope(&held, not_after_ms);
     let revoked = fresh.revoke(&harness).await;
     assert_eq!(reply(&harness, &revoked)["ok"], true);
-    assert_eq!(revoked["entry"], Value::Null);
+    assert_eq!(revoked["log"], Value::Null);
     let late = fresh.send(&harness, held_envelope).await;
     let body = reply(&harness, &late);
     assert_eq!(body["code"], "bad_challenge");
     assert_eq!(body["head"], json!({"seq": 0, "hash": b64u(&[0u8; 32])}));
-    assert_eq!(late["entry"], Value::Null);
+    assert_eq!(late["log"], Value::Null);
     assert_eq!(late["grant"]["state"], "revoked");
     assert_eq!(harness.head_seq("user-2"), 0);
 
@@ -602,7 +629,7 @@ async fn a_grant_that_was_held_back_is_refused_after_a_revoke_of_the_account() {
     let seq = harness.head_seq("user-1");
     let late = app.send(&harness, held_envelope).await;
     assert_eq!(reply(&harness, &late)["code"], "bad_challenge");
-    assert_eq!(late["entry"], Value::Null);
+    assert_eq!(late["log"], Value::Null);
     // The grant in force is the one the app made after the revoke.
     assert_eq!(late["grant"]["state"], "active");
     assert_eq!(harness.head_seq("user-1"), seq);
@@ -611,8 +638,9 @@ async fn a_grant_that_was_held_back_is_refused_after_a_revoke_of_the_account() {
 
 #[tokio::test]
 async fn a_grant_with_a_challenge_from_after_a_revoke_is_accepted() {
-    let provider = quiet_provider().await;
+    let provider = quiet_provider_and_log_store().await;
     let harness = Harness::new(&provider);
+    harness.use_log_store().await;
     let app = App::new("user-1", 1);
     app.grant(&harness).await;
     let record = password(&app);
@@ -629,10 +657,11 @@ async fn a_grant_with_a_challenge_from_after_a_revoke_is_accepted() {
     assert_eq!(body["challenge"], attested.challenge.as_str());
     assert_eq!(response["grant"]["state"], "active");
     assert_eq!(
-        app.event(&harness, &response["entry"])["t"],
+        app.logged(&harness, &provider, &response["log"])["t"],
         "grant_accepted"
     );
     // grant, revoke, grant.
+    assert_eq!(response["log"]["seq"], 3);
     assert_eq!(harness.head_seq("user-1"), 3);
     assert_eq!(release(&harness, &app, &record).await.0, 200);
 }
@@ -682,7 +711,7 @@ async fn a_revoke_is_signed_by_the_key_of_the_grant() {
     let body = reply(&harness, &response);
     assert_eq!(body["ok"], false);
     assert_eq!(body["code"], "bad_signature");
-    assert_eq!(response["entry"], Value::Null);
+    assert_eq!(response["log"], Value::Null);
     assert_eq!(response["grant"]["state"], "active");
     assert_eq!(release(&harness, &app, &password(&app)).await.0, 200);
 
@@ -690,7 +719,7 @@ async fn a_revoke_is_signed_by_the_key_of_the_grant() {
     let fresh = App::new("user-9", 9);
     let response = fresh.revoke(&harness).await;
     assert_eq!(reply(&harness, &response)["ok"], true);
-    assert_eq!(response["entry"], Value::Null);
+    assert_eq!(response["log"], Value::Null);
     assert_eq!(
         response["grant"],
         json!({"state": "revoked", "key_id": fresh.keys.key_id(), "custody": "", "not_after_ms": 0})
@@ -702,8 +731,9 @@ async fn a_revoke_is_signed_by_the_key_of_the_grant() {
 
 #[tokio::test]
 async fn a_new_grant_replaces_the_grant_before_it() {
-    let provider = quiet_provider().await;
+    let provider = quiet_provider_and_log_store().await;
     let harness = Harness::new(&provider);
+    harness.use_log_store().await;
     let first = App::new("user-1", 1);
     first.grant(&harness).await;
     let old_record = password(&first);
@@ -713,12 +743,17 @@ async fn a_new_grant_replaces_the_grant_before_it() {
     let second = App::new("user-1", 2);
     let response = second.grant(&harness).await;
     assert_eq!(response["grant"]["key_id"], second.keys.key_id().as_str());
-    // The chain continues: the entry of the new grant follows the entries before it.
-    assert_eq!(second.entry_body(&harness, &response["entry"])["seq"], 3);
+    // The chain continues: the entry of the new grant follows the entries before it, under
+    // the new key.
     assert_eq!(
-        second.entry_body(&harness, &response["entry"])["key_id"],
-        second.keys.key_id().as_str()
+        response["log"],
+        json!({"seq": 3, "index": 0, "created": true})
     );
+    let chain = provider.chain("user-1", &harness.node.node);
+    let entry = second.entry_body(&harness, &chain[2].entry);
+    assert_eq!(entry["seq"], 3);
+    assert_eq!(entry["key_id"], second.keys.key_id().as_str());
+    assert_eq!(chain[2].parts().key_id, second.keys.key_id());
 
     // Records of the old key no longer open, records of the new key do.
     let (status, failure) = release(&harness, &first, &old_record).await;
@@ -815,7 +850,7 @@ async fn an_expired_grant_counts_as_no_grant_in_commands() {
     let body = reply(&harness, &response);
     assert_eq!(body["ok"], true);
     assert_eq!(body["type"], "revoke_reply");
-    assert_eq!(response["entry"], Value::Null);
+    assert_eq!(response["log"], Value::Null);
     assert_eq!(harness.head_seq("user-1"), 1);
     assert_eq!(
         response["grant"],

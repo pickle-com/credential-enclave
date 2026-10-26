@@ -3,18 +3,19 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
 use std::time::Duration;
 
-use credential_enclave_protocol::encoding::{b64u, b64u_decode, Signed};
+use credential_enclave_protocol::encoding::{b64u, b64u_decode, to_json, Signed};
 use credential_enclave_protocol::keys::{binding, Custody, LogStoreId, NodeKeys};
-use credential_enclave_protocol::log::{self, Head};
+use credential_enclave_protocol::log::{self, EntryKind, Head};
 use credential_enclave_protocol::record::{self, Kind, Record};
 use credential_enclave_protocol::secret::Secret;
 use credential_enclave_protocol::{limits, ProtocolError};
 use serde::Serialize;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 
 use crate::api::responses::Refreshed;
 use crate::api::ApiError;
@@ -40,7 +41,10 @@ pub struct Limits {
     /// Sum of the bodies that may be in memory at the same time. A call that would exceed it
     /// waits.
     pub body_budget_bytes: usize,
-    /// `forward` calls that run at the same time.
+    /// `forward` and `forward/batch` calls that run at the same time. The bodies in memory are
+    /// bounded by `body_budget_bytes` and the provider requests in flight by
+    /// `limits::PROVIDER_INFLIGHT`, so a call that waits for a slot holds nothing but its frame
+    /// reservation.
     pub forward_concurrency: usize,
     /// Challenges a node keeps.
     pub challenges: usize,
@@ -56,7 +60,7 @@ impl Default for Limits {
         Limits {
             body_bytes: limits::BODY_BYTES,
             body_budget_bytes: 2 * 1024 * 1024 * 1024,
-            forward_concurrency: 64,
+            forward_concurrency: 512,
             challenges: 100_000,
             pending: 100_000,
             log_write: Duration::from_secs(5),
@@ -161,17 +165,11 @@ pub struct GrantStatus {
     pub not_after_ms: u64,
 }
 
-/// A log entry that waits for its storage acknowledgement.
-pub struct Entry {
-    pub seq: u64,
-    pub signed: Signed,
-}
-
 /// A log entry that the log store has not confirmed (protocol.md 7.6).
 pub struct Unconfirmed {
     pub seq: u64,
-    /// The chain hash of the entry: the last part of its key in the log store.
-    pub hash: [u8; 32],
+    /// The key of the object of the entry in the log store (protocol.md 7.6).
+    pub key: String,
     pub entry: Signed,
     /// True while a call writes the entry: the call that created it, or a later call that
     /// took it along. An entry no call writes is a pending entry: the next write of the
@@ -179,14 +177,93 @@ pub struct Unconfirmed {
     pub writing: bool,
 }
 
-/// The entry of an identical GET request that later ones share (protocol.md 7.2).
-#[derive(Clone, Copy)]
+/// The `seq` of the entry an open batch became, set when the batch is closed. Every call
+/// whose event joined the batch holds the same cell, so it finds its entry without any
+/// bookkeeping of the account.
+pub type BatchSeq = Arc<OnceLock<u64>>;
+
+/// Where the event of a call is (protocol.md 7.1): in an open batch of the account, named by
+/// the cell of that batch and the index of the event in it, or in an entry, named by the
+/// `seq` of the entry and the index of the event in it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EventPlace {
+    Open { batch: BatchSeq, index: u32 },
+    Entry { seq: u64, index: u32 },
+}
+
+impl EventPlace {
+    /// The `seq` of the entry that holds the event, when that entry exists: an event of an
+    /// open batch has none until the batch is closed. The place of a control event always has
+    /// one.
+    pub fn seq(&self) -> Option<u64> {
+        match self {
+            EventPlace::Entry { seq, .. } => Some(*seq),
+            EventPlace::Open { batch, .. } => batch.get().copied(),
+        }
+    }
+
+    /// The index of the event in its entry.
+    pub fn index(&self) -> u32 {
+        match self {
+            EventPlace::Open { index, .. } | EventPlace::Entry { index, .. } => *index,
+        }
+    }
+}
+
+/// The event of an identical GET request that later ones share (protocol.md 7.2).
+#[derive(Clone)]
 pub struct Recent {
-    /// The time of the entry.
+    /// The time of the event.
     pub entry_ms: u64,
-    /// The `seq` of the entry. A request shares the entry only once the log store confirmed
-    /// it.
-    pub seq: u64,
+    /// Where the event is. A request shares it only once the log store confirmed the entry
+    /// that holds it.
+    pub target: EventPlace,
+}
+
+/// The use events of an account whose entry does not exist yet (protocol.md 7.1). The call
+/// that finds no writer closes it into an entry; the writer closes it when its write ends.
+pub struct OpenBatch {
+    /// The events in the order of their creation.
+    pub events: Vec<Value>,
+    /// The length of the JSON array of the events so far: the bound of the plaintext.
+    pub bytes: usize,
+    /// The cell that receives the `seq` of the entry when this batch is closed. A new cell
+    /// starts with the next batch.
+    pub seq: BatchSeq,
+    /// The key the events were created under: the entry is sealed to its log public key.
+    pub key_id: String,
+    pub log_pk: [u8; 32],
+}
+
+impl OpenBatch {
+    fn new() -> OpenBatch {
+        OpenBatch {
+            events: Vec::new(),
+            bytes: 2,
+            seq: Arc::new(OnceLock::new()),
+            key_id: String::new(),
+            log_pk: [0u8; 32],
+        }
+    }
+
+    /// True when `event_bytes` more bytes, or one more event, would take the batch over the
+    /// caps of protocol.md 7.1.
+    fn full_for(&self, event_bytes: usize) -> bool {
+        !self.events.is_empty()
+            && (self.events.len() >= limits::ENTRY_EVENTS
+                || self.bytes + event_bytes + 1 > limits::ENTRY_PLAINTEXT_BYTES)
+    }
+}
+
+/// The counts of `log` of `GET /v1/health` (enclave.md 5.1), since the node started.
+#[derive(Default)]
+pub struct LogCounters {
+    pub entries: AtomicU64,
+    pub events: AtomicU64,
+    pub writes: AtomicU64,
+    pub write_failures: AtomicU64,
+    pub batch_calls: AtomicU64,
+    pub batch_requests: AtomicU64,
 }
 
 /// The response of a successful `refresh`, kept for a repeated call with the same record. It
@@ -209,12 +286,18 @@ pub struct Account {
     pub grant: GrantState,
     /// The end of the (node, account) chain.
     pub head: Head,
-    /// Entries without a storage acknowledgement.
-    pub unacked: VecDeque<Entry>,
+    /// The use events whose entry does not exist yet.
+    pub open: OpenBatch,
+    /// True while a call of this account writes to the log store: the writer of the group
+    /// commit (protocol.md 7.1).
+    pub writer: bool,
+    /// Woken when a write of this account ended: the waiting calls look at their entries
+    /// again.
+    pub notify: Arc<Notify>,
     /// Entries the log store has not confirmed, in the order of their `seq`. Empty on a node
     /// that runs without a log store.
     pub unconfirmed: Vec<Unconfirmed>,
-    /// Merge key to its entry: identical GET requests of `forward` that have no body. Kept
+    /// Merge key to its event: identical GET requests of `forward` that have no body. Kept
     /// for 300 seconds.
     pub recent: HashMap<[u8; 32], Recent>,
     /// The `final` head, once the orderly shutdown created it.
@@ -225,6 +308,9 @@ pub struct Account {
     /// The `time_ms` of the last entry of the chain. An entry is never dated before the entry
     /// in front of it.
     last_entry_ms: u64,
+    /// The `time_ms` of the last event created. The times of the events of a chain do not
+    /// decrease with (seq, index).
+    last_event_ms: u64,
     /// True once this node accepted a revoke command of the account. From then on the
     /// delegation of the account comes from its app alone: no delegation transfer is taken
     /// for it. A revocation marker can be replaced by the grant of any key (protocol.md 5.3
@@ -243,12 +329,15 @@ impl Account {
         Account {
             grant: GrantState::None,
             head: Head::EMPTY,
-            unacked: VecDeque::new(),
+            open: OpenBatch::new(),
+            writer: false,
+            notify: Arc::new(Notify::new()),
             unconfirmed: Vec::new(),
             recent: HashMap::new(),
             final_head: None,
             kept_refreshes: VecDeque::new(),
             last_entry_ms: 0,
+            last_event_ms: 0,
             revoked_here: false,
             revoke_serial: 0,
         }
@@ -266,9 +355,12 @@ impl Account {
             },
             _ => return,
         };
-        // Replacing the state drops the grant, which overwrites its user key with zeros.
+        // Replacing the state drops the grant, which overwrites its user key with zeros. The
+        // merge window of the grant ends with it: no request merges into an event made under
+        // a grant that is over.
         self.grant = expired;
         self.kept_refreshes.clear();
+        self.recent.clear();
     }
 
     /// The kept response of a `refresh` of the record with this key, when it was kept less
@@ -333,18 +425,25 @@ impl Account {
         }
     }
 
-    /// Step 5 of the common front: fewer than 64 entries wait for an acknowledgement.
-    pub fn ensure_capacity(&self) -> Result<(), ProtocolError> {
-        if self.unacked.len() >= limits::UNACKED_ENTRIES {
-            return Err(ProtocolError::LogBacklog);
-        }
-        Ok(())
-    }
-
     /// True when the log store confirmed the entry `seq`. On a node that runs without a log
     /// store every entry counts as confirmed: such a node keeps no account of it.
     pub fn is_confirmed(&self, seq: u64) -> bool {
         !self.unconfirmed.iter().any(|entry| entry.seq == seq)
+    }
+
+    /// True when the open batch holds events.
+    pub fn has_open_events(&self) -> bool {
+        !self.open.events.is_empty()
+    }
+
+    /// Drops the merge keys whose window of 300 seconds passed (protocol.md 7.2). A call that
+    /// creates events drops them on its way, and the sweep of the node drops them for an
+    /// account that makes no call, so an idle account holds the keys of its last 300 seconds at
+    /// most.
+    pub fn prune_recent(&mut self, now_ms: u64) {
+        let window_ms = limits::MERGE_WINDOW_S * 1000;
+        self.recent
+            .retain(|_, recent| now_ms < recent.entry_ms.saturating_add(window_ms));
     }
 
     /// The number of pending entries: entries that the log store has not confirmed and that
@@ -354,14 +453,6 @@ impl Account {
             .iter()
             .filter(|entry| !entry.writing)
             .count()
-    }
-
-    /// Leaves the entry `seq` to the next write of the account: the call that created it does
-    /// not write it itself (`peer/import`).
-    pub fn leave_pending(&mut self, seq: u64) {
-        if let Some(entry) = self.unconfirmed.iter_mut().find(|entry| entry.seq == seq) {
-            entry.writing = false;
-        }
     }
 
     /// The delegation state as `status` reports it: `active`, `none`, `revoked` or `expired`.
@@ -535,6 +626,8 @@ pub struct Node {
     pub limits: Limits,
     pub forward_slots: Semaphore,
     pub body_budget: Arc<Semaphore>,
+    /// The counts of `log` of `GET /v1/health`.
+    pub log_counters: LogCounters,
 }
 
 /// Locks a mutex. A poisoned lock is used as it is: the release build aborts on a panic, so a
@@ -590,6 +683,7 @@ impl Node {
             forward_slots: Semaphore::new(limits.forward_concurrency),
             body_budget: Arc::new(Semaphore::new(limits.body_budget_bytes)),
             limits,
+            log_counters: LogCounters::default(),
         })
     }
 
@@ -729,6 +823,21 @@ impl Node {
             .count()
     }
 
+    /// The number of accounts whose open batch holds events at this moment.
+    pub fn open_batch_count(&self) -> usize {
+        let accounts: Vec<Arc<Mutex<Account>>> = self
+            .accounts
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect();
+        accounts
+            .iter()
+            .filter(|account| lock(account).has_open_events())
+            .count()
+    }
+
     /// The number of accounts that have a grant within its time. Reading the state of an
     /// account ends a grant whose time passed.
     pub fn grant_count(&self) -> usize {
@@ -790,74 +899,230 @@ impl Node {
         lock(&self.pending).take(node_state, now_ms)
     }
 
-    /// Creates the next entry of an account chain and raises the end of the chain. The caller
-    /// holds the account lock, so one chain never forks. `key_id` and `log_pk` are those of the
-    /// grant in force at this moment.
+    /// Creates an event on the chain of an account (protocol.md 7.1) and returns where it is.
+    /// The caller holds the account lock, so one chain never forks. `key_id` and `log_pk` are
+    /// those of the grant in force at this moment, `now_ms` the node time the caller read.
     ///
-    /// On a node with a log store the entry starts as one its call writes: the call confirms
-    /// it with `log_store::confirm` before the act the entry describes, or leaves it to the
-    /// next write of the account ([`Account::leave_pending`]). The `seq` of the entry is the
-    /// `seq` of the end of the chain when this function returns.
-    pub fn append_entry(
+    /// A use event goes into the open batch of the account; when the batch is full for it, or
+    /// was opened under another key, the batch is closed into an entry first. A control event
+    /// closes the open batch, when it holds events, and forms an entry of its own. An entry
+    /// starts as an unconfirmed entry that no call writes yet: the call confirms it with
+    /// `log_store::commit` before the act the event describes, or leaves it to the next write
+    /// of the account (`peer/import`).
+    ///
+    /// The `time_ms` of the event is `now_ms`, or the time of the event before it when that
+    /// one is later: a caller may have read the node time before it took the account lock,
+    /// and the times of one chain do not decrease with (seq, index).
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_event(
         &self,
         account: &mut Account,
         user_id: &str,
         key_id: &str,
         log_pk: &[u8; 32],
-        time_ms: u64,
-        event: &serde_json::Value,
-    ) -> Result<Signed, ApiError> {
+        now_ms: u64,
+        kind: EntryKind,
+        event: Value,
+    ) -> Result<EventPlace, ApiError> {
         let seed = self.random_secret::<32>()?;
-        Ok(self.append_entry_seeded(account, user_id, key_id, log_pk, time_ms, event, &seed))
+        self.create_event_seeded(account, user_id, key_id, log_pk, now_ms, kind, event, &seed)
     }
 
-    /// [`Node::append_entry`] with the HPKE seed of the entry drawn by the caller. A call that
-    /// creates entries on several chains draws every seed first, so a failure of the random
-    /// source leaves every chain as it was.
-    ///
-    /// The `time_ms` of the entry is `time_ms`, or the time of the entry in front of it when
-    /// that one is later: a caller may have read the node time before it took the account
-    /// lock, and the times of one chain do not decrease with `seq` (enclave.md section 8).
+    /// [`Node::create_event`] with the HPKE seed drawn by the caller. A call that creates
+    /// events on several chains draws every seed first, so a failure of the random source
+    /// leaves every chain as it was. The seed is used when this call closes a batch or forms a
+    /// control entry; a use event that joins an open batch does not use it (the close of that
+    /// batch draws its own).
     #[allow(clippy::too_many_arguments)]
-    pub fn append_entry_seeded(
+    pub fn create_event_seeded(
         &self,
         account: &mut Account,
         user_id: &str,
         key_id: &str,
         log_pk: &[u8; 32],
-        time_ms: u64,
-        event: &serde_json::Value,
+        now_ms: u64,
+        kind: EntryKind,
+        mut event: Value,
         seed: &Secret<[u8; 32]>,
-    ) -> Signed {
-        let time_ms = time_ms.max(account.last_entry_ms);
+    ) -> Result<EventPlace, ApiError> {
+        let time_ms = now_ms.max(account.last_event_ms);
+        account.last_event_ms = time_ms;
+        event["time_ms"] = Value::from(time_ms);
+        match kind {
+            EntryKind::Control => {
+                if account.has_open_events() {
+                    self.close_batch(account, user_id, time_ms)?;
+                }
+                let seq = self.append_closed(
+                    account,
+                    user_id,
+                    key_id,
+                    log_pk,
+                    time_ms,
+                    kind,
+                    vec![event],
+                    seed,
+                );
+                Ok(EventPlace::Entry { seq, index: 0 })
+            }
+            EntryKind::Use => {
+                let event_bytes = to_json(&event).len();
+                let other_key = account.has_open_events() && account.open.key_id != key_id;
+                if other_key || account.open.full_for(event_bytes) {
+                    self.close_batch_seeded(account, user_id, time_ms, seed);
+                }
+                if account.open.events.is_empty() {
+                    account.open.key_id = key_id.to_string();
+                    account.open.log_pk = *log_pk;
+                    account.open.bytes = 2;
+                } else {
+                    account.open.bytes += 1;
+                }
+                account.open.bytes += event_bytes;
+                account.open.events.push(event);
+                Ok(EventPlace::Open {
+                    batch: account.open.seq.clone(),
+                    index: (account.open.events.len() - 1) as u32,
+                })
+            }
+        }
+    }
+
+    /// Creates the use events of a `forward/batch` call in one step, in the order given.
+    /// `events` pairs each event with its merge key when the request is a GET without a body.
+    /// A request that matches an event of the open batch or of an entry created less than
+    /// 300 seconds before shares that event (protocol.md 7.2), also inside the batch. Returns
+    /// where every event is and whether this call created it.
+    pub fn create_events(
+        &self,
+        account: &mut Account,
+        user_id: &str,
+        key_id: &str,
+        log_pk: &[u8; 32],
+        now_ms: u64,
+        events: Vec<(Option<[u8; 32]>, Value)>,
+    ) -> Result<Vec<(EventPlace, bool)>, ApiError> {
+        account.prune_recent(now_ms);
+        let mut places = Vec::with_capacity(events.len());
+        for (merge_key, event) in events {
+            if let Some(shared) = merge_key.and_then(|key| account.recent.get(&key).cloned()) {
+                places.push((shared.target, false));
+                continue;
+            }
+            let place = self.create_event(
+                account,
+                user_id,
+                key_id,
+                log_pk,
+                now_ms,
+                EntryKind::Use,
+                event,
+            )?;
+            if let Some(key) = merge_key {
+                account.recent.insert(
+                    key,
+                    Recent {
+                        entry_ms: now_ms,
+                        target: place.clone(),
+                    },
+                );
+            }
+            places.push((place, true));
+        }
+        Ok(places)
+    }
+
+    /// Closes the open batch of an account into an entry (protocol.md 7.1) and returns the
+    /// `seq` of that entry, `None` when the batch holds no event. The caller holds the account
+    /// lock. The entry is an unconfirmed entry that no call writes yet.
+    pub fn close_batch(
+        &self,
+        account: &mut Account,
+        user_id: &str,
+        now_ms: u64,
+    ) -> Result<Option<u64>, ApiError> {
+        if !account.has_open_events() {
+            return Ok(None);
+        }
+        let seed = self.random_secret::<32>()?;
+        Ok(Some(
+            self.close_batch_seeded(account, user_id, now_ms, &seed),
+        ))
+    }
+
+    /// [`Node::close_batch`] with the seed drawn by the caller, for a batch that holds events.
+    fn close_batch_seeded(
+        &self,
+        account: &mut Account,
+        user_id: &str,
+        now_ms: u64,
+        seed: &Secret<[u8; 32]>,
+    ) -> u64 {
+        let events = std::mem::take(&mut account.open.events);
+        let (key_id, log_pk) = (account.open.key_id.clone(), account.open.log_pk);
+        let batch = std::mem::replace(&mut account.open.seq, Arc::new(OnceLock::new()));
+        account.open.bytes = 2;
+        let seq = self.append_closed(
+            account,
+            user_id,
+            &key_id,
+            &log_pk,
+            now_ms,
+            EntryKind::Use,
+            events,
+            seed,
+        );
+        // Every call whose event joined the batch, and every `recent` that points into it,
+        // now finds the entry through the cell.
+        let _ = batch.set(seq);
+        seq
+    }
+
+    /// Creates the next entry of the chain from `events` and raises the end of the chain. The
+    /// `time_ms` of the entry is `now_ms`, or the time of the entry before it, or the time of
+    /// the latest event, whichever is largest: the times of a chain do not decrease, and no
+    /// event is dated after its entry.
+    #[allow(clippy::too_many_arguments)]
+    fn append_closed(
+        &self,
+        account: &mut Account,
+        user_id: &str,
+        key_id: &str,
+        log_pk: &[u8; 32],
+        now_ms: u64,
+        kind: EntryKind,
+        events: Vec<Value>,
+        seed: &Secret<[u8; 32]>,
+    ) -> u64 {
+        let time_ms = now_ms.max(account.last_entry_ms).max(account.last_event_ms);
         account.last_entry_ms = time_ms;
-        let (signed, head) = log::append(
+        let count = events.len() as u64;
+        let (signed, head, parts) = log::append_batch(
             &self.keys,
             &account.head,
             user_id,
             key_id,
             log_pk,
             time_ms,
-            event,
+            kind,
+            &events,
             seed,
         );
         if account.head.seq == 0 {
             self.chains.fetch_add(1, Ordering::SeqCst);
         }
         account.head = head;
-        account.unacked.push_back(Entry {
-            seq: head.seq,
-            signed: signed.clone(),
-        });
+        self.log_counters.entries.fetch_add(1, Ordering::Relaxed);
+        self.log_counters.events.fetch_add(count, Ordering::Relaxed);
         if self.log_store.tracks() {
             account.unconfirmed.push(Unconfirmed {
                 seq: head.seq,
-                hash: head.hash,
-                entry: signed.clone(),
-                writing: true,
+                key: log::object_key_v2(user_id, &self.node, &parts),
+                entry: signed,
+                writing: false,
             });
         }
-        signed
+        head.seq
     }
 }
 
@@ -904,7 +1169,8 @@ pub fn merge_key(record_id: &[u8; 16], host: &str, path: &str, query: &str) -> [
 }
 
 /// The events of protocol.md 7.2. Each function returns the event with its keys in the order
-/// of that table.
+/// of that table: `t` first, then `time_ms` (the value [`Node::create_event`] sets to the node
+/// time of the creation), then the other keys.
 ///
 /// An event holds no secret. Its values are identifiers, addresses, the hash of a request body
 /// and the context string of the caller, and a scope string that passed the public field rule.
@@ -912,6 +1178,10 @@ pub fn merge_key(record_id: &[u8; 16], host: &str, path: &str, query: &str) -> [
 pub mod events {
     use super::{b64u, limits, Custody, Digest, Sha256};
     use serde_json::{json, Value};
+
+    /// The `time_ms` key every event carries after `t`. [`super::Node::create_event`] writes
+    /// the node time into it.
+    const TIME_MS: u64 = 0;
 
     /// Copies at most 8,192 bytes of an address part and marks a cut with `…` (U+2026). No
     /// address of `forward` is longer than that, so the path and the query of a request are
@@ -932,18 +1202,20 @@ pub mod events {
     pub fn grant_accepted(not_after_ms: u64, custody: Custody) -> Value {
         json!({
             "t": "grant_accepted",
+            "time_ms": TIME_MS,
             "not_after_ms": not_after_ms,
             "custody": custody.as_str(),
         })
     }
 
     pub fn grant_revoked() -> Value {
-        json!({"t": "grant_revoked"})
+        json!({"t": "grant_revoked", "time_ms": TIME_MS})
     }
 
     pub fn connection_created(record_id: &str, provider: &str, scope: &str) -> Value {
         json!({
             "t": "connection_created",
+            "time_ms": TIME_MS,
             "record_id": record_id,
             "provider": provider,
             "scope": scope,
@@ -951,7 +1223,12 @@ pub mod events {
     }
 
     pub fn credential_refreshed(record_id: &str, provider: &str) -> Value {
-        json!({"t": "credential_refreshed", "record_id": record_id, "provider": provider})
+        json!({
+            "t": "credential_refreshed",
+            "time_ms": TIME_MS,
+            "record_id": record_id,
+            "provider": provider,
+        })
     }
 
     /// `provider_revoke` says whether the node calls the revocation address of the provider
@@ -959,6 +1236,7 @@ pub mod events {
     pub fn connection_removed(record_id: &str, provider: &str, provider_revoke: bool) -> Value {
         json!({
             "t": "connection_removed",
+            "time_ms": TIME_MS,
             "record_id": record_id,
             "provider": provider,
             "provider_revoke": provider_revoke,
@@ -969,7 +1247,7 @@ pub mod events {
     /// signing public key, so the account can verify the entries of the receiving node with
     /// this value.
     pub fn grant_transferred_out(to: &str) -> Value {
-        json!({"t": "grant_transferred_out", "to": to})
+        json!({"t": "grant_transferred_out", "time_ms": TIME_MS, "to": to})
     }
 
     /// `from` is the node that gave the delegation. `not_after_ms` is the end the receiving
@@ -977,9 +1255,32 @@ pub mod events {
     pub fn grant_transferred_in(from: &str, not_after_ms: u64, custody: Custody) -> Value {
         json!({
             "t": "grant_transferred_in",
+            "time_ms": TIME_MS,
             "from": from,
             "not_after_ms": not_after_ms,
             "custody": custody.as_str(),
+        })
+    }
+
+    /// The event of a mail call: `operation` is `verify`, `read` or `submit` and `request` the
+    /// parameters of the call.
+    pub fn mail_request(
+        record_id: &str,
+        operation: &str,
+        request: &Value,
+        body: &[u8],
+        context: &str,
+    ) -> Value {
+        json!({
+            "t": "mail_request",
+            "time_ms": TIME_MS,
+            "record_id": record_id,
+            "provider": "naver_mail",
+            "operation": operation,
+            "request": request,
+            "body_bytes": body.len(),
+            "body_sha256": b64u(&Sha256::digest(body)),
+            "context": context,
         })
     }
 
@@ -1005,6 +1306,7 @@ pub mod events {
         };
         let mut event = json!({
             "t": "provider_request",
+            "time_ms": TIME_MS,
             "record_id": record_id,
             "provider": provider,
             "method": method,
@@ -1030,6 +1332,7 @@ pub mod events {
     ) -> Value {
         json!({
             "t": "secret_released",
+            "time_ms": TIME_MS,
             "record_id": record_id,
             "kind": kind,
             "field": field,
@@ -1041,6 +1344,7 @@ pub mod events {
     pub fn totp_issued(record_id: &str, origin: &str, context: &str) -> Value {
         json!({
             "t": "totp_issued",
+            "time_ms": TIME_MS,
             "record_id": record_id,
             "origin": origin,
             "context": context,
@@ -1060,24 +1364,27 @@ pub mod events {
         fn events_have_the_key_order_of_protocol_7_2() {
             assert_eq!(
                 text(&grant_accepted(9, Custody::Enclave)),
-                r#"{"t":"grant_accepted","not_after_ms":9,"custody":"enclave"}"#
+                r#"{"t":"grant_accepted","time_ms":0,"not_after_ms":9,"custody":"enclave"}"#
             );
             assert_eq!(
                 text(&grant_accepted(9, Custody::Operator)),
-                r#"{"t":"grant_accepted","not_after_ms":9,"custody":"operator"}"#
+                r#"{"t":"grant_accepted","time_ms":0,"not_after_ms":9,"custody":"operator"}"#
             );
-            assert_eq!(text(&grant_revoked()), r#"{"t":"grant_revoked"}"#);
+            assert_eq!(
+                text(&grant_revoked()),
+                r#"{"t":"grant_revoked","time_ms":0}"#
+            );
             assert_eq!(
                 text(&connection_created("r", "slack", "chat:write")),
-                r#"{"t":"connection_created","record_id":"r","provider":"slack","scope":"chat:write"}"#
+                r#"{"t":"connection_created","time_ms":0,"record_id":"r","provider":"slack","scope":"chat:write"}"#
             );
             assert_eq!(
                 text(&credential_refreshed("r", "x")),
-                r#"{"t":"credential_refreshed","record_id":"r","provider":"x"}"#
+                r#"{"t":"credential_refreshed","time_ms":0,"record_id":"r","provider":"x"}"#
             );
             assert_eq!(
                 text(&connection_removed("r", "x", true)),
-                r#"{"t":"connection_removed","record_id":"r","provider":"x","provider_revoke":true}"#
+                r#"{"t":"connection_removed","time_ms":0,"record_id":"r","provider":"x","provider_revoke":true}"#
             );
             assert_eq!(
                 text(&secret_released(
@@ -1088,21 +1395,35 @@ pub mod events {
                     "browser:fill"
                 )),
                 concat!(
-                    r#"{"t":"secret_released","record_id":"r","kind":"vault_card","field":"card_cvc","#,
-                    r#""origin":"https://a.example","context":"browser:fill"}"#
+                    r#"{"t":"secret_released","time_ms":0,"record_id":"r","kind":"vault_card","#,
+                    r#""field":"card_cvc","origin":"https://a.example","context":"browser:fill"}"#
                 )
             );
             assert_eq!(
                 text(&totp_issued("r", "https://a.example", "browser:fill")),
-                r#"{"t":"totp_issued","record_id":"r","origin":"https://a.example","context":"browser:fill"}"#
+                r#"{"t":"totp_issued","time_ms":0,"record_id":"r","origin":"https://a.example","context":"browser:fill"}"#
             );
             assert_eq!(
                 text(&grant_transferred_out("NODE-B")),
-                r#"{"t":"grant_transferred_out","to":"NODE-B"}"#
+                r#"{"t":"grant_transferred_out","time_ms":0,"to":"NODE-B"}"#
             );
             assert_eq!(
                 text(&grant_transferred_in("NODE-A", 9, Custody::Enclave)),
-                r#"{"t":"grant_transferred_in","from":"NODE-A","not_after_ms":9,"custody":"enclave"}"#
+                r#"{"t":"grant_transferred_in","time_ms":0,"from":"NODE-A","not_after_ms":9,"custody":"enclave"}"#
+            );
+            assert_eq!(
+                text(&mail_request(
+                    "r",
+                    "read",
+                    &json!({"action": "folders"}),
+                    b"",
+                    "cli:naver-mail"
+                )),
+                concat!(
+                    r#"{"t":"mail_request","time_ms":0,"record_id":"r","provider":"naver_mail","operation":"read","#,
+                    r#""request":{"action":"folders"},"body_bytes":0,"#,
+                    r#""body_sha256":"47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU","context":"cli:naver-mail"}"#
+                )
             );
         }
 
@@ -1121,7 +1442,7 @@ pub mod events {
                     true
                 )),
                 concat!(
-                    r#"{"t":"provider_request","record_id":"r","provider":"x","method":"GET","#,
+                    r#"{"t":"provider_request","time_ms":0,"record_id":"r","provider":"x","method":"GET","#,
                     r#""host":"api.x.com","path":"/2/users/me","query":"a=1","body_bytes":0,"#,
                     r#""body_sha256":"","context":"cli:x","window_s":300}"#
                 )
@@ -1283,13 +1604,14 @@ mod tests {
             );
             (refresh_key(&sealed), sealed)
         };
+        let log = crate::api::responses::LogRef {
+            seq: 1,
+            index: 0,
+            created: true,
+        };
         let keys: Vec<[u8; 32]> = (0..17u8)
             .map(|index| {
                 let (key, sealed) = response(index);
-                let entry = Signed {
-                    body: String::new(),
-                    sig: String::new(),
-                };
                 let public = crate::oauth::tests::empty_public_fields();
                 account.keep_refresh(
                     &grant([1; 32]),
@@ -1298,7 +1620,7 @@ mod tests {
                     Refreshed {
                         record: sealed,
                         public,
-                        entry,
+                        log,
                     },
                 );
                 key
@@ -1328,16 +1650,41 @@ mod tests {
             Refreshed {
                 record: sealed,
                 public: crate::oauth::tests::empty_public_fields(),
-                entry: Signed {
-                    body: String::new(),
-                    sig: String::new(),
-                },
+                log,
             },
         );
         assert!(account.kept_refresh(&key, 3_000).is_none());
         // The end of the grant drops what was kept.
         account.expire(10_000_000);
         assert!(account.kept_refresh(&keys[16], 3_000).is_none());
+    }
+
+    #[test]
+    fn the_merge_keys_of_an_account_are_dropped_when_their_window_passed() {
+        let mut account = Account::new();
+        let place = |index: u32| EventPlace::Entry { seq: 1, index };
+        account.recent.insert(
+            [1u8; 32],
+            Recent {
+                entry_ms: 1_000,
+                target: place(0),
+            },
+        );
+        account.recent.insert(
+            [2u8; 32],
+            Recent {
+                entry_ms: 200_000,
+                target: place(1),
+            },
+        );
+        // At the end of the window of the first key it is dropped and the second one stays.
+        account.prune_recent(1_000 + limits::MERGE_WINDOW_S * 1000);
+        assert!(!account.recent.contains_key(&[1u8; 32]));
+        assert!(account.recent.contains_key(&[2u8; 32]));
+        account.prune_recent(200_000 + limits::MERGE_WINDOW_S * 1000 - 1);
+        assert!(account.recent.contains_key(&[2u8; 32]));
+        account.prune_recent(200_000 + limits::MERGE_WINDOW_S * 1000);
+        assert!(account.recent.is_empty());
     }
 
     #[test]

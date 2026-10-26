@@ -11,6 +11,7 @@ use credential_enclave_protocol::ProtocolError;
 
 use super::responses::Configured;
 use super::{invalid, json_ok, respond, ApiError, JsonBody};
+use crate::log_store::LogStoreEndpoint;
 use crate::state::{Node, OperatorConfig, ProviderCredentials};
 
 /// Longest callback address, in bytes.
@@ -28,19 +29,38 @@ pub async fn config(State(node): State<Arc<Node>>, request: Request) -> Response
 /// a log store once. A configuration that names the same one again, or none, leaves it in
 /// place, and a configuration that names another one is `invalid_request` and changes nothing:
 /// the binding of the attestation names the log store, and what a verifier read there holds
-/// for as long as the node lives.
+/// for as long as the node lives. A node of the local platform also takes an optional
+/// `endpoint` in `log_store` (enclave.md 5.14): an `http://host:port` or `https://host:port`
+/// origin it writes to in path-style. A node of the nitro platform refuses a configuration
+/// with `endpoint`.
 async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
     let body = JsonBody::read(request).await?;
+    let mut endpoint = None;
     let log_store = match body.get("log_store") {
         None => None,
-        Some(value) => Some(
-            value
-                .get("bucket")
-                .and_then(serde_json::Value::as_str)
-                .zip(value.get("region").and_then(serde_json::Value::as_str))
-                .and_then(|(bucket, region)| LogStoreId::parse(bucket, region))
-                .ok_or_else(|| invalid("log_store"))?,
-        ),
+        Some(value) => {
+            if let Some(text) = value.get("endpoint").filter(|text| !text.is_null()) {
+                if node.platform.name() != "local" {
+                    return Err(ApiError::with_message(
+                        ProtocolError::InvalidRequest,
+                        "endpoint is accepted on the local platform only",
+                    ));
+                }
+                endpoint = Some(
+                    text.as_str()
+                        .and_then(LogStoreEndpoint::parse)
+                        .ok_or_else(|| invalid("endpoint"))?,
+                );
+            }
+            Some(
+                value
+                    .get("bucket")
+                    .and_then(serde_json::Value::as_str)
+                    .zip(value.get("region").and_then(serde_json::Value::as_str))
+                    .and_then(|(bucket, region)| LogStoreId::parse(bucket, region))
+                    .ok_or_else(|| invalid("log_store"))?,
+            )
+        }
     };
     let providers = body
         .object("providers")?
@@ -84,11 +104,13 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
             },
         );
     }
-    if log_store.is_some_and(|id| !node.log_store.set_id(id)) {
-        return Err(ApiError::with_message(
-            ProtocolError::InvalidRequest,
-            "the node has another log store",
-        ));
+    if let Some(id) = log_store {
+        if !node.log_store.set_id(id) || !node.log_store.set_endpoint(endpoint) {
+            return Err(ApiError::with_message(
+                ProtocolError::InvalidRequest,
+                "the node has another log store",
+            ));
+        }
     }
     node.set_config(OperatorConfig { providers: parsed });
     Ok(json_ok(&Configured { configured: true }))

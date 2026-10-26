@@ -22,7 +22,7 @@ use credential_enclave_protocol::envelope::{
     self, Envelope, ReplyBody, ReplyHead, TransferEnvelope, TransferGrant,
 };
 use credential_enclave_protocol::keys::{self, Custody, NodeKeys};
-use credential_enclave_protocol::log::{self, Head};
+use credential_enclave_protocol::log::{self, EntryKind, EntryParts, Head};
 use credential_enclave_protocol::record::{record_aad, seal_record};
 use credential_enclave_protocol::secret::Secret;
 use credential_enclave_protocol::{purpose, statement, totp};
@@ -494,7 +494,188 @@ fn signed() -> Value {
     })
 }
 
+/// The vector `log`: a chain of format 2 (protocol.md 7.1) of three entries, the keys of its
+/// objects, and the outcomes of the index verification over the keys and of the content
+/// verification over the objects.
 fn log_chain() -> Value {
+    let node = node_keys();
+    let account = account_keys();
+    let key_id = account.key_id();
+    let record_id = b64u(&fixed_prefix::<16>("record id"));
+    let batches: [(EntryKind, Vec<Value>); 3] = [
+        (
+            EntryKind::Control,
+            vec![json!({
+                "t": "grant_accepted",
+                "time_ms": TIME_MS + 1_000,
+                "not_after_ms": TIME_MS + 2_592_000_000,
+                "custody": Custody::Enclave.as_str(),
+            })],
+        ),
+        (
+            EntryKind::Use,
+            (0..3u64)
+                .map(|index| {
+                    json!({
+                        "t": "provider_request",
+                        "time_ms": TIME_MS + 1_900 + index,
+                        "record_id": record_id,
+                        "provider": "google_workspace",
+                        "method": "GET",
+                        "host": "gmail.googleapis.com",
+                        "path": format!("/gmail/v1/users/me/threads/thread-{index}"),
+                        "query": "format=metadata",
+                        "body_bytes": 0,
+                        "body_sha256": "",
+                        "context": "cli:gog",
+                        "window_s": 300,
+                    })
+                })
+                .collect(),
+        ),
+        (
+            EntryKind::Use,
+            vec![json!({
+                "t": "secret_released",
+                "time_ms": TIME_MS + 3_000,
+                "record_id": record_id,
+                "kind": "vault_card",
+                "field": "card_number",
+                "origin": "https://shop.example",
+                "context": "browser:fill",
+            })],
+        ),
+    ];
+    let prefix = log::chain_prefix(USER_ID, &node.node());
+    let mut head = Head::EMPTY;
+    let mut entries = Vec::new();
+    let mut signed_entries = Vec::new();
+    let mut parts: Vec<EntryParts> = Vec::new();
+    for (index, (kind, events)) in batches.iter().enumerate() {
+        let seed = fixed(&format!("log entry {} hpke seed", index + 1));
+        let time_ms = TIME_MS + 1_000 * (index as u64 + 1);
+        let (entry, next, key) = log::append_batch(
+            &node,
+            &head,
+            USER_ID,
+            &key_id,
+            &account.log_pk(),
+            time_ms,
+            *kind,
+            events,
+            &Secret::new(seed),
+        );
+        let body = b64u_decode(&entry.body).expect("entry body");
+        entries.push(json!({
+            "seq": next.seq,
+            "hpke_seed": b64u(&seed),
+            "time_ms": time_ms,
+            "kind": kind.letter().to_string(),
+            "count": events.len(),
+            "events_text": text(&to_json(&Value::Array(events.clone()))),
+            "entry": signed_value(&entry),
+            "body_text": text(&body),
+            "body_hash": b64u(&key.body_hash),
+            "entry_hash": b64u(&key.entry_hash),
+            "key": log::object_key_v2(USER_ID, &node.node(), &key),
+        }));
+        signed_entries.push(entry);
+        parts.push(key);
+        head = next;
+    }
+    let nonce = b64u(&fixed_prefix::<16>("chain head nonce"));
+    let signed_head = log::signed_head(&node, USER_ID, &head, &nonce, TIME_MS + 4_000, false);
+    let final_head = log::signed_head(&node, USER_ID, &head, "", TIME_MS + 5_000, true);
+    let public = node.sign_public();
+    let index_of = |keys: &[EntryParts]| {
+        app::verify_index(
+            &public,
+            USER_ID,
+            &Head::EMPTY,
+            keys,
+            &signed_head,
+            Some(&nonce),
+        )
+    };
+    let content_valid = signed_entries.iter().enumerate().all(|(index, entry)| {
+        let cursor = match index {
+            0 => Head::EMPTY,
+            _ => Head {
+                seq: parts[index - 1].seq,
+                hash: parts[index - 1].entry_hash,
+            },
+        };
+        match app::verify_entry_v2(&public, USER_ID, &parts[index], Some(&cursor), entry) {
+            Ok(body) => {
+                let bytes = b64u_decode(&entry.body).expect("entry body");
+                body.count as usize == batches[index].1.len()
+                    && app::open_entry_v2(&account.log, &bytes).as_deref()
+                        == Ok(batches[index].1.as_slice())
+            }
+            Err(_) => false,
+        }
+    });
+    let keys_of = |list: &[EntryParts]| -> Vec<Value> {
+        list.iter()
+            .map(|key| Value::String(log::object_key_v2(USER_ID, &node.node(), key)))
+            .collect()
+    };
+    let without_middle = [parts[0].clone(), parts[2].clone()];
+    let mut forged = parts[1].clone();
+    forged.body_hash = log::body_hash(b"not the body of the entry");
+    forged.entry_hash =
+        log::entry_hash_v2(&parts[0].entry_hash, &forged.body_hash, &forged.fields());
+    let with_forged = [
+        parts[0].clone(),
+        parts[1].clone(),
+        forged.clone(),
+        parts[2].clone(),
+    ];
+    let cursor = Head {
+        seq: 1,
+        hash: parts[0].entry_hash,
+    };
+    json!({
+        "node_sign_pk": b64u(&public),
+        "node": node.node(),
+        "user_id": USER_ID,
+        "key_id": key_id,
+        "log_private": b64u(&account.log.to_bytes()),
+        "log_pk": b64u(&account.log_pk()),
+        "hpke_info_text": purpose::LOG_ENTRY_SEAL_V2,
+        "signature_context_text": purpose::LOG_ENTRY_V2,
+        "chain_prefix_text": purpose::LOG_CHAIN_V2,
+        "key_prefix": prefix,
+        "checkpoint": {"seq": 0, "hash": b64u(&Head::EMPTY.hash), "time_ms": 0},
+        "entries": entries,
+        "head_nonce": nonce,
+        "head": signed_value(&signed_head),
+        "head_text": text(&b64u_decode(&signed_head.body).expect("head body")),
+        "final_head": signed_value(&final_head),
+        "index_valid": index_of(&parts).is_ok(),
+        "content_valid": content_valid,
+        "missing_middle": {
+            "keys": keys_of(&without_middle),
+            "index_valid": index_of(&without_middle).is_ok(),
+            "gap_seq": 2,
+        },
+        "forged_key": {
+            "keys": keys_of(&with_forged),
+            "index_valid": index_of(&with_forged).is_ok(),
+            "ambiguous_seq": 2,
+            "genuine_object_verifies": app::verify_entry_v2(
+                &public, USER_ID, &parts[1], Some(&cursor), &signed_entries[1]
+            ).is_ok(),
+            "forged_key_object_verifies": app::verify_entry_v2(
+                &public, USER_ID, &forged, Some(&cursor), &signed_entries[1]
+            ).is_ok(),
+        },
+    })
+}
+
+/// The vector `log_v1`: a chain of format 1 (protocol.md 7.1, "Format 1") as the releases
+/// before v2.0.0 wrote it.
+fn log_chain_v1() -> Value {
     let node = node_keys();
     let account = account_keys();
     let key_id = account.key_id();
@@ -894,17 +1075,21 @@ fn generate() -> String {
     let document = json!({
         "v": 1,
         "description": concat!(
-            "Test vectors of protocol v1 (protocol.md section 13). Generated by ",
+            "Test vectors of the protocol (protocol.md section 13). Generated by ",
             "`cargo run -p credential-enclave-protocol --bin vectors` from fixed inputs. ",
             "Byte values are base64url without padding. A key ending in `_text` holds the same ",
             "bytes as UTF-8 text. An `hpke_seed` is the input keying material of the HPKE ",
-            "ephemeral key pair: the pair is DeriveKeyPair(hpke_seed) of RFC 9180 section 7.1.3."
+            "ephemeral key pair: the pair is DeriveKeyPair(hpke_seed) of RFC 9180 section 7.1.3. ",
+            "`log` is the credential log of format 2 (the releases from v2.0.0 on: one entry ",
+            "holds the events of one account, the key of its object carries body_hash and ",
+            "entry_hash) and `log_v1` the log of format 1 (one entry holds one event)."
         ),
         "key_derivation": key_derivation(),
         "record": record(),
         "command": command(),
         "signed": signed(),
         "log": log_chain(),
+        "log_v1": log_chain_v1(),
         "attestation": attestation(),
         "totp": totp_vectors(),
         "transfer": transfer(),

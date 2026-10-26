@@ -9,20 +9,19 @@ use std::sync::Arc;
 
 use axum::extract::{Request, State};
 use axum::response::Response;
-use credential_enclave_protocol::encoding::Signed;
 use credential_enclave_protocol::envelope::{
     open_command, reply, Command, Envelope, Grant, ReplyBody, ReplyHead, Revoke,
 };
 use credential_enclave_protocol::keys::key_id;
-use credential_enclave_protocol::log::Head;
+use credential_enclave_protocol::log::{EntryKind, Head};
 use credential_enclave_protocol::{limits, ProtocolError};
 
-use super::responses::Messages;
+use super::responses::{LogRef, Messages};
 use super::{json_ok, respond, ApiError, JsonBody};
 use crate::log_store;
-use crate::state::{events, lock, ActiveGrant, GrantState, GrantStatus, Node};
+use crate::state::{events, lock, ActiveGrant, EventPlace, GrantState, GrantStatus, Node};
 
-/// What a command led to: the fields of the reply and the entry it created.
+/// What a command led to: the fields of the reply and the event it created.
 struct Outcome {
     kind: &'static str,
     failure: Option<ProtocolError>,
@@ -31,7 +30,17 @@ struct Outcome {
     key_id: String,
     not_after_ms: u64,
     head: Head,
-    entry: Option<Signed>,
+    log: Option<LogRef>,
+}
+
+/// The `log` object of a control event: the entry the event forms on its own. A control
+/// event is never in an open batch, so its place always names an entry.
+fn log_of(place: &EventPlace) -> Option<LogRef> {
+    Some(LogRef {
+        seq: place.seq()?,
+        index: place.index(),
+        created: true,
+    })
 }
 
 impl Outcome {
@@ -47,7 +56,7 @@ impl Outcome {
             key_id: String::new(),
             not_after_ms: 0,
             head: Head::EMPTY,
-            entry: None,
+            log: None,
         }
     }
 }
@@ -97,7 +106,7 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
     };
     Ok(json_ok(&Messages {
         reply: signed,
-        entry: outcome.entry,
+        log: outcome.log,
         grant,
     }))
 }
@@ -128,7 +137,7 @@ async fn accept_grant(
         key_id: key_id.clone(),
         not_after_ms: 0,
         head,
-        entry: None,
+        log: None,
     };
     // 10: a node takes the user key of its own custody only. Like the checks before it, this
     // one says that the node cannot take the command, so the reply names no user, challenge
@@ -153,7 +162,7 @@ async fn accept_grant(
         return Ok(failed(ProtocolError::BadChallenge, head_of(node, user_id)));
     };
     let account = node.account_or_create(user_id);
-    let (entry, seq, not_after_ms) = {
+    let (place, not_after_ms) = {
         let mut account = lock(&account);
         // 12, for a grant: the challenge was issued after the last revoke of the account that
         // this node accepted. A sealed grant is a value its carrier can keep: one that was
@@ -171,27 +180,29 @@ async fn accept_grant(
         let not_after_ms = grant
             .not_after_ms
             .min(now_ms.saturating_add(limits::GRANT_MAX_MS));
-        // 14: the entry.
+        // 14: the entry (a control entry of its own; an open batch of the account is closed
+        // before it).
         node.ensure_open()?;
-        let entry = node.append_entry(
+        let place = node.create_event(
             &mut account,
             user_id,
             &key_id,
             &grant.log_pk,
             now_ms,
-            &events::grant_accepted(not_after_ms, grant.custody),
+            EntryKind::Control,
+            events::grant_accepted(not_after_ms, grant.custody),
         )?;
-        (entry, account.head.seq, not_after_ms)
+        (place, not_after_ms)
     };
     // 14: the user key is put in place only after the log store confirmed the entry. When it
     // does not, the entry stays on the chain as a pending entry and the node holds no key.
-    if log_store::confirm(node, user_id, &account, &[seq])
-        .await
-        .is_err()
-    {
-        let head = lock(&account).head;
-        return Ok(failed(ProtocolError::LogStoreUnavailable, head));
-    }
+    let log = match log_store::commit(node, user_id, &account, &[(place, true)]).await {
+        Ok(refs) => refs.into_iter().next().ok_or_else(ApiError::internal)?,
+        Err(_) => {
+            let head = lock(&account).head;
+            return Ok(failed(ProtocolError::LogStoreUnavailable, head));
+        }
+    };
     let mut account = lock(&account);
     // The account was free while the entry was written. A revoke the node accepted in that
     // time stands: the challenge of this grant was issued before it (step 12).
@@ -207,6 +218,9 @@ async fn accept_grant(
     );
     if !same_key {
         account.forget_refreshes();
+        // The merge window belongs to a grant: a request under the new grant merges into no
+        // event made under another key, and none made before a revoke.
+        account.recent.clear();
     }
     account.grant = GrantState::Active(ActiveGrant {
         key_id: key_id.clone(),
@@ -226,7 +240,7 @@ async fn accept_grant(
         key_id,
         not_after_ms,
         head: account.head,
-        entry: Some(entry),
+        log: Some(log),
     })
 }
 
@@ -243,7 +257,7 @@ async fn accept_revoke(
     now_ms: u64,
 ) -> Result<Outcome, ApiError> {
     let key_id = key_id(&revoke.sign_pk);
-    let outcome = |failure: Option<ProtocolError>, head: Head, entry: Option<Signed>| Outcome {
+    let outcome = |failure: Option<ProtocolError>, head: Head, log: Option<LogRef>| Outcome {
         kind: "revoke_reply",
         failure,
         user_id: revoke.user_id.clone(),
@@ -251,7 +265,7 @@ async fn accept_revoke(
         key_id: key_id.clone(),
         not_after_ms: 0,
         head,
-        entry,
+        log,
     };
     if revoke.user_id != user_id {
         return Ok(outcome(
@@ -268,7 +282,7 @@ async fn accept_revoke(
         ));
     }
     let account = node.account_or_create(user_id);
-    let (head, entry) = {
+    let (head, place) = {
         let mut account = lock(&account);
         node.ensure_open()?;
         // A grant whose time passed is no grant.
@@ -289,20 +303,22 @@ async fn accept_revoke(
             }
             GrantState::None | GrantState::Expired { .. } | GrantState::Revoked { .. } => None,
         };
-        let entry = match sealed_to {
-            Some((grant_key_id, log_pk)) => Some(node.append_entry(
+        let place = match sealed_to {
+            Some((grant_key_id, log_pk)) => Some(node.create_event(
                 &mut account,
                 user_id,
                 &grant_key_id,
                 &log_pk,
                 now_ms,
-                &events::grant_revoked(),
+                EntryKind::Control,
+                events::grant_revoked(),
             )?),
             None => None,
         };
         // Replacing the state drops the grant: its user key is overwritten with zeros. The
-        // kept `refresh` responses go with it.
+        // kept `refresh` responses and the merge window go with it.
         account.forget_refreshes();
+        account.recent.clear();
         account.grant = GrantState::Revoked {
             key_id: key_id.clone(),
             sign_pk: revoke.sign_pk,
@@ -313,12 +329,13 @@ async fn accept_revoke(
         // Neither does a grant that was made before this moment: the serial drawn here, under
         // the lock of the account, is larger than the serial of every challenge issued so far.
         account.revoke_serial = node.next_serial();
-        (account.head, entry)
+        (account.head, place)
     };
     // The key is gone. The entry is written when the store takes it, now or with a later
     // write of the account: a revoke is never refused for the log store.
-    if entry.is_some() {
-        let _ = log_store::confirm(node, user_id, &account, &[head.seq]).await;
+    let log = place.as_ref().and_then(log_of);
+    if let Some(place) = place {
+        let _ = log_store::commit(node, user_id, &account, &[(place, true)]).await;
     }
-    Ok(outcome(None, head, entry))
+    Ok(outcome(None, head, log))
 }

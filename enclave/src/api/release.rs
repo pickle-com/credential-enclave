@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use axum::extract::{Request, State};
 use axum::response::Response;
+use credential_enclave_protocol::log::EntryKind;
 use credential_enclave_protocol::ProtocolError;
 
 use super::responses::Released;
@@ -61,35 +62,39 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
 
     node.ensure_open()?;
     let account = node.account(user_id).ok_or(ProtocolError::GrantRequired)?;
-    log_store::admit(node, user_id, &account).await?;
-    let (selected, entry, seq) = {
+    log_store::admit(node, &account).await?;
+    let (selected, place) = {
         let mut account = lock(&account);
         node.ensure_open()?;
         let now_ms = node.now_ms();
         let grant = account.active(now_ms)?;
-        account.ensure_capacity()?;
         let selected = vault::open_record(&grant, user_id, &record)?.select(field, now_ms)?;
         let event = if selected.is_totp() {
             events::totp_issued(&record.id, origin, context)
         } else {
             events::secret_released(&record.id, selected.kind().as_str(), field, origin, context)
         };
-        // The entry raises the end of the chain before the value leaves the node.
-        let entry = node.append_entry(
+        // The event is on the chain before the value leaves the node.
+        let place = node.create_event(
             &mut account,
             user_id,
             &grant.key_id,
             &grant.log_pk,
             now_ms,
-            &event,
+            EntryKind::Use,
+            event,
         )?;
-        (selected, entry, account.head.seq)
+        (selected, place)
     };
-    // The value leaves only after the log store confirmed the entry.
-    log_store::confirm(node, user_id, &account, &[seq]).await?;
+    // The value leaves only after the log store confirmed the entry that holds the event.
+    let log = log_store::commit(node, user_id, &account, &[(place, true)])
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(ApiError::internal)?;
     Ok(json_ok(&Released {
-        value: selected.hand_out(&entry),
-        entry,
+        value: selected.hand_out(),
+        log,
     }))
 }
 

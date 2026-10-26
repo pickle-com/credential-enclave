@@ -30,6 +30,13 @@ An item marked stage 2, 3 or 4 is a field or a message that the current release 
 Records and log entries that are already stored are not written again when a later stage comes
 into use.
 
+The log (section 7) has two formats. Format 1 is the format of the releases before v2.0.0: one
+entry holds one event, and the key of its object in the log store is `{seq}-{hash}`. Format 2 is
+the format of the releases from v2.0.0 on: one entry holds the events of one or more acts of one
+account, and the key of its object carries the hash of the body and the hash of the chain. A node
+writes one format for its whole life, the format of its release. A reader (the app) reads both:
+the shape of the key tells the format. Entries that are already stored are not written again.
+
 ---
 
 ## 1. Common rules
@@ -44,7 +51,7 @@ into use.
 | Signatures | Ed25519 (RFC 8032). The signature input is the purpose string (ASCII, ends with `\n`) followed by the message bytes |
 | Carriage of signed values | A signed JSON value is always carried as the pair `{"body": b64u(body bytes), "sig": b64u(signature)}`. The signature is verified over the received `body` bytes as they are, and `body` is parsed as JSON after that. An implementation that serializes the JSON again and verifies the result is not allowed |
 | Hash | SHA-256 |
-| Version | Every object carries `"v":1`. The receiver refuses a `v` that is not 1 (`unsupported_version`) |
+| Version | Every object carries `"v":1`, except the body of a log entry of format 2, which carries `"v":2` (7.1). The receiver refuses another `v` (`unsupported_version`) |
 | Length limits | `user_id`, `provider` and `kind` are 1 to 128 characters long and hold no control character (U+0000 to U+001F) |
 
 Identifiers:
@@ -414,7 +421,7 @@ and `state` from the return URL, and sends them with the command `oauth_code`.
   that `state` with `code` (the same processing as the complete call of enclave.md 5.6).
 - The reply: `type` is `oauth_code_reply`, and the body carries `state` and `record_id` in
   addition. The plaintext response of the call is that of complete (`record`, `public`,
-  `statement`, `entry`).
+  `statement`, `log`).
 - The callback address (redirect_uri) of a provider that uses this path is an https address that
   the app intercepts. No request for that address reaches the servers of the operator.
 
@@ -474,57 +481,101 @@ and what happens to a value after it left the node is a promise of the operator.
 ### 7.1 The entry
 
 ```text
-entry = {"body": b64u(body), "sig": b64u(Ed25519(node signing key, "pickle.secure.v1.log-entry\n" || body))}
-body  = UTF-8(JSON {"v":1,"node":"...","user_id":"...","key_id":"...","seq":1,"prev":b64u(32),"time_ms":0,"enc":b64u,"ct":b64u})
-        enc, ct = HPKE single-shot seal: recipient public key = the log_pk of the grant at that time, info = UTF-8("pickle.secure.v1.log-entry"),
-                  aad = UTF-8(node + "\n" + user_id + "\n" + key_id + "\n" + seq in decimal), plaintext = UTF-8(JSON event)
-entry_hash = SHA-256("pickle.secure.v1.log-chain\n" || body)
+entry = {"body": b64u(body), "sig": b64u(Ed25519(node signing key, "pickle.secure.v2.log-entry\n" || body))}
+body  = UTF-8(JSON {"v":2,"node":"...","user_id":"...","key_id":"...","seq":1,"prev":b64u(32),"time_ms":0,"kind":"u","count":1,"enc":b64u,"ct":b64u})
+        enc, ct = HPKE single-shot seal: recipient public key = the log_pk of the grant at that time, info = UTF-8("pickle.secure.v2.log-entry"),
+                  aad = UTF-8(node + "\n" + user_id + "\n" + key_id + "\n" + seq in decimal),
+                  plaintext = UTF-8(JSON array of the events, in the order of their creation)
+body_hash  = SHA-256(body)
+entry_hash = SHA-256("pickle.secure.v2.log-chain\n" || prev || body_hash || UTF-8(fields))
+             prev:   the 32 bytes of the entry_hash of the entry before
+             fields: the first five parts of the key of the entry as the key writes them (7.6),
+                     "{seq}-{time_ms}-{kind}-{count}-{key_id}" (57 characters)
 ```
 
 - There is one chain per (node, account) pair. The `seq` of the first entry is 1 and its `prev` is
-  32 zero bytes. The `prev` of every later entry is the `entry_hash` of the entry before it.
-- The entry and the act. `forward`, `refresh`, `revoke-token`, `release`, the commands grant and
-  revoke, and `peer/export` create their entry before the act: the node creates the entry and
-  raises the end of the chain in its memory, and after that it calls the provider, hands the value
+  32 zero bytes. The `prev` of every later entry is the `entry_hash` of the entry before it. `count`
+  is the number of events in the plaintext (1 to 128) and `kind` is the letter of the kind of the
+  entry.
+- The two kinds of entry. A use entry (`kind` `u`) holds use events: `provider_request`,
+  `credential_refreshed`, `mail_request`, `secret_released`, `totp_issued`. A control entry (`kind`
+  `c`) holds one control event: `grant_accepted`, `grant_revoked`, `connection_created`,
+  `connection_removed`, `grant_transferred_out`, `grant_transferred_in`. A control entry is never
+  merged with another event. The first entry of a chain is a control entry: no node uses a user key
+  before it accepted a grant or a transfer.
+- The open batch and the group commit. A node keeps, per account, the use events whose entry does
+  not exist yet (the open batch). A call that creates a use event puts it into the open batch. When
+  no write of that account is in progress, the call closes the open batch into one entry (the entry
+  gets the next `seq`, is sealed and signed, and the end of the chain rises) and writes it (7.6):
+  the call is the writer of the account. While a write of the account is in progress, the call
+  waits: the writer closes the open batch into the next entry when its write ends, and one of the
+  waiting calls writes it. So an entry holds the events that arrived while the write before it
+  ran. An open batch is closed before it holds more than 128 events or more than 1,048,576 bytes
+  of plaintext, and a control event closes the open batch before it and forms an entry of its own.
+  An act waits for the confirmation of the entry that holds its event (7.6): no event is in two
+  entries, and no entry is created for an act that the common front refused. When the store does
+  not confirm the write, the writer fails with `log_store_unavailable` and the entry is a pending
+  entry (7.6); a call that waited for that entry writes it once more, as the next writer, and a
+  call that waited for twice the time limit of a write fails with `log_store_unavailable`.
+- A forward batch (enclave.md 5.8b) creates one use event per request of the batch, in the order of
+  the requests, all into the open batch of the account in one step. The requests of one batch may
+  end up in two entries when the open batch reaches a cap between them; the batch waits for the
+  confirmation of every entry that holds one of its events.
+- The entry and the act. `forward`, `forward/batch`, `refresh`, `revoke-token`, `release`, the
+  commands grant and revoke, and `peer/export` create their event before the act: the node creates
+  the event, and the entry that holds it, and after that it calls the provider, hands the value
   out, changes the delegation or seals the user key to a peer. `peer/import` creates its entry
-  before it puts a grant in place. `oauth/complete` receives the token response of the provider
+  before it puts a grant in place, and writes it after (7.6). `oauth/complete` receives the token response of the provider
   first and creates the entry `connection_created` before the record leaves the node: no part of
   an accepted token response leaves the node before that entry exists, and when a step after the
   response fails, the tokens are dropped inside the node and nothing of them leaves. `oauth/merge`
-  calls no provider and creates no entry.
+  calls no provider and creates no event.
 - The entry and the log store. A node that has a log store writes the entry to it between the
   creation of the entry and the act, and acts only after the store confirmed the entry. 7.6 names
   the act of every call and the two calls that do not wait.
-- The cases that share an entry or create none are named where they are described: identical GET
+- The cases that share an event or create none are named where they are described: identical GET
   requests (7.2), a repeated `refresh` of the same record and a `refresh` of a record without a
   refresh token (enclave.md 5.7), a revoke of an account without a grant (5.4), a repeated
   transfer of a grant to the same node, a transfer that a node takes for an account whose grant
   of the same key it holds (10.1), and a call that uses a credential of an account that has 64
   pending entries (enclave.md 5.14).
-- The entry is carried in the response of the call, and the operator's backend stores it. The
-  backend stores the bytes of `body` and `sig` as they are. The log store holds the same bytes
-  (7.6): the storage of the backend is the place a reader fetches an entry from quickly, and the
-  log store is the place where an entry cannot be deleted.
+- The entry is not carried in the response of a call. The response names the entry and the index
+  of the event in it (the `log` object of a response, enclave.md section 4). The storage of the
+  operator's backend holds no entry: the log store is the one place an entry is read from.
 - The ephemeral key pair of the HPKE seal is `DeriveKeyPair` (RFC 9180 7.1.3) with 32 random bytes
   as the input keying material. A node uses new random bytes for every entry. The test vectors
   (section 13) fix these 32 bytes (`hpke_seed`).
-- The key order of the event JSON is the order that the table of 7.2 gives (`t` is the first key).
+- The key order of the event JSON is the order that the table of 7.2 gives (`t` is the first key
+  and `time_ms` the second).
+
+Format 1 (the releases before v2.0.0): the signature purpose is `pickle.secure.v1.log-entry\n`,
+the body is `{"v":1,"node","user_id","key_id","seq","prev","time_ms","enc","ct"}`, the HPKE info is
+`pickle.secure.v1.log-entry`, the plaintext is one event (the JSON object, not an array),
+`entry_hash = SHA-256("pickle.secure.v1.log-chain\n" || body)`, and the object key is
+`{seq}-{b64u(entry_hash)}` (7.6). A reader verifies a chain of format 1 by its entries (7.4,
+"Format 1").
 
 ### 7.2 The events (the plaintext of an entry)
 
 | `t` | The other keys | Created by |
 | --- | --- | --- |
-| `grant_accepted` | `not_after_ms`, `custody` | The command grant |
-| `grant_revoked` | | The command revoke |
-| `connection_created` | `record_id`, `provider`, `scope` (the scope string among the public fields of enclave.md 6.4: the `scope` of the token place, else the top-level `scope`, when the provider definition lists it. Otherwise the empty string) | `oauth/complete` |
-| `credential_refreshed` | `record_id`, `provider`. It records a refresh call (the entry is created before the call, so a refresh that the provider refused is on the log as well) | `refresh` |
-| `connection_removed` | `record_id`, `provider`, `provider_revoke` (bool: whether the node calls the revocation address of the provider after this entry. It is true when the definition has a revocation address and the plaintext of the record has a token. The entry is created before the call, so it does not carry the outcome of the call) | `revoke-token` |
-| `provider_request` | `record_id`, `provider`, `method`, `host`, `path`, `query`, `body_bytes`, `body_sha256` (b64u, the empty string when there is no body), `context`, `window_s` (300, only on a request that can be merged) | `forward` |
-| `secret_released` | `record_id`, `kind`, `field`, `origin`, `context` | `release` |
-| `totp_issued` | `record_id`, `origin`, `context` | `release` |
-| `grant_transferred_out` | `to` (the `node` of the receiving node) | `peer/export` (section 10) |
-| `grant_transferred_in` | `from` (the `node` of the giving node), `not_after_ms`, `custody` | `peer/import` (section 10) |
+| `grant_accepted` | `time_ms`, `not_after_ms`, `custody` | The command grant |
+| `grant_revoked` | `time_ms` | The command revoke |
+| `connection_created` | `time_ms`, `record_id`, `provider`, `scope` (the scope string among the public fields of enclave.md 6.4: the `scope` of the token place, else the top-level `scope`, when the provider definition lists it. Otherwise the empty string) | `oauth/complete` |
+| `credential_refreshed` | `time_ms`, `record_id`, `provider`. It records a refresh call (the event is created before the call, so a refresh that the provider refused is on the log as well) | `refresh` |
+| `connection_removed` | `time_ms`, `record_id`, `provider`, `provider_revoke` (bool: whether the node calls the revocation address of the provider after this event. It is true when the definition has a revocation address and the plaintext of the record has a token. The event is created before the call, so it does not carry the outcome of the call) | `revoke-token` |
+| `provider_request` | `time_ms`, `record_id`, `provider`, `method`, `host`, `path`, `query`, `body_bytes`, `body_sha256` (b64u, the empty string when there is no body), `context`, `window_s` (300, only on a request that can be merged) | `forward`, `forward/batch` (one per request) |
+| `mail_request` | `time_ms`, `record_id`, `provider`, `operation`, `request`, `body_bytes`, `body_sha256`, `context` (the mail call surface at the end of this document) | `mail/verify`, `mail/read`, `mail/submit` |
+| `secret_released` | `time_ms`, `record_id`, `kind`, `field`, `origin`, `context` | `release` |
+| `totp_issued` | `time_ms`, `record_id`, `origin`, `context` | `release` |
+| `grant_transferred_out` | `time_ms`, `to` (the `node` of the receiving node) | `peer/export` (section 10) |
+| `grant_transferred_in` | `time_ms`, `from` (the `node` of the giving node), `not_after_ms`, `custody` | `peer/import` (section 10) |
 
+- `time_ms` is the node time at which the event was created: the moment the call passed the common
+  front and the account lock created the event. The `time_ms` of an entry (7.1) is the time at
+  which the open batch was closed, and it is never before the `time_ms` of an event of the entry.
+  The times of the events of one chain do not decrease with (`seq`, index), and neither do the
+  times of its entries.
 - `method`, `host`, `path` and `query` are those of the request that the node sends. `path` and
   `query` are whole: an address of `forward` is at most 8,192 bytes long (enclave.md section 7),
   and an event holds up to 8,192 bytes of each.
@@ -532,12 +583,16 @@ entry_hash = SHA-256("pickle.secure.v1.log-chain\n" || body)
   node does not verify this value. The log screen of the app shows it apart, as a context that the
   operator stated.
 - Merging of identical requests: a `provider_request` whose method is GET and whose body is empty
-  creates no new entry when such an entry of the same account for the same record and the same
-  address (equal host, path and query) was created less than 300 seconds before. An entry that can
+  creates no new event when such an event of the same account for the same record and the same
+  address (equal host, path and query) was created less than 300 seconds before, in the open batch
+  or in an entry. The request shares that event and waits for the entry that holds it. Two
+  identical GET requests inside one forward batch share one event the same way. The window belongs
+  to the grant: a revoke, an expiry and a grant of another key clear it, so no request merges into
+  an event made under a grant that is over. An event that can
   be the target of a merge (a GET without a body) carries `window_s: 300`: it says that the same
   request may have happened any number of times in the 300 seconds after it. A GET request with a
   body, a request of another method and the release of a vault value (`release`) are not merged:
-  each has its own entry.
+  each has its own event.
 - The identifier of a node (`node`) is the signing public key of that node. So an app that read the
   `to` of a `grant_transferred_out` can verify the signatures of the entries of the receiving node
   with that value.
@@ -555,70 +610,116 @@ body = UTF-8(JSON {"v":1,"type":"head","node":"...","user_id":"...","seq":0,"has
   string).
 - A node creates a head whose `final` is true in its orderly shutdown, one per account. After that
   the node creates no entry for that account.
+- The head covers entries. The events of an open batch are not on the chain yet, and their acts
+  have not taken place (an act follows the confirmation of its entry, which follows the close of
+  the batch). So a head names every act that took place or could have taken place.
 
 ### 7.4 Verification (the app)
 
-For one (node, account) chain, the app starts from the signing public key of that node (the node
+For one (node, account) chain the app starts from the signing public key of that node (the node
 identifier is that key), which it keeps in its list of nodes, and from its last verified point
-`{seq, hash}`.
+`{seq, hash, time_ms}`. The app reads the log store itself (7.6): it lists the object versions
+under the prefix of the account and of the node through addresses the operator's backend signs,
+checks every address before it calls it (the host of the bucket of `LOG_STORES` of its server
+target, or, in a debug build only, the path-style form of the bucket of the S3 stand-in of the
+local stack at the host the backend hands out, over http or https; the prefix of its own account,
+the path, prefix, key, markers and version of the request, no query key besides those of that
+request, the page size of 1,000, the encoding `url` of the names and the signature), and takes
+the listing as the index of completeness. The responses come from S3 over
+TLS and the operator domain cannot change them. The content of an entry is read from the object of
+its key, never from the backend.
 
-1. The app lists the log store (7.6): the nodes of the account (the common prefixes of
-   `v1/accounts/{user_id}/` with the delimiter `/`), and for each node the object versions after
-   the verified point (`ListObjectVersions` of the prefix `v1/accounts/{user_id}/{node}/` from the
-   key marker of the verified `seq`). The listing is the index of completeness: the keys name `seq`
-   and `entry_hash`. The app calls a presigned address the operator's backend hands out only when
-   it names the bucket of its server target and the path, prefix, key, markers and version of the
-   request, and carries no query key besides those of that request, the page size of 1,000, the
-   encoding `url` of the names (the app decodes them) and the signature; the responses come from
-   S3 over TLS and the operator domain cannot change them. The nodes of the listing that the list
-   of nodes does not know are examined after the known nodes, at most `LOG_STORE_NODES` of them in
-   one run (more leave the run pending).
-2. The app obtains a head. From a living node it requests one with a new nonce and checks the
-   signature and the nonce. For a node that is gone it checks the signature of the `final` head
-   that the operator's backend stored. The head is a secondary check: a head whose `seq` lies
-   beyond the end of the listing, and a storage of the operator's backend that holds a larger
-   `seq` than the listing shows, name entries the store has not confirmed yet (the verification is
-   pending), a head whose `hash` differs from the chain at its `seq` is a mismatch.
-3. For every `seq` after the verified point up to the last listed one, the app takes the entry from
-   the storage of the operator's backend when it serves it, otherwise from the object version of
-   that key (the latest version first). It checks the node signature, `node`, `user_id`, that `seq`
-   continues without a gap, that `prev` equals the `entry_hash` of the entry before it, and that
-   `entry_hash` equals the hash of the key. The end the chain is vouched for up to is the `seq` of
-   the head when there is one, otherwise the largest `seq` the operator's storage holds: a `seq`
-   beyond it none of whose versions verifies is an object someone else put under the prefix (the
-   operator domain can write to the bucket) and ends the walk without a mark; a `seq` up to it
-   none of whose versions verifies is an entry that does not verify. The verified point moves to
-   the last entry that passed. An entry taken from the store that is younger than
-   `LOG_WITHHELD_GRACE_MS` leaves the verification pending with the verified point before it (the
-   backend may still be storing it); an older one inside the cache window of the operator's
-   storage (`LOG_CACHE_DAYS`) counts as withheld.
-4. A node of the listing that the list of nodes does not know is verified with its identifier as
-   the signing public key. When an entry sealed to the key of this account verifies on it, the node
-   enters the list of nodes with the origin `store` and marks the log in every run until a traced
-   transfer (`grant_transferred_out`) explains it. A prefix under which no chain verifies (a gap, or
-   an object that does not verify) is left out.
-5. A node of the platform `local` writes no entry to the store, and a build of the app whose
-   backend has no log store (a development backend) reads no store: for such a node the app
-   receives the entries from the storage of the backend in order up to the head and applies the
-   checks of step 3 without the key hash.
-6. The app keeps the time its reads of the store began to fail and clears it at a run that
-   completes with the store read. While it is set, an entry the store holds that the backend did
-   not serve counts as withheld when it was inside the cache window at that time, and reads that
-   have been failing for `LOG_STORE_STALE_MS` mark the log.
+The two verifications:
+
+| Verification | What it reads | When |
+| --- | --- | --- |
+| Index verification | The head, the keys of the listing, and the bodies of the control entries | Every synchronization (every 24 hours), and every time the log screen opens |
+| Content verification | The body of an entry: signature, `body_hash`, `prev`, the opening of the plaintext | The entries beyond the vouched end, the entries of format 1, the control entries, a `seq` with more than one candidate key that satisfies the chain equation, and the entries the screen shows |
+
+Index verification of a chain of format 2:
+
+1. The app obtains a head: from a living node with a new nonce (signature and nonce checked), from
+   the backend the `final` head of a node that is gone (signature checked). The `seq` of the head is
+   the vouched end. A node that is gone without a `final` head has no vouched end. When the `seq`
+   and the `hash` of the head equal the verified point, the chain is verified and the app reads no
+   listing of that node in this run.
+2. The app lists the keys of the node prefix from the key marker of its verified point (the `seq`
+   as 20 digits followed by `-~`: every key of that `seq` sorts before it). A key of format 2 has
+   seven parts: `seq` (20 digits), `time_ms` (13 digits), `kind` (`c` or `u`), `count` (3 digits),
+   `key_id` (16 hexadecimal characters), `b64u(body_hash)`, `b64u(entry_hash)`. A key of another
+   shape under the node prefix is left out, and so is a delete marker of the listing.
+3. For every `seq` after the verified point up to the vouched end, in order: among the keys of that
+   `seq` (a key counts once however many versions of its object the listing shows: a write the node
+   repeated adds a version) the app takes the candidates whose `entry_hash` equals
+   `SHA-256("pickle.secure.v2.log-chain\n" || cursor.hash || body_hash || UTF-8(the first five parts of the key))`.
+   A key of other parts than the node wrote (another `time_ms`, `kind`, `count` or `key_id` beside
+   the hashes of the entry) does not satisfy the equation. When exactly one candidate
+   satisfies the equation and its `kind` is `u`, the cursor moves to it without reading its object.
+   When its `kind` is `c`, the app reads the object (the latest version first), verifies the
+   signature of the node, `body.seq`, `body.prev` = `cursor.hash`, `SHA-256(body)` = `body_hash`,
+   `body.key_id` = `key_id`, `body.count` = 1, opens the event when `key_id` is its own, and traces
+   a transfer (`grant_transferred_out`: the receiving node enters the list of nodes). When more
+   than one candidate satisfies the equation (the operator domain can add objects under any key),
+   the app reads their objects and takes the one whose signature verifies. When no candidate
+   satisfies the equation: a gap (missing) and attention.
+4. At the vouched end the cursor hash equals the hash of the head, otherwise attention. Beyond the
+   vouched end (entries written after the head was signed) the app stops: the next run reads them
+   from a newer head. For a node that is gone without a `final` head, every entry after the
+   verified point is read by content verification (the signature alone proves that the node wrote
+   it).
+5. The verified point moves to the cursor (`seq`, `hash` and the `time_ms` of the key). The listing
+   of the account prefix (delimiter `/`) is the discovery of nodes: a node the list of the app does
+   not know is verified from `seq` 1 with its first entry (a control entry) read by content; when
+   that entry is sealed to the key of this account and no traced transfer explains the node, the
+   node is a delegation the app did not make (attention) and stays in the list with that mark. The
+   nodes of the listing that the list of nodes does not know are examined after the known nodes, at
+   most `LOG_STORE_NODES` of them in one run (more leave the run pending).
+
+Expired entries: an object of the store cannot be deleted for 365 days (7.6), and after that its
+absence says nothing about the operator domain (the lifecycle rule of the bucket removes it at 400
+days, and nothing forbids its removal before then once its retention ended). When the listing from
+the verified point starts at a `seq` above `verified.seq + 1` and the `time_ms` of the verified
+point, or of the first listed entry, is more than 365 days before the node time of the head, the
+entries between are expired: the app moves the verified point to the first listed key (reading that
+object by content when its `kind` is `u`, so that the new point is a signed entry of the node) and
+continues. A verified point of format 1 has no `time_ms` (0) and never qualifies as expired.
+
+Young gaps: a node writes an entry the store did not confirm again with the next write of the
+account and, at the latest, in its sweep of 30 seconds (7.6), so a gap below the vouched end is
+usually an entry that is about to be written. A gap whose first key after it (every key of that
+`seq`) is a key of format 2 younger than one hour (`LOG_GAP_GRACE_MS`) leaves the chain pending:
+the next run reads the gap again. A gap whose first key after it is older than that is missing
+(attention): the node did not write the entry in time, and the acts of the entries of a gap did not
+take place (an act follows the confirmation of its entry).
+
+Why the equation suffices up to the vouched end: the hash of the head is signed by the node, each
+`entry_hash` commits to the `entry_hash` before it, to `body_hash` and to the five parts of its own
+key, and `body_hash` commits to the body. A sequence of keys that satisfies the equations and ends
+at the hash of the head fixes the keys and the bodies of the chain under the collision resistance
+of SHA-256. An object the operator domain added either fails the equation or, when it satisfies it
+with the hashes of a genuine entry, has the same key as the genuine object (a second version, whose
+body does not verify): a key of other parts (another `time_ms`, `kind`, `count` or `key_id`) fails
+it. The genuine objects cannot be deleted before their retention ends, so the chain of genuine keys
+is always in the listing.
 
 | Result | Meaning |
 | --- | --- |
-| Everything passes | Every entry the node wrote for this account is in the log store without a gap up to the end of the listing, and every entry inside the cache window of the operator's storage (`LOG_CACHE_DAYS`, section 12) was served by it |
-| A `seq` is missing from the listing below its end, or an entry up to the vouched end does not verify | The log has an omission or a change |
-| An entry inside the cache window is in the store but not in the storage of the operator, and it is older than `LOG_WITHHELD_GRACE_MS` | The operator's storage withheld an entry: the app shows it and marks the log |
-| A node appears in the listing that no grant of the app and no traced transfer explains, with an entry sealed to the key of this account | A node used the key of the account outside the delegations the app knows |
+| Everything passes | The entries that this node wrote for this account are in the store without a gap up to the vouched end, the chain hashes agree with the head, and every control entry verifies |
+| A `seq` without a candidate whose first key after it is older than one hour, a candidate chain that does not reach the hash of the head, a control entry that does not verify | The stored log has an omission or a change |
+| A `seq` without a candidate whose first key after it is younger than one hour | Pending: the node has still to write the entry again (7.6); the next run reads the gap |
+| A node appears in the listing that no grant of the app and no traced transfer explains, with a first entry sealed to the key of this account | A node used the key of the account outside the delegations the app knows |
+| A node that is gone has no `final` head | The entries after the verified point are read by content verification. The part the app has not read yet is pending |
 | The store cannot be listed or read, an address the backend handed out is not one of the request, more unknown prefixes than `LOG_STORE_NODES` are listed, or a release build of the app is refused the store | The verification is pending (the app does not treat it as complete); the refusal of a release build marks the log, and reads that keep failing for `LOG_STORE_STALE_MS` mark the log |
-| A node that is gone has no `final` head | The end of its chain is the end of the listing (step 3). Without a log store (step 5) the part after the last verified point cannot be checked against a head |
 
-The authenticity of an entry that the app displays is checked with the node signature of that
-entry (the whole chain is not needed for this), and the content is opened with the log decryption
-private key. The app does not open an entry whose `key_id` is not its own. It shows such an entry
-as part of a delegation of another key.
+Format 1 (the chains of nodes of the releases before v2.0.0): the app verifies every entry by its
+object (signature, `node`, `user_id`, `seq`, `prev`, and `entry_hash` equal to the hash of the
+key), up to the head. These chains end when their nodes are drained (`final` head), and the app
+reads them until its verified point reaches the `final` head.
+
+The authenticity of an entry the app displays is checked with the node signature of that entry and
+with its key (`body_hash`), and its content is opened with the log decryption private key. The app
+does not open an entry whose `key_id` is not its own. It shows such an entry as part of a
+delegation of another key.
 
 ### 7.5 The witness signature (stage 2)
 
@@ -636,17 +737,16 @@ witness = {"node": <witness node>, "sig": b64u(Ed25519(witness node signing key,
 
 ### 7.6 The log store
 
-The storage of the operator's backend is inside the operator domain: an entry that is stored there
-can be deleted there, and what the app's verification of the chain shows is that something is
-missing. The log store is the place where an entry cannot be deleted: a node writes every entry
-there itself, and acts only after the store confirmed the entry.
+The log store is the one place an entry is stored, and the place where an entry cannot be deleted:
+a node writes every entry there itself, and acts only after the store confirmed the entry. The
+storage of the operator's backend holds no entry.
 
 | Item | Value |
 | --- | --- |
 | Store | One Amazon S3 bucket with Object Lock and versioning. The binding of a node names the bucket and its region (4.1) |
-| Object key | `v1/accounts/{user_id}/{node}/{seq}-{hash}`. `seq` is the `seq` of the entry as 20 decimal digits, with zeros in front. `hash` is `b64u(entry_hash)` of the entry (7.1) |
-| Object body | The signed entry as a response carries it: `{"body":"...","sig":"..."}`, the same bytes |
-| Retention | Mode `COMPLIANCE`, until the node time of the write plus 365 days. Until then nobody, the root user of the AWS account included, can delete that object version, overwrite it or shorten its retention |
+| Object key | Format 2: `v1/accounts/{user_id}/{node}/{seq}-{time_ms}-{kind}-{count}-{key_id}-{body_hash}-{entry_hash}`. `seq` is the `seq` of the entry as 20 decimal digits with zeros in front, `time_ms` the `time_ms` of the entry as 13 decimal digits with zeros in front, `kind` the letter `c` (a control entry) or `u` (a use entry), `count` the `count` of the entry as 3 decimal digits with zeros in front, `key_id` the `key_id` of the entry (16 lower-case hexadecimal characters), `body_hash` and `entry_hash` the b64u of the two hashes of 7.1. Format 1: `v1/accounts/{user_id}/{node}/{seq}-{hash}` with `hash` = `b64u(entry_hash)`. The prefix of the store is the same for both formats |
+| Object body | The signed entry: `{"body":"...","sig":"..."}` |
+| Retention | Every object version is written with mode `COMPLIANCE` and a retention until the node time of the write plus 365 days. Until then nobody, the root user of the AWS account included, can delete that object version, overwrite it or shorten its retention. The lifecycle rule of the bucket expires current versions 400 days after their creation and removes noncurrent versions 400 days after they became noncurrent. So an entry is in the store for at least 365 days and at most about 400 days, and a reader treats the absence of an entry older than 365 days as expired, not as an omission (7.4) |
 
 The write of one entry:
 
@@ -668,6 +768,10 @@ Authorization: AWS4-HMAC-SHA256 Credential=..., SignedHeaders=..., Signature=...
   that the operator domain gives the node (enclave.md 5.14). In the path, every byte of the key
   outside the unreserved characters of RFC 3986 is percent-encoded, and `/` is not: a `user_id`
   is written into the key as it is.
+- The node keeps up to 32 idle HTTP/1.1 connections to the store and sends a write over the most
+  recently used one; a write over an idle connection that ends without a response goes once more
+  over a new connection (a `PUT` is idempotent, and a repeated write adds a second version of the
+  same object). A connection carries one write at a time.
 - The one confirmation of a write is the status 200 of that request. Every other status, a
   failure of the connection and a write that takes longer than its time limit are no
   confirmation. A bucket without Object Lock refuses a request with these headers, so a node
@@ -679,15 +783,19 @@ Authorization: AWS4-HMAC-SHA256 Credential=..., SignedHeaders=..., Signature=...
   that someone else wrote under that key can have another body or no retention. So a write that
   is repeated (the answer of the first one was lost) adds a second version of the same object. A
   reader of the store takes a key for an entry of the node when one version of the object is an
-  entry that verifies: the signature of the node over its `body`, and `entry_hash(body)` equal to
-  the `hash` of the key.
+  entry that verifies: the signature of the node over its `body`, and the hashes of the key equal
+  to those of the body (7.1).
 
 The acts that wait for the confirmation. A node that has a log store does not perform the act of a
-row before the store confirmed the entry of that row:
+row before the store confirmed the entry that holds the event of that row. The group commit (7.1)
+means that one write confirms the acts of every event of the entry, and a write that is not
+confirmed fails every call that waits for that entry with `log_store_unavailable` and leaves the
+entry as a pending entry (a call that waited writes it once more, 7.1):
 
-| Call | Entry | The act that waits | When the store does not confirm the entry |
+| Call | Event | The act that waits | When the store does not confirm the entry |
 | --- | --- | --- | --- |
-| `forward` | `provider_request` | The request to the provider. A request that shares the entry of an identical GET request (7.2) waits for that entry: when the store confirmed it before, nothing is written, and when it is a pending entry, the call writes it again | `log_store_unavailable`. No request is sent |
+| `forward` | `provider_request` | The request to the provider. A request that shares the event of an identical GET request (7.2) waits for the entry that holds it: when the store confirmed it before, nothing is written, and when it is a pending entry, the call writes it again | `log_store_unavailable`. No request is sent |
+| `forward/batch` | `provider_request`, one per request | The requests to the provider, all of them, after every entry that holds one of their events is confirmed | `log_store_unavailable` for the whole call. No request is sent |
 | `refresh` | `credential_refreshed` | The call of the token address | `log_store_unavailable`. The token address is not called |
 | `revoke-token` | `connection_removed` | The call of the revocation address | `log_store_unavailable`. The revocation address is not called |
 | `release` | `secret_released`, `totp_issued` | The value in the response | `log_store_unavailable`. The value does not leave |
@@ -695,13 +803,18 @@ row before the store confirmed the entry of that row:
 | The command grant | `grant_accepted` | The user key is put into the memory of the node | The signed reply has `ok` false and the code `log_store_unavailable`. The node holds no key |
 | The command revoke | `grant_revoked` | None. The user key is erased whatever the store answers | The reply is that of a revoke that succeeded. The entry is a pending entry |
 | `peer/export` | `grant_transferred_out`, one per account | The grant of that account enters the transfer | `log_store_unavailable` for the whole call, also when the store confirmed the entries of other accounts: no grant is handed over. The next call for the same receiving node creates no entry for these accounts: it writes the entries that wait again |
-| `peer/import` | `grant_transferred_in`, one per account | None. The grant is put in place, and the entry is a pending entry | Does not apply: the call does not write |
+| `peer/import` | `grant_transferred_in`, one per account | None. The grant is put in place first; the call then writes the entries it created in one round, when the node has credentials for its log store | The grant stays in place and the entry is a pending entry: the next write of the account takes it along. The call succeeds all the same |
 
 - A pending entry is an entry that the store has not confirmed and that no call is writing. It
-  stays in the memory of the node (it is on the chain and among the entries without a storage
-  acknowledgement). The next write of the same account takes the pending entries of that account
-  along, at the same time as its own entry. A pending entry that the store refuses again does not
-  fail that call: the condition of an act is the confirmation of the entry of that act.
+  stays in the memory of the node (it is on the chain). The next write of the same account takes
+  the pending entries of that account along, at the same time as its own entry, and a request
+  that merges into an event of a pending entry waits for that write. The sweep of the node (a task
+  that runs every 30 seconds, `SWEEP_INTERVAL`) writes the pending entries of every account again
+  as well, so an account that makes no further call does not leave a gap in the store for longer
+  than the sweep and the write take. A pending entry that the store refuses again does not fail
+  that call: the condition of an act is the confirmation of the entry of that act. An account
+  whose pending entries reached 64 gets no further entry from a call that uses a credential
+  (enclave.md 5.14).
 - What a missing object means. An object of the log store cannot be deleted before its retention
   ends. So for a `seq` of a chain whose object is not in the store, the act that entry describes
   did not take place: the node did not call the provider, did not hand the value out, did not
@@ -1039,8 +1152,7 @@ any other form is not a release tag and has no place in the order.
 | `exchange_failed`, `refresh_failed` | The provider refused the exchange or the refresh. The failure carries the HTTP status of the provider and one word of a closed vocabulary for the error of its response (enclave.md 5.7) |
 | `provider_unreachable`, `timeout` | A transport failure, a time limit that passed |
 | `response_withheld` | A provider response failed a check of rule E4 of the egress policy (egress-policy.md) and was not handed on. A repeated call does not change the outcome |
-| `too_large` | A body above the limit (64 MiB each for a request and a response) |
-| `log_backlog` | The entries of that account without a storage acknowledgement reached the limit (64) |
+| `too_large` | A body above the limit (64 MiB each for a request and a response; for `forward/batch`, the bodies of the results together) |
 | `log_store_unavailable` | The log store did not confirm the entry of the call, or the node cannot write to it: it has no log store in its configuration, or no credentials within their time (7.6). The act of the call did not take place. A repeated call can succeed |
 | `capacity_unavailable` | The mail call could not immediately reserve its slot or body budget. No credential was opened and no provider request was sent. A later call can succeed |
 
@@ -1060,10 +1172,22 @@ any other form is not a release tag and has no place in the order.
 | Longest release statement (10.3) | 16,384 bytes |
 | Notice period of a release (10.3) | 0 seconds |
 | Longest time by which a log entry lies after the time of the node (10.3) | 300 seconds |
-| Most entries without a storage acknowledgement (per account) | 64 |
-| Retention of an object of the log store | 365 days from the node time of the write |
-| `LOG_CACHE_DAYS` (the app) | 14 days: the time for which the storage of the operator's backend keeps every entry. The app treats an entry inside this window that the store holds and the backend does not serve as withheld (7.4) |
-| `LOG_WITHHELD_GRACE_MS` (the app) | 1 hour: an entry taken from the store younger than this is not judged withheld yet; the verification stays pending before it (7.4) |
+| Most events in one entry (`ENTRY_EVENTS`) | 128 |
+| Most bytes of the plaintext of one entry (`ENTRY_PLAINTEXT_BYTES`) | 1,048,576 |
+| Most requests in one forward batch (`FORWARD_BATCH_REQUESTS`) | 100 |
+| Requests of one forward batch in flight at once (`FORWARD_BATCH_CONCURRENCY`) | 6 |
+| Provider requests of a node in flight at once (`PROVIDER_INFLIGHT`) | 512 |
+| Idle connections of a node to its log store (`LOG_STORE_IDLE_CONNECTIONS`) | 32 |
+| Idle connections of a node to one provider host for one account, and their idle time (`PROVIDER_IDLE_CONNECTIONS`, `PROVIDER_IDLE_MS`) | 8, 30 seconds |
+| Pending entries of an account at which a call that uses a credential creates no entry (`PENDING_ENTRIES`) | 64 |
+| Interval of the sweep of a node, which writes the pending entries of every account again (`SWEEP_INTERVAL`) | 30 seconds |
+| Retention of an object of the log store (Object Lock), expiry of the bucket lifecycle (`LOG_RETENTION_DAYS`, `LOG_EXPIRY_DAYS`) | 365 days from the node time of the write, 400 days |
+| `LOG_VERIFY_KEYS` (the app) | 8,000: the keys one index verification run walks |
+| `LOG_VERIFY_BODIES` (the app) | 2,000: the entry bodies one run reads |
+| `LOG_EXPIRES_DAYS` (the app) | 365: the age at which a reader treats the absence of an entry as expired, the retention of its lock (7.4) |
+| `LOG_GAP_GRACE_MS` (the app) | 3,600,000: a gap whose first key after it is younger than this leaves the chain pending, not attention (7.4) |
+| `LOG_SCREEN_EVENTS` (the app) | 50: the events of one further page of the log screen (the first page reads the events its definition asks for) |
+| `LOG_SUMMARY_DAYS`, `LOG_SUMMARY_STEP`, `LOG_SUMMARY_ENTRIES` (the app) | 7, 100, 1,000: the days of the summary of the log screen (the reads, sends and changes of the events of the entries of that window, counted once per device from their bodies and kept on the device as the summary tally), the entries one read of the screen counts before answering and each later step counts, and the most entries of the window the tally counts (the screen shows the counts with a plus while entries of the window are not counted) |
 | `LOG_STORE_STALE_MS` (the app) | 3 days: reads of the store that have been failing for this long mark the log (7.4) |
 | `LOG_STORE_NODES` (the app) | 16: the nodes of the listing the list of nodes does not know that one verification run examines |
 | Listing pages one verification run reads per node (the app) | 8 pages of 1,000 keys |
@@ -1088,7 +1212,8 @@ name ends with `_text` holds the same value again as UTF-8 text.
 | `record` | `user_key`, `id`, `nonce`, `user_id`, `key_id`, `custody`, `kind`, `provider`, `plaintext`, `aad_text`, `record_key`, `record` (the finished record), `tampered` (records with one field changed each, and `opens: false`. One of them has a changed `custody`), `imported` (a record of kind `oauth_imported` under the same user key: `id`, `nonce`, `kind`, `provider`, `plaintext`, `aad_text`, `record_key`, `record`) | A record created from the same input equals `record`, and the records of `tampered` do not open. The record of `imported` opens under `user_key` and has the plaintext form of kind `oauth` |
 | `command` | The node keys (`node_sign_seed`, `node_sign_pk`, `node_seal_private`, `node_seal_pk`, `node`), the `info` and the `aad` of HPKE, the signature purpose, `cases` (`name`, `envelope`, `result`, `opens`, the opened `payload` and `sig`, `signature_valid`) | A node implementation opens the envelope and gives `result` (`ok` for a success, the code of 5.3 for a failure) |
 | `signed` | `authorization_url_text`, `cases` (`name`, the signature purpose, `public_key`, `body`, `sig`, `valid`): replies, the two statements about an authorization, heads, a challenge statement, and changed ones (among them a reply offered under the purpose string of a challenge statement) | Every case verifies as `valid` says. The `url_sha256` of the `oauth_begin` statement is the hash of `authorization_url_text` |
-| `log` | The node signing public key, `user_id`, `key_id`, `log_private`, `log_pk`, `checkpoint`, `entries` (three entries: `seq`, `hpke_seed`, `time_ms`, `event_text`, `entry`, `entry_hash`), `head_nonce`, `head`, `final_head`, `chain_valid`, `missing_middle` (the list without the middle entry, and `chain_valid: false`) | The verification of the chain gives the same result, every entry opens to `event_text`, and an entry created with the same `hpke_seed` equals `entry` |
+| `log` | Format 2: the node signing public key, `user_id`, `key_id`, `log_private`, `log_pk`, `checkpoint`, `entries` (three entries: a control entry `grant_accepted`, a use entry with three `provider_request` events, a use entry with one `secret_released` event; each with `seq`, `hpke_seed`, `time_ms`, `kind`, `count`, `events_text`, `entry`, `body_text`, `body_hash`, `entry_hash`, `key`), `head_nonce`, `head`, `final_head`, `index_valid` (the keys alone verify to the head), `content_valid`, `missing_middle` (the keys without the middle one: `index_valid` false), `forged_key` (the keys with one more key of `seq` 2 whose `body_hash` is another and whose `entry_hash` is consistent with it: `ambiguous_seq` 2, and the content verification takes the genuine object alone) | The index verification of the keys and the content verification of the entries give these results, every entry opens to `events_text`, and an entry created with the same `hpke_seed` equals `entry` |
+| `log_v1` | The vector `log` of format 1 as the releases before v2.0.0 wrote it: the node signing public key, `user_id`, `key_id`, `log_private`, `log_pk`, `checkpoint`, `entries` (three entries: `seq`, `hpke_seed`, `time_ms`, `event_text`, `entry`, `entry_hash`), `head_nonce`, `head`, `final_head`, `chain_valid`, `missing_middle` | A reader of format 1 verifies the chain with the same result and opens every entry to `event_text` |
 | `attestation.local` | `nonce`, `response` (with its `challenge_statement`), `document_text`, `binding` (of a node without a log store: it has no `log` key), `sign_pk`, `seal_pk`, `release`, `challenge_statement_text` (the body of the statement), `accepted`, `rejected`: another nonce, a binding of version 2, and four responses with the accepted document and nonce that fail for the challenge statement alone (the statement is missing, it is the statement of another request, of another challenge, of another node) | The result of the verification of a local document and of its challenge statement (4.2, 4.4) |
 | `attestation.nitro` | `included` (bool). When it is true: a real Nitro document, its nonce and the expected `binding`. In the committed file it is false, and a `note` states that the file holds no Nitro document | Nothing while `included` is false. Real Nitro documents are inputs of the tests of this repository (`protocol/tests/fixtures/`, `verify/tests/fixtures/`) |
 | `totp` | A list of `seed_base32`, `time_ms`, `code` | RFC 6238 |

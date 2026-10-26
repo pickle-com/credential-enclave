@@ -5,7 +5,7 @@
 //! out one `final` head per account that has a chain.
 
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::extract::{Request, State};
 use axum::response::Response;
@@ -14,7 +14,8 @@ use credential_enclave_protocol::ProtocolError;
 
 use super::responses::{Closed, Heads};
 use super::{invalid, json_ok, respond, ApiError, JsonBody};
-use crate::state::{lock, Node};
+use crate::log_store;
+use crate::state::{lock, Account, Node};
 
 /// Most heads in one page.
 const PAGE_LIMIT: u64 = 1000;
@@ -53,6 +54,29 @@ async fn final_heads(node: &Node, request: Request) -> Result<Response, ApiError
         ));
     }
     let now_ms = node.now_ms();
+    // The open batch of every account is closed into an entry and those entries are written
+    // in one round before a head is signed: a final head covers every event that was
+    // created. An entry that round does not confirm stays a pending entry.
+    let mut closed: Vec<(String, Arc<Mutex<Account>>, u64)> = Vec::new();
+    for (user_id, account) in node.accounts_after("") {
+        let seq = {
+            let mut guard = lock(&account);
+            match guard.has_open_events() {
+                true => node.close_batch(&mut guard, &user_id, now_ms)?,
+                false => None,
+            }
+        };
+        if let Some(seq) = seq {
+            closed.push((user_id, account, seq));
+        }
+    }
+    if !closed.is_empty() {
+        let awaited: Vec<(&Mutex<Account>, u64)> = closed
+            .iter()
+            .map(|(_, account, seq)| (account.as_ref(), *seq))
+            .collect();
+        let _ = log_store::confirm_each(node, &awaited).await;
+    }
     let mut remaining = node
         .accounts_with_chain()
         .into_iter()

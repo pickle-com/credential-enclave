@@ -12,9 +12,9 @@ use credential_enclave_protocol::{limits, purpose};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use super::{provider, quiet_provider};
+use super::{provider, provider_with_log_store, quiet_provider};
 use crate::state::{lock, ActiveGrant, GrantState};
-use crate::testing::{operator_config, App, Harness, Reply, Seen};
+use crate::testing::{operator_config, App, Harness, Provider, Reply, Seen};
 
 fn jwt(claims: &Value) -> String {
     format!(
@@ -85,14 +85,29 @@ fn code(outcome: &(u16, Value)) -> (u16, &str) {
     (outcome.0, outcome.1["code"].as_str().unwrap_or_default())
 }
 
+/// An event without its `time_ms`, the node time of its creation.
+fn without_time(mut event: Value) -> Value {
+    assert!(event["time_ms"].as_u64().is_some(), "{event}");
+    event.as_object_mut().unwrap().remove("time_ms");
+    event
+}
+
+/// A configured node with the log store of the tests. The stand-in confirms every write, and
+/// a test reads the events of the node from what it received.
+async fn node_with_log_store(provider: &Provider) -> Harness {
+    let harness = Harness::new(provider);
+    harness.use_log_store().await;
+    harness
+}
+
 #[tokio::test]
 async fn a_google_connection_is_issued_inside_the_node_with_pkce() {
-    let provider = provider(|seen| match seen.target.as_str() {
+    let provider = provider_with_log_store(|seen| match seen.target.as_str() {
         "/token" => Reply::json(200, &google_token()),
         _ => Reply::json(404, &json!({})),
     })
     .await;
-    let harness = Harness::configured(&provider).await;
+    let harness = node_with_log_store(&provider).await;
     let app = App::new("user-1", 1);
     app.grant(&harness).await;
 
@@ -250,7 +265,8 @@ async fn a_google_connection_is_issued_inside_the_node_with_pkce() {
     }
     assert!(!started.to_string().contains(&verifier));
 
-    // The completion statement and the entry name the record.
+    // The completion statement and the event name the record. The event forms entry 2, after
+    // the entry of the grant.
     let statement = harness.verified(purpose::STATEMENT, &issued["statement"]);
     assert_eq!(statement["type"], "oauth_complete");
     assert_eq!(statement["state"], state);
@@ -274,20 +290,23 @@ async fn a_google_connection_is_issued_inside_the_node_with_pkce() {
         ]
     );
     assert_eq!(
-        app.event(&harness, &issued["entry"]),
+        issued["log"],
+        json!({"seq": 2, "index": 0, "created": true})
+    );
+    assert_eq!(
+        without_time(app.logged(&harness, &provider, &issued["log"])),
         json!({
             "t": "connection_created", "record_id": record["id"], "provider": "google_workspace",
             "scope": "openid https://www.googleapis.com/auth/gmail.readonly",
         })
     );
-    assert_eq!(app.entry_body(&harness, &issued["entry"])["seq"], 2);
 
     // A state is used once.
     assert_eq!(
         code(&complete(&harness, "user-1", state).await),
         (404, "state_unknown")
     );
-    assert_eq!(provider.seen().len(), 1);
+    assert_eq!(provider.requests().len(), 1);
 }
 
 #[tokio::test]
@@ -396,7 +415,7 @@ async fn a_pending_authorization_is_bound_to_its_state_user_key_and_time() {
     );
 
     // No exchange reached the provider in any of these cases.
-    assert!(provider.seen().is_empty());
+    assert!(provider.requests().is_empty());
 }
 
 #[tokio::test]
@@ -497,12 +516,12 @@ async fn a_refresh_merges_the_response_into_the_same_record() {
             &json!({"error": "invalid_grant", "error_description": "Token has been revoked."}),
         ),
     ]));
-    let provider = provider({
+    let provider = provider_with_log_store({
         let answers = answers.clone();
         move |_| lock(&answers).remove(0)
     })
     .await;
-    let harness = Harness::configured(&provider).await;
+    let harness = node_with_log_store(&provider).await;
     let app = App::new("user-1", 1);
     app.grant(&harness).await;
     let state = begin(&harness, "user-1", "google_workspace", json!({}), "")
@@ -522,7 +541,7 @@ async fn a_refresh_merges_the_response_into_the_same_record() {
         )
         .await;
     assert_eq!(status, 200, "{renewed}");
-    let call = &provider.seen()[1];
+    let call = &provider.requests()[1];
     assert_eq!(call.target, "/token");
     assert_eq!(
         call.form(),
@@ -559,7 +578,11 @@ async fn a_refresh_merges_the_response_into_the_same_record() {
     );
     assert!(!renewed.to_string().contains("ya29.second-access"));
     assert_eq!(
-        app.event(&harness, &renewed["entry"]),
+        renewed["log"],
+        json!({"seq": 3, "index": 0, "created": true})
+    );
+    assert_eq!(
+        without_time(app.logged(&harness, &provider, &renewed["log"])),
         json!({"t": "credential_refreshed", "record_id": record["id"], "provider": "google_workspace"})
     );
 
@@ -578,7 +601,9 @@ async fn a_refresh_merges_the_response_into_the_same_record() {
     assert!(token.get("expires_in").is_none());
     assert!(rotated["public"]["token"].get("expires_in").is_none());
     assert_eq!(
-        provider.seen()[2].form_value("refresh_token").as_deref(),
+        provider.requests()[2]
+            .form_value("refresh_token")
+            .as_deref(),
         Some("1//first-refresh")
     );
 
@@ -638,7 +663,7 @@ async fn a_refresh_needs_an_oauth_record_with_a_refresh_token() {
 
     // None of these created an entry or reached a provider.
     assert_eq!(harness.head_seq("user-1"), 1);
-    assert!(provider.seen().is_empty());
+    assert!(provider.requests().is_empty());
 }
 
 fn slack_token() -> Value {
@@ -674,7 +699,7 @@ async fn slack_tokens_live_in_the_nested_place_and_ok_false_is_a_refusal() {
         ),
         Reply::json(200, &json!({"ok": false, "error": "invalid_refresh_token"})),
     ]));
-    let provider = provider({
+    let provider = provider_with_log_store({
         let answers = answers.clone();
         move |seen| match seen.target.as_str() {
             "/api/oauth.v2.access" => lock(&answers).remove(0),
@@ -682,7 +707,7 @@ async fn slack_tokens_live_in_the_nested_place_and_ok_false_is_a_refusal() {
         }
     })
     .await;
-    let harness = Harness::configured(&provider).await;
+    let harness = node_with_log_store(&provider).await;
     let app = App::new("user-1", 1);
     app.grant(&harness).await;
     let start = || {
@@ -710,10 +735,10 @@ async fn slack_tokens_live_in_the_nested_place_and_ok_false_is_a_refusal() {
     assert_eq!(failure["code"], "exchange_failed");
     assert_eq!(failure["provider_status"], 200);
     assert_eq!(failure["provider_error"], "invalid_code");
-    assert_eq!(provider.seen()[0].server_name, "slack.com");
-    assert!(provider.seen()[0].form_value("code_verifier").is_none());
+    assert_eq!(provider.requests()[0].server_name, "slack.com");
+    assert!(provider.requests()[0].form_value("code_verifier").is_none());
 
-    // A successful exchange: the scope of the entry and the public fields come from the
+    // A successful exchange: the scope of the event and the public fields come from the
     // nested place, and no token value is public.
     let started = start().await.1;
     let (status, issued) = complete(&harness, "user-1", started["state"].as_str().unwrap()).await;
@@ -735,7 +760,7 @@ async fn slack_tokens_live_in_the_nested_place_and_ok_false_is_a_refusal() {
     assert_eq!(issued["public"]["id_token_claims"], json!({}));
     assert!(!issued.to_string().contains("xoxe"));
     assert_eq!(
-        app.event(&harness, &issued["entry"])["scope"],
+        app.logged(&harness, &provider, &issued["log"])["scope"],
         "channels:history,chat:write"
     );
 
@@ -748,7 +773,9 @@ async fn slack_tokens_live_in_the_nested_place_and_ok_false_is_a_refusal() {
         .await;
     assert_eq!(status, 200, "{renewed}");
     assert_eq!(
-        provider.seen()[2].form_value("refresh_token").as_deref(),
+        provider.requests()[2]
+            .form_value("refresh_token")
+            .as_deref(),
         Some("xoxe-1-first")
     );
     let token = app.open(&renewed["record"])["token"].clone();
@@ -780,7 +807,7 @@ async fn slack_tokens_live_in_the_nested_place_and_ok_false_is_a_refusal() {
         .unwrap();
     assert_eq!(forwarded.status, 200);
     assert_eq!(
-        provider.seen().last().unwrap().header("authorization"),
+        provider.requests().last().unwrap().header("authorization"),
         Some("Bearer xoxe.xoxp-second")
     );
 
@@ -799,7 +826,7 @@ async fn slack_tokens_live_in_the_nested_place_and_ok_false_is_a_refusal() {
 
 #[tokio::test]
 async fn notion_link_and_granola_authenticate_the_way_their_definitions_say() {
-    let provider = provider(|seen| match seen.server_name.as_str() {
+    let provider = provider_with_log_store(|seen| match seen.server_name.as_str() {
         "api.notion.com" => Reply::json(
             200,
             &json!({
@@ -825,7 +852,7 @@ async fn notion_link_and_granola_authenticate_the_way_their_definitions_say() {
         ),
     })
     .await;
-    let harness = Harness::configured(&provider).await;
+    let harness = node_with_log_store(&provider).await;
     let app = App::new("user-1", 1);
     app.grant(&harness).await;
 
@@ -838,7 +865,7 @@ async fn notion_link_and_granola_authenticate_the_way_their_definitions_say() {
     let issued = complete(&harness, "user-1", started["state"].as_str().unwrap())
         .await
         .1;
-    let call = provider.seen().last().unwrap().clone();
+    let call = provider.requests().last().unwrap().clone();
     assert_eq!(
         (call.server_name.as_str(), call.target.as_str()),
         ("api.notion.com", "/v1/oauth/token")
@@ -864,7 +891,7 @@ async fn notion_link_and_granola_authenticate_the_way_their_definitions_say() {
         })
     );
     assert_eq!(issued["public"]["has_refresh_token"], false);
-    assert_eq!(app.event(&harness, &issued["entry"])["scope"], "");
+    assert_eq!(app.logged(&harness, &provider, &issued["log"])["scope"], "");
 
     // link: the publishable key in the address and as the bearer of the token call, the
     // client values in the body.
@@ -879,7 +906,7 @@ async fn notion_link_and_granola_authenticate_the_way_their_definitions_say() {
     let url = started["authorization_url"].as_str().unwrap();
     assert!(url.ends_with("&code_challenge_method=S256&key=pk_test_1&scope=userinfo%3Aread"));
     complete(&harness, "user-1", started["state"].as_str().unwrap()).await;
-    let call = provider.seen().last().unwrap().clone();
+    let call = provider.requests().last().unwrap().clone();
     assert_eq!(
         (call.server_name.as_str(), call.target.as_str()),
         ("login.link.com", "/auth/token")
@@ -923,7 +950,7 @@ async fn notion_link_and_granola_authenticate_the_way_their_definitions_say() {
     let issued = complete(&harness, "user-1", started["state"].as_str().unwrap())
         .await
         .1;
-    let call = provider.seen().last().unwrap().clone();
+    let call = provider.requests().last().unwrap().clone();
     assert_eq!(call.server_name, "mcp-auth.granola.ai");
     let fields: Vec<String> = call.form().into_iter().map(|(name, _)| name).collect();
     assert_eq!(
@@ -951,7 +978,7 @@ async fn notion_link_and_granola_authenticate_the_way_their_definitions_say() {
         )
         .await;
     assert_eq!(status, 200);
-    let call = provider.seen().last().unwrap().clone();
+    let call = provider.requests().last().unwrap().clone();
     assert_eq!(
         call.form(),
         [
@@ -1099,9 +1126,9 @@ async fn a_reconnect_without_a_refresh_token_keeps_the_previous_one() {
             "has_refresh_token": true,
         })
     );
-    assert!(merged.get("entry").is_none());
+    assert!(merged.get("log").is_none());
     assert_eq!(harness.head_seq("user-1"), 1);
-    assert!(provider.seen().is_empty());
+    assert!(provider.requests().is_empty());
 
     // A new record with its own refresh token keeps it.
     let (_, kept) = merge(previous.clone(), new.clone()).await;
@@ -1143,17 +1170,16 @@ async fn a_reconnect_without_a_refresh_token_keeps_the_previous_one() {
 
 #[tokio::test]
 async fn revoke_token_sends_the_refresh_token_to_the_revocation_address() {
-    let provider =
-        provider(
-            |seen: &Seen| match (seen.server_name.as_str(), seen.target.as_str()) {
-                ("api.x.com", "/2/oauth2/revoke") => {
-                    Reply::json(400, &json!({"error": "invalid_request"}))
-                }
-                _ => Reply::json(200, &json!({})),
-            },
-        )
-        .await;
-    let harness = Harness::configured(&provider).await;
+    let provider = provider_with_log_store(|seen: &Seen| {
+        match (seen.server_name.as_str(), seen.target.as_str()) {
+            ("api.x.com", "/2/oauth2/revoke") => {
+                Reply::json(400, &json!({"error": "invalid_request"}))
+            }
+            _ => Reply::json(200, &json!({})),
+        }
+    })
+    .await;
+    let harness = node_with_log_store(&provider).await;
     let app = App::new("user-1", 1);
     app.grant(&harness).await;
     let revoke = |record: Value| {
@@ -1177,7 +1203,7 @@ async fn revoke_token_sends_the_refresh_token_to_the_revocation_address() {
     let (status, revoked) = revoke(google.clone()).await;
     assert_eq!(status, 200);
     assert_eq!(revoked["revoked"], true);
-    let call = provider.seen().last().unwrap().clone();
+    let call = provider.requests().last().unwrap().clone();
     assert_eq!(
         (call.server_name.as_str(), call.target.as_str()),
         ("oauth2.googleapis.com", "/revoke")
@@ -1191,7 +1217,11 @@ async fn revoke_token_sends_the_refresh_token_to_the_revocation_address() {
     );
     assert_eq!(call.header("authorization"), None);
     assert_eq!(
-        app.event(&harness, &revoked["entry"]),
+        revoked["log"],
+        json!({"seq": 2, "index": 0, "created": true})
+    );
+    assert_eq!(
+        without_time(app.logged(&harness, &provider, &revoked["log"])),
         json!({"t": "connection_removed", "record_id": google["id"], "provider": "google_workspace", "provider_revoke": true})
     );
 
@@ -1203,7 +1233,7 @@ async fn revoke_token_sends_the_refresh_token_to_the_revocation_address() {
         &json!({"token": {"access_token": "l-access"}, "obtained_ms": 1}),
     );
     assert_eq!(revoke(link).await.1["revoked"], true);
-    let call = provider.seen().last().unwrap().clone();
+    let call = provider.requests().last().unwrap().clone();
     assert_eq!(
         (call.server_name.as_str(), call.target.as_str()),
         ("login.link.com", "/auth/revoke")
@@ -1223,20 +1253,20 @@ async fn revoke_token_sends_the_refresh_token_to_the_revocation_address() {
     let x = app.record("oauth", "x", &json!({"token": {"access_token": "x-access", "refresh_token": "x-refresh"}, "obtained_ms": 1}));
     let (status, refused) = revoke(x.clone()).await;
     assert_eq!((status, refused["revoked"].as_bool()), (200, Some(false)));
-    let call = provider.seen().last().unwrap().clone();
+    let call = provider.requests().last().unwrap().clone();
     assert_eq!(
         call.header("authorization"),
         Some(format!("Basic {}", STANDARD.encode("x-client:x-secret")).as_str())
     );
-    // The entry was created before the call: it says that the node calls the revocation
+    // The event was created before the call: it says that the node calls the revocation
     // address, not what the provider answered.
     assert_eq!(
-        app.event(&harness, &refused["entry"]),
+        without_time(app.logged(&harness, &provider, &refused["log"])),
         json!({"t": "connection_removed", "record_id": x["id"], "provider": "x", "provider_revoke": true})
     );
 
     // microsoft has no revocation address: the entry is written and no provider is called.
-    let calls = provider.seen().len();
+    let calls = provider.requests().len();
     let microsoft = app.record(
         "oauth",
         "microsoft",
@@ -1245,10 +1275,10 @@ async fn revoke_token_sends_the_refresh_token_to_the_revocation_address() {
     let (status, skipped) = revoke(microsoft.clone()).await;
     assert_eq!((status, skipped["revoked"].as_bool()), (200, Some(false)));
     assert_eq!(
-        app.event(&harness, &skipped["entry"]),
+        without_time(app.logged(&harness, &provider, &skipped["log"])),
         json!({"t": "connection_removed", "record_id": microsoft["id"], "provider": "microsoft", "provider_revoke": false})
     );
-    assert_eq!(provider.seen().len(), calls);
+    assert_eq!(provider.requests().len(), calls);
 
     // A record that is not OAuth.
     let vault = app.record("vault_password", "vault", &json!({"value": "x"}));
@@ -1305,7 +1335,7 @@ async fn a_repeated_refresh_of_the_same_record_gets_the_kept_response() {
     // one, which the record that was sent still holds, is no longer valid there.
     let (status, first) = refresh(&harness, "user-1", &record).await;
     assert_eq!(status, 200, "{first}");
-    assert_eq!(provider.seen().len(), 2);
+    assert_eq!(provider.requests().len(), 2);
     assert_eq!(
         app.open(&first["record"])["token"]["refresh_token"],
         "1//rotated-refresh-1"
@@ -1319,7 +1349,7 @@ async fn a_repeated_refresh_of_the_same_record_gets_the_kept_response() {
         assert_eq!(status, 200);
         assert_eq!(again, first);
     }
-    assert_eq!(provider.seen().len(), 2);
+    assert_eq!(provider.requests().len(), 2);
     assert_eq!(harness.head_seq("user-1"), seq);
 
     // The kept response belongs to the account: another account does not get it, and the
@@ -1330,14 +1360,16 @@ async fn a_repeated_refresh_of_the_same_record_gets_the_kept_response() {
         code(&refresh(&harness, "user-2", &record).await),
         (400, "user_mismatch")
     );
-    assert_eq!(provider.seen().len(), 2);
+    assert_eq!(provider.requests().len(), 2);
 
     // The record the refresh returned is another record: its refresh is a provider call.
     let (status, second) = refresh(&harness, "user-1", &first["record"]).await;
     assert_eq!(status, 200);
-    assert_eq!(provider.seen().len(), 3);
+    assert_eq!(provider.requests().len(), 3);
     assert_eq!(
-        provider.seen()[2].form_value("refresh_token").as_deref(),
+        provider.requests()[2]
+            .form_value("refresh_token")
+            .as_deref(),
         Some("1//rotated-refresh-1")
     );
     assert_ne!(second["record"]["ct"], first["record"]["ct"]);
@@ -1346,14 +1378,16 @@ async fn a_repeated_refresh_of_the_same_record_gets_the_kept_response() {
     // gone, and the same record is a provider call again.
     harness.node.clock.advance(3_600_000 - 2_000);
     assert_eq!(refresh(&harness, "user-1", &record).await.1, first);
-    assert_eq!(provider.seen().len(), 3);
+    assert_eq!(provider.requests().len(), 3);
     harness.node.clock.advance(2_000);
     let (status, late) = refresh(&harness, "user-1", &record).await;
     assert_eq!(status, 200);
-    assert_eq!(provider.seen().len(), 4);
+    assert_eq!(provider.requests().len(), 4);
     assert_ne!(late["record"]["ct"], first["record"]["ct"]);
     assert_eq!(
-        provider.seen()[3].form_value("refresh_token").as_deref(),
+        provider.requests()[3]
+            .form_value("refresh_token")
+            .as_deref(),
         Some("1//first-refresh")
     );
 }
@@ -1373,7 +1407,7 @@ async fn a_revoke_drops_the_kept_refresh_responses() {
     let record = complete(&harness, "user-1", &state).await.1["record"].clone();
     let (_, first) = refresh(&harness, "user-1", &record).await;
     assert_eq!(refresh(&harness, "user-1", &record).await.1, first);
-    assert_eq!(provider.seen().len(), 2);
+    assert_eq!(provider.requests().len(), 2);
 
     // After a revoke the account gets nothing, the kept response included.
     app.revoke(&harness).await;
@@ -1386,7 +1420,7 @@ async fn a_revoke_drops_the_kept_refresh_responses() {
     let (status, after) = refresh(&harness, "user-1", &record).await;
     assert_eq!(status, 200);
     assert_ne!(after, first);
-    assert_eq!(provider.seen().len(), 3);
+    assert_eq!(provider.requests().len(), 3);
 
     // An expired grant drops them as well.
     assert_eq!(refresh(&harness, "user-1", &record).await.1, after);
@@ -1397,7 +1431,7 @@ async fn a_revoke_drops_the_kept_refresh_responses() {
     );
     app.grant(&harness).await;
     assert_eq!(refresh(&harness, "user-1", &record).await.0, 200);
-    assert_eq!(provider.seen().len(), 4);
+    assert_eq!(provider.requests().len(), 4);
 }
 
 #[tokio::test]
@@ -1480,7 +1514,7 @@ async fn an_imported_record_is_used_like_an_oauth_record_and_stays_imported() {
         )
         .await;
     assert_eq!((status, &revoked["revoked"]), (200, &json!(true)));
-    let call = provider.seen().last().unwrap().clone();
+    let call = provider.requests().last().unwrap().clone();
     assert_eq!(call.target, "/revoke");
     assert_eq!(
         call.form_value("token").as_deref(),
@@ -1569,5 +1603,5 @@ async fn a_token_response_with_a_token_in_a_public_field_is_withheld() {
     );
     assert!(!failure.to_string().contains("1//rotated-leaked"));
     assert_eq!(harness.head_seq("user-1"), before + 1);
-    assert_eq!(provider.seen().len(), 4);
+    assert_eq!(provider.requests().len(), 4);
 }

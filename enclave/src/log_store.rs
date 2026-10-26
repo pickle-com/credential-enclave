@@ -25,28 +25,35 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 use std::task::Poll;
+use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use credential_enclave_protocol::encoding::{to_json, Signed};
 use credential_enclave_protocol::keys::LogStoreId;
-use credential_enclave_protocol::log::object_key;
 use credential_enclave_protocol::secret::Secret;
 use credential_enclave_protocol::{limits, ProtocolError};
 use hmac::{Hmac, Mac};
-use hyper::body::Bytes;
-use hyper::header::{HeaderValue, AUTHORIZATION, CONNECTION, CONTENT_LENGTH};
+use hyper::body::{Body, Bytes};
+use hyper::client::conn::http1::SendRequest;
+use hyper::header::{HeaderValue, AUTHORIZATION, CONTENT_LENGTH};
 use hyper::{Method, Request, StatusCode};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+use crate::api::responses::LogRef;
 use crate::egress::OnceBody;
-use crate::state::{lock, Account, Node};
+use crate::state::{lock, Account, EventPlace, Node};
 
 /// Writes of one call that run at the same time.
 const WRITE_CONCURRENCY: usize = 32;
+/// The interval of the sweep of the node ([`keep_sweeping`]).
+pub const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+/// Open connections to the log store that carry no write ([`IdleConnections`]).
+const IDLE_CONNECTIONS: usize = 32;
 /// Pending entries of one account at which a call that uses a credential creates no further
 /// entry before the store confirmed some of them ([`admit`]).
 pub const PENDING_ENTRIES: usize = 64;
@@ -256,10 +263,57 @@ fn object_path(key: &str) -> String {
     path
 }
 
+/// The endpoint of the log store of a node of the local platform (enclave.md 5.14): the S3
+/// stand-in of the local stack, written to in path-style with the `Host` header of the
+/// endpoint and, when its scheme is `http`, without TLS.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogStoreEndpoint {
+    pub tls: bool,
+    pub host: String,
+    pub port: u16,
+}
+
+impl LogStoreEndpoint {
+    /// Reads an `http://host:port` or `https://host:port` origin: a scheme, a host of letters,
+    /// digits, `.` and `-`, and an optional port. A path, a query, a fragment and user
+    /// information are `None`.
+    pub fn parse(text: &str) -> Option<LogStoreEndpoint> {
+        let (tls, rest) = match (text.strip_prefix("http://"), text.strip_prefix("https://")) {
+            (Some(rest), _) => (false, rest),
+            (_, Some(rest)) => (true, rest),
+            _ => return None,
+        };
+        let (host, port) = match rest.split_once(':') {
+            Some((host, port)) => (host, port.parse::<u16>().ok().filter(|port| *port != 0)?),
+            None => (rest, if tls { 443 } else { 80 }),
+        };
+        let valid_host = !host.is_empty()
+            && host.len() <= 253
+            && host
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'));
+        valid_host.then(|| LogStoreEndpoint {
+            tls,
+            host: host.to_string(),
+            port,
+        })
+    }
+
+    /// The value of the `Host` header: the host, with the port when it is not the default of
+    /// the scheme.
+    pub fn authority(&self) -> String {
+        match (self.tls, self.port) {
+            (true, 443) | (false, 80) => self.host.clone(),
+            _ => format!("{}:{}", self.host, self.port),
+        }
+    }
+}
+
 /// Where a write goes and what signs it.
 struct Writer {
     id: LogStoreId,
     credentials: Arc<Credentials>,
+    endpoint: Option<LogStoreEndpoint>,
 }
 
 /// The log store of a node and the credentials for it.
@@ -269,7 +323,37 @@ pub struct LogStore {
     /// The bucket and its region. Set once: the binding of the attestation names it, and what
     /// a verifier read there holds for as long as the node lives.
     id: OnceLock<LogStoreId>,
+    /// The endpoint of a node of the local platform, set once with the log store.
+    endpoint: OnceLock<Option<LogStoreEndpoint>>,
     credentials: RwLock<Option<Arc<Credentials>>>,
+    idle: IdleConnections,
+}
+
+/// The open HTTP/1.1 connections to the log store that carry no write, the most recently used
+/// last.
+#[derive(Default)]
+struct IdleConnections(Mutex<Vec<SendRequest<OnceBody>>>);
+
+impl IdleConnections {
+    /// The most recently used connection that is still open, once it is ready for a request.
+    async fn take(&self) -> Option<SendRequest<OnceBody>> {
+        loop {
+            let mut sender = lock(&self.0).pop()?;
+            if sender.ready().await.is_ok() {
+                return Some(sender);
+            }
+        }
+    }
+
+    /// Keeps a connection whose response has ended, while fewer than [`IDLE_CONNECTIONS`] are
+    /// kept.
+    fn put(&self, sender: SendRequest<OnceBody>) {
+        let mut connections = lock(&self.0);
+        connections.retain(|sender| !sender.is_closed());
+        if connections.len() < IDLE_CONNECTIONS {
+            connections.push(sender);
+        }
+    }
 }
 
 impl LogStore {
@@ -279,7 +363,9 @@ impl LogStore {
         LogStore {
             required,
             id: OnceLock::new(),
+            endpoint: OnceLock::new(),
             credentials: RwLock::new(None),
+            idle: IdleConnections::default(),
         }
     }
 
@@ -292,6 +378,12 @@ impl LogStore {
     /// does not change.
     pub fn set_id(&self, id: LogStoreId) -> bool {
         self.id.get_or_init(|| id.clone()) == &id
+    }
+
+    /// Sets the endpoint of the log store (`None` for the host of the bucket). False when the
+    /// node has another one: the endpoint is set once, with the log store.
+    pub fn set_endpoint(&self, endpoint: Option<LogStoreEndpoint>) -> bool {
+        self.endpoint.get_or_init(|| endpoint.clone()) == &endpoint
     }
 
     /// Replaces the credentials.
@@ -337,6 +429,7 @@ impl LogStore {
         Ok(Some(Writer {
             id: id.clone(),
             credentials,
+            endpoint: self.endpoint.get().cloned().flatten(),
         }))
     }
 
@@ -349,7 +442,8 @@ impl LogStore {
 /// One entry in the hands of a call.
 struct Write {
     seq: u64,
-    hash: [u8; 32],
+    /// The key of the object of the entry (protocol.md 7.6).
+    key: String,
     entry: Signed,
     /// True for an entry an act of the call waits for.
     required: bool,
@@ -361,13 +455,12 @@ struct Write {
 /// When it is dropped, the entries the store confirmed leave the account, and the others
 /// become pending entries: also when the call ends before its writes do.
 struct Claim<'a> {
-    user_id: &'a str,
     account: &'a Mutex<Account>,
     writes: Vec<Write>,
 }
 
 impl<'a> Claim<'a> {
-    fn take(user_id: &'a str, account: &'a Mutex<Account>, seqs: &[u64]) -> Claim<'a> {
+    fn take(account: &'a Mutex<Account>, seqs: &[u64]) -> Claim<'a> {
         let mut writes = Vec::new();
         for entry in lock(account).unconfirmed.iter_mut() {
             let required = seqs.contains(&entry.seq);
@@ -377,18 +470,14 @@ impl<'a> Claim<'a> {
                 entry.writing = true;
                 writes.push(Write {
                     seq: entry.seq,
-                    hash: entry.hash,
+                    key: entry.key.clone(),
                     entry: entry.entry.clone(),
                     required,
                     confirmed: false,
                 });
             }
         }
-        Claim {
-            user_id,
-            account,
-            writes,
-        }
+        Claim { account, writes }
     }
 
     /// True when the store confirmed every entry that an act waits for. An entry that was
@@ -419,7 +508,7 @@ impl Drop for Claim<'_> {
 
 /// Runs futures at the same time, on the task of the caller, and returns their outputs in the
 /// order of the futures.
-async fn join_all<F: Future>(futures: impl Iterator<Item = F>) -> Vec<F::Output> {
+pub(crate) async fn join_all<F: Future>(futures: impl Iterator<Item = F>) -> Vec<F::Output> {
     let mut futures: Vec<Pin<Box<F>>> = futures.map(Box::pin).collect();
     let mut outputs: Vec<Option<F::Output>> = futures.iter().map(|_| None).collect();
     std::future::poll_fn(|context| {
@@ -467,13 +556,20 @@ async fn write_claims(node: &Node, claims: &mut [Claim<'_>]) {
     for round in order.chunks(WRITE_CONCURRENCY) {
         let outcomes = join_all(round.iter().map(|(at, index)| {
             let claim = &claims[*at];
-            send_to_log_store(node, &writer, claim.user_id, &claim.writes[*index])
+            send_to_log_store(node, &writer, &claim.writes[*index])
         }))
         .await;
+        node.log_counters
+            .writes
+            .fetch_add(outcomes.len() as u64, Ordering::Relaxed);
+        let failed = outcomes.iter().filter(|confirmed| !**confirmed).count();
+        node.log_counters
+            .write_failures
+            .fetch_add(failed as u64, Ordering::Relaxed);
         for ((at, index), confirmed) in round.iter().zip(&outcomes) {
             claims[*at].writes[*index].confirmed = *confirmed;
         }
-        if outcomes.contains(&false) {
+        if failed > 0 {
             return;
         }
     }
@@ -488,18 +584,48 @@ async fn write_claims(node: &Node, claims: &mut [Claim<'_>]) {
 /// operator. The connection goes to `{bucket}.s3.{region}.amazonaws.com`: TLS ends inside the
 /// node and the certificate is verified against the trust roots of the binary.
 ///
+/// The write goes over an idle connection when there is one. When that connection ends without
+/// a response, the write goes once more over a new connection: a `PUT` is idempotent (RFC 9110
+/// 9.2.2), and a repeated write adds a second version of the same object. A write over a new
+/// connection is not repeated.
+///
 /// The one confirmation is the status 200. Every other status, a failure of the connection
 /// and a write that takes longer than its time limit (5 seconds) are no confirmation.
-async fn send_to_log_store(node: &Node, writer: &Writer, user_id: &str, write: &Write) -> bool {
-    let exchange = async {
-        let request = put_request(writer, &node.node, user_id, write, node.now_ms())?;
-        let mut sender = node
-            .egress
-            .open(node.platform.as_ref(), &writer.id.host())
-            .await
-            .ok()?;
+async fn send_to_log_store(node: &Node, writer: &Writer, write: &Write) -> bool {
+    // One `PUT` of the entry: whether the store answered 200, or `None` when the connection
+    // ended without a response.
+    let put = |mut sender: SendRequest<OnceBody>| async move {
+        let request = put_request(writer, write, node.now_ms())?;
         let response = sender.send_request(request).await.ok()?;
+        if response.body().is_end_stream() {
+            node.log_store.idle.put(sender);
+        }
         Some(response.status() == StatusCode::OK)
+    };
+    let exchange = async {
+        if let Some(sender) = node.log_store.idle.take().await {
+            if let Some(confirmed) = put(sender).await {
+                return Some(confirmed);
+            }
+        }
+        let sender = match &writer.endpoint {
+            None => node
+                .egress
+                .open(node.platform.as_ref(), &writer.id.host())
+                .await
+                .ok()?,
+            Some(endpoint) => node
+                .egress
+                .open_at(
+                    node.platform.as_ref(),
+                    &endpoint.host,
+                    endpoint.port,
+                    endpoint.tls,
+                )
+                .await
+                .ok()?,
+        };
+        put(sender).await
     };
     matches!(
         tokio::time::timeout(node.limits.log_write, exchange).await,
@@ -508,16 +634,18 @@ async fn send_to_log_store(node: &Node, writer: &Writer, user_id: &str, write: &
 }
 
 /// The request that writes one entry (protocol.md 7.6): `PUT` of the signed entry as the node
-/// carries it in a response, `{"body":"...","sig":"..."}`, with the retention of the object
-/// and the checksum S3 requires of a request that sets one.
-fn put_request(
-    writer: &Writer,
-    node: &str,
-    user_id: &str,
-    write: &Write,
-    now_ms: u64,
-) -> Option<Request<OnceBody>> {
-    let path = object_path(&object_key(user_id, node, write.seq, &write.hash));
+/// carries it in a response, `{"body":"...","sig":"..."}`, under the key of the entry, with
+/// the retention of the object and the checksum S3 requires of a request that sets one. With an
+/// endpoint (a node of the local platform) the request target is path-style:
+/// `/{bucket}/{key}` with the `Host` of the endpoint.
+fn put_request(writer: &Writer, write: &Write, now_ms: u64) -> Option<Request<OnceBody>> {
+    let (path, host) = match &writer.endpoint {
+        None => (object_path(&write.key), writer.id.host()),
+        Some(endpoint) => (
+            format!("/{}{}", writer.id.bucket(), object_path(&write.key)),
+            endpoint.authority(),
+        ),
+    };
     let body = to_json(&write.entry);
     let digest = Sha256::digest(&body);
     let payload_sha256 = hex(&digest);
@@ -526,7 +654,7 @@ fn put_request(
     // The headers of the request, in the order of their names. All of them are signed.
     let headers = [
         ("content-type", "application/json".to_string()),
-        ("host", writer.id.host()),
+        ("host", host),
         ("x-amz-checksum-sha256", STANDARD.encode(digest)),
         ("x-amz-content-sha256", payload_sha256.clone()),
         ("x-amz-date", amz_date.clone()),
@@ -559,9 +687,45 @@ fn put_request(
     }
     builder
         .header(AUTHORIZATION, authorization)
-        .header(CONNECTION, HeaderValue::from_static("close"))
         .body(OnceBody::new(Bytes::from(body)))
         .ok()
+}
+
+/// The sweep of the node (enclave.md section 3): every [`SWEEP_INTERVAL`], for every account, the
+/// merge keys whose window passed are dropped and the pending entries are written again. A pending
+/// entry is otherwise written again with the next write of its account only, so without the sweep
+/// an account that makes no further call would leave a gap in the store for as long as it is
+/// idle, and a reader of the store would take that gap for an omission. The task ends when the
+/// orderly shutdown of the node starts.
+pub async fn keep_sweeping(node: Arc<Node>) {
+    loop {
+        tokio::time::sleep(SWEEP_INTERVAL).await;
+        if node.ensure_open().is_err() {
+            return;
+        }
+        sweep(&node).await;
+    }
+}
+
+/// One sweep ([`keep_sweeping`]). The accounts are visited one at a time: the pending entries of
+/// an account are written with the rules of [`confirm`] (at most 32 at the same time, over the
+/// idle connections), and the calls of the account that wait look at their entries again. An
+/// entry the store does not confirm stays pending for the next sweep.
+pub async fn sweep(node: &Node) {
+    let now_ms = node.now_ms();
+    for (_, account) in node.accounts_after("") {
+        let pending = {
+            let mut guard = lock(&account);
+            guard.prune_recent(now_ms);
+            guard.pending_entries() > 0
+        };
+        if !pending || node.ensure_open().is_err() {
+            continue;
+        }
+        let _ = confirm(node, &account, &[]).await;
+        let notify = lock(&account).notify.clone();
+        notify.notify_waiters();
+    }
 }
 
 /// Step 3 of the common front, for a call that uses a credential: the node can write to its
@@ -571,17 +735,22 @@ fn put_request(
 /// the store confirmed some of them. The call writes the pending entries again here. When
 /// they still wait after that, it ends with `log_store_unavailable` and creates no entry: an
 /// account does not collect entries of acts that never took place without a bound.
-pub async fn admit(
-    node: &Node,
-    user_id: &str,
-    account: &Mutex<Account>,
-) -> Result<(), ProtocolError> {
+pub async fn admit(node: &Node, account: &Mutex<Account>) -> Result<(), ProtocolError> {
     node.log_store.ensure_ready(node.now_ms())?;
     if lock(account).pending_entries() < PENDING_ENTRIES {
         return Ok(());
     }
-    let _ = confirm(node, user_id, account, &[]).await;
-    match lock(account).pending_entries() < PENDING_ENTRIES {
+    let _ = confirm(node, account, &[]).await;
+    let (admitted, notify) = {
+        let account = lock(account);
+        (
+            account.pending_entries() < PENDING_ENTRIES,
+            account.notify.clone(),
+        )
+    };
+    // A call that waits for one of the entries this round confirmed goes on now.
+    notify.notify_waiters();
+    match admitted {
         true => Ok(()),
         false => Err(ProtocolError::LogStoreUnavailable),
     }
@@ -595,14 +764,13 @@ pub async fn admit(
 /// a log store nothing is written and the answer is `Ok`.
 pub async fn confirm(
     node: &Node,
-    user_id: &str,
     account: &Mutex<Account>,
     seqs: &[u64],
 ) -> Result<(), ProtocolError> {
     if !node.log_store.tracks() {
         return Ok(());
     }
-    let mut claim = [Claim::take(user_id, account, seqs)];
+    let mut claim = [Claim::take(account, seqs)];
     write_claims(node, &mut claim).await;
     match claim[0].holds() {
         true => Ok(()),
@@ -612,28 +780,177 @@ pub async fn confirm(
 
 /// [`confirm`] for one entry of each of several accounts, with the writes of all of them
 /// sharing the limit of 32 at the same time. `Ok` when the store confirmed every one of
-/// these entries. After a failure, the entries the store confirmed stay confirmed.
+/// these entries. After a failure, the entries the store confirmed stay confirmed. The round
+/// runs beside the group commit of [`commit`]: a call of one of these accounts that writes in
+/// the same time takes no entry this round is writing, except one its own act waits for, and
+/// the waiting calls of these accounts look at their entries again when the round ends.
 pub async fn confirm_each(
     node: &Node,
-    entries: &[(&str, &Mutex<Account>, u64)],
+    entries: &[(&Mutex<Account>, u64)],
 ) -> Result<(), ProtocolError> {
     if !node.log_store.tracks() {
         return Ok(());
     }
     let mut claims: Vec<Claim<'_>> = entries
         .iter()
-        .map(|(user_id, account, seq)| Claim::take(user_id, account, &[*seq]))
+        .map(|(account, seq)| Claim::take(account, &[*seq]))
         .collect();
     write_claims(node, &mut claims).await;
-    match claims.iter().all(Claim::holds) {
+    let outcome = claims.iter().all(Claim::holds);
+    drop(claims);
+    for (account, _) in entries {
+        let notify = lock(account).notify.clone();
+        notify.notify_waiters();
+    }
+    match outcome {
         true => Ok(()),
         false => Err(ProtocolError::LogStoreUnavailable),
+    }
+}
+
+/// The group commit of one account for one call (protocol.md 7.1): writes the entries that
+/// hold the events of the call and returns the place of every event.
+///
+/// `places` are where the events of the call are (one for a single call, up to
+/// [`limits::FORWARD_BATCH_REQUESTS`] for a `forward/batch` call), each with whether this call
+/// created the event. The call returns `Ok` when the store confirmed every entry that holds
+/// one of its events: when no write of the account is in progress the call closes the open
+/// batch, when its events are in it, and writes (it is the writer); while a write of the
+/// account is in progress the call waits for its end and looks again. `Err(log_store_unavailable)`
+/// when a write of an entry of the call was not confirmed or when the call waited for
+/// twice the time of a write; `Err(closing)` when the node started its orderly shutdown while
+/// the call waited.
+///
+/// On a node that runs without a log store the open batch is closed and every entry counts as
+/// confirmed.
+pub async fn commit(
+    node: &Node,
+    user_id: &str,
+    account: &Arc<Mutex<Account>>,
+    places: &[(EventPlace, bool)],
+) -> Result<Vec<LogRef>, ProtocolError> {
+    if !node.log_store.tracks() {
+        let mut account = lock(account);
+        node.close_batch(&mut account, user_id, node.now_ms())
+            .map_err(|_| ProtocolError::Internal)?;
+        return resolved(&account, places).ok_or(ProtocolError::Internal);
+    }
+    let deadline = tokio::time::Instant::now() + 2 * node.limits.log_write;
+    let notify = lock(account).notify.clone();
+    loop {
+        enum Role {
+            Done(Vec<LogRef>),
+            Write(Vec<u64>),
+            Wait,
+        }
+        // The notification is taken before the state is read: a write that ends between the
+        // reading and the waiting wakes this call all the same.
+        let notified = notify.notified();
+        let role = {
+            let mut account = lock(account);
+            if let Some(refs) = resolved(&account, places) {
+                Role::Done(refs)
+            } else if account.writer {
+                Role::Wait
+            } else {
+                let open = places.iter().any(|(place, _)| place.seq().is_none());
+                if open {
+                    node.close_batch(&mut account, user_id, node.now_ms())
+                        .map_err(|_| ProtocolError::Internal)?;
+                }
+                let seqs: Vec<u64> = places
+                    .iter()
+                    .filter_map(|(place, _)| place.seq())
+                    .filter(|seq| !account.is_confirmed(*seq))
+                    .collect();
+                account.writer = true;
+                Role::Write(seqs)
+            }
+        };
+        match role {
+            Role::Done(refs) => return Ok(refs),
+            Role::Write(seqs) => {
+                let mut guard = WriterGuard {
+                    node,
+                    user_id,
+                    account,
+                    armed: true,
+                };
+                let outcome = confirm(node, account, &seqs).await;
+                guard.armed = false;
+                let refs = end_write(node, user_id, account, places);
+                outcome?;
+                return refs.ok_or(ProtocolError::LogStoreUnavailable);
+            }
+            Role::Wait => {
+                node.ensure_open()?;
+                if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                    return Err(ProtocolError::LogStoreUnavailable);
+                }
+            }
+        }
+    }
+}
+
+/// The `log` objects of `places` when every entry that holds one of them exists and the store
+/// confirmed it, `None` while one of them is in an open batch or in an unconfirmed entry.
+fn resolved(account: &Account, places: &[(EventPlace, bool)]) -> Option<Vec<LogRef>> {
+    places
+        .iter()
+        .map(|(place, created)| {
+            let seq = place.seq()?;
+            account.is_confirmed(seq).then_some(LogRef {
+                seq,
+                index: place.index(),
+                created: *created,
+            })
+        })
+        .collect()
+}
+
+/// Ends the write of the writer of an account: the account has no writer, the events that
+/// arrived while the write ran form the next entry (which the next writer writes), and the
+/// waiting calls look at their entries again. Returns [`resolved`] for `places`.
+fn end_write(
+    node: &Node,
+    user_id: &str,
+    account: &Mutex<Account>,
+    places: &[(EventPlace, bool)],
+) -> Option<Vec<LogRef>> {
+    let (notify, refs) = {
+        let mut account = lock(account);
+        account.writer = false;
+        if account.has_open_events() {
+            let _ = node.close_batch(&mut account, user_id, node.now_ms());
+        }
+        (account.notify.clone(), resolved(&account, places))
+    };
+    notify.notify_waiters();
+    refs
+}
+
+/// Ends the write of a call whose future is dropped before its write ended (its caller went
+/// away): without it the account would keep a writer that never ends, and every later call of
+/// the account would wait for it. The entries of the write stay pending (`Claim`).
+struct WriterGuard<'a> {
+    node: &'a Node,
+    user_id: &'a str,
+    account: &'a Mutex<Account>,
+    armed: bool,
+}
+
+impl Drop for WriterGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            end_write(self.node, self.user_id, self.account, &[]);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use credential_enclave_protocol::log::object_key;
 
     fn credentials(session_token: &str) -> Credentials {
         Credentials::new(
@@ -757,10 +1074,11 @@ mod tests {
         let writer = Writer {
             id,
             credentials: Arc::new(credentials("TOKEN")),
+            endpoint: None,
         };
         let write = Write {
             seq: 7,
-            hash: [0xfb; 32],
+            key: object_key("user 1", "NODE", 7, &[0xfb; 32]),
             entry: Signed {
                 body: "Ym9keQ".to_string(),
                 sig: "c2ln".to_string(),
@@ -769,7 +1087,7 @@ mod tests {
             confirmed: false,
         };
         // 2026-10-01T12:10:45.123Z.
-        let request = put_request(&writer, "NODE", "user 1", &write, 1_790_856_645_123).unwrap();
+        let request = put_request(&writer, &write, 1_790_856_645_123).unwrap();
         let body = br#"{"body":"Ym9keQ","sig":"c2ln"}"#;
         let digest = Sha256::digest(body);
         let path = concat!(
@@ -808,7 +1126,6 @@ mod tests {
                 ),
                 ("x-amz-security-token", "TOKEN"),
                 ("authorization", authorization),
-                ("connection", "close"),
             ]
         );
         // The request asks for no condition on the key: the store answers 200 only when it
@@ -816,7 +1133,7 @@ mod tests {
         assert!(!request.headers().contains_key("if-none-match"));
         assert!(request.headers()[SECURITY_TOKEN].is_sensitive());
         assert!(!format!("{:?}", request.headers()).contains("TOKEN"));
-        // Every header but the length of the body and the header of the connection is
+        // Every header but the length of the body is
         // signed: signing the headers of the request again gives its `Authorization`.
         let signed: Vec<(&str, String)> = headers[1..8]
             .iter()
@@ -854,15 +1171,9 @@ mod tests {
         let without_session = Writer {
             id: writer.id.clone(),
             credentials: Arc::new(credentials("")),
+            endpoint: None,
         };
-        let request = put_request(
-            &without_session,
-            "NODE",
-            "user 1",
-            &write,
-            1_790_856_645_123,
-        )
-        .unwrap();
+        let request = put_request(&without_session, &write, 1_790_856_645_123).unwrap();
         assert!(!request.headers().contains_key(SECURITY_TOKEN));
         let authorization = request.headers()[AUTHORIZATION].to_str().unwrap();
         assert!(authorization.ends_with(concat!(
@@ -885,6 +1196,73 @@ mod tests {
         assert!(authorization.ends_with(
             "Signature=4158355ad822130ed2a001d7f5b2be44e92c716e10bc40539237ff032b19eac8"
         ));
+    }
+
+    #[test]
+    fn a_local_endpoint_is_written_in_path_style_with_its_own_host() {
+        let id = LogStoreId::parse("character-credential-log-local-1", "us-west-2").unwrap();
+        let endpoint =
+            LogStoreEndpoint::parse("http://minio.character.svc.cluster.local:9000").unwrap();
+        assert_eq!(
+            endpoint,
+            LogStoreEndpoint {
+                tls: false,
+                host: "minio.character.svc.cluster.local".to_string(),
+                port: 9000,
+            }
+        );
+        assert_eq!(
+            endpoint.authority(),
+            "minio.character.svc.cluster.local:9000"
+        );
+        assert_eq!(
+            LogStoreEndpoint::parse("https://s3.local")
+                .unwrap()
+                .authority(),
+            "s3.local"
+        );
+        for text in [
+            "minio:9000",
+            "ftp://minio:9000",
+            "http://minio:9000/bucket",
+            "http://user@minio:9000",
+            "http://minio:0",
+            "http://mi nio",
+            "http://",
+        ] {
+            assert_eq!(LogStoreEndpoint::parse(text), None, "{text}");
+        }
+        let writer = Writer {
+            id,
+            credentials: Arc::new(credentials("")),
+            endpoint: Some(endpoint),
+        };
+        let write = Write {
+            seq: 7,
+            key: object_key("user 1", "NODE", 7, &[0xfb; 32]),
+            entry: Signed {
+                body: "Ym9keQ".to_string(),
+                sig: "c2ln".to_string(),
+            },
+            required: true,
+            confirmed: false,
+        };
+        let request = put_request(&writer, &write, 1_790_856_645_123).unwrap();
+        assert_eq!(
+            request.uri().to_string(),
+            concat!(
+                "/character-credential-log-local-1/v1/accounts/user%201/NODE/",
+                "00000000000000000007--_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s"
+            )
+        );
+        assert_eq!(
+            request.headers()["host"],
+            "minio.character.svc.cluster.local:9000"
+        );
+        // The signature covers the path-style target and the host of the endpoint.
+        let authorization = request.headers()[AUTHORIZATION].to_str().unwrap();
+        assert!(authorization
+            .contains("Credential=AKIAIOSFODNN7EXAMPLE/20261001/us-west-2/s3/aws4_request,"));
     }
 
     #[test]
@@ -933,6 +1311,19 @@ mod tests {
     #[test]
     fn the_path_of_an_object_is_its_key_with_every_part_encoded_once() {
         let key = object_key("user-1", "NODE", 7, &[0xfb; 32]);
+        assert_eq!(object_path(&key), format!("/{key}"));
+        // A key of format 2 has no character that is encoded: its parts are digits, letters,
+        // `-` and `_`.
+        let parts = credential_enclave_protocol::log::EntryParts {
+            seq: 2,
+            time_ms: 1_790_000_000_000,
+            kind: credential_enclave_protocol::log::EntryKind::Use,
+            count: 3,
+            key_id: "0123456789abcdef".to_string(),
+            body_hash: [0xfb; 32],
+            entry_hash: [0x3f; 32],
+        };
+        let key = credential_enclave_protocol::log::object_key_v2("user-1", "NODE", &parts);
         assert_eq!(object_path(&key), format!("/{key}"));
         // Every part of a key is encoded once, and `/` stays.
         assert_eq!(

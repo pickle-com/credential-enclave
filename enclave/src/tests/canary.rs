@@ -794,8 +794,8 @@ mod fixture {
     use crate::frame;
     use crate::providers::{endpoint, ClientKind, Definitions};
     use crate::testing::{
-        Answer, App, Attested, Forwarded, Harness, Provider, Reply, Seen, LOG_BUCKET, LOG_HOST,
-        LOG_REGION,
+        decode_batch, Answer, App, Attested, BatchOutcome, Forwarded, Harness, Provider, Reply,
+        Seen, LOG_BUCKET, LOG_HOST, LOG_REGION,
     };
     use crate::tests::{provider_and_log_store, provider_hosts};
 
@@ -1336,7 +1336,7 @@ mod fixture {
                 headers: headers
                     .map(|pair| (text(&pair[0]), text(&pair[1])))
                     .collect(),
-                entry: meta["entry"].clone(),
+                log: meta["log"].clone(),
                 body: body.to_vec(),
             })
         }
@@ -1344,6 +1344,33 @@ mod fixture {
         /// A `forward` call with the method GET, without headers of the caller.
         pub async fn get(&self, record: &Value, address: &str) -> Result<Forwarded, (u16, Value)> {
             self.forward(record, "GET", address, json!([]), b"").await
+        }
+
+        /// A `forward/batch` call of the first node: one GET request without a body per
+        /// address. `Err` carries the status and the failure body.
+        pub async fn forward_batch(
+            &self,
+            record: &Value,
+            addresses: &[String],
+        ) -> Result<Vec<BatchOutcome>, (u16, Value)> {
+            let requests: Vec<Value> = addresses
+                .iter()
+                .map(|address| {
+                    json!({"method": "GET", "url": address, "headers": [], "body_bytes": 0})
+                })
+                .collect();
+            let request = frame::encode_head(&json!({
+                "user_id": self.app.user_id, "record": record, "context": "canary",
+                "timeout_ms": 5000, "requests": requests,
+            }));
+            let answer = self
+                .exchange(0, true, "POST", "/v1/forward/batch", request)
+                .await;
+            if answer.status != 200 {
+                return Err(json_of(answer));
+            }
+            let (meta, body) = frame::decode(&Bytes::from(answer.body)).unwrap();
+            Ok(decode_batch(&meta, &body))
         }
 
         /// The attestation response of one of the two nodes.
@@ -1386,21 +1413,56 @@ mod fixture {
             json!({"providers": providers})
         }
 
-        /// Gives the first node the operator configuration.
+        /// Gives the first node the operator configuration, and names the log store of the
+        /// tests, with credentials for it, in the configuration of both nodes. From then on a
+        /// node acts only after the stand-in confirmed the entry of the act, and the chain of
+        /// the account is read from the objects the stand-in received.
         pub async fn configure(&self) {
-            let (status, response) = self.post("/v1/config", self.operator_config()).await;
+            let mut first = self.operator_config();
+            first["log_store"] = json!({"bucket": LOG_BUCKET, "region": LOG_REGION});
+            let (status, response) = self.post("/v1/config", first).await;
+            assert_eq!(status, 200, "{response}");
+            self.configure_log_store_of(1).await;
+            self.give_log_store_credentials().await;
+        }
+
+        /// Names the log store of the tests, with credentials for it, in the configuration of
+        /// both nodes, without a provider.
+        pub async fn configure_log_store(&self) {
+            for node in 0..NODES.len() {
+                self.configure_log_store_of(node).await;
+            }
+            self.give_log_store_credentials().await;
+        }
+
+        async fn configure_log_store_of(&self, node: usize) {
+            let log_store = json!({"bucket": LOG_BUCKET, "region": LOG_REGION});
+            let config = json!({"providers": {}, "log_store": log_store});
+            let (status, response) = self.post_on(node, "/v1/config", config).await;
             assert_eq!(status, 200, "{response}");
         }
 
-        /// Names the log store of the tests in the configuration of both nodes. From then on
-        /// a node acts only after the stand-in confirmed the entry of the act.
-        pub async fn configure_log_store(&self) {
-            let log_store = json!({"bucket": LOG_BUCKET, "region": LOG_REGION});
-            let mut first = self.operator_config();
-            first["log_store"] = log_store.clone();
-            let second = json!({"providers": {}, "log_store": log_store});
-            for (node, config) in [first, second].into_iter().enumerate() {
-                let (status, response) = self.post_on(node, "/v1/config", config).await;
+        /// The credentials of the operator for the log store. The session token reaches the
+        /// log store and nothing else, and the secret access key reaches nothing.
+        pub fn log_store_credentials(&self, access_key_id: &str) -> Value {
+            let store = [at(Role::LogStore, LOG_STORE)];
+            json!({
+                "access_key_id": access_key_id,
+                "secret_access_key": self
+                    .secrets
+                    .text("secret access key for the log store", &[]),
+                "session_token": self
+                    .secrets
+                    .text("session token for the log store", &store),
+                "expires_ms": 4_102_444_800_000u64,
+            })
+        }
+
+        async fn give_log_store_credentials(&self) {
+            for node in 0..NODES.len() {
+                let body = self.log_store_credentials("ASIACANARY");
+                let (status, response) =
+                    self.post_on(node, "/v1/log-store/credentials", body).await;
                 assert_eq!(status, 200, "{response}");
             }
         }
@@ -1574,36 +1636,47 @@ mod fixture {
             outcome
         }
 
-        /// The event of an entry that one of the two nodes created for the account: the node
-        /// signature verifies and the log key of the account opens it. Its kind is a kind
-        /// that this release writes.
-        pub fn event(&self, node: usize, entry: &Value) -> Value {
-            let event = self.app.event(&self.nodes[node], entry);
+        /// The event a `log` object names on one of the two nodes, read from the object the
+        /// log store stand-in received: the node signature verifies and the log key of the
+        /// account opens it. Its kind is a kind that this release writes.
+        pub fn logged(&self, node: usize, log: &Value) -> Value {
+            let event = self.app.logged(&self.nodes[node], &self.provider, log);
             let kind = event["t"].as_str().unwrap_or_default();
             assert!(EVENTS.contains(&kind), "an event of the kind {kind:?}");
             event
         }
 
-        /// Fetches the entries of the account that wait on the first node, acknowledges them
-        /// and returns the kinds of their events and the `seq` of the end of the chain.
-        pub async fn drain_log(&self) -> (Vec<String>, u64) {
-            let user_id = &self.app.user_id;
-            let waiting = json!({"user_id": user_id, "after_seq": 0});
-            let (status, listed) = self.post("/v1/log/entries", waiting).await;
-            assert_eq!(status, 200, "{listed}");
-            let entries = listed["entries"].as_array().unwrap().iter();
-            let kind = |entry| self.event(0, entry)["t"].as_str().unwrap().to_string();
-            let kinds = entries.map(kind).collect();
-            let seq = listed["head"]["seq"].as_u64().unwrap();
-            let stored = json!({"user_id": user_id, "seq": seq});
-            let (status, acknowledged) = self.post("/v1/log/ack", stored).await;
-            assert_eq!((status, &acknowledged["unacked"]), (200, &json!(0)));
-            (kinds, seq)
+        /// The kinds of the events of the chain of the account on the first node, in the
+        /// order of the chain, read from the objects the log store stand-in received, and the
+        /// `seq` of the end of the chain.
+        pub fn logged_kinds(&self) -> (Vec<String>, u64) {
+            let node = &self.nodes[0];
+            let kinds = self
+                .provider
+                .chain(&self.app.user_id, &node.node.node)
+                .iter()
+                .flat_map(|stored| self.app.events(node, &stored.entry))
+                .map(|event| {
+                    let kind = event["t"].as_str().unwrap_or_default().to_string();
+                    assert!(
+                        EVENTS.contains(&kind.as_str()),
+                        "an event of the kind {kind:?}"
+                    );
+                    kind
+                })
+                .collect();
+            (kinds, node.head_seq(&self.app.user_id))
         }
 
-        /// The requests the stand-in received so far.
+        /// The requests the stand-in received so far: those of the providers and the writes to
+        /// the log store.
         pub fn seen(&self) -> Vec<Seen> {
             self.provider.seen()
+        }
+
+        /// The requests of the providers the stand-in received so far.
+        pub fn requests(&self) -> Vec<Seen> {
+            self.provider.requests()
         }
 
         /// The routes the tests called and that answered with a status `with` accepts.
@@ -1731,7 +1804,9 @@ mod fixture {
                     ));
                 }
             }
-            if connections.len() != self.seen().len() {
+            // A node reuses its connections to the log store and to a provider host: the
+            // stand-in receives at least one request over every connection.
+            if connections.len() > self.seen().len() {
                 leaks.push("a connection without a request that the stand-in received".into());
             }
             for request in self.seen() {
@@ -1892,26 +1967,19 @@ async fn walk() -> Canary {
     assert_eq!(code(&outcome), (400, "invalid_request"));
     canary.configure().await;
 
-    // The log store of both nodes, and the credentials for it: values of another form are
-    // refused. The session token reaches the log store and nothing else, the secret access
-    // key reaches nothing, and neither comes back, in this response or in a later one.
-    canary.configure_log_store().await;
-    let credentials = |access_key_id: &str| {
-        let (secrets, store) = (&canary.secrets, [at(Role::LogStore, LOG_STORE)]);
-        json!({
-            "access_key_id": access_key_id,
-            "secret_access_key": secrets.text("secret access key for the log store", &[]),
-            "session_token": secrets.text("session token for the log store", &store),
-            "expires_ms": 4_102_444_800_000u64,
-        })
-    };
+    // The credentials for the log store of both nodes: values of another form are refused.
+    // The session token reaches the log store and nothing else, the secret access key
+    // reaches nothing, and neither comes back, in this response or in a later one.
     let outcome = canary
-        .post("/v1/log-store/credentials", credentials("no access key"))
+        .post(
+            "/v1/log-store/credentials",
+            canary.log_store_credentials("no access key"),
+        )
         .await;
     assert_eq!(code(&outcome), (400, "invalid_request"));
     let stored = json!({"credentials_expires_ms": 4_102_444_800_000u64});
     for node in 0..NODES.len() {
-        let body = credentials("ASIACANARY");
+        let body = canary.log_store_credentials("ASIACANARY");
         let outcome = canary
             .post_on(node, "/v1/log-store/credentials", body)
             .await;
@@ -1946,6 +2014,18 @@ async fn walk() -> Canary {
                 "{address}"
             );
         }
+        // The same addresses in one batch: one entry names them all, and every request is
+        // answered.
+        let addresses = stand_in.api_addresses(&provider);
+        let outcomes = canary
+            .forward_batch(&connected["record"], &addresses)
+            .await
+            .unwrap_or_else(|failure| panic!("{provider}: {failure:?}"));
+        assert_eq!(outcomes.len(), addresses.len(), "{provider}");
+        assert!(
+            outcomes.iter().all(|outcome| outcome.status == Some(200)),
+            "{provider}: {outcomes:?}"
+        );
 
         let tokens = stand_in.token_response(&provider);
         stand_in.next_tokens(&tokens);
@@ -1971,7 +2051,6 @@ async fn walk() -> Canary {
             (200, expected),
             "{provider}"
         );
-        canary.drain_log().await;
         records.insert(provider, record.clone());
     }
     let google = &records["google_workspace"];
@@ -2016,6 +2095,8 @@ async fn walk() -> Canary {
     assert_eq!(code(&outcome), (403, "not_allowed"));
     let outcome = canary.post_bytes("/v1/forward", b"no frame").await;
     assert_eq!(code(&outcome), (400, "invalid_request"));
+    let outcome = canary.post_bytes("/v1/forward/batch", b"no frame").await;
+    assert_eq!(code(&outcome), (400, "invalid_request"));
 
     release_the_vault(&canary, 0, &vault).await;
     let no_https = json!({
@@ -2025,12 +2106,12 @@ async fn walk() -> Canary {
     let outcome = canary.post("/v1/release", no_https).await;
     assert_eq!(code(&outcome), (400, "invalid_request"));
 
-    // The log of the account.
+    // The two calls of the releases before v2.0.0 that handed the log of an account out do
+    // not exist: the log store is the one place an entry is read from.
     for path in ["/v1/log/entries", "/v1/log/ack"] {
-        let outcome = canary.post(path, json!({"user_id": user})).await;
-        assert_eq!(code(&outcome), (400, "invalid_request"), "{path}");
+        let outcome = canary.probe("POST", path, json!({"user_id": user})).await;
+        assert_eq!(code(&outcome), (404, "invalid_request"), "{path}");
     }
-    canary.drain_log().await;
 
     // The delegation moves to the second node and that node uses it. A node hands nothing to
     // itself and takes no transfer that was sealed for another node.
@@ -2041,8 +2122,10 @@ async fn walk() -> Canary {
     assert_eq!(code(&outcome), (400, "invalid_request"));
     let (status, exported) = canary.post("/v1/peer/export", export_to(&peer)).await;
     assert_eq!(status, 200, "{exported}");
-    let (envelope, entry) = (&exported["envelope"], &exported["entries"][0]);
-    assert_eq!(canary.event(0, entry)["t"], "grant_transferred_out");
+    let (envelope, logs) = (&exported["envelope"], &exported["logs"]);
+    assert_eq!(logs[0]["user_id"], user);
+    let transferred = json!({"seq": logs[0]["seq"], "index": 0});
+    assert_eq!(canary.logged(0, &transferred)["t"], "grant_transferred_out");
     let outcome = canary
         .post("/v1/peer/import", import_from(&peer, envelope))
         .await;
@@ -2055,11 +2138,14 @@ async fn walk() -> Canary {
         (200, &json!(1)),
         "{imported}"
     );
+    // The import wrote the entry it created (the second node has credentials for the store),
+    // and the release that follows on that node continues the chain.
+    assert_eq!(imported["logs"], json!([{"user_id": user, "seq": 1}]));
+    release_the_vault(&canary, 1, &vault).await;
     assert_eq!(
-        canary.event(1, &imported["entries"][0])["t"],
+        canary.logged(1, &json!({"seq": 1, "index": 0}))["t"],
         "grant_transferred_in"
     );
-    release_the_vault(&canary, 1, &vault).await;
     let (status, back) = canary.post_on(1, "/v1/peer/export", export_to(&this)).await;
     assert_eq!(status, 200, "{back}");
     let returned = import_from(&peer, &back["envelope"]);
@@ -2095,7 +2181,6 @@ async fn walk() -> Canary {
     let (status, revoked) = canary.send(&canary.revoke_envelope().await).await;
     assert_eq!((status, &canary.reply(&revoked)["ok"]), (200, &json!(true)));
     refusals((409, "grant_revoked"), until_revoked).await;
-    canary.drain_log().await;
 
     // The orderly shutdown. Final heads exist only after `close`, and a closing node takes
     // no command and no transfer.
@@ -2147,7 +2232,7 @@ async fn the_walk_calls_every_route_in_a_success_case_and_in_a_failure_case() {
         routes.iter().map(owned).collect()
     };
     let routes = routes();
-    assert_eq!(routes.len(), 22);
+    assert_eq!(routes.len(), 21);
     let (mail_success, mail_failure) = super::mail::canary_routes().await;
     let mut called = canary.routes_called(|_| true);
     called.extend(mail_success.clone());
@@ -2223,19 +2308,24 @@ async fn a_credential_reaches_only_the_addresses_of_its_own_provider() {
 
 #[tokio::test]
 async fn a_release_carries_the_one_value_it_was_asked_for_and_never_a_totp_seed() {
-    // `release` needs no operator configuration.
+    // `release` needs no provider in the operator configuration: the node has its log store
+    // and nothing else.
     let canary = Canary::start().await;
+    canary.configure_log_store().await;
     canary.grant().await;
     let vault = Vault::plant(&canary);
     release_the_vault(&canary, 0, &vault).await;
 
-    // One entry per value that left, and none for a refusal.
-    let (kinds, _) = canary.drain_log().await;
+    // One event per value that left, and none for a refusal.
+    let (kinds, _) = canary.logged_kinds();
     let released = ["secret_released"; 3];
     assert_eq!(kinds[..1], ["grant_accepted"]);
     assert_eq!(kinds[1..4], released);
     assert_eq!(kinds[4..], ["totp_issued"]);
-    assert!(canary.seen().is_empty(), "no provider received a request");
+    assert!(
+        canary.requests().is_empty(),
+        "no provider received a request"
+    );
     canary.verdict();
 }
 
@@ -2258,7 +2348,7 @@ async fn the_answer_of_a_revocation_address_leaves_as_one_bit() {
         let (answered, outcome) = canary.revoke_token(&connected["record"]).await;
         assert_eq!(answered, 200, "{status}: {outcome}");
         let keys: Vec<&String> = outcome.as_object().unwrap().keys().collect();
-        assert_eq!(keys, ["revoked", "entry"], "{status}");
+        assert_eq!(keys, ["revoked", "log"], "{status}");
         assert_eq!(outcome["revoked"], revoked, "{status}");
     }
     canary.verdict();
@@ -2269,7 +2359,7 @@ async fn a_redirect_to_another_host_is_returned_and_not_followed() {
     let canary = Canary::ready().await;
     let (_, connected) = canary.connect("google_workspace").await;
     let address = canary.stand_in.api_address("google_workspace");
-    let exchanged = canary.seen().len();
+    let exchanged = canary.requests().len();
 
     // A node that followed one of these redirects would hand the token of one provider to
     // another, to a token address, or to a host of no definition. The stand-in answers for the
@@ -2296,7 +2386,7 @@ async fn a_redirect_to_another_host_is_returned_and_not_followed() {
         assert_eq!(forwarded.header("location"), Some(target), "{status}");
         assert_eq!(forwarded.body, b"moved", "{status}");
     }
-    assert_eq!(canary.seen().len(), exchanged + statuses.len());
+    assert_eq!(canary.requests().len(), exchanged + statuses.len());
     canary.verdict();
 }
 
@@ -2369,7 +2459,10 @@ async fn records_of_the_kinds_oauth_operator_and_api_key_are_used_by_no_call() {
             unused(&released, &format!("release of {field}, {kind}"));
         }
     }
-    assert!(canary.seen().is_empty(), "no provider received a request");
+    assert!(
+        canary.requests().is_empty(),
+        "no provider received a request"
+    );
     canary.verdict();
 }
 
@@ -2426,7 +2519,6 @@ async fn a_token_the_device_imported_is_used_inside_the_node_and_handed_out_by_n
             (200, expected),
             "{provider}"
         );
-        canary.drain_log().await;
     }
     canary.verdict();
 }
@@ -2522,7 +2614,6 @@ async fn public_fields_are_the_listed_leaves_of_the_listed_type_and_size() {
             assert_eq!(status, 200, "{provider}, {shape:?}: {connected}");
             assert_public(&provider, &tokens, &connected["public"], true);
         }
-        canary.drain_log().await;
     }
     canary.verdict();
 }
@@ -2787,7 +2878,7 @@ async fn a_repeated_refresh_of_one_record_is_answered_from_memory() {
     let (_, connected) = canary.connect("google_workspace").await;
     let (status, first) = canary.refresh(&connected["record"]).await;
     assert_eq!(status, 200, "{first}");
-    let (_, seq) = canary.drain_log().await;
+    let logged = canary.logged_kinds();
 
     // The same record again: the node answers with the response it kept. It asks the provider
     // nothing and writes no entry.
@@ -2801,7 +2892,7 @@ async fn a_repeated_refresh_of_one_record_is_answered_from_memory() {
         1,
         "token requests of a refresh"
     );
-    assert_eq!(canary.drain_log().await, (Vec::new(), seq));
+    assert_eq!(canary.logged_kinds(), logged);
     canary.verdict();
 }
 
@@ -2917,8 +3008,8 @@ async fn a_provider_response_that_reflects_the_injected_credential_is_withheld()
     assert_withheld(&refused(canary.get(record, &numbered).await, case), case);
 
     // Each request went out, so each is on the log, although its response was withheld.
-    assert_eq!(canary.seen().len(), 1 + requests);
-    let (kinds, _) = canary.drain_log().await;
+    assert_eq!(canary.requests().len(), 1 + requests);
+    let (kinds, _) = canary.logged_kinds();
     let recorded = kinds.iter().filter(|kind| *kind == "provider_request");
     assert_eq!(recorded.count(), requests);
     canary.verdict();
@@ -2945,7 +3036,7 @@ async fn forward_asks_for_the_identity_coding_and_withholds_a_coded_response() {
         let numbered = format!("{address}?asked={request}");
         let forwarded = canary.forward(record, "GET", &numbered, headers, b"").await;
         assert_eq!(forwarded.map(|forwarded| forwarded.status), Ok(200));
-        let sent = canary.seen().pop().unwrap();
+        let sent = canary.requests().pop().unwrap();
         let is_coding = |(name, _): &&(String, String)| name == "accept-encoding";
         let codings: Vec<&str> = sent
             .headers

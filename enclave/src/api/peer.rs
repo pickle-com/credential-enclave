@@ -29,15 +29,22 @@ use axum::response::Response;
 use credential_enclave_protocol::encoding::b64u_decode;
 use credential_enclave_protocol::envelope::{TransferEnvelope, TransferGrant};
 use credential_enclave_protocol::keys::key_id;
+use credential_enclave_protocol::log::EntryKind;
 use credential_enclave_protocol::release::{verify_endorsement, LogEntry, ReleaseMeasurement};
 use credential_enclave_protocol::secret::Secret;
 use credential_enclave_protocol::{limits, ProtocolError};
 
-use super::responses::{Exported, Imported};
+use super::responses::{AccountLogRef, Exported, Imported};
 use super::{invalid, json_ok, respond, ApiError, JsonBody};
 use crate::attest::{verify_peer, Accepted, Peer};
 use crate::log_store;
-use crate::state::{events, lock, Account, ActiveGrant, GrantState, Handover, Node};
+use crate::state::{events, lock, Account, ActiveGrant, EventPlace, GrantState, Handover, Node};
+
+/// The `seq` of the control entry a place names. A control event is never in an open batch,
+/// so its place always names an entry.
+fn seq_of(place: &EventPlace) -> Result<u64, ApiError> {
+    place.seq().ok_or_else(ApiError::internal)
+}
 
 /// Steps 1 to 3a of protocol.md 10.1 under the rule `accepted`: the attestation response of
 /// the peer verifies, the peer runs on the platform of this node and, on nitro, has a
@@ -191,8 +198,9 @@ async fn run_export(node: &Node, request: Request) -> Result<Response, ApiError>
     }
 
     // The entries. One entry per grant and peer: the first transfer of a grant to the peer
-    // puts the peer on the list of the grant and creates the entry. A later one finds both.
-    let mut entries = Vec::with_capacity(page.len());
+    // puts the peer on the list of the grant and creates the entry (a control entry, which
+    // closes an open batch of the account before it). A later one finds both.
+    let mut logs = Vec::with_capacity(page.len());
     let mut handed: Vec<(String, Arc<Mutex<Account>>, u64)> = Vec::with_capacity(page.len());
     for ((user_id, account), seed) in page.into_iter().zip(seeds) {
         let seq = {
@@ -201,28 +209,39 @@ async fn run_export(node: &Node, request: Request) -> Result<Response, ApiError>
             if !transferable(&mut account, &to_public, now_ms) {
                 continue;
             }
-            let next_seq = account.head.seq + 1;
-            let GrantState::Active(held) = &mut account.grant else {
-                continue;
+            let (handed_before, key_id, log_pk) = match &account.grant {
+                GrantState::Active(held) => (
+                    held.handed_to(&to_public),
+                    key_id(&held.sign_pk),
+                    held.log_pk,
+                ),
+                _ => continue,
             };
-            match held.handed_to(&to_public) {
+            match handed_before {
                 Some(seq) => seq,
                 None => {
-                    held.exported_to.push(Handover {
-                        peer: to_public,
-                        seq: next_seq,
-                    });
-                    let (key_id, log_pk) = (key_id(&held.sign_pk), held.log_pk);
-                    entries.push(node.append_entry_seeded(
+                    let place = node.create_event_seeded(
                         &mut account,
                         &user_id,
                         &key_id,
                         &log_pk,
                         now_ms,
-                        &events::grant_transferred_out(&to),
+                        EntryKind::Control,
+                        events::grant_transferred_out(&to),
                         &seed,
-                    ));
-                    next_seq
+                    )?;
+                    let seq = seq_of(&place)?;
+                    if let GrantState::Active(held) = &mut account.grant {
+                        held.exported_to.push(Handover {
+                            peer: to_public,
+                            seq,
+                        });
+                    }
+                    logs.push(AccountLogRef {
+                        user_id: user_id.clone(),
+                        seq,
+                    });
+                    seq
                 }
             }
         };
@@ -232,9 +251,9 @@ async fn run_export(node: &Node, request: Request) -> Result<Response, ApiError>
     // No grant enters the transfer before the log store confirmed the entry of each account
     // of the page: the entries this call created, and those of an earlier call that still
     // wait.
-    let awaited: Vec<(&str, &Mutex<Account>, u64)> = handed
+    let awaited: Vec<(&Mutex<Account>, u64)> = handed
         .iter()
-        .map(|(user_id, account, seq)| (user_id.as_str(), account.as_ref(), *seq))
+        .map(|(_, account, seq)| (account.as_ref(), *seq))
         .collect();
     log_store::confirm_each(node, &awaited).await?;
 
@@ -275,7 +294,7 @@ async fn run_export(node: &Node, request: Request) -> Result<Response, ApiError>
     };
     Ok(json_ok(&Exported {
         envelope,
-        entries,
+        logs,
         next,
     }))
 }
@@ -303,10 +322,13 @@ pub async fn import(State(node): State<Arc<Node>>, request: Request) -> Response
 /// Takes the delegations of a transfer that the peer whose attestation response the call
 /// carries made for this node.
 ///
-/// The entry `grant_transferred_in` of a grant this call puts in place is not written to the
-/// log store by this call: it is a pending entry, and the next write of the account takes it
-/// along. The entry that says where the grant went is the `grant_transferred_out` of the
-/// giving node, which the log store confirmed before the transfer was made.
+/// The grant is put in place before the entry `grant_transferred_in` of the account is written:
+/// the call writes the entries it created in one round after that, when the node has
+/// credentials for its log store, and an entry the store did not confirm, or that the node
+/// could not write, is a pending entry that the next write of the account takes along. The
+/// outcome of the round does not change the outcome of the call. The entry that says where the
+/// grant went is the `grant_transferred_out` of the giving node, which the log store confirmed
+/// before the transfer was made.
 ///
 /// A grant of the custody of this node whose time has not passed is taken when the account has
 /// no grant within its time here and never revoked here: the entry `grant_transferred_in` is
@@ -351,22 +373,23 @@ async fn run_import(node: &Node, request: Request) -> Result<Response, ApiError>
     for _ in 0..transfer.grants.len() {
         seeds.push(node.random_secret::<32>()?);
     }
-    let mut entries = Vec::new();
+    let mut logs = Vec::new();
+    let mut created: Vec<(Arc<Mutex<Account>>, u64)> = Vec::new();
     for (grant, seed) in transfer.grants.into_iter().zip(seeds) {
         if grant.custody != node.custody || grant.not_after_ms <= now_ms {
             continue;
         }
         let not_after_ms = grant.not_after_ms.min(latest_ms);
         let account = node.account_or_create(&grant.user_id);
-        let mut account = lock(&account);
+        let mut guard = lock(&account);
         if node.ensure_open().is_err() {
             break;
         }
-        if account.revoked_here {
+        if guard.revoked_here {
             continue;
         }
-        account.expire(now_ms);
-        match &mut account.grant {
+        guard.expire(now_ms);
+        match &mut guard.grant {
             GrantState::Active(held) => {
                 if held.sign_pk == grant.sign_pk {
                     held.not_after_ms = held.not_after_ms.max(not_after_ms);
@@ -375,18 +398,24 @@ async fn run_import(node: &Node, request: Request) -> Result<Response, ApiError>
             GrantState::Revoked { .. } => {}
             GrantState::None | GrantState::Expired { .. } => {
                 let key_id = key_id(&grant.sign_pk);
-                entries.push(node.append_entry_seeded(
-                    &mut account,
+                // The entry starts as a pending entry; the round below writes it when the node
+                // can, and the next write of the account takes it along otherwise.
+                let place = node.create_event_seeded(
+                    &mut guard,
                     &grant.user_id,
                     &key_id,
                     &grant.log_pk,
                     now_ms,
-                    &events::grant_transferred_in(&from, not_after_ms, grant.custody),
+                    EntryKind::Control,
+                    events::grant_transferred_in(&from, not_after_ms, grant.custody),
                     &seed,
-                ));
-                let seq = account.head.seq;
-                account.leave_pending(seq);
-                account.grant = GrantState::Active(ActiveGrant {
+                )?;
+                let seq = seq_of(&place)?;
+                logs.push(AccountLogRef {
+                    user_id: grant.user_id.clone(),
+                    seq,
+                });
+                guard.grant = GrantState::Active(ActiveGrant {
                     key_id,
                     sign_pk: grant.sign_pk,
                     log_pk: grant.log_pk,
@@ -395,11 +424,24 @@ async fn run_import(node: &Node, request: Request) -> Result<Response, ApiError>
                     not_after_ms,
                     exported_to: Vec::new(),
                 });
+                drop(guard);
+                created.push((account, seq));
             }
         }
     }
+    // The grants are in place. The entries of the import are written now, in one round, so that
+    // the chain of an account that acts on another node afterwards is complete in the store all
+    // the same. The outcome of the round changes nothing: an entry that is not confirmed is a
+    // pending entry.
+    if !created.is_empty() {
+        let awaited: Vec<(&Mutex<Account>, u64)> = created
+            .iter()
+            .map(|(account, seq)| (account.as_ref(), *seq))
+            .collect();
+        let _ = log_store::confirm_each(node, &awaited).await;
+    }
     Ok(json_ok(&Imported {
-        imported: entries.len(),
-        entries,
+        imported: logs.len(),
+        logs,
     }))
 }
