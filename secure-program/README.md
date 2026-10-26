@@ -14,7 +14,9 @@ version listing of the account's prefix up to the head a node signed (the index 
 reads the control entries and the entries it shows, counts the summary of the last seven days of
 the log screen from the entries of that window (each read once per device and kept as the summary
 tally), and reads every entry when the user starts the full verification (at most once an hour per
-device). The storage of the operator holds no entry, and entries older than 400 days are expired.
+device). The storage of the operator holds no entry. The absence of an entry older than 365 days
+(the retention of its Object Lock) is expired, not an omission (protocol.md 7.4), and the lifecycle
+rule of the bucket removes entries at 400 days (7.6).
 
 This file is the source of truth of the program. The repository `pickle-com/interactive-character`
 (the backend of the operator) vendors a byte-identical copy at `backend/assets/ui/secure-program.js`
