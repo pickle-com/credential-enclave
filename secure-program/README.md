@@ -15,7 +15,10 @@ reads the control entries and the entries it shows, and counts the summary of th
 of the log screen from the entries of that window (each read once per device and kept as the
 summary tally). The storage of the operator holds no entry. The absence of an entry older than 365
 days (the retention of its Object Lock) is expired, not an omission (protocol.md 7.4), and the
-lifecycle rule of the bucket removes entries at 400 days (7.6).
+lifecycle rule of the bucket removes entries at 400 days (7.6). The program sends the requests of one
+procedure that do not depend on each other together (the account query with the node list, the grants
+to every node, the reads of one verification run in four stages: heads and listing addresses,
+listings, object addresses, objects) and judges the results in the order protocol.md 7.4 gives.
 
 This file is the source of truth of the program. The repository `pickle-com/interactive-character`
 (the backend of the operator) vendors a byte-identical copy at `backend/assets/ui/secure-program.js`

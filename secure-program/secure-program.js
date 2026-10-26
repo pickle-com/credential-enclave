@@ -22,7 +22,7 @@
 
   // ---- Constants ----
 
-  const VERSION = 29;
+  const VERSION = 30;
   const MASTER_KEY_SERVICE = "com.pickle.client.secure.master-key";
   const LEDGER_SERVICE = "com.pickle.client.secure.ledger";
   const LEDGER_STORE_KEY = "ledger";
@@ -69,6 +69,16 @@
   const LOG_STORE_STALE_MS = 3 * DAY_MS;
   // The route of the report of one verification run.
   const LOG_REPORT_PATH = "/api/secure/log/verified";
+  // The route that hands out the listing addresses of one verification run in one response (the node
+  // discovery listing and the listing of every node of the ledger), and the most object versions the
+  // run requests addresses for and reads ahead of the judgement (the control entries and the format 1
+  // entries of the first listing page of every node; the limit of the address route).
+  const LOG_LISTINGS_PATH = "/api/secure/log/store/listings";
+  const LOG_PREFETCH_OBJECTS = 100;
+  // The key of the device store that marks the sealing check as done for this device and account: a
+  // query of the pending values (GET /api/secure/sealing) that found none, or an upload that left none.
+  // Writing a master key (a new key, a replaced key, a transferred key) clears it.
+  const SEALING_CHECK_STORE_KEY = "sealing_checked";
   // The query keys a presigned listing address may carry besides the signature keys (X-Amz-...):
   // the versions listing, its prefix and delimiter, the markers of the page, the page size (1000)
   // and the encoding of the names in the response (url: the keys are decoded).
@@ -701,6 +711,9 @@
       service: item.service, account: item.account, value: bytes,
       synchronizable: true, accessible: "after_first_unlock",
     });
+    // A key this device did not have before (new, replaced, transferred) may be the key the pending
+    // values of the account are to be sealed under: the sealing check runs once more.
+    native.storeSet(SEALING_CHECK_STORE_KEY, null);
   }
 
   function deleteMasterKey() {
@@ -733,6 +746,21 @@
     }
     if (!isObject) throw native.error("invalid_response", method + " " + path);
     return { status: response.status, json: json };
+  }
+
+  /** The outcome of a promise as a value: {ok: true, value} or {ok: false, error}. The requests of one
+   *  stage are awaited through this so that the failure of one does not drop the responses of the
+   *  others; what a failure means is decided where the response is used. */
+  function settled(promise) {
+    return promise.then(
+      function (value) { return { ok: true, value: value }; },
+      function (error) { return { ok: false, error: error }; });
+  }
+
+  /** One stage: the requests of promises are already sent (native.http is called when the promise is
+   *  made); the stage ends when every one of them settled. Returns their settled outcomes in order. */
+  function stage(promises) {
+    return Promise.all(promises.map(settled));
   }
 
   // ---- Signed values ----
@@ -1597,13 +1625,16 @@
 
   /** The nodes of this account in the log store: the common prefixes of the account prefix (the
    *  node discovery listing). A prefix that does not name a node id is left out. */
-  async function discoverStoreNodes() {
+  async function discoverStoreNodes(reads) {
     const prefix = accountPrefix();
     const nodes = [];
     let keyMarker = null;
     let versionIdMarker = null;
     for (let page = 0; page < LOG_STORE_PAGES; page += 1) {
-      const listing = await listStorePage(true, null, keyMarker, versionIdMarker);
+      // The first page was read ahead (beginVerificationReads) when the run has it; the pages after
+      // it, and the first page when the read ahead did not arrive, are read here.
+      const ready = page === 0 && reads && reads.discovery !== null ? reads.discovery : null;
+      const listing = ready !== null ? ready : await listStorePage(true, null, keyMarker, versionIdMarker);
       for (const common of listing.prefixes) {
         if (common.slice(0, prefix.length) !== prefix || common.slice(-1) !== "/") continue;
         const id = common.slice(prefix.length, -1);
@@ -1622,29 +1653,53 @@
    *  the same seq is an object someone else put there, and only a key the chain equation or a
    *  verified object confirms counts), min is the smallest listed seq (0 when none), max the
    *  largest (afterSeq when none), truncated whether the listing went on beyond pages pages. */
-  async function storeIndex(id, afterSeq, pages) {
+  async function storeIndex(id, afterSeq, pages, reads) {
     const prefix = accountPrefix() + id + "/";
     const index = { entries: new Map(), min: 0, max: afterSeq, truncated: false };
-    let keyMarker = prefix + seqDigits(afterSeq) + "-~";
+    let keyMarker = listingMarker(id, afterSeq);
     let versionIdMarker = null;
     for (let page = 0; page < pages; page += 1) {
-      const listing = await listStorePage(false, id, keyMarker, versionIdMarker);
-      for (const version of listing.versions) {
-        const parts = parseStoreKey(version.key, prefix);
-        if (parts === null || parts.seq <= afterSeq) continue;
-        if (!index.entries.has(parts.seq)) index.entries.set(parts.seq, []);
-        index.entries.get(parts.seq).push({
-          key: version.key, versionId: version.versionId, isLatest: version.isLatest, parts: parts,
-        });
-        if (index.min === 0 || parts.seq < index.min) index.min = parts.seq;
-        if (parts.seq > index.max) index.max = parts.seq;
-      }
+      // The first page was read ahead (beginVerificationReads) when the run has the page of this very
+      // marker; every other page is read here.
+      const ready = page === 0 ? prefetchedPage(reads, id, keyMarker) : null;
+      const listing = ready !== null ? ready : await listStorePage(false, id, keyMarker, versionIdMarker);
+      addListing(index, listing, prefix, afterSeq);
       if (!listing.truncated || listing.nextKeyMarker === null) return index;
       keyMarker = listing.nextKeyMarker;
       versionIdMarker = listing.nextVersionIdMarker;
     }
     index.truncated = true;
     return index;
+  }
+
+  /** The key marker of the listing of one node from its verification point: every key of that seq
+   *  sorts before it (docs/protocol.md 7.4 step 2). */
+  function listingMarker(id, afterSeq) {
+    return accountPrefix() + id + "/" + seqDigits(afterSeq) + "-~";
+  }
+
+  /** Adds the versions of one listing page to an index (storeIndex): the keys under prefix whose seq
+   *  is after afterSeq, grouped by seq. */
+  function addListing(index, listing, prefix, afterSeq) {
+    for (const version of listing.versions) {
+      const parts = parseStoreKey(version.key, prefix);
+      if (parts === null || parts.seq <= afterSeq) continue;
+      if (!index.entries.has(parts.seq)) index.entries.set(parts.seq, []);
+      index.entries.get(parts.seq).push({
+        key: version.key, versionId: version.versionId, isLatest: version.isLatest, parts: parts,
+      });
+      if (index.min === 0 || parts.seq < index.min) index.min = parts.seq;
+      if (parts.seq > index.max) index.max = parts.seq;
+    }
+  }
+
+  /** The listing page of a node read ahead of the judgement, when the run has one and it is the page
+   *  of this very key marker (the first page from the verification point of the node when the reads
+   *  were begun); null otherwise. */
+  function prefetchedPage(reads, id, keyMarker) {
+    if (!reads) return null;
+    const page = reads.pages.get(id);
+    return page !== undefined && page.keyMarker === keyMarker ? page.listing : null;
   }
 
   /** The smallest listed seq after seq (the far end of a gap), seq itself when none is listed. */
@@ -1708,13 +1763,20 @@
    *  requests, along with its address, the addresses of the candidates of ahead (the objects the
    *  caller will read next), LOG_STORE_OBJECTS addresses per request. fetched and bytes count the
    *  objects read and their size. */
-  function storeReader() {
+  function storeReader(reads) {
     const urls = new Map();
     const reader = {
       fetched: 0,
       bytes: 0,
       object: async function (candidate, ahead) {
         const name = candidate.key + "\n" + candidate.versionId;
+        // An object read ahead of the judgement (completeVerificationReads) is that very version.
+        const ready = reads ? reads.objects.get(name) : undefined;
+        if (ready !== undefined) {
+          reader.fetched += 1;
+          reader.bytes += ready.bytes;
+          return ready.signed;
+        }
         if (!urls.has(name)) {
           const wanted = [candidate];
           for (const other of ahead) {
@@ -1900,7 +1962,7 @@
    *  whose state is verified, pending (a budget ran out, the store could not be read, or the store
    *  has pages or entries still to confirm) or attention (a gap, a mismatch, or a part that cannot
    *  be checked). */
-  async function verifyChain(ledger, id, summary, budgets, keys, store) {
+  async function verifyChain(ledger, id, summary, budgets, keys, store, reads) {
     const node = ledger.nodes[id];
     const stored = summary === undefined ? { live: false, final_head: null } : summary;
     const outcome = { state: "verified", checked: 0, missing: 0, expired: 0, ours: false };
@@ -1912,35 +1974,13 @@
       return outcome;
     }
 
-    let head = node.final;
-    let live = head === null && stored.live === true;
-    if (live) {
-      const nonce = native.randomBytes(32);
-      let response = null;
-      try {
-        response = await api("POST", "/api/secure/nodes/" + id + "/status", { nonce: nonce });
-      } catch (error) {
-        if (error.code !== "node_not_found") throw error;
-        live = false;
-      }
-      if (response !== null) {
-        try {
-          head = openHead(response.json.head, node, id, nonce);
-        } catch (error) {
-          outcome.state = "attention";
-          return outcome;
-        }
-      }
+    const resolved = await headFor(node, id, stored, reads ? reads.heads.get(id) : undefined);
+    if (resolved.attention) {
+      outcome.state = "attention";
+      return outcome;
     }
-    if (head === null && stored.final_head !== null && stored.final_head !== undefined) {
-      try {
-        head = openHead(stored.final_head, node, id, null);
-      } catch (error) {
-        outcome.state = "attention";
-        return outcome;
-      }
-      node.final = { seq: head.seq, hash: head.hash };
-    }
+    const head = resolved.head;
+    if (resolved.final) node.final = { seq: head.seq, hash: head.hash };
     if (head !== null && head.seq === node.checkpoint.seq && sameBytes(head.hash, node.checkpoint.hash)) {
       // Nothing was written since the verification point: the listing is not read this run.
       return outcome;
@@ -1951,7 +1991,54 @@
       outcome.state = "pending";
       return outcome;
     }
-    return walkStore(ledger, node, id, head, budgets, keys, store, outcome);
+    return walkStore(ledger, node, id, head, budgets, keys, store, outcome, reads);
+  }
+
+  /** The head of one chain for this run (docs/protocol.md 7.4 step 1): the final head the ledger
+   *  keeps; otherwise the head a living node signed for a fresh nonce (the status request read ahead
+   *  in reads when the run has one, sent here when the node summary says the node lives); otherwise
+   *  the final head the backend keeps for a gone node. Returns {head, final, attention}: head is null
+   *  when none was obtained (a gone node without a final head), final is true when the head is the
+   *  final head of the backend (the ledger records it), attention is true when a head did not verify.
+   *  The status of a node is used only when the summary says the node lives (the head of a gone node
+   *  is its final head): a status read ahead for a node the summary says is gone is not looked at,
+   *  whatever it answered. A status that fails with anything but node_not_found is thrown (as the
+   *  request itself would be). */
+  async function headFor(node, id, stored, prefetched) {
+    let head = node.final;
+    if (head !== null) return { head: head, final: false, attention: false };
+    let answered = null;
+    if (prefetched !== undefined && stored.live === true) {
+      const outcome = await prefetched.result;
+      if (outcome.ok) {
+        answered = { head: outcome.value.json.head, nonce: prefetched.nonce };
+      } else if (outcome.error && outcome.error.code !== "node_not_found") {
+        throw outcome.error;
+      }
+    } else if (prefetched === undefined && stored.live === true) {
+      const nonce = native.randomBytes(32);
+      try {
+        const response = await api("POST", "/api/secure/nodes/" + id + "/status", { nonce: nonce });
+        answered = { head: response.json.head, nonce: nonce };
+      } catch (error) {
+        if (error.code !== "node_not_found") throw error;
+      }
+    }
+    if (answered !== null) {
+      try {
+        return { head: openHead(answered.head, node, id, answered.nonce), final: false, attention: false };
+      } catch (error) {
+        return { head: null, final: false, attention: true };
+      }
+    }
+    if (stored.final_head !== null && stored.final_head !== undefined) {
+      try {
+        return { head: openHead(stored.final_head, node, id, null), final: true, attention: false };
+      } catch (error) {
+        return { head: null, final: false, attention: true };
+      }
+    }
+    return { head: null, final: false, attention: false };
   }
 
   /** The verification of one chain with the listing of the log store as the index of completeness
@@ -1965,7 +2052,7 @@
    *  verifying entry: the entries before it are expired when the verification point, or the entry
    *  itself, is older than the retention of the store, otherwise missing. For a node found in the
    *  store only, a prefix that is not a chain is left out. */
-  async function walkStore(ledger, node, id, head, budgets, keys, store, outcome) {
+  async function walkStore(ledger, node, id, head, budgets, keys, store, outcome, reads) {
     let cursor = node.checkpoint;
     if (head !== null &&
         (head.seq < cursor.seq || (head.seq === cursor.seq && !sameBytes(head.hash, cursor.hash)))) {
@@ -1974,7 +2061,7 @@
     }
     let index = null;
     try {
-      index = await storeIndex(id, cursor.seq, LOG_STORE_PAGES);
+      index = await storeIndex(id, cursor.seq, LOG_STORE_PAGES, reads);
     } catch (error) {
       if (!isStoreFailure(error)) throw error;
       storeFailed(store, error);
@@ -1991,7 +2078,7 @@
     const discovered = node.origin === "store";
     const headTime = head !== null && head.time_ms !== 0 ? head.time_ms : native.nowMs();
     const retention = LOG_EXPIRES_DAYS * DAY_MS;
-    const reader = storeReader();
+    const reader = storeReader(reads);
     try {
       if (index.min !== 0 && index.min > cursor.seq + 1) {
         // The listing begins beyond the seq after the verification point: the entries between are
@@ -3040,20 +3127,48 @@
     return judged.keys;
   }
 
+  /** The living nodes with their attestations for a fresh nonce: {nonce, nodes}. The request of the
+   *  delegation step (renewGrants), sent ahead when the caller knows that the step will follow. */
+  async function fetchOffered() {
+    const nonce = native.randomBytes(32);
+    const nodes = (await api("GET", "/api/secure/nodes", null, { nonce: nonce })).json.nodes;
+    return { nonce: nonce, nodes: nodes };
+  }
+
+  /** presentKeys together with the node list of the delegation step: when the keychain holds a master
+   *  key, the node list is requested along with the account query (one stage) so that the grants of
+   *  liveGrantLedger follow one round trip after the keys. offered is null when no master key is held
+   *  (the account query alone decides the key state and no delegation follows) and when the node list
+   *  request failed (renewGrants then requests the list itself). */
+  async function presentKeysWithNodes() {
+    const judging = judgeKey();
+    // No list while delegation is off: liveGrantLedger refuses before it would delegate.
+    const pending = readMasterKey() !== null && !delegationOff(loadLedger()) ? settled(fetchOffered()) : null;
+    const judged = await judging;
+    if (judged.keyState !== "present") throw native.error("key_required", judged.keyState);
+    const offered = pending === null ? null : await pending;
+    return { keys: judged.keys, offered: offered !== null && offered.ok ? offered.value : null };
+  }
+
   /** Renews the grant of every living node. A node that is in the ledger and whose last grant is
    *  within the renewal interval (grantRenewMs) is skipped (not when force is true); every other
    *  node has its attestation verified, receives a grant with the lifetime the ledger sets, and is
-   *  written to the ledger. A node of the ledger that is not in the response list gets its gone
-   *  time. Returns the Set of accepted node ids, the number of nodes whose attestation failed to
-   *  verify, and the number of nodes whose attestation verified but did not take the grant. */
-  async function renewGrants(keys, ledger, force) {
-    const nonce = native.randomBytes(32);
-    const offered = (await api("GET", "/api/secure/nodes", null, { nonce: nonce })).json.nodes;
+   *  written to the ledger. The grants go out together (one stage): the nodes are independent of
+   *  each other and the relay writes one row per node. A node of the ledger that is not in the
+   *  response list gets its gone time. offered is the node list already requested (fetchOffered:
+   *  {nonce, nodes}); without it the list is requested here. Returns the Set of accepted node ids,
+   *  the number of nodes whose attestation failed to verify, and the number of nodes whose
+   *  attestation verified but did not take the grant. */
+  async function renewGrants(keys, ledger, force, offered) {
+    if (offered === undefined || offered === null) offered = await fetchOffered();
+    const nonce = offered.nonce;
     const listed = new Set();
     const accepted = new Set();
     let rejected = 0;
     let failed = 0;
-    for (const response of Array.isArray(offered) ? offered : []) {
+    // The nodes that receive a grant in this run, in the order of the list.
+    const wanted = [];
+    for (const response of Array.isArray(offered.nodes) ? offered.nodes : []) {
       const claimed = response !== null && typeof response === "object" ? response.node : undefined;
       listed.add(claimed);
       const known = typeof claimed === "string" ? ledger.nodes[claimed] : undefined;
@@ -3072,39 +3187,47 @@
       }
       listed.add(node.node);
       accepted.add(node.node);
-      try {
-        const grant = await sendGrant(node, response.challenge, keys, grantTtlMs(ledger));
-        // The grant time written to the ledger is after the last revocation time (a device clock
-        // that runs backwards does not make a grant after a revoke read as one before it).
-        const granted = Math.max(grant.granted_ms, ledger.revoked_ms + 1);
-        const existing = ledger.nodes[node.node];
-        if (existing !== undefined && existing.seal_pk === "") {
-          // A node that entered the ledger through the tracing of a delegation transfer: the values
-          // of the attestation verified this time are filled in.
-          existing.seal_pk = node.sealPk;
-          existing.platform = node.platform;
-          existing.release = node.release;
-        }
-        if (existing === undefined) {
-          // The chain of a node seen for the first time is verified from its first entry (another
-          // device may have delegated to it first).
-          ledger.nodes[node.node] = {
-            sign_pk: node.signPk, seal_pk: node.sealPk, platform: node.platform, release: node.release,
-            first_ms: granted, granted_ms: granted, not_after_ms: grant.not_after_ms,
-            checkpoint: { seq: 0, hash: ZERO_HASH, time_ms: 0 }, final: null, gone_ms: 0, origin: "grant",
-            unknown_ms: 0,
-          };
-        } else {
-          existing.granted_ms = granted;
-          existing.not_after_ms = grant.not_after_ms;
-          existing.origin = "grant";
-          existing.unknown_ms = 0;
-        }
-      } catch (error) {
+      wanted.push({ node: node, challenge: response.challenge });
+    }
+    const results = await stage(wanted.map(function (item) {
+      return sendGrant(item.node, item.challenge, keys, grantTtlMs(ledger));
+    }));
+    for (let i = 0; i < wanted.length; i += 1) {
+      const node = wanted[i].node;
+      const result = results[i];
+      if (!result.ok) {
         // A node that did not take the grant is not written to the ledger (the published state
         // grant becomes partial or none).
         failed += 1;
-        native.log("grant failed: " + failureCode(error));
+        native.log("grant failed: " + failureCode(result.error));
+        continue;
+      }
+      const grant = result.value;
+      // The grant time written to the ledger is after the last revocation time (a device clock
+      // that runs backwards does not make a grant after a revoke read as one before it).
+      const granted = Math.max(grant.granted_ms, ledger.revoked_ms + 1);
+      const existing = ledger.nodes[node.node];
+      if (existing !== undefined && existing.seal_pk === "") {
+        // A node that entered the ledger through the tracing of a delegation transfer: the values
+        // of the attestation verified this time are filled in.
+        existing.seal_pk = node.sealPk;
+        existing.platform = node.platform;
+        existing.release = node.release;
+      }
+      if (existing === undefined) {
+        // The chain of a node seen for the first time is verified from its first entry (another
+        // device may have delegated to it first).
+        ledger.nodes[node.node] = {
+          sign_pk: node.signPk, seal_pk: node.sealPk, platform: node.platform, release: node.release,
+          first_ms: granted, granted_ms: granted, not_after_ms: grant.not_after_ms,
+          checkpoint: { seq: 0, hash: ZERO_HASH, time_ms: 0 }, final: null, gone_ms: 0, origin: "grant",
+          unknown_ms: 0,
+        };
+      } else {
+        existing.granted_ms = granted;
+        existing.not_after_ms = grant.not_after_ms;
+        existing.origin = "grant";
+        existing.unknown_ms = 0;
       }
     }
     const now = native.nowMs();
@@ -3143,17 +3266,200 @@
   }
 
   /** Reports the result of one verification run to the backend (the one way the server learns what
-   *  the device verified). A failure is logged and changes nothing. */
-  async function reportVerification(result, counts, nodes, elapsedMs) {
-    try {
-      await api("POST", LOG_REPORT_PATH, {
-        status: result.status, store: result.store, nodes: nodes, keys_checked: counts.keys,
-        bodies_fetched: counts.bodies, missing: counts.missing, expired: counts.expired,
-        unknown_nodes: counts.unknown, elapsed_ms: elapsedMs, program_version: VERSION,
-      });
-    } catch (error) {
-      native.log("verification report: " + failureCode(error));
+   *  the device verified). The run does not wait for the answer: the report is sent and a failure
+   *  is logged when it arrives; it changes nothing. */
+  function reportVerification(result, counts, nodes, elapsedMs) {
+    settled(api("POST", LOG_REPORT_PATH, {
+      status: result.status, store: result.store, nodes: nodes, keys_checked: counts.keys,
+      bodies_fetched: counts.bodies, missing: counts.missing, expired: counts.expired,
+      unknown_nodes: counts.unknown, elapsed_ms: elapsedMs, program_version: VERSION,
+    })).then(function (outcome) {
+      if (!outcome.ok) native.log("verification report: " + failureCode(outcome.error));
+    });
+  }
+
+  /** The reads of one verification run sent ahead of its judgement (one stage): the node summary of
+   *  the account, the listing addresses of the node discovery listing and of every chain of the
+   *  ledger the run will walk (one request: LOG_LISTINGS_PATH), and the status (head) of every living
+   *  node of the ledger. The judgement (verifyAll) uses a response only when it is the very response
+   *  the judgement would have requested (the same node, marker, nonce, object version); what did not
+   *  arrive is requested there. Returns the reads object completeVerificationReads fills. */
+  function beginVerificationReads(ledger) {
+    const reads = {
+      summaries: settled(api("GET", "/api/secure/log/nodes")),
+      heads: new Map(),
+      targets: [],
+      listings: null,
+      discovery: null,
+      pages: new Map(),
+      objects: new Map(),
+    };
+    for (const id of Object.keys(ledger.nodes)) {
+      const node = ledger.nodes[id];
+      if (!writesToStore(node)) continue;
+      if (node.final !== null && node.checkpoint.seq >= node.final.seq) continue;
+      if (reads.targets.length < LOG_STORE_NODES) {
+        reads.targets.push({
+          node: id, key_marker: listingMarker(id, node.checkpoint.seq), version_id_marker: null,
+        });
+      }
+      if (node.gone_ms === 0 && node.final === null) {
+        const nonce = native.randomBytes(32);
+        reads.heads.set(id, {
+          nonce: nonce,
+          result: settled(api("POST", "/api/secure/nodes/" + id + "/status", { nonce: nonce })),
+        });
+      }
     }
+    reads.listings = settled(requestListings(true, reads.targets));
+    return reads;
+  }
+
+  /** The listing addresses of one run in one request: the node discovery listing of the account
+   *  prefix (discovery) and the listing of every node of nodes ({node, key_marker,
+   *  version_id_marker}) from its marker. Every address is checked as the address of one listing
+   *  request is (listingUrlAccepted); an address that is not the one requested, a node that is not
+   *  the one requested, and a missing address reject the whole response (url_rejected). Returns
+   *  {discovery: url | null, nodes: Map<node, {url, keyMarker}>}. */
+  async function requestListings(discovery, nodes) {
+    let response = null;
+    try {
+      response = (await api("POST", LOG_LISTINGS_PATH, { discovery: discovery, nodes: nodes })).json;
+    } catch (error) {
+      throw storeFailure(error && error.code === "log_store_disabled" ? "disabled" : "unreachable");
+    }
+    const out = { discovery: null, nodes: new Map() };
+    if (discovery) {
+      const item = response.discovery;
+      const expected = { prefix: accountPrefix(), nodes: true, keyMarker: null, versionIdMarker: null };
+      if (item === null || typeof item !== "object" || !listingUrlAccepted(item.list_url, expected)) {
+        throw storeFailure("url_rejected");
+      }
+      out.discovery = item.list_url;
+    }
+    const listed = Array.isArray(response.nodes) ? response.nodes : [];
+    if (listed.length !== nodes.length) throw storeFailure("url_rejected");
+    for (let i = 0; i < nodes.length; i += 1) {
+      const wanted = nodes[i];
+      const item = listed[i];
+      const expected = {
+        prefix: accountPrefix() + wanted.node + "/", nodes: false,
+        keyMarker: wanted.key_marker, versionIdMarker: wanted.version_id_marker,
+      };
+      if (item === null || typeof item !== "object" || item.node !== wanted.node ||
+          !listingUrlAccepted(item.list_url, expected)) {
+        throw storeFailure("url_rejected");
+      }
+      out.nodes.set(wanted.node, { url: item.list_url, keyMarker: wanted.key_marker });
+    }
+    return out;
+  }
+
+  /** The stages after the first of the reads of a run: B, the discovery listing and the listing of
+   *  every node whose head differs from its verification point (a node whose head equals it is not
+   *  listed: docs/protocol.md 7.4 step 1); C, one address request for the object versions the
+   *  judgement reads by content on those pages (the control entries and the format 1 entries up to
+   *  the vouched end, every candidate of a chain nobody vouches for), at most LOG_PREFETCH_OBJECTS;
+   *  D, those objects. A read that fails is not kept: the judgement requests it again. Nothing here
+   *  changes the ledger or the judgement; summaries is the node summary table of the run. */
+  async function completeVerificationReads(ledger, reads, summaries) {
+    const listings = await reads.listings;
+    const outcomes = new Map();
+    for (const [id, entry] of reads.heads) {
+      outcomes.set(id, { outcome: await entry.result, nonce: entry.nonce });
+    }
+    if (!listings.ok) return;
+    const gets = [];
+    if (listings.value.discovery !== null) gets.push({ kind: "discovery", url: listings.value.discovery });
+    for (const target of reads.targets) {
+      const node = ledger.nodes[target.node];
+      const address = listings.value.nodes.get(target.node);
+      if (node === undefined || address === undefined) continue;
+      const stored = summaries[target.node] === undefined
+        ? { live: false, final_head: null }
+        : summaries[target.node];
+      const decision = headAhead(node, target.node, stored, outcomes.get(target.node));
+      if (decision === null) continue;
+      // A head at the verification point (nothing written since) is not listed; a head before it, or
+      // at it with another hash, is a mismatch the judgement marks without a listing (walkStore).
+      if (decision.head !== null && decision.head.seq <= node.checkpoint.seq) continue;
+      gets.push({
+        kind: "node", id: target.node, url: address.url, keyMarker: address.keyMarker,
+        vouched: decision.head === null ? null : decision.head.seq,
+      });
+    }
+    const pages = await stage(gets.map(function (item) { return fetchStore(item.url); }));
+    const wanted = [];
+    for (let i = 0; i < gets.length; i += 1) {
+      const item = gets[i];
+      const page = pages[i];
+      if (!page.ok || page.value.status !== 200) continue;
+      const parsed = parseListVersions(page.value.body);
+      if (parsed === null) continue;
+      if (item.kind === "discovery") {
+        reads.discovery = parsed;
+        continue;
+      }
+      reads.pages.set(item.id, { keyMarker: item.keyMarker, listing: parsed });
+      const node = ledger.nodes[item.id];
+      const index = { entries: new Map(), min: 0, max: node.checkpoint.seq, truncated: false };
+      addListing(index, parsed, accountPrefix() + item.id + "/", node.checkpoint.seq);
+      const seqs = Array.from(index.entries.keys()).sort(function (a, b) { return a - b; });
+      for (const seq of seqs) {
+        if (item.vouched !== null && seq > item.vouched) break;
+        const candidates = index.entries.get(seq).slice().sort(function (a, b) {
+          return (b.isLatest ? 1 : 0) - (a.isLatest ? 1 : 0);
+        });
+        for (const candidate of candidates) {
+          if (item.vouched !== null && candidate.parts.format === 2 && candidate.parts.kind === "u") continue;
+          if (wanted.length >= LOG_PREFETCH_OBJECTS) break;
+          wanted.push(candidate);
+        }
+        if (wanted.length >= LOG_PREFETCH_OBJECTS) break;
+      }
+    }
+    if (wanted.length === 0) return;
+    let urls = null;
+    try {
+      urls = await storeObjectUrls(wanted);
+    } catch (error) {
+      return;
+    }
+    const bodies = await stage(wanted.map(function (candidate) {
+      return fetchStoreObject(urls.get(candidate.key + "\n" + candidate.versionId));
+    }));
+    for (let i = 0; i < wanted.length; i += 1) {
+      if (bodies[i].ok) reads.objects.set(wanted[i].key + "\n" + wanted[i].versionId, bodies[i].value);
+    }
+  }
+
+  /** The head the judgement will have for one chain, from the reads alone (nothing is sent and
+   *  nothing is recorded): the final head of the ledger, the head of the status read ahead (read is
+   *  {outcome, nonce}; used, as headFor uses it, only for a node the summary says lives), or the
+   *  final head of the node summary. Returns {head} (head null when the judgement will have none)
+   *  or null when the judgement will mark the chain without reading its listing (a head that does
+   *  not verify, a status failure the judgement throws). */
+  function headAhead(node, id, stored, read) {
+    if (node.final !== null) return { head: node.final };
+    if (read !== undefined && stored.live === true) {
+      const outcome = read.outcome;
+      if (outcome.ok) {
+        try {
+          return { head: openHead(outcome.value.json.head, node, id, read.nonce) };
+        } catch (error) {
+          return null;
+        }
+      }
+      if (outcome.error && outcome.error.code !== "node_not_found") return null;
+    }
+    if (stored.final_head !== null && stored.final_head !== undefined) {
+      try {
+        return { head: openHead(stored.final_head, node, id, null) };
+      } catch (error) {
+        return null;
+      }
+    }
+    return { head: null };
   }
 
   /** The log verification (docs/protocol.md 7.4): lists the nodes of the account in the log store,
@@ -3164,28 +3470,41 @@
    *  explains the node), publishes the state log (publishLogState) and reports the run. One run
    *  spends at most LOG_VERIFY_KEYS keys and LOG_VERIFY_BODIES bodies over every node. A run whose
    *  node discovery listing cannot be read verifies nothing (the verification points stay). */
-  async function verifyAll(ledger, keys) {
+  async function verifyAll(ledger, keys, reads) {
     const started = native.nowMs();
-    const listed = (await api("GET", "/api/secure/log/nodes")).json.nodes;
+    // The reads of the run were sent ahead by the caller (together with its own requests) or are
+    // sent now; the judgement below uses them only where they are the very responses it would request.
+    if (!reads) reads = beginVerificationReads(ledger);
+    const summariesOutcome = await reads.summaries;
+    if (!summariesOutcome.ok) throw summariesOutcome.error;
+    const listed = summariesOutcome.value.json.nodes;
     const summaries = Object.create(null);
     for (const summary of Array.isArray(listed) ? listed : []) {
       if (summary !== null && typeof summary === "object" && typeof summary.node === "string") {
         summaries[summary.node] = summary;
       }
     }
+    await completeVerificationReads(ledger, reads, summaries);
     const store = { state: "verified" };
     const now = native.nowMs();
     const counts = { pending: false, unverified: 0, missing: 0, expired: 0, unknown: 0, keys: 0, bodies: 0 };
+    // The listing addresses of the run that the backend refused or that did not name the listings
+    // requested are the store failure of the run, as the refusal of one listing address is
+    // (listStorePage). A listing request that did not arrive is sent again by the judgement.
+    const listings = await reads.listings;
     let discovered = [];
     try {
-      discovered = await discoverStoreNodes();
+      if (!listings.ok && isStoreFailure(listings.error) && listings.error.kind !== "unreachable") {
+        throw listings.error;
+      }
+      discovered = await discoverStoreNodes(reads);
     } catch (error) {
       if (!isStoreFailure(error)) throw error;
       storeFailed(store, error);
       if (store.state !== "absent" && store.state !== "refused") {
         counts.pending = true;
         const result = publishLogState(ledger, store, counts, now);
-        await reportVerification(result, counts, Object.keys(ledger.nodes).length, native.nowMs() - started);
+        reportVerification(result, counts, Object.keys(ledger.nodes).length, native.nowMs() - started);
         return result;
       }
     }
@@ -3210,7 +3529,7 @@
     while (queue.length > 0) {
       const id = queue.shift();
       if (ledger.nodes[id] === undefined) continue;
-      const outcome = await verifyChain(ledger, id, summaries[id], budgets, keys, store);
+      const outcome = await verifyChain(ledger, id, summaries[id], budgets, keys, store, reads);
       counts.missing += outcome.missing;
       counts.expired += outcome.expired;
       if (outcome.ours) ours.add(id);
@@ -3244,7 +3563,7 @@
       }
     }
     const result = publishLogState(ledger, store, counts, now);
-    await reportVerification(result, counts, Object.keys(ledger.nodes).length, native.nowMs() - started);
+    reportVerification(result, counts, Object.keys(ledger.nodes).length, native.nowMs() - started);
     return result;
   }
 
@@ -3256,15 +3575,27 @@
    *  is the opened bytes as they are (re-serializing the JSON would change integers above 2^53, the
    *  notation of numbers and escape sequences): only that it is a JSON object is checked. Nothing is
    *  done when no node holds a grant (no node could open those records). A failure is only logged
-   *  and does not change the result of sync. Returns the number of stored items. */
-  async function sealPending(keys, ledger) {
+   *  and does not change the result of sync. first is the settled outcome of the first query (sent
+   *  ahead, together with the first reads of the verification) or null when this device and account
+   *  completed the check before (SEALING_CHECK_STORE_KEY): then nothing is queried. A query that found
+   *  no item, and an upload that left none, mark the check as complete; a failed query marks nothing
+   *  (the next sync queries again). Returns the number of stored items. */
+  async function sealPending(keys, ledger, first) {
     let sealed = 0;
+    if (first === null || first === undefined) return 0;
     try {
       const custody = heldCustody(ledger, native.nowMs());
       if (custody === null) return 0;
       const user = userId();
       for (let round = 0; round < SEALING_ROUNDS; round += 1) {
-        const pending = (await api("GET", "/api/secure/sealing")).json;
+        let pending = null;
+        if (round === 0) {
+          const outcome = await first;
+          if (!outcome.ok) throw outcome.error;
+          pending = outcome.value.json;
+        } else {
+          pending = (await api("GET", "/api/secure/sealing")).json;
+        }
         const items = Array.isArray(pending.items) ? pending.items : [];
         const records = [];
         for (const item of items) {
@@ -3283,9 +3614,15 @@
             native.log("pending item skipped: " + failureCode(error));
           }
         }
+        if (items.length === 0) {
+          native.storeSet(SEALING_CHECK_STORE_KEY, "1");
+          break;
+        }
         if (records.length === 0) break;
         const stored = (await api("PUT", "/api/secure/sealing", { items: records })).json;
         sealed += Array.isArray(stored.sealed) ? stored.sealed.length : 0;
+        // The check is marked complete only by a query that found nothing: after an upload the next
+        // sync queries once more (an item the backend rejected stays pending and is offered again).
         if (pending.more !== true) break;
       }
     } catch (error) {
@@ -3295,12 +3632,14 @@
   }
 
   /** From the delegation step of sync to its end: when delegation is on the grants of the living
-   *  nodes are renewed, the ledger is saved, grant is published, the log is verified when its
-   *  period has elapsed, and runtime.ready is published. */
-  async function delegate(keys, ledger) {
+   *  nodes are renewed, the ledger is saved, grant is published, the steps after the grants run
+   *  (afterGrants: the sealing check, the completion of an application password setup, the log
+   *  verification when its period has elapsed), and runtime.ready is published. offered is the node
+   *  list already requested (null: renewGrants requests it). */
+  async function delegate(keys, ledger, offered) {
     let renewed = { accepted: new Set(), rejected: 0 };
     if (!delegationOff(ledger)) {
-      renewed = await renewGrants(keys, ledger);
+      renewed = await renewGrants(keys, ledger, undefined, offered);
     } else {
       // While delegation is off the revoke is sent again to every living node: it reaches the nodes
       // that were not reached when it was turned off, and the nodes that took over a delegation
@@ -3317,22 +3656,56 @@
       state: { grant: grant, grant_days: ledger.ttl_days },
       runtime: { rejected_nodes: renewed.rejected },
     });
-    if (!delegationOff(ledger)) {
-      await sealPending(keys, ledger);
-      await finishAppPasswordSetup(keys, ledger);
-    }
-    if (native.nowMs() - logState.verified_ms >= LOG_VERIFY_INTERVAL_MS) await verifyAll(ledger, keys);
+    await afterGrants(keys, ledger);
     native.publish({ runtime: { ready: true } });
     return { grant: grant, accepted: renewed.accepted.size, rejected: renewed.rejected };
+  }
+
+  /** The steps of delegate after the grants: the sealing check (when this device and account have
+   *  not completed one), the completion of an application password setup, and the log verification
+   *  when its period has elapsed. The query of the sealing check and the first reads of the
+   *  verification (beginVerificationReads) are sent together as one stage; the steps then run in
+   *  the order of v29 on the responses. While delegation is off only the verification runs. */
+  async function afterGrants(keys, ledger) {
+    const on = !delegationOff(ledger);
+    const due = native.nowMs() - logState.verified_ms >= LOG_VERIFY_INTERVAL_MS;
+    // The query of the sealing check is sent only when a node holds a grant: without one nothing
+    // could be sealed (sealPending) and the account is not asked.
+    const sealing = on && needsSealingCheck() && heldCustody(ledger, native.nowMs()) !== null
+      ? settled(api("GET", "/api/secure/sealing"))
+      : null;
+    const reads = due ? beginVerificationReads(ledger) : null;
+    if (on) {
+      await sealPending(keys, ledger, sealing);
+      await finishAppPasswordSetup(keys, ledger);
+    }
+    if (due) await verifyAll(ledger, keys, reads);
+  }
+
+  /** Whether the sealing check has still to run for this device and account. */
+  function needsSealingCheck() {
+    return native.storeGet(SEALING_CHECK_STORE_KEY) === null;
   }
 
   /** The body of sync. A failure publishes its code to state.error, a success clears it. */
   async function runSync() {
     try {
-      const judged = await judgeKey();
+      // The node list of the delegation step is requested along with the account query when this
+      // device holds a master key and delegation is on; a device without a key delegates nothing,
+      // and while delegation is off the revoke is sent again with a list of its own (delegate).
+      const judging = judgeKey();
+      const pending = readMasterKey() !== null && !delegationOff(loadLedger())
+        ? settled(fetchOffered())
+        : null;
+      const judged = await judging;
       let outcome = { grant: { state: "none", not_after_ms: 0 }, accepted: 0, rejected: 0 };
-      if (judged.keyState === "present") outcome = await delegate(judged.keys, loadLedger());
-      else native.publish({ runtime: { ready: true } });
+      if (judged.keyState === "present") {
+        const offered = pending === null ? null : await pending;
+        outcome = await delegate(
+          judged.keys, loadLedger(), offered !== null && offered.ok ? offered.value : null);
+      } else {
+        native.publish({ runtime: { ready: true } });
+      }
       native.publish({ state: { error: null } });
       // Catching up on the master key transfer: a device with the key reads the pending requests, a
       // device with a transfer in progress advances one step, and the polling loop is started again.
@@ -3364,10 +3737,10 @@
    *  a grant (a node that restarted) receives one. When delegation is off it is delegation_off; when
    *  no living node holds a grant it is grant_required (attestation_failed when every living node
    *  failed the attestation verification). Returns the renewed ledger. */
-  async function liveGrantLedger(keys) {
+  async function liveGrantLedger(keys, offered) {
     const ledger = loadLedger();
     if (delegationOff(ledger)) throw native.error("delegation_off", "delegation is turned off");
-    const renewed = await renewGrants(keys, ledger);
+    const renewed = await renewGrants(keys, ledger, undefined, offered);
     saveLedger(ledger);
     const grant = grantState(ledger, renewed.accepted, native.nowMs());
     native.publish({ state: { grant: grant }, runtime: { rejected_nodes: renewed.rejected } });
@@ -3383,7 +3756,11 @@
    *  it succeeded: when two devices create a key at the same time, the one that loses the
    *  registration does not write to the keychain. */
   async function createKey() {
-    const judged = await judgeKey();
+    // The node list of the delegation step is requested along with the account query (one stage):
+    // the key is made for the grants that follow. The registration waits for the account query.
+    const judging = judgeKey();
+    const pending = settled(fetchOffered());
+    const judged = await judging;
     if (judged.keyState !== "absent") return { key_state: judged.keyState, key_id: judged.keyId };
     const masterKey = native.randomBytes(32);
     const keys = deriveKeys(masterKey);
@@ -3396,7 +3773,8 @@
     }
     writeMasterKey(masterKey);
     publishKey("present", keys);
-    await delegate(keys, loadLedger());
+    const offered = await pending;
+    await delegate(keys, loadLedger(), offered.ok ? offered.value : null);
     return { key_state: "present", key_id: keys.keyId };
   }
 
@@ -3404,7 +3782,9 @@
    *  registered, the key of the account is replaced with a new one. The nodes of the old ledger
    *  belong to the records of the old key, so a new node ledger is made. */
   async function resetKey() {
-    const judged = await judgeKey();
+    const judging = judgeKey();
+    const pending = settled(fetchOffered());
+    const judged = await judging;
     if (judged.keyState !== "waiting" && judged.keyState !== "mismatch") {
       throw native.error("invalid_state", judged.keyState);
     }
@@ -3419,7 +3799,8 @@
       unknown_nodes: 0, store: "pending", store_failing_ms: 0,
     };
     publishKey("present", keys);
-    await delegate(keys, ledger);
+    const offered = await pending;
+    await delegate(keys, ledger, offered.ok ? offered.value : null);
     return { key_state: "present", key_id: keys.keyId };
   }
 
@@ -3454,8 +3835,8 @@
   async function connect(args) {
     const target = typeof args.target === "string" ? args.target.trim() : "";
     if (target === "") throw native.error("invalid_input", "target");
-    const keys = await presentKeys();
-    const ledger = await liveGrantLedger(keys);
+    const { keys, offered } = await presentKeysWithNodes();
+    const ledger = await liveGrantLedger(keys, offered);
 
     const request = { target: target };
     for (const name of ["login_hint", "request_id"]) {
@@ -3572,8 +3953,8 @@
     const username = stringArgument(args.username).trim().toLowerCase();
     const password = stringArgument(args.password);
     if (!username || !password) throw native.error("invalid_input", "mail connection");
-    const keys = await presentKeys();
-    const ledger = await liveGrantLedger(keys);
+    const { keys, offered } = await presentKeysWithNodes();
+    const ledger = await liveGrantLedger(keys, offered);
     const custody = await recordCustody();
     const record = sealRecord(keys, custody, "app_password", "naver_mail", {
       username: username, password: password,
@@ -3624,8 +4005,8 @@
   }
 
   async function beginAppPasswordSetup(args) {
-    const keys = await presentKeys();
-    await liveGrantLedger(keys);
+    const { keys, offered } = await presentKeysWithNodes();
+    await liveGrantLedger(keys, offered);
     let identity = stringArgument(args.identity).trim().toLowerCase();
     if (identity && identity.indexOf("@") < 0) identity += "@naver.com";
     if (identity && !/^[a-z0-9_.-]{1,64}@naver\.com$/.test(identity)) {
@@ -3866,9 +4247,13 @@
     const textual = typeof args.limit === "string" && args.limit.trim() !== "";
     const given = textual ? Number(args.limit) : args.limit;
     const limit = Number.isFinite(given) ? Math.min(500, Math.max(1, Math.floor(given))) : 100;
-    const keys = await presentKeys();
+    // The first reads of the verification are sent along with the account query of presentKeys when
+    // this device holds a master key (without one the key state is not present and nothing is read).
     const ledger = loadLedger();
-    const log = await verifyAll(ledger, keys);
+    const judging = presentKeys();
+    const reads = readMasterKey() !== null ? beginVerificationReads(ledger) : null;
+    const keys = await judging;
+    const log = await verifyAll(ledger, keys, reads);
     const ids = log.store === "verified" ? screenNodes(ledger) : [];
     anchorScreen(ledger, ids);
     const since = summarySince(native.nowMs());
@@ -4044,6 +4429,7 @@
     native.keychainDelete(mailSetupItem());
     native.storeSet(LEDGER_STORE_KEY, null);
     native.storeSet(LOG_SUMMARY_STORE_KEY, null);
+    native.storeSet(SEALING_CHECK_STORE_KEY, null);
     summaryState = null;
   }
 
