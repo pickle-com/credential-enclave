@@ -11,9 +11,10 @@ the account keys from it (protocol.md section 3), verifies the attestation of en
 that hold a grant, and transfers the master key between the devices of one account. The program
 reads the log store directly (protocol.md 7.4): it verifies the log from the keys of the object
 version listing of the account's prefix up to the head a node signed (the index verification),
-reads the control entries and the entries it shows, draws the overview of the log screen from the
-keys alone, and reads every entry when the user starts the full verification. The storage of the
-operator holds no entry, and entries older than 400 days are expired.
+reads the control entries and the entries it shows, counts the summary of the last seven days of
+the log screen from the entries of that window (each read once per device and kept as the summary
+tally), and reads every entry when the user starts the full verification (at most once an hour per
+device). The storage of the operator holds no entry, and entries older than 400 days are expired.
 
 This file is the source of truth of the program. The repository `pickle-com/interactive-character`
 (the backend of the operator) vendors a byte-identical copy at `backend/assets/ui/secure-program.js`

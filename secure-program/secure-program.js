@@ -75,18 +75,26 @@
   const LISTING_QUERY_KEYS = [
     "versions", "prefix", "delimiter", "key-marker", "version-id-marker", "max-keys", "encoding-type",
   ];
-  // The log screen: the days of the overview (drawn from the keys alone), the events of the recent
-  // activity (the entries read for the first page), the events of one later page, the keys one
-  // listing of the screen reads down a chain, the entries the screen keeps opened in a runtime, the
-  // objects whose addresses are requested along with the one being read, and the objects the full
-  // verification reads at a time.
-  const LOG_OVERVIEW_DAYS = 7;
-  const LOG_RECENT_EVENTS = 20;
+  // The log screen: the days of the summary (the counts of the events of the entries of that window,
+  // kept per device as the summary tally), the entries one read of the screen counts into the tally
+  // before answering and each step of the count that goes on apart from the calls, the most entries
+  // of the window the tally counts, the key of the tally in the device store, the events of one
+  // later page, the keys one listing of the screen reads down a chain, the entries the screen keeps
+  // opened in a runtime, the objects whose addresses are requested along with the one being read,
+  // the objects the full verification reads at a time, the time after the start of a full
+  // verification before another may start, and the key of the last full verification in the device
+  // store.
+  const LOG_SUMMARY_DAYS = 7;
+  const LOG_SUMMARY_STEP = 100;
+  const LOG_SUMMARY_ENTRIES = 1000;
+  const LOG_SUMMARY_STORE_KEY = "log_summary";
   const LOG_SCREEN_EVENTS = 50;
   const LOG_DISPLAY_LIST = 1000;
   const LOG_DISPLAY_ENTRIES = 1000;
   const LOG_DISPLAY_AHEAD = 10;
   const LOG_FULL_FETCHES = 8;
+  const LOG_FULL_INTERVAL_MS = 3600000;
+  const LOG_FULL_STORE_KEY = "log_full";
   // The limit of the serialized node ledger (UTF-8, bytes).
   const LEDGER_LIMIT_BYTES = 65536;
   // The DER of the AWS Nitro Enclaves Root-G1 certificate (base64url). Its SHA-256 is
@@ -2583,7 +2591,10 @@
   }
 
   /** The largest seq of node id below startSeq whose entry is before beforeMs, 0 when there is
-   *  none. The keys are read further down the chain while the seqs known are not enough. */
+   *  none. The keys are read further down the chain while the seqs known are not enough: from the
+   *  floor of the keys known, or, while none is known, from startSeq when it is a seq and from the
+   *  verification point of the ledger otherwise (a chain whose start the ledger knows is
+   *  exhausted). */
   async function pointerBelow(ledger, id, beforeMs, startSeq, keys, reader) {
     const node = displayNode(id);
     for (;;) {
@@ -2592,7 +2603,15 @@
         if ((await entryTime(ledger, id, seq, keys, reader)) < beforeMs) return seq;
       }
       if (node.exhausted) return 0;
-      await loadKeysBefore(id, node.floor === 0 ? startSeq : node.floor);
+      let below = node.floor !== 0 ? node.floor : startSeq;
+      if (below === Infinity) {
+        below = ledger.nodes[id] !== undefined ? ledger.nodes[id].checkpoint.seq + 1 : 1;
+      }
+      if (below <= 1) {
+        node.exhausted = true;
+        return 0;
+      }
+      await loadKeysBefore(id, below);
     }
   }
 
@@ -2661,26 +2680,123 @@
     return ids;
   }
 
-  /** The date strings (device locale) of today and the count - 1 days before it, today first. The
-   *  days are found by stepping back one hour at a time (a step of a day skips or repeats a day on
-   *  the days of a daylight saving transition). */
-  function dayLabels(now, count) {
-    const labels = [formatTime(now, "date")];
-    let at = now;
-    while (labels.length < count) {
-      at -= 3600000;
-      const label = formatTime(at, "date");
-      if (label !== labels[labels.length - 1]) labels.push(label);
+  // ---- The summary of the last LOG_SUMMARY_DAYS days ----
+
+  // The summary tally: what this device counted of the entries of the window of the last
+  // LOG_SUMMARY_DAYS days, kept in the device store under LOG_SUMMARY_STORE_KEY (a device counts for
+  // itself: the ledger is synchronized between the devices of an account, the tally is not).
+  // buckets maps the start of an hour (ms, as a decimal string) to the counts of the events of that
+  // hour {reads, sends, changes, entries, providers} (the shape countInto fills, plus the entries
+  // counted into the bucket); nodes maps a node id to the range {lo, hi} of the seqs of that node
+  // whose entries were counted (lo is hi + 1 while none was). An entry is counted once, each of
+  // its events into the bucket of the time of the event; an entry the device cannot open (another
+  // key) adds nothing but is passed over like the others.
+  const SUMMARY_BUCKET_MS = 3600000;
+
+  function loadSummaryTally() {
+    const kept = native.storeGet(LOG_SUMMARY_STORE_KEY);
+    if (kept !== null) {
+      try {
+        const tally = JSON.parse(kept);
+        if (tally !== null && typeof tally === "object" && tally.v === 1 &&
+            tally.buckets !== null && typeof tally.buckets === "object" &&
+            tally.nodes !== null && typeof tally.nodes === "object") {
+          return tally;
+        }
+      } catch (error) {
+        // A value that is not a tally starts a new one.
+      }
     }
-    return labels;
+    return { v: 1, buckets: {}, nodes: {} };
   }
 
-  /** Reads, for every node of ids, the keys of the last LOG_OVERVIEW_DAYS days (and a day before, for
-   *  the boundary of the first day) when the screen does not know them yet: down the chain from the
-   *  verification point until a key older than that or the start of the chain, at most two listings
-   *  per node and call. */
-  async function loadOverviewKeys(ledger, ids, now) {
-    const since = now - (LOG_OVERVIEW_DAYS + 1) * DAY_MS;
+  function saveSummaryTally(tally) {
+    native.storeSet(LOG_SUMMARY_STORE_KEY, JSON.stringify(tally));
+  }
+
+  /** The start of the window of the summary: LOG_SUMMARY_DAYS before now. */
+  function summarySince(now) {
+    return now - LOG_SUMMARY_DAYS * DAY_MS;
+  }
+
+  /** The start of the hour of ms (the key of a bucket). */
+  function summaryHour(ms) {
+    return Math.floor(ms / SUMMARY_BUCKET_MS) * SUMMARY_BUCKET_MS;
+  }
+
+  /** Removes the buckets of the hours that ended before the window began. */
+  function pruneSummary(tally, since) {
+    const floor = summaryHour(since);
+    for (const key of Object.keys(tally.buckets)) {
+      if (Number(key) < floor) delete tally.buckets[key];
+    }
+  }
+
+  function summaryBucket(tally, ms) {
+    const key = String(summaryHour(ms));
+    let bucket = tally.buckets[key];
+    if (bucket === undefined) {
+      bucket = { reads: 0, sends: 0, changes: 0, entries: 0, providers: [] };
+      tally.buckets[key] = bucket;
+    }
+    return bucket;
+  }
+
+  /** Counts one entry the screen opened (displayEntry) into the tally: the entry into the bucket
+   *  of its time and every item of it into the bucket of the time of the item. */
+  function countEntryInto(tally, entry) {
+    summaryBucket(tally, entry.time_ms).entries += 1;
+    for (const item of entry.items) countInto(summaryBucket(tally, item.time_ms), item);
+  }
+
+  /** The entries counted into the buckets of the window (from since). */
+  function summaryEntries(tally, since) {
+    const floor = summaryHour(since);
+    let entries = 0;
+    for (const key of Object.keys(tally.buckets)) {
+      if (Number(key) >= floor) entries += tally.buckets[key].entries;
+    }
+    return entries;
+  }
+
+  /** The summary of the window from the tally {reads, sends, changes, providers_text, truncated}:
+   *  the sums of the buckets from since, the providers in the order of their latest use (the
+   *  buckets are merged from the latest), and truncated as given (whether entries of the window
+   *  remain to be counted: the screen shows the counts with a plus). */
+  function summaryResult(tally, since, truncated) {
+    const floor = summaryHour(since);
+    const hours = Object.keys(tally.buckets).map(Number).filter(function (hour) { return hour >= floor; });
+    hours.sort(function (a, b) { return b - a; });
+    const total = { reads: 0, sends: 0, changes: 0, providers: [] };
+    for (const hour of hours) {
+      const bucket = tally.buckets[String(hour)];
+      total.reads += bucket.reads;
+      total.sends += bucket.sends;
+      total.changes += bucket.changes;
+      for (const used of bucket.providers) {
+        let merged = null;
+        for (const entry of total.providers) {
+          if (entry.provider === used.provider) merged = entry;
+        }
+        if (merged === null) {
+          merged = { provider: used.provider, name: providerName(used.provider), services: [] };
+          total.providers.push(merged);
+        }
+        for (const service of used.services) {
+          if (merged.services.indexOf(service) < 0) merged.services.push(service);
+        }
+      }
+    }
+    return {
+      reads: total.reads, sends: total.sends, changes: total.changes,
+      providers_text: providersText(total), truncated: truncated,
+    };
+  }
+
+  /** Reads, for every node of ids, the keys of the window (the entries since since) the screen does
+   *  not know yet: down the chain from the verification point until a key older than since or the
+   *  start of the chain, at most two listings per node and call. */
+  async function loadSummaryKeys(ledger, ids, since) {
     for (const id of ids) {
       const node = displayNode(id);
       for (let round = 0; round < 2; round += 1) {
@@ -2701,62 +2817,157 @@
     }
   }
 
-  /** The overview of the last LOG_OVERVIEW_DAYS days from the keys of the chain the screen knows
-   *  (linkedKeys): per day (today first) the number of events and entries, per node the number of
-   *  events and whether it is alive, the number of nodes alive (nodes_live), whether any node has
-   *  keys of format 1 (format1), whether the keys of some node do not cover the window (partial: the
-   *  listing stopped before the start of the chain or a key older than the window, or the keys of
-   *  the chain end before that) and the totals. A key of format 1 carries no time and is not
-   *  counted; its node is marked format1. A key the chain does not name is not counted. */
-  function overviewOf(ledger, ids, now) {
-    const labels = dayLabels(now, LOG_OVERVIEW_DAYS);
-    const days = labels.map(function (label) { return { key: label, label: label, events: 0, entries: 0 }; });
-    const byLabel = new Map();
-    for (const day of days) byLabel.set(day.key, day);
-    const since = now - (LOG_OVERVIEW_DAYS + 1) * DAY_MS;
-    const nodes = [];
-    let nodesLive = 0;
-    let anyFormat1 = false;
-    let partial = false;
-    let totalEvents = 0;
-    let totalEntries = 0;
+  // The summary tally of this runtime (loaded from the device store at its first use and written
+  // after every step of the count) and whether the count goes on apart from the procedure calls.
+  let summaryState = null;
+  let summaryRunning = false;
+
+  function summaryTally() {
+    if (summaryState === null) summaryState = loadSummaryTally();
+    return summaryState;
+  }
+
+  /** Whether entries of the window of node id are not counted: a key above the counted range, the
+   *  key below the range being in the window (its time since or later, or a key of format 1), or
+   *  keys below the range not read yet. */
+  function summaryUncounted(tally, id, since) {
+    const node = displayNode(id);
+    const seqs = sortedSeqs(node);
+    const range = tally.nodes[id];
+    if (range === undefined) return seqs.length > 0;
+    if (seqs.length > 0 && seqs[0] > range.hi) return true;
+    let next = 0;
+    for (const seq of seqs) {
+      if (seq < range.lo) {
+        next = seq;
+        break;
+      }
+    }
+    if (next === 0) return !node.exhausted;
+    const time = keyTimeOf(node, next);
+    return time === null || time >= since;
+  }
+
+  /** Counts up to max entries of the window (since) into the tally over the nodes of ids and
+   *  returns {truncated, remaining}: whether entries of the window are not counted
+   *  (summaryUncounted: the screen shows the counts with a plus) and whether the count goes on
+   *  (entries above a range, or entries not counted while the window holds fewer than
+   *  LOG_SUMMARY_ENTRIES counted entries). For each node the entries above
+   *  the counted range come first, the oldest of them first (the range stays one range), then the
+   *  entries below it, the newest first, reading more keys down the chain when the keys known end
+   *  above since; a seq without a key (a gap) is passed over. A node the tally has no range for
+   *  starts at its newest key and descends; when the keys above the range of a node outnumber
+   *  LOG_SUMMARY_ENTRIES (a long absence, a very active account) the tally is emptied and every
+   *  node starts over at its newest key, so that the window counts the newest entries. The descent
+   *  stops when the window holds LOG_SUMMARY_ENTRIES counted entries. An entry older than since
+   *  (the time of its key) is passed over without being read and ends the descent. Throws a store
+   *  failure. */
+  async function summaryStep(ledger, ids, keys, tally, since, max) {
+    const reader = storeReader();
+    for (const id of ids) {
+      const seqs = sortedSeqs(displayNode(id));
+      const range = tally.nodes[id];
+      if (seqs.length > 0 && range !== undefined && seqs[0] - range.hi > LOG_SUMMARY_ENTRIES) {
+        tally.buckets = {};
+        tally.nodes = {};
+      }
+    }
+    let budget = max;
     for (const id of ids) {
       const node = displayNode(id);
-      const linked = linkedKeys(node);
-      let events = 0;
-      let format1 = false;
-      let oldest = null;
-      for (const seq of sortedSeqs(node)) {
-        const named = linked.get(seq);
-        if (named === undefined) {
-          const others = node.candidates.get(seq) || [];
-          if (others.some(function (candidate) { return candidate.parts.format === 1; })) format1 = true;
+      const seqs = sortedSeqs(node);
+      if (seqs.length === 0) continue;
+      let range = tally.nodes[id];
+      if (range === undefined) {
+        range = { lo: seqs[0] + 1, hi: seqs[0] };
+        tally.nodes[id] = range;
+      }
+      while (budget > 0 && range.hi < seqs[0]) {
+        const seq = range.hi + 1;
+        if (node.candidates.has(seq)) {
+          const time = keyTimeOf(node, seq);
+          if (time === null || time >= since) {
+            const entry = await displayEntry(ledger, id, seq, keys, reader);
+            if (entry.time_ms >= since) countEntryInto(tally, entry);
+            budget -= 1;
+          }
+        }
+        range.hi = seq;
+      }
+      while (budget > 0 && summaryEntries(tally, since) < LOG_SUMMARY_ENTRIES) {
+        const seq = range.lo - 1;
+        if (seq < 1) break;
+        if (!node.candidates.has(seq)) {
+          if (seq < node.floor) {
+            if (node.exhausted) break;
+            await loadKeysBefore(id, node.floor);
+            continue;
+          }
+          range.lo = seq;
           continue;
         }
-        const parts = named.parts;
-        oldest = parts.time_ms;
-        if (parts.time_ms < since) break;
-        const day = byLabel.get(formatTime(parts.time_ms, "date"));
-        if (day === undefined) continue;
-        day.events += parts.count;
-        day.entries += 1;
-        events += parts.count;
-        totalEvents += parts.count;
-        totalEntries += 1;
+        const time = keyTimeOf(node, seq);
+        if (time !== null && time < since) break;
+        const entry = await displayEntry(ledger, id, seq, keys, reader);
+        if (entry.time_ms < since) break;
+        countEntryInto(tally, entry);
+        range.lo = seq;
+        budget -= 1;
       }
-      // The window is covered when the keys reach the start of the chain (or everything below is
-      // expired) or a key of the chain older than the window was reached.
-      if (!node.exhausted && (oldest === null || oldest >= since)) partial = true;
-      const known = ledger.nodes[id];
-      const live = known !== undefined && known.gone_ms === 0;
-      nodes.push({ node: id, events: events, live: live, format1: format1 });
-      if (live) nodesLive += 1;
-      if (format1) anyFormat1 = true;
     }
-    return {
-      days: days, nodes: nodes, nodes_live: nodesLive, format1: anyFormat1, partial: partial,
-      total_events: totalEvents, total_entries: totalEntries,
-    };
+    let uncounted = false;
+    let above = false;
+    for (const id of ids) {
+      if (summaryUncounted(tally, id, since)) uncounted = true;
+      const range = tally.nodes[id];
+      const seqs = sortedSeqs(displayNode(id));
+      if (range !== undefined && seqs.length > 0 && seqs[0] > range.hi) above = true;
+    }
+    const capped = summaryEntries(tally, since) >= LOG_SUMMARY_ENTRIES;
+    return { truncated: uncounted, remaining: uncounted && (above || !capped) };
+  }
+
+  /** The count that goes on apart from the procedure calls while entries of the window remain:
+   *  steps of LOG_SUMMARY_STEP entries, the tally written after each. A store failure ends it (the
+   *  next read_log goes on from the tally), and the end of the runtime ends it at its next call of
+   *  the bridge. */
+  async function summaryLoop(ledger, ids, keys) {
+    try {
+      for (;;) {
+        const tally = summaryTally();
+        const since = summarySince(native.nowMs());
+        pruneSummary(tally, since);
+        await loadSummaryKeys(ledger, ids, since);
+        const step = await summaryStep(ledger, ids, keys, tally, since, LOG_SUMMARY_STEP);
+        saveSummaryTally(tally);
+        if (!step.remaining) break;
+      }
+    } catch (error) {
+      native.log("summary count: " + failureCode(error));
+    }
+    summaryRunning = false;
+  }
+
+  /** The summary of the window for read_log (the keys of the window were read: loadSummaryKeys):
+   *  when the store was read in this call and no count goes on, a step of at most LOG_SUMMARY_STEP
+   *  entries first, and the count going on apart from the calls when it has more to do. truncated
+   *  while entries of the window are not counted, a count goes on, or the store could not be read
+   *  in this call. null when the store could not be read and nothing was ever counted. */
+  async function readSummary(ledger, ids, keys, since) {
+    const tally = summaryTally();
+    pruneSummary(tally, since);
+    let truncated = true;
+    if (ids.length > 0 && !summaryRunning) {
+      const step = await summaryStep(ledger, ids, keys, tally, since, LOG_SUMMARY_STEP);
+      saveSummaryTally(tally);
+      truncated = step.truncated;
+      if (step.remaining) {
+        summaryRunning = true;
+        summaryLoop(ledger, ids, keys);
+      }
+    }
+    if (ids.length === 0 && Object.keys(tally.buckets).length === 0) return null;
+    return summaryResult(tally, since, truncated);
   }
 
   // ---- Procedures ----
@@ -3661,53 +3872,48 @@
     return isStoreFailure(error) ? native.error("log_store_" + error.kind, "log screen") : error;
   }
 
-  // The counts of the later pages read in this runtime (the reads, sends and changes of their
-  // request items, the providers used, the entries read) and the ids of the entries counted. The
-  // log screen reads them as runtime.log_counts (published after every page).
-  let pageCounts = { reads: 0, sends: 0, changes: 0, providers: [], entries: 0, counted: new Set() };
-
-  function publishLogCounts() {
-    native.publish({ runtime: { log_counts: {
-      reads: pageCounts.reads, sends: pageCounts.sends, changes: pageCounts.changes,
-      providers_text: providersText(pageCounts), entries: pageCounts.entries,
-    } } });
-  }
-
   /** The log query (the first page of the log screen): verifies the chains (index verification),
-   *  reads the keys of the last LOG_OVERVIEW_DAYS days, draws the overview from the keys alone and
-   *  reads the latest entries until LOG_RECENT_EVENTS events (the recent activity). When the
-   *  verification could not read the store (its state is not verified: a store that failed, an
-   *  address that was rejected, an env without a store) the screen reads nothing: the overview is
-   *  null and the recent activity empty, and the state of the verification says why. The list of
-   *  the places of the later pages becomes the one place of the second page (an empty list when
-   *  there is no more). */
-  async function readLog() {
+   *  reads the latest entries until limit events (the list, as day groups) and counts the summary
+   *  of the last LOG_SUMMARY_DAYS days (readSummary). limit is a number or its decimal string (the
+   *  arguments of a definition action arrive as evaluated strings). When the verification could not
+   *  read the store (its state is not verified: a store that failed, an address that was rejected,
+   *  an env without a store) the screen reads nothing: the list is empty, the summary is the tally
+   *  kept (null when there is none) and the state of the verification says why. The list of the
+   *  places of the later pages becomes the one place of the second page (an empty list when there
+   *  is no more), and the state of the last full verification is published again (log_full). */
+  async function readLog(args) {
+    const textual = typeof args.limit === "string" && args.limit.trim() !== "";
+    const given = textual ? Number(args.limit) : args.limit;
+    const limit = Number.isFinite(given) ? Math.min(500, Math.max(1, Math.floor(given))) : 100;
     const keys = await presentKeys();
     const ledger = loadLedger();
     const log = await verifyAll(ledger, keys);
     const ids = log.store === "verified" ? screenNodes(ledger) : [];
     anchorScreen(ledger, ids);
-    const now = native.nowMs();
-    let overview = null;
-    let recent = { entries: [], items: [], last_ms: 0, has_more: false };
-    if (ids.length > 0) {
-      try {
-        await loadOverviewKeys(ledger, ids, now);
-        overview = overviewOf(ledger, ids, now);
-        recent = await collectEntries(ledger, ids, keys, Infinity, LOG_RECENT_EVENTS);
-      } catch (error) {
-        throw screenStoreError(error);
+    const since = summarySince(native.nowMs());
+    let first = { entries: [], items: [], last_ms: 0, has_more: false };
+    let summary = null;
+    try {
+      if (ids.length > 0) {
+        // The keys of the window first: a chain whose start the screen knows is exhausted without a
+        // listing, and the list then reads no keys below it.
+        await loadSummaryKeys(ledger, ids, since);
+        first = await collectEntries(ledger, ids, keys, Infinity, limit);
       }
+      summary = await readSummary(ledger, ids, keys, since);
+    } catch (error) {
+      throw screenStoreError(error);
     }
-    const groups = displayGroups(recent.items);
-    const next = logPageAfter(recent, 0, groups.length);
+    const groups = displayGroups(first.items);
+    const next = logPageAfter(first, 0, groups.length);
     logPagePlaces = next === null ? [] : [next];
     publishLogPages();
+    publishFull();
     return {
       status: log.status, verified_ms: log.verified_ms, unverified_nodes: log.unverified_nodes,
       missing: log.missing, expired: log.expired, unknown_nodes: log.unknown_nodes, store: log.store,
-      store_failing_ms: log.store_failing_ms, overview: overview, recent: recent.items,
-      recent_days: displayDays(groups), has_more: recent.has_more,
+      store_failing_ms: log.store_failing_ms, has_more: first.has_more, summary: summary,
+      days: displayDays(groups),
     };
   }
 
@@ -3727,12 +3933,10 @@
 
   /** One later page of the log screen: the entries before before_ms until LOG_SCREEN_EVENTS events,
    *  as the list of day groups (consecutive requests and days that straddle a page boundary are
-   *  grouped per page). The counts of the pages read in this runtime are published as
-   *  runtime.log_counts (the log screen shows them above the pages). The chains are not verified
-   *  (read_log does that): the signature check of each entry is the verified of the group. When
-   *  that place is the last of the list and there is more, the next place is appended (a call that
-   *  reads an earlier page again, and a call that ended after read_log replaced the list, append
-   *  nothing). */
+   *  grouped per page). The chains are not verified (read_log does that): the signature check of
+   *  each entry is the verified of the group. When that place is the last of the list and there is
+   *  more, the next place is appended (a call that reads an earlier page again, and a call that
+   *  ended after read_log replaced the list, append nothing). */
   async function readLogPage(args) {
     const before = logPageCursor(args.before_ms);
     if (before === null) throw native.error("invalid_input", "before_ms");
@@ -3746,14 +3950,6 @@
     } catch (error) {
       throw screenStoreError(error);
     }
-    for (const entry of page.entries) {
-      const name = entry.id + ":" + entry.seq;
-      if (pageCounts.counted.has(name)) continue;
-      pageCounts.counted.add(name);
-      pageCounts.entries += 1;
-      for (const item of entry.items) countInto(pageCounts, item);
-    }
-    publishLogCounts();
     const groups = displayGroups(page.items);
     const last = logPagePlaces.length === 0 ? null : logPagePlaces[logPagePlaces.length - 1];
     const next = last !== null && last.before_ms === before ? logPageAfter(page, last.rows, groups.length) : null;
@@ -3769,11 +3965,40 @@
   // The full verification in progress (null when none): the run the loop checks for a cancel, and
   // the published state log_full {status, started_ms, finished_ms, finished_text, nodes_total,
   // nodes_done, entries_total, entries_checked, events_checked, expired, bytes, failures: {signature,
-  // hash, open, missing}, failure}.
+  // hash, open, missing}, failure, can_start}. The state of the last full verification of this
+  // device is kept in the device store (LOG_FULL_STORE_KEY) and published again in a new runtime:
+  // the log screen shows its result and whether another may start (can_start: none is running and
+  // LOG_FULL_INTERVAL_MS passed since the start of the last one).
   let fullRun = null;
   let fullState = null;
 
+  function loadFullState() {
+    const kept = native.storeGet(LOG_FULL_STORE_KEY);
+    if (kept === null) return null;
+    try {
+      const state = JSON.parse(kept);
+      if (state === null || typeof state !== "object" || typeof state.started_ms !== "number") return null;
+      // A run the end of its runtime stopped.
+      if (state.status === "running") state.status = "cancelled";
+      return state;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function saveFullState() {
+    native.storeSet(LOG_FULL_STORE_KEY, fullState === null ? null : JSON.stringify(fullState));
+  }
+
+  function fullCanStart(now) {
+    if (fullRun !== null) return false;
+    if (fullState === null) fullState = loadFullState();
+    return fullState === null || now - fullState.started_ms >= LOG_FULL_INTERVAL_MS;
+  }
+
   function publishFull() {
+    const canStart = fullCanStart(native.nowMs());
+    if (fullState !== null) fullState.can_start = canStart;
     native.publish({ state: { log_full: fullState } });
   }
 
@@ -3890,13 +4115,17 @@
       fullState.failure = isStoreFailure(error) ? "log_store_" + error.kind : failureCode(error);
     }
     fullRun = null;
+    saveFullState();
     publishFull();
   }
 
-  /** Starts the full verification (when none is running) and returns the state log_full at once; the
-   *  loop goes on inside the runtime apart from the procedure calls and publishes its progress. */
+  /** Starts the full verification (when none is running and LOG_FULL_INTERVAL_MS passed since the
+   *  start of the last one of this device: otherwise too_soon) and returns the state log_full at
+   *  once; the loop goes on inside the runtime apart from the procedure calls and publishes its
+   *  progress. */
   async function startFullVerification() {
     if (fullRun !== null) return { log_full: fullState };
+    if (!fullCanStart(native.nowMs())) throw native.error("too_soon", "full verification");
     const keys = await presentKeys();
     const ledger = loadLedger();
     fullRun = { cancelled: false };
@@ -3905,6 +4134,7 @@
       nodes_total: 0, nodes_done: 0, entries_total: 0, entries_checked: 0, events_checked: 0,
       expired: 0, bytes: 0, failures: { signature: 0, hash: 0, open: 0, missing: 0 }, failure: "",
     };
+    saveFullState();
     publishFull();
     fullVerificationLoop(ledger, keys, fullRun);
     return { log_full: fullState };
@@ -4012,13 +4242,17 @@
     return { grant: grant };
   }
 
-  /** An account end that erases the account records: deletes the master key item and the node
-   *  ledger (the keychain item and the device copy). */
+  /** An account end that erases the account records: deletes the master key item, the node ledger
+   *  (the keychain item and the device copy), the summary tally and the last full verification. */
   async function eraseAccountKeys() {
     deleteMasterKey();
     native.keychainDelete(ledgerItem());
     native.keychainDelete(mailSetupItem());
     native.storeSet(LEDGER_STORE_KEY, null);
+    native.storeSet(LOG_SUMMARY_STORE_KEY, null);
+    native.storeSet(LOG_FULL_STORE_KEY, null);
+    summaryState = null;
+    fullState = null;
   }
 
   // ---- Serialization ----
@@ -4528,7 +4762,7 @@
       },
       store_login: function (args) { return serial(function () { return storeLogin(args); }); },
       store_card: function (args) { return serial(function () { return storeCard(args); }); },
-      read_log: function () { return serial(readLog); },
+      read_log: function (args) { return serial(function () { return readLog(args); }); },
       read_log_page: function (args) {
         const before = logPageCursor(args.before_ms);
         if (before !== null) openLogPage(before);
@@ -4542,8 +4776,9 @@
     onEvent: function (name, payload) {
       if (name === "session_ready") {
         // A new runtime does not take over the transfer of the previous runtime (the secrets exist
-        // in the runtime only), nor a full verification in progress: the published states are
-        // cleared.
+        // in the runtime only), nor a full verification in progress: the transfer state is cleared
+        // and the full verification state is the last one the device kept (a run in progress at
+        // the end of its runtime is cancelled).
         resetTransfer();
         fullState = null;
         publishFull();

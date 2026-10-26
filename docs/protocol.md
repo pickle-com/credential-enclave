@@ -725,7 +725,9 @@ The full verification: at the request of the user the app reads every entry of e
 the smallest listed `seq` by content verification, counts the entries, the events and the expired
 entries (the `seq`s below the smallest listed one), and reports every entry that does not verify.
 It is the same check as the index verification with every body read; the `prev` of the first
-listed entry is not checked when entries before it expired. It keeps nothing on the device.
+listed entry is not checked when entries before it expired. It keeps nothing of what it read on the
+device; the device keeps the result of its last run and starts another at most `LOG_FULL_INTERVAL_MS`
+after the start of the last one.
 
 ### 7.5 The witness signature (stage 2)
 
@@ -1192,7 +1194,9 @@ any other form is not a release tag and has no place in the order.
 | `LOG_VERIFY_BODIES` (the app) | 2,000: the entry bodies one run reads |
 | `LOG_EXPIRES_DAYS` (the app) | 365: the age at which a reader treats the absence of an entry as expired, the retention of its lock (7.4) |
 | `LOG_GAP_GRACE_MS` (the app) | 3,600,000: a gap whose first key after it is younger than this leaves the chain pending, not attention (7.4) |
-| `LOG_RECENT_EVENTS`, `LOG_SCREEN_EVENTS` (the app) | 20, 50: the events of the recent activity of the log screen, the events of one further page |
+| `LOG_SCREEN_EVENTS` (the app) | 50: the events of one further page of the log screen (the first page reads the events its definition asks for) |
+| `LOG_SUMMARY_DAYS`, `LOG_SUMMARY_STEP`, `LOG_SUMMARY_ENTRIES` (the app) | 7, 100, 1,000: the days of the summary of the log screen (the reads, sends and changes of the events of the entries of that window, counted once per device from their bodies and kept on the device as the summary tally), the entries one read of the screen counts before answering and each later step counts, and the most entries of the window the tally counts (the screen shows the counts with a plus while entries of the window are not counted) |
+| `LOG_FULL_INTERVAL_MS` (the app) | 3,600,000: the time after the start of a full verification before the device may start another |
 | `LOG_STORE_STALE_MS` (the app) | 3 days: reads of the store that have been failing for this long mark the log (7.4) |
 | `LOG_STORE_NODES` (the app) | 16: the nodes of the listing the list of nodes does not know that one verification run examines |
 | Listing pages one verification run reads per node (the app) | 8 pages of 1,000 keys |
