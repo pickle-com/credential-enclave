@@ -1,6 +1,6 @@
 [package]
 name = "credential-enclave"
-version = "2.0.0"
+version = "2.0.1"
 description = "The credential enclave node program"
 edition.workspace = true
 rust-version.workspace = true

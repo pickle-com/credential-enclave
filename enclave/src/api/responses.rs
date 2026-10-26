@@ -122,6 +122,28 @@ pub struct LogCounts {
     pub batch_requests: u64,
 }
 
+/// `load` of `GET /v1/health`: the load of the node at the moment of the call.
+#[derive(Serialize)]
+pub struct Load {
+    /// P: a count, the provider requests in flight.
+    pub provider_inflight: usize,
+    /// P: a count, the calls that hold one of the places of the bound of concurrent `forward`
+    /// and `forward/batch` calls.
+    pub forward_calls: usize,
+    /// P: the CPU time in user mode of the kernel the node runs in since it booted, in
+    /// milliseconds. Null when the kernel exposes no procfs value.
+    pub cpu_user_ms: Option<u64>,
+    /// P: the CPU time in kernel mode, in the same way.
+    pub cpu_system_ms: Option<u64>,
+    /// P: the idle time, in the same way.
+    pub cpu_idle_ms: Option<u64>,
+    /// P: a size, the memory of the kernel in bytes. Null when the kernel exposes no procfs
+    /// value.
+    pub memory_total_bytes: Option<u64>,
+    /// P: a size, the memory the kernel estimates it can give out, in the same way.
+    pub memory_available_bytes: Option<u64>,
+}
+
 /// `GET /v1/health`.
 #[derive(Serialize)]
 pub struct Health<'a> {
@@ -151,6 +173,8 @@ pub struct Health<'a> {
     pub log_store: Option<LogStoreState<'a>>,
     /// P: the counts of the log.
     pub log: LogCounts,
+    /// P: the load of the node.
+    pub load: Load,
 }
 
 /// `log_store` of `GET /v1/health`.

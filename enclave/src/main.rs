@@ -19,6 +19,7 @@ mod clock;
 mod egress;
 mod frame;
 mod lineage;
+mod load;
 mod log_store;
 mod mail;
 mod oauth;

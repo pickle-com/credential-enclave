@@ -692,6 +692,15 @@ impl Node {
         self.clock.now_ms()
     }
 
+    /// The calls that hold one of the places of the bound of concurrent `forward` and
+    /// `forward/batch` calls at this moment (`forward`, `forward/batch` and the mail calls take
+    /// one each).
+    pub fn forward_calls(&self) -> usize {
+        self.limits
+            .forward_concurrency
+            .saturating_sub(self.forward_slots.available_permits())
+    }
+
     /// `N` random bytes that may appear in a response: a challenge, the node part of a state,
     /// the `id` and the nonce of a record. Every random value of a response comes from this
     /// function, and it reads nothing but the random source of the platform.
