@@ -417,6 +417,12 @@ impl Egress {
         Egress::build(clock, roots)
     }
 
+    /// The provider requests in flight at this moment: the places of the node-wide bound that
+    /// are taken.
+    pub fn provider_inflight(&self) -> usize {
+        limits::PROVIDER_INFLIGHT.saturating_sub(self.inflight.available_permits())
+    }
+
     fn build(clock: Arc<Clock>, roots: RootCertStore) -> Egress {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut config = ClientConfig::builder_with_details(provider, Arc::new(TlsTime(clock)))

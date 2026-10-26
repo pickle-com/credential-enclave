@@ -26,20 +26,42 @@ async fn health_reports_the_node_in_the_key_order_of_5_1() {
     let health: Value = serde_json::from_slice(&bytes).unwrap();
     let started_ms = health["started_ms"].as_u64().unwrap();
     let time_ms = health["time_ms"].as_u64().unwrap();
-    assert_eq!(
-        String::from_utf8(bytes.to_vec()).unwrap(),
-        format!(
-            concat!(
-                "{{\"node\":\"{}\",\"release\":\"v0.0.0-test\",\"platform\":\"local\",",
-                "\"custody\":\"operator\",\"started_ms\":{},\"time_ms\":{},",
-                "\"configured\":false,\"closing\":false,\"accounts\":0,\"grants\":0,",
-                "\"mail_providers\":[\"naver_mail\"],\"log_store\":null,",
-                "\"log\":{{\"entries\":0,\"events\":0,\"writes\":0,\"write_failures\":0,",
-                "\"open_batches\":0,\"batch_calls\":0,\"batch_requests\":0}}}}"
-            ),
-            harness.node.node, started_ms, time_ms
-        )
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    let prefix = format!(
+        concat!(
+            "{{\"node\":\"{}\",\"release\":\"v0.0.0-test\",\"platform\":\"local\",",
+            "\"custody\":\"operator\",\"started_ms\":{},\"time_ms\":{},",
+            "\"configured\":false,\"closing\":false,\"accounts\":0,\"grants\":0,",
+            "\"mail_providers\":[\"naver_mail\"],\"log_store\":null,",
+            "\"log\":{{\"entries\":0,\"events\":0,\"writes\":0,\"write_failures\":0,",
+            "\"open_batches\":0,\"batch_calls\":0,\"batch_requests\":0}},",
+            "\"load\":{{\"provider_inflight\":0,\"forward_calls\":0,"
+        ),
+        harness.node.node, started_ms, time_ms
     );
+    assert!(text.starts_with(&prefix), "{text}");
+    // The five values of the kernel end the body. They depend on the machine that runs the
+    // test: numbers from the procfs of a Linux kernel, null on another kernel.
+    assert!(text.ends_with("}}"), "{text}");
+    let load = health["load"].as_object().unwrap();
+    let kernel_values = [
+        "cpu_user_ms",
+        "cpu_system_ms",
+        "cpu_idle_ms",
+        "memory_total_bytes",
+        "memory_available_bytes",
+    ];
+    assert_eq!(
+        load.keys().skip(2).collect::<Vec<_>>(),
+        kernel_values.to_vec()
+    );
+    for key in kernel_values {
+        let value = &load[key];
+        assert!(value.is_u64() || value.is_null(), "{key}: {value}");
+        if cfg!(target_os = "linux") {
+            assert!(value.is_u64(), "{key}: {value}");
+        }
+    }
     assert_eq!(harness.node.node.len(), 43);
     assert!(time_ms >= started_ms && started_ms > 1_700_000_000_000);
 

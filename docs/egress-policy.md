@@ -330,7 +330,7 @@ calls, and `egress/sink-callers.tsv` (the one caller of K1).
 
 | Call | The fields of a successful response and their classes |
 | --- | --- |
-| `GET /v1/health` | `node` P, `release` P, `platform` P, `custody` P, `started_ms` P, `time_ms` P, `configured` P, `closing` P, `accounts` P, `grants` P, `mail_providers` P, `log_store` E and P (`bucket`, `region` and `credentials_expires_ms` E, `pending` P), `log` P (seven counts) |
+| `GET /v1/health` | `node` P, `release` P, `platform` P, `custody` P, `started_ms` P, `time_ms` P, `configured` P, `closing` P, `accounts` P, `grants` P, `mail_providers` P, `log_store` E and P (`bucket`, `region` and `credentials_expires_ms` E, `pending` P), `log` P (seven counts), `load` P (two counts, three CPU times and two sizes of the kernel; the five of the kernel are null when it exposes none) |
 | `POST /v1/config` | `configured` P |
 | `POST /v1/attestation` | `v` P, `platform` P, `document` S (the platform signs the two public keys of the node, the release and the nonce of the caller), `node` P, `challenge` P, `release` P, `challenge_statement` S (its body: `type`, `node`, `challenge`, `time_ms` P, the nonce of the caller E) |
 | `POST /v1/messages` | `reply` S (its body: `type`, `ok`, `code`, `node`, `time_ms` P, `user_id`, `challenge`, `key_id`, `not_after_ms` D, `head` P), `log` P, `grant` D |
