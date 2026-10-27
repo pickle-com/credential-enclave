@@ -41,6 +41,8 @@ struct Script {
     refused: Vec<String>,
     /// The stand-in answers no write.
     silent: bool,
+    /// Writes the stand-in reads without answering, leaving the connection open.
+    stalled: usize,
     /// The stand-in closes the connection after each answer.
     close: bool,
     /// Writes the stand-in reads and answers by closing the connection without a response.
@@ -89,6 +91,10 @@ async fn stand_in() -> (Provider, Store) {
             if script.lost > 0 {
                 script.lost -= 1;
                 return Reply::Raw(Vec::new());
+            }
+            if script.stalled > 0 {
+                script.stalled -= 1;
+                return Reply::Hang;
             }
             if script.silent {
                 return Reply::Hang;
@@ -579,6 +585,9 @@ async fn a_store_that_cannot_be_reached_or_does_not_answer_stops_the_act() {
     unavailable(&release(&harness, &app, &password(&app)).await);
     let waited = started.elapsed();
     assert!(waited >= Duration::from_millis(300) && waited < Duration::from_secs(3));
+    assert_eq!(writes(&provider).len(), 3);
+    assert_eq!(harness.platform.connections().len(), 2);
+    assert_eq!(harness.health().await["log_store"]["pending"], 1);
     assert!(provider_requests(&provider).is_empty());
 }
 
@@ -1683,6 +1692,22 @@ async fn a_write_whose_idle_connection_ends_without_a_response_goes_over_a_new_c
     let writes = writes(&provider);
     assert_eq!(writes.len(), 3);
     assert_eq!(seq_of(&writes[1]), seq_of(&writes[2]));
+    assert_eq!(harness.platform.connections().len(), 2);
+    assert_eq!(harness.health().await["log_store"]["pending"], 0);
+}
+
+#[tokio::test]
+async fn a_stalled_idle_log_connection_is_retried_over_a_new_connection() {
+    let (provider, store) = stand_in().await;
+    let (harness, app) = node_with_log_store(&provider).await;
+    lock(&store).stalled = 1;
+
+    let (status, released) = release(&harness, &app, &password(&app)).await;
+    assert_eq!((status, &released["value"]), (200, &json!("hunter2")));
+    let writes = writes(&provider);
+    assert_eq!(writes.len(), 3);
+    assert_eq!(writes[1].target, writes[2].target);
+    assert_eq!(writes[1].body, writes[2].body);
     assert_eq!(harness.platform.connections().len(), 2);
     assert_eq!(harness.health().await["log_store"]["pending"], 0);
 }
