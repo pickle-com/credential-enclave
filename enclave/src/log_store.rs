@@ -585,9 +585,9 @@ async fn write_claims(node: &Node, claims: &mut [Claim<'_>]) {
 /// node and the certificate is verified against the trust roots of the binary.
 ///
 /// The write goes over an idle connection when there is one. When that connection ends without
-/// a response, the write goes once more over a new connection: a `PUT` is idempotent (RFC 9110
-/// 9.2.2), and a repeated write adds a second version of the same object. A write over a new
-/// connection is not repeated.
+/// a response, or the idle attempt takes half the write's time limit, the write goes once more
+/// over a new connection: a `PUT` is idempotent (RFC 9110 9.2.2), and a repeated write adds a
+/// second version of the same object. A write over a new connection is not repeated.
 ///
 /// The one confirmation is the status 200. Every other status, a failure of the connection
 /// and a write that takes longer than its time limit (5 seconds) are no confirmation.
@@ -603,10 +603,13 @@ async fn send_to_log_store(node: &Node, writer: &Writer, write: &Write) -> bool 
         Some(response.status() == StatusCode::OK)
     };
     let exchange = async {
-        if let Some(sender) = node.log_store.idle.take().await {
-            if let Some(confirmed) = put(sender).await {
-                return Some(confirmed);
-            }
+        let reuse = async {
+            let sender = node.log_store.idle.take().await?;
+            put(sender).await
+        };
+        // Leave time to open a fresh connection if the idle attempt stalls.
+        if let Ok(Some(confirmed)) = tokio::time::timeout(node.limits.log_write / 2, reuse).await {
+            return Some(confirmed);
         }
         let sender = match &writer.endpoint {
             None => node
