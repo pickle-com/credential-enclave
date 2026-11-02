@@ -249,6 +249,7 @@ pub(super) async fn execute(
                 Some(user_id),
                 outbound,
                 node.now_ms(),
+                timeout,
             )
             .await?;
         drop(request_budget);

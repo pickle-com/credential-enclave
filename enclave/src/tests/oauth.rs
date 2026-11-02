@@ -3,17 +3,20 @@
 //! fields.
 
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use credential_enclave_protocol::encoding::b64u;
 use credential_enclave_protocol::keys::Custody;
+use credential_enclave_protocol::record::Record;
 use credential_enclave_protocol::{limits, purpose};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::{provider, provider_with_log_store, quiet_provider};
-use crate::state::{lock, ActiveGrant, GrantState};
+use crate::providers::Definitions;
+use crate::state::{lock, refresh_key, ActiveGrant, GrantState, Limits};
 use crate::testing::{operator_config, App, Harness, Provider, Reply, Seen};
 
 fn jwt(claims: &Value) -> String {
@@ -1288,6 +1291,12 @@ async fn revoke_token_sends_the_refresh_token_to_the_revocation_address() {
 /// A stand-in whose token address answers the exchange with the first Google token and every
 /// refresh with a new access token and a rotated refresh token.
 async fn rotating_provider() -> crate::testing::Provider {
+    rotating_provider_with(200, Duration::ZERO).await
+}
+
+/// [`rotating_provider`] whose refresh answers carry `status` and arrive after `delay`. With a
+/// status other than 200 the answer is a refusal (`invalid_grant`).
+async fn rotating_provider_with(status: u16, delay: Duration) -> crate::testing::Provider {
     let refreshes = Arc::new(Mutex::new(0u32));
     provider(move |seen: &Seen| {
         if seen.form_value("grant_type").as_deref() == Some("authorization_code") {
@@ -1295,17 +1304,293 @@ async fn rotating_provider() -> crate::testing::Provider {
         }
         let mut count = lock(&refreshes);
         *count += 1;
-        Reply::json(
-            200,
-            &json!({
+        let body = match status {
+            200 => json!({
                 "access_token": format!("ya29.refreshed-access-{count}"),
                 "refresh_token": format!("1//rotated-refresh-{count}"),
                 "expires_in": 3599,
                 "token_type": "Bearer",
             }),
-        )
+            _ => json!({"error": "invalid_grant", "error_description": "Token has been revoked."}),
+        };
+        Reply::json(status, &body).after(delay)
     })
     .await
+}
+
+/// A configured node whose `refresh` waits 300 milliseconds for the token address, keeps
+/// receiving a late response for 3 seconds, and continues `places` late calls at once.
+async fn late_harness(provider: &Provider, places: usize) -> Harness {
+    let harness = Harness::with(
+        provider,
+        Definitions::embedded(),
+        Limits {
+            token_timeout: Duration::from_millis(300),
+            token_late_limit: Duration::from_secs(3),
+            refresh_late_tasks: places,
+            ..Limits::default()
+        },
+    );
+    let (status, _) = harness
+        .post("/v1/config", operator_config(&harness.node.definitions))
+        .await;
+    assert_eq!(status, 200);
+    harness
+}
+
+/// A connection of `google_workspace` for `app` on `harness`: the record of the exchange.
+async fn connected(harness: &Harness, app: &App) -> Value {
+    let state = begin(harness, &app.user_id, "google_workspace", json!({}), "")
+        .await
+        .1["state"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (status, issued) = complete(harness, &app.user_id, &state).await;
+    assert_eq!(status, 200, "{issued}");
+    issued["record"].clone()
+}
+
+/// The failure of a token address call that passed its time limit.
+fn timed_out() -> Value {
+    json!({
+        "code": "refresh_failed", "message": "the provider refused the refresh",
+        "provider_status": 0, "provider_error": "",
+    })
+}
+
+/// The `late` counts of `refresh` of health.
+async fn late_counts(harness: &Harness) -> (Value, u64) {
+    let refresh = harness.health().await["refresh"].clone();
+    (
+        refresh["late"].clone(),
+        refresh["late_inflight"].as_u64().unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn a_refresh_whose_response_arrives_late_keeps_it_for_the_next_call() {
+    // The provider answers a refresh after 800 milliseconds: after the time limit of the
+    // call, before the late limit.
+    let provider = rotating_provider_with(200, Duration::from_millis(800)).await;
+    let harness = late_harness(&provider, 1).await;
+    let app = App::new("user-1", 1);
+    app.grant(&harness).await;
+    let record = connected(&harness, &app).await;
+
+    // The call fails at its time limit with the failure of a transport failure, and the late
+    // call goes on in its place.
+    let started = Instant::now();
+    let (status, failure) = refresh(&harness, "user-1", &record).await;
+    let waited = started.elapsed();
+    assert_eq!((status, failure), (502, timed_out()));
+    assert!(
+        waited >= Duration::from_millis(300) && waited < Duration::from_millis(800),
+        "{waited:?}"
+    );
+    let seq = harness.head_seq("user-1");
+    assert_eq!(
+        late_counts(&harness).await,
+        (
+            json!({"kept": 0, "dropped": 0, "failed": 0, "abandoned": 0}),
+            1
+        )
+    );
+
+    // The response arrived and was kept: the same record gets it without another provider
+    // call and without another entry, and its `log` object names the entry of the first call.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        late_counts(&harness).await,
+        (
+            json!({"kept": 1, "dropped": 0, "failed": 0, "abandoned": 0}),
+            0
+        )
+    );
+    let (status, again) = refresh(&harness, "user-1", &record).await;
+    assert_eq!(status, 200, "{again}");
+    assert_eq!(
+        app.open(&again["record"])["token"]["refresh_token"],
+        "1//rotated-refresh-1"
+    );
+    assert_eq!(
+        again["log"],
+        json!({"seq": seq, "index": 0, "created": true})
+    );
+    assert_eq!(provider.requests().len(), 2);
+    assert_eq!(harness.head_seq("user-1"), seq);
+}
+
+#[tokio::test]
+async fn a_late_success_is_dropped_after_a_revoke_or_a_close() {
+    // A revoke while the late call runs: the success is not kept, and after a new grant the
+    // same record is a provider call.
+    let provider = rotating_provider_with(200, Duration::from_millis(800)).await;
+    let harness = late_harness(&provider, 1).await;
+    let app = App::new("user-1", 1);
+    app.grant(&harness).await;
+    let record = connected(&harness, &app).await;
+    assert_eq!(refresh(&harness, "user-1", &record).await.0, 502);
+    app.revoke(&harness).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        late_counts(&harness).await,
+        (
+            json!({"kept": 0, "dropped": 1, "failed": 0, "abandoned": 0}),
+            0
+        )
+    );
+    app.grant(&harness).await;
+    assert_eq!(refresh(&harness, "user-1", &record).await.0, 502);
+    assert_eq!(provider.requests().len(), 3);
+
+    // The orderly shutdown while the late call runs: the success is not kept either.
+    let closing = late_harness(&provider, 1).await;
+    app.grant(&closing).await;
+    let record = connected(&closing, &app).await;
+    assert_eq!(refresh(&closing, "user-1", &record).await.0, 502);
+    assert_eq!(closing.post("/v1/close", json!({})).await.0, 200);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        late_counts(&closing).await,
+        (
+            json!({"kept": 0, "dropped": 1, "failed": 0, "abandoned": 0}),
+            0
+        )
+    );
+    let account = closing.node.account("user-1").unwrap();
+    let key = refresh_key(&Record::from_value(&record).unwrap());
+    let now_ms = closing.node.now_ms();
+    assert!(lock(&account).kept_refresh(&key, now_ms).is_none());
+}
+
+#[tokio::test]
+async fn a_late_refusal_and_the_late_limit_end_the_exchange() {
+    // The provider refuses the refresh after the time limit of the call: nothing is kept,
+    // and the next call with the same record is a provider call again.
+    let provider = rotating_provider_with(400, Duration::from_millis(800)).await;
+    let harness = late_harness(&provider, 1).await;
+    let app = App::new("user-1", 1);
+    app.grant(&harness).await;
+    let record = connected(&harness, &app).await;
+    assert_eq!(refresh(&harness, "user-1", &record).await.1, timed_out());
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        late_counts(&harness).await,
+        (
+            json!({"kept": 0, "dropped": 0, "failed": 1, "abandoned": 0}),
+            0
+        )
+    );
+    assert_eq!(refresh(&harness, "user-1", &record).await.1, timed_out());
+    assert_eq!(provider.requests().len(), 3);
+
+    // A provider that never answers: the late call ends at the late limit, and the node
+    // waits no longer for it.
+    let silent =
+        provider_with_log_store(
+            |seen: &Seen| match seen.form_value("grant_type").as_deref() {
+                Some("authorization_code") => Reply::json(200, &google_token()),
+                _ => Reply::Hang,
+            },
+        )
+        .await;
+    let harness = Harness::with(
+        &silent,
+        Definitions::embedded(),
+        Limits {
+            token_timeout: Duration::from_millis(300),
+            token_late_limit: Duration::from_millis(1_000),
+            ..Limits::default()
+        },
+    );
+    harness.use_log_store().await;
+    app.grant(&harness).await;
+    let record = connected(&harness, &app).await;
+    assert_eq!(refresh(&harness, "user-1", &record).await.1, timed_out());
+    assert_eq!(late_counts(&harness).await.1, 1);
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    assert_eq!(
+        late_counts(&harness).await,
+        (
+            json!({"kept": 0, "dropped": 0, "failed": 1, "abandoned": 0}),
+            0
+        )
+    );
+}
+
+#[tokio::test]
+async fn a_call_that_ends_before_its_time_limit_ends_its_exchange() {
+    // The caller gives up 100 milliseconds into a call whose provider answers after 800: the
+    // exchange ends with the call, so the response is never kept and no late call is counted.
+    let provider = rotating_provider_with(200, Duration::from_millis(800)).await;
+    let harness = late_harness(&provider, 1).await;
+    let app = App::new("user-1", 1);
+    app.grant(&harness).await;
+    let record = connected(&harness, &app).await;
+    let call = refresh(&harness, "user-1", &record);
+    assert!(tokio::time::timeout(Duration::from_millis(100), call)
+        .await
+        .is_err());
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    assert_eq!(
+        late_counts(&harness).await,
+        (
+            json!({"kept": 0, "dropped": 0, "failed": 0, "abandoned": 0}),
+            0
+        )
+    );
+    let account = harness.node.account("user-1").unwrap();
+    let key = refresh_key(&Record::from_value(&record).unwrap());
+    let now_ms = harness.node.now_ms();
+    assert!(lock(&account).kept_refresh(&key, now_ms).is_none());
+    // The request had left: the next call with the same record is a provider call.
+    assert_eq!(provider.requests().len(), 2);
+    assert_eq!(refresh(&harness, "user-1", &record).await.0, 502);
+    assert_eq!(provider.requests().len(), 3);
+}
+
+#[tokio::test]
+async fn late_exchanges_are_bounded_by_the_places_for_them() {
+    // One place for late calls, and two calls that pass their time limit at the same moment:
+    // one goes on in the place, the other is ended with its call.
+    let provider = rotating_provider_with(200, Duration::from_millis(800)).await;
+    let harness = late_harness(&provider, 1).await;
+    let app = App::new("user-1", 1);
+    app.grant(&harness).await;
+    let first = connected(&harness, &app).await;
+    let second = connected(&harness, &app).await;
+    let (one, two) = tokio::join!(
+        refresh(&harness, "user-1", &first),
+        refresh(&harness, "user-1", &second)
+    );
+    assert_eq!((one.1, two.1), (timed_out(), timed_out()));
+    assert_eq!(
+        late_counts(&harness).await,
+        (
+            json!({"kept": 0, "dropped": 0, "failed": 0, "abandoned": 1}),
+            1
+        )
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        late_counts(&harness).await,
+        (
+            json!({"kept": 1, "dropped": 0, "failed": 0, "abandoned": 1}),
+            0
+        )
+    );
+
+    // Of the two records, the one whose call went on has a kept response, and the other is
+    // a provider call again.
+    assert_eq!(provider.requests().len(), 4);
+    let outcomes = [
+        refresh(&harness, "user-1", &first).await,
+        refresh(&harness, "user-1", &second).await,
+    ];
+    let kept = outcomes.iter().filter(|outcome| outcome.0 == 200).count();
+    assert_eq!(kept, 1, "{outcomes:?}");
+    assert_eq!(provider.requests().len(), 5);
 }
 
 async fn refresh(harness: &Harness, user_id: &str, record: &Value) -> (u16, Value) {

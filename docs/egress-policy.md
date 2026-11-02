@@ -233,11 +233,13 @@ definition tests of `enclave/src/providers/mod.rs`, and the canary test.
 
 - The `code` of a failure is one of the list of protocol.md section 11. The `message` is a
   `&'static str`: a fixed string of the source.
-- `provider_error` is a word of a closed list. The node reads the error string of the provider
-  response (a string `error`; for an object `error` its `code`, else its `message`; else the
-  top-level `code`) and compares it with the list below. What leaves is the element of the
-  list that equals it, the empty string when the response has no such string, and `other`
-  otherwise. Each of them is a constant of the source: no byte of a refused response leaves.
+- `provider_error` is a word of a closed list. The node reads the error strings of the provider
+  response, in this order: a string `error`; for an object `error` its string `code` and then
+  its string `message`; and, when none of those is a non-empty string, the top-level string
+  `code`. It compares each of them with the list below. What leaves is the first element of
+  the list that equals one of them, the empty string when the response has no such string, and
+  `other` otherwise. Each of them is a constant of the source: no byte of a refused response
+  leaves.
 
   ```text
   invalid_request invalid_client invalid_grant unauthorized_client unsupported_grant_type
@@ -330,7 +332,7 @@ calls, and `egress/sink-callers.tsv` (the one caller of K1).
 
 | Call | The fields of a successful response and their classes |
 | --- | --- |
-| `GET /v1/health` | `node` P, `release` P, `platform` P, `custody` P, `started_ms` P, `time_ms` P, `configured` P, `closing` P, `accounts` P, `grants` P, `mail_providers` P, `log_store` E and P (`bucket`, `region` and `credentials_expires_ms` E, `pending` P), `log` P (seven counts), `load` P (two counts, three CPU times and two sizes of the kernel; the five of the kernel are null when it exposes none) |
+| `GET /v1/health` | `node` P, `release` P, `platform` P, `custody` P, `started_ms` P, `time_ms` P, `configured` P, `closing` P, `accounts` P, `grants` P, `mail_providers` P, `log_store` E and P (`bucket`, `region` and `credentials_expires_ms` E, `pending` and `pending_oldest_ms` P), `log` P (seven counts, six counts of failed write attempts under constant cause names, the count of repeated attempts, eight cumulative counts of the time to confirmation under constant bounds, their sum and their count), `load` P (two counts, three CPU times and two sizes of the kernel; the five of the kernel are null when it exposes none), `egress` P (the count of opened connections, four counts of failed opens under constant cause names, the counts of repeated opens and of opens in progress, two counts of reused idle connections), `refresh` P (four counts of late token address calls under constant outcome names, the count of those in progress) |
 | `POST /v1/config` | `configured` P |
 | `POST /v1/attestation` | `v` P, `platform` P, `document` S (the platform signs the two public keys of the node, the release and the nonce of the caller), `node` P, `challenge` P, `release` P, `challenge_statement` S (its body: `type`, `node`, `challenge`, `time_ms` P, the nonce of the caller E) |
 | `POST /v1/messages` | `reply` S (its body: `type`, `ok`, `code`, `node`, `time_ms` P, `user_id`, `challenge`, `key_id`, `not_after_ms` D, `head` P), `log` P, `grant` D |
@@ -373,7 +375,11 @@ No other value that comes from a secret or from a sealed input leaves in the cle
 
 `POST /v1/refresh` keeps the response of a successful refresh for 3,600 seconds, for the
 account and under the hash of the `ct` of the record that was sent. What it keeps is what the
-response held: C, R, P and D values. Section 5.7 of enclave.md describes it.
+response held: C, R, P and D values. A token address call that did not answer within the time
+limit of the call fails the call, and the node keeps receiving its response for up to 120
+seconds: a success that arrives then is kept the same way, when the grant it ran under is still
+in force and the node is not closing, and nothing of it leaves otherwise. Section 5.7 of
+enclave.md describes it.
 
 ## 5. What these rules show and what they do not
 

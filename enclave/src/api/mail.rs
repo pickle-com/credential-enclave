@@ -1,7 +1,6 @@
 //! Typed mail calls. Passwords are opened only after grant checks and used after logging.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::extract::{Request, State};
 use axum::http::header::CONTENT_LENGTH;
@@ -33,7 +32,7 @@ pub async fn submit(State(node): State<Arc<Node>>, request: Request) -> Response
 
 async fn call(node: Arc<Node>, request: Request, operation: &'static str) -> Response {
     respond(
-        match tokio::time::timeout(Duration::from_secs(30), run(&node, request, operation)).await {
+        match tokio::time::timeout(mail::CALL_TIMEOUT, run(&node, request, operation)).await {
             Ok(result) => result,
             Err(_) => Err(ProtocolError::Timeout.into()),
         },

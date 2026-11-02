@@ -103,7 +103,7 @@ impl TimeProvider for TlsTime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::{Listener, Measurement, Platform, Stream};
+    use crate::platform::{ConnectError, Listener, Measurement, Platform, Stream};
     use std::sync::atomic::AtomicUsize;
 
     /// A platform whose trusted time is a script: each read takes a given delay and returns a
@@ -145,8 +145,8 @@ mod tests {
             Err(PlatformError("unused"))
         }
 
-        async fn connect(&self, _: &str, _: u16) -> Result<Stream, PlatformError> {
-            Err(PlatformError("unused"))
+        async fn connect(&self, _: &str, _: u16) -> Result<Stream, ConnectError> {
+            Err(ConnectError::Transport("unused"))
         }
     }
 

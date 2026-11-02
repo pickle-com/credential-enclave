@@ -12,7 +12,8 @@
 //!    the provider definitions and of the log store (`egress`);
 //! 4. sends the operator configuration, with the log store of the node, to the node once the
 //!    node answers (`config`);
-//! 5. reports the state of the node on TCP 9091, `/healthz` and `/metrics` (`health`);
+//! 5. reports the state of the node and the counts of the egress relay on TCP 9091, `/healthz`
+//!    and `/metrics` (`health`);
 //! 6. on SIGTERM asks the backend to collect the state of the node, then ends the enclave
 //!    (`drain`, `launch`).
 //!
@@ -48,7 +49,7 @@ use tokio::signal::unix::{signal, Signal, SignalKind};
 
 use config::{ConfigError, Injection, LogStore};
 use drain::Drain;
-use egress::{Allowlist, TcpOutbound};
+use egress::{Allowlist, EgressCounters, TcpOutbound};
 use relay::{NodeConnector, VsockListener, VsockNode};
 
 /// The provider definitions of the node. The host program is built from the same file.
@@ -210,13 +211,27 @@ async fn run() -> Result<(), String> {
             egress::EGRESS_PORT
         )
     })?;
+    // The queue of the egress listener holds the connections the node opens at once. A kernel
+    // that refuses the length leaves the listener with its default queue: the program goes on.
+    match egress_listener.widen_backlog() {
+        Ok(backlog) => log(&format!("egress: vsock listener backlog {backlog}")),
+        Err(error) => log(&format!(
+            "egress: the backlog of the vsock listener stays at the default: {error}"
+        )),
+    }
 
     let node: Arc<dyn NodeConnector> = Arc::new(VsockNode);
-    tokio::spawn(health::serve(status_listener, node.clone()));
+    let counters = Arc::new(EgressCounters::default());
+    tokio::spawn(health::serve(
+        status_listener,
+        node.clone(),
+        counters.clone(),
+    ));
     tokio::spawn(egress::serve(
         egress_listener,
         allowlist,
         Arc::new(TcpOutbound),
+        counters,
     ));
 
     // A termination signal during the start ends the program at once: the node has served no

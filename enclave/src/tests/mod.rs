@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::providers::{endpoint, Definitions};
 use crate::testing::{Provider, Reply, Seen, LOG_HOST};
@@ -19,6 +19,26 @@ mod oauth;
 mod peer;
 mod records;
 mod surface;
+
+/// The seven counts of the `log` object of health that a test of the log can fix: the entries,
+/// the events, the writes, the failed writes, the open batches and the two counts of the
+/// batch calls. The other keys of the object count failed attempts by cause, repeated
+/// attempts and the times to confirmation, which depend on the machine that runs the test.
+fn seven_counts(log: &Value) -> Value {
+    let mut counts = serde_json::Map::new();
+    for key in [
+        "entries",
+        "events",
+        "writes",
+        "write_failures",
+        "open_batches",
+        "batch_calls",
+        "batch_requests",
+    ] {
+        counts.insert(key.to_string(), log[key].clone());
+    }
+    Value::Object(counts)
+}
 
 /// Every host a node can connect to with the embedded definitions: the token addresses, the
 /// revocation addresses and the hosts of the `api` rules.

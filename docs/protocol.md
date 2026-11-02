@@ -768,10 +768,14 @@ Authorization: AWS4-HMAC-SHA256 Credential=..., SignedHeaders=..., Signature=...
   that the operator domain gives the node (enclave.md 5.14). In the path, every byte of the key
   outside the unreserved characters of RFC 3986 is percent-encoded, and `/` is not: a `user_id`
   is written into the key as it is.
-- The node keeps up to 32 idle HTTP/1.1 connections to the store and sends a write over the most
-  recently used one; a write over an idle connection that ends without a response goes once more
-  over a new connection (a `PUT` is idempotent, and a repeated write adds a second version of the
-  same object). A connection carries one write at a time.
+- The node keeps up to 32 idle HTTP/1.1 connections to the store and sends the first attempt of
+  a write over the most recently used one. An attempt the store does not confirm because the
+  connection failed, the connection closed without a response, the attempt passed its time
+  limit, or the status was 5xx or 429 is repeated over a new connection, with a full jitter
+  backoff between the attempts, within a budget of twice the time limit of a write per entry; a
+  4xx status other than 429 is not repeated (enclave.md 5.14). A `PUT` is idempotent, and a
+  repeated attempt adds a version of the same object with the same body. A connection carries
+  one write at a time.
 - The one confirmation of a write is the status 200 of that request. Every other status, a
   failure of the connection and a write that takes longer than its time limit are no
   confirmation. A bucket without Object Lock refuses a request with these headers, so a node
@@ -1167,6 +1171,8 @@ any other form is not a release tag and has no place in the order.
 | Merge window of identical GET requests | 300 seconds |
 | Time a node keeps the response of a successful `refresh` (enclave.md 5.7) | 3,600 seconds |
 | Kept `refresh` responses per account | 16 (the most recent ones) |
+| Longest time a node keeps receiving the response of a token address call of `refresh` after the time limit of the call, counted from the start of the call (`TOKEN_LATE_LIMIT`, enclave.md 5.7) | 120 seconds |
+| Token address calls of `refresh` a node continues after their time limit at once (`REFRESH_LATE_TASKS`) | 128 |
 | Most accounts in one delegation transfer | 1,000 |
 | Most nodes that a node hands one grant to (10.1) | 64 |
 | Longest release statement (10.3) | 16,384 bytes |

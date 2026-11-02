@@ -28,10 +28,67 @@ pub const NODE_PORT: u32 = 8080;
 const NODE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Size of the buffer of each direction of a pipe.
 const PIPE_BUFFER_BYTES: usize = 64 * 1024;
-/// Pause after a failed accept, so a persistent failure does not spin.
+/// Pause after a failed accept of a class that asks for one, so a persistent failure does not
+/// spin.
 const ACCEPT_RETRY_PAUSE: Duration = Duration::from_millis(50);
-/// Length of the queue of connections that wait for accept.
+/// Length of the queue of connections that wait for accept, on the two TCP listeners and on the
+/// vsock listener of the egress relay.
 const LISTEN_BACKLOG: u32 = 1024;
+
+/// The class of a failed accept. The class decides whether the next accept runs at once or
+/// after a pause, and it is the `cause` label of
+/// `credential_enclave_host_egress_accept_errors_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AcceptFailure {
+    /// The connection was gone before accept returned it (`ECONNABORTED`, `EPROTO`), or the
+    /// call was interrupted or found no connection (`EINTR`, `EAGAIN`): the next accept runs at
+    /// once.
+    Aborted,
+    /// The process or the kernel is out of descriptors or memory (`EMFILE`, `ENFILE`,
+    /// `ENOBUFS`, `ENOMEM`): the next accept runs after a pause of 50 milliseconds.
+    Resources,
+    /// Any other failure: the next accept runs after a pause of 50 milliseconds.
+    Other,
+}
+
+impl AcceptFailure {
+    /// The three classes, in the order of the label values of the metrics.
+    pub const ALL: [AcceptFailure; 3] = [
+        AcceptFailure::Aborted,
+        AcceptFailure::Resources,
+        AcceptFailure::Other,
+    ];
+
+    /// Classifies the error of a failed accept: by its OS error number when it has one, by its
+    /// kind otherwise.
+    pub fn of(error: &io::Error) -> AcceptFailure {
+        match error.raw_os_error() {
+            Some(libc::ECONNABORTED | libc::EINTR | libc::EAGAIN | libc::EPROTO) => {
+                AcceptFailure::Aborted
+            }
+            Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => {
+                AcceptFailure::Resources
+            }
+            Some(_) => AcceptFailure::Other,
+            None => match error.kind() {
+                io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::Interrupted
+                | io::ErrorKind::WouldBlock => AcceptFailure::Aborted,
+                io::ErrorKind::OutOfMemory => AcceptFailure::Resources,
+                _ => AcceptFailure::Other,
+            },
+        }
+    }
+
+    /// The value of the `cause` label.
+    pub fn label(self) -> &'static str {
+        match self {
+            AcceptFailure::Aborted => "aborted",
+            AcceptFailure::Resources => "resources",
+            AcceptFailure::Other => "other",
+        }
+    }
+}
 
 /// A bidirectional byte pipe.
 pub trait ByteStream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
@@ -91,7 +148,8 @@ pub struct VsockListener {
 }
 
 impl VsockListener {
-    /// Listens on `port`.
+    /// Listens on `port`. The queue of connections that wait for accept has the length the
+    /// library sets, 128, until [`VsockListener::widen_backlog`] runs.
     #[cfg(target_os = "linux")]
     pub fn bind(port: u32) -> io::Result<VsockListener> {
         let address = tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_ANY, port);
@@ -101,6 +159,25 @@ impl VsockListener {
     /// Listens on `port`.
     #[cfg(not(target_os = "linux"))]
     pub fn bind(_port: u32) -> io::Result<VsockListener> {
+        Err(vsock_unsupported())
+    }
+
+    /// Sets the queue of connections that wait for accept to `LISTEN_BACKLOG` with a second
+    /// `listen` call on the bound socket, and returns that length. The kernel of the parent
+    /// instance resets a connection request that finds the queue full, so the queue holds the
+    /// connections the node opens at once. When the call fails the queue keeps the length of
+    /// `bind`, and the listener works as before.
+    #[cfg(target_os = "linux")]
+    pub fn widen_backlog(&self) -> io::Result<u32> {
+        let backlog = i32::try_from(LISTEN_BACKLOG)
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        socket2::SockRef::from(&self.inner).listen(backlog)?;
+        Ok(LISTEN_BACKLOG)
+    }
+
+    /// Sets the queue of connections that wait for accept to `LISTEN_BACKLOG`.
+    #[cfg(not(target_os = "linux"))]
+    pub fn widen_backlog(&self) -> io::Result<u32> {
         Err(vsock_unsupported())
     }
 
@@ -150,18 +227,25 @@ where
     .await;
 }
 
-/// Pauses after a failed accept.
-pub async fn pause_after_failed_accept() {
-    tokio::time::sleep(ACCEPT_RETRY_PAUSE).await;
+/// Pauses after a failed accept of the class `failure` when that class asks for one: a
+/// persistent failure does not spin, and a connection that was gone before accept returned it
+/// costs no wait.
+pub async fn pause_after_failed_accept(failure: AcceptFailure) {
+    if failure != AcceptFailure::Aborted {
+        tokio::time::sleep(ACCEPT_RETRY_PAUSE).await;
+    }
 }
 
 /// The inbound relay: pipes every connection of `listener` to a new connection to the node. A
 /// connection whose node connection cannot be opened is closed.
 pub async fn serve(listener: TcpListener, node: Arc<dyn NodeConnector>) {
     loop {
-        let Ok((caller, _)) = listener.accept().await else {
-            pause_after_failed_accept().await;
-            continue;
+        let (caller, _) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                pause_after_failed_accept(AcceptFailure::of(&error)).await;
+                continue;
+            }
         };
         let _ = caller.set_nodelay(true);
         let node = node.clone();
@@ -293,7 +377,23 @@ mod tests {
     async fn the_vsock_endpoints_carry_bytes_over_the_loopback_transport() {
         const LOOPBACK_CID: u32 = 1;
         const PORT: u32 = 18_443;
+        // More connections than the queue of `bind` holds: the kernel resets the 130th
+        // connection request of a queue of 128.
+        const WAITING: usize = 300;
         let listener = VsockListener::bind(PORT).unwrap();
+        assert_eq!(listener.widen_backlog().unwrap(), LISTEN_BACKLOG);
+
+        // Every connection opens before the first accept: the widened queue holds them all.
+        let mut waiting: Vec<Stream> = Vec::with_capacity(WAITING);
+        for index in 0..WAITING {
+            match vsock_connect(LOOPBACK_CID, PORT).await {
+                Ok(stream) => waiting.push(stream),
+                Err(error) => panic!("connection {index} did not enter the queue: {error}"),
+            }
+        }
+        assert_eq!(waiting.len(), WAITING);
+
+        // The first connection of the queue carries bytes in both directions.
         let accepted = tokio::spawn(async move {
             let mut stream = listener.accept().await.unwrap();
             let mut buffer = [0u8; 4];
@@ -302,12 +402,79 @@ mod tests {
             stream.write_all(b" back").await.unwrap();
             stream.shutdown().await.unwrap();
         });
-        let mut stream = vsock_connect(LOOPBACK_CID, PORT).await.unwrap();
+        let mut stream = waiting.remove(0);
         stream.write_all(b"ping").await.unwrap();
         let mut received = Vec::new();
         stream.read_to_end(&mut received).await.unwrap();
         assert_eq!(received, b"ping back");
         accepted.await.unwrap();
+    }
+
+    #[test]
+    fn a_failed_accept_is_classified_by_its_os_error_number_or_its_kind() {
+        for code in [libc::ECONNABORTED, libc::EINTR, libc::EAGAIN, libc::EPROTO] {
+            let error = io::Error::from_raw_os_error(code);
+            assert_eq!(AcceptFailure::of(&error), AcceptFailure::Aborted, "{error}");
+        }
+        for code in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            let error = io::Error::from_raw_os_error(code);
+            assert_eq!(
+                AcceptFailure::of(&error),
+                AcceptFailure::Resources,
+                "{error}"
+            );
+        }
+        for code in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK, libc::EOPNOTSUPP] {
+            let error = io::Error::from_raw_os_error(code);
+            assert_eq!(AcceptFailure::of(&error), AcceptFailure::Other, "{error}");
+        }
+
+        // An error without an OS error number is classified by its kind.
+        for kind in [
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::WouldBlock,
+        ] {
+            assert_eq!(
+                AcceptFailure::of(&io::Error::from(kind)),
+                AcceptFailure::Aborted,
+                "{kind:?}"
+            );
+        }
+        assert_eq!(
+            AcceptFailure::of(&io::Error::from(io::ErrorKind::OutOfMemory)),
+            AcceptFailure::Resources
+        );
+        for kind in [
+            io::ErrorKind::Other,
+            io::ErrorKind::InvalidInput,
+            io::ErrorKind::Unsupported,
+        ] {
+            assert_eq!(
+                AcceptFailure::of(&io::Error::from(kind)),
+                AcceptFailure::Other,
+                "{kind:?}"
+            );
+        }
+
+        assert_eq!(
+            AcceptFailure::ALL.map(AcceptFailure::label),
+            ["aborted", "resources", "other"]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_an_aborted_accept_is_followed_by_the_next_accept_at_once() {
+        let slack = Duration::from_millis(10);
+        let started = tokio::time::Instant::now();
+        pause_after_failed_accept(AcceptFailure::Aborted).await;
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        pause_after_failed_accept(AcceptFailure::Resources).await;
+        let waited = started.elapsed();
+        assert!(waited >= ACCEPT_RETRY_PAUSE && waited < ACCEPT_RETRY_PAUSE + slack);
+        pause_after_failed_accept(AcceptFailure::Other).await;
+        let waited = started.elapsed();
+        assert!(waited >= 2 * ACCEPT_RETRY_PAUSE && waited < 2 * ACCEPT_RETRY_PAUSE + slack);
     }
 
     #[tokio::test]

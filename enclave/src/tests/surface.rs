@@ -34,15 +34,27 @@ async fn health_reports_the_node_in_the_key_order_of_5_1() {
             "\"configured\":false,\"closing\":false,\"accounts\":0,\"grants\":0,",
             "\"mail_providers\":[\"naver_mail\"],\"log_store\":null,",
             "\"log\":{{\"entries\":0,\"events\":0,\"writes\":0,\"write_failures\":0,",
-            "\"open_batches\":0,\"batch_calls\":0,\"batch_requests\":0}},",
+            "\"open_batches\":0,\"batch_calls\":0,\"batch_requests\":0,",
+            "\"write_attempt_failures\":{{\"connect\":0,\"tls\":0,\"closed\":0,\"timeout\":0,",
+            "\"status_4xx\":0,\"status_5xx\":0}},\"write_retries\":0,",
+            "\"write_ms_buckets\":{{\"25\":0,\"50\":0,\"100\":0,\"250\":0,\"500\":0,",
+            "\"1000\":0,\"2500\":0,\"5000\":0}},\"write_ms_sum\":0,\"write_count\":0}},",
             "\"load\":{{\"provider_inflight\":0,\"forward_calls\":0,"
         ),
         harness.node.node, started_ms, time_ms
     );
     assert!(text.starts_with(&prefix), "{text}");
-    // The five values of the kernel end the body. They depend on the machine that runs the
-    // test: numbers from the procfs of a Linux kernel, null on another kernel.
-    assert!(text.ends_with("}}"), "{text}");
+    // The five values of the kernel follow. They depend on the machine that runs the test:
+    // numbers from the procfs of a Linux kernel, null on another kernel. The counts of the
+    // outbound connections and of the late token address calls end the body.
+    let suffix = concat!(
+        "},\"egress\":{\"opens\":0,\"open_failures\":{\"transport\":0,\"relay_refused\":0,",
+        "\"tls\":0,\"http\":0},\"open_retries\":0,\"open_inflight\":0,",
+        "\"idle_reuses\":{\"provider\":0,\"log_store\":0}},",
+        "\"refresh\":{\"late\":{\"kept\":0,\"dropped\":0,\"failed\":0,\"abandoned\":0},",
+        "\"late_inflight\":0}}"
+    );
+    assert!(text.ends_with(suffix), "{text}");
     let load = health["load"].as_object().unwrap();
     let kernel_values = [
         "cpu_user_ms",
@@ -74,12 +86,38 @@ async fn health_reports_the_node_in_the_key_order_of_5_1() {
     assert_eq!(health["accounts"], 1);
     assert_eq!(health["grants"], 1);
     // The counts of the log: the grant created one entry with one event. The node has no log
-    // store, so it sent no write.
+    // store, so it sent no write, and the counts of the attempts stay at zero.
     assert_eq!(
         health["log"],
         json!({
             "entries": 1, "events": 1, "writes": 0, "write_failures": 0, "open_batches": 0,
             "batch_calls": 0, "batch_requests": 0,
+            "write_attempt_failures": {
+                "connect": 0, "tls": 0, "closed": 0, "timeout": 0, "status_4xx": 0, "status_5xx": 0,
+            },
+            "write_retries": 0,
+            "write_ms_buckets": {
+                "25": 0, "50": 0, "100": 0, "250": 0, "500": 0, "1000": 0, "2500": 0, "5000": 0,
+            },
+            "write_ms_sum": 0,
+            "write_count": 0,
+        })
+    );
+    assert_eq!(
+        health["egress"],
+        json!({
+            "opens": 0,
+            "open_failures": {"transport": 0, "relay_refused": 0, "tls": 0, "http": 0},
+            "open_retries": 0,
+            "open_inflight": 0,
+            "idle_reuses": {"provider": 0, "log_store": 0},
+        })
+    );
+    assert_eq!(
+        health["refresh"],
+        json!({
+            "late": {"kept": 0, "dropped": 0, "failed": 0, "abandoned": 0},
+            "late_inflight": 0,
         })
     );
 }

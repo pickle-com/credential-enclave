@@ -19,7 +19,7 @@ use super::{invalid, json_ok, provider_credentials, record_of, respond, ApiError
 use crate::log_store;
 use crate::oauth::{
     self, authorization_url, call_token_address, check_params, token_request, ClientId,
-    ClientValues, PkceVerifier, TokenGrant,
+    ClientValues, PkceVerifier, ProviderError, TokenGrant,
 };
 use crate::providers::{ClientKind, Pkce};
 use crate::state::{events, lock, Node, PendingAuth};
@@ -197,11 +197,17 @@ async fn run_complete(node: &Node, request: Request) -> Result<Response, ApiErro
             code_verifier: pending.code_verifier.as_ref(),
         },
     )?;
-    let response = call_token_address(node, definition, request)
-        .await
-        .map_err(|failure| {
-            ApiError::provider(ProtocolError::ExchangeFailed, failure.status, failure.error)
-        })?;
+    // An authorization code is used once, so a call that passed its time limit is not
+    // continued: the exchange ends with the call, with `provider_status` 0.
+    let response = tokio::time::timeout(
+        node.limits.token_timeout,
+        call_token_address(node, definition, request),
+    )
+    .await
+    .map_err(|_| ApiError::provider(ProtocolError::ExchangeFailed, 0, ProviderError::NONE))?
+    .map_err(|failure| {
+        ApiError::provider(ProtocolError::ExchangeFailed, failure.status, failure.error)
+    })?;
 
     // 4, 5: the token response becomes the plaintext of the record. The public fields pass
     // rule E4 before anything is created: a response that fails it leaves no record, no

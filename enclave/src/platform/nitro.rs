@@ -9,7 +9,7 @@
 use credential_enclave_protocol::attestation::read_unverified_nitro_document;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use super::{Measurement, PlatformError};
+use super::{ConnectError, Measurement, PlatformError};
 
 #[cfg(target_os = "linux")]
 pub use enclave::NitroPlatform;
@@ -47,8 +47,9 @@ pub fn attestation_measurement(document: &[u8]) -> Result<Measurement, PlatformE
 
 /// Asks the egress relay of the parent instance for a pipe to `host:port`: sends the line
 /// `CONNECT {host}:{port}\n` and expects the line `OK\n`. After that the connection carries the
-/// bytes of the provider connection (TLS ends inside the node).
-pub async fn open_tunnel<S>(stream: &mut S, host: &str, port: u16) -> Result<(), PlatformError>
+/// bytes of the provider connection (TLS ends inside the node). Every failure of this
+/// handshake is a refusal of the relay: the pipe to the relay itself is open.
+pub async fn open_tunnel<S>(stream: &mut S, host: &str, port: u16) -> Result<(), ConnectError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -57,9 +58,11 @@ where
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'.' || byte == b'-'
         });
     if !valid_host {
-        return Err(PlatformError("the provider host is not a DNS name"));
+        return Err(ConnectError::RelayRefused(
+            "the provider host is not a DNS name",
+        ));
     }
-    let refused = PlatformError("the egress relay refused the connection");
+    let refused = ConnectError::RelayRefused("the egress relay refused the connection");
     stream
         .write_all(format!("CONNECT {host}:{port}\n").as_bytes())
         .await
@@ -92,7 +95,9 @@ mod enclave {
 
     use super::{attestation_measurement, attestation_timestamp, open_tunnel};
     use crate::platform::local::kernel_random;
-    use crate::platform::{Listener, Measurement, Platform, PlatformError, Stream, LISTEN_PORT};
+    use crate::platform::{
+        ConnectError, Listener, Measurement, Platform, PlatformError, Stream, LISTEN_PORT,
+    };
 
     /// The vsock CID of the parent instance.
     const PARENT_CID: u32 = 3;
@@ -207,10 +212,12 @@ mod enclave {
                 .map_err(|_| PlatformError("cannot listen on vsock port 8080"))
         }
 
-        async fn connect(&self, host: &str, port: u16) -> Result<Stream, PlatformError> {
+        async fn connect(&self, host: &str, port: u16) -> Result<Stream, ConnectError> {
             let mut stream = VsockStream::connect(VsockAddr::new(PARENT_CID, EGRESS_PORT))
                 .await
-                .map_err(|_| PlatformError("cannot reach the egress relay of the parent"))?;
+                .map_err(|_| {
+                    ConnectError::Transport("cannot reach the egress relay of the parent")
+                })?;
             open_tunnel(&mut stream, host, port).await?;
             Ok(Box::new(stream))
         }

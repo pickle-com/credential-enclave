@@ -1132,6 +1132,139 @@ async fn two_calls_whose_responses_have_no_length_do_not_wait_for_each_other() {
     assert_budget_is_free(&harness);
 }
 
+#[tokio::test]
+async fn an_open_that_fails_before_a_request_byte_left_is_repeated() {
+    // A node without a log store: every connection it asks its platform for is one to the
+    // provider.
+    let provider = quiet_provider().await;
+    let harness = Harness::configured(&provider).await;
+    let app = App::new("user-1", 1);
+    app.grant(&harness).await;
+    let record = google_record(&app);
+
+    // The platform refuses the first two connections: the third attempt opens the connection
+    // and the request reaches the provider once.
+    harness.platform.refuse_connections(2);
+    let started = Instant::now();
+    let forwarded = harness
+        .forward(meta(&app, &record, "GET", PROFILE, json!([])), b"")
+        .await
+        .unwrap();
+    assert_eq!(forwarded.status, 200);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(provider.requests().len(), 1);
+    assert_eq!(gmail_connections(&harness), 3);
+    let egress = harness.health().await["egress"].clone();
+    assert_eq!(egress["opens"], 1);
+    assert_eq!(egress["open_failures"]["transport"], 2);
+    assert_eq!(egress["open_retries"], 2);
+    assert_eq!(egress["open_inflight"], 0);
+
+    // Three refusals end the open, and the call is `provider_unreachable`. The request goes to
+    // another host, so no idle connection of the account carries it.
+    harness.platform.refuse_connections(3);
+    let userinfo = "https://www.googleapis.com/oauth2/v3/userinfo";
+    assert_eq!(
+        failure(
+            harness
+                .forward(meta(&app, &record, "GET", userinfo, json!([])), b"")
+                .await
+        ),
+        (502, "provider_unreachable".to_string())
+    );
+    assert_eq!(provider.requests().len(), 1);
+    let egress = harness.health().await["egress"].clone();
+    assert_eq!(egress["opens"], 1);
+    assert_eq!(egress["open_failures"]["transport"], 5);
+    assert_eq!(egress["open_retries"], 4);
+
+    // A failed attempt is repeated only within half the time limit of the call: with a time
+    // limit of one second and a refusal that takes 600 milliseconds to arrive, half the limit
+    // has passed when the first attempt fails, so the call fails without a second attempt.
+    harness
+        .platform
+        .pause_connections(Duration::from_millis(600));
+    harness.platform.refuse_connections(1);
+    let mut slow = meta(&app, &record, "GET", userinfo, json!([]));
+    slow["timeout_ms"] = json!(1000);
+    let started = Instant::now();
+    assert_eq!(
+        failure(harness.forward(slow, b"").await),
+        (502, "provider_unreachable".to_string())
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(600) && elapsed < Duration::from_millis(950),
+        "{elapsed:?}"
+    );
+    let egress = harness.health().await["egress"].clone();
+    assert_eq!(egress["open_failures"]["transport"], 6);
+    assert_eq!(egress["open_retries"], 4);
+    assert_budget_is_free(&harness);
+}
+
+#[tokio::test]
+async fn the_node_opens_a_bounded_number_of_connections_at_once() {
+    let provider = quiet_provider().await;
+    // Two connections open at the same time, each taking 300 milliseconds to open.
+    let harness = Harness::with(
+        &provider,
+        Definitions::embedded(),
+        Limits {
+            open_concurrency: 2,
+            ..Limits::default()
+        },
+    );
+    harness
+        .post(
+            "/v1/config",
+            crate::testing::operator_config(&harness.node.definitions),
+        )
+        .await;
+    let app = App::new("user-1", 1);
+    app.grant(&harness).await;
+    let record = google_record(&app);
+    harness
+        .platform
+        .pause_connections(Duration::from_millis(300));
+
+    // Three requests of the account to three hosts: none has an idle connection, so three
+    // connections are opened. Two open at once, the third waits for a place: while the first
+    // two open, two connections are being opened, and the three calls take two rounds.
+    let addresses = [
+        PROFILE,
+        "https://www.googleapis.com/oauth2/v3/userinfo",
+        "https://docs.googleapis.com/v1/documents/d1",
+    ];
+    let started = Instant::now();
+    let calls = async {
+        let (one, two, three) = tokio::join!(
+            harness.forward(meta(&app, &record, "GET", addresses[0], json!([])), b""),
+            harness.forward(meta(&app, &record, "GET", addresses[1], json!([])), b""),
+            harness.forward(meta(&app, &record, "GET", addresses[2], json!([])), b""),
+        );
+        for outcome in [one, two, three] {
+            assert_eq!(outcome.unwrap().status, 200);
+        }
+    };
+    let probe = async {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        harness.health().await["egress"]["open_inflight"].clone()
+    };
+    let ((), inflight) = tokio::join!(calls, probe);
+    assert_eq!(inflight, 2);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(600) && elapsed < Duration::from_secs(3),
+        "{elapsed:?}"
+    );
+    assert_eq!(provider.requests().len(), 3);
+    let egress = harness.health().await["egress"].clone();
+    assert_eq!(egress["opens"], 3);
+    assert_eq!(egress["open_inflight"], 0);
+    assert_budget_is_free(&harness);
+}
+
 fn gmail_connections(harness: &Harness) -> usize {
     harness
         .platform
@@ -1187,6 +1320,16 @@ async fn requests_of_one_account_to_one_host_share_a_connection_and_accounts_do_
 
     // A response with `Connection: close` ends the connection: the next request opens one.
     assert_eq!(provider.requests().len(), 5);
+    // Health counts the requests that went over an idle connection of their account (the
+    // second and the third of the first account) and every connection that was opened: the
+    // three to the provider, and one per write to the log store, whose stand-in closes its
+    // connection after every answer.
+    let egress = harness.health().await["egress"].clone();
+    assert_eq!(egress["idle_reuses"]["provider"], 2);
+    assert_eq!(
+        egress["opens"].as_u64().unwrap() as usize,
+        harness.platform.connections().len()
+    );
     assert_budget_is_free(&harness);
 }
 

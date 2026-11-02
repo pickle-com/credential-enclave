@@ -22,7 +22,7 @@ use crate::api::ApiError;
 use crate::clock::Clock;
 use crate::egress::Egress;
 use crate::lineage::Lineage;
-use crate::log_store::LogStore;
+use crate::log_store::{LogStore, WriteFailure};
 use crate::oauth::PkceVerifier;
 use crate::platform::{PlatformError, SharedPlatform};
 use crate::providers::Definitions;
@@ -32,6 +32,16 @@ use crate::providers::Definitions;
 pub const REFRESH_KEPT_MS: u64 = 3_600 * 1000;
 /// The responses of `refresh` a node keeps per account: the most recent 16.
 pub const REFRESH_KEPT_ENTRIES: usize = 16;
+/// Time limit of a token address call (enclave.md 6.3): the default of
+/// `Limits::token_timeout`.
+pub const TOKEN_TIMEOUT: Duration = Duration::from_secs(15);
+/// Longest time a node keeps receiving the response of a token address call of `refresh`
+/// after the time limit of the call passed, counted from the start of the call (enclave.md
+/// 5.7): the default of `Limits::token_late_limit`.
+pub const TOKEN_LATE_LIMIT: Duration = Duration::from_secs(120);
+/// Token address calls of `refresh` that a node continues after their time limit at the same
+/// time (enclave.md 5.7): the default of `Limits::refresh_late_tasks`.
+pub const REFRESH_LATE_TASKS: usize = 128;
 
 /// The capacities of a node (enclave.md sections 3 and 8).
 #[derive(Clone, Copy, Debug)]
@@ -50,9 +60,25 @@ pub struct Limits {
     pub challenges: usize,
     /// Pending authorizations a node keeps.
     pub pending: usize,
-    /// Longest write of one entry to the log store: the connection, the TLS handshake and
-    /// the exchange.
+    /// Longest attempt to write one entry to the log store: the connection, the TLS handshake
+    /// and the exchange. An attempt over an idle connection gets half of it, and the attempts
+    /// of one entry share a budget of twice it (enclave.md 5.14).
     pub log_write: Duration,
+    /// Time limit of a token address call: the whole of `oauth/complete`'s call, and the time
+    /// `refresh` waits for its call before the call fails (enclave.md 5.7).
+    pub token_timeout: Duration,
+    /// Longest time a node keeps receiving the response of a token address call of `refresh`
+    /// whose time limit passed, counted from the start of the call.
+    pub token_late_limit: Duration,
+    /// Token address calls of `refresh` the node continues after their time limit at the same
+    /// time. A call that finds no place ends with its time limit.
+    pub refresh_late_tasks: usize,
+    /// Outbound connections the node opens at the same time: the connections to providers and
+    /// to the log store that are being opened (enclave.md section 8). A further open waits.
+    pub open_concurrency: usize,
+    /// Entries the sweep of the node writes per second, over every account (enclave.md
+    /// section 3).
+    pub sweep_write_rate: u32,
 }
 
 impl Default for Limits {
@@ -64,6 +90,11 @@ impl Default for Limits {
             challenges: 100_000,
             pending: 100_000,
             log_write: Duration::from_secs(5),
+            token_timeout: TOKEN_TIMEOUT,
+            token_late_limit: TOKEN_LATE_LIMIT,
+            refresh_late_tasks: REFRESH_LATE_TASKS,
+            open_concurrency: crate::egress::OPEN_CONCURRENCY,
+            sweep_write_rate: crate::log_store::SWEEP_WRITE_RATE,
         }
     }
 }
@@ -175,6 +206,11 @@ pub struct Unconfirmed {
     /// took it along. An entry no call writes is a pending entry: the next write of the
     /// account takes it along.
     pub writing: bool,
+    /// The node time at which the entry was created: the time since which the store has not
+    /// confirmed it. The sweep writes the pending entries of an account only after a part of
+    /// its interval passed since this time, and `pending_oldest_ms` of health is the age of the
+    /// oldest pending entry (enclave.md 5.1).
+    pub pending_since_ms: u64,
 }
 
 /// The `seq` of the entry an open batch became, set when the batch is closed. Every call
@@ -255,15 +291,88 @@ impl OpenBatch {
     }
 }
 
+/// The upper bounds, in milliseconds, of the cumulative buckets of the time to confirmation of
+/// a write to the log store (`write_ms_buckets` of health, enclave.md 5.1).
+pub const WRITE_MS_BOUNDS: [u64; 8] = [25, 50, 100, 250, 500, 1000, 2500, 5000];
+
 /// The counts of `log` of `GET /v1/health` (enclave.md 5.1), since the node started.
 #[derive(Default)]
 pub struct LogCounters {
     pub entries: AtomicU64,
     pub events: AtomicU64,
+    /// Attempts to write an entry to the log store, confirmed or not.
     pub writes: AtomicU64,
+    /// Entries the store did not confirm within the budget of their attempts.
     pub write_failures: AtomicU64,
     pub batch_calls: AtomicU64,
     pub batch_requests: AtomicU64,
+    /// Attempts the store did not confirm, by cause.
+    pub write_attempt_failures: WriteAttemptFailures,
+    /// Attempts that followed an attempt the store did not confirm.
+    pub write_retries: AtomicU64,
+    /// Confirmed attempts whose time to confirmation was at most the bound of
+    /// [`WRITE_MS_BOUNDS`] at the same index: cumulative buckets.
+    pub write_ms_buckets: [AtomicU64; WRITE_MS_BOUNDS.len()],
+    /// The sum of the times to confirmation of the confirmed attempts, in milliseconds.
+    pub write_ms_sum: AtomicU64,
+    /// Confirmed attempts.
+    pub write_count: AtomicU64,
+}
+
+impl LogCounters {
+    /// Records a confirmed attempt that took `elapsed_ms` from its start to the status 200.
+    pub fn record_confirmed(&self, elapsed_ms: u64) {
+        for (bucket, bound) in self.write_ms_buckets.iter().zip(WRITE_MS_BOUNDS) {
+            if elapsed_ms <= bound {
+                bucket.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.write_ms_sum.fetch_add(elapsed_ms, Ordering::Relaxed);
+        self.write_count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The attempts to write an entry that the log store did not confirm, by cause
+/// (`write_attempt_failures` of health). The causes are those of
+/// [`crate::log_store::WriteFailure`].
+#[derive(Default)]
+pub struct WriteAttemptFailures {
+    pub connect: AtomicU64,
+    pub tls: AtomicU64,
+    pub closed: AtomicU64,
+    pub timeout: AtomicU64,
+    pub status_4xx: AtomicU64,
+    pub status_5xx: AtomicU64,
+}
+
+impl WriteAttemptFailures {
+    pub fn count(&self, cause: WriteFailure) {
+        let counter = match cause {
+            WriteFailure::Connect => &self.connect,
+            WriteFailure::Tls => &self.tls,
+            WriteFailure::Closed => &self.closed,
+            WriteFailure::Timeout => &self.timeout,
+            WriteFailure::Status4xx => &self.status_4xx,
+            WriteFailure::Status5xx => &self.status_5xx,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The counts of `refresh` of `GET /v1/health` (enclave.md 5.1): the outcomes of the token
+/// address calls of `refresh` that the node continued after their time limit (5.7).
+#[derive(Default)]
+pub struct RefreshCounters {
+    /// Late calls whose success became the kept response of the record.
+    pub late_kept: AtomicU64,
+    /// Late calls whose success was not kept: the grant had ended, a revoke or a grant of
+    /// another key arrived, or the node was closing.
+    pub late_dropped: AtomicU64,
+    /// Late calls that ended with a refusal of the provider, a transport failure or the late
+    /// limit.
+    pub late_failed: AtomicU64,
+    /// Calls that found no place among the late calls at their time limit and ended there.
+    pub late_abandoned: AtomicU64,
 }
 
 /// The response of a successful `refresh`, kept for a repeated call with the same record. It
@@ -374,23 +483,23 @@ impl Account {
             .map(|kept| &kept.response)
     }
 
-    /// Keeps the response of a successful `refresh` that ran under `grant`. Nothing is kept
-    /// when that grant is no longer in force: a revoke that was answered while the provider
-    /// call ran leaves no kept response behind it.
+    /// Keeps the response of a successful `refresh` that ran under `grant` and returns true.
+    /// Nothing is kept, and false is returned, when that grant is no longer in force: a revoke
+    /// that was answered while the provider call ran leaves no kept response behind it.
     pub fn keep_refresh(
         &mut self,
         grant: &GrantView,
         key: [u8; 32],
         now_ms: u64,
         response: Refreshed,
-    ) {
+    ) -> bool {
         self.expire(now_ms);
         let in_force = matches!(
             &self.grant,
             GrantState::Active(active) if active.sign_pk == grant.sign_pk
         );
         if !in_force {
-            return;
+            return false;
         }
         self.kept_refreshes.retain(|kept| kept.key != key);
         while self.kept_refreshes.len() >= REFRESH_KEPT_ENTRIES {
@@ -401,6 +510,7 @@ impl Account {
             kept_ms: now_ms,
             response,
         });
+        true
     }
 
     /// Drops the kept `refresh` responses: the delegation they were made under ended.
@@ -453,6 +563,15 @@ impl Account {
             .iter()
             .filter(|entry| !entry.writing)
             .count()
+    }
+
+    /// The `pending_since_ms` of the oldest pending entry, `None` when the account has none.
+    pub fn oldest_pending_since_ms(&self) -> Option<u64> {
+        self.unconfirmed
+            .iter()
+            .filter(|entry| !entry.writing)
+            .map(|entry| entry.pending_since_ms)
+            .min()
     }
 
     /// The delegation state as `status` reports it: `active`, `none`, `revoked` or `expired`.
@@ -626,8 +745,21 @@ pub struct Node {
     pub limits: Limits,
     pub forward_slots: Semaphore,
     pub body_budget: Arc<Semaphore>,
+    /// The places of the token address calls of `refresh` that the node continues after their
+    /// time limit (enclave.md 5.7): `limits.refresh_late_tasks` of them.
+    pub late_refreshes: Arc<Semaphore>,
     /// The counts of `log` of `GET /v1/health`.
     pub log_counters: LogCounters,
+    /// The counts of `refresh` of `GET /v1/health`.
+    pub refresh_counters: RefreshCounters,
+}
+
+/// The pending entries of a node at one moment (`log_store` of health, enclave.md 5.1).
+pub struct PendingSummary {
+    /// The accounts that have a pending entry.
+    pub accounts: usize,
+    /// The age of the oldest pending entry in milliseconds of node time, 0 when there is none.
+    pub oldest_ms: u64,
 }
 
 /// Locks a mutex. A poisoned lock is used as it is: the release build aborts on a panic, so a
@@ -682,8 +814,10 @@ impl Node {
             egress,
             forward_slots: Semaphore::new(limits.forward_concurrency),
             body_budget: Arc::new(Semaphore::new(limits.body_budget_bytes)),
+            late_refreshes: Arc::new(Semaphore::new(limits.refresh_late_tasks)),
             limits,
             log_counters: LogCounters::default(),
+            refresh_counters: RefreshCounters::default(),
         })
     }
 
@@ -699,6 +833,14 @@ impl Node {
         self.limits
             .forward_concurrency
             .saturating_sub(self.forward_slots.available_permits())
+    }
+
+    /// The token address calls of `refresh` the node continues after their time limit at this
+    /// moment (enclave.md 5.7).
+    pub fn late_refreshes_inflight(&self) -> usize {
+        self.limits
+            .refresh_late_tasks
+            .saturating_sub(self.late_refreshes.available_permits())
     }
 
     /// `N` random bytes that may appear in a response: a challenge, the node part of a state,
@@ -816,9 +958,9 @@ impl Node {
         binding(&self.keys, self.release, self.log_store.id())
     }
 
-    /// The number of accounts that have a pending entry: an entry the log store has not
-    /// confirmed and no call writes at this moment.
-    pub fn pending_count(&self) -> usize {
+    /// The accounts that have a pending entry (an entry the log store has not confirmed and no
+    /// call writes at this moment), and the age of the oldest pending entry.
+    pub fn pending_summary(&self) -> PendingSummary {
         let accounts: Vec<Arc<Mutex<Account>>> = self
             .accounts
             .read()
@@ -826,10 +968,18 @@ impl Node {
             .values()
             .cloned()
             .collect();
-        accounts
-            .iter()
-            .filter(|account| lock(account).pending_entries() > 0)
-            .count()
+        let now_ms = self.now_ms();
+        let mut summary = PendingSummary {
+            accounts: 0,
+            oldest_ms: 0,
+        };
+        for account in &accounts {
+            if let Some(since_ms) = lock(account).oldest_pending_since_ms() {
+                summary.accounts += 1;
+                summary.oldest_ms = summary.oldest_ms.max(now_ms.saturating_sub(since_ms));
+            }
+        }
+        summary
     }
 
     /// The number of accounts whose open batch holds events at this moment.
@@ -1129,6 +1279,7 @@ impl Node {
                 key: log::object_key_v2(user_id, &self.node, &parts),
                 entry: signed,
                 writing: false,
+                pending_since_ms: time_ms,
             });
         }
         head.seq

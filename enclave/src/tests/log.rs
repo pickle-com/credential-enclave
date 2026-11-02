@@ -398,7 +398,7 @@ async fn events_that_arrive_during_a_write_form_the_next_entry() {
     // batch left.
     let log = harness.health().await["log"].clone();
     assert_eq!(
-        log,
+        super::seven_counts(&log),
         json!({
             "entries": 3, "events": 5, "writes": 3, "write_failures": 0, "open_batches": 0,
             "batch_calls": 0, "batch_requests": 0,

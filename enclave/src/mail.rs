@@ -5,6 +5,7 @@ use std::{
     fmt, io,
     pin::Pin,
     task::{Context, Poll},
+    time::Duration,
 };
 
 use async_imap::imap_proto::{
@@ -30,6 +31,11 @@ use crate::state::{open_for, GrantView, Limits, Node};
 /// Protocol input a verify, folder listing or search connection accepts: 4 MiB. A UID set or
 /// headers above it end the connection; the search must be narrowed.
 pub(crate) const LISTING_INPUT_BYTES: usize = 4 * 1024 * 1024;
+
+/// The end-to-end time limit of a mail call, its admission included (`api::mail`). It is also
+/// the budget of the opening of a mail connection: a failed attempt is repeated within half of
+/// it (`Egress::open_mail`).
+pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Protocol input a raw message read accepts: the body limit plus 1 MiB of protocol overhead.
 /// The returned message itself still has the body limit.
@@ -114,7 +120,7 @@ impl AppPassword {
     ) -> Result<Session<MailStream>, MailError> {
         let stream = node
             .egress
-            .open_mail(node.platform.as_ref(), "imap.naver.com", 993)
+            .open_mail(node.platform.as_ref(), "imap.naver.com", 993, CALL_TIMEOUT)
             .await
             .map_err(|_| MailError::Unavailable)?;
         let mut client = Client::new(limited(stream, response_bytes));
@@ -143,7 +149,7 @@ impl AppPassword {
     async fn smtp(&self, node: &Node) -> Result<Smtp, MailError> {
         let stream = node
             .egress
-            .open_mail(node.platform.as_ref(), "smtp.naver.com", 465)
+            .open_mail(node.platform.as_ref(), "smtp.naver.com", 465, CALL_TIMEOUT)
             .await
             .map_err(|_| MailError::Unavailable)?;
         let mut smtp = Smtp {

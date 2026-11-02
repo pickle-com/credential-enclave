@@ -110,9 +110,9 @@ pub struct LogCounts {
     pub entries: u64,
     /// P: the events in them.
     pub events: u64,
-    /// P: PUT requests sent to the log store.
+    /// P: attempts to write an entry to the log store (PUT requests), confirmed or not.
     pub writes: u64,
-    /// P: those that were not confirmed.
+    /// P: entries the store did not confirm within the budget of their attempts.
     pub write_failures: u64,
     /// P: accounts whose open batch holds events at this moment.
     pub open_batches: usize,
@@ -120,6 +120,127 @@ pub struct LogCounts {
     pub batch_calls: u64,
     /// P: the requests in them.
     pub batch_requests: u64,
+    /// P: the attempts the store did not confirm, by cause.
+    pub write_attempt_failures: WriteAttemptFailureCounts,
+    /// P: attempts that followed an attempt the store did not confirm.
+    pub write_retries: u64,
+    /// P: the confirmed attempts by their time to confirmation, cumulative.
+    pub write_ms_buckets: WriteMsBuckets,
+    /// P: the sum of the times to confirmation of the confirmed attempts, in milliseconds.
+    pub write_ms_sum: u64,
+    /// P: the confirmed attempts.
+    pub write_count: u64,
+}
+
+/// `write_attempt_failures` of `log` of health: the keys are the causes of
+/// `crate::log_store::WriteFailure`, constants of the source.
+#[derive(Serialize)]
+pub struct WriteAttemptFailureCounts {
+    /// P
+    pub connect: u64,
+    /// P
+    pub tls: u64,
+    /// P
+    pub closed: u64,
+    /// P
+    pub timeout: u64,
+    /// P
+    pub status_4xx: u64,
+    /// P
+    pub status_5xx: u64,
+}
+
+/// `write_ms_buckets` of `log` of health: the confirmed attempts whose time to confirmation
+/// was at most the milliseconds of the key (`crate::state::WRITE_MS_BOUNDS`). The counts are
+/// cumulative: every attempt counted under a key is counted under every larger key as well.
+#[derive(Serialize)]
+pub struct WriteMsBuckets {
+    /// P
+    #[serde(rename = "25")]
+    pub le_25: u64,
+    /// P
+    #[serde(rename = "50")]
+    pub le_50: u64,
+    /// P
+    #[serde(rename = "100")]
+    pub le_100: u64,
+    /// P
+    #[serde(rename = "250")]
+    pub le_250: u64,
+    /// P
+    #[serde(rename = "500")]
+    pub le_500: u64,
+    /// P
+    #[serde(rename = "1000")]
+    pub le_1000: u64,
+    /// P
+    #[serde(rename = "2500")]
+    pub le_2500: u64,
+    /// P
+    #[serde(rename = "5000")]
+    pub le_5000: u64,
+}
+
+/// `egress` of `GET /v1/health`: the outbound connections since the node started, and those
+/// being opened at this moment (enclave.md 5.1).
+#[derive(Serialize)]
+pub struct EgressCounts {
+    /// P: connections that were opened.
+    pub opens: u64,
+    /// P: attempts to open a connection that failed, by cause.
+    pub open_failures: OpenFailureCounts,
+    /// P: attempts that followed a failed attempt.
+    pub open_retries: u64,
+    /// P: a count, the connections being opened at this moment.
+    pub open_inflight: usize,
+    /// P: requests that went over an idle connection, by peer.
+    pub idle_reuses: IdleReuseCounts,
+}
+
+/// `open_failures` of `egress` of health: the keys are the causes of
+/// `crate::egress::OpenError`, constants of the source.
+#[derive(Serialize)]
+pub struct OpenFailureCounts {
+    /// P
+    pub transport: u64,
+    /// P
+    pub relay_refused: u64,
+    /// P
+    pub tls: u64,
+    /// P
+    pub http: u64,
+}
+
+/// `idle_reuses` of `egress` of health.
+#[derive(Serialize)]
+pub struct IdleReuseCounts {
+    /// P: requests to a provider over an idle connection of their account and host.
+    pub provider: u64,
+    /// P: writes to the log store over an idle connection to it.
+    pub log_store: u64,
+}
+
+/// `refresh` of `GET /v1/health`: the token address calls of `refresh` that the node continued
+/// after their time limit (enclave.md 5.7).
+#[derive(Serialize)]
+pub struct RefreshCounts {
+    /// P: the outcomes of the late calls since the node started.
+    pub late: LateRefreshCounts,
+    /// P: a count, the late calls in progress at this moment.
+    pub late_inflight: usize,
+}
+
+/// `late` of `refresh` of health.
+#[derive(Serialize)]
+pub struct LateRefreshCounts {
+    /// P: late successes that became the kept response of their record.
+    pub kept: u64,
+    /// P: late successes that were not kept (the grant had ended or the node was closing).
+    pub dropped: u64,
+    /// P: late calls that ended with a refusal, a transport failure or the late limit.
+    pub failed: u64,
+    /// P: calls that found no place among the late calls and ended at their time limit.
+    pub abandoned: u64,
 }
 
 /// `load` of `GET /v1/health`: the load of the node at the moment of the call.
@@ -175,6 +296,10 @@ pub struct Health<'a> {
     pub log: LogCounts,
     /// P: the load of the node.
     pub load: Load,
+    /// P: the outbound connections of the node.
+    pub egress: EgressCounts,
+    /// P: the late token address calls of `refresh`.
+    pub refresh: RefreshCounts,
 }
 
 /// `log_store` of `GET /v1/health`.
@@ -188,6 +313,9 @@ pub struct LogStoreState<'a> {
     pub credentials_expires_ms: u64,
     /// P: a count, the accounts that have a pending entry.
     pub pending: usize,
+    /// P: node clock, the age of the oldest pending entry in milliseconds, 0 when there is
+    /// none.
+    pub pending_oldest_ms: u64,
 }
 
 /// `POST /v1/config`.

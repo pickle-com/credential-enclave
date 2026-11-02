@@ -50,8 +50,6 @@ use crate::providers::{
 };
 use crate::state::{open_for, GrantView, Node};
 
-/// Time limit of a token address call.
-pub const TOKEN_TIMEOUT: Duration = Duration::from_secs(15);
 /// Time limit of a revocation address call.
 pub const REVOKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Longest token response a node reads: 1 MiB.
@@ -853,26 +851,44 @@ pub struct TokenFailure {
     pub error: ProviderError,
 }
 
-/// The error word of a provider response (enclave.md 5.7): when the response is a JSON object,
-/// a string `error`; when `error` is an object, its string `code`, else its string `message`;
-/// without a usable `error`, the top-level string `code`. That string is mapped to the closed
-/// vocabulary of [`ProviderError`].
+/// The error word of a provider response (enclave.md 5.7). The candidates are the error
+/// strings of the response, in this order: when the response is a JSON object, a string
+/// `error`; for an object `error` its string `code` and then its string `message`; and, when
+/// none of those is a non-empty string, the top-level string `code`. Each candidate is
+/// compared with the closed vocabulary of [`ProviderError`]: the word is the first candidate
+/// that is in it, `other` when there were candidates but none is in it, and the empty word
+/// when there was none.
 fn provider_error(response: &Value) -> ProviderError {
     let Some(object) = response.as_object() else {
         return ProviderError::NONE;
     };
-    let mut code = match object.get("error") {
-        Some(Value::String(text)) => Some(text.as_str()),
-        Some(Value::Object(nested)) => match nested.get("code").and_then(Value::as_str) {
-            Some(text) if !text.is_empty() => Some(text),
-            _ => nested.get("message").and_then(Value::as_str),
-        },
-        _ => None,
-    };
-    if code.is_none_or(str::is_empty) {
-        code = object.get("code").and_then(Value::as_str);
+    let mut candidates: Vec<&str> = Vec::with_capacity(3);
+    match object.get("error") {
+        Some(Value::String(text)) => candidates.push(text),
+        Some(Value::Object(nested)) => candidates.extend(
+            ["code", "message"]
+                .iter()
+                .filter_map(|key| nested.get(*key).and_then(Value::as_str)),
+        ),
+        _ => {}
     }
-    ProviderError::of(code.unwrap_or_default())
+    candidates.retain(|text| !text.is_empty());
+    if candidates.is_empty() {
+        candidates.extend(
+            object
+                .get("code")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty()),
+        );
+    }
+    if candidates.is_empty() {
+        return ProviderError::NONE;
+    }
+    candidates
+        .iter()
+        .map(|text| ProviderError::of(text))
+        .find(|word| *word != ProviderError::OTHER)
+        .unwrap_or(ProviderError::OTHER)
 }
 
 /// The object that holds the tokens: the `token_container` object when the definition names
@@ -930,7 +946,11 @@ fn inject_token<'a>(rule: &Inject, token: &'a Map<String, Value>) -> Option<&'a 
 /// JSON object, a passed `ok_field` check and an `access_token` string in the token place.
 ///
 /// The response body is a secret from the moment it was read. Of a refused call, only the
-/// status and the error word leave this function.
+/// status and the error word leave this function. The time limit of the call is the caller's:
+/// `oauth/complete` bounds the call with the time limit of a token address call
+/// (`Limits::token_timeout`), and `refresh` runs it on a task of its own that it waits for
+/// that long and lets go on until the late limit (enclave.md 5.7). The opening of the
+/// connection takes the time limit of a token address call as the budget of its attempts.
 pub async fn call_token_address(
     node: &Node,
     definition: &Definition,
@@ -940,25 +960,23 @@ pub async fn call_token_address(
         status: 0,
         error: ProviderError::NONE,
     };
-    let exchange = tokio::time::timeout(TOKEN_TIMEOUT, async {
-        let exchange = node
-            .egress
-            .send_to_provider(node.platform.as_ref(), None, request, node.now_ms())
-            .await
-            .map_err(|_| transport)?;
-        let status = exchange.status;
-        let body = exchange
-            .read_body(TOKEN_RESPONSE_LIMIT_BYTES)
-            .await
-            .map(Secret::new)
-            .map_err(|_| transport)?;
-        Ok::<_, TokenFailure>((status, body))
-    })
-    .await;
-    let (status, body) = match exchange {
-        Ok(outcome) => outcome?,
-        Err(_) => return Err(transport),
-    };
+    let exchange = node
+        .egress
+        .send_to_provider(
+            node.platform.as_ref(),
+            None,
+            request,
+            node.now_ms(),
+            node.limits.token_timeout,
+        )
+        .await
+        .map_err(|_| transport)?;
+    let status = exchange.status;
+    let body = exchange
+        .read_body(TOKEN_RESPONSE_LIMIT_BYTES)
+        .await
+        .map(Secret::new)
+        .map_err(|_| transport)?;
     judge_token_response(definition, status, &body)
 }
 
@@ -1597,6 +1615,20 @@ pub mod tests {
         assert_eq!(
             word(json!({"ok": false, "error": "invalid_auth"})),
             "invalid_auth"
+        );
+        // For an object `error`, `code` and then `message` are compared: the first that is in
+        // the list is the word, and a listed message counts when the code is not listed.
+        assert_eq!(
+            word(json!({"error": {"code": "unknown_code", "message": "refresh_token not found"}})),
+            "refresh_token not found"
+        );
+        assert_eq!(
+            word(json!({"error": {"code": "invalid_grant", "message": "anything"}})),
+            "invalid_grant"
+        );
+        assert_eq!(
+            word(json!({"error": {"code": "x", "message": "y"}})),
+            "other"
         );
         // A string that is not in the list leaves as `other`, whatever it holds.
         assert_eq!(

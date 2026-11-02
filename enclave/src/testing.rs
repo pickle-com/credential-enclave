@@ -43,7 +43,7 @@ use crate::egress::Egress;
 use crate::frame;
 use crate::lineage::{Lineage, LOG_KEY_PEM, RELEASE_KEY_PEM};
 use crate::platform::local::{kernel_random, local_document, system_time_ms};
-use crate::platform::{Listener, Measurement, Platform, PlatformError, Stream};
+use crate::platform::{ConnectError, Listener, Measurement, Platform, PlatformError, Stream};
 use crate::providers::Definitions;
 use crate::state::{lock, Limits, Node};
 
@@ -65,6 +65,11 @@ pub struct TestPlatform {
     draws: Mutex<std::collections::VecDeque<Vec<u8>>>,
     /// The host and the port of every provider connection the node asked for.
     connections: Mutex<Vec<(String, u16)>>,
+    /// Connections the platform still refuses: the next this many calls of `connect` fail
+    /// with a transport failure, after the pause, before anything is opened.
+    refusals: Mutex<usize>,
+    /// A pause before every connection is opened or refused.
+    connect_pause: Mutex<Duration>,
 }
 
 impl TestPlatform {
@@ -102,6 +107,17 @@ impl TestPlatform {
     /// sees these destinations.
     pub fn connections(&self) -> Vec<(String, u16)> {
         lock(&self.connections).clone()
+    }
+
+    /// Makes the next `count` calls of `connect` fail with a transport failure, as when the
+    /// egress relay of the parent or the network refuses the connection.
+    pub fn refuse_connections(&self, count: usize) {
+        *lock(&self.refusals) = count;
+    }
+
+    /// Makes every connection take `pause` to open, or to be refused.
+    pub fn pause_connections(&self, pause: Duration) {
+        *lock(&self.connect_pause) = pause;
     }
 }
 
@@ -150,15 +166,28 @@ impl Platform for TestPlatform {
             .map_err(|_| PlatformError("cannot listen"))
     }
 
-    async fn connect(&self, host: &str, port: u16) -> Result<Stream, PlatformError> {
+    async fn connect(&self, host: &str, port: u16) -> Result<Stream, ConnectError> {
         lock(&self.connections).push((host.to_string(), port));
+        let pause = *lock(&self.connect_pause);
+        if !pause.is_zero() {
+            tokio::time::sleep(pause).await;
+        }
+        {
+            let mut refusals = lock(&self.refusals);
+            if *refusals > 0 {
+                *refusals -= 1;
+                return Err(ConnectError::Transport(
+                    "the test platform refused the connection",
+                ));
+            }
+        }
         let plain = lock(&self.plain_routes)
             .get(&(host.to_string(), port))
             .copied();
         if let Some(address) = plain {
-            let stream = TcpStream::connect(address)
-                .await
-                .map_err(|_| PlatformError("the plain stand-in refused the connection"))?;
+            let stream = TcpStream::connect(address).await.map_err(|_| {
+                ConnectError::Transport("the plain stand-in refused the connection")
+            })?;
             return Ok(Box::new(stream));
         }
         if port != 443
@@ -167,15 +196,17 @@ impl Platform for TestPlatform {
                 ("imap.naver.com", 993) | ("smtp.naver.com", 465)
             )
         {
-            return Err(PlatformError("not a provider protocol destination"));
+            return Err(ConnectError::Transport(
+                "not a provider protocol destination",
+            ));
         }
         let address = lock(&self.routes)
             .get(host)
             .copied()
-            .ok_or(PlatformError("no stand-in for this host"))?;
+            .ok_or(ConnectError::Transport("no stand-in for this host"))?;
         let stream = TcpStream::connect(address)
             .await
-            .map_err(|_| PlatformError("the stand-in refused the connection"))?;
+            .map_err(|_| ConnectError::Transport("the stand-in refused the connection"))?;
         Ok(Box::new(stream))
     }
 }
@@ -803,7 +834,8 @@ impl Harness {
         let platform = Arc::new(platform);
         provider.route(&platform);
         let clock = Arc::new(Clock::start(platform.as_ref()).unwrap());
-        let egress = Egress::with_test_roots(clock.clone(), provider.roots());
+        let egress =
+            Egress::with_test_roots(clock.clone(), provider.roots(), limits.open_concurrency);
         let node = Arc::new(
             Node::start(
                 platform.clone(),
@@ -837,7 +869,7 @@ impl Harness {
         let clock = Arc::new(Clock::start(platform.as_ref()).unwrap());
         let mut roots = provider.roots();
         roots.roots.extend(extra_roots.roots);
-        let egress = Egress::with_test_roots(clock.clone(), roots);
+        let egress = Egress::with_test_roots(clock.clone(), roots, limits.open_concurrency);
         let node = Arc::new(
             Node::start(
                 platform.clone(),

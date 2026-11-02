@@ -97,14 +97,15 @@ async fn terminated() {
 async fn run(platform_name: &str) -> Result<(), PlatformError> {
     let platform = platform::select(platform_name)?;
     let clock = Arc::new(Clock::start(platform.as_ref())?);
+    let limits = Limits::default();
     let node = Arc::new(Node::start(
         platform.clone(),
         clock.clone(),
         Definitions::embedded(),
-        Egress::new(clock.clone()),
+        Egress::new(clock.clone(), limits.open_concurrency),
         RELEASE,
         Lineage::embedded(RELEASE)?,
-        Limits::default(),
+        limits,
     )?);
     let listener = platform.listen().await?;
     tokio::spawn(keep_calibrating(platform, clock));

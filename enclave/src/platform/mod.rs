@@ -33,6 +33,22 @@ impl std::fmt::Display for PlatformError {
 
 impl std::error::Error for PlatformError {}
 
+/// Why the platform could not open a byte pipe to a provider or to the log store. Each variant
+/// carries a fixed string of the source: it never carries key material, request bodies or
+/// addresses. The two kinds are counted apart by `egress` of `GET /v1/health` (enclave.md
+/// 5.1), and both are repeated by the node before any request byte left it (enclave.md 5.14).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectError {
+    /// The pipe itself could not be opened: on nitro the vsock connection to the egress relay
+    /// of the parent, on local the TCP connection to the host.
+    Transport(&'static str),
+    /// The egress relay of the parent took the connection and did not answer the `CONNECT`
+    /// line with `OK`. The nitro platform, which is compiled on Linux only, is the one that
+    /// creates it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    RelayRefused(&'static str),
+}
+
 /// The measurement of an enclave image: PCR0, PCR1 and PCR2 of its attestation documents. Two
 /// enclaves with the same measurement run the same program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,12 +116,12 @@ pub trait Platform: Send + Sync + 'static {
     fn trusted_time_ms(&self) -> Result<u64, PlatformError>;
     /// Opens the listener for backend calls.
     fn listen(&self) -> impl Future<Output = Result<Listener, PlatformError>> + Send;
-    /// Opens a byte pipe to `host:port` of a provider.
+    /// Opens a byte pipe to `host:port` of a provider or of the log store.
     fn connect(
         &self,
         host: &str,
         port: u16,
-    ) -> impl Future<Output = Result<Stream, PlatformError>> + Send;
+    ) -> impl Future<Output = Result<Stream, ConnectError>> + Send;
 }
 
 /// A boxed future, for the object-safe form of [`Platform`].
@@ -125,7 +141,7 @@ pub trait DynPlatform: Send + Sync + 'static {
         &'a self,
         host: &'a str,
         port: u16,
-    ) -> BoxFuture<'a, Result<Stream, PlatformError>>;
+    ) -> BoxFuture<'a, Result<Stream, ConnectError>>;
 }
 
 impl<P: Platform> DynPlatform for P {
@@ -161,7 +177,7 @@ impl<P: Platform> DynPlatform for P {
         &'a self,
         host: &'a str,
         port: u16,
-    ) -> BoxFuture<'a, Result<Stream, PlatformError>> {
+    ) -> BoxFuture<'a, Result<Stream, ConnectError>> {
         Box::pin(Platform::connect(self, host, port))
     }
 }
