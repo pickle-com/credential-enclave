@@ -27,6 +27,7 @@ mod platform;
 mod provider_response;
 mod providers;
 mod state;
+mod subset;
 #[cfg(test)]
 mod testing;
 #[cfg(test)]

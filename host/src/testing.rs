@@ -105,10 +105,13 @@ pub const EGRESS_OBJECT: &str = r#"{"opens":100,"open_failures":{"transport":1,"
 pub const REFRESH_OBJECT: &str =
     r#"{"late":{"kept":1,"dropped":2,"failed":3,"abandoned":4},"late_inflight":5}"#;
 
+/// The `state` object of [`health_body_with_egress_and_refresh`].
+pub const STATE_OBJECT: &str = r#"{"kept_refreshes":11,"merge_keys":22,"pending_entries":33,"idle_connections":{"provider":44,"log_store":55}}"#;
+
 /// The `health` body of a node of release v2.1.0 with the given values:
 /// [`health_body_with_load`] with the `log_store` object [`LOG_STORE_OBJECT`] in place of null,
 /// the write counts [`LOG_WRITE_COUNTS`] at the end of the `log` object, and the objects
-/// [`EGRESS_OBJECT`] and [`REFRESH_OBJECT`] after the `load` object.
+/// [`EGRESS_OBJECT`], [`REFRESH_OBJECT`] and [`STATE_OBJECT`] after the `load` object.
 pub fn health_body_with_egress_and_refresh(
     configured: bool,
     accounts: u64,
@@ -121,7 +124,9 @@ pub fn health_body_with_egress_and_refresh(
         started_ms,
         LOG_STORE_OBJECT,
         LOG_WRITE_COUNTS,
-        &format!(r#","load":{LOAD_OBJECT},"egress":{EGRESS_OBJECT},"refresh":{REFRESH_OBJECT}"#),
+        &format!(
+            r#","load":{LOAD_OBJECT},"egress":{EGRESS_OBJECT},"refresh":{REFRESH_OBJECT},"state":{STATE_OBJECT}"#
+        ),
     )
 }
 

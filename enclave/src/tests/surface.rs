@@ -46,13 +46,16 @@ async fn health_reports_the_node_in_the_key_order_of_5_1() {
     assert!(text.starts_with(&prefix), "{text}");
     // The five values of the kernel follow. They depend on the machine that runs the test:
     // numbers from the procfs of a Linux kernel, null on another kernel. The counts of the
-    // outbound connections and of the late token address calls end the body.
+    // outbound connections, of the late token address calls and of the state of the accounts
+    // end the body.
     let suffix = concat!(
         "},\"egress\":{\"opens\":0,\"open_failures\":{\"transport\":0,\"relay_refused\":0,",
         "\"tls\":0,\"http\":0},\"open_retries\":0,\"open_inflight\":0,",
         "\"idle_reuses\":{\"provider\":0,\"log_store\":0}},",
         "\"refresh\":{\"late\":{\"kept\":0,\"dropped\":0,\"failed\":0,\"abandoned\":0},",
-        "\"late_inflight\":0}}"
+        "\"late_inflight\":0},",
+        "\"state\":{\"kept_refreshes\":0,\"merge_keys\":0,\"pending_entries\":0,",
+        "\"idle_connections\":{\"provider\":0,\"log_store\":0}}}"
     );
     assert!(text.ends_with(suffix), "{text}");
     let load = health["load"].as_object().unwrap();
@@ -118,6 +121,13 @@ async fn health_reports_the_node_in_the_key_order_of_5_1() {
         json!({
             "late": {"kept": 0, "dropped": 0, "failed": 0, "abandoned": 0},
             "late_inflight": 0,
+        })
+    );
+    assert_eq!(
+        health["state"],
+        json!({
+            "kept_refreshes": 0, "merge_keys": 0, "pending_entries": 0,
+            "idle_connections": {"provider": 0, "log_store": 0},
         })
     );
 }
@@ -423,6 +433,7 @@ async fn the_router_serves_the_calls_of_the_route_list_and_no_other() {
             "POST /v1/close/heads",
             "POST /v1/peer/export",
             "POST /v1/peer/import",
+            "POST /v1/grants/prune",
             "POST /v1/log-store/credentials",
         ]
     );

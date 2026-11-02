@@ -388,7 +388,7 @@ async fn a_pending_authorization_is_bound_to_its_state_user_key_and_time() {
     {
         let account = harness.node.account("user-1").unwrap();
         let mut account = lock(&account);
-        let GrantState::Active(grant) = &account.grant else {
+        let GrantState::Active(grant) = account.grant() else {
             panic!("user-1 has a grant");
         };
         let colliding = ActiveGrant {
@@ -400,7 +400,7 @@ async fn a_pending_authorization_is_bound_to_its_state_user_key_and_time() {
             not_after_ms: grant.not_after_ms,
             exported_to: Vec::new(),
         };
-        account.grant = GrantState::Active(colliding);
+        account.set_grant(GrantState::Active(colliding));
     }
     assert_eq!(
         code(&complete(&harness, "user-1", &state).await),

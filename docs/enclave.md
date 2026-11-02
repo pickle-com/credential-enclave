@@ -46,11 +46,12 @@ credential-enclave/
 │   ├── src/platform/mod.rs       # trait Platform (section 2)
 │   ├── src/platform/nitro.rs     # NSM attestation, vsock listener, vsock egress
 │   ├── src/platform/local.rs     # unsigned document, TCP listener, direct egress
-│   ├── src/state.rs              # the state of a node (section 3), the events of the log
+│   ├── src/state.rs              # the state of a node (section 3), the counts of health, the events of the log
+│   ├── src/subset.rs             # the delegation subset: which accounts a node holds (protocol.md 10.4)
 │   ├── src/clock.rs              # node time (section 8)
 │   ├── src/api/mod.rs            # the router, the failure responses
 │   ├── src/api/responses.rs      # every response type (rule E3 of the egress policy)
-│   ├── src/api/{health,config,attestation,messages,status,oauth,refresh,revoke,forward,forward_batch,release,close,peer,log_store}.rs
+│   ├── src/api/{health,config,attestation,messages,status,oauth,refresh,revoke,forward,forward_batch,release,close,peer,grants,log_store}.rs
 │   ├── src/attest.rs             # which peer a node accepts (same platform; same measurement, a later release with an endorsement, a predecessor)
 │   ├── src/lineage.rs            # the release key, the log key and the list of predecessors of the program (5.13)
 │   ├── src/load.rs               # the CPU time and the memory of the kernel, from procfs, for `load` of health (5.1)
@@ -196,8 +197,10 @@ struct Node {
     refresh_counters: RefreshCounters,  // { late_kept, late_dropped, late_failed, late_abandoned }: the counts of `refresh` of health (5.1)
     challenges: Mutex<Expiring<[u8; 16], u64>>,         // the issued challenges, each with its serial. Removed after 300 seconds or on use. At most 100,000
     serials: AtomicU64,                                 // the next serial: one count for the challenges the node issues and the revoke commands it accepts. It starts at 1 and only grows
-    accounts: RwLock<HashMap<String, Arc<Mutex<Account>>>>,  // user_id -> the state of the account. One lock per account
+    accounts: RwLock<BTreeMap<String, Arc<Mutex<Account>>>>,  // user_id -> the state of the account, in the order of user_id: a page of accounts after a user_id is a range of the map. One lock per account
     pending: Mutex<Expiring<String, PendingAuth>>,      // node_state -> the pending authorization (600 seconds, used once). At most 100,000
+    chains: AtomicUsize,                                // the accounts that have a chain: `accounts` of health (5.1)
+    counters: Arc<StateCounters>,                       // { grants, pending_accounts, pending_entries, kept_refreshes, merge_keys, open_batches, pending_oldest_since_ms }: the counts of health kept by the methods of Account (5.1)
     // and: the platform, the clock, the provider definitions, the TLS client (with the idle connections to the providers, 5.8, the bound of connections being opened and the counts of `egress` of health, 5.1), the limits of section 8
 }
 struct Account {
@@ -206,10 +209,11 @@ struct Account {
     open: OpenBatch,                 // the use events whose entry does not exist yet: { events: Vec<Value>, bytes, seq: Arc<OnceLock<u64>> (the cell that receives the seq of the entry when the batch is closed), key_id, log_pk }
     writer: bool,                    // true while a call of this account writes to the log store (the writer of the group commit, protocol.md 7.1)
     notify: Arc<Notify>,             // woken when a write of this account ended: the waiting calls look at their entries again
-    unconfirmed: Vec<Unconfirmed>,   // the entries the log store has not confirmed: { seq, key, entry, writing, pending_since_ms }. Empty on a node without a log store (5.14)
+    unconfirmed: Vec<Unconfirmed>,   // the entries the log store has not confirmed: { seq, key, entry, writing, pending_since_ms, prev_hash, outcome_unknown }. Empty on a node without a log store (5.14)
     recent: HashMap<[u8; 32], Recent>,  // merge key -> { entry_ms, target: EventPlace } of its event. Removed after 300 seconds (the GET requests of forward that have no body)
     final_head: Option<Signed>,      // the final head that the orderly shutdown created (5.11)
     kept_refreshes: VecDeque<KeptRefresh>,  // the responses of the successful refresh calls of the last 3,600 seconds, at most 16 (5.7)
+    counters: Arc<StateCounters>,    // the counts of the node: the methods that change grant, unconfirmed, recent, kept_refreshes and open move them
     last_entry_ms: u64,              // the time_ms of the last entry of the chain (section 8)
     last_event_ms: u64,              // the time_ms of the last event created (section 8)
     revoked_here: bool,              // true once this node accepted a revoke command of the account (protocol.md 10.1)
@@ -226,11 +230,23 @@ struct Credentials { access_key_id: String, secret_access_key: Secret<String>, s
 - A node writes nothing to disk. Nodes share no state. The one exchange between nodes is the
   delegation transfer (5.13). The witnessing of stage 2 is in section 10.
 - A grant whose time has passed: every place that reads the state of an account (a call that uses
-  a credential, a command, `status`) first checks `now >= not_after_ms`. When that is true, the
-  node erases the user key and changes the state to `Expired { key_id, not_after_ms }`, and judges
-  after that. A call that uses a credential refuses `Expired` with `grant_expired`. There is no
-  case in which an `Active` state holds a user key that is overwritten with zeros (protocol.md
-  5.4).
+  a credential, a command, `status`, the sweep of the node) first checks `now >= not_after_ms`.
+  When that is true, the node erases the user key and changes the state to
+  `Expired { key_id, not_after_ms }`, and judges after that. A call that uses a credential refuses
+  `Expired` with `grant_expired`. There is no case in which an `Active` state holds a user key
+  that is overwritten with zeros (protocol.md 5.4). `grants/prune` (5.15) changes the state of an
+  account outside the share of the node from `Active` or `Expired` to `None` and erases the user
+  key the same way.
+- The counts of health (5.1) are kept with the state they count: `grants` (the accounts whose
+  state is `Active`), `pending` of `log_store` (the accounts whose `unconfirmed` is not empty),
+  `open_batches` of `log` (the accounts whose open batch holds events) and the three counts of
+  `state` (the entries of `unconfirmed`, the elements of `kept_refreshes` and the keys of `recent`
+  over every account) are atomic integers of the node that the methods of `Account` move when
+  they change the state (`set_grant`, `expire`, `drop_grant`, the methods of the kept responses,
+  of the merge keys and of the unconfirmed entries, and the creation and the close of a batch).
+  A health call reads the integers and locks no account. `grants` counts a grant whose time
+  passed until the first read of the account or the sweep ends it: at most one sweep interval
+  after its end.
 - `exported_to` of an `Active` grant is the list of the nodes that the grant was handed to with
   `peer/export`: the signing public key of each and the `seq` of the entry
   `grant_transferred_out` that names it, at most 64 (protocol.md 10.1). A grant command, a
@@ -251,28 +267,43 @@ struct Credentials { access_key_id: String, secret_access_key: Secret<String>, s
   for every entry that holds one of its events. A writer whose call ends before its write does
   (the caller closed the connection) is no longer the writer: the account has no writer until the
   next call, and its entries are pending entries.
-- The sweep of the node: a task that runs every 30 seconds (`log_store::keep_sweeping`) visits
-  every account, in an order the random source of the platform shuffles, drops the merge keys
-  whose window of 300 seconds passed (`recent`), and writes the pending entries of the account
-  again with the rules of a write (at most 32 at the same time, over the idle connections). It
-  writes the pending entries of an account only when the oldest of them has been pending for
-  longer than a jitter it draws for that account in `[0, 30 seconds)`; otherwise they wait for
-  the next sweep. Over the whole node it writes at most 64 entries per second (`sweep_write_rate`
-  of section 8: a token bucket with a burst of one second), and it ends when the next sweep is
-  due, so the accounts it did not reach wait for that sweep. Without the sweep, a pending entry
-  of an account that makes no further call would stay out of the store for as long as the
-  account is idle, and a reader of the store would take that gap for an omission; and the merge
-  keys of an idle account would stay in memory until its next call. The random order, the jitter
-  and the rate spread the writes of the accounts whose entries became pending at one moment (an
-  outage of the store) over two sweeps and keep the recovery from more than doubling the live
-  load on the store. The sweep ends when the orderly shutdown starts.
-- `unconfirmed` of an account holds the entries that the log store has not confirmed. `writing`
-  is true while a call writes the entry. `pending_since_ms` is the node time at which the entry
-  was created: the age of the oldest pending entry of the node is `pending_oldest_ms` of
-  `log_store` of health (5.1). An entry of this list that no call writes is a pending entry
-  (protocol.md 7.6). A call takes the entries it writes out of the pending state inside the lock
-  of the account and puts back the ones the store did not confirm, also when the call ends
-  before its writes do (the caller closed the connection).
+- The sweep of the node: a task that runs every 30 seconds (`log_store::keep_sweeping`) in three
+  passes. The first pass visits every account once, in the order of the sorted index and one
+  chunk of 1,000 accounts of the index at a time (the index is locked for one chunk, not for the
+  walk): it ends a grant whose time passed, drops the merge keys whose window of 300 seconds
+  passed (`recent`) and the kept `refresh` responses whose 3,600 seconds passed, and collects
+  the accounts that have a pending entry. The second pass visits the collected accounts in an
+  order the random source of the platform shuffles and writes the pending entries of each again
+  with the rules of a write (at most 32 at the same time, over the idle connections). It writes
+  the pending entries of an account only when the oldest of them has been pending for longer
+  than a jitter it draws for that account in `[0, 30 seconds)`; otherwise they wait for the next
+  sweep. Over the whole node it writes at most 64 entries per second (`sweep_write_rate` of
+  section 8: a token bucket with a burst of one second), and the pass ends when the next sweep
+  is due, so the accounts it did not reach wait for that sweep. The third pass reads the oldest
+  pending entry of the collected accounts again and keeps its `pending_since_ms` in the counts
+  of the node (0 when none is left): `pending_oldest_ms` of health is computed from that value
+  until the next sweep. Without the sweep, a pending entry of an account that makes no further
+  call would stay out of the store for as long as the account is idle, and a reader of the store
+  would take that gap for an omission; the merge keys and the kept responses of an idle account
+  would stay in memory until its next call; and the user key of an idle account whose grant ended
+  would stay until its next call. The random order, the jitter and the rate spread the writes of
+  the accounts whose entries became pending at one moment (an outage of the store) over two
+  sweeps and keep the recovery from more than doubling the live load on the store. The sweep
+  ends when the orderly shutdown starts.
+- `unconfirmed` of an account holds the entries that the log store has not confirmed, in the
+  order of their `seq`. `writing` is true while a call writes the entry. `pending_since_ms` is
+  the node time at which the entry was created: the age of the oldest pending entry of the node,
+  as the last sweep found it, is `pending_oldest_ms` of `log_store` of health (5.1). `prev_hash`
+  is the hash of the end of the chain before the entry (the `prev` of its body): the orderly
+  shutdown ends a chain whose last entries are unconfirmed at that point (5.11). `outcome_unknown`
+  is true once an attempt to write the entry ended with the connection closed without a response
+  or passed its time limit after the request may have been sent (5.14): the store may hold the
+  object, and the orderly shutdown does not drop such an entry; it does not go back to false
+  while the entry is unconfirmed. An entry of this list that no call writes is a pending entry
+  (protocol.md 7.6). A call takes the entries
+  it writes out of the pending state inside the lock of the account and puts back the ones the
+  store did not confirm, also when the call ends before its writes do (the caller closed the
+  connection).
 - The merge key of `forward` is
   `SHA-256(the 16 bytes of the record id || host || "\n" || path || "\n" || query)`. The
   separators keep different addresses from having the same key. The key holds no body: a GET
@@ -367,7 +398,8 @@ GET /v1/health -> {"node":"...","release":"v2.1.0","platform":"nitro","custody":
                           "write_ms_buckets":{"25":0,"50":0,"100":0,"250":0,"500":0,"1000":0,"2500":0,"5000":0},"write_ms_sum":0,"write_count":0},
                    "load":{"provider_inflight":0,"forward_calls":0,"cpu_user_ms":0|null,"cpu_system_ms":0|null,"cpu_idle_ms":0|null,"memory_total_bytes":0|null,"memory_available_bytes":0|null},
                    "egress":{"opens":0,"open_failures":{"transport":0,"relay_refused":0,"tls":0,"http":0},"open_retries":0,"open_inflight":0,"idle_reuses":{"provider":0,"log_store":0}},
-                   "refresh":{"late":{"kept":0,"dropped":0,"failed":0,"abandoned":0},"late_inflight":0}}
+                   "refresh":{"late":{"kept":0,"dropped":0,"failed":0,"abandoned":0},"late_inflight":0},
+                   "state":{"kept_refreshes":0,"merge_keys":0,"pending_entries":0,"idle_connections":{"provider":0,"log_store":0}}}
 POST /v1/config {"providers":{"google_workspace":{"client_id":"...","client_secret":"...","redirect_uri":"https://.../api/integrations/google_workspace/oauth/callback","publishable_key":""}, ...},
                  "log_store":{"bucket":"...","region":"...","endpoint":"http://host:port"}}
              -> {"configured":true}
@@ -375,12 +407,27 @@ POST /v1/config {"providers":{"google_workspace":{"client_id":"...","client_secr
 
 - `accounts` of `health` is the number of accounts that have a chain (a `seq` of at least 1).
   `grants` is the number of accounts that have a grant within its time (the operator domain reads
-  this value to see that a delegation transfer arrived).
+  this value to see that a delegation transfer arrived). Both are counts the node keeps with the
+  state (section 3): a health call locks no account, and its time does not grow with the number
+  of accounts. A grant whose time passed is counted until the first read of the account or the
+  sweep ends it, at most one sweep interval (30 seconds) after its end.
 - `log_store` of `health` is null on a node without a log store. Otherwise it names the bucket
   and its region, the end of the credentials the node holds (`credentials_expires_ms`, 0 when it
-  holds none), the number of accounts that have a pending entry (`pending`) and the age of the
-  oldest pending entry in milliseconds of node time (`pending_oldest_ms`, 0 when there is none).
-  The endpoint of a node of the local platform is not reported.
+  holds none), the number of accounts that have an entry the store has not confirmed
+  (`pending`, a count kept with the state) and the age of the oldest pending entry in
+  milliseconds of node time (`pending_oldest_ms`). The age is computed from the oldest pending
+  entry the last sweep of the node found (section 3): it grows with the node time until the next
+  sweep, it is 0 when that sweep found no pending entry or no sweep ran yet, and the set of
+  entries it stands for is up to 30 seconds old. The endpoint of a node of the local platform is
+  not reported.
+- `state` of `health`: the sizes of the variable state of the accounts at the moment of the
+  call, each a count kept with the state (section 3). `kept_refreshes` is the number of kept
+  `refresh` responses over every account (5.7), `merge_keys` the number of merge keys over every
+  account (protocol.md 7.2), `pending_entries` the number of entries the log store has not
+  confirmed over every account, and `idle_connections` the number of idle connections the node
+  keeps at this moment, to the providers over every account and host (`provider`, 5.8 step 8)
+  and to the log store (`log_store`, 5.14). The operator domain reads these values to tell the
+  memory of the delegation state from the memory of the variable state.
 - `log` of `health`: counts since the node started. `entries` is the number of entries the node
   created, `events` the number of events in them, `writes` the number of attempts to write an
   entry to the log store (`PUT` requests, confirmed or not: an entry the store did not confirm
@@ -799,7 +846,7 @@ acknowledgement of its storage.
 
 ```json
 close       {} -> {"accounts":0}
-close/heads {"cursor":"","limit":1000} -> {"heads":[{"body":"...","sig":"..."}],"next":""}
+close/heads {"cursor":"","limit":1000} -> {"heads":[{"body":"...","sig":"..."}],"next":"","truncated":0,"skipped":0}
 ```
 
 `close` raises `closing`: from then on, the calls that use a credential and the commands are
@@ -808,13 +855,27 @@ the number of accounts that have a chain. `close/heads` returns the `final` head
 that has a chain, in the lexical order of `user_id` (`cursor` is the last `user_id` of the page
 before, and an empty `next` ends the listing). `close/heads` before `close` is `invalid_request`.
 A node creates the `final` head of an account once, and a repeated call returns the same head.
-`limit` is at least 1, and a value above 1,000 is read as 1,000. `close/heads` closes the open
-batch of every account that has one, writes those entries with one round of writes (the pending
-entries of the same accounts along), and signs the final heads after that. An entry that round
-does not confirm stays a pending entry and the final head covers it. A call that passed the common
-front before `close` and waits for a write runs to its end: its event is on the chain, and the
-final head covers it. The host program starts this sequence when it receives the termination
-signal (section 9).
+`limit` is at least 1, and a value above 1,000 is read as 1,000. The host program starts this
+sequence when it receives the termination signal (section 9), and the pre-stop hook of the pod
+starts it before the signal (section 9, `drain`).
+
+A page of `close/heads` is the first `limit` accounts after the cursor that have a chain (an
+account whose final head stands at `seq` 0 stays listed). The call closes the open batch of every
+account of the page into an entry and writes the entries of these accounts that the store has not
+confirmed in one round of writes (the entries it closed and the pending entries, with the attempts
+of a write of 5.14). It then signs a final head for each account of the page by the state of its
+unconfirmed entries after the round:
+
+| The unconfirmed entries of the account | The final head |
+| --- | --- |
+| None | At the head of the chain |
+| A tail of the chain whose every entry is known not to be in the store: every `seq` from the first unconfirmed one to the head is unconfirmed, and every attempt to write each of them failed before a request byte left the node (the connection, the TLS handshake) or was answered by the store with a status other than 200 | At the entry before the first unconfirmed one: its `seq` is that entry's `seq` and its `hash` the `prev` of the first unconfirmed entry (`seq` 0 and 32 zero bytes when the first unconfirmed entry is entry 1). The unconfirmed entries are dropped from the chain and from the entries the store has not confirmed, so no sweep writes them again, and the account is counted in `truncated`. Their acts never took place: an act follows the confirmation of its entry. A dropped `grant_transferred_in` entry leaves the grant it recorded in place on the closing node, and the `grant_transferred_out` of the giving node records the handover |
+| An unconfirmed entry whose write may have reached the store (an attempt ended with the connection closed without a response, or passed its time limit after the request may have been sent: `outcome_unknown` of the entry, section 3), an unconfirmed entry below a confirmed one (a gap inside the chain), or an entry that a call writes at this moment | No final head in this call: the account is counted in `skipped`, its entries stay as they are (the sweep ended with `close`; the round of every later `close/heads` call writes the pending ones again), and it is listed in the pages of a later call, which looks again. An entry whose write may have reached the store is not dropped: the node leaves no final head for that account until the store confirms the entry, because a reader that found the object above the final head would mark the chain |
+
+`truncated` and `skipped` count the accounts of the page. A call that passed the common front
+before `close` and waits for a write runs to its end: its event is on the chain, and when the
+store confirms the entry the final head covers it. A final head once signed is returned as it is,
+and counted in neither value, by every later call.
 
 ### 5.12 `POST /v1/seal`, `POST /v1/open`
 
@@ -826,13 +887,23 @@ in the clear, and no call hands the plaintext of a token out.
 
 ```json
 export {"peer":{the attestation response of the receiving node},"after":"","limit":1000,
+        "subset":{"pods":3,"pod":1,"copies":2},
         "endorsement":{"statement":"...","entry":{"body":"...","integrated_time":0,"log_index":0,"log_id":"...","signed_entry_timestamp":"..."}}}
   -> {"envelope":{...}|null,"logs":[{"user_id":"...","seq":1}],"next":""}
-import {"peer":{the attestation response of the giving node},"envelope":{...}}
+import {"peer":{the attestation response of the giving node},"envelope":{...},"subset":{"pods":3,"pod":2,"copies":2}}
   -> {"imported":0,"logs":[{"user_id":"...","seq":1}]}
 ```
 
-The rules are those of protocol.md 10.1 and 10.3. What this document adds:
+The rules are those of protocol.md 10.1, 10.3 and 10.4. What this document adds:
+
+- `subset` is optional in both calls (protocol.md 10.4). In export, `pod` is the ordinal of the
+  receiving node: the page selects the accounts of its share alone, and `limit` counts the
+  selected grants. In import, `pod` is the ordinal of this node: a grant of an account outside its
+  share is left out, not put in place, without an entry and not counted in `imported`. The key
+  absent or `null` is a call without a subset. A `subset` that is not an object of three integers
+  within the bounds of protocol.md 10.4 is `invalid_request`, and the call changes nothing. A node
+  of release v2.0.1 does not read the key: it exports every account, and the receiving node of
+  this release keeps its share.
 
 - `peer` is the response of `POST /v1/attestation` of that peer, as it is (the nonce is a value
   that the caller chose, and the node does not look at it).
@@ -850,9 +921,10 @@ The rules are those of protocol.md 10.1 and 10.3. What this document adds:
   orderly shutdown is `close`, `peer/export`, `close/heads`. import is refused with `closing` in
   the state `closing`, and when the shutdown starts during an import, the call answers with what
   it took until then.
-- The pages of export: the node goes through the accounts in the order of `user_id` until `limit`
-  grants are selected, and `next` is the last `user_id` it looked at (the last page can be empty).
-  An omitted `limit` is 1,000 and an omitted `after` is the empty string. `imported` of import is
+- The pages of export: the node goes through the accounts in the order of `user_id`, reading its
+  sorted index one chunk of 1,000 accounts at a time (section 3), until `limit` grants are
+  selected, and `next` is the last `user_id` it looked at (the last page can be empty). An
+  omitted `limit` is 1,000 and an omitted `after` is the empty string. `imported` of import is
   the number of grants that this call put in place (it equals the number of elements of `logs`,
   the control entries `grant_transferred_in` the call created). Within the 1 MiB limit of a JSON
   body, a page of 1,000 grants fits when a `user_id` is at most about 350 bytes long (a `user_id`
@@ -937,6 +1009,30 @@ The write of an entry (`enclave/src/log_store.rs`) is the request of protocol.md
 | Sweep | The sweep of section 3 visits the accounts in a random order, writes the pending entries of an account only after a jitter of up to 30 seconds since the oldest of them became pending, and writes at most 64 entries per second over the whole node (`sweep_write_rate` of section 8). An account the sweep did not reach before the next sweep is due waits for that sweep |
 | The limit of pending entries | An account whose pending entries reached 64 gets no further entry from a call that uses a credential (step 3 of the common front): the call writes the pending entries again, goes on when fewer than 64 are left, and otherwise ends with `log_store_unavailable` without an entry. A command and a delegation transfer are not stopped by this limit |
 | Platform | A node of platform `nitro` requires a log store (protocol.md 7.6). A node of platform `local` keeps account of the entries it creates from the call of `config` that named its log store: the entries it created before are not written |
+
+### 5.15 `POST /v1/grants/prune`
+
+```json
+prune {"subset":{"pods":3,"pod":1,"copies":2},"after":"","limit":1000} -> {"pruned":["<user_id>", ...],"next":""}
+```
+
+The rules are those of protocol.md 10.4. What this document adds:
+
+- `subset` is required: `pod` is the ordinal of this node. A missing key or a value outside the
+  bounds of protocol.md 10.4 is `invalid_request`, and the call changes nothing.
+- The node walks its accounts in the order of `user_id` after `after` (an omitted `after` is the
+  empty string), reading its sorted index one chunk of 1,000 accounts at a time (section 3), and
+  for every account that the subset does not give to this node drops a grant within its time and
+  an expired grant alike: the state becomes `None`, the user key is overwritten with zeros, and the
+  kept `refresh` responses and the merge keys of the account go with the grant. A revocation
+  marker stays, and so does the chain of the account. The walk ends after `limit` pruned accounts
+  (1 to 1,000, a larger value is read as 1,000) or after 10,000 accounts looked at, whichever
+  comes first. `pruned` lists the `user_id` of every account the call pruned, in `user_id` order,
+  and `next` is the last `user_id` the walk looked at, the empty string when it reached the end;
+  the caller repeats the call with `next` as `after` until `next` is empty.
+- No entry is created and nothing is written to the log store: nothing is used, and the operator
+  chose which nodes hold the key. The acts the chain records stand. `grants` of health follows.
+- The call works without the operator configuration and in the state `closing`.
 
 ## 6. The provider definitions
 
@@ -1222,7 +1318,9 @@ The rules:
   response are held in memory, and each of them is `too_large` above 64 MiB (for a batch, the
   bodies of its results together). A call that would raise the sum of the bodies in memory above
   2 GiB waits until there is room.
-- The size of the enclave: 2 vCPUs and 4,096 MiB of memory (constants of the host program).
+- The size of the enclave: 2 vCPUs (a constant of the host program) and the memory that the
+  environment variable `CREDENTIAL_ENCLAVE_MEMORY_MIB` of the host program gives in MiB, 4,096
+  when the variable is not set (section 9).
 - Output: the node writes nothing to the standard output (a production enclave has no console).
   Diagnostic values leave through `health` and through the failure codes of the calls only. A
   failure message is a fixed string of the source: it carries no credential, no key, no body and
@@ -1276,17 +1374,19 @@ the longest `context`) are in protocol.md section 12.
 
 The host program runs inside the parent pod of the enclave. It is an untrusted component: nothing
 that a node guarantees depends on it. It is kept in this repository next to the node program. It
-takes no argument, and it reads its configuration from environment variables.
+takes no argument, or the one argument `drain` (the row `drain` below), and it reads its
+configuration from environment variables.
 
 | Function | What it does |
 | --- | --- |
-| Start | `nitro-cli run-enclave --eif-path /opt/credential-enclave/enclave.eif --cpu-count 2 --memory 4096 --enclave-cid 16`. When the start fails, the host program prints the ends of the `nitro-cli` log files and ends with a status that is not 0 |
-| Inbound relay | For every connection on TCP `0.0.0.0:8080` it opens a connection to vsock `16:8080` and moves the bytes in both directions. It does not read the bytes: the call surface of the node ends inside the enclave |
+| Start | `nitro-cli run-enclave --eif-path /opt/credential-enclave/enclave.eif --cpu-count 2 --memory {memory} --enclave-cid 16`, where `{memory}` is the value of the environment variable `CREDENTIAL_ENCLAVE_MEMORY_MIB` in MiB and 4,096 when the variable is not set or empty. A value that is not a positive decimal integer (a sign, a leading zero, a fraction, letters, a value above 4,294,967,295) ends the host program before the start of the enclave with one line on the standard error that names the variable and the value, and a status that is not 0. The host program logs the memory and the vCPUs it starts the enclave with. When the start fails, the host program prints the ends of the `nitro-cli` log files and ends with a status that is not 0 |
+| Inbound relay | For every connection on TCP `0.0.0.0:8080` it opens a connection to vsock `16:8080` and moves the bytes in both directions. It does not read the bytes: the call surface of the node ends inside the enclave. It counts the connections for which the vsock connection to the node failed or did not open within its time limit of 5 seconds (the Status row): a caller whose connection the relay closes without a byte |
 | Egress relay | It listens on vsock port 8443. It reads the first line `CONNECT {host}:{port}\n`. When the host is on the allow list and the port is 443, it connects by TCP, answers `OK\n` and moves the bytes. Otherwise it sends `ERR\n` and closes. The allow list is the hosts of section 7, the hosts of the token addresses and the revocation addresses of 6.2 (the host program is built from the same definitions file), and the host of the log store, `{bucket}.s3.{region}.amazonaws.com`, when the two variables of the next row name one. TLS ends inside the node, so the relay sees ciphertext only. This list is a second line: the node itself sends a credential only to the addresses of its definitions, and log entries only to its log store. Its listener has a backlog of 1,024 connections (the queue of connections that wait for accept; the kernel of the parent instance resets a connection request that finds the queue full); when the kernel refuses to set it the host program logs one line and keeps the default. A failed accept, on this listener and on the two TCP listeners, is classified by its error: `ECONNABORTED`, `EPROTO`, `EINTR` and `EAGAIN` (the connection was gone before accept returned it, or the call was interrupted) are followed by the next accept at once; `EMFILE`, `ENFILE`, `ENOBUFS` and `ENOMEM` (the process or the kernel is out of descriptors or memory) and every other error are followed by a pause of 50 milliseconds. The egress relay counts its failed accepts by class (`aborted`, `resources`, `other`), its connections by outcome and the connections whose bytes it moves at this moment (the Status row) |
 | Operator configuration | It reads the values of every provider from environment variables and calls `POST /v1/config` once the `health` call of the node answers. The variables: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `OUTLOOK_CLIENT_ID`, `OUTLOOK_CLIENT_SECRET`, `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `NOTION_CLIENT_ID`, `NOTION_CLIENT_SECRET`, `X_CLIENT_ID`, `X_CLIENT_SECRET`, `LINK_CLIENT_ID`, `LINK_CLIENT_SECRET`, `STRIPE_PUBLISHABLE_KEY`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, and `CHARACTER_API_BASE_URL` (the front of the callback address `{value}/api/integrations/{provider}/oauth/callback`). The configuration names every provider of the definitions: `redirect_uri` is always set, and a value without a variable is the empty string. `CREDENTIAL_ENCLAVE_LOG_BUCKET` and `CREDENTIAL_ENCLAVE_LOG_REGION` name the log store: when both are set and have the forms of protocol.md 4.1, the configuration carries them as `log_store`. When one is missing or has another form, the configuration carries no `log_store` and one line of the log says why. Without `CHARACTER_API_BASE_URL` no configuration is sent. A configuration that the node refuses is not sent again. The host program does not send the credentials for the log store: the backend sends them (5.14) |
-| Status | TCP 9091: `GET /healthz` (200 when the round trip of the `health` call of the node succeeds within 8 seconds, 503 otherwise) and `GET /metrics` (the Prometheus text format). Four gauges: `credential_enclave_up` (1 when the `health` round trip succeeds, 0 when it fails), `credential_enclave_configured` (1 when `configured` of `health` is true), `credential_enclave_accounts` (`accounts` of `health`), `credential_enclave_started_timestamp_seconds` (`started_ms` of `health` in seconds). From the `log` object of `health`, when the node answers with one: the counters `credential_enclave_log_entries_total` (`entries`), `credential_enclave_log_events_total` (`events`), `credential_enclave_log_store_writes_total` (`writes`), `credential_enclave_log_store_write_failures_total` (`write_failures`), `credential_enclave_forward_batch_calls_total` (`batch_calls`), `credential_enclave_forward_batch_requests_total` (`batch_requests`), and the gauge `credential_enclave_log_open_batches` (`open_batches`); and, when the object holds the write counts of 5.1: the counter `credential_enclave_log_store_write_attempt_failures_total{cause}` (`write_attempt_failures`; `cause` is `connect`, `tls`, `closed`, `timeout`, `status_4xx` or `status_5xx`), the counter `credential_enclave_log_store_write_retries_total` (`write_retries`), and the histogram `credential_enclave_log_store_write_seconds`: `_bucket{le}` for `le` `0.025`, `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5` and `5` from the cumulative counts of `write_ms_buckets`, `_bucket{le="+Inf"}` and `_count` from `write_count`, `_sum` from `write_ms_sum` as seconds with three decimals. From the `log_store` object of `health`, when it is not null: the gauge `credential_enclave_log_store_pending_accounts` (`pending`) and, when the object holds `pending_oldest_ms`, the gauge `credential_enclave_log_store_pending_oldest_seconds` (its milliseconds as seconds with three decimals). From the `load` object of `health`, when the node answers with one: the gauges `credential_enclave_provider_inflight` (`provider_inflight`) and `credential_enclave_forward_calls` (`forward_calls`); when its three CPU values are not null, the counters `credential_enclave_cpu_user_seconds_total`, `credential_enclave_cpu_system_seconds_total` and `credential_enclave_cpu_idle_seconds_total` (the milliseconds of `health` as seconds with three decimals); when its two memory values are not null, the gauges `credential_enclave_memory_total_bytes` and `credential_enclave_memory_available_bytes`. From the `egress` object of `health`, when the node answers with one: the counter `credential_enclave_egress_opens_total` (`opens`), the counter `credential_enclave_egress_open_failures_total{cause}` (`open_failures`; `cause` is `transport`, `relay_refused`, `tls` or `http`), the counter `credential_enclave_egress_open_retries_total` (`open_retries`), the gauge `credential_enclave_egress_open_inflight` (`open_inflight`) and the counter `credential_enclave_egress_idle_reuses_total{peer}` (`idle_reuses`; `peer` is `provider` or `log_store`). From the `refresh` object of `health`, when the node answers with one: the counter `credential_enclave_refresh_late_total{outcome}` (`late`; `outcome` is `kept`, `dropped`, `failed` or `abandoned`) and the gauge `credential_enclave_refresh_late_inflight` (`late_inflight`). From the host program itself, with every answer, after the series of `health`: the counter `credential_enclave_host_egress_accept_errors_total{cause}` (the failed accepts of the egress relay; `cause` is `aborted`, `resources` or `other`), the counter `credential_enclave_host_egress_relays_total{outcome}` (the connections of the node the egress relay served; `outcome` is `relayed`, `malformed`, `not_allowed` or `unreachable`) and the gauge `credential_enclave_host_egress_relays_inflight` (the connections whose bytes the egress relay moves at this moment). When the `health` call fails, the answer is `credential_enclave_up 0` and the three series of the host program. A counter of the node restarts at 0 when the node restarts (the started timestamp changes), a CPU counter when the kernel of the node boots, and a counter of the host program when the host program starts |
+| Status | TCP 9091: `GET /healthz` (200 when the round trip of the `health` call of the node succeeds within 8 seconds, 503 otherwise) and `GET /metrics` (the Prometheus text format). Four gauges: `credential_enclave_up` (1 when the `health` round trip succeeds, 0 when it fails), `credential_enclave_configured` (1 when `configured` of `health` is true), `credential_enclave_accounts` (`accounts` of `health`), `credential_enclave_started_timestamp_seconds` (`started_ms` of `health` in seconds). From the `log` object of `health`, when the node answers with one: the counters `credential_enclave_log_entries_total` (`entries`), `credential_enclave_log_events_total` (`events`), `credential_enclave_log_store_writes_total` (`writes`), `credential_enclave_log_store_write_failures_total` (`write_failures`), `credential_enclave_forward_batch_calls_total` (`batch_calls`), `credential_enclave_forward_batch_requests_total` (`batch_requests`), and the gauge `credential_enclave_log_open_batches` (`open_batches`); and, when the object holds the write counts of 5.1: the counter `credential_enclave_log_store_write_attempt_failures_total{cause}` (`write_attempt_failures`; `cause` is `connect`, `tls`, `closed`, `timeout`, `status_4xx` or `status_5xx`), the counter `credential_enclave_log_store_write_retries_total` (`write_retries`), and the histogram `credential_enclave_log_store_write_seconds`: `_bucket{le}` for `le` `0.025`, `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5` and `5` from the cumulative counts of `write_ms_buckets`, `_bucket{le="+Inf"}` and `_count` from `write_count`, `_sum` from `write_ms_sum` as seconds with three decimals. From the `log_store` object of `health`, when it is not null: the gauge `credential_enclave_log_store_pending_accounts` (`pending`) and, when the object holds `pending_oldest_ms`, the gauge `credential_enclave_log_store_pending_oldest_seconds` (its milliseconds as seconds with three decimals). From the `load` object of `health`, when the node answers with one: the gauges `credential_enclave_provider_inflight` (`provider_inflight`) and `credential_enclave_forward_calls` (`forward_calls`); when its three CPU values are not null, the counters `credential_enclave_cpu_user_seconds_total`, `credential_enclave_cpu_system_seconds_total` and `credential_enclave_cpu_idle_seconds_total` (the milliseconds of `health` as seconds with three decimals); when its two memory values are not null, the gauges `credential_enclave_memory_total_bytes` and `credential_enclave_memory_available_bytes`. From the `egress` object of `health`, when the node answers with one: the counter `credential_enclave_egress_opens_total` (`opens`), the counter `credential_enclave_egress_open_failures_total{cause}` (`open_failures`; `cause` is `transport`, `relay_refused`, `tls` or `http`), the counter `credential_enclave_egress_open_retries_total` (`open_retries`), the gauge `credential_enclave_egress_open_inflight` (`open_inflight`) and the counter `credential_enclave_egress_idle_reuses_total{peer}` (`idle_reuses`; `peer` is `provider` or `log_store`). From the `refresh` object of `health`, when the node answers with one: the counter `credential_enclave_refresh_late_total{outcome}` (`late`; `outcome` is `kept`, `dropped`, `failed` or `abandoned`) and the gauge `credential_enclave_refresh_late_inflight` (`late_inflight`). After the series of the objects, when the answer holds the value: the gauge `credential_enclave_grants` (`grants` of `health`, the accounts with a grant within its time; every release answers it). From the `state` object of `health`, when the node answers with one: the gauges `credential_enclave_kept_refreshes` (`kept_refreshes`), `credential_enclave_merge_keys` (`merge_keys`), `credential_enclave_pending_entries` (`pending_entries`) and `credential_enclave_idle_connections{peer}` (`idle_connections`; `peer` is `provider` or `log_store`). From the host program itself, with every answer, after the series of `health`: the counter `credential_enclave_host_egress_accept_errors_total{cause}` (the failed accepts of the egress relay; `cause` is `aborted`, `resources` or `other`), the counter `credential_enclave_host_egress_relays_total{outcome}` (the connections of the node the egress relay served; `outcome` is `relayed`, `malformed`, `not_allowed` or `unreachable`), the gauge `credential_enclave_host_egress_relays_inflight` (the connections whose bytes the egress relay moves at this moment) and the counter `credential_enclave_host_inbound_node_connect_failures_total` (the connections of callers for which the inbound relay could not open its connection to the node). When the `health` call fails, the answer is `credential_enclave_up 0` and the four series of the host program. A counter of the node restarts at 0 when the node restarts (the started timestamp changes), a CPU counter when the kernel of the node boots, and a counter of the host program when the host program starts |
 | Sending the operator configuration again | Does not happen. The configuration is sent once at the start. To change a value, the pod is replaced |
-| Shutdown | On SIGTERM (or SIGINT) the host program calls `POST {CREDENTIAL_ENCLAVE_DRAIN_URL}` (the shutdown collection route of the backend): the body `{"pod": "<the value of CREDENTIAL_ENCLAVE_POD_NAME>"}`, the headers `Authorization: Bearer {CREDENTIAL_ENCLAVE_DRAIN_TOKEN}` and `Content-Type: application/json`. Inside that request the backend makes the calls of the orderly shutdown to the node (5.11, 5.13), through the inbound relay. The host program waits for the response (at most 100 seconds), then calls `nitro-cli terminate-enclave --all` and ends. When one of the three variables (`CREDENTIAL_ENCLAVE_DRAIN_URL`, `CREDENTIAL_ENCLAVE_DRAIN_TOKEN`, `CREDENTIAL_ENCLAVE_POD_NAME`) is missing, it ends the enclave without the collection |
+| Shutdown | On SIGTERM (or SIGINT) the host program logs one line with the output of `nitro-cli describe-enclaves` on one line (the JSON list of the running enclaves: the enclave object while the node is alive, `[]` when the enclave ended before the signal; the line says whether the node was alive when the signal came), then calls `POST {CREDENTIAL_ENCLAVE_DRAIN_URL}` (the shutdown collection route of the backend): the body `{"pod": "<the value of CREDENTIAL_ENCLAVE_POD_NAME>"}`, the headers `Authorization: Bearer {CREDENTIAL_ENCLAVE_DRAIN_TOKEN}` and `Content-Type: application/json`. Inside that request the backend makes the calls of the orderly shutdown to the node (5.11, 5.13), through the inbound relay. The host program waits for the response (at most 100 seconds), then calls `nitro-cli terminate-enclave --all` and ends. When one of the three variables (`CREDENTIAL_ENCLAVE_DRAIN_URL`, `CREDENTIAL_ENCLAVE_DRAIN_TOKEN`, `CREDENTIAL_ENCLAVE_POD_NAME`) is missing, it ends the enclave without the collection. The call of the signal path repeats the call of the `drain` subcommand when the pre-stop hook made one: the backend takes a repeated call for the same pod as the same collection |
+| `drain` | `credential-enclave-host drain` makes the shutdown collection call of the Shutdown row alone (the same request, from the same three variables), waits for the response for at most 110 seconds from the start of the call, logs one line with the outcome (the status of the response and the elapsed milliseconds, the failure and the elapsed milliseconds, or the end of the wait) and ends with the status 0 in every case: a failed collection does not hold the end of the pod. When one of the three variables is missing, or the address cannot be used, it logs one line and ends with the status 0 without a call. The pre-stop hook of the pod runs it before the termination signal reaches the host program, while the node is alive |
 | local | The node program with `--platform local` runs alone, without the host program. Whatever starts it sends the operator configuration |
 
 The output of the host program is its log: lines on the standard output, and the output of
@@ -1394,16 +1494,18 @@ place of every provider (`enclave/src/testing.rs`).
 | Attestation documents | The unit tests of `protocol/src/attestation.rs`, `enclave/src/attest.rs` and `enclave/src/platform/nitro.rs`, with the files of `protocol/tests/fixtures/` | The certificate chain and the signature of real Nitro attestation documents, the definite and the indefinite form of the payload, the refusal of another root, of a changed document, of other PCRs and of a debug-mode enclave. A peer under the statement of a later release and a peer of a listed predecessor: accepted with the measurement and the release of the real document, refused with another release in the binding, with another PCR, with another log store, on the local platform, and as a debug-mode enclave |
 | Command processing | `enclave/src/tests/commands.rs` | The state transitions of sequences of grant and revoke: a challenge is used once and for 300 seconds, a command for another node or of another user, the range of the expiry, the custody of a grant, a revoke and an old envelope after it, a grant that was held back until after a revoke, replacement, an expired grant |
 | Records | `enclave/src/tests/records.rs` | A record of another account, of another key or of another custody does not open, and neither does a record with a changed field of its AAD. The kind of a record decides the fields that `release` hands out |
-| Log | `enclave/src/tests/log.rs` | The entry is on the chain before the provider is called (the provider stand-in looks at the head at the time of the call), the group commit (the events that arrive during a write form the next entry; a merged GET waits for the entry of the event it shares; a control event closes the open batch and stands alone; the caps of 128 events and 1,048,576 bytes), the `log` object of every response, the chain verified from the keys of the store and its head (index and content verification, a gap, a changed key), the final heads of `close`, a final head that covers an open batch, the times of the events and entries of a chain |
+| Log | `enclave/src/tests/log.rs` | The entry is on the chain before the provider is called (the provider stand-in looks at the head at the time of the call), the group commit (the events that arrive during a write form the next entry; a merged GET waits for the entry of the event it shares; a control event closes the open batch and stands alone; the caps of 128 events and 1,048,576 bytes), the `log` object of every response, the chain verified from the keys of the store and its head (index and content verification, a gap, a changed key), the final heads of `close` when the store confirmed every entry, a final head that covers an open batch, the times of the events and entries of a chain |
+| Orderly shutdown | `enclave/src/tests/close.rs` | The final head rule of 5.11 against a store that refuses writes: pending entries that are the tail of a chain are dropped and the final head stands at the last confirmed entry (the sweep writes nothing more, the keys the store holds reach the head, `truncated` 1); a chain whose every entry is pending ends at `seq` 0 and leaves the account without a chain; a confirmed entry above a pending one leaves the account without a head and counted in `skipped` until a later call finds the gap closed; a repeated call returns the same head |
 | Log store | `enclave/src/tests/log_store.rs`, the unit tests of `enclave/src/log_store.rs` | Against a stand-in for Amazon S3 on the TLS server of the provider stand-in: the write of an entry arrives before the request to the provider, under the key of format 2 whose seven parts the test computes again from the body, with the headers and a signature that the test computes again from the request. A write the store does not confirm (a status other than 200, a 412 included, no connection, no answer within the time limit) stops the act of every call, the writer and the calls that waited for it. A pending entry is written again with the next write of its account, and a request that shares an event waits for its entry. The signed refusal of a grant, a revoke that erases the key whatever the store answers, the failure and the repetition of `peer/export`, the refusal of a peer of another log store, a node of the nitro platform without a log store or credentials, the limit of pending entries, calls that end before their write (the account has no writer afterwards), calls that run at the same time form one entry and write each entry once. The idle connections: one connection for writes in a row, a connection the store closed, a write whose idle connection ends without a response, the current credentials over an idle connection. The attempts of a write: a 5xx status and 429 are repeated over a new connection with the same body within the budget, a 4xx status is not, an idle connection that stalls or that closes without a response is left for a new connection, a new connection that closes without a response is repeated as well, a store that cannot be reached is asked for three connections, and the causes and the counts of health. The sweep: its rate, its random order, and the jitter before it writes the entries of an account. The local endpoint: a path-style write over plain HTTP with the host of the endpoint, refused on the nitro platform and for a value that is not an origin. The signature against the examples of the AWS documentation |
 | Address check | The unit tests of `enclave/src/providers/mod.rs` | The refusals of section 7 (another host, a path outside the lists, a denied path in its spellings, dot segments, dot segments in front of a path parameter, encoded separators and separators that are encoded twice, a port, user information), and the validation of the definitions, including the rules for public fields |
 | OAuth | `enclave/src/tests/oauth.rs`, the unit tests of `enclave/src/oauth.rs` | Against the provider stand-in: exchange, refresh, the merge of a reconnect, the nested token place of slack and its `ok: false`, the public fields and the containment check, the closed vocabulary of `provider_error`, the kept response of a repeated refresh, a token address call of `refresh` whose response arrives after the time limit of the call (kept for the next call with the same record; dropped after a revoke or after `close`; a late refusal and the late limit; the bound of the late calls and their counts in health), a record of kind `oauth_imported` |
 | forward | `enclave/src/tests/forward.rs`, the unit tests of `enclave/src/provider_response.rs` and `enclave/src/egress.rs` | Header removal, the refusal of a header that overrides the method and of the batch address of Microsoft Graph, the injected credential, the event of a GET request with a body, the whole path and the whole query in the event of the longest address, redirects that are not followed, chunked responses, the body limit, the time limit, a response that reflects the credential (as it is, under percent escapes of up to three layers, in base64 and in hexadecimal), the idle connections per (account, host): two accounts never share one, a connection is dropped after 30 seconds idle, a GET over an idle connection that ends without a response is sent once more and a POST is not; an open that fails before a request byte left is repeated within half the time limit of the call (two refusals and then a success, three refusals, a refusal that arrives after half the time limit), the bound of connections being opened at once, and the counts of `egress` of health |
 | forward/batch | `enclave/src/tests/forward_batch.rs` | One entry names every request before any leaves; a batch of 100 with 6 in flight; a request that fails the address check refuses the whole call with its index and creates no event; a merged request inside a batch shares the event; two entries when the open batch reaches its cap inside a batch; one failed request leaves the other results intact and keeps its `log` object; the bodies of the results together under the body limit; the results in the order of the requests; the bodies split by `body_bytes`; a batch of 0 or 101 requests is invalid |
-| Delegation transfer | `enclave/src/tests/peer.rs` | The round trip of export and import between two nodes of the local platform, paging, the exclusion of expired grants and of accounts that revoked, a grant of another `sign_pk` is not replaced, the refusal of a changed envelope and of an envelope for another node, the entries `grant_transferred_out` and `grant_transferred_in` (the `logs` of the responses and the objects of the store), a repeated export to the same peer without a new entry, the limit of 64 peers per grant, an export with an endorsement that does not hold (it hands nothing over and leaves no entry, also for a peer the call without an endorsement accepts) |
-| Call surface | `enclave/src/tests/surface.rs`, the unit tests of `enclave/src/load.rs` | `health` with the counts of its `log`, `egress` and `refresh` objects and the values of its `load` object (the readers of `/proc/stat`, `/proc/meminfo` and the auxiliary vector on sample text: the columns of each mode, a line with fewer columns, malformed text), the operator configuration, attestation and its challenge statement, the failure bodies, HTTP/1.1 over a real connection, that `log/entries` and `log/ack` do not exist, and that the calls of the router are the calls of the table in section 4 of egress-policy.md |
+| Delegation transfer | `enclave/src/tests/peer.rs` | The round trip of export and import between two nodes of the local platform, paging, the exclusion of expired grants and of accounts that revoked, a grant of another `sign_pk` is not replaced, the refusal of a changed envelope and of an envelope for another node, the entries `grant_transferred_out` and `grant_transferred_in` (the `logs` of the responses and the objects of the store), a repeated export to the same peer without a new entry, the limit of 64 peers per grant, an export with an endorsement that does not hold (it hands nothing over and leaves no entry, also for a peer the call without an endorsement accepts), the `subset` of export (the share of the peer alone, with entries for it alone, and pages that count the selected grants) and of import (the share of the receiving node alone out of a transfer of every account, `copies` at or above `pods` names every account, `null` is a call without a subset, a subset outside its bounds is refused by both calls) |
+| Delegation subset and pruning | `enclave/src/tests/grants.rs`, the unit tests of `enclave/src/subset.rs` | The assignment vectors of protocol.md 10.4 and the agreement of `contains` with `assign`; `grants/prune` drops the grants within their time and the expired grants outside the share page by page in `user_id` order, leaves the chains, the revocation markers and the grants of the share, prunes nothing more on a repeated walk, works in the state `closing`, and refuses a missing subset, a subset outside its bounds and a `limit` of 0; after grants, a refresh, merged GET requests, refused writes, an expiry, a revoke, an import, a prune, two sweeps and the shutdown, every count of health (`accounts`, `grants`, `pending`, `pending_entries`, `kept_refreshes`, `merge_keys`, `open_batches`) equals a scan of the accounts |
+| Call surface | `enclave/src/tests/surface.rs`, the unit tests of `enclave/src/load.rs` | `health` with the counts of its `log`, `egress`, `refresh` and `state` objects and the values of its `load` object (the readers of `/proc/stat`, `/proc/meminfo` and the auxiliary vector on sample text: the columns of each mode, a line with fewer columns, malformed text), the operator configuration, attestation and its challenge statement, the failure bodies, HTTP/1.1 over a real connection, that `log/entries` and `log/ack` do not exist, and that the calls of the router are the calls of the table in section 4 of egress-policy.md |
 | Egress policy | `enclave/src/tests/canary.rs` | The canary test of egress-policy.md: every secret carries a distinct marker, the provider stand-in breaks its contract on purpose (reflected credentials, tokens in public fields, content and transfer codings, cookies, redirects), every call of the router is made in a success and in a failure, no marker appears in a response in any of the searched encodings, and a credential reaches only the addresses of its own provider. The one exception is the requested field of a successful `release`. Both nodes of the walk have a log store: no write to it carries a secret of the account, and of the credentials for it the session token reaches the log store alone and the secret access key no request |
-| Host program | The unit tests of `host/src/` | The relays, the allow list of the egress relay with the host of the log store, the operator configuration with the log store of the environment, the status surface (the four gauges, the seven series of the `log` object of `health`, which the answer of a node of a release before v2.0.0 does not have, and the seven series of its `load` object, which the answer of a node of a release before v2.0.1 does not have and whose CPU and memory series are absent when the values are null) and the shutdown call, against a stand-in for the node over in-memory pipes |
+| Host program | The unit tests of `host/src/` | The relays (the inbound relay counts the connections for which the node could not be reached), the allow list of the egress relay with the host of the log store, the operator configuration with the log store of the environment, the memory of the enclave from its variable (the default, a value, the refused values), the description line of the enclaves, the one argument `drain`, the status surface (the four gauges, the seven series of the `log` object of `health`, which the answer of a node of a release before v2.0.0 does not have, the seven series of its `load` object, which the answer of a node of a release before v2.0.1 does not have and whose CPU and memory series are absent when the values are null, the series of its `egress`, `refresh` and `state` objects, the gauge of its `grants` value, and the four series of the two relays) and the shutdown call, against a stand-in for the node over in-memory pipes |
 | Verification tool | The unit tests of `verify/src/`, `verify/tests/offline.rs`, with the files of `verify/tests/fixtures/` | The checks on a stored attestation document of a node of release v1.0.0 against the `measurements.json` of that release, the refusals, the report with the log store of a binding, and the exit status of the built tool |
 
 

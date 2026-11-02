@@ -332,7 +332,7 @@ calls, and `egress/sink-callers.tsv` (the one caller of K1).
 
 | Call | The fields of a successful response and their classes |
 | --- | --- |
-| `GET /v1/health` | `node` P, `release` P, `platform` P, `custody` P, `started_ms` P, `time_ms` P, `configured` P, `closing` P, `accounts` P, `grants` P, `mail_providers` P, `log_store` E and P (`bucket`, `region` and `credentials_expires_ms` E, `pending` and `pending_oldest_ms` P), `log` P (seven counts, six counts of failed write attempts under constant cause names, the count of repeated attempts, eight cumulative counts of the time to confirmation under constant bounds, their sum and their count), `load` P (two counts, three CPU times and two sizes of the kernel; the five of the kernel are null when it exposes none), `egress` P (the count of opened connections, four counts of failed opens under constant cause names, the counts of repeated opens and of opens in progress, two counts of reused idle connections), `refresh` P (four counts of late token address calls under constant outcome names, the count of those in progress) |
+| `GET /v1/health` | `node` P, `release` P, `platform` P, `custody` P, `started_ms` P, `time_ms` P, `configured` P, `closing` P, `accounts` P, `grants` P, `mail_providers` P, `log_store` E and P (`bucket`, `region` and `credentials_expires_ms` E, `pending` and `pending_oldest_ms` P), `log` P (seven counts, six counts of failed write attempts under constant cause names, the count of repeated attempts, eight cumulative counts of the time to confirmation under constant bounds, their sum and their count), `load` P (two counts, three CPU times and two sizes of the kernel; the five of the kernel are null when it exposes none), `egress` P (the count of opened connections, four counts of failed opens under constant cause names, the counts of repeated opens and of opens in progress, two counts of reused idle connections), `refresh` P (four counts of late token address calls under constant outcome names, the count of those in progress), `state` P (three counts of kept `refresh` responses, merge keys and unconfirmed entries, two counts of idle connections under constant peer names) |
 | `POST /v1/config` | `configured` P |
 | `POST /v1/attestation` | `v` P, `platform` P, `document` S (the platform signs the two public keys of the node, the release and the nonce of the caller), `node` P, `challenge` P, `release` P, `challenge_statement` S (its body: `type`, `node`, `challenge`, `time_ms` P, the nonce of the caller E) |
 | `POST /v1/messages` | `reply` S (its body: `type`, `ok`, `code`, `node`, `time_ms` P, `user_id`, `challenge`, `key_id`, `not_after_ms` D, `head` P), `log` P, `grant` D |
@@ -349,9 +349,10 @@ calls, and `egress/sink-callers.tsv` (the one caller of K1).
 | `POST /v1/mail/submit` | `status` P, `headers` P, submission status P, SMTP code R, `log` P, after E4. A lost reply is not a rejection |
 | `POST /v1/release` | `value` V, `log` P |
 | `POST /v1/close` | `accounts` P |
-| `POST /v1/close/heads` | `heads` S, `next` E |
+| `POST /v1/close/heads` | `heads` S, `next` E, `truncated` P, `skipped` P |
 | `POST /v1/peer/export` | `envelope` C (K2), `logs` E and P (`user_id` E, `seq` P), `next` E |
 | `POST /v1/peer/import` | `imported` P, `logs` E and P (`user_id` E, `seq` P) |
+| `POST /v1/grants/prune` | `pruned` E (the `user_id` of every account whose grant the call dropped), `next` E |
 | `POST /v1/log-store/credentials` | `credentials_expires_ms` E |
 
 The `log` object of a response is P: the `seq` of the entry that holds the event of the call,

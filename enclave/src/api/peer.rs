@@ -35,10 +35,11 @@ use credential_enclave_protocol::secret::Secret;
 use credential_enclave_protocol::{limits, ProtocolError};
 
 use super::responses::{AccountLogRef, Exported, Imported};
-use super::{invalid, json_ok, respond, ApiError, JsonBody};
+use super::{invalid, json_ok, limit_of, respond, subset_of, ApiError, JsonBody};
 use crate::attest::{verify_peer, Accepted, Peer};
 use crate::log_store;
 use crate::state::{events, lock, Account, ActiveGrant, EventPlace, GrantState, Handover, Node};
+use crate::subset::Subset;
 
 /// The `seq` of the control entry a place names. A control event is never in an open batch,
 /// so its place always names an entry.
@@ -102,10 +103,12 @@ pub async fn export(State(node): State<Arc<Node>>, request: Request) -> Response
 /// call carries.
 ///
 /// The page holds the accounts with a grant within its time, in `user_id` order after `after`,
-/// at most `limit` of them (1 to 1,000, a larger value is read as 1,000). For each account the
-/// entry `grant_transferred_out` that names the peer is on its chain, and the log store
-/// confirmed it, before its grant enters the transfer. The transfer is signed by this node and
-/// sealed to the sealing key of the peer. A page without a grant answers with
+/// at most `limit` of them (1 to 1,000, a larger value is read as 1,000). With a `subset`
+/// (enclave.md 5.13), the page holds only the accounts that the subset gives to the peer: the
+/// share of the peer, so that a transfer carries no grant the peer would not keep. For each
+/// account the entry `grant_transferred_out` that names the peer is on its chain, and the log
+/// store confirmed it, before its grant enters the transfer. The transfer is signed by this
+/// node and sealed to the sealing key of the peer. A page without a grant answers with
 /// `envelope: null`. An empty `next` ends the listing.
 ///
 /// When the log store does not confirm the entry of one account of the page, the call ends
@@ -130,14 +133,8 @@ pub async fn export(State(node): State<Arc<Node>>, request: Request) -> Response
 async fn run_export(node: &Node, request: Request) -> Result<Response, ApiError> {
     let body = JsonBody::read(request).await?;
     let after = body.text_or_empty("after")?;
-    let limit = match body.get("limit") {
-        None => limits::TRANSFER_GRANTS as u64,
-        Some(value) => value
-            .as_u64()
-            .filter(|limit| *limit >= 1)
-            .ok_or_else(|| invalid("limit"))?
-            .min(limits::TRANSFER_GRANTS as u64),
-    } as usize;
+    let limit = limit_of(&body, limits::TRANSFER_GRANTS)?;
+    let subset = subset_of(&body)?;
 
     // 1 to 3a
     let own = node.platform.measurement();
@@ -174,14 +171,16 @@ async fn run_export(node: &Node, request: Request) -> Result<Response, ApiError>
     // failure of the random source changes nothing.
     let to = peer.node();
     let to_public = peer.sign_public();
-    let mut candidates = node.accounts_after(after).into_iter().peekable();
+    let mut candidates = node.accounts_after(after).peekable();
     let mut page = Vec::new();
     let mut last = String::new();
     while page.len() < limit {
         let Some((user_id, account)) = candidates.next() else {
             break;
         };
-        if transferable(&mut lock(&account), &to_public, now_ms) {
+        if in_share(subset.as_ref(), &user_id)
+            && transferable(&mut lock(&account), &to_public, now_ms)
+        {
             page.push((user_id.clone(), account));
         }
         last = user_id;
@@ -209,7 +208,7 @@ async fn run_export(node: &Node, request: Request) -> Result<Response, ApiError>
             if !transferable(&mut account, &to_public, now_ms) {
                 continue;
             }
-            let (handed_before, key_id, log_pk) = match &account.grant {
+            let (handed_before, key_id, log_pk) = match account.grant() {
                 GrantState::Active(held) => (
                     held.handed_to(&to_public),
                     key_id(&held.sign_pk),
@@ -231,7 +230,7 @@ async fn run_export(node: &Node, request: Request) -> Result<Response, ApiError>
                         &seed,
                     )?;
                     let seq = seq_of(&place)?;
-                    if let GrantState::Active(held) = &mut account.grant {
+                    if let GrantState::Active(held) = account.grant_mut() {
                         held.exported_to.push(Handover {
                             peer: to_public,
                             seq,
@@ -266,7 +265,7 @@ async fn run_export(node: &Node, request: Request) -> Result<Response, ApiError>
         if !transferable(&mut account, &to_public, now_ms) {
             continue;
         }
-        let GrantState::Active(held) = &account.grant else {
+        let GrantState::Active(held) = account.grant() else {
             continue;
         };
         let recorded = held
@@ -307,12 +306,18 @@ fn transferable(account: &mut Account, to: &[u8; 32], now_ms: u64) -> bool {
     if !account.has_grant(now_ms) || account.final_head.is_some() {
         return false;
     }
-    match &account.grant {
+    match account.grant() {
         GrantState::Active(held) => {
             held.handed_to(to).is_some() || held.exported_to.len() < limits::TRANSFER_PEERS
         }
         _ => false,
     }
+}
+
+/// True when the account is in the share a `subset` names, and for every account when the
+/// call names no subset.
+fn in_share(subset: Option<&Subset>, user_id: &str) -> bool {
+    subset.is_none_or(|subset| subset.contains(user_id))
 }
 
 pub async fn import(State(node): State<Arc<Node>>, request: Request) -> Response {
@@ -329,6 +334,11 @@ pub async fn import(State(node): State<Arc<Node>>, request: Request) -> Response
 /// outcome of the round does not change the outcome of the call. The entry that says where the
 /// grant went is the `grant_transferred_out` of the giving node, which the log store confirmed
 /// before the transfer was made.
+///
+/// With a `subset` (enclave.md 5.13), a grant of an account that the subset does not give to
+/// this node is left out: not put in place, no entry, not counted. A giving node of a release
+/// without the subset rule hands every account over, and this filter keeps the share of this
+/// node all the same.
 ///
 /// A grant of the custody of this node whose time has not passed is taken when the account has
 /// no grant within its time here and never revoked here: the entry `grant_transferred_in` is
@@ -349,6 +359,7 @@ pub async fn import(State(node): State<Arc<Node>>, request: Request) -> Response
 async fn run_import(node: &Node, request: Request) -> Result<Response, ApiError> {
     let body = JsonBody::read(request).await?;
     let envelope = body.object("envelope")?;
+    let subset = subset_of(&body)?;
     node.ensure_open()?;
 
     // 1
@@ -376,7 +387,10 @@ async fn run_import(node: &Node, request: Request) -> Result<Response, ApiError>
     let mut logs = Vec::new();
     let mut created: Vec<(Arc<Mutex<Account>>, u64)> = Vec::new();
     for (grant, seed) in transfer.grants.into_iter().zip(seeds) {
-        if grant.custody != node.custody || grant.not_after_ms <= now_ms {
+        if grant.custody != node.custody
+            || grant.not_after_ms <= now_ms
+            || !in_share(subset.as_ref(), &grant.user_id)
+        {
             continue;
         }
         let not_after_ms = grant.not_after_ms.min(latest_ms);
@@ -389,7 +403,7 @@ async fn run_import(node: &Node, request: Request) -> Result<Response, ApiError>
             continue;
         }
         guard.expire(now_ms);
-        match &mut guard.grant {
+        match guard.grant_mut() {
             GrantState::Active(held) => {
                 if held.sign_pk == grant.sign_pk {
                     held.not_after_ms = held.not_after_ms.max(not_after_ms);
@@ -415,7 +429,7 @@ async fn run_import(node: &Node, request: Request) -> Result<Response, ApiError>
                     user_id: grant.user_id.clone(),
                     seq,
                 });
-                guard.grant = GrantState::Active(ActiveGrant {
+                guard.set_grant(GrantState::Active(ActiveGrant {
                     key_id,
                     sign_pk: grant.sign_pk,
                     log_pk: grant.log_pk,
@@ -423,7 +437,7 @@ async fn run_import(node: &Node, request: Request) -> Result<Response, ApiError>
                     user_key: grant.user_key.clone(),
                     not_after_ms,
                     exported_to: Vec::new(),
-                });
+                }));
                 drop(guard);
                 created.push((account, seq));
             }

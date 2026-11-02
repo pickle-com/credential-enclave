@@ -13,6 +13,7 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -236,9 +237,30 @@ pub async fn pause_after_failed_accept(failure: AcceptFailure) {
     }
 }
 
+/// The counts of the inbound relay since the host program started. The relay writes them and
+/// the status surface reads them for `/metrics` (enclave.md section 9).
+#[derive(Debug, Default)]
+pub struct InboundCounters {
+    /// Connections of callers for which the connection to the node could not be opened.
+    node_connect_failures: AtomicU64,
+}
+
+impl InboundCounters {
+    /// The connections of callers for which the vsock connection to the node failed or did not
+    /// open within its time limit: the value of
+    /// `credential_enclave_host_inbound_node_connect_failures_total`.
+    pub fn node_connect_failures(&self) -> u64 {
+        self.node_connect_failures.load(Ordering::Relaxed)
+    }
+}
+
 /// The inbound relay: pipes every connection of `listener` to a new connection to the node. A
-/// connection whose node connection cannot be opened is closed.
-pub async fn serve(listener: TcpListener, node: Arc<dyn NodeConnector>) {
+/// connection whose node connection cannot be opened is closed and counted.
+pub async fn serve(
+    listener: TcpListener,
+    node: Arc<dyn NodeConnector>,
+    counters: Arc<InboundCounters>,
+) {
     loop {
         let (caller, _) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -249,9 +271,15 @@ pub async fn serve(listener: TcpListener, node: Arc<dyn NodeConnector>) {
         };
         let _ = caller.set_nodelay(true);
         let node = node.clone();
+        let counters = counters.clone();
         tokio::spawn(async move {
-            if let Ok(stream) = node.connect().await {
-                pipe(caller, stream).await;
+            match node.connect().await {
+                Ok(stream) => pipe(caller, stream).await,
+                Err(_) => {
+                    counters
+                        .node_connect_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
         });
     }
@@ -291,11 +319,12 @@ mod tests {
         }
     }
 
-    async fn relay_with(node: EchoNode) -> SocketAddr {
+    async fn relay_with(node: EchoNode) -> (SocketAddr, Arc<InboundCounters>) {
         let listener = listen_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
         let address = listener.local_addr().unwrap();
-        tokio::spawn(serve(listener, Arc::new(node)));
-        address
+        let counters = Arc::new(InboundCounters::default());
+        tokio::spawn(serve(listener, Arc::new(node), counters.clone()));
+        (address, counters)
     }
 
     #[tokio::test]
@@ -349,7 +378,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_inbound_relay_pipes_a_tcp_connection_to_the_node() {
-        let address = relay_with(EchoNode { reachable: true }).await;
+        let (address, counters) = relay_with(EchoNode { reachable: true }).await;
         let mut first = TcpStream::connect(address).await.unwrap();
         let mut second = TcpStream::connect(address).await.unwrap();
 
@@ -363,9 +392,11 @@ mod tests {
         second.read_exact(&mut buffer).await.unwrap();
         assert_eq!(&buffer, b"second call");
 
-        // The caller closes: the node side ends and the relay closes the connection.
+        // The caller closes: the node side ends and the relay closes the connection. Every
+        // connection to the node opened.
         first.shutdown().await.unwrap();
         assert_eq!(first.read(&mut [0u8; 8]).await.unwrap(), 0);
+        assert_eq!(counters.node_connect_failures(), 0);
     }
 
     /// The vsock endpoints against the loopback transport of the kernel (context id 1). The
@@ -479,10 +510,20 @@ mod tests {
 
     #[tokio::test]
     async fn the_inbound_relay_closes_a_connection_when_the_node_cannot_be_reached() {
-        let address = relay_with(EchoNode { reachable: false }).await;
-        let mut caller = TcpStream::connect(address).await.unwrap();
-        // The connection ends without a byte: with an orderly close or with a reset.
-        let mut buffer = [0u8; 8];
-        assert!(matches!(caller.read(&mut buffer).await, Ok(0) | Err(_)));
+        let (address, counters) = relay_with(EchoNode { reachable: false }).await;
+        for expected in 1..=3u64 {
+            let mut caller = TcpStream::connect(address).await.unwrap();
+            // The connection ends without a byte: with an orderly close or with a reset.
+            let mut buffer = [0u8; 8];
+            assert!(matches!(caller.read(&mut buffer).await, Ok(0) | Err(_)));
+            // Every connection whose node connection failed is counted.
+            for _ in 0..200 {
+                if counters.node_connect_failures() == expected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(counters.node_connect_failures(), expected);
+        }
     }
 }

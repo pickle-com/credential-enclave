@@ -450,6 +450,12 @@ impl LogStore {
     pub fn ensure_ready(&self, now_ms: u64) -> Result<(), ProtocolError> {
         self.writer(now_ms).map(|_| ())
     }
+
+    /// The idle connections to the log store at this moment (`log_store` of
+    /// `idle_connections` of health).
+    pub fn idle_connections(&self) -> usize {
+        lock(&self.idle.0).len()
+    }
 }
 
 /// One entry in the hands of a call.
@@ -461,6 +467,22 @@ struct Write {
     /// True for an entry an act of the call waits for.
     required: bool,
     confirmed: bool,
+    /// True when an attempt of this call may have reached the store without a confirmation
+    /// ([`WriteOutcome::outcome_unknown`]).
+    outcome_unknown: bool,
+}
+
+/// The end of the attempts of one entry ([`send_to_log_store`]).
+#[derive(Clone, Copy)]
+struct WriteOutcome {
+    /// The store confirmed the entry.
+    confirmed: bool,
+    /// Not confirmed, and an attempt may have reached the store all the same: the connection
+    /// closed without a response, or the attempt passed its time limit after the request may
+    /// have been sent. An attempt that failed before any request byte left the node (the
+    /// connection, the TLS handshake) and an attempt the store answered with a status other
+    /// than 200 did not store the object.
+    outcome_unknown: bool,
 }
 
 /// The entries of one account that a call writes: the entries the call names and the pending
@@ -475,7 +497,7 @@ struct Claim<'a> {
 impl<'a> Claim<'a> {
     fn take(account: &'a Mutex<Account>, seqs: &[u64]) -> Claim<'a> {
         let mut writes = Vec::new();
-        for entry in lock(account).unconfirmed.iter_mut() {
+        for entry in lock(account).unconfirmed_mut() {
             let required = seqs.contains(&entry.seq);
             // An entry another call writes is left to that call, unless an act of this call
             // waits for it: then both write it, and the store keeps two versions of it.
@@ -487,6 +509,7 @@ impl<'a> Claim<'a> {
                     entry: entry.entry.clone(),
                     required,
                     confirmed: false,
+                    outcome_unknown: false,
                 });
             }
         }
@@ -507,13 +530,13 @@ impl Drop for Claim<'_> {
         let mut account = lock(self.account);
         for write in &self.writes {
             if write.confirmed {
-                account.unconfirmed.retain(|entry| entry.seq != write.seq);
+                account.confirm_entry(write.seq);
             } else if let Some(entry) = account
-                .unconfirmed
-                .iter_mut()
+                .unconfirmed_mut()
                 .find(|entry| entry.seq == write.seq)
             {
                 entry.writing = false;
+                entry.outcome_unknown |= write.outcome_unknown;
             }
         }
     }
@@ -572,12 +595,14 @@ async fn write_claims(node: &Node, claims: &mut [Claim<'_>]) {
             send_to_log_store(node, &writer, &claim.writes[*index])
         }))
         .await;
-        let failed = outcomes.iter().filter(|confirmed| !**confirmed).count();
+        let failed = outcomes.iter().filter(|outcome| !outcome.confirmed).count();
         node.log_counters
             .write_failures
             .fetch_add(failed as u64, Ordering::Relaxed);
-        for ((at, index), confirmed) in round.iter().zip(&outcomes) {
-            claims[*at].writes[*index].confirmed = *confirmed;
+        for ((at, index), outcome) in round.iter().zip(&outcomes) {
+            let write = &mut claims[*at].writes[*index];
+            write.confirmed = outcome.confirmed;
+            write.outcome_unknown |= outcome.outcome_unknown;
         }
         if failed > 0 {
             return;
@@ -621,8 +646,9 @@ fn status_failure(status: StatusCode) -> AttemptFailure {
     }
 }
 
-/// Sink K5 of the egress policy: writes one entry to the log store and returns true when the
-/// store confirmed the write.
+/// Sink K5 of the egress policy: writes one entry to the log store and returns whether the
+/// store confirmed the write and, when it did not, whether an attempt may have reached the store
+/// (the orderly shutdown drops no such entry, enclave.md 5.11).
 ///
 /// What leaves is the signed entry (its content is sealed to the log public key of the
 /// account) under the key of protocol.md 7.6 ([`object_key`]), with a retention in compliance
@@ -645,12 +671,13 @@ fn status_failure(status: StatusCode) -> AttemptFailure {
 /// and an attempt that takes longer than its time limit are no confirmation. Every attempt is
 /// counted as a write of `log` of health, every failed attempt under its cause, every repeated
 /// attempt as a retry, and the time to the confirmation of a confirmed attempt in the buckets.
-async fn send_to_log_store(node: &Node, writer: &Writer, write: &Write) -> bool {
+async fn send_to_log_store(node: &Node, writer: &Writer, write: &Write) -> WriteOutcome {
     let counters = &node.log_counters;
     let limit = node.limits.log_write;
     let budget = 2 * limit;
     let started = Instant::now();
     let mut attempts: u32 = 0;
+    let mut outcome_unknown = false;
     loop {
         attempts += 1;
         counters.writes.fetch_add(1, Ordering::Relaxed);
@@ -661,12 +688,21 @@ async fn send_to_log_store(node: &Node, writer: &Writer, write: &Write) -> bool 
                 let elapsed_ms =
                     u64::try_from(attempt_started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 counters.record_confirmed(elapsed_ms);
-                return true;
+                return WriteOutcome {
+                    confirmed: true,
+                    outcome_unknown: false,
+                };
             }
             Err((cause, repeated)) => {
                 counters.write_attempt_failures.count(cause);
+                // The request of these two attempts may have reached the store.
+                outcome_unknown |= matches!(cause, WriteFailure::Closed | WriteFailure::Timeout);
+                let failed = WriteOutcome {
+                    confirmed: false,
+                    outcome_unknown,
+                };
                 if !repeated {
-                    return false;
+                    return failed;
                 }
                 let backoff = full_jitter(
                     node.platform.as_ref(),
@@ -675,7 +711,7 @@ async fn send_to_log_store(node: &Node, writer: &Writer, write: &Write) -> bool 
                     WRITE_BACKOFF_CAP,
                 );
                 if started.elapsed() + backoff + WRITE_RETRY_MARGIN > budget {
-                    return false;
+                    return failed;
                 }
                 counters.write_retries.fetch_add(1, Ordering::Relaxed);
                 tokio::time::sleep(backoff).await;
@@ -825,8 +861,9 @@ fn put_request(writer: &Writer, write: &Write, now_ms: u64) -> Option<Request<On
         .ok()
 }
 
-/// The sweep of the node (enclave.md section 3): every [`SWEEP_INTERVAL`], for every account, the
-/// merge keys whose window passed are dropped and the pending entries are written again. A pending
+/// The sweep of the node (enclave.md section 3): every [`SWEEP_INTERVAL`], for every account, a
+/// grant whose time passed is ended, the merge keys whose window passed and the kept `refresh`
+/// responses whose time passed are dropped, and the pending entries are written again. A pending
 /// entry is otherwise written again with the next write of its account only, so without the sweep
 /// an account that makes no further call would leave a gap in the store for as long as it is
 /// idle, and a reader of the store would take that gap for an omission. The task ends when the
@@ -841,15 +878,26 @@ pub async fn keep_sweeping(node: Arc<Node>) {
     }
 }
 
-/// One sweep ([`keep_sweeping`]). The accounts are visited one at a time, in an order the
-/// random source of the platform shuffles. The pending entries of an account are written with
-/// the rules of [`confirm`] (at most 32 at the same time, over the idle connections) when the
-/// oldest of them has been pending for longer than a jitter drawn in `[0, SWEEP_INTERVAL)` for
-/// that account; otherwise they wait for the next sweep. Over the whole node the sweep writes
-/// at most `Limits::sweep_write_rate` entries per second (a token bucket with a burst of one
-/// second), and it ends when the next sweep is due: the accounts it did not reach wait for
-/// that sweep. The calls of an account whose entries were written look at their entries
+/// One sweep ([`keep_sweeping`]), in three passes.
+///
+/// The first pass visits every account of the node once, in the order of the sorted index,
+/// one chunk of the index at a time: it ends a grant whose time passed (as every read of the
+/// state of an account does), drops the merge keys whose window passed and the kept `refresh`
+/// responses whose time passed, and collects the accounts that have a pending entry.
+///
+/// The second pass visits the collected accounts one at a time, in an order the random source
+/// of the platform shuffles. The pending entries of an account are written with the rules of
+/// [`confirm`] (at most 32 at the same time, over the idle connections) when the oldest of
+/// them has been pending for longer than a jitter drawn in `[0, SWEEP_INTERVAL)` for that
+/// account; otherwise they wait for the next sweep. Over the whole node the sweep writes at
+/// most `Limits::sweep_write_rate` entries per second (a token bucket with a burst of one
+/// second), and the pass ends when the next sweep is due: the accounts it did not reach wait
+/// for that sweep. The calls of an account whose entries were written look at their entries
 /// again. An entry the store does not confirm stays pending for the next sweep.
+///
+/// The third pass reads the oldest pending entry of the collected accounts again and keeps its
+/// `pending_since_ms` in the counts of the node (0 when none is left): `pending_oldest_ms` of
+/// health is computed from it until the next sweep.
 ///
 /// The random order and the jitter spread the writes of the accounts whose entries became
 /// pending at one moment (an outage of the store) over two sweeps instead of one burst, and
@@ -858,15 +906,24 @@ pub async fn sweep(node: &Node) {
     let now_ms = node.now_ms();
     let platform = node.platform.as_ref();
     let mut random = RandomDraws::new(platform);
-    let mut accounts = node.accounts_after("");
-    shuffle(&mut accounts, &mut random);
+    let mut pending_accounts: Vec<(String, Arc<Mutex<Account>>)> = Vec::new();
+    for (user_id, account) in node.accounts_after("") {
+        let mut guard = lock(&account);
+        guard.expire(now_ms);
+        guard.prune_recent(now_ms);
+        guard.prune_refreshes(now_ms);
+        if guard.oldest_pending_since_ms().is_some() {
+            drop(guard);
+            pending_accounts.push((user_id, account));
+        }
+    }
+    shuffle(&mut pending_accounts, &mut random);
     let deadline = Instant::now() + SWEEP_INTERVAL;
     let mut bucket = TokenBucket::new(node.limits.sweep_write_rate);
     let interval_ms = u64::try_from(SWEEP_INTERVAL.as_millis()).unwrap_or(u64::MAX);
-    for (_, account) in accounts {
+    for (_, account) in &pending_accounts {
         let waiting = {
-            let mut guard = lock(&account);
-            guard.prune_recent(now_ms);
+            let guard = lock(account);
             guard
                 .oldest_pending_since_ms()
                 .map(|since_ms| (guard.pending_entries(), now_ms.saturating_sub(since_ms)))
@@ -875,18 +932,26 @@ pub async fn sweep(node: &Node) {
             continue;
         };
         if node.ensure_open().is_err() {
-            return;
+            break;
         }
         if age_ms < random.next() % interval_ms {
             continue;
         }
         if !bucket.take(pending, deadline).await {
-            return;
+            break;
         }
-        let _ = confirm(node, &account, &[]).await;
-        let notify = lock(&account).notify.clone();
+        let _ = confirm(node, account, &[]).await;
+        let notify = lock(account).notify.clone();
         notify.notify_waiters();
     }
+    let oldest_since_ms = pending_accounts
+        .iter()
+        .filter_map(|(_, account)| lock(account).oldest_pending_since_ms())
+        .min()
+        .unwrap_or(0);
+    node.counters
+        .pending_oldest_since_ms
+        .store(oldest_since_ms, Ordering::Relaxed);
 }
 
 /// Random values from the random source of the platform, read 512 bytes at a time. When the
@@ -1337,6 +1402,7 @@ mod tests {
             },
             required: true,
             confirmed: false,
+            outcome_unknown: false,
         };
         // 2026-10-01T12:10:45.123Z.
         let request = put_request(&writer, &write, 1_790_856_645_123).unwrap();
@@ -1498,6 +1564,7 @@ mod tests {
             },
             required: true,
             confirmed: false,
+            outcome_unknown: false,
         };
         let request = put_request(&writer, &write, 1_790_856_645_123).unwrap();
         assert_eq!(

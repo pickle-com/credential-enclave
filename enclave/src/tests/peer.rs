@@ -278,6 +278,9 @@ async fn export_pages_through_the_accounts_that_have_a_grant() {
     App::new("g", 9).revoke(&old).await;
     grant_until(&App::new("d", 7), &old, old.node.now_ms() + 60_000).await;
     old.node.clock.advance(61_000);
+    // The end of the grant of d is read by a status call: a grant whose time passed ends at
+    // the first read of the account, or in the sweep of the node.
+    assert_eq!(grant_state(&old, "d").await["state"], "expired");
     assert_eq!(old.health().await["grants"], 4);
 
     let to = attestation(&new).await;
@@ -961,7 +964,7 @@ async fn a_full_page_of_1000_grants_fits_one_import_call() {
     for index in 0..1005 {
         let user_id = format!("00000000-0000-4000-8000-{index:012}");
         let account = old.node.account_or_create(&user_id);
-        lock(&account).grant = GrantState::Active(ActiveGrant {
+        lock(&account).set_grant(GrantState::Active(ActiveGrant {
             key_id: key_id(&keys.sign_pk()),
             sign_pk: keys.sign_pk(),
             log_pk: keys.log_pk(),
@@ -969,7 +972,7 @@ async fn a_full_page_of_1000_grants_fits_one_import_call() {
             user_key: Secret::new(*keys.user_key_operator),
             not_after_ms,
             exported_to: Vec::new(),
-        });
+        }));
     }
     assert_eq!(old.health().await["grants"], 1005);
 
@@ -993,6 +996,182 @@ async fn a_full_page_of_1000_grants_fits_one_import_call() {
     let (_, imported) = import(&new, &from, &second["envelope"]).await;
     assert_eq!(imported["imported"], 5);
     assert_eq!(new.health().await["grants"], 1005);
+}
+
+/// The accounts of `user_ids` that ordinal `pod` holds under the subset, in order.
+fn share(user_ids: &[&str], pods: u32, pod: u32, copies: u32) -> Vec<String> {
+    user_ids
+        .iter()
+        .filter(|user_id| crate::subset::assign(user_id, pods, copies).contains(&pod))
+        .map(|user_id| user_id.to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn an_export_with_a_subset_hands_over_the_share_of_the_peer_and_an_import_keeps_its_own() {
+    let provider = quiet_provider().await;
+    let old = Harness::new(&provider);
+    let holders = ["a", "b", "c", "d", "e", "f", "g", "h"];
+    for (index, user_id) in holders.iter().enumerate() {
+        App::new(user_id, index as u8 + 1).grant(&old).await;
+    }
+    let users = |page: &Value| -> Vec<String> {
+        page["logs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(log_user)
+            .collect()
+    };
+
+    // The peer is pod 1 of 3 nodes with 2 copies per account: the page holds the accounts of
+    // its share alone, with an entry for each, and nothing else enters the envelope.
+    let new = Harness::new(&provider);
+    let to = attestation(&new).await;
+    let from = attestation(&old).await;
+    let subset = json!({"pods": 3, "pod": 1, "copies": 2});
+    let expected = share(&holders, 3, 1, 2);
+    assert!(
+        expected.len() >= 2 && expected.len() < holders.len(),
+        "{expected:?}"
+    );
+    let (status, exported) = old
+        .post(
+            "/v1/peer/export",
+            json!({"peer": to, "after": "", "limit": 1000, "subset": subset}),
+        )
+        .await;
+    assert_eq!(status, 200, "{exported}");
+    assert_eq!(users(&exported), expected);
+    assert_eq!(exported["next"], "");
+    let (status, imported) = import(&new, &from, &exported["envelope"]).await;
+    assert_eq!(status, 200, "{imported}");
+    assert_eq!(
+        imported["imported"].as_u64().unwrap() as usize,
+        expected.len()
+    );
+    for user_id in holders {
+        let in_share = expected.iter().any(|share| share == user_id);
+        assert_eq!(
+            grant_state(&new, user_id).await["state"],
+            if in_share { "active" } else { "none" },
+            "{user_id}"
+        );
+    }
+    // The accounts outside the share got no entry on the giving node.
+    for user_id in holders {
+        let in_share = expected.iter().any(|share| share == user_id);
+        assert_eq!(
+            old.head_seq(user_id),
+            if in_share { 2 } else { 1 },
+            "{user_id}"
+        );
+    }
+
+    // The pages count the selected grants, and `next` is the last account looked at.
+    let third = Harness::new(&provider);
+    let to_third = attestation(&third).await;
+    let (_, first) = old
+        .post(
+            "/v1/peer/export",
+            json!({"peer": to_third, "after": "", "limit": 1, "subset": subset}),
+        )
+        .await;
+    assert_eq!(users(&first), expected[..1]);
+    assert_eq!(first["next"], expected[0]);
+    let (_, rest) = old
+        .post(
+            "/v1/peer/export",
+            json!({"peer": to_third, "after": expected[0], "limit": 1000, "subset": subset}),
+        )
+        .await;
+    assert_eq!(users(&rest), expected[1..]);
+
+    // A giving node without the subset rule hands every account over: the receiving node keeps
+    // its own share and leaves the rest out, with no entry and no count for them.
+    let fourth = Harness::new(&provider);
+    let to_fourth = attestation(&fourth).await;
+    let (_, everything) = export(&old, &to_fourth, "", 1000).await;
+    assert_eq!(users(&everything).len(), holders.len());
+    let own = json!({"pods": 3, "pod": 2, "copies": 2});
+    let expected = share(&holders, 3, 2, 2);
+    let (status, imported) = fourth
+        .post(
+            "/v1/peer/import",
+            json!({"peer": from, "envelope": everything["envelope"], "subset": own}),
+        )
+        .await;
+    assert_eq!(status, 200, "{imported}");
+    assert_eq!(
+        imported["logs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(log_user)
+            .collect::<Vec<String>>(),
+        expected
+    );
+    assert_eq!(
+        imported["imported"].as_u64().unwrap() as usize,
+        expected.len()
+    );
+    assert_eq!(fourth.health().await["grants"], expected.len());
+    for user_id in holders {
+        let in_share = expected.iter().any(|share| share == user_id);
+        assert_eq!(
+            fourth.head_seq(user_id),
+            if in_share { 1 } else { 0 },
+            "{user_id}"
+        );
+    }
+    // The same envelope again without a subset takes the rest.
+    let (_, imported) = import(&fourth, &from, &everything["envelope"]).await;
+    assert_eq!(
+        imported["imported"].as_u64().unwrap() as usize,
+        holders.len() - expected.len()
+    );
+
+    // `copies` at or above `pods` gives every account to every node, and `null` is a call
+    // without a subset.
+    let fifth = Harness::new(&provider);
+    let to_fifth = attestation(&fifth).await;
+    let (_, all) = old
+        .post(
+            "/v1/peer/export",
+            json!({"peer": to_fifth, "subset": {"pods": 2, "pod": 0, "copies": 2}}),
+        )
+        .await;
+    assert_eq!(users(&all).len(), holders.len());
+    let (status, none) = old
+        .post("/v1/peer/export", json!({"peer": to_fifth, "subset": null}))
+        .await;
+    assert_eq!(status, 200);
+    assert!(none["envelope"].is_object());
+
+    // A subset outside its bounds is refused by both calls, and nothing changes.
+    for subset in [
+        json!({"pods": 0, "pod": 0, "copies": 1}),
+        json!({"pods": 3, "pod": 3, "copies": 1}),
+        json!({"pods": 3, "pod": 0, "copies": 0}),
+        json!({"pods": 3, "pod": 0}),
+        json!("3"),
+    ] {
+        let outcome = old
+            .post(
+                "/v1/peer/export",
+                json!({"peer": to_fifth, "subset": subset}),
+            )
+            .await;
+        assert_eq!(code(&outcome), (400, "invalid_request"), "{subset}");
+        let outcome = fifth
+            .post(
+                "/v1/peer/import",
+                json!({"peer": from, "envelope": everything["envelope"], "subset": subset}),
+            )
+            .await;
+        assert_eq!(code(&outcome), (400, "invalid_request"), "{subset}");
+    }
+    assert_eq!(fifth.health().await["grants"], 0);
 }
 
 /// The entry of the transparency log Rekor with the index 150,000,000, in the form of the

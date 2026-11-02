@@ -79,6 +79,7 @@ operator_response!(
     Heads,
     Exported,
     Imported,
+    Pruned,
     ErrorBody<'_>,
 );
 
@@ -243,6 +244,29 @@ pub struct LateRefreshCounts {
     pub abandoned: u64,
 }
 
+/// `state` of `GET /v1/health`: the sizes of the variable state of the accounts and of the
+/// idle connections at the moment of the call (enclave.md 5.1).
+#[derive(Serialize)]
+pub struct StateCounts {
+    /// P: a count, the kept `refresh` responses over every account.
+    pub kept_refreshes: usize,
+    /// P: a count, the merge keys over every account.
+    pub merge_keys: usize,
+    /// P: a count, the entries the log store has not confirmed over every account.
+    pub pending_entries: usize,
+    /// P: the idle connections the node keeps, by peer.
+    pub idle_connections: IdleConnectionCounts,
+}
+
+/// `idle_connections` of `state` of health.
+#[derive(Serialize)]
+pub struct IdleConnectionCounts {
+    /// P: a count, the idle connections to providers over every account and host.
+    pub provider: usize,
+    /// P: a count, the idle connections to the log store.
+    pub log_store: usize,
+}
+
 /// `load` of `GET /v1/health`: the load of the node at the moment of the call.
 #[derive(Serialize)]
 pub struct Load {
@@ -300,6 +324,8 @@ pub struct Health<'a> {
     pub egress: EgressCounts,
     /// P: the late token address calls of `refresh`.
     pub refresh: RefreshCounts,
+    /// P: the sizes of the variable state of the accounts.
+    pub state: StateCounts,
 }
 
 /// `log_store` of `GET /v1/health`.
@@ -501,7 +527,21 @@ pub struct Closed {
 pub struct Heads {
     /// S: each body holds the end of a chain (P).
     pub heads: Vec<Signed>,
-    /// E: the `user_id` of the last head of the page.
+    /// E: the `user_id` the listing continues after.
+    pub next: String,
+    /// P: a count, the accounts of the page whose final head stands at the last entry the
+    /// store confirmed, below pending entries that were dropped.
+    pub truncated: usize,
+    /// P: a count, the accounts of the page that got no final head in this call.
+    pub skipped: usize,
+}
+
+/// `POST /v1/grants/prune`.
+#[derive(Serialize)]
+pub struct Pruned {
+    /// E: the `user_id` of every account whose grant this call dropped.
+    pub pruned: Vec<String>,
+    /// E: the `user_id` the walk continues after.
     pub next: String,
 }
 

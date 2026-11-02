@@ -25,6 +25,7 @@ use crate::oauth::{ProviderError, Withheld};
 use crate::platform::{Listener, PlatformError};
 use crate::providers::{ClientKind, Definition};
 use crate::state::{Node, OperatorConfig, ProviderCredentials};
+use crate::subset::Subset;
 use credential_enclave_protocol::record::Record;
 
 mod attestation;
@@ -32,6 +33,7 @@ mod close;
 mod config;
 mod forward;
 mod forward_batch;
+mod grants;
 mod health;
 mod log_store;
 mod mail;
@@ -89,6 +91,7 @@ fn routes() -> Vec<Route> {
         route(Method::POST, "/v1/close/heads", close::heads),
         route(Method::POST, "/v1/peer/export", peer::export),
         route(Method::POST, "/v1/peer/import", peer::import),
+        route(Method::POST, "/v1/grants/prune", grants::prune),
         route(
             Method::POST,
             "/v1/log-store/credentials",
@@ -481,6 +484,9 @@ fn missing(key: &str) -> ApiError {
         "endpoint" => "endpoint is missing or invalid",
         "cursor" => "cursor is missing or invalid",
         "limit" => "limit is missing or invalid",
+        "subset" => {
+            "subset is missing or invalid: pods 1 to 1024, pod below pods, copies at least 1"
+        }
         _ => "a field is missing or invalid",
     };
     ApiError::with_message(ProtocolError::InvalidRequest, message)
@@ -489,6 +495,30 @@ fn missing(key: &str) -> ApiError {
 /// The record of a call.
 pub fn record_of(body: &JsonBody, key: &str) -> Result<Record, ApiError> {
     Ok(Record::from_value(body.object(key)?)?)
+}
+
+/// The optional `subset` of a call (enclave.md 5.13 and 5.15): `None` when the key is absent
+/// or null, `invalid_request` when its value is not a subset object within its bounds.
+pub fn subset_of(body: &JsonBody) -> Result<Option<Subset>, ApiError> {
+    match body.get("subset") {
+        None => Ok(None),
+        Some(value) => Subset::from_value(value)
+            .map(Some)
+            .ok_or_else(|| invalid("subset")),
+    }
+}
+
+/// The `limit` of a paged call: an absent key is `page_limit`, a value is at least 1, and a
+/// value above `page_limit` is read as `page_limit`.
+pub fn limit_of(body: &JsonBody, page_limit: usize) -> Result<usize, ApiError> {
+    match body.get("limit") {
+        None => Ok(page_limit),
+        Some(value) => value
+            .as_u64()
+            .filter(|limit| *limit >= 1)
+            .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX).min(page_limit))
+            .ok_or_else(|| invalid("limit")),
+    }
 }
 
 /// The client values of a provider from the operator configuration. A provider the

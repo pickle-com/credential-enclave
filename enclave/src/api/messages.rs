@@ -213,16 +213,16 @@ async fn accept_grant(
     // old grant overwrites its user key with zeros. The kept `refresh` responses of a grant of
     // another key go with it. The new grant was handed to no node yet.
     let same_key = matches!(
-        &account.grant,
+        account.grant(),
         GrantState::Active(held) if held.sign_pk == grant.sign_pk
     );
     if !same_key {
         account.forget_refreshes();
         // The merge window belongs to a grant: a request under the new grant merges into no
         // event made under another key, and none made before a revoke.
-        account.recent.clear();
+        account.clear_recent();
     }
-    account.grant = GrantState::Active(ActiveGrant {
+    account.set_grant(GrantState::Active(ActiveGrant {
         key_id: key_id.clone(),
         sign_pk: grant.sign_pk,
         log_pk: grant.log_pk,
@@ -230,7 +230,7 @@ async fn accept_grant(
         user_key: grant.user_key.clone(),
         not_after_ms,
         exported_to: Vec::new(),
-    });
+    }));
     // 15: the reply carries the end the node accepted.
     Ok(Outcome {
         kind: "grant_reply",
@@ -290,7 +290,7 @@ async fn accept_revoke(
         // A revoke of an account without a grant passes without a check and creates no entry.
         // With a grant, the revoke is signed by the key of that grant, and the entry is sealed
         // to the log key of the grant that ends here.
-        let sealed_to = match &account.grant {
+        let sealed_to = match account.grant() {
             GrantState::Active(grant) => {
                 if grant.sign_pk != revoke.sign_pk {
                     return Ok(outcome(
@@ -318,11 +318,11 @@ async fn accept_revoke(
         // Replacing the state drops the grant: its user key is overwritten with zeros. The
         // kept `refresh` responses and the merge window go with it.
         account.forget_refreshes();
-        account.recent.clear();
-        account.grant = GrantState::Revoked {
+        account.clear_recent();
+        account.set_grant(GrantState::Revoked {
             key_id: key_id.clone(),
             sign_pk: revoke.sign_pk,
-        };
+        });
         // The marker can be replaced by a later grant. That the account revoked here stays
         // known: no transfer brings a delegation back to this node for it.
         account.revoked_here = true;

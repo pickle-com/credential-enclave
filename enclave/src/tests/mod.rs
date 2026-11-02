@@ -9,9 +9,11 @@ use crate::providers::{endpoint, Definitions};
 use crate::testing::{Provider, Reply, Seen, LOG_HOST};
 
 mod canary;
+mod close;
 mod commands;
 mod forward;
 mod forward_batch;
+mod grants;
 mod log;
 mod log_store;
 mod mail;

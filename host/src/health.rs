@@ -6,8 +6,9 @@
 //!   the `log` object of the call (six counters and one gauge, and the write counts of a node
 //!   of release v2.1.0 or later), of its `log_store` object, of its `load` object (two gauges,
 //!   three counters and two gauges), of its `egress` object and of its `refresh` object, each
-//!   when the node answers with one; and the three series of the egress relay of the host
-//!   program itself, with every answer.
+//!   when the node answers with one; the gauge of its `grants` value and the four gauges of its
+//!   `state` object, each when the node answers with it; and the four series of the two relays
+//!   of the host program itself, with every answer.
 //!
 //! Every request makes one `health` call over a new connection to the node. Nothing is cached:
 //! an answer says what the node answered just now.
@@ -28,7 +29,7 @@ use tokio::net::TcpListener;
 
 use crate::egress::EgressCounters;
 use crate::http;
-use crate::relay::{self, AcceptFailure, NodeConnector};
+use crate::relay::{self, AcceptFailure, InboundCounters, NodeConnector};
 
 /// Longest `health` round trip that counts as a success.
 pub const HEALTH_TIMEOUT: Duration = Duration::from_secs(8);
@@ -42,14 +43,17 @@ const PROMETHEUS_TEXT: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 /// The values of the `health` call the host program reads (enclave.md 5.1). The response has
 /// more fields: they are not read. `log` is absent in the response of a node of a release
-/// before v2.0.0, `load` in the response of a node of a release before v2.0.1, and `egress` and
-/// `refresh` in the response of a node of a release before v2.1.0. `log_store` is null in the
-/// response of a node without a log store.
+/// before v2.0.0, `load` in the response of a node of a release before v2.0.1, and `egress`,
+/// `refresh` and `state` in the response of a node of a release before v2.1.0. `log_store` is
+/// null in the response of a node without a log store. `grants` is read when the response has
+/// it.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct NodeHealth {
     pub configured: bool,
     pub accounts: u64,
     pub started_ms: u64,
+    #[serde(default)]
+    pub grants: Option<u64>,
     #[serde(default)]
     pub log: Option<LogCounts>,
     #[serde(default)]
@@ -60,6 +64,25 @@ pub struct NodeHealth {
     pub egress: Option<EgressCounts>,
     #[serde(default)]
     pub refresh: Option<RefreshCounts>,
+    #[serde(default)]
+    pub state: Option<StateCounts>,
+}
+
+/// The `state` object of the `health` call: the sizes of the variable state of the accounts of
+/// the node and its idle connections at the moment of the call.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct StateCounts {
+    pub kept_refreshes: u64,
+    pub merge_keys: u64,
+    pub pending_entries: u64,
+    pub idle_connections: IdleConnections,
+}
+
+/// `idle_connections` of the `state` object: the idle connections of the node, by peer.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct IdleConnections {
+    pub provider: u64,
+    pub log_store: u64,
 }
 
 /// The `log` object of the `health` call: counts since the node started. The five values after
@@ -262,7 +285,23 @@ fn seconds_gauge(text: &mut String, name: &str, help: &str, ms: u64) {
     seconds(text, "gauge", name, help, ms);
 }
 
-/// A counter with one label: one sample per value of the label, in the order given.
+/// A series with one label: one sample per value of the label, in the order given.
+fn labeled_series(
+    text: &mut String,
+    kind: &str,
+    name: &str,
+    help: &str,
+    label: &str,
+    samples: &[(&str, u64)],
+) {
+    let _ = writeln!(text, "# HELP {name} {help}");
+    let _ = writeln!(text, "# TYPE {name} {kind}");
+    for (value, count) in samples {
+        let _ = writeln!(text, "{name}{{{label}=\"{value}\"}} {count}");
+    }
+}
+
+/// A counter with one label.
 fn labeled_counter(
     text: &mut String,
     name: &str,
@@ -270,11 +309,12 @@ fn labeled_counter(
     label: &str,
     samples: &[(&str, u64)],
 ) {
-    let _ = writeln!(text, "# HELP {name} {help}");
-    let _ = writeln!(text, "# TYPE {name} counter");
-    for (value, count) in samples {
-        let _ = writeln!(text, "{name}{{{label}=\"{value}\"}} {count}");
-    }
+    labeled_series(text, "counter", name, help, label, samples);
+}
+
+/// A gauge with one label.
+fn labeled_gauge(text: &mut String, name: &str, help: &str, label: &str, samples: &[(&str, u64)]) {
+    labeled_series(text, "gauge", name, help, label, samples);
 }
 
 /// A histogram of seconds: one `_bucket` sample per bound with the cumulative count within it,
@@ -299,17 +339,22 @@ fn seconds_histogram(
 }
 
 /// The metrics of one `health` call and of the host program itself. A failed call gives
-/// `credential_enclave_up 0` and the three series of the host program: the other series repeat
+/// `credential_enclave_up 0` and the four series of the host program: the other series repeat
 /// values of the response, and there is none. The series of the response come after the four
 /// gauges in the order of its objects, each when the node answered with the object: the seven
 /// series of the `log` object and, when the node gave its write counts, their series; the
 /// gauges of the `log_store` object; the series of the `load` object (two gauges, then the
 /// three CPU counters when the node gave the three values, then the two memory gauges when it
-/// gave the two values); the series of the `egress` object; the series of the `refresh` object.
-/// The three series of the host program come last. A counter of the node restarts at 0 when
-/// the node restarts (the started timestamp changes then), a CPU counter when the kernel of the
-/// node boots, and a counter of the host program when the host program starts.
-pub fn metrics(health: Option<&NodeHealth>, counters: &EgressCounters) -> String {
+/// gave the two values); the series of the `egress` object; the series of the `refresh`
+/// object; the gauge of the `grants` value; the gauges of the `state` object. The four series
+/// of the host program come last. A counter of the node restarts at 0 when the node restarts
+/// (the started timestamp changes then), a CPU counter when the kernel of the node boots, and a
+/// counter of the host program when the host program starts.
+pub fn metrics(
+    health: Option<&NodeHealth>,
+    counters: &EgressCounters,
+    inbound: &InboundCounters,
+) -> String {
     let mut text = String::new();
     gauge(
         &mut text,
@@ -320,7 +365,7 @@ pub fn metrics(health: Option<&NodeHealth>, counters: &EgressCounters) -> String
     if let Some(health) = health {
         node_series(&mut text, health);
     }
-    host_series(&mut text, counters);
+    host_series(&mut text, counters, inbound);
     text
 }
 
@@ -363,6 +408,49 @@ fn node_series(text: &mut String, health: &NodeHealth) {
     if let Some(refresh) = &health.refresh {
         refresh_series(text, refresh);
     }
+    if let Some(grants) = health.grants {
+        gauge(
+            text,
+            "credential_enclave_grants",
+            "Accounts of the enclave node that have a grant within its time.",
+            format_args!("{grants}"),
+        );
+    }
+    if let Some(state) = &health.state {
+        state_series(text, state);
+    }
+}
+
+/// The gauges of the `state` object.
+fn state_series(text: &mut String, state: &StateCounts) {
+    gauge(
+        text,
+        "credential_enclave_kept_refreshes",
+        "Kept refresh responses of the enclave node over every account at this moment.",
+        format_args!("{}", state.kept_refreshes),
+    );
+    gauge(
+        text,
+        "credential_enclave_merge_keys",
+        "Merge keys of identical GET requests of the enclave node over every account at this moment.",
+        format_args!("{}", state.merge_keys),
+    );
+    gauge(
+        text,
+        "credential_enclave_pending_entries",
+        "Log entries of the enclave node that the log store has not confirmed at this moment.",
+        format_args!("{}", state.pending_entries),
+    );
+    labeled_gauge(
+        text,
+        "credential_enclave_idle_connections",
+        "Idle connections the enclave node keeps at this moment, by peer.",
+        "peer",
+        &[
+            ("provider", state.idle_connections.provider),
+            ("log_store", state.idle_connections.log_store),
+        ],
+    );
 }
 
 /// The series of the `log` object: six counters and one gauge, then the series of the write
@@ -585,9 +673,10 @@ fn refresh_series(text: &mut String, refresh: &RefreshCounts) {
     );
 }
 
-/// The three series of the egress relay of the host program. The `cause` label takes the three
-/// classes of [`AcceptFailure`], and the `outcome` label the four outcomes of a connection.
-fn host_series(text: &mut String, counters: &EgressCounters) {
+/// The four series of the two relays of the host program: three of the egress relay (the
+/// `cause` label takes the three classes of [`AcceptFailure`], and the `outcome` label the
+/// four outcomes of a connection) and one of the inbound relay.
+fn host_series(text: &mut String, counters: &EgressCounters, inbound: &InboundCounters) {
     labeled_counter(
         text,
         "credential_enclave_host_egress_accept_errors_total",
@@ -608,6 +697,12 @@ fn host_series(text: &mut String, counters: &EgressCounters) {
         "Connections of the node whose bytes the egress relay of the host program moves at this moment.",
         format_args!("{}", counters.relays_inflight()),
     );
+    counter(
+        text,
+        "credential_enclave_host_inbound_node_connect_failures_total",
+        "Connections of callers for which the inbound relay of the host program could not open its connection to the node since it started.",
+        inbound.node_connect_failures(),
+    );
 }
 
 fn respond(status: StatusCode, content_type: &'static str, body: String) -> Response<Full<Bytes>> {
@@ -625,6 +720,7 @@ async fn answer(
     path: &str,
     node: &dyn NodeConnector,
     counters: &EgressCounters,
+    inbound: &InboundCounters,
 ) -> Response<Full<Bytes>> {
     if method != Method::GET {
         return respond(
@@ -647,7 +743,7 @@ async fn answer(
             respond(
                 StatusCode::OK,
                 PROMETHEUS_TEXT,
-                metrics(health.as_ref(), counters),
+                metrics(health.as_ref(), counters, inbound),
             )
         }
         _ => respond(StatusCode::NOT_FOUND, TEXT, "not found\n".into()),
@@ -655,11 +751,12 @@ async fn answer(
 }
 
 /// Serves the status surface on every connection of `listener`. `counters` are the counts of
-/// the egress relay, read for `/metrics`.
+/// the egress relay and `inbound` those of the inbound relay, read for `/metrics`.
 pub async fn serve(
     listener: TcpListener,
     node: Arc<dyn NodeConnector>,
     counters: Arc<EgressCounters>,
+    inbound: Arc<InboundCounters>,
 ) {
     loop {
         let (stream, _) = match listener.accept().await {
@@ -671,16 +768,19 @@ pub async fn serve(
         };
         let node = node.clone();
         let counters = counters.clone();
+        let inbound = inbound.clone();
         tokio::spawn(async move {
             let service = service_fn(move |request: Request<Incoming>| {
                 let node = node.clone();
                 let counters = counters.clone();
+                let inbound = inbound.clone();
                 async move {
                     let response = answer(
                         request.method(),
                         request.uri().path(),
                         node.as_ref(),
                         counters.as_ref(),
+                        inbound.as_ref(),
                     )
                     .await;
                     Ok::<_, Infallible>(response)
@@ -708,7 +808,7 @@ mod tests {
         health_body, health_body_with_egress_and_refresh, health_body_with_load, Behavior, FakeNode,
     };
 
-    /// The three series of the host program before the egress relay served a connection.
+    /// The four series of the host program before either relay served a connection.
     const HOST_SERIES_AT_START: &str =
         "# HELP credential_enclave_host_egress_accept_errors_total Failed accepts of the egress relay of the host program since it started, by cause.\n\
          # TYPE credential_enclave_host_egress_accept_errors_total counter\n\
@@ -723,10 +823,15 @@ mod tests {
          credential_enclave_host_egress_relays_total{outcome=\"unreachable\"} 0\n\
          # HELP credential_enclave_host_egress_relays_inflight Connections of the node whose bytes the egress relay of the host program moves at this moment.\n\
          # TYPE credential_enclave_host_egress_relays_inflight gauge\n\
-         credential_enclave_host_egress_relays_inflight 0\n";
+         credential_enclave_host_egress_relays_inflight 0\n\
+         # HELP credential_enclave_host_inbound_node_connect_failures_total Connections of callers for which the inbound relay of the host program could not open its connection to the node since it started.\n\
+         # TYPE credential_enclave_host_inbound_node_connect_failures_total counter\n\
+         credential_enclave_host_inbound_node_connect_failures_total 0\n";
 
-    /// The names of the series that a node of release v2.1.0 adds.
-    const NEW_SERIES: [&str; 12] = [
+    /// The names of the series that a node of release v2.1.0 adds, the gauge of `grants`
+    /// among them (the value is in the answer of every release, and the gauge follows the
+    /// series of the objects).
+    const NEW_SERIES: [&str; 17] = [
         "credential_enclave_log_store_write_attempt_failures_total",
         "credential_enclave_log_store_write_retries_total",
         "credential_enclave_log_store_write_seconds",
@@ -739,11 +844,21 @@ mod tests {
         "credential_enclave_egress_idle_reuses_total",
         "credential_enclave_refresh_late_total",
         "credential_enclave_refresh_late_inflight",
+        "credential_enclave_grants",
+        "credential_enclave_kept_refreshes",
+        "credential_enclave_merge_keys",
+        "credential_enclave_pending_entries",
+        "credential_enclave_idle_connections",
     ];
 
     /// The series of a response without the series of the host program, which come last.
     fn node_part(text: &str) -> &str {
         text.strip_suffix(HOST_SERIES_AT_START).unwrap()
+    }
+
+    /// The counts of an inbound relay that served no connection.
+    fn no_inbound() -> InboundCounters {
+        InboundCounters::default()
     }
 
     /// The `load` object of `testing::LOAD_OBJECT`, as the host program reads it.
@@ -759,10 +874,14 @@ mod tests {
         }
     }
 
-    async fn status_surface(node: Arc<FakeNode>, counters: Arc<EgressCounters>) -> SocketAddr {
+    async fn status_surface(
+        node: Arc<FakeNode>,
+        counters: Arc<EgressCounters>,
+        inbound: Arc<InboundCounters>,
+    ) -> SocketAddr {
         let listener = relay::listen_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
         let address = listener.local_addr().unwrap();
-        tokio::spawn(serve(listener, node, counters));
+        tokio::spawn(serve(listener, node, counters, inbound));
         address
     }
 
@@ -793,11 +912,13 @@ mod tests {
                 configured: true,
                 accounts: 7,
                 started_ms: 1_790_000_000_123,
+                grants: Some(0),
                 log: Some(log.clone()),
                 load: Some(load_of_the_body()),
                 log_store: None,
                 egress: None,
                 refresh: None,
+                state: None,
             })
         );
         let calls = node.calls();
@@ -816,16 +937,18 @@ mod tests {
                 configured: true,
                 accounts: 7,
                 started_ms: 1_790_000_000_123,
+                grants: Some(0),
                 log: Some(log.clone()),
                 load: None,
                 log_store: None,
                 egress: None,
                 refresh: None,
+                state: None,
             })
         );
 
         // A node of release v2.1.0 answers with the write counts of the log, the log store it
-        // holds, and the egress and refresh objects.
+        // holds, and the egress, refresh and state objects.
         let node = FakeNode::answering(|_| {
             (
                 200,
@@ -838,6 +961,7 @@ mod tests {
                 configured: true,
                 accounts: 7,
                 started_ms: 1_790_000_000_123,
+                grants: Some(0),
                 log: Some(LogCounts {
                     write_attempt_failures: Some(WriteAttemptFailures {
                         connect: 1,
@@ -891,6 +1015,15 @@ mod tests {
                     },
                     late_inflight: 5,
                 }),
+                state: Some(StateCounts {
+                    kept_refreshes: 11,
+                    merge_keys: 22,
+                    pending_entries: 33,
+                    idle_connections: IdleConnections {
+                        provider: 44,
+                        log_store: 55,
+                    },
+                }),
             })
         );
 
@@ -928,7 +1061,7 @@ mod tests {
         );
 
         // Fields a later node adds do not change the reading, and a node of a release before
-        // v2.0.0 answers without `log`.
+        // v2.0.0 answers without `log`. `grants` is read from every release that answers it.
         let node = FakeNode::answering(|_| {
             let body = r#"{"node":"n","custody":"enclave","grants":3,"configured":false,"accounts":0,"started_ms":5,"closing":true}"#;
             (200, body.to_string())
@@ -939,11 +1072,13 @@ mod tests {
                 configured: false,
                 accounts: 0,
                 started_ms: 5,
+                grants: Some(3),
                 log: None,
                 load: None,
                 log_store: None,
                 egress: None,
                 refresh: None,
+                state: None,
             })
         );
     }
@@ -980,18 +1115,21 @@ mod tests {
     #[test]
     fn the_metrics_are_four_gauges_of_the_health_call_and_the_series_of_its_log_and_load() {
         let no_counts = EgressCounters::default();
+        let no_inbound = no_inbound();
         let health = NodeHealth {
             configured: true,
             accounts: 12,
             started_ms: 1_790_000_000_042,
+            grants: None,
             log: None,
             load: None,
             log_store: None,
             egress: None,
             refresh: None,
+            state: None,
         };
         assert_eq!(
-            metrics(Some(&health), &no_counts),
+            metrics(Some(&health), &no_counts, &no_inbound),
             [
                 "# HELP credential_enclave_up 1 when the health call of the enclave node succeeds, 0 when it fails.\n\
                  # TYPE credential_enclave_up gauge\n\
@@ -1013,18 +1151,20 @@ mod tests {
             configured: false,
             accounts: 0,
             started_ms: 1000,
+            grants: None,
             log: None,
             load: None,
             log_store: None,
             egress: None,
             refresh: None,
+            state: None,
         };
-        let text = metrics(Some(&unconfigured), &no_counts);
+        let text = metrics(Some(&unconfigured), &no_counts, &no_inbound);
         assert!(text.contains("\ncredential_enclave_configured 0\n"));
         assert!(text.contains("\ncredential_enclave_accounts 0\n"));
         assert!(text.contains("\ncredential_enclave_started_timestamp_seconds 1.000\n"));
         assert!(!text.contains("credential_enclave_log_"));
-        assert_eq!(text.matches("# TYPE ").count(), 4 + 3);
+        assert_eq!(text.matches("# TYPE ").count(), 4 + 4);
 
         // With the `log` object of a node of release v2.0.0 or later: six counters and one
         // gauge after the four gauges, and none of the series of release v2.1.0.
@@ -1041,7 +1181,7 @@ mod tests {
             }),
             ..health
         };
-        let text = metrics(Some(&with_log), &no_counts);
+        let text = metrics(Some(&with_log), &no_counts, &no_inbound);
         assert!(text.starts_with("# HELP credential_enclave_up "));
         assert!(text.contains(
             "# HELP credential_enclave_log_entries_total Log entries the enclave node created since it started.\n\
@@ -1054,7 +1194,7 @@ mod tests {
         assert!(text.contains("\n# TYPE credential_enclave_forward_batch_calls_total counter\ncredential_enclave_forward_batch_calls_total 3\n"));
         assert!(text.contains("\n# TYPE credential_enclave_forward_batch_requests_total counter\ncredential_enclave_forward_batch_requests_total 35\n"));
         assert!(node_part(&text).ends_with("\n# TYPE credential_enclave_log_open_batches gauge\ncredential_enclave_log_open_batches 2\n"));
-        assert_eq!(text.matches("# TYPE ").count(), 11 + 3);
+        assert_eq!(text.matches("# TYPE ").count(), 11 + 4);
         for series in LOAD_SERIES.iter().chain(NEW_SERIES.iter()) {
             assert!(!text.contains(series), "{series}");
         }
@@ -1065,8 +1205,8 @@ mod tests {
             load: Some(load_of_the_body()),
             ..with_log.clone()
         };
-        let text = metrics(Some(&with_load), &no_counts);
-        assert_eq!(text.matches("# TYPE ").count(), 18 + 3);
+        let text = metrics(Some(&with_load), &no_counts, &no_inbound);
+        assert_eq!(text.matches("# TYPE ").count(), 18 + 4);
         for series in NEW_SERIES {
             assert!(!text.contains(series), "{series}");
         }
@@ -1113,8 +1253,8 @@ mod tests {
             }),
             ..with_log
         };
-        let text = metrics(Some(&without_kernel_values), &no_counts);
-        assert_eq!(text.matches("# TYPE ").count(), 13 + 3);
+        let text = metrics(Some(&without_kernel_values), &no_counts, &no_inbound);
+        assert_eq!(text.matches("# TYPE ").count(), 13 + 4);
         assert!(node_part(&text).ends_with(
             "\n# TYPE credential_enclave_forward_calls gauge\ncredential_enclave_forward_calls 1\n"
         ));
@@ -1131,8 +1271,8 @@ mod tests {
             )
         });
         let health = node_health(node.as_ref()).await.unwrap();
-        let text = metrics(Some(&health), &EgressCounters::default());
-        assert_eq!(text.matches("# TYPE ").count(), 18 + 12 + 3);
+        let text = metrics(Some(&health), &EgressCounters::default(), &no_inbound());
+        assert_eq!(text.matches("# TYPE ").count(), 18 + 17 + 4);
 
         // The series of the write counts follow the seven series of the log, the two gauges of
         // the log store follow them, and the series of the load come next.
@@ -1182,8 +1322,9 @@ mod tests {
             "_bucket{{le=\"+Inf\"}} {write_count}\ncredential_enclave_log_store_write_seconds_sum 123.456\ncredential_enclave_log_store_write_seconds_count {write_count}\n"
         )));
 
-        // The series of the egress and refresh objects follow the load, and the series of the
-        // host program come last.
+        // The series of the egress and refresh objects follow the load, the gauge of the grants
+        // and the gauges of the state object follow them, and the series of the host program
+        // come last.
         let tail = rest
             .split_once("credential_enclave_memory_available_bytes 3221225472\n")
             .unwrap()
@@ -1218,7 +1359,23 @@ mod tests {
                  credential_enclave_refresh_late_total{outcome=\"abandoned\"} 4\n\
                  # HELP credential_enclave_refresh_late_inflight Token address calls of refresh that continue after the time limit of their call at this moment.\n\
                  # TYPE credential_enclave_refresh_late_inflight gauge\n\
-                 credential_enclave_refresh_late_inflight 5\n",
+                 credential_enclave_refresh_late_inflight 5\n\
+                 # HELP credential_enclave_grants Accounts of the enclave node that have a grant within its time.\n\
+                 # TYPE credential_enclave_grants gauge\n\
+                 credential_enclave_grants 0\n\
+                 # HELP credential_enclave_kept_refreshes Kept refresh responses of the enclave node over every account at this moment.\n\
+                 # TYPE credential_enclave_kept_refreshes gauge\n\
+                 credential_enclave_kept_refreshes 11\n\
+                 # HELP credential_enclave_merge_keys Merge keys of identical GET requests of the enclave node over every account at this moment.\n\
+                 # TYPE credential_enclave_merge_keys gauge\n\
+                 credential_enclave_merge_keys 22\n\
+                 # HELP credential_enclave_pending_entries Log entries of the enclave node that the log store has not confirmed at this moment.\n\
+                 # TYPE credential_enclave_pending_entries gauge\n\
+                 credential_enclave_pending_entries 33\n\
+                 # HELP credential_enclave_idle_connections Idle connections the enclave node keeps at this moment, by peer.\n\
+                 # TYPE credential_enclave_idle_connections gauge\n\
+                 credential_enclave_idle_connections{peer=\"provider\"} 44\n\
+                 credential_enclave_idle_connections{peer=\"log_store\"} 55\n",
                 HOST_SERIES_AT_START,
             ]
             .concat()
@@ -1238,9 +1395,10 @@ mod tests {
             }),
             egress: None,
             refresh: None,
+            state: None,
             ..health
         };
-        let text = metrics(Some(&partial), &EgressCounters::default());
+        let text = metrics(Some(&partial), &EgressCounters::default(), &no_inbound());
         assert!(text.contains("\ncredential_enclave_log_store_write_retries_total 1\n"));
         assert!(text.contains("\ncredential_enclave_log_store_pending_accounts 2\n"));
         assert!(!text.contains("credential_enclave_log_store_write_seconds"));
@@ -1248,6 +1406,9 @@ mod tests {
         assert!(!text.contains("credential_enclave_log_store_pending_oldest_seconds"));
         assert!(!text.contains("credential_enclave_egress_"));
         assert!(!text.contains("credential_enclave_refresh_"));
+        assert!(!text.contains("credential_enclave_kept_refreshes"));
+        assert!(!text.contains("credential_enclave_idle_connections"));
+        assert!(node_part(&text).ends_with("\ncredential_enclave_grants 0\n"));
     }
 
     /// The names of the seven series of the `load` object.
@@ -1264,7 +1425,7 @@ mod tests {
     #[test]
     fn a_failed_health_call_gives_the_up_gauge_and_the_series_of_the_host_program() {
         assert_eq!(
-            metrics(None, &EgressCounters::default()),
+            metrics(None, &EgressCounters::default(), &no_inbound()),
             [
                 "# HELP credential_enclave_up 1 when the health call of the enclave node succeeds, 0 when it fails.\n\
                  # TYPE credential_enclave_up gauge\n\
@@ -1278,7 +1439,12 @@ mod tests {
     #[tokio::test]
     async fn healthz_follows_the_node() {
         let node = FakeNode::answering(|_| (200, health_body(false, 0, 1_790_000_000_000)));
-        let address = status_surface(node.clone(), Arc::new(EgressCounters::default())).await;
+        let address = status_surface(
+            node.clone(),
+            Arc::new(EgressCounters::default()),
+            Arc::new(no_inbound()),
+        )
+        .await;
         assert_eq!(
             call(address, Method::GET, "/healthz").await,
             (200, "ok\n".to_string())
@@ -1295,11 +1461,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_metrics_route_reports_the_node_its_absence_and_the_egress_relay() {
+    async fn the_metrics_route_reports_the_node_its_absence_and_the_two_relays() {
         let node =
             FakeNode::answering(|_| (200, health_body_with_load(true, 3, 1_790_000_000_500)));
         let counters = Arc::new(EgressCounters::default());
-        let address = status_surface(node.clone(), counters.clone()).await;
+        let inbound_counters = Arc::new(no_inbound());
+        let address =
+            status_surface(node.clone(), counters.clone(), inbound_counters.clone()).await;
         let (status, text) = call(address, Method::GET, "/metrics").await;
         assert_eq!(status, 200);
         assert!(text.contains("\ncredential_enclave_up 1\n"), "{text}");
@@ -1328,13 +1496,20 @@ mod tests {
             text.contains("\ncredential_enclave_cpu_user_seconds_total 1.234\n"),
             "{text}"
         );
+        // The gauge of the grants follows the series of the objects of the answer.
         assert!(
-            node_part(&text).ends_with("\ncredential_enclave_memory_available_bytes 3221225472\n"),
+            node_part(&text).ends_with(
+                "\ncredential_enclave_memory_available_bytes 3221225472\n\
+                 # HELP credential_enclave_grants Accounts of the enclave node that have a grant within its time.\n\
+                 # TYPE credential_enclave_grants gauge\n\
+                 credential_enclave_grants 0\n"
+            ),
             "{text}"
         );
 
-        // The egress relay refuses one connection of the node: the series of the host program
-        // count it, whatever the node answers.
+        // The egress relay refuses one connection of the node, and the inbound relay cannot
+        // reach the node for one connection of a caller: the series of the host program count
+        // both, whatever the node answers.
         let (mut node_side, inbound) = tokio::io::duplex(64);
         node_side.write_all(b"\n").await.unwrap();
         let allowlist = Allowlist::from_definitions(crate::DEFINITIONS).unwrap();
@@ -1342,8 +1517,28 @@ mod tests {
             crate::egress::relay(inbound, &allowlist, &TcpOutbound, &counters).await,
             Outcome::Malformed
         );
+        let relay_listener = relay::listen_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let relay_address = relay_listener.local_addr().unwrap();
+        tokio::spawn(relay::serve(
+            relay_listener,
+            FakeNode::new(Behavior::Unreachable),
+            inbound_counters.clone(),
+        ));
+        let mut caller = TcpStream::connect(relay_address).await.unwrap();
+        let mut buffer = [0u8; 8];
+        assert!(matches!(
+            tokio::io::AsyncReadExt::read(&mut caller, &mut buffer).await,
+            Ok(0) | Err(_)
+        ));
+        for _ in 0..200 {
+            if inbound_counters.node_connect_failures() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
 
-        // A node of release v2.0.0 answers without `load`: none of its series.
+        // A node of release v2.0.0 answers without `load`: none of its series, and the gauge
+        // of the grants after the series of the log.
         node.set(Behavior::Answer(Arc::new(|_| {
             (200, health_body(true, 3, 1_790_000_000_500))
         })));
@@ -1353,7 +1548,12 @@ mod tests {
             .split_once("# HELP credential_enclave_host_egress_accept_errors_total ")
             .unwrap();
         assert!(
-            node_text.ends_with("\ncredential_enclave_log_open_batches 2\n"),
+            node_text.ends_with(
+                "\ncredential_enclave_log_open_batches 2\n\
+                 # HELP credential_enclave_grants Accounts of the enclave node that have a grant within its time.\n\
+                 # TYPE credential_enclave_grants gauge\n\
+                 credential_enclave_grants 0\n"
+            ),
             "{text}"
         );
         for series in LOAD_SERIES {
@@ -1366,7 +1566,12 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.ends_with("\ncredential_enclave_host_egress_relays_inflight 0\n"),
+            text.ends_with(
+                "\ncredential_enclave_host_egress_relays_inflight 0\n\
+                 # HELP credential_enclave_host_inbound_node_connect_failures_total Connections of callers for which the inbound relay of the host program could not open its connection to the node since it started.\n\
+                 # TYPE credential_enclave_host_inbound_node_connect_failures_total counter\n\
+                 credential_enclave_host_inbound_node_connect_failures_total 1\n"
+            ),
             "{text}"
         );
 
@@ -1385,13 +1590,22 @@ mod tests {
             ),
             "{text}"
         );
-        assert_eq!(text.matches("# TYPE ").count(), 1 + 3);
+        assert!(
+            text.ends_with("\ncredential_enclave_host_inbound_node_connect_failures_total 1\n"),
+            "{text}"
+        );
+        assert_eq!(text.matches("# TYPE ").count(), 1 + 4);
     }
 
     #[tokio::test]
     async fn other_paths_and_methods_are_refused() {
         let node = FakeNode::answering(|_| (200, health_body(true, 0, 1)));
-        let address = status_surface(node.clone(), Arc::new(EgressCounters::default())).await;
+        let address = status_surface(
+            node.clone(),
+            Arc::new(EgressCounters::default()),
+            Arc::new(no_inbound()),
+        )
+        .await;
         assert_eq!(call(address, Method::GET, "/").await.0, 404);
         assert_eq!(call(address, Method::GET, "/v1/health").await.0, 404);
         assert_eq!(call(address, Method::POST, "/healthz").await.0, 405);

@@ -748,7 +748,7 @@ async fn a_pending_entry_is_written_again_with_the_next_write_of_the_account() {
     }
     assert_eq!(harness.health().await["log_store"]["pending"], 0);
     let account = harness.node.account("user-1").unwrap();
-    assert!(lock(&account).unconfirmed.is_empty());
+    assert!(lock(&account).unconfirmed().is_empty());
 
     // A pending entry that the store still refuses does not fail the call that took it along.
     refuse(&store, 500);
@@ -760,11 +760,11 @@ async fn a_pending_entry_is_written_again_with_the_next_write_of_the_account() {
     let (status, released) = release(&harness, &app, &vault).await;
     assert_eq!((status, &released["value"]), (200, &json!("hunter2")));
     assert_eq!(lock(&account).pending_entries(), 1);
-    assert_eq!(lock(&account).unconfirmed[0].seq, 5);
+    assert_eq!(lock(&account).unconfirmed()[0].seq, 5);
     // It is taken along again by the write after that.
     confirm(&store);
     assert_eq!(release(&harness, &app, &vault).await.0, 200);
-    assert!(lock(&account).unconfirmed.is_empty());
+    assert!(lock(&account).unconfirmed().is_empty());
     let all: Vec<u64> = writes(&provider).iter().map(seq_of).collect();
     assert_eq!(all.iter().filter(|seq| **seq == 5).count(), 3);
 }
@@ -780,15 +780,22 @@ async fn the_sweep_of_the_node_writes_a_pending_entry_again_without_a_further_ca
     let vault = password(&app);
 
     // A release the store refuses: entry 2 is pending, and the account makes no further call.
+    // The age of the oldest pending entry is what the last sweep found: 0 before a sweep ran,
+    // and the age of entry 2 after the sweep that found it (the store still refuses).
     refuse(&store, 500);
     unavailable(&release(&harness, &app, &vault).await);
+    let health = harness.health().await;
+    assert_eq!(health["log_store"]["pending"], 1);
+    assert_eq!(health["log_store"]["pending_oldest_ms"], 0);
+    log_store::sweep(&harness.node).await;
     let health = harness.health().await;
     assert_eq!(health["log_store"]["pending"], 1);
     assert!(health["log_store"]["pending_oldest_ms"].as_u64().unwrap() < 5_000);
     let before = writes(&provider).len();
 
     // Once the entry has been pending for the interval of the sweep, the sweep writes it
-    // again: the same entry under its own key, confirmed.
+    // again: the same entry under its own key, confirmed. The age grows with the node time
+    // until that sweep.
     confirm(&store);
     harness.node.clock.advance(SWEEP_INTERVAL_MS);
     assert!(
@@ -805,7 +812,7 @@ async fn the_sweep_of_the_node_writes_a_pending_entry_again_without_a_further_ca
     assert_eq!(health["log_store"]["pending"], 0);
     assert_eq!(health["log_store"]["pending_oldest_ms"], 0);
     let account = harness.node.account("user-1").unwrap();
-    assert!(lock(&account).unconfirmed.is_empty());
+    assert!(lock(&account).unconfirmed().is_empty());
 
     // A store that still refuses leaves the entry pending for the next sweep; a sweep of an
     // account without a pending entry writes nothing.
@@ -1046,7 +1053,7 @@ async fn a_revoke_erases_the_key_whatever_the_store_answers() {
     // The next write of the account takes it along: here the entry of a new grant.
     confirm(&store);
     app.grant(&harness).await;
-    assert!(lock(&account).unconfirmed.is_empty());
+    assert!(lock(&account).unconfirmed().is_empty());
     let last: Vec<u64> = writes(&provider).iter().rev().take(2).map(seq_of).collect();
     assert!(last.contains(&3) && last.contains(&4), "{last:?}");
 
@@ -1492,7 +1499,7 @@ async fn an_account_collects_at_most_64_pending_entries_of_calls_that_use_a_cred
     // the release after it.
     confirm(&store);
     app.grant(&harness).await;
-    assert!(lock(&account).unconfirmed.is_empty());
+    assert!(lock(&account).unconfirmed().is_empty());
     let (status, released) = release(&harness, &app, &vault).await;
     assert_eq!((status, &released["value"]), (200, &json!("hunter2")));
     // Every entry of the chain is in the store.
@@ -1517,7 +1524,7 @@ async fn a_call_at_the_limit_of_pending_entries_goes_on_once_the_store_made_room
     let (status, released) = release(&harness, &app, &vault).await;
     assert_eq!((status, &released["value"]), (200, &json!("hunter2")));
     assert_eq!(released["log"]["seq"], 2 + PENDING_ENTRIES as u64);
-    assert!(lock(&account).unconfirmed.is_empty());
+    assert!(lock(&account).unconfirmed().is_empty());
     // The call wrote the 64 pending entries first, and its own entry after the store took
     // them.
     let seqs: Vec<u64> = writes(&provider).iter().map(seq_of).collect();
@@ -1545,14 +1552,14 @@ async fn a_call_that_ends_before_its_write_leaves_its_entry_pending() {
     // Its entry is on the chain and no call writes it: it is a pending entry, and the account
     // has no writer.
     assert_eq!(harness.head_seq("user-1"), 2);
-    assert_eq!(lock(&account).unconfirmed.len(), 1);
+    assert_eq!(lock(&account).unconfirmed().len(), 1);
     assert_eq!(lock(&account).pending_entries(), 1);
     assert!(!lock(&account).writer);
 
     // The next write of the account takes it along.
     confirm(&store);
     assert_eq!(release(&harness, &app, &vault).await.0, 200);
-    assert!(lock(&account).unconfirmed.is_empty());
+    assert!(lock(&account).unconfirmed().is_empty());
 }
 
 #[tokio::test]
@@ -1581,7 +1588,7 @@ async fn a_node_without_a_log_store_writes_nowhere() {
     assert!(writes(&provider).is_empty());
     assert_eq!(harness.health().await["log_store"], Value::Null);
     let account = harness.node.account("user-1").unwrap();
-    assert!(lock(&account).unconfirmed.is_empty());
+    assert!(lock(&account).unconfirmed().is_empty());
     assert_eq!(
         harness.platform.connections(),
         [("gmail.googleapis.com".to_string(), 443)]
@@ -1648,7 +1655,7 @@ async fn a_revoke_that_is_accepted_while_a_grant_waits_for_the_store_stands() {
     );
     assert_eq!(writes(&provider).len(), 1);
     let account = harness.node.account("user-1").unwrap();
-    assert!(lock(&account).unconfirmed.is_empty());
+    assert!(lock(&account).unconfirmed().is_empty());
     assert_eq!(harness.head_seq("user-1"), 1);
 }
 
@@ -1725,7 +1732,7 @@ async fn calls_that_run_at_the_same_time_form_one_entry_and_write_each_entry_onc
         .collect();
     assert_eq!(counts, [1, 1, 3]);
     let account = harness.node.account("user-1").unwrap();
-    assert!(lock(&account).unconfirmed.is_empty());
+    assert!(lock(&account).unconfirmed().is_empty());
 }
 
 #[tokio::test]
@@ -1764,7 +1771,7 @@ async fn a_write_the_store_refuses_fails_the_writer_and_the_calls_that_waited_fo
     let (status, released) = release(&harness, &app, &vault).await;
     assert_eq!((status, &released["value"]), (200, &json!("hunter2")));
     assert_eq!(released["log"]["seq"], 4);
-    assert!(lock(&account).unconfirmed.is_empty());
+    assert!(lock(&account).unconfirmed().is_empty());
     let mut seqs: Vec<u64> = writes(&provider)[4..].iter().map(seq_of).collect();
     seqs.sort();
     assert_eq!(seqs, [2, 3, 4]);

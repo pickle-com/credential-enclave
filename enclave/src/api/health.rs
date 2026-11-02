@@ -8,8 +8,9 @@ use axum::response::Response;
 
 use super::json_ok;
 use super::responses::{
-    EgressCounts, Health, IdleReuseCounts, LateRefreshCounts, Load, LogCounts, LogStoreState,
-    OpenFailureCounts, RefreshCounts, WriteAttemptFailureCounts, WriteMsBuckets,
+    EgressCounts, Health, IdleConnectionCounts, IdleReuseCounts, LateRefreshCounts, Load,
+    LogCounts, LogStoreState, OpenFailureCounts, RefreshCounts, StateCounts,
+    WriteAttemptFailureCounts, WriteMsBuckets,
 };
 use crate::load;
 use crate::state::Node;
@@ -18,24 +19,31 @@ use crate::state::Node;
 /// node and `grants` the accounts that have a grant within its time (the operator domain reads
 /// it to see that a delegation transfer arrived). `log_store` is null on a node without a log
 /// store. Otherwise it names the bucket and its region, the end of the credentials the node
-/// holds (0 when it holds none), the number of accounts that have a pending entry and the age
-/// of the oldest pending entry. `log` counts the entries, events, write attempts (confirmed,
-/// failed by cause, repeated, and the time to confirmation of the confirmed ones) and batch
-/// calls since the node started. `load` is the load at the moment of the call: the provider
-/// requests in flight, the calls that hold a forward slot, and the CPU time and the memory of
-/// the kernel the node runs in, read from procfs (`crate::load`), null where the kernel
-/// exposes no value. `egress` counts the outbound connections (opened, failed by cause,
-/// repeated, being opened, and the requests that reused an idle connection), and `refresh`
-/// the token address calls of `refresh` the node continued after their time limit, by
-/// outcome and in progress.
+/// holds (0 when it holds none), the number of accounts that have an entry the store has not
+/// confirmed and the age of the oldest pending entry as the last sweep of the node found it.
+/// `log` counts the entries, events, write attempts (confirmed, failed by cause, repeated, and
+/// the time to confirmation of the confirmed ones) and batch calls since the node started.
+/// `load` is the load at the moment of the call: the provider requests in flight, the calls
+/// that hold a forward slot, and the CPU time and the memory of the kernel the node runs in,
+/// read from procfs (`crate::load`), null where the kernel exposes no value. `egress` counts
+/// the outbound connections (opened, failed by cause, repeated, being opened, and the requests
+/// that reused an idle connection), `refresh` the token address calls of `refresh` the node
+/// continued after their time limit, by outcome and in progress, and `state` the sizes of the
+/// variable state of the accounts (kept `refresh` responses, merge keys, unconfirmed entries)
+/// and the idle connections by peer.
+///
+/// Every count of the accounts is a count the node keeps with the state it counts
+/// (`crate::state::StateCounters`): the call walks no account, so its time does not grow with
+/// the number of accounts.
 pub async fn health(State(node): State<Arc<Node>>) -> Response {
     let counters = &node.log_counters;
     let egress = &node.egress.counters;
     let refresh = &node.refresh_counters;
+    let state = &node.counters;
     let cpu = load::read_cpu();
     let memory = load::read_memory();
-    let pending = node.pending_summary();
     let read = |counter: &std::sync::atomic::AtomicU64| counter.load(Ordering::Relaxed);
+    let count = |counter: &std::sync::atomic::AtomicUsize| counter.load(Ordering::Relaxed);
     let buckets = &counters.write_ms_buckets;
     json_ok(&Health {
         node: &node.node,
@@ -47,21 +55,21 @@ pub async fn health(State(node): State<Arc<Node>>) -> Response {
         configured: node.is_configured(),
         closing: node.closing.load(Ordering::SeqCst),
         accounts: node.account_count(),
-        grants: node.grant_count(),
+        grants: count(&state.grants),
         mail_providers: &["naver_mail"],
         log_store: node.log_store.id().map(|id| LogStoreState {
             bucket: id.bucket(),
             region: id.region(),
             credentials_expires_ms: node.log_store.credentials_expires_ms(),
-            pending: pending.accounts,
-            pending_oldest_ms: pending.oldest_ms,
+            pending: count(&state.pending_accounts),
+            pending_oldest_ms: node.pending_oldest_ms(),
         }),
         log: LogCounts {
             entries: read(&counters.entries),
             events: read(&counters.events),
             writes: read(&counters.writes),
             write_failures: read(&counters.write_failures),
-            open_batches: node.open_batch_count(),
+            open_batches: count(&state.open_batches),
             batch_calls: read(&counters.batch_calls),
             batch_requests: read(&counters.batch_requests),
             write_attempt_failures: WriteAttemptFailureCounts {
@@ -118,6 +126,15 @@ pub async fn health(State(node): State<Arc<Node>>) -> Response {
                 abandoned: read(&refresh.late_abandoned),
             },
             late_inflight: node.late_refreshes_inflight(),
+        },
+        state: StateCounts {
+            kept_refreshes: count(&state.kept_refreshes),
+            merge_keys: count(&state.merge_keys),
+            pending_entries: count(&state.pending_entries),
+            idle_connections: IdleConnectionCounts {
+                provider: node.egress.provider_idle.idle_total(),
+                log_store: node.log_store.idle_connections(),
+            },
         },
     })
 }

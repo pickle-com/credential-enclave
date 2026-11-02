@@ -498,6 +498,12 @@ impl ProviderConnections {
             .get(&(user_id.to_string(), host.to_string()))
             .map_or(0, Vec::len)
     }
+
+    /// The number of idle connections over every account and host, as they are kept at this
+    /// moment (`provider` of `idle_connections` of health).
+    pub fn idle_total(&self) -> usize {
+        lock(&self.0).values().map(Vec::len).sum()
+    }
 }
 
 /// The TLS client of a node.

@@ -543,7 +543,7 @@ fn unconfirmed_parts(
     user_id: &str,
 ) -> Vec<EntryParts> {
     lock(account)
-        .unconfirmed
+        .unconfirmed()
         .iter()
         .map(|entry| {
             match parse_object_key(&entry.key, &chain_prefix(user_id, &harness.node.node)) {
@@ -595,7 +595,7 @@ async fn an_entry_holds_at_most_128_events() {
     let log = harness.health().await["log"].clone();
     assert_eq!((&log["entries"], &log["events"]), (&json!(2), &json!(129)));
     // The events of the first entry open in the order of their creation.
-    let entry = serde_json::to_value(&lock(&account).unconfirmed[0].entry).unwrap();
+    let entry = serde_json::to_value(&lock(&account).unconfirmed()[0].entry).unwrap();
     let events = app.events(&harness, &entry);
     assert_eq!(events.len(), limits::ENTRY_EVENTS);
     assert_eq!(events[0]["record_id"], "r0");
@@ -621,7 +621,7 @@ async fn an_entry_plaintext_stays_under_the_byte_limit() {
     assert_eq!(parts.len(), 1);
     assert_eq!((parts[0].seq, parts[0].count), (1, 3));
     assert_eq!(lock(&account).open.events.len(), 1);
-    let entry = serde_json::to_value(&lock(&account).unconfirmed[0].entry).unwrap();
+    let entry = serde_json::to_value(&lock(&account).unconfirmed()[0].entry).unwrap();
     let events = app.events(&harness, &entry);
     let plaintext = to_json(&Value::Array(events.clone()));
     assert!(plaintext.len() <= limits::ENTRY_PLAINTEXT_BYTES);
@@ -670,7 +670,7 @@ async fn event_and_entry_times_do_not_decrease() {
             .unwrap();
     }
     let written: Vec<(u64, u64, Vec<u64>)> = lock(&account)
-        .unconfirmed
+        .unconfirmed()
         .iter()
         .map(|entry| times_of(&entry.entry))
         .collect();
@@ -707,7 +707,7 @@ async fn event_and_entry_times_do_not_decrease() {
         .node
         .close_batch(&mut lock(&account), "user-1", 8_500)
         .unwrap();
-    let last = times_of(&lock(&account).unconfirmed[5].entry);
+    let last = times_of(&lock(&account).unconfirmed()[5].entry);
     assert_eq!(last, (6, 9_000, vec![9_000, 9_000]));
 }
 
@@ -941,16 +941,21 @@ async fn close_ends_every_chain_with_a_final_head() {
     .unwrap();
     assert_eq!(end.seq, 2);
 
-    // A node creates one final head per account: asking again returns the same heads.
+    // A node creates one final head per account: asking again returns the same heads. The
+    // store confirmed every entry, so no head was moved and no account was skipped.
     let (_, all) = harness
         .post("/v1/close/heads", json!({"cursor": "", "limit": 1000}))
         .await;
     assert_eq!(all["heads"], json!([first["heads"][0], second["heads"][0]]));
     assert_eq!(all["next"], "");
+    assert_eq!((&all["truncated"], &all["skipped"]), (&json!(0), &json!(0)));
     let (_, past) = harness
         .post("/v1/close/heads", json!({"cursor": "bob", "limit": 10}))
         .await;
-    assert_eq!(past, json!({"heads": [], "next": ""}));
+    assert_eq!(
+        past,
+        json!({"heads": [], "next": "", "truncated": 0, "skipped": 0})
+    );
     assert_eq!(harness.head_seq("alice"), 2);
 }
 
