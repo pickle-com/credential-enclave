@@ -1,7 +1,9 @@
 //! The final head of the orderly shutdown (enclave.md 5.11, protocol.md 7.3): it stands at the
-//! last entry the log store confirmed. Pending entries that are the tail of a chain are dropped
-//! and the head moves below them; a confirmed entry above a pending one leaves the account
-//! without a head until the gap closes.
+//! last entry the log store confirmed. Pending entries that are the tail of a chain and that the
+//! store is known not to hold are dropped and the head moves below them; an entry the store may
+//! hold (a request that left and got no answer, a 5xx answer, a call that ended while the store
+//! held its request) and a confirmed entry above a pending one leave the account without a head
+//! until the store confirms the entry or the gap closes.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -16,12 +18,13 @@ use super::provider_and_log_store;
 use crate::state::{lock, Limits};
 use crate::testing::{App, Harness, Provider, Reply};
 
-/// What the log store stand-in does with a write: it refuses every write when `status` is not
-/// 0, and the writes of the entry `seq` alone when `seq` is set; it reads `lost` writes and
-/// closes the connection without a response; it reads every write without answering while
-/// `hang` is set. `confirmed` holds the request targets of the writes it answered with 200: the
-/// objects the store holds (a refused write stores nothing; a lost or hanging write may or may
-/// not have been stored, as far as the node can tell).
+/// What the log store stand-in does with a write: it refuses every write with `status` when
+/// `status` is not 0, and the writes of the entry `seq` alone (with `status`, or 403 when
+/// `status` is 0) when `seq` is set; it reads `lost` writes and closes the connection without a
+/// response; it reads every write without answering while `hang` is set. `confirmed` holds the
+/// request targets of the writes it answered with 200: the objects the store holds (a write
+/// refused with a 4xx status stores nothing; a write answered with a 5xx status, a lost write and
+/// a hanging write may or may not have been stored, as far as the node can tell).
 #[derive(Default)]
 struct Refusal {
     status: u16,
@@ -54,7 +57,14 @@ async fn refusing_store() -> (Provider, Store) {
                 .is_some_and(|seq| seen.target.contains(&format!("/{seq:020}-")));
             let refused = of_seq || (refusal.seq.is_none() && refusal.status != 0);
             match refused {
-                true => Reply::with_body(503, &[], b"<Error></Error>"),
+                true => Reply::with_body(
+                    match refusal.status {
+                        0 => 403,
+                        status => status,
+                    },
+                    &[],
+                    b"<Error></Error>",
+                ),
                 false => {
                     refusal.confirmed.push(seen.target.clone());
                     Reply::with_body(200, &[("etag", "\"0\"")], b"")
@@ -143,10 +153,11 @@ fn verified_end(
 async fn a_pending_tail_is_dropped_and_the_final_head_stands_at_the_last_confirmed_entry() {
     let (provider, store) = refusing_store().await;
     let (harness, app) = node_with_log_store(&provider).await;
-    // Entry 1 (the grant) and entry 2 (a release) are in the store. Then the store refuses:
-    // two releases fail and leave entries 3 and 4 pending.
+    // Entry 1 (the grant) and entry 2 (a release) are in the store. Then the store refuses
+    // with a 4xx status (the object is known not to be there): two releases fail and leave
+    // entries 3 and 4 pending.
     assert_eq!(release(&harness, &app).await.0, 200);
-    lock(&store).status = 503;
+    lock(&store).status = 403;
     for _ in 0..2 {
         assert_eq!(
             release(&harness, &app).await.1["code"],
@@ -232,11 +243,11 @@ async fn a_tail_whose_write_may_have_reached_the_store_leaves_the_account_withou
     );
     assert_eq!(health["state"]["pending_entries"], 2);
 
-    // The shutdown while the store refuses with a status: the entries are known not to be
+    // The shutdown while the store refuses with a 4xx status: the entries are known not to be
     // stored by that round, and still the earlier attempts may have stored them. The account
     // gets no final head, nothing is dropped, and the sweep keeps the entries pending.
     lock(&store).hang = false;
-    lock(&store).status = 503;
+    lock(&store).status = 403;
     assert_eq!(harness.post("/v1/close", json!({})).await.0, 200);
     let page = heads(&harness).await;
     assert_eq!(
@@ -312,6 +323,93 @@ async fn a_tail_whose_writes_never_left_the_node_is_dropped() {
 }
 
 #[tokio::test]
+async fn a_tail_the_store_answered_with_a_5xx_status_leaves_the_account_without_a_head() {
+    let (provider, store) = refusing_store().await;
+    let (harness, app) = node_with_log_store(&provider).await;
+    assert_eq!(release(&harness, &app).await.0, 200);
+    // The store answers the writes of entries 3 and 4 with 503: S3 promises nothing about the
+    // object of such an answer, so the entries may be in the store.
+    lock(&store).status = 503;
+    for _ in 0..2 {
+        assert_eq!(
+            release(&harness, &app).await.1["code"],
+            "log_store_unavailable"
+        );
+    }
+    assert_eq!(harness.head_seq("user-1"), 4);
+    let health = harness.health().await;
+    assert!(
+        health["log"]["write_attempt_failures"]["status_5xx"]
+            .as_u64()
+            .unwrap()
+            >= 2
+    );
+
+    // The shutdown while the store keeps answering 503: no final head, nothing dropped.
+    assert_eq!(harness.post("/v1/close", json!({})).await.0, 200);
+    let page = heads(&harness).await;
+    assert_eq!(
+        (&page["heads"], &page["truncated"], &page["skipped"]),
+        (&json!([]), &json!(0), &json!(1))
+    );
+    assert_eq!(harness.head_seq("user-1"), 4);
+    let account = harness.node.account("user-1").unwrap();
+    assert_eq!(lock(&account).unconfirmed().len(), 2);
+
+    // The store takes the entries: the round of the repeated call writes them and the head
+    // stands at the end of the chain.
+    lock(&store).status = 0;
+    let page = heads(&harness).await;
+    assert!(lock(&account).unconfirmed().is_empty());
+    let head = harness.verified(purpose::HEAD, &page["heads"][0]);
+    assert_eq!((&head["seq"], &head["final"]), (&json!(4), &json!(true)));
+    let end = verified_end(&provider, &store, &harness, "user-1", &page["heads"][0]);
+    assert_eq!(end.seq, 4);
+}
+
+#[tokio::test]
+async fn a_write_a_call_abandoned_while_the_store_held_its_request_leaves_the_account_without_a_head(
+) {
+    let (provider, store) = refusing_store().await;
+    let (harness, app) = node_with_log_store(&provider).await;
+    assert_eq!(release(&harness, &app).await.0, 200);
+    // Entry 3: the store reads the write and never answers, and the caller gives up before the
+    // time limit of the attempt. The request was with the store when the call ended, so the
+    // node knows nothing about the object.
+    lock(&store).hang = true;
+    let call = release(&harness, &app);
+    assert!(tokio::time::timeout(Duration::from_millis(300), call)
+        .await
+        .is_err());
+    assert_eq!(harness.head_seq("user-1"), 3);
+    let account = harness.node.account("user-1").unwrap();
+    assert_eq!(lock(&account).unconfirmed().len(), 1);
+
+    // The shutdown while the store refuses with a 4xx status: the round of the page fails
+    // definitely, and still the account gets no final head, because the abandoned request
+    // may have stored the object.
+    lock(&store).hang = false;
+    lock(&store).status = 403;
+    assert_eq!(harness.post("/v1/close", json!({})).await.0, 200);
+    let page = heads(&harness).await;
+    assert_eq!(
+        (&page["heads"], &page["truncated"], &page["skipped"]),
+        (&json!([]), &json!(0), &json!(1))
+    );
+    assert_eq!(harness.head_seq("user-1"), 3);
+    assert_eq!(lock(&account).unconfirmed().len(), 1);
+
+    // The store takes the entry: the repeated call writes it and signs the head at entry 3.
+    lock(&store).status = 0;
+    let page = heads(&harness).await;
+    assert!(lock(&account).unconfirmed().is_empty());
+    let head = harness.verified(purpose::HEAD, &page["heads"][0]);
+    assert_eq!((&head["seq"], &head["final"]), (&json!(3), &json!(true)));
+    let end = verified_end(&provider, &store, &harness, "user-1", &page["heads"][0]);
+    assert_eq!(end.seq, 3);
+}
+
+#[tokio::test]
 async fn a_chain_whose_every_entry_is_pending_ends_at_seq_zero() {
     // The receiving node of a transfer creates entry 1 (`grant_transferred_in`) as a pending
     // entry; its store refuses the round of the import.
@@ -319,7 +417,7 @@ async fn a_chain_whose_every_entry_is_pending_ends_at_seq_zero() {
     let (old, app) = node_with_log_store(&provider).await;
     let new = Harness::new(&provider);
     new.use_log_store().await;
-    lock(&store).status = 503;
+    lock(&store).status = 403;
     let to = new
         .post("/v1/attestation", json!({"nonce": b64u(&[9u8; 32])}))
         .await
@@ -340,7 +438,7 @@ async fn a_chain_whose_every_entry_is_pending_ends_at_seq_zero() {
     let (_, exported) = old
         .post("/v1/peer/export", json!({"peer": to, "limit": 1000}))
         .await;
-    lock(&store).status = 503;
+    lock(&store).status = 403;
     let (status, imported) = new
         .post(
             "/v1/peer/import",

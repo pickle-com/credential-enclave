@@ -184,6 +184,10 @@ pub struct GrantView {
     pub log_pk: [u8; 32],
     pub custody: Custody,
     pub user_key: Secret<[u8; 32]>,
+    /// The revoke serial of the account when the view was taken: a revoke accepted after it
+    /// draws a larger one, so a grant of the same key made after that revoke is told apart from
+    /// the grant the view was taken under.
+    pub revoke_serial: u64,
 }
 
 /// The plaintext copy of the delegation state that a caller reads (enclave.md 5.3 and 5.4).
@@ -588,7 +592,9 @@ impl Account {
 
     /// Keeps the response of a successful `refresh` that ran under `grant` and returns true.
     /// Nothing is kept, and false is returned, when that grant is no longer in force: a revoke
-    /// that was answered while the provider call ran leaves no kept response behind it.
+    /// that was answered while the provider call ran leaves no kept response behind it, also
+    /// when a grant of the same key followed that revoke (the revoke serial of the view is then
+    /// behind the one of the account).
     pub fn keep_refresh(
         &mut self,
         grant: &GrantView,
@@ -597,10 +603,11 @@ impl Account {
         response: Refreshed,
     ) -> bool {
         self.expire(now_ms);
-        let in_force = matches!(
-            &self.grant,
-            GrantState::Active(active) if active.sign_pk == grant.sign_pk
-        );
+        let in_force = self.revoke_serial == grant.revoke_serial
+            && matches!(
+                &self.grant,
+                GrantState::Active(active) if active.sign_pk == grant.sign_pk
+            );
         if !in_force {
             return false;
         }
@@ -706,6 +713,7 @@ impl Account {
                 log_pk: grant.log_pk,
                 custody: grant.custody,
                 user_key: grant.user_key.clone(),
+                revoke_serial: self.revoke_serial,
             }),
         }
     }
@@ -1998,6 +2006,7 @@ mod tests {
             log_pk: [2; 32],
             custody: Custody::Operator,
             user_key: user_key.clone(),
+            revoke_serial: 0,
         };
         let counters = Arc::new(StateCounters::default());
         let mut account = Account::new(counters.clone());

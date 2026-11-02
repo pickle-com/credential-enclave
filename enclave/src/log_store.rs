@@ -25,7 +25,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 use std::task::Poll;
 use std::time::{Duration, Instant};
@@ -468,8 +468,27 @@ struct Write {
     required: bool,
     confirmed: bool,
     /// True when an attempt of this call may have reached the store without a confirmation
-    /// ([`WriteOutcome::outcome_unknown`]).
+    /// ([`WriteOutcome::outcome_unknown`]). Copied from the attempts after a round.
     outcome_unknown: bool,
+    /// Set by an attempt just before its request leaves, cleared when the store answered it
+    /// with a status: while it is set, the request may be with the store. It is read when the
+    /// call that owns the write ends before its round ends (`Claim::drop`), where the round
+    /// has not copied its outcome yet.
+    in_flight: AtomicBool,
+    /// Set by an attempt that ended with the connection closed without a response, passed its
+    /// time limit after the request left, or was answered with a 5xx status: the store may hold
+    /// the object. Never cleared: a later attempt that failed before a byte left changes
+    /// nothing about the earlier one.
+    may_be_stored: AtomicBool,
+}
+
+impl Write {
+    /// True when some attempt of this call may have reached the store without a confirmation:
+    /// an attempt left its request and got no answer yet, or an earlier attempt ended in a
+    /// state where the store may hold the object.
+    fn may_have_reached_the_store(&self) -> bool {
+        self.in_flight.load(Ordering::Relaxed) || self.may_be_stored.load(Ordering::Relaxed)
+    }
 }
 
 /// The end of the attempts of one entry ([`send_to_log_store`]).
@@ -510,6 +529,8 @@ impl<'a> Claim<'a> {
                     required,
                     confirmed: false,
                     outcome_unknown: false,
+                    in_flight: AtomicBool::new(false),
+                    may_be_stored: AtomicBool::new(false),
                 });
             }
         }
@@ -536,7 +557,8 @@ impl Drop for Claim<'_> {
                 .find(|entry| entry.seq == write.seq)
             {
                 entry.writing = false;
-                entry.outcome_unknown |= write.outcome_unknown;
+                entry.outcome_unknown |=
+                    write.outcome_unknown || write.may_have_reached_the_store();
             }
         }
     }
@@ -648,7 +670,9 @@ fn status_failure(status: StatusCode) -> AttemptFailure {
 
 /// Sink K5 of the egress policy: writes one entry to the log store and returns whether the
 /// store confirmed the write and, when it did not, whether an attempt may have reached the store
-/// (the orderly shutdown drops no such entry, enclave.md 5.11).
+/// (its request left and the connection closed or the time limit passed without an answer, or
+/// the store answered with a 5xx status: the orderly shutdown drops no such entry, enclave.md
+/// 5.11).
 ///
 /// What leaves is the signed entry (its content is sealed to the log public key of the
 /// account) under the key of protocol.md 7.6 ([`object_key`]), with a retention in compliance
@@ -677,7 +701,6 @@ async fn send_to_log_store(node: &Node, writer: &Writer, write: &Write) -> Write
     let budget = 2 * limit;
     let started = Instant::now();
     let mut attempts: u32 = 0;
-    let mut outcome_unknown = false;
     loop {
         attempts += 1;
         counters.writes.fetch_add(1, Ordering::Relaxed);
@@ -695,11 +718,20 @@ async fn send_to_log_store(node: &Node, writer: &Writer, write: &Write) -> Write
             }
             Err((cause, repeated)) => {
                 counters.write_attempt_failures.count(cause);
-                // The request of these two attempts may have reached the store.
-                outcome_unknown |= matches!(cause, WriteFailure::Closed | WriteFailure::Timeout);
+                // The request may have reached the store when it left (the connection closed
+                // without a response, or the time limit passed after it left) and when the
+                // store answered with a 5xx status (S3 promises nothing about the object of
+                // such an answer). A time limit that passed while the connection opened, and
+                // every failure before a byte left, say the object is not there.
+                if write.in_flight.load(Ordering::Relaxed)
+                    || matches!(cause, WriteFailure::Status5xx)
+                {
+                    write.may_be_stored.store(true, Ordering::Relaxed);
+                }
+                write.in_flight.store(false, Ordering::Relaxed);
                 let failed = WriteOutcome {
                     confirmed: false,
-                    outcome_unknown,
+                    outcome_unknown: write.may_be_stored.load(Ordering::Relaxed),
                 };
                 if !repeated {
                     return failed;
@@ -752,10 +784,14 @@ async fn write_once(
         };
         let request =
             put_request(writer, write, node.now_ms()).ok_or((WriteFailure::Connect, false))?;
+        // From here the request may be with the store, until the store answered it. A call
+        // that ends during the wait leaves the flag set.
+        write.in_flight.store(true, Ordering::Relaxed);
         let response = sender
             .send_request(request)
             .await
             .map_err(|_| (WriteFailure::Closed, true))?;
+        write.in_flight.store(false, Ordering::Relaxed);
         if response.body().is_end_stream() {
             node.log_store.idle.put(sender);
         }
@@ -1403,6 +1439,8 @@ mod tests {
             required: true,
             confirmed: false,
             outcome_unknown: false,
+            in_flight: AtomicBool::new(false),
+            may_be_stored: AtomicBool::new(false),
         };
         // 2026-10-01T12:10:45.123Z.
         let request = put_request(&writer, &write, 1_790_856_645_123).unwrap();
@@ -1565,6 +1603,8 @@ mod tests {
             required: true,
             confirmed: false,
             outcome_unknown: false,
+            in_flight: AtomicBool::new(false),
+            may_be_stored: AtomicBool::new(false),
         };
         let request = put_request(&writer, &write, 1_790_856_645_123).unwrap();
         assert_eq!(

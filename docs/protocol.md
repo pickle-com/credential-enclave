@@ -613,8 +613,10 @@ body = UTF-8(JSON {"v":1,"type":"head","node":"...","user_id":"...","seq":0,"has
   end of the chain and the store confirmed none of them, the node drops them from its chain and
   signs the final head below them (enclave.md 5.11): a final head of `seq` 0 says that the store
   holds no confirmed entry of the node for that account. An entry whose write may have reached the
-  store (the connection closed without a response, or the attempt passed its time limit) is not
-  dropped: the node leaves no final head for that account until the store confirms the entry.
+  store (the connection closed without a response, the attempt passed its time limit after the
+  request left, the store answered with a 5xx status, or the call that owned the write ended while
+  the store held the request) is not dropped: the node leaves no final head for that account
+  until the store confirms the entry.
   After that the node creates no entry for that account.
 - The head covers entries. The events of an open batch are not on the chain yet, and their acts
   have not taken place (an act follows the confirmation of its entry, which follows the close of
@@ -717,7 +719,7 @@ is always in the listing.
 | A `seq` without a candidate whose first key after it is younger than one hour | Pending: the node has still to write the entry again (7.6); the next run reads the gap |
 | A node appears in the listing that no grant of the app and no traced transfer explains, with a first entry sealed to the key of this account | A node used the key of the account outside the delegations the app knows |
 | A node that is gone has no `final` head | The entries after the verified point are read by content verification. The part the app has not read yet is pending |
-| A node that is gone has a `final` head, and a key of its prefix lies above the `seq` of that head | The stored log holds an object the node did not vouch for: attention (step 4). A node avoids this state in its orderly shutdown: it signs the final head below an unconfirmed tail only when every write attempt of those entries failed before a request byte left the node or was answered by the store with a status other than 200, and it leaves no final head for an account with an unconfirmed entry whose write may have reached the store (7.3) |
+| A node that is gone has a `final` head, and a key of its prefix lies above the `seq` of that head | The stored log holds an object the node did not vouch for: attention (step 4). A node avoids this state in its orderly shutdown: it signs the final head below an unconfirmed tail only when every write attempt of those entries failed before a request byte left the node or was answered by the store with a 4xx status, and it leaves no final head for an account with an unconfirmed entry whose write may have reached the store (7.3) |
 | The store cannot be listed or read, an address the backend handed out is not one of the request, more unknown prefixes than `LOG_STORE_NODES` are listed, or a release build of the app is refused the store | The verification is pending (the app does not treat it as complete); the refusal of a release build marks the log, and reads that keep failing for `LOG_STORE_STALE_MS` mark the log |
 
 Format 1 (the chains of nodes of the releases before v2.0.0): the app verifies every entry by its

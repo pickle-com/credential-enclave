@@ -1465,6 +1465,31 @@ async fn a_late_success_is_dropped_after_a_revoke_or_a_close() {
 }
 
 #[tokio::test]
+async fn a_late_success_is_dropped_after_a_revoke_and_a_grant_of_the_same_key() {
+    // A revoke and then a grant of the same key while the late call runs: the success belongs
+    // to the delegation that was revoked, not to the new one, and is not kept.
+    let provider = rotating_provider_with(200, Duration::from_millis(800)).await;
+    let harness = late_harness(&provider, 1).await;
+    let app = App::new("user-1", 1);
+    app.grant(&harness).await;
+    let record = connected(&harness, &app).await;
+    assert_eq!(refresh(&harness, "user-1", &record).await.0, 502);
+    app.revoke(&harness).await;
+    app.grant(&harness).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        late_counts(&harness).await,
+        (
+            json!({"kept": 0, "dropped": 1, "failed": 0, "abandoned": 0}),
+            0
+        )
+    );
+    // The same record is a provider call again under the new delegation.
+    assert_eq!(refresh(&harness, "user-1", &record).await.0, 502);
+    assert_eq!(provider.requests().len(), 3);
+}
+
+#[tokio::test]
 async fn a_late_refusal_and_the_late_limit_end_the_exchange() {
     // The provider refuses the refresh after the time limit of the call: nothing is kept,
     // and the next call with the same record is a provider call again.
