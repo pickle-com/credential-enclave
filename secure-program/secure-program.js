@@ -22,7 +22,7 @@
 
   // ---- Constants ----
 
-  const VERSION = 31;
+  const VERSION = 32;
   const MASTER_KEY_SERVICE = "com.pickle.client.secure.master-key";
   const LEDGER_SERVICE = "com.pickle.client.secure.ledger";
   const LEDGER_STORE_KEY = "ledger";
@@ -182,6 +182,14 @@
       pcr0: "04349059fa93cdbee77b1e7143278d080a38e6024df90eac578562f3a0bfb3ebe27226f6c9c6eca3be938835d5020d50",
       pcr1: "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
       pcr2: "6dfa057738dcfabb85bc7e395e745a9f58f98f54269fa07ef53c9e4d39669e62643574874a45628cd256083c9f2d32a9",
+      log_store: true,
+    },
+    // pickle-com/credential-enclave v2.1.0 (commit 9f123732ad5e20640ec9e3a27fb9f628eadf9187).
+    {
+      release: "v2.1.0",
+      pcr0: "4b636738685e1a61dd102c59d6c1cc5ddd50f6fb1c92afdf8850899a2bb58608198d423d4772ca77c711a172a70428ff",
+      pcr1: "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+      pcr2: "5ed1f53c8c96dfcc7e675663f24f4b2593e5f25d9e5e0bebad9e0be82891027875fe74d2b7c5ca5e899366773f1f84ba",
       log_store: true,
     },
   ];
