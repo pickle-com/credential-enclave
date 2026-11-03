@@ -18,9 +18,12 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use credential_enclave_protocol::limits;
 use credential_enclave_protocol::secret::Secret;
@@ -35,7 +38,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsConnector;
 
 use crate::clock::{Clock, TlsTime};
-use crate::platform::DynPlatform;
+use crate::platform::{ConnectError, DynPlatform};
 use crate::providers::Destination;
 use crate::state::lock;
 
@@ -44,6 +47,17 @@ pub const PROVIDER_PORT: u16 = 443;
 
 /// Open connections to providers in total that carry no request, over every account.
 const IDLE_PROVIDER_CONNECTIONS_TOTAL: usize = 1024;
+
+/// Outbound connections a node opens at the same time (enclave.md section 8): the default of
+/// `Limits::open_concurrency`. A quarter of the backlog of the egress relay of the host
+/// program, so a burst of opens waits in the node and not in a queue the kernel resets.
+pub const OPEN_CONCURRENCY: usize = 256;
+/// Attempts to open one outbound connection ([`Egress::open_at`]).
+const OPEN_ATTEMPTS: u32 = 3;
+/// The base of the full jitter backoff between two attempts to open a connection.
+const OPEN_BACKOFF_BASE: Duration = Duration::from_millis(50);
+/// The cap of that backoff.
+const OPEN_BACKOFF_CAP: Duration = Duration::from_millis(400);
 
 /// Response headers that are not passed on: the headers that describe one connection
 /// (RFC 9110 7.6.1), and the cookie headers. A node drops the `Cookie` header of every request,
@@ -99,6 +113,101 @@ pub enum EgressError {
     /// The response body is under a transfer coding other than `chunked`: the node cannot read
     /// it.
     Coded,
+}
+
+/// Why an attempt to open an outbound connection failed (enclave.md 5.14). Every variant is a
+/// failure before any request byte left the node, so an attempt of every kind is repeated. No
+/// variant carries bytes of the exchange, and the four names are the closed vocabulary of
+/// `open_failures` of health.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenError {
+    /// The platform could not open the byte pipe: the vsock connection to the egress relay of
+    /// the parent on nitro, the TCP connection on local.
+    Transport,
+    /// The egress relay of the parent refused the host and the port (nitro).
+    RelayRefused,
+    /// The TLS handshake failed: the certificate, the protocol, or the connection during it.
+    /// A host that is not a server name fails here as well.
+    Tls,
+    /// The HTTP/1.1 handshake failed.
+    Http,
+}
+
+impl From<ConnectError> for OpenError {
+    fn from(error: ConnectError) -> OpenError {
+        match error {
+            ConnectError::Transport(_) => OpenError::Transport,
+            ConnectError::RelayRefused(_) => OpenError::RelayRefused,
+        }
+    }
+}
+
+impl From<OpenError> for EgressError {
+    fn from(_: OpenError) -> EgressError {
+        EgressError::Unreachable
+    }
+}
+
+/// The counts of `egress` of `GET /v1/health` (enclave.md 5.1), since the node started.
+#[derive(Default)]
+pub struct EgressCounters {
+    /// Outbound connections that were opened: the byte pipe, the TLS handshake and, for a
+    /// connection to a provider or to the log store, the HTTP/1.1 handshake.
+    pub opens: AtomicU64,
+    /// Attempts to open a connection that failed, by cause.
+    pub open_failures: OpenFailureCounters,
+    /// Attempts that followed a failed attempt.
+    pub open_retries: AtomicU64,
+    /// Requests that went over an idle connection instead of a new one.
+    pub idle_reuses: IdleReuseCounters,
+}
+
+/// The failed attempts to open a connection, by cause ([`OpenError`]).
+#[derive(Default)]
+pub struct OpenFailureCounters {
+    pub transport: AtomicU64,
+    pub relay_refused: AtomicU64,
+    pub tls: AtomicU64,
+    pub http: AtomicU64,
+}
+
+impl OpenFailureCounters {
+    fn count(&self, error: OpenError) {
+        let counter = match error {
+            OpenError::Transport => &self.transport,
+            OpenError::RelayRefused => &self.relay_refused,
+            OpenError::Tls => &self.tls,
+            OpenError::Http => &self.http,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The requests that went over an idle connection, by peer: a provider (enclave.md 5.8 step
+/// 8) or the log store (5.14).
+#[derive(Default)]
+pub struct IdleReuseCounters {
+    pub provider: AtomicU64,
+    pub log_store: AtomicU64,
+}
+
+/// A full jitter backoff: a random time between zero and the smaller of `cap` and `base`
+/// doubled for every attempt after the first. The randomness comes from the random source of
+/// the platform; when that source fails, the backoff is the upper bound.
+pub(crate) fn full_jitter(
+    platform: &dyn DynPlatform,
+    attempt: u32,
+    base: Duration,
+    cap: Duration,
+) -> Duration {
+    let doublings = attempt.saturating_sub(1).min(16);
+    let upper = base.saturating_mul(1u32 << doublings).min(cap);
+    let mut bytes = [0u8; 8];
+    if platform.fill_random(&mut bytes).is_err() {
+        return upper;
+    }
+    let upper_ms = u64::try_from(upper.as_millis()).unwrap_or(u64::MAX);
+    Duration::from_millis(u64::from_le_bytes(bytes) % upper_ms.saturating_add(1))
 }
 
 /// One outbound request. Its host and its request target are those of its [`Destination`].
@@ -389,6 +498,12 @@ impl ProviderConnections {
             .get(&(user_id.to_string(), host.to_string()))
             .map_or(0, Vec::len)
     }
+
+    /// The number of idle connections over every account and host, as they are kept at this
+    /// moment (`provider` of `idle_connections` of health).
+    pub fn idle_total(&self) -> usize {
+        lock(&self.0).values().map(Vec::len).sum()
+    }
 }
 
 /// The TLS client of a node.
@@ -399,22 +514,34 @@ pub struct Egress {
     pub provider_idle: Arc<ProviderConnections>,
     /// The node-wide bound of provider requests in flight (enclave.md section 8).
     inflight: Arc<Semaphore>,
+    /// The node-wide bound of outbound connections being opened (enclave.md section 8): a
+    /// place is held from the first attempt to the open connection or the last failure.
+    opens: Arc<Semaphore>,
+    /// The size of that bound.
+    open_concurrency: usize,
+    /// The counts of `egress` of health.
+    pub counters: EgressCounters,
 }
 
 impl Egress {
     /// The TLS client of a running node: the trust roots are the `webpki-roots` compiled into
-    /// the binary.
-    pub fn new(clock: Arc<Clock>) -> Egress {
+    /// the binary. `open_concurrency` is the bound of connections being opened at the same
+    /// time (`Limits::open_concurrency`).
+    pub fn new(clock: Arc<Clock>, open_concurrency: usize) -> Egress {
         let mut roots = RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        Egress::build(clock, roots)
+        Egress::build(clock, roots, open_concurrency)
     }
 
     /// A TLS client that trusts the given roots only. Tests use it to trust the certificate
     /// authority of their provider stand-in. The node binary does not contain this function.
     #[cfg(test)]
-    pub fn with_test_roots(clock: Arc<Clock>, roots: RootCertStore) -> Egress {
-        Egress::build(clock, roots)
+    pub fn with_test_roots(
+        clock: Arc<Clock>,
+        roots: RootCertStore,
+        open_concurrency: usize,
+    ) -> Egress {
+        Egress::build(clock, roots, open_concurrency)
     }
 
     /// The provider requests in flight at this moment: the places of the node-wide bound that
@@ -423,7 +550,14 @@ impl Egress {
         limits::PROVIDER_INFLIGHT.saturating_sub(self.inflight.available_permits())
     }
 
-    fn build(clock: Arc<Clock>, roots: RootCertStore) -> Egress {
+    /// The outbound connections being opened at this moment: the places of the bound of
+    /// `open_concurrency` that are taken, the attempts and the backoffs between them included.
+    pub fn open_inflight(&self) -> usize {
+        self.open_concurrency
+            .saturating_sub(self.opens.available_permits())
+    }
+
+    fn build(clock: Arc<Clock>, roots: RootCertStore, open_concurrency: usize) -> Egress {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut config = ClientConfig::builder_with_details(provider, Arc::new(TlsTime(clock)))
             .with_safe_default_protocol_versions()
@@ -437,12 +571,17 @@ impl Egress {
             mail_connector,
             provider_idle: Arc::new(ProviderConnections::default()),
             inflight: Arc::new(Semaphore::new(limits::PROVIDER_INFLIGHT)),
+            opens: Arc::new(Semaphore::new(open_concurrency)),
+            open_concurrency,
+            counters: EgressCounters::default(),
         }
     }
 
     /// Opens a connection to port 443 of `host` and returns its HTTP/1.1 sender: the byte pipe
     /// of the platform, TLS that ends inside the node with a certificate verified against the
-    /// trust roots of this client at the time of the node clock, then HTTP/1.1.
+    /// trust roots of this client at the time of the node clock, then HTTP/1.1. `budget` is
+    /// the time limit of the call the connection is for: a failed attempt is repeated within
+    /// half of it ([`Egress::open_at`]).
     ///
     /// This is the way of every outbound connection of a node: to a provider
     /// ([`Egress::send_to_provider`]) and to the log store (`crate::log_store`).
@@ -450,47 +589,122 @@ impl Egress {
         &self,
         platform: &dyn DynPlatform,
         host: &str,
-    ) -> Result<SendRequest<OnceBody>, EgressError> {
-        self.open_at(platform, host, PROVIDER_PORT, true).await
+        budget: Duration,
+    ) -> Result<SendRequest<OnceBody>, OpenError> {
+        self.open_at(platform, host, PROVIDER_PORT, true, budget)
+            .await
     }
 
     /// [`Egress::open`] to `host:port`, with TLS or, for the log store endpoint of a node of
     /// the local platform only (enclave.md 5.14), over the plain byte pipe.
+    ///
+    /// An attempt that fails before any request byte left the node (the byte pipe, the
+    /// refusal of the egress relay, the TLS handshake, the HTTP/1.1 handshake) is repeated: at
+    /// most [`OPEN_ATTEMPTS`] attempts, with a full jitter backoff between them, as long as the
+    /// attempts and the backoff stay within half of `budget`. The attempts of one open take one
+    /// place of the bound of connections being opened; a further open waits for a place.
     pub(crate) async fn open_at(
         &self,
         platform: &dyn DynPlatform,
         host: &str,
         port: u16,
         tls: bool,
-    ) -> Result<SendRequest<OnceBody>, EgressError> {
-        let stream = platform
-            .connect(host, port)
-            .await
-            .map_err(|_| EgressError::Unreachable)?;
-        if !tls {
-            return Egress::handshake(stream).await;
+        budget: Duration,
+    ) -> Result<SendRequest<OnceBody>, OpenError> {
+        let server_name = match tls {
+            true => match ServerName::try_from(host.to_string()) {
+                Ok(name) => Some(name),
+                Err(_) => {
+                    self.counters.open_failures.count(OpenError::Tls);
+                    return Err(OpenError::Tls);
+                }
+            },
+            false => None,
+        };
+        self.with_attempts(platform, budget, move || {
+            self.open_once(platform, host, port, server_name.clone())
+        })
+        .await
+    }
+
+    /// One attempt of [`Egress::open_at`].
+    async fn open_once(
+        &self,
+        platform: &dyn DynPlatform,
+        host: &str,
+        port: u16,
+        server_name: Option<ServerName<'static>>,
+    ) -> Result<SendRequest<OnceBody>, OpenError> {
+        let stream = platform.connect(host, port).await?;
+        match server_name {
+            None => Egress::handshake(stream).await,
+            Some(name) => {
+                let tls = self
+                    .connector
+                    .connect(name, stream)
+                    .await
+                    .map_err(|_| OpenError::Tls)?;
+                Egress::handshake(tls).await
+            }
         }
-        let server_name =
-            ServerName::try_from(host.to_string()).map_err(|_| EgressError::Invalid)?;
-        let tls = self
-            .connector
-            .connect(server_name, stream)
+    }
+
+    /// Runs `attempt` until it succeeds, at most [`OPEN_ATTEMPTS`] times, within one place of
+    /// the bound of connections being opened. Between two attempts the node waits a full
+    /// jitter backoff (base [`OPEN_BACKOFF_BASE`], cap [`OPEN_BACKOFF_CAP`]); an attempt is
+    /// repeated only when it and the backoff before it stay within half of `budget`, counted
+    /// from the moment the place was asked for, so the open never takes the whole time limit
+    /// of its call. Every attempt and every repetition is counted.
+    async fn with_attempts<T, F, Fut>(
+        &self,
+        platform: &dyn DynPlatform,
+        budget: Duration,
+        mut attempt: F,
+    ) -> Result<T, OpenError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, OpenError>>,
+    {
+        let started = Instant::now();
+        let _place = self
+            .opens
+            .clone()
+            .acquire_owned()
             .await
-            .map_err(|_| EgressError::Unreachable)?;
-        Egress::handshake(tls).await
+            .map_err(|_| OpenError::Transport)?;
+        let mut attempts = 0;
+        loop {
+            match attempt().await {
+                Ok(opened) => {
+                    self.counters.opens.fetch_add(1, Ordering::Relaxed);
+                    return Ok(opened);
+                }
+                Err(error) => {
+                    self.counters.open_failures.count(error);
+                    attempts += 1;
+                    let backoff =
+                        full_jitter(platform, attempts, OPEN_BACKOFF_BASE, OPEN_BACKOFF_CAP);
+                    if attempts >= OPEN_ATTEMPTS || started.elapsed() + backoff > budget / 2 {
+                        return Err(error);
+                    }
+                    self.counters.open_retries.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+        }
     }
 
     /// The HTTP/1.1 handshake over an open byte stream: returns the sender of requests and
     /// drives the connection on a task of its own until the sender is dropped or the other
     /// side closes it.
-    async fn handshake<IO>(io: IO) -> Result<SendRequest<OnceBody>, EgressError>
+    async fn handshake<IO>(io: IO) -> Result<SendRequest<OnceBody>, OpenError>
     where
         IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let (sender, connection) =
             hyper::client::conn::http1::handshake::<_, OnceBody>(TokioIo::new(io))
                 .await
-                .map_err(|_| EgressError::Unreachable)?;
+                .map_err(|_| OpenError::Http)?;
         tokio::spawn(async move {
             // The connection ends when its sender is dropped or the other side closes it.
             let _ = connection.await;
@@ -498,12 +712,15 @@ impl Egress {
         Ok(sender)
     }
 
-    /// Fixed mail destinations. TLS and its trusted clock stay inside the node.
+    /// Fixed mail destinations. TLS and its trusted clock stay inside the node. A failed
+    /// attempt to open the connection is repeated by the rule of [`Egress::open_at`], within
+    /// half of `budget`.
     pub(crate) async fn open_mail(
         &self,
         platform: &dyn DynPlatform,
         host: &str,
         port: u16,
+        budget: Duration,
     ) -> Result<crate::platform::Stream, EgressError> {
         if !matches!(
             (host, port),
@@ -512,15 +729,18 @@ impl Egress {
             return Err(EgressError::Invalid);
         }
         let name = ServerName::try_from(host.to_string()).map_err(|_| EgressError::Invalid)?;
-        let stream = platform
-            .connect(host, port)
-            .await
-            .map_err(|_| EgressError::Unreachable)?;
         let tls = self
-            .mail_connector
-            .connect(name, stream)
-            .await
-            .map_err(|_| EgressError::Unreachable)?;
+            .with_attempts(platform, budget, move || {
+                let name = name.clone();
+                async move {
+                    let stream = platform.connect(host, port).await?;
+                    self.mail_connector
+                        .connect(name, stream)
+                        .await
+                        .map_err(|_| OpenError::Tls)
+                }
+            })
+            .await?;
         Ok(Box::new(tls))
     }
 
@@ -538,13 +758,16 @@ impl Egress {
     /// address) every request opens its own connection.
     ///
     /// Every request takes a share of the node-wide bound of provider requests in flight and
-    /// holds it until the exchange is dropped.
+    /// holds it until the exchange is dropped. `budget` is the time limit of the call: the
+    /// opening of a new connection repeats a failed attempt within half of it
+    /// ([`Egress::open_at`]).
     pub async fn send_to_provider(
         &self,
         platform: &dyn DynPlatform,
         account: Option<&str>,
         outbound: OutboundRequest,
         now_ms: u64,
+        budget: Duration,
     ) -> Result<Exchange, EgressError> {
         let inflight = self
             .inflight
@@ -557,12 +780,18 @@ impl Egress {
             Some(user_id) => self.provider_idle.take(user_id, &host, now_ms).await,
             None => None,
         };
+        if idle.is_some() {
+            self.counters
+                .idle_reuses
+                .provider
+                .fetch_add(1, Ordering::Relaxed);
+        }
         let repeatable = matches!(outbound.method.as_str(), "GET" | "HEAD");
         let (sender, response) = match idle {
             Some(mut sender) => match sender.send_request(build_request(&outbound)?).await {
                 Ok(response) => (sender, response),
                 Err(_) if repeatable => {
-                    let mut fresh = self.open(platform, &host).await?;
+                    let mut fresh = self.open(platform, &host, budget).await?;
                     let response = fresh
                         .send_request(build_request(&outbound)?)
                         .await
@@ -572,7 +801,7 @@ impl Egress {
                 Err(_) => return Err(EgressError::Unreachable),
             },
             None => {
-                let mut fresh = self.open(platform, &host).await?;
+                let mut fresh = self.open(platform, &host, budget).await?;
                 let response = fresh
                     .send_request(build_request(&outbound)?)
                     .await

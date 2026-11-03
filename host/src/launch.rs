@@ -1,12 +1,15 @@
-//! The start and the end of the enclave (enclave.md section 9), both through `nitro-cli`.
+//! The start, the description and the end of the enclave (enclave.md section 9), all through
+//! `nitro-cli`.
 //!
 //! ```text
 //! nitro-cli run-enclave --eif-path /opt/credential-enclave/enclave.eif \
-//!     --cpu-count 2 --memory 4096 --enclave-cid 16
+//!     --cpu-count 2 --memory {CREDENTIAL_ENCLAVE_MEMORY_MIB, default 4096} --enclave-cid 16
+//! nitro-cli describe-enclaves
 //! nitro-cli terminate-enclave --all
 //! ```
 //!
-//! The arguments are constants of the host program. `nitro-cli` writes to the standard output
+//! The arguments are constants of the host program, except the memory, which the environment
+//! variable `CREDENTIAL_ENCLAVE_MEMORY_MIB` gives. `nitro-cli` writes to the standard output
 //! and the standard error of the host program, so its messages and error codes are part of the
 //! container log.
 
@@ -25,8 +28,27 @@ pub const EIF_PATH: &str = "/opt/credential-enclave/enclave.eif";
 pub const MEASUREMENTS_PATH: &str = "/opt/credential-enclave/measurements.json";
 /// The vCPUs of the enclave.
 const CPU_COUNT: u32 = 2;
-/// The memory of the enclave, in MiB.
-const MEMORY_MIB: u32 = 4096;
+/// The variable that gives the memory of the enclave, in MiB.
+pub const MEMORY_VARIABLE: &str = "CREDENTIAL_ENCLAVE_MEMORY_MIB";
+/// The memory of the enclave when the variable is not set, in MiB.
+pub const DEFAULT_MEMORY_MIB: u32 = 4096;
+/// Longest output of `describe-enclaves` the host program puts into its log line.
+const DESCRIBE_LINE_BYTES: usize = 4096;
+
+/// Reads the memory of the enclave from the environment (`variable` reads one variable): the
+/// default when the variable is not set, else its value as a positive integer of MiB. A value
+/// that is not a positive integer is an error, and the host program does not start.
+pub fn memory_mib(variable: &dyn Fn(&str) -> Option<String>) -> Result<u32, String> {
+    let Some(value) = variable(MEMORY_VARIABLE) else {
+        return Ok(DEFAULT_MEMORY_MIB);
+    };
+    let canonical = value.bytes().all(|byte| byte.is_ascii_digit()) && !value.starts_with('0');
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|_| canonical)
+        .ok_or_else(|| format!("{MEMORY_VARIABLE} is not a positive integer: {value:?}"))
+}
 
 /// Where `nitro-cli` keeps the socket of a running enclave.
 const SOCKET_DIRECTORY: &str = "/run/nitro_enclaves";
@@ -35,8 +57,8 @@ const LOG_DIRECTORY: &str = "/var/log/nitro_enclaves";
 /// How much of the end of each `nitro-cli` log file is printed after a failed start.
 const LOG_TAIL_BYTES: usize = 16 * 1024;
 
-/// The arguments of the start.
-fn run_enclave_arguments() -> Vec<String> {
+/// The arguments of the start, with the memory of the enclave in MiB.
+fn run_enclave_arguments(memory_mib: u32) -> Vec<String> {
     [
         "run-enclave",
         "--eif-path",
@@ -44,7 +66,7 @@ fn run_enclave_arguments() -> Vec<String> {
         "--cpu-count",
         &CPU_COUNT.to_string(),
         "--memory",
-        &MEMORY_MIB.to_string(),
+        &memory_mib.to_string(),
         "--enclave-cid",
         &ENCLAVE_CID.to_string(),
     ]
@@ -56,6 +78,41 @@ fn run_enclave_arguments() -> Vec<String> {
 /// host program started.
 fn terminate_enclave_arguments() -> Vec<String> {
     ["terminate-enclave", "--all"].map(str::to_string).to_vec()
+}
+
+/// The arguments of the description: the running enclaves of this container, a JSON list.
+fn describe_enclaves_arguments() -> Vec<String> {
+    ["describe-enclaves"].map(str::to_string).to_vec()
+}
+
+/// The standard output of a program that ran to its end, as one line: every run of whitespace
+/// is one space, and the text is cut at [`DESCRIBE_LINE_BYTES`].
+fn output_line(program: &str, arguments: &[String]) -> Result<String, String> {
+    let output = Command::new(program)
+        .args(arguments)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("cannot start {program}: {error}"))?;
+    if !output.status.success() {
+        let action = arguments.first().map(String::as_str).unwrap_or_default();
+        return Err(format!("{program} {action} ended with {}", output.status));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if line.len() > DESCRIBE_LINE_BYTES {
+        let mut end = DESCRIBE_LINE_BYTES;
+        while !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        line.truncate(end);
+    }
+    Ok(line)
 }
 
 /// Runs a program to its end with the output streams of the host program.
@@ -95,21 +152,28 @@ fn log_tails(directory: &Path) -> Vec<(PathBuf, String)> {
         .collect()
 }
 
-/// Starts the enclave and waits until `nitro-cli` reports the start. This call blocks.
+/// Starts the enclave with `memory_mib` MiB of memory and waits until `nitro-cli` reports the
+/// start. This call blocks.
 ///
 /// After a failure the log files of `nitro-cli` are printed to the standard error: the files
 /// are gone when the container restarts, and the container log is what remains.
-pub fn run_enclave() -> Result<(), String> {
+pub fn run_enclave(memory_mib: u32) -> Result<(), String> {
     for directory in [SOCKET_DIRECTORY, LOG_DIRECTORY] {
         let _ = std::fs::create_dir_all(directory);
     }
-    let outcome = run(NITRO_CLI, &run_enclave_arguments());
+    let outcome = run(NITRO_CLI, &run_enclave_arguments(memory_mib));
     if outcome.is_err() {
         for (path, text) in log_tails(Path::new(LOG_DIRECTORY)) {
             eprintln!("---- {} ----\n{}", path.display(), text.trim_end());
         }
     }
     outcome
+}
+
+/// The running enclaves of this container as `nitro-cli` describes them, on one line: the
+/// JSON list of enclave objects, `[]` when none runs. This call blocks.
+pub fn describe_enclaves() -> Result<String, String> {
+    output_line(NITRO_CLI, &describe_enclaves_arguments())
 }
 
 /// Ends the enclave. This call blocks.
@@ -170,16 +234,55 @@ mod tests {
     }
 
     #[test]
-    fn the_enclave_starts_with_the_fixed_arguments() {
+    fn the_enclave_starts_with_the_fixed_arguments_and_the_memory_of_the_environment() {
         assert_eq!(
-            run_enclave_arguments().join(" "),
+            run_enclave_arguments(DEFAULT_MEMORY_MIB).join(" "),
             "run-enclave --eif-path /opt/credential-enclave/enclave.eif --cpu-count 2 \
              --memory 4096 --enclave-cid 16"
+        );
+        assert_eq!(
+            run_enclave_arguments(8192).join(" "),
+            "run-enclave --eif-path /opt/credential-enclave/enclave.eif --cpu-count 2 \
+             --memory 8192 --enclave-cid 16"
         );
         assert_eq!(
             terminate_enclave_arguments().join(" "),
             "terminate-enclave --all"
         );
+        assert_eq!(describe_enclaves_arguments(), ["describe-enclaves"]);
+    }
+
+    #[test]
+    fn the_memory_is_the_variable_or_the_default_and_refuses_other_values() {
+        let environment = |value: Option<&'static str>| {
+            move |name: &str| {
+                assert_eq!(name, MEMORY_VARIABLE);
+                value.filter(|value| !value.is_empty()).map(str::to_string)
+            }
+        };
+        assert_eq!(memory_mib(&environment(None)), Ok(4096));
+        assert_eq!(memory_mib(&environment(Some(""))), Ok(4096));
+        assert_eq!(memory_mib(&environment(Some("4096"))), Ok(4096));
+        assert_eq!(memory_mib(&environment(Some("8192"))), Ok(8192));
+        assert_eq!(memory_mib(&environment(Some("1"))), Ok(1));
+        for value in [
+            "0",
+            "-1",
+            "4096.5",
+            "4 GiB",
+            "0x1000",
+            "04096",
+            "4294967296",
+            "abc",
+        ] {
+            assert_eq!(
+                memory_mib(&environment(Some(value))),
+                Err(format!(
+                    "CREDENTIAL_ENCLAVE_MEMORY_MIB is not a positive integer: {value:?}"
+                )),
+                "{value}"
+            );
+        }
     }
 
     #[test]
@@ -196,6 +299,36 @@ mod tests {
             missing.starts_with("cannot start /nonexistent/nitro-cli: "),
             "{missing}"
         );
+    }
+
+    #[test]
+    fn the_output_of_a_program_is_one_line() {
+        let arguments = [
+            "[\n  {\n    \"EnclaveID\": \"i-0\",\n    \"State\": \"RUNNING\"\n  }\n]\n".to_string(),
+        ];
+        assert_eq!(
+            output_line("echo", &arguments),
+            Ok("[ { \"EnclaveID\": \"i-0\", \"State\": \"RUNNING\" } ]".to_string())
+        );
+        assert_eq!(
+            output_line("echo", &["[]".to_string()]),
+            Ok("[]".to_string())
+        );
+        assert_eq!(output_line("true", &[]), Ok(String::new()));
+        let failure = output_line("false", &["describe-enclaves".to_string()]).unwrap_err();
+        assert!(
+            failure.starts_with("false describe-enclaves ended with exit"),
+            "{failure}"
+        );
+        let missing = output_line("/nonexistent/nitro-cli", &[]).unwrap_err();
+        assert!(
+            missing.starts_with("cannot start /nonexistent/nitro-cli: "),
+            "{missing}"
+        );
+        // A long output is cut at the limit of the line.
+        let long = "x".repeat(DESCRIBE_LINE_BYTES + 100);
+        let line = output_line("echo", &[long]).unwrap();
+        assert_eq!(line.len(), DESCRIBE_LINE_BYTES);
     }
 
     #[test]

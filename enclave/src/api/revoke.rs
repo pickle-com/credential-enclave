@@ -96,7 +96,13 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
             let outcome = tokio::time::timeout(REVOKE_TIMEOUT, async {
                 let exchange = node
                     .egress
-                    .send_to_provider(node.platform.as_ref(), None, request, node.now_ms())
+                    .send_to_provider(
+                        node.platform.as_ref(),
+                        None,
+                        request,
+                        node.now_ms(),
+                        REVOKE_TIMEOUT,
+                    )
                     .await
                     .ok()?;
                 Some(exchange.status)

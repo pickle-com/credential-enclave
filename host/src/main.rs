@@ -2,28 +2,35 @@
 //!
 //! ```text
 //! credential-enclave-host
+//! credential-enclave-host drain
 //! ```
 //!
-//! The host program runs in the parent pod of a Nitro enclave and takes no argument. It
+//! The host program runs in the parent pod of a Nitro enclave. Without an argument it
 //!
-//! 1. starts the enclave from the enclave image file of its container image (`launch`);
+//! 1. starts the enclave from the enclave image file of its container image, with the memory
+//!    the environment gives it (`launch`);
 //! 2. relays TCP 8080 to the listener of the node, vsock 16:8080 (`relay`);
 //! 3. relays the outbound connections of the node, vsock port 8443, to port 443 of the hosts of
 //!    the provider definitions and of the log store (`egress`);
 //! 4. sends the operator configuration, with the log store of the node, to the node once the
 //!    node answers (`config`);
-//! 5. reports the state of the node on TCP 9091, `/healthz` and `/metrics` (`health`);
-//! 6. on SIGTERM asks the backend to collect the state of the node, then ends the enclave
-//!    (`drain`, `launch`).
+//! 5. reports the state of the node and the counts of the two relays on TCP 9091, `/healthz`
+//!    and `/metrics` (`health`);
+//! 6. on SIGTERM logs the enclaves `nitro-cli` describes, asks the backend to collect the state
+//!    of the node, then ends the enclave (`drain`, `launch`).
+//!
+//! With the argument `drain` it makes the shutdown collection call of step 6 alone, logs its
+//! outcome and ends with the status 0 whatever the outcome: the pre-stop hook of the pod runs
+//! it before the termination signal reaches the host program.
 //!
 //! The host program is an untrusted component: nothing a node guarantees depends on it. It sees
 //! the calls to the node and the TLS ciphertext between the node and the providers. It holds
 //! the OAuth client values of the operator and never writes them to its output.
 //!
 //! Environment: `CHARACTER_API_BASE_URL` and the client values of `config`,
-//! `CREDENTIAL_ENCLAVE_LOG_BUCKET` and `CREDENTIAL_ENCLAVE_LOG_REGION` of the log store, and
-//! `CREDENTIAL_ENCLAVE_DRAIN_URL`, `CREDENTIAL_ENCLAVE_DRAIN_TOKEN` and
-//! `CREDENTIAL_ENCLAVE_POD_NAME` of `drain`.
+//! `CREDENTIAL_ENCLAVE_LOG_BUCKET` and `CREDENTIAL_ENCLAVE_LOG_REGION` of the log store,
+//! `CREDENTIAL_ENCLAVE_MEMORY_MIB` of `launch`, and `CREDENTIAL_ENCLAVE_DRAIN_URL`,
+//! `CREDENTIAL_ENCLAVE_DRAIN_TOKEN` and `CREDENTIAL_ENCLAVE_POD_NAME` of `drain`.
 
 #![forbid(unsafe_code)]
 
@@ -48,8 +55,8 @@ use tokio::signal::unix::{signal, Signal, SignalKind};
 
 use config::{ConfigError, Injection, LogStore};
 use drain::Drain;
-use egress::{Allowlist, TcpOutbound};
-use relay::{NodeConnector, VsockListener, VsockNode};
+use egress::{Allowlist, EgressCounters, TcpOutbound};
+use relay::{InboundCounters, NodeConnector, VsockListener, VsockNode};
 
 /// The provider definitions of the node. The host program is built from the same file.
 pub const DEFINITIONS: &str = include_str!("../../enclave/src/providers/definitions.json");
@@ -136,9 +143,49 @@ async fn collect(drain: Option<Drain>) {
     }
 }
 
+/// Longest wait of the subcommand `drain` for the shutdown collection call, from its start.
+const DRAIN_SUBCOMMAND_LIMIT: Duration = Duration::from_secs(110);
+
+/// The subcommand `drain`: the shutdown collection call of [`collect`] on its own, for the
+/// pre-stop hook of the pod. It logs one line with the outcome and ends with the status 0 in
+/// every case: a collection that fails does not hold the end of the pod, and the termination
+/// signal that follows makes the same call again (the backend takes a repeated call for the
+/// same pod as the same collection).
+async fn run_drain() {
+    let drain = match Drain::from_variables(&variable) {
+        Ok(Some(drain)) => drain,
+        Ok(None) => {
+            log("drain: skipped, its variables are not set");
+            return;
+        }
+        Err(reason) => {
+            log(&format!(
+                "drain: skipped, {} cannot be used, {reason}",
+                drain::URL_VARIABLE
+            ));
+            return;
+        }
+    };
+    let started = tokio::time::Instant::now();
+    let outcome = tokio::time::timeout(DRAIN_SUBCOMMAND_LIMIT, drain.call()).await;
+    let elapsed_ms = started.elapsed().as_millis();
+    match outcome {
+        Ok(Ok(status)) => log(&format!(
+            "drain: the backend answered {status} after {elapsed_ms} ms"
+        )),
+        Ok(Err(reason)) => log(&format!("drain: failed after {elapsed_ms} ms, {reason}")),
+        Err(_) => log(&format!(
+            "drain: no response within {} seconds",
+            DRAIN_SUBCOMMAND_LIMIT.as_secs()
+        )),
+    }
+}
+
 async fn run() -> Result<(), String> {
     log(&format!("version {}", env!("CARGO_PKG_VERSION")));
     log(&launch::release_line(Path::new(launch::MEASUREMENTS_PATH)));
+    let memory_mib = launch::memory_mib(&variable)?;
+    log(&format!("enclave: memory {memory_mib} MiB, 2 vCPUs"));
 
     let allowlist = Allowlist::from_definitions(DEFINITIONS)?;
     let providers = config::provider_names(DEFINITIONS)?;
@@ -210,13 +257,29 @@ async fn run() -> Result<(), String> {
             egress::EGRESS_PORT
         )
     })?;
+    // The queue of the egress listener holds the connections the node opens at once. A kernel
+    // that refuses the length leaves the listener with its default queue: the program goes on.
+    match egress_listener.widen_backlog() {
+        Ok(backlog) => log(&format!("egress: vsock listener backlog {backlog}")),
+        Err(error) => log(&format!(
+            "egress: the backlog of the vsock listener stays at the default: {error}"
+        )),
+    }
 
     let node: Arc<dyn NodeConnector> = Arc::new(VsockNode);
-    tokio::spawn(health::serve(status_listener, node.clone()));
+    let counters = Arc::new(EgressCounters::default());
+    let inbound_counters = Arc::new(InboundCounters::default());
+    tokio::spawn(health::serve(
+        status_listener,
+        node.clone(),
+        counters.clone(),
+        inbound_counters.clone(),
+    ));
     tokio::spawn(egress::serve(
         egress_listener,
         allowlist,
         Arc::new(TcpOutbound),
+        counters,
     ));
 
     // A termination signal during the start ends the program at once: the node has served no
@@ -224,7 +287,7 @@ async fn run() -> Result<(), String> {
     // enclave with it.
     log("enclave: starting");
     tokio::select! {
-        outcome = tokio::task::spawn_blocking(launch::run_enclave) => {
+        outcome = tokio::task::spawn_blocking(move || launch::run_enclave(memory_mib)) => {
             outcome.map_err(|_| "the start of the enclave did not complete".to_string())??;
         }
         signal_name = termination(&mut terminate, &mut interrupt) => {
@@ -233,7 +296,11 @@ async fn run() -> Result<(), String> {
     }
     log("enclave: started");
 
-    tokio::spawn(relay::serve(inbound_listener, node.clone()));
+    tokio::spawn(relay::serve(
+        inbound_listener,
+        node.clone(),
+        inbound_counters,
+    ));
     tokio::spawn(report_first_answer(node.clone()));
     match operator_config {
         Ok(body) => {
@@ -247,6 +314,13 @@ async fn run() -> Result<(), String> {
 
     let signal_name = termination(&mut terminate, &mut interrupt).await;
     log(&format!("{signal_name}: shutting down"));
+    // Whether the node was alive when the signal came: the enclave object `nitro-cli`
+    // describes, or `[]`.
+    match tokio::task::spawn_blocking(launch::describe_enclaves).await {
+        Ok(Ok(line)) => log(&format!("enclave: describe-enclaves {line}")),
+        Ok(Err(reason)) => log(&format!("enclave: describe-enclaves failed, {reason}")),
+        Err(_) => log("enclave: describe-enclaves did not complete"),
+    }
     collect(drain).await;
     log("enclave: ending");
     match tokio::task::spawn_blocking(launch::terminate_enclave).await {
@@ -257,11 +331,29 @@ async fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn main() -> ExitCode {
-    if std::env::args().len() > 1 {
-        eprintln!("usage: credential-enclave-host (no arguments, see the environment variables)");
-        return ExitCode::from(2);
+/// What the arguments ask for: the host program, or the subcommand `drain`.
+#[derive(Debug, PartialEq, Eq)]
+enum Invocation {
+    Host,
+    Drain,
+}
+
+/// Reads the arguments after the program name. Anything but no argument or the one argument
+/// `drain` is a usage error.
+fn invocation(arguments: impl Iterator<Item = String>) -> Option<Invocation> {
+    let arguments: Vec<String> = arguments.collect();
+    match arguments.iter().map(String::as_str).collect::<Vec<&str>>()[..] {
+        [] => Some(Invocation::Host),
+        ["drain"] => Some(Invocation::Drain),
+        _ => None,
     }
+}
+
+fn main() -> ExitCode {
+    let Some(invocation) = invocation(std::env::args().skip(1)) else {
+        eprintln!("usage: credential-enclave-host [drain] (see the environment variables)");
+        return ExitCode::from(2);
+    };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -272,7 +364,13 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let outcome = runtime.block_on(run());
+    let outcome = match invocation {
+        Invocation::Host => runtime.block_on(run()),
+        Invocation::Drain => {
+            runtime.block_on(run_drain());
+            Ok(())
+        }
+    };
     // The relays and the status surface end with the process: nothing waits for their tasks.
     runtime.shutdown_background();
     match outcome {
@@ -281,5 +379,23 @@ fn main() -> ExitCode {
             eprintln!("credential-enclave-host: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod argument_tests {
+    use super::{invocation, Invocation};
+
+    fn parse(arguments: &[&str]) -> Option<Invocation> {
+        invocation(arguments.iter().map(|argument| argument.to_string()))
+    }
+
+    #[test]
+    fn the_one_argument_is_the_subcommand_drain() {
+        assert_eq!(parse(&[]), Some(Invocation::Host));
+        assert_eq!(parse(&["drain"]), Some(Invocation::Drain));
+        assert_eq!(parse(&["drain", "now"]), None);
+        assert_eq!(parse(&["--drain"]), None);
+        assert_eq!(parse(&["start"]), None);
     }
 }

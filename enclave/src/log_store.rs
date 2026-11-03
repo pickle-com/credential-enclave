@@ -25,10 +25,10 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 use std::task::Poll;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -45,18 +45,31 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::api::responses::LogRef;
-use crate::egress::OnceBody;
+use crate::egress::{full_jitter, OnceBody, OpenError};
+use crate::platform::DynPlatform;
 use crate::state::{lock, Account, EventPlace, Node};
 
 /// Writes of one call that run at the same time.
 const WRITE_CONCURRENCY: usize = 32;
 /// The interval of the sweep of the node ([`keep_sweeping`]).
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+/// Entries the sweep writes per second over the whole node ([`sweep`]): the default of
+/// `Limits::sweep_write_rate`. The class of the peak write rate of a node, so the recovery
+/// after an outage of the store does not more than double the live load on it.
+pub const SWEEP_WRITE_RATE: u32 = 64;
 /// Open connections to the log store that carry no write ([`IdleConnections`]).
 const IDLE_CONNECTIONS: usize = 32;
 /// Pending entries of one account at which a call that uses a credential creates no further
 /// entry before the store confirmed some of them ([`admit`]).
 pub const PENDING_ENTRIES: usize = 64;
+/// The base of the full jitter backoff between two attempts to write one entry
+/// ([`send_to_log_store`]).
+const WRITE_BACKOFF_BASE: Duration = Duration::from_millis(100);
+/// The cap of that backoff.
+const WRITE_BACKOFF_CAP: Duration = Duration::from_secs(1);
+/// The time a repeated attempt needs to have left in the budget of its entry: an attempt is
+/// repeated only when the time passed, the backoff and this margin fit in the budget.
+const WRITE_RETRY_MARGIN: Duration = Duration::from_secs(1);
 
 /// Longest access key identifier, in characters.
 const ACCESS_KEY_ID_CHARS: usize = 128;
@@ -437,6 +450,12 @@ impl LogStore {
     pub fn ensure_ready(&self, now_ms: u64) -> Result<(), ProtocolError> {
         self.writer(now_ms).map(|_| ())
     }
+
+    /// The idle connections to the log store at this moment (`log_store` of
+    /// `idle_connections` of health).
+    pub fn idle_connections(&self) -> usize {
+        lock(&self.idle.0).len()
+    }
 }
 
 /// One entry in the hands of a call.
@@ -448,6 +467,41 @@ struct Write {
     /// True for an entry an act of the call waits for.
     required: bool,
     confirmed: bool,
+    /// True when an attempt of this call may have reached the store without a confirmation
+    /// ([`WriteOutcome::outcome_unknown`]). Copied from the attempts after a round.
+    outcome_unknown: bool,
+    /// Set by an attempt just before its request leaves, cleared when the store answered it
+    /// with a status: while it is set, the request may be with the store. It is read when the
+    /// call that owns the write ends before its round ends (`Claim::drop`), where the round
+    /// has not copied its outcome yet.
+    in_flight: AtomicBool,
+    /// Set by an attempt that ended with the connection closed without a response, passed its
+    /// time limit after the request left, or was answered with a 5xx status: the store may hold
+    /// the object. Never cleared: a later attempt that failed before a byte left changes
+    /// nothing about the earlier one.
+    may_be_stored: AtomicBool,
+}
+
+impl Write {
+    /// True when some attempt of this call may have reached the store without a confirmation:
+    /// an attempt left its request and got no answer yet, or an earlier attempt ended in a
+    /// state where the store may hold the object.
+    fn may_have_reached_the_store(&self) -> bool {
+        self.in_flight.load(Ordering::Relaxed) || self.may_be_stored.load(Ordering::Relaxed)
+    }
+}
+
+/// The end of the attempts of one entry ([`send_to_log_store`]).
+#[derive(Clone, Copy)]
+struct WriteOutcome {
+    /// The store confirmed the entry.
+    confirmed: bool,
+    /// Not confirmed, and an attempt may have reached the store all the same: the connection
+    /// closed without a response, or the attempt passed its time limit after the request may
+    /// have been sent. An attempt that failed before any request byte left the node (the
+    /// connection, the TLS handshake) and an attempt the store answered with a status other
+    /// than 200 did not store the object.
+    outcome_unknown: bool,
 }
 
 /// The entries of one account that a call writes: the entries the call names and the pending
@@ -462,7 +516,7 @@ struct Claim<'a> {
 impl<'a> Claim<'a> {
     fn take(account: &'a Mutex<Account>, seqs: &[u64]) -> Claim<'a> {
         let mut writes = Vec::new();
-        for entry in lock(account).unconfirmed.iter_mut() {
+        for entry in lock(account).unconfirmed_mut() {
             let required = seqs.contains(&entry.seq);
             // An entry another call writes is left to that call, unless an act of this call
             // waits for it: then both write it, and the store keeps two versions of it.
@@ -474,6 +528,9 @@ impl<'a> Claim<'a> {
                     entry: entry.entry.clone(),
                     required,
                     confirmed: false,
+                    outcome_unknown: false,
+                    in_flight: AtomicBool::new(false),
+                    may_be_stored: AtomicBool::new(false),
                 });
             }
         }
@@ -494,13 +551,14 @@ impl Drop for Claim<'_> {
         let mut account = lock(self.account);
         for write in &self.writes {
             if write.confirmed {
-                account.unconfirmed.retain(|entry| entry.seq != write.seq);
+                account.confirm_entry(write.seq);
             } else if let Some(entry) = account
-                .unconfirmed
-                .iter_mut()
+                .unconfirmed_mut()
                 .find(|entry| entry.seq == write.seq)
             {
                 entry.writing = false;
+                entry.outcome_unknown |=
+                    write.outcome_unknown || write.may_have_reached_the_store();
             }
         }
     }
@@ -559,15 +617,14 @@ async fn write_claims(node: &Node, claims: &mut [Claim<'_>]) {
             send_to_log_store(node, &writer, &claim.writes[*index])
         }))
         .await;
-        node.log_counters
-            .writes
-            .fetch_add(outcomes.len() as u64, Ordering::Relaxed);
-        let failed = outcomes.iter().filter(|confirmed| !**confirmed).count();
+        let failed = outcomes.iter().filter(|outcome| !outcome.confirmed).count();
         node.log_counters
             .write_failures
             .fetch_add(failed as u64, Ordering::Relaxed);
-        for ((at, index), confirmed) in round.iter().zip(&outcomes) {
-            claims[*at].writes[*index].confirmed = *confirmed;
+        for ((at, index), outcome) in round.iter().zip(&outcomes) {
+            let write = &mut claims[*at].writes[*index];
+            write.confirmed = outcome.confirmed;
+            write.outcome_unknown |= outcome.outcome_unknown;
         }
         if failed > 0 {
             return;
@@ -575,8 +632,47 @@ async fn write_claims(node: &Node, claims: &mut [Claim<'_>]) {
     }
 }
 
-/// Sink K5 of the egress policy: writes one entry to the log store and returns true when the
-/// store confirmed the write.
+/// How an attempt to write an entry ended without a confirmation (enclave.md 5.14): the cause
+/// under which `write_attempt_failures` of health counts it. The six names are a closed
+/// vocabulary of the source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteFailure {
+    /// The byte pipe, the egress relay or the HTTP/1.1 handshake failed, or the request could
+    /// not be built.
+    Connect,
+    /// The TLS handshake failed.
+    Tls,
+    /// The connection closed without a response.
+    Closed,
+    /// The attempt passed its time limit.
+    Timeout,
+    /// A status other than 200 that is neither 5xx nor 429: a 4xx status (the signature, the
+    /// credentials or the configuration of the bucket), and the statuses of the other classes
+    /// that the store does not answer a `PUT` with.
+    Status4xx,
+    /// A status 5xx, or 429.
+    Status5xx,
+}
+
+/// The failure of one attempt: its cause, and whether the attempt is repeated over a new
+/// connection when the budget of the entry permits.
+type AttemptFailure = (WriteFailure, bool);
+
+/// The failure of a status other than 200: a 5xx status and 429 are repeated, every other
+/// status is not.
+fn status_failure(status: StatusCode) -> AttemptFailure {
+    match status.as_u16() {
+        429 => (WriteFailure::Status4xx, true),
+        500..=599 => (WriteFailure::Status5xx, true),
+        _ => (WriteFailure::Status4xx, false),
+    }
+}
+
+/// Sink K5 of the egress policy: writes one entry to the log store and returns whether the
+/// store confirmed the write and, when it did not, whether an attempt may have reached the store
+/// (its request left and the connection closed or the time limit passed without an answer, or
+/// the store answered with a 5xx status: the orderly shutdown drops no such entry, enclave.md
+/// 5.11).
 ///
 /// What leaves is the signed entry (its content is sealed to the log public key of the
 /// account) under the key of protocol.md 7.6 ([`object_key`]), with a retention in compliance
@@ -584,53 +680,163 @@ async fn write_claims(node: &Node, claims: &mut [Claim<'_>]) {
 /// operator. The connection goes to `{bucket}.s3.{region}.amazonaws.com`: TLS ends inside the
 /// node and the certificate is verified against the trust roots of the binary.
 ///
-/// The write goes over an idle connection when there is one. When that connection ends without
-/// a response, the write goes once more over a new connection: a `PUT` is idempotent (RFC 9110
-/// 9.2.2), and a repeated write adds a second version of the same object. A write over a new
-/// connection is not repeated.
+/// The attempts of one entry share a budget of twice the time limit of a write. The first
+/// attempt goes over an idle connection when there is one, with half the time limit; every
+/// later attempt, and the first when there is no idle connection, opens a new connection
+/// (`Egress::open`, which repeats a failed open itself) with the whole time limit. An attempt
+/// that ends without a confirmation because the connection failed, closed without a response,
+/// passed its time limit or was answered with a 5xx status or 429 is repeated after a full
+/// jitter backoff, as long as the time passed, the backoff and a margin of one second fit in
+/// the budget; a 4xx status other than 429 ends the write at once. A `PUT` is idempotent (RFC
+/// 9110 9.2.2), and a repeated attempt adds a version of the same object with the same body:
+/// `put_request` renews the date and the signature only.
 ///
 /// The one confirmation is the status 200. Every other status, a failure of the connection
-/// and a write that takes longer than its time limit (5 seconds) are no confirmation.
-async fn send_to_log_store(node: &Node, writer: &Writer, write: &Write) -> bool {
-    // One `PUT` of the entry: whether the store answered 200, or `None` when the connection
-    // ended without a response.
-    let put = |mut sender: SendRequest<OnceBody>| async move {
-        let request = put_request(writer, write, node.now_ms())?;
-        let response = sender.send_request(request).await.ok()?;
+/// and an attempt that takes longer than its time limit are no confirmation. Every attempt is
+/// counted as a write of `log` of health, every failed attempt under its cause, every repeated
+/// attempt as a retry, and the time to the confirmation of a confirmed attempt in the buckets.
+async fn send_to_log_store(node: &Node, writer: &Writer, write: &Write) -> WriteOutcome {
+    let counters = &node.log_counters;
+    let limit = node.limits.log_write;
+    let budget = 2 * limit;
+    let started = Instant::now();
+    let mut attempts: u32 = 0;
+    loop {
+        attempts += 1;
+        counters.writes.fetch_add(1, Ordering::Relaxed);
+        let attempt_started = Instant::now();
+        let remaining = budget.saturating_sub(started.elapsed());
+        match write_once(node, writer, write, attempts == 1, limit.min(remaining)).await {
+            Ok(()) => {
+                let elapsed_ms =
+                    u64::try_from(attempt_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                counters.record_confirmed(elapsed_ms);
+                return WriteOutcome {
+                    confirmed: true,
+                    outcome_unknown: false,
+                };
+            }
+            Err((cause, repeated)) => {
+                counters.write_attempt_failures.count(cause);
+                // The request may have reached the store when it left (the connection closed
+                // without a response, or the time limit passed after it left) and when the
+                // store answered with a 5xx status (S3 promises nothing about the object of
+                // such an answer). A time limit that passed while the connection opened, and
+                // every failure before a byte left, say the object is not there.
+                if write.in_flight.load(Ordering::Relaxed)
+                    || matches!(cause, WriteFailure::Status5xx)
+                {
+                    write.may_be_stored.store(true, Ordering::Relaxed);
+                }
+                write.in_flight.store(false, Ordering::Relaxed);
+                let failed = WriteOutcome {
+                    confirmed: false,
+                    outcome_unknown: write.may_be_stored.load(Ordering::Relaxed),
+                };
+                if !repeated {
+                    return failed;
+                }
+                let backoff = full_jitter(
+                    node.platform.as_ref(),
+                    attempts,
+                    WRITE_BACKOFF_BASE,
+                    WRITE_BACKOFF_CAP,
+                );
+                if started.elapsed() + backoff + WRITE_RETRY_MARGIN > budget {
+                    return failed;
+                }
+                counters.write_retries.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(backoff).await;
+            }
+        }
+    }
+}
+
+/// One attempt of [`send_to_log_store`]: one `PUT` of the entry, over an idle connection when
+/// `first` and there is one (with half of `limit`), else over a new connection (with `limit`,
+/// which also bounds the open). `Ok` is the status 200.
+async fn write_once(
+    node: &Node,
+    writer: &Writer,
+    write: &Write,
+    first: bool,
+    limit: Duration,
+) -> Result<(), AttemptFailure> {
+    let idle = match first {
+        true => node.log_store.idle.take().await,
+        false => None,
+    };
+    let attempt_limit = match idle.is_some() {
+        true => limit / 2,
+        false => limit,
+    };
+    let exchange = async {
+        let mut sender = match idle {
+            Some(sender) => {
+                node.egress
+                    .counters
+                    .idle_reuses
+                    .log_store
+                    .fetch_add(1, Ordering::Relaxed);
+                sender
+            }
+            None => open_log_connection(node, writer, attempt_limit).await?,
+        };
+        let request =
+            put_request(writer, write, node.now_ms()).ok_or((WriteFailure::Connect, false))?;
+        // From here the request may be with the store, until the store answered it. A call
+        // that ends during the wait leaves the flag set.
+        write.in_flight.store(true, Ordering::Relaxed);
+        let response = sender
+            .send_request(request)
+            .await
+            .map_err(|_| (WriteFailure::Closed, true))?;
+        write.in_flight.store(false, Ordering::Relaxed);
         if response.body().is_end_stream() {
             node.log_store.idle.put(sender);
         }
-        Some(response.status() == StatusCode::OK)
-    };
-    let exchange = async {
-        if let Some(sender) = node.log_store.idle.take().await {
-            if let Some(confirmed) = put(sender).await {
-                return Some(confirmed);
-            }
+        match response.status() {
+            StatusCode::OK => Ok(()),
+            status => Err(status_failure(status)),
         }
-        let sender = match &writer.endpoint {
-            None => node
-                .egress
-                .open(node.platform.as_ref(), &writer.id.host())
+    };
+    match tokio::time::timeout(attempt_limit, exchange).await {
+        Ok(outcome) => outcome,
+        Err(_) => Err((WriteFailure::Timeout, true)),
+    }
+}
+
+/// A new connection to the log store: to the host of the bucket, or to the endpoint of a node
+/// of the local platform (enclave.md 5.14). `budget` is the time limit of the attempt.
+async fn open_log_connection(
+    node: &Node,
+    writer: &Writer,
+    budget: Duration,
+) -> Result<SendRequest<OnceBody>, AttemptFailure> {
+    let opened = match &writer.endpoint {
+        None => {
+            node.egress
+                .open(node.platform.as_ref(), &writer.id.host(), budget)
                 .await
-                .ok()?,
-            Some(endpoint) => node
-                .egress
+        }
+        Some(endpoint) => {
+            node.egress
                 .open_at(
                     node.platform.as_ref(),
                     &endpoint.host,
                     endpoint.port,
                     endpoint.tls,
+                    budget,
                 )
                 .await
-                .ok()?,
-        };
-        put(sender).await
+        }
     };
-    matches!(
-        tokio::time::timeout(node.limits.log_write, exchange).await,
-        Ok(Some(true))
-    )
+    opened.map_err(|error| match error {
+        OpenError::Tls => (WriteFailure::Tls, true),
+        OpenError::Transport | OpenError::RelayRefused | OpenError::Http => {
+            (WriteFailure::Connect, true)
+        }
+    })
 }
 
 /// The request that writes one entry (protocol.md 7.6): `PUT` of the signed entry as the node
@@ -691,8 +897,9 @@ fn put_request(writer: &Writer, write: &Write, now_ms: u64) -> Option<Request<On
         .ok()
 }
 
-/// The sweep of the node (enclave.md section 3): every [`SWEEP_INTERVAL`], for every account, the
-/// merge keys whose window passed are dropped and the pending entries are written again. A pending
+/// The sweep of the node (enclave.md section 3): every [`SWEEP_INTERVAL`], for every account, a
+/// grant whose time passed is ended, the merge keys whose window passed and the kept `refresh`
+/// responses whose time passed are dropped, and the pending entries are written again. A pending
 /// entry is otherwise written again with the next write of its account only, so without the sweep
 /// an account that makes no further call would leave a gap in the store for as long as it is
 /// idle, and a reader of the store would take that gap for an omission. The task ends when the
@@ -707,24 +914,170 @@ pub async fn keep_sweeping(node: Arc<Node>) {
     }
 }
 
-/// One sweep ([`keep_sweeping`]). The accounts are visited one at a time: the pending entries of
-/// an account are written with the rules of [`confirm`] (at most 32 at the same time, over the
-/// idle connections), and the calls of the account that wait look at their entries again. An
-/// entry the store does not confirm stays pending for the next sweep.
+/// One sweep ([`keep_sweeping`]), in three passes.
+///
+/// The first pass visits every account of the node once, in the order of the sorted index,
+/// one chunk of the index at a time: it ends a grant whose time passed (as every read of the
+/// state of an account does), drops the merge keys whose window passed and the kept `refresh`
+/// responses whose time passed, and collects the accounts that have a pending entry.
+///
+/// The second pass visits the collected accounts one at a time, in an order the random source
+/// of the platform shuffles. The pending entries of an account are written with the rules of
+/// [`confirm`] (at most 32 at the same time, over the idle connections) when the oldest of
+/// them has been pending for longer than a jitter drawn in `[0, SWEEP_INTERVAL)` for that
+/// account; otherwise they wait for the next sweep. Over the whole node the sweep writes at
+/// most `Limits::sweep_write_rate` entries per second (a token bucket with a burst of one
+/// second), and the pass ends when the next sweep is due: the accounts it did not reach wait
+/// for that sweep. The calls of an account whose entries were written look at their entries
+/// again. An entry the store does not confirm stays pending for the next sweep.
+///
+/// The third pass reads the oldest pending entry of the collected accounts again and keeps its
+/// `pending_since_ms` in the counts of the node (0 when none is left): `pending_oldest_ms` of
+/// health is computed from it until the next sweep.
+///
+/// The random order and the jitter spread the writes of the accounts whose entries became
+/// pending at one moment (an outage of the store) over two sweeps instead of one burst, and
+/// the rate keeps the recovery from more than doubling the live load on the store.
 pub async fn sweep(node: &Node) {
     let now_ms = node.now_ms();
-    for (_, account) in node.accounts_after("") {
-        let pending = {
-            let mut guard = lock(&account);
-            guard.prune_recent(now_ms);
-            guard.pending_entries() > 0
+    let platform = node.platform.as_ref();
+    let mut random = RandomDraws::new(platform);
+    let mut pending_accounts: Vec<(String, Arc<Mutex<Account>>)> = Vec::new();
+    for (user_id, account) in node.accounts_after("") {
+        let mut guard = lock(&account);
+        guard.expire(now_ms);
+        guard.prune_recent(now_ms);
+        guard.prune_refreshes(now_ms);
+        if guard.oldest_pending_since_ms().is_some() {
+            drop(guard);
+            pending_accounts.push((user_id, account));
+        }
+    }
+    shuffle(&mut pending_accounts, &mut random);
+    let deadline = Instant::now() + SWEEP_INTERVAL;
+    let mut bucket = TokenBucket::new(node.limits.sweep_write_rate);
+    let interval_ms = u64::try_from(SWEEP_INTERVAL.as_millis()).unwrap_or(u64::MAX);
+    for (_, account) in &pending_accounts {
+        let waiting = {
+            let guard = lock(account);
+            guard
+                .oldest_pending_since_ms()
+                .map(|since_ms| (guard.pending_entries(), now_ms.saturating_sub(since_ms)))
         };
-        if !pending || node.ensure_open().is_err() {
+        let Some((pending, age_ms)) = waiting else {
+            continue;
+        };
+        if node.ensure_open().is_err() {
+            break;
+        }
+        if age_ms < random.next() % interval_ms {
             continue;
         }
-        let _ = confirm(node, &account, &[]).await;
-        let notify = lock(&account).notify.clone();
+        if !bucket.take(pending, deadline).await {
+            break;
+        }
+        let _ = confirm(node, account, &[]).await;
+        let notify = lock(account).notify.clone();
         notify.notify_waiters();
+    }
+    let oldest_since_ms = pending_accounts
+        .iter()
+        .filter_map(|(_, account)| lock(account).oldest_pending_since_ms())
+        .min()
+        .unwrap_or(0);
+    node.counters
+        .pending_oldest_since_ms
+        .store(oldest_since_ms, Ordering::Relaxed);
+}
+
+/// Random values from the random source of the platform, read 512 bytes at a time. When the
+/// source fails, every value is 0: the sweep then visits the accounts in one fixed order and
+/// writes every pending entry without a jitter.
+struct RandomDraws<'a> {
+    platform: &'a dyn DynPlatform,
+    buffer: [u8; 512],
+    at: usize,
+}
+
+impl<'a> RandomDraws<'a> {
+    fn new(platform: &'a dyn DynPlatform) -> RandomDraws<'a> {
+        RandomDraws {
+            platform,
+            buffer: [0u8; 512],
+            at: 512,
+        }
+    }
+
+    fn next(&mut self) -> u64 {
+        if self.at + 8 > self.buffer.len() {
+            if self.platform.fill_random(&mut self.buffer).is_err() {
+                return 0;
+            }
+            self.at = 0;
+        }
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&self.buffer[self.at..self.at + 8]);
+        self.at += 8;
+        u64::from_le_bytes(bytes)
+    }
+}
+
+/// Puts `items` in a random order (Fisher-Yates).
+fn shuffle<T>(items: &mut [T], random: &mut RandomDraws<'_>) {
+    for remaining in (2..=items.len()).rev() {
+        let chosen = usize::try_from(random.next() % remaining as u64).unwrap_or(0);
+        items.swap(remaining - 1, chosen);
+    }
+}
+
+/// The pace of the writes of the sweep: `rate` entries per second, with a burst of one second
+/// of them. The tokens are counted in thousandths, and the count goes below zero when an
+/// account has more entries than one second of the rate: that debt is paid before the next
+/// account is written.
+struct TokenBucket {
+    rate: i64,
+    tokens: i64,
+    last: Instant,
+}
+
+impl TokenBucket {
+    fn new(rate: u32) -> TokenBucket {
+        let rate = i64::from(rate.max(1));
+        TokenBucket {
+            rate,
+            tokens: rate * 1000,
+            last: Instant::now(),
+        }
+    }
+
+    /// Takes the tokens of `count` entries, waiting for them to accrue, and returns false when
+    /// they would accrue after `deadline`.
+    async fn take(&mut self, count: usize, deadline: Instant) -> bool {
+        let now = Instant::now();
+        let accrued = i64::try_from(now.duration_since(self.last).as_millis()).unwrap_or(i64::MAX);
+        let capacity = self.rate * 1000;
+        self.tokens = self
+            .tokens
+            .saturating_add(accrued.saturating_mul(self.rate))
+            .min(capacity);
+        self.last = now;
+        let needed = i64::try_from(count)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(1000);
+        let target = needed.min(capacity);
+        if self.tokens < target {
+            // The ceiling of the division: both values are positive here.
+            let wait_ms = (target - self.tokens + self.rate - 1) / self.rate;
+            let wait = Duration::from_millis(u64::try_from(wait_ms).unwrap_or(u64::MAX));
+            if now + wait > deadline {
+                return false;
+            }
+            tokio::time::sleep(wait).await;
+            self.tokens = target;
+            self.last = Instant::now();
+        }
+        self.tokens = self.tokens.saturating_sub(needed);
+        true
     }
 }
 
@@ -1085,6 +1438,9 @@ mod tests {
             },
             required: true,
             confirmed: false,
+            outcome_unknown: false,
+            in_flight: AtomicBool::new(false),
+            may_be_stored: AtomicBool::new(false),
         };
         // 2026-10-01T12:10:45.123Z.
         let request = put_request(&writer, &write, 1_790_856_645_123).unwrap();
@@ -1246,6 +1602,9 @@ mod tests {
             },
             required: true,
             confirmed: false,
+            outcome_unknown: false,
+            in_flight: AtomicBool::new(false),
+            may_be_stored: AtomicBool::new(false),
         };
         let request = put_request(&writer, &write, 1_790_856_645_123).unwrap();
         assert_eq!(

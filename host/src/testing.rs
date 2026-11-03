@@ -71,7 +71,7 @@ impl FakeNode {
 /// The `health` body of a node of release v2.0.0 with the given values, in the form of
 /// enclave.md 5.1: with the `log` object and without the `load` object.
 pub fn health_body(configured: bool, accounts: u64, started_ms: u64) -> String {
-    health_body_of("v2.0.0", configured, accounts, started_ms, "")
+    health_body_of("v2.0.0", configured, accounts, started_ms, "null", "", "")
 }
 
 /// The `load` object of [`health_body_with_load`].
@@ -85,7 +85,48 @@ pub fn health_body_with_load(configured: bool, accounts: u64, started_ms: u64) -
         configured,
         accounts,
         started_ms,
+        "null",
+        "",
         &format!(r#","load":{LOAD_OBJECT}"#),
+    )
+}
+
+/// The `log_store` object of [`health_body_with_egress_and_refresh`].
+pub const LOG_STORE_OBJECT: &str = r#"{"bucket":"character-credential-log-dev-1","region":"us-west-2","credentials_expires_ms":1790000900000,"pending":6,"pending_oldest_ms":12345}"#;
+
+/// The write counts of the `log` object of [`health_body_with_egress_and_refresh`]: the keys
+/// of release v2.1.0 after the seven counts.
+pub const LOG_WRITE_COUNTS: &str = r#","write_attempt_failures":{"connect":1,"tls":2,"closed":3,"timeout":4,"status_4xx":5,"status_5xx":6},"write_retries":7,"write_ms_buckets":{"25":10,"50":20,"100":30,"250":40,"500":50,"1000":60,"2500":70,"5000":80},"write_ms_sum":123456,"write_count":90"#;
+
+/// The `egress` object of [`health_body_with_egress_and_refresh`].
+pub const EGRESS_OBJECT: &str = r#"{"opens":100,"open_failures":{"transport":1,"relay_refused":2,"tls":3,"http":4},"open_retries":5,"open_inflight":6,"idle_reuses":{"provider":200,"log_store":300}}"#;
+
+/// The `refresh` object of [`health_body_with_egress_and_refresh`].
+pub const REFRESH_OBJECT: &str =
+    r#"{"late":{"kept":1,"dropped":2,"failed":3,"abandoned":4},"late_inflight":5}"#;
+
+/// The `state` object of [`health_body_with_egress_and_refresh`].
+pub const STATE_OBJECT: &str = r#"{"kept_refreshes":11,"merge_keys":22,"pending_entries":33,"idle_connections":{"provider":44,"log_store":55}}"#;
+
+/// The `health` body of a node of release v2.1.0 with the given values:
+/// [`health_body_with_load`] with the `log_store` object [`LOG_STORE_OBJECT`] in place of null,
+/// the write counts [`LOG_WRITE_COUNTS`] at the end of the `log` object, and the objects
+/// [`EGRESS_OBJECT`], [`REFRESH_OBJECT`] and [`STATE_OBJECT`] after the `load` object.
+pub fn health_body_with_egress_and_refresh(
+    configured: bool,
+    accounts: u64,
+    started_ms: u64,
+) -> String {
+    health_body_of(
+        "v2.1.0",
+        configured,
+        accounts,
+        started_ms,
+        LOG_STORE_OBJECT,
+        LOG_WRITE_COUNTS,
+        &format!(
+            r#","load":{LOAD_OBJECT},"egress":{EGRESS_OBJECT},"refresh":{REFRESH_OBJECT},"state":{STATE_OBJECT}"#
+        ),
     )
 }
 
@@ -94,25 +135,29 @@ fn health_body_of(
     configured: bool,
     accounts: u64,
     started_ms: u64,
+    log_store: &str,
+    log_write_counts: &str,
     after_log: &str,
 ) -> String {
     format!(
         concat!(
             r#"{{"node":"n","release":"{release}","platform":"nitro","started_ms":{started_ms},"time_ms":{time_ms},"#,
             r#""configured":{configured},"closing":false,"accounts":{accounts},"grants":0,"#,
-            r#""mail_providers":["naver_mail"],"log_store":null,"#,
+            r#""mail_providers":["naver_mail"],"log_store":{log_store},"#,
             r#""log":{{"entries":{entries},"events":{events},"writes":{writes},"write_failures":1,"#,
-            r#""open_batches":2,"batch_calls":3,"batch_requests":{batch_requests}}}{after_log}}}"#
+            r#""open_batches":2,"batch_calls":3,"batch_requests":{batch_requests}{log_write_counts}}}{after_log}}}"#
         ),
         release = release,
         started_ms = started_ms,
         time_ms = started_ms + 1000,
         configured = configured,
         accounts = accounts,
+        log_store = log_store,
         entries = accounts * 10,
         events = accounts * 100,
         writes = accounts * 10 + 1,
         batch_requests = accounts * 100 / 2 + 50,
+        log_write_counts = log_write_counts,
         after_log = after_log,
     )
 }

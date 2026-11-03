@@ -2152,6 +2152,27 @@ async fn walk() -> Canary {
     let (status, known) = canary.post("/v1/peer/import", returned.clone()).await;
     assert_eq!((status, &known["imported"]), (200, &json!(0)), "{known}");
 
+    // The operator reduces the nodes that hold the key of the account to one of two: the
+    // second node is outside the subset of the account and drops its grant, with no entry and
+    // no use. A subset outside its bounds is refused.
+    let outcome = canary
+        .post(
+            "/v1/grants/prune",
+            json!({"subset": {"pods": 0, "pod": 0, "copies": 1}}),
+        )
+        .await;
+    assert_eq!(code(&outcome), (400, "invalid_request"));
+    let outside = (0..2u32)
+        .find(|pod| !crate::subset::assign(&user, 2, 1).contains(pod))
+        .unwrap();
+    let prune =
+        json!({"subset": {"pods": 2, "pod": outside, "copies": 1}, "after": "", "limit": 1000});
+    let (status, pruned) = canary.post_on(1, "/v1/grants/prune", prune.clone()).await;
+    assert_eq!(status, 200, "{pruned}");
+    assert_eq!(pruned["pruned"], json!([user]));
+    let (status, again) = canary.post_on(1, "/v1/grants/prune", prune).await;
+    assert_eq!((status, &again["pruned"]), (200, &json!([])), "{again}");
+
     // The calls that use a record of the account, for the two states that refuse them all.
     let until_revoked = pending_state(&canary, "google_workspace").await;
     let until_closed = pending_state(&canary, "slack").await;
@@ -2232,7 +2253,7 @@ async fn the_walk_calls_every_route_in_a_success_case_and_in_a_failure_case() {
         routes.iter().map(owned).collect()
     };
     let routes = routes();
-    assert_eq!(routes.len(), 21);
+    assert_eq!(routes.len(), 22);
     let (mail_success, mail_failure) = super::mail::canary_routes().await;
     let mut called = canary.routes_called(|_| true);
     called.extend(mail_success.clone());

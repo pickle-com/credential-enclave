@@ -608,11 +608,21 @@ body = UTF-8(JSON {"v":1,"type":"head","node":"...","user_id":"...","seq":0,"has
   without entries has `seq` 0 and a `hash` of 32 zero bytes.
 - `nonce` is the value that the requester gave (in a head whose `final` is true it is the empty
   string).
-- A node creates a head whose `final` is true in its orderly shutdown, one per account. After that
-  the node creates no entry for that account.
+- A node creates a head whose `final` is true in its orderly shutdown, one per account, at the
+  last entry of the chain that the log store confirmed. When the entries above that one are the
+  end of the chain and the store confirmed none of them, the node drops them from its chain and
+  signs the final head below them (enclave.md 5.11): a final head of `seq` 0 says that the store
+  holds no confirmed entry of the node for that account. An entry whose write may have reached the
+  store (the connection closed without a response, the attempt passed its time limit after the
+  request left, the store answered with a 5xx status, or the call that owned the write ended while
+  the store held the request) is not dropped: the node leaves no final head for that account
+  until the store confirms the entry.
+  After that the node creates no entry for that account.
 - The head covers entries. The events of an open batch are not on the chain yet, and their acts
   have not taken place (an act follows the confirmation of its entry, which follows the close of
-  the batch). So a head names every act that took place or could have taken place.
+  the batch). So a head names every act that took place or could have taken place. A final head
+  names every act of the node for that account: an entry the store never confirmed names acts
+  that did not take place, and the final head stands below it.
 
 ### 7.4 Verification (the app)
 
@@ -709,6 +719,7 @@ is always in the listing.
 | A `seq` without a candidate whose first key after it is younger than one hour | Pending: the node has still to write the entry again (7.6); the next run reads the gap |
 | A node appears in the listing that no grant of the app and no traced transfer explains, with a first entry sealed to the key of this account | A node used the key of the account outside the delegations the app knows |
 | A node that is gone has no `final` head | The entries after the verified point are read by content verification. The part the app has not read yet is pending |
+| A node that is gone has a `final` head, and a key of its prefix lies above the `seq` of that head | The stored log holds an object the node did not vouch for: attention (step 4). A node avoids this state in its orderly shutdown: it signs the final head below an unconfirmed tail only when every write attempt of those entries failed before a request byte left the node or was answered by the store with a 4xx status, and it leaves no final head for an account with an unconfirmed entry whose write may have reached the store (7.3) |
 | The store cannot be listed or read, an address the backend handed out is not one of the request, more unknown prefixes than `LOG_STORE_NODES` are listed, or a release build of the app is refused the store | The verification is pending (the app does not treat it as complete); the refusal of a release build marks the log, and reads that keep failing for `LOG_STORE_STALE_MS` mark the log |
 
 Format 1 (the chains of nodes of the releases before v2.0.0): the app verifies every entry by its
@@ -768,10 +779,14 @@ Authorization: AWS4-HMAC-SHA256 Credential=..., SignedHeaders=..., Signature=...
   that the operator domain gives the node (enclave.md 5.14). In the path, every byte of the key
   outside the unreserved characters of RFC 3986 is percent-encoded, and `/` is not: a `user_id`
   is written into the key as it is.
-- The node keeps up to 32 idle HTTP/1.1 connections to the store and sends a write over the most
-  recently used one; a write over an idle connection that ends without a response goes once more
-  over a new connection (a `PUT` is idempotent, and a repeated write adds a second version of the
-  same object). A connection carries one write at a time.
+- The node keeps up to 32 idle HTTP/1.1 connections to the store and sends the first attempt of
+  a write over the most recently used one. An attempt the store does not confirm because the
+  connection failed, the connection closed without a response, the attempt passed its time
+  limit, or the status was 5xx or 429 is repeated over a new connection, with a full jitter
+  backoff between the attempts, within a budget of twice the time limit of a write per entry; a
+  4xx status other than 429 is not repeated (enclave.md 5.14). A `PUT` is idempotent, and a
+  repeated attempt adds a version of the same object with the same body. A connection carries
+  one write at a time.
 - The one confirmation of a write is the status 200 of that request. Every other status, a
   failure of the connection and a write that takes longer than its time limit are no
   confirmation. A bucket without Object Lock refuses a request with these headers, so a node
@@ -1001,6 +1016,9 @@ giving node and the envelope):
 - The app sends the revocation of a delegation to every living node: a node to which the app never
   handed a delegation can hold one that it took over. A node that accepted the revocation takes no
   transfer for that account (step 3 of the table above).
+- Both calls take an optional `subset` object (10.4). With it, the giving node selects the
+  accounts of the share of the receiving node alone, and the receiving node keeps the grants of
+  its own share alone.
 - A transfer to a node of a later release follows 10.3: the release key of the operator and the
   public transparency log decide which release receives the delegations of a node.
 - A transfer to a node of another release under a rule of the account is stage 3: the app writes
@@ -1129,6 +1147,55 @@ any other form is not a release tag and has no place in the order.
 - The account sees the transfer on its chain as it sees every transfer: the entry
   `grant_transferred_out` on the chain of the giving node names the receiving node (10.1).
 
+### 10.4 The delegation subset
+
+Purpose: the operator runs `pods` nodes and gives the delegation of every account to `copies` of
+them, so that the state of a node and the work of a transfer grow with the accounts of its share
+and not with every account. The nodes are numbered by their ordinal, 0 to `pods - 1`, and the
+operator's backend lists for an account the nodes of its share. The nodes of an account are a
+function of the account and the two integers alone:
+
+```text
+rank(user_id, ordinal) = SHA-256(UTF-8(user_id) || "\n" || UTF-8(ordinal as decimal digits))
+assign(user_id, pods, copies) = the first min(copies, pods) ordinals of 0..pods in the ascending
+                                order of (rank(user_id, ordinal), ordinal)
+```
+
+The order of two ranks is the order of their 32 bytes. A node that restarts keeps its ordinal
+and its share. When `pods` grows by one, the accounts whose first `copies` ordinals gain the new
+ordinal hand one ordinal over to it and every other account keeps its ordinals; when `pods`
+shrinks by one, the accounts that held the removed ordinal gain the ordinal that ranks next for
+them and every other account keeps its ordinals.
+
+The `subset` object of a request names the nodes the operator runs, the ordinal of the node the
+request is about and the nodes per account:
+
+```text
+subset = {"pods": 3, "pod": 1, "copies": 2}
+```
+
+`pods` is 1 to 1,024, `pod` is below `pods` and `copies` is at least 1; a `copies` at or above
+`pods` names every node. Another value is `invalid_request`. A node does not know its own
+ordinal: the caller names it. A false value from the caller makes a node hold fewer grants, never
+more: the receiving node of a transfer and the node that prunes still verify every other rule.
+
+| Call | What `subset` does |
+| --- | --- |
+| `peer/export` (`pod` is the ordinal of the receiving node) | The page selects the accounts whose `assign(user_id, pods, copies)` contains `pod` alone, and `limit` counts those. Without the key the page selects every account with a grant, as 10.1 states |
+| `peer/import` (`pod` is the ordinal of this node) | A grant of the envelope whose account's `assign(user_id, pods, copies)` does not contain `pod` is left out: not put in place, no entry, not counted in `imported`. Without the key every grant of the envelope is taken. A giving node of a release without this rule hands every account over, and the receiving node keeps its share all the same |
+| `grants/prune` (`pod` is the ordinal of this node; the key is required) | The node walks its accounts in `user_id` order after `after` and drops the grant, within its time or expired, of every account whose `assign(user_id, pods, copies)` does not contain `pod`: the user key is overwritten with zeros and the account has no grant, as at the end of a grant. No entry is created (nothing is used: the operator chose which nodes hold a key). A revocation marker and the chain of the account stay. The response lists the `user_id` of every pruned account and the `user_id` the walk continues after, the empty string when it reached the end (enclave.md 5.15) |
+
+Test vectors of the assignment; the backend of the operator computes the same function:
+
+| `user_id` | `pods` | `copies` | `assign` |
+| --- | --- | --- | --- |
+| `user-1` | 3 | 2 | {0, 1} |
+| `00000000-0000-4000-8000-000000000007` | 12 | 2 | {2, 6} |
+| `alice` | 5 | 3 | {0, 2, 3} |
+| `bob` | 4 | 1 | {1} |
+| `사용자 1` | 6 | 2 | {0, 4} |
+| `carol` | 2 | 5 | {0, 1} |
+
 ## 11. All failure codes (node)
 
 | Code | Meaning |
@@ -1167,8 +1234,14 @@ any other form is not a release tag and has no place in the order.
 | Merge window of identical GET requests | 300 seconds |
 | Time a node keeps the response of a successful `refresh` (enclave.md 5.7) | 3,600 seconds |
 | Kept `refresh` responses per account | 16 (the most recent ones) |
+| Longest time a node keeps receiving the response of a token address call of `refresh` after the time limit of the call, counted from the start of the call (`TOKEN_LATE_LIMIT`, enclave.md 5.7) | 120 seconds |
+| Token address calls of `refresh` a node continues after their time limit at once (`REFRESH_LATE_TASKS`) | 128 |
 | Most accounts in one delegation transfer | 1,000 |
 | Most nodes that a node hands one grant to (10.1) | 64 |
+| Nodes a delegation subset names (`pods`, 10.4) | 1 to 1,024 |
+| Nodes per account of a delegation subset (`copies`, 10.4) | 1 to `pods` (a larger value names every node) |
+| Most pruned accounts in one page of `grants/prune` (10.4, enclave.md 5.15) | 1,000 |
+| Most accounts one `grants/prune` call looks at (`SCAN_LIMIT`) | 10,000 |
 | Longest release statement (10.3) | 16,384 bytes |
 | Notice period of a release (10.3) | 0 seconds |
 | Longest time by which a log entry lies after the time of the node (10.3) | 300 seconds |

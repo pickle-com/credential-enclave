@@ -1,6 +1,6 @@
 [package]
 name = "credential-enclave-host"
-version = "2.0.1"
+version = "2.1.0"
 description = "The host program of the credential enclave: the program of the parent pod"
 edition.workspace = true
 rust-version.workspace = true
@@ -20,7 +20,11 @@ serde.workspace = true
 serde_json.workspace = true
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "linux")'.dependencies]
+socket2 = "0.6"
 tokio-vsock = "0.7"
 
 [dev-dependencies]

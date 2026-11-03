@@ -138,7 +138,7 @@ async fn one_entry_names_every_request_before_any_leaves() {
 
     let log = harness.health().await["log"].clone();
     assert_eq!(
-        log,
+        super::seven_counts(&log),
         json!({
             "entries": 2, "events": 101, "writes": 2, "write_failures": 0, "open_batches": 0,
             "batch_calls": 1, "batch_requests": 100,

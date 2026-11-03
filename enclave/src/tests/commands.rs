@@ -838,8 +838,8 @@ async fn an_expired_grant_counts_as_no_grant_in_commands() {
     {
         let account = harness.node.account("user-1").unwrap();
         assert!(matches!(
-            lock(&account).grant,
-            GrantState::Expired { not_after_ms: end, .. } if end == not_after_ms
+            lock(&account).grant(),
+            GrantState::Expired { not_after_ms: end, .. } if *end == not_after_ms
         ));
     }
 

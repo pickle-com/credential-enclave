@@ -10,7 +10,7 @@ use credential_enclave_protocol::encoding::{b64u, to_json};
 use serde::Serialize;
 use tokio::net::{TcpListener, TcpStream};
 
-use super::{Listener, Measurement, Platform, PlatformError, Stream, LISTEN_PORT};
+use super::{ConnectError, Listener, Measurement, Platform, PlatformError, Stream, LISTEN_PORT};
 
 /// The local platform.
 pub struct LocalPlatform;
@@ -82,13 +82,13 @@ impl Platform for LocalPlatform {
             .map_err(|_| PlatformError("cannot listen on TCP 0.0.0.0:8080"))
     }
 
-    async fn connect(&self, host: &str, port: u16) -> Result<Stream, PlatformError> {
+    async fn connect(&self, host: &str, port: u16) -> Result<Stream, ConnectError> {
         let stream = TcpStream::connect((host, port))
             .await
-            .map_err(|_| PlatformError("cannot connect to the provider"))?;
+            .map_err(|_| ConnectError::Transport("cannot connect to the provider"))?;
         stream
             .set_nodelay(true)
-            .map_err(|_| PlatformError("cannot configure the provider connection"))?;
+            .map_err(|_| ConnectError::Transport("cannot configure the provider connection"))?;
         Ok(Box::new(stream))
     }
 }

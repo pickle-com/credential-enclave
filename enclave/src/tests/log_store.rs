@@ -39,8 +39,14 @@ struct Script {
     status: u16,
     /// Parts of request targets: a write whose target holds one of them is answered with 503.
     refused: Vec<String>,
+    /// Writes the stand-in answers with `refusal_status` before it answers by `status` again.
+    refusals: usize,
+    /// The status of those answers, 503 when it is 0.
+    refusal_status: u16,
     /// The stand-in answers no write.
     silent: bool,
+    /// Writes the stand-in reads without answering, leaving the connection open.
+    stalled: usize,
     /// The stand-in closes the connection after each answer.
     close: bool,
     /// Writes the stand-in reads and answers by closing the connection without a response.
@@ -57,6 +63,17 @@ fn refuse(store: &Store, status: u16) {
 
 fn confirm(store: &Store) {
     *lock(store) = Script::default();
+}
+
+/// The write time limit of the tests that refuse writes: 450 milliseconds. The budget of an
+/// entry is twice the limit, which is below the margin of one second a repeated attempt needs
+/// in the budget, so under this limit the store answers one write per entry and a refusal
+/// ends the write at once. The tests of the repeated attempts use the default limit.
+fn short_write_limits() -> Limits {
+    Limits {
+        log_write: Duration::from_millis(450),
+        ..Limits::default()
+    }
 }
 
 /// The part of the key of the entry `seq` that names it.
@@ -90,11 +107,24 @@ async fn stand_in() -> (Provider, Store) {
                 script.lost -= 1;
                 return Reply::Raw(Vec::new());
             }
+            if script.stalled > 0 {
+                script.stalled -= 1;
+                return Reply::Hang;
+            }
             if script.silent {
                 return Reply::Hang;
             }
             let refused = script.refused.iter().any(|part| seen.target.contains(part));
-            let reply = match (refused, script.status) {
+            let status = if script.refusals > 0 {
+                script.refusals -= 1;
+                match script.refusal_status {
+                    0 => 503,
+                    status => status,
+                }
+            } else {
+                script.status
+            };
+            let reply = match (refused, status) {
                 (true, _) => Reply::with_body(503, &[], b"<Error><Code>SlowDown</Code></Error>"),
                 (false, 0 | 200) => Reply::with_body(
                     200,
@@ -121,7 +151,17 @@ async fn stand_in() -> (Provider, Store) {
 /// A node of the local platform with the log store of the tests, and the app of an account
 /// that granted on it.
 async fn node_with_log_store(provider: &Provider) -> (Harness, App) {
-    let harness = Harness::new(provider);
+    node_with_limits(provider, Limits::default()).await
+}
+
+/// [`node_with_log_store`] with the limits of [`short_write_limits`]: a node that writes every
+/// entry once, for the tests in which the store refuses writes.
+async fn node_without_repeated_writes(provider: &Provider) -> (Harness, App) {
+    node_with_limits(provider, short_write_limits()).await
+}
+
+async fn node_with_limits(provider: &Provider, limits: Limits) -> (Harness, App) {
+    let harness = Harness::with(provider, Definitions::embedded(), limits);
     harness.use_log_store().await;
     let app = App::new("user-1", 1);
     app.grant(&harness).await;
@@ -480,7 +520,7 @@ async fn the_log_store_confirms_the_entry_before_the_provider_is_called() {
 #[tokio::test]
 async fn a_write_the_store_does_not_confirm_stops_the_act() {
     let (provider, store) = stand_in().await;
-    let (harness, app) = node_with_log_store(&provider).await;
+    let (harness, app) = node_without_repeated_writes(&provider).await;
     let record = google_record(&app);
     let state = begin(&harness, &app).await;
     refuse(&store, 500);
@@ -539,14 +579,30 @@ async fn a_write_the_store_does_not_confirm_stops_the_act() {
         unavailable(&release(&harness, &app, &password(&app)).await);
     }
     assert!(provider_requests(&provider).len() == 1);
+    // The counts of health. Every call wrote its own entry and the pending entries of the
+    // account along, each once under this write limit: the write of the grant, then 1 to 5
+    // writes for the five calls the store answered with 500 (15 attempts), 5 for the merged
+    // request answered with 412, and 6 to 10 for the five releases answered with another
+    // status (40 attempts). The 5xx answers are counted under their cause and every other
+    // status under the other one.
+    let log = harness.health().await["log"].clone();
+    assert_eq!(log["writes"], 61);
+    assert_eq!(log["write_failures"], 60);
+    assert_eq!(log["write_retries"], 0);
+    assert_eq!(
+        log["write_attempt_failures"],
+        json!({"connect": 0, "tls": 0, "closed": 0, "timeout": 0, "status_4xx": 45, "status_5xx": 15})
+    );
+    assert_eq!(log["write_count"], 1);
 }
 
 #[tokio::test]
 async fn a_store_that_cannot_be_reached_or_does_not_answer_stops_the_act() {
     // A stand-in for the providers only: the platform has no way to the host of the log
-    // store, as when the host program or the network refuses the connection.
+    // store, as when the host program or the network refuses the connection. The node asks
+    // its platform for the connection three times before the write fails.
     let provider = super::quiet_provider().await;
-    let harness = Harness::new(&provider);
+    let harness = Harness::with(&provider, Definitions::embedded(), short_write_limits());
     harness.use_log_store().await;
     let app = App::new("user-1", 1);
     let attested = app.attest(&harness).await;
@@ -558,10 +614,17 @@ async fn a_store_that_cannot_be_reached_or_does_not_answer_stops_the_act() {
     assert_eq!(reply["code"], "log_store_unavailable");
     assert_eq!(
         harness.platform.connections(),
-        [(LOG_HOST.to_string(), 443)]
+        vec![(LOG_HOST.to_string(), 443); 3]
     );
+    let health = harness.health().await;
+    assert_eq!(health["egress"]["open_failures"]["transport"], 3);
+    assert_eq!(health["egress"]["open_retries"], 2);
+    assert_eq!(health["egress"]["opens"], 0);
+    assert_eq!(health["log"]["write_attempt_failures"]["connect"], 1);
 
     // A store that takes the connection and never answers: the write ends at its time limit.
+    // The attempt goes over the idle connection of the write of the grant, with half the
+    // limit, and under this limit no attempt follows it.
     let (provider, store) = stand_in().await;
     let harness = Harness::with(
         &provider,
@@ -578,14 +641,76 @@ async fn a_store_that_cannot_be_reached_or_does_not_answer_stops_the_act() {
     let started = std::time::Instant::now();
     unavailable(&release(&harness, &app, &password(&app)).await);
     let waited = started.elapsed();
-    assert!(waited >= Duration::from_millis(300) && waited < Duration::from_secs(3));
+    assert!(waited >= Duration::from_millis(150) && waited < Duration::from_millis(600));
+    assert_eq!(writes(&provider).len(), 2);
+    assert_eq!(harness.platform.connections().len(), 1);
+    let health = harness.health().await;
+    assert_eq!(health["log_store"]["pending"], 1);
+    assert_eq!(health["log"]["write_attempt_failures"]["timeout"], 1);
+    assert_eq!(health["egress"]["idle_reuses"]["log_store"], 1);
     assert!(provider_requests(&provider).is_empty());
+}
+
+#[tokio::test]
+async fn a_write_the_store_refuses_with_a_server_error_is_repeated_within_its_budget() {
+    let (provider, store) = stand_in().await;
+    let (harness, app) = node_with_log_store(&provider).await;
+
+    // The store answers the first two attempts with 503 and the third with 200: the entry is
+    // confirmed, with the same bytes under the same key in every attempt.
+    lock(&store).refusals = 2;
+    let (status, released) = release(&harness, &app, &password(&app)).await;
+    assert_eq!((status, &released["value"]), (200, &json!("hunter2")));
+    let attempts = writes(&provider);
+    assert_eq!(attempts.len(), 4);
+    for write in &attempts[1..] {
+        assert_eq!(
+            (&write.target, &write.body),
+            (&attempts[1].target, &attempts[1].body)
+        );
+        assert_write_of(&harness, write, "user-1", 2);
+    }
+    let log = harness.health().await["log"].clone();
+    assert_eq!(log["writes"], 4);
+    assert_eq!(log["write_failures"], 0);
+    assert_eq!(log["write_retries"], 2);
+    assert_eq!(log["write_attempt_failures"]["status_5xx"], 2);
+    assert_eq!(log["write_count"], 2);
+    assert_eq!(log["write_ms_buckets"]["5000"], 2);
+    assert!(log["write_ms_sum"].as_u64().unwrap() < 5000);
+    assert_eq!(harness.health().await["log_store"]["pending"], 0);
+
+    // 429 is repeated like a 5xx status.
+    *lock(&store) = Script {
+        refusals: 1,
+        refusal_status: 429,
+        ..Script::default()
+    };
+    assert_eq!(release(&harness, &app, &password(&app)).await.0, 200);
+    let log = harness.health().await["log"].clone();
+    assert_eq!(log["write_retries"], 3);
+    assert_eq!(log["write_attempt_failures"]["status_4xx"], 1);
+
+    // A 4xx status other than 429 is not repeated: the write fails at once.
+    *lock(&store) = Script {
+        refusals: 1,
+        refusal_status: 403,
+        ..Script::default()
+    };
+    let before = writes(&provider).len();
+    unavailable(&release(&harness, &app, &password(&app)).await);
+    assert_eq!(writes(&provider).len(), before + 1);
+    let log = harness.health().await["log"].clone();
+    assert_eq!(log["write_retries"], 3);
+    assert_eq!(log["write_failures"], 1);
+    assert_eq!(log["write_attempt_failures"]["status_4xx"], 2);
+    assert_eq!(harness.health().await["log_store"]["pending"], 1);
 }
 
 #[tokio::test]
 async fn a_pending_entry_is_written_again_with_the_next_write_of_the_account() {
     let (provider, store) = stand_in().await;
-    let (harness, app) = node_with_log_store(&provider).await;
+    let (harness, app) = node_without_repeated_writes(&provider).await;
     let vault = password(&app);
 
     // Two releases fail: entries 2 and 3 are pending.
@@ -623,7 +748,7 @@ async fn a_pending_entry_is_written_again_with_the_next_write_of_the_account() {
     }
     assert_eq!(harness.health().await["log_store"]["pending"], 0);
     let account = harness.node.account("user-1").unwrap();
-    assert!(lock(&account).unconfirmed.is_empty());
+    assert!(lock(&account).unconfirmed().is_empty());
 
     // A pending entry that the store still refuses does not fail the call that took it along.
     refuse(&store, 500);
@@ -635,41 +760,65 @@ async fn a_pending_entry_is_written_again_with_the_next_write_of_the_account() {
     let (status, released) = release(&harness, &app, &vault).await;
     assert_eq!((status, &released["value"]), (200, &json!("hunter2")));
     assert_eq!(lock(&account).pending_entries(), 1);
-    assert_eq!(lock(&account).unconfirmed[0].seq, 5);
+    assert_eq!(lock(&account).unconfirmed()[0].seq, 5);
     // It is taken along again by the write after that.
     confirm(&store);
     assert_eq!(release(&harness, &app, &vault).await.0, 200);
-    assert!(lock(&account).unconfirmed.is_empty());
+    assert!(lock(&account).unconfirmed().is_empty());
     let all: Vec<u64> = writes(&provider).iter().map(seq_of).collect();
     assert_eq!(all.iter().filter(|seq| **seq == 5).count(), 3);
 }
 
+/// The interval of the sweep in milliseconds of node time: the age at which the sweep writes
+/// a pending entry whatever jitter it drew for the account.
+const SWEEP_INTERVAL_MS: u64 = 30_000;
+
 #[tokio::test]
 async fn the_sweep_of_the_node_writes_a_pending_entry_again_without_a_further_call() {
     let (provider, store) = stand_in().await;
-    let (harness, app) = node_with_log_store(&provider).await;
+    let (harness, app) = node_without_repeated_writes(&provider).await;
     let vault = password(&app);
 
     // A release the store refuses: entry 2 is pending, and the account makes no further call.
+    // The age of the oldest pending entry is what the last sweep found: 0 before a sweep ran,
+    // and the age of entry 2 after the sweep that found it (the store still refuses).
     refuse(&store, 500);
     unavailable(&release(&harness, &app, &vault).await);
-    assert_eq!(harness.health().await["log_store"]["pending"], 1);
+    let health = harness.health().await;
+    assert_eq!(health["log_store"]["pending"], 1);
+    assert_eq!(health["log_store"]["pending_oldest_ms"], 0);
+    log_store::sweep(&harness.node).await;
+    let health = harness.health().await;
+    assert_eq!(health["log_store"]["pending"], 1);
+    assert!(health["log_store"]["pending_oldest_ms"].as_u64().unwrap() < 5_000);
     let before = writes(&provider).len();
 
-    // The sweep writes the pending entry again: the same entry under its own key, confirmed.
+    // Once the entry has been pending for the interval of the sweep, the sweep writes it
+    // again: the same entry under its own key, confirmed. The age grows with the node time
+    // until that sweep.
     confirm(&store);
+    harness.node.clock.advance(SWEEP_INTERVAL_MS);
+    assert!(
+        harness.health().await["log_store"]["pending_oldest_ms"]
+            .as_u64()
+            .unwrap()
+            >= 30_000
+    );
     log_store::sweep(&harness.node).await;
     let written = writes(&provider)[before..].to_vec();
     assert_eq!(written.iter().map(seq_of).collect::<Vec<u64>>(), [2]);
     assert_write_of(&harness, &written[0], "user-1", 2);
-    assert_eq!(harness.health().await["log_store"]["pending"], 0);
+    let health = harness.health().await;
+    assert_eq!(health["log_store"]["pending"], 0);
+    assert_eq!(health["log_store"]["pending_oldest_ms"], 0);
     let account = harness.node.account("user-1").unwrap();
-    assert!(lock(&account).unconfirmed.is_empty());
+    assert!(lock(&account).unconfirmed().is_empty());
 
     // A store that still refuses leaves the entry pending for the next sweep; a sweep of an
     // account without a pending entry writes nothing.
     refuse(&store, 500);
     unavailable(&release(&harness, &app, &vault).await);
+    harness.node.clock.advance(SWEEP_INTERVAL_MS);
     log_store::sweep(&harness.node).await;
     assert_eq!(harness.health().await["log_store"]["pending"], 1);
     confirm(&store);
@@ -681,9 +830,88 @@ async fn the_sweep_of_the_node_writes_a_pending_entry_again_without_a_further_ca
 }
 
 #[tokio::test]
+async fn the_sweep_paces_its_writes_and_visits_the_accounts_in_a_random_order() {
+    let (provider, store) = stand_in().await;
+    // The sweep of this node writes at most 20 entries per second.
+    let harness = Harness::with(
+        &provider,
+        Definitions::embedded(),
+        Limits {
+            sweep_write_rate: 20,
+            ..short_write_limits()
+        },
+    );
+    harness.use_log_store().await;
+    let apps: Vec<App> = (0..8u8)
+        .map(|index| App::new(&format!("user-{index}"), index + 1))
+        .collect();
+    for app in &apps {
+        app.grant(&harness).await;
+    }
+    let pending_entries = || async {
+        refuse(&store, 500);
+        for app in &apps {
+            for _ in 0..5 {
+                unavailable(&release(&harness, app, &password(app)).await);
+            }
+        }
+        confirm(&store);
+        assert_eq!(harness.health().await["log_store"]["pending"], 8);
+    };
+    // The order in which the sweep wrote the accounts: the `user_id` of each write after
+    // `from`, one per account.
+    let order = |from: usize| -> Vec<String> {
+        let mut seen = Vec::new();
+        for write in &writes(&provider)[from..] {
+            let user_id = write.target.split('/').nth(3).unwrap().to_string();
+            if !seen.contains(&user_id) {
+                seen.push(user_id);
+            }
+        }
+        seen
+    };
+
+    // Forty pending entries over eight accounts, each entry older than the interval: the
+    // sweep writes all of them at its rate. The first second of entries is written at once
+    // and the rest at 20 per second: at least one second in all.
+    pending_entries().await;
+    harness.node.clock.advance(SWEEP_INTERVAL_MS);
+    let before = writes(&provider).len();
+    let started = std::time::Instant::now();
+    log_store::sweep(&harness.node).await;
+    let paced = started.elapsed();
+    assert!(
+        paced >= Duration::from_millis(900) && paced < Duration::from_secs(5),
+        "{paced:?}"
+    );
+    assert_eq!(writes(&provider).len(), before + 40);
+    assert_eq!(harness.health().await["log_store"]["pending"], 0);
+    let mut orders = vec![order(before)];
+    assert_eq!(orders[0].len(), 8);
+
+    // The accounts are visited in a random order: two more sweeps of the same accounts do
+    // not all repeat the first order.
+    for _ in 0..2 {
+        pending_entries().await;
+        harness.node.clock.advance(SWEEP_INTERVAL_MS);
+        let before = writes(&provider).len();
+        log_store::sweep(&harness.node).await;
+        orders.push(order(before));
+    }
+    assert!(orders.iter().any(|order| order != &orders[0]), "{orders:?}");
+
+    // Entries that just became pending wait for a later sweep: the sweep writes the entries
+    // of an account only once they are older than a jitter of up to the interval.
+    pending_entries().await;
+    let before = writes(&provider).len();
+    log_store::sweep(&harness.node).await;
+    assert!(writes(&provider).len() <= before + 5);
+}
+
+#[tokio::test]
 async fn a_request_that_shares_an_entry_waits_for_the_store_to_confirm_that_entry() {
     let (provider, store) = stand_in().await;
-    let (harness, app) = node_with_log_store(&provider).await;
+    let (harness, app) = node_without_repeated_writes(&provider).await;
     let record = google_record(&app);
 
     // The first request fails at the store: its entry, 2, is on the chain and pending.
@@ -730,7 +958,7 @@ async fn a_request_that_shares_an_entry_waits_for_the_store_to_confirm_that_entr
 #[tokio::test]
 async fn a_grant_is_put_in_place_only_after_the_store_confirmed_its_entry() {
     let (provider, store) = stand_in().await;
-    let harness = Harness::new(&provider);
+    let harness = Harness::with(&provider, Definitions::embedded(), short_write_limits());
     harness.use_log_store().await;
     let app = App::new("user-1", 1);
     let not_after_ms = harness.node.now_ms() + limits::GRANT_MAX_MS;
@@ -791,7 +1019,7 @@ async fn a_grant_is_put_in_place_only_after_the_store_confirmed_its_entry() {
 #[tokio::test]
 async fn a_revoke_erases_the_key_whatever_the_store_answers() {
     let (provider, store) = stand_in().await;
-    let (harness, app) = node_with_log_store(&provider).await;
+    let (harness, app) = node_without_repeated_writes(&provider).await;
     let vault = password(&app);
     assert_eq!(release(&harness, &app, &vault).await.0, 200);
 
@@ -825,7 +1053,7 @@ async fn a_revoke_erases_the_key_whatever_the_store_answers() {
     // The next write of the account takes it along: here the entry of a new grant.
     confirm(&store);
     app.grant(&harness).await;
-    assert!(lock(&account).unconfirmed.is_empty());
+    assert!(lock(&account).unconfirmed().is_empty());
     let last: Vec<u64> = writes(&provider).iter().rev().take(2).map(seq_of).collect();
     assert!(last.contains(&3) && last.contains(&4), "{last:?}");
 
@@ -846,8 +1074,8 @@ async fn a_revoke_erases_the_key_whatever_the_store_answers() {
 #[tokio::test]
 async fn an_export_hands_a_grant_over_only_after_the_store_confirmed_its_entry() {
     let (provider, store) = stand_in().await;
-    let old = Harness::new(&provider);
-    let new = Harness::new(&provider);
+    let old = Harness::with(&provider, Definitions::embedded(), short_write_limits());
+    let new = Harness::with(&provider, Definitions::embedded(), short_write_limits());
     old.use_log_store().await;
     new.use_log_store().await;
     let alice = App::new("alice", 1);
@@ -929,7 +1157,7 @@ async fn an_export_hands_a_grant_over_only_after_the_store_confirmed_its_entry()
 
     // A grant that took the place of the one an entry was made for is not handed over under
     // that entry: the new grant gets its own.
-    let third = Harness::new(&provider);
+    let third = Harness::with(&provider, Definitions::embedded(), short_write_limits());
     third.use_log_store().await;
     let to_third = attestation(&third).await;
     refuse(&store, 500);
@@ -1149,7 +1377,8 @@ async fn a_node_takes_one_log_store_and_names_it_in_its_binding() {
     assert_eq!(
         harness.health().await["log_store"],
         json!({
-            "bucket": LOG_BUCKET, "region": LOG_REGION, "credentials_expires_ms": 0, "pending": 0,
+            "bucket": LOG_BUCKET, "region": LOG_REGION, "credentials_expires_ms": 0,
+            "pending": 0, "pending_oldest_ms": 0,
         })
     );
     let binding = binding_of(&attestation(&harness).await);
@@ -1243,7 +1472,7 @@ async fn a_node_takes_one_log_store_and_names_it_in_its_binding() {
 #[tokio::test]
 async fn an_account_collects_at_most_64_pending_entries_of_calls_that_use_a_credential() {
     let (provider, store) = stand_in().await;
-    let (harness, app) = node_with_log_store(&provider).await;
+    let (harness, app) = node_without_repeated_writes(&provider).await;
     let vault = password(&app);
     let account = harness.node.account("user-1").unwrap();
 
@@ -1270,7 +1499,7 @@ async fn an_account_collects_at_most_64_pending_entries_of_calls_that_use_a_cred
     // the release after it.
     confirm(&store);
     app.grant(&harness).await;
-    assert!(lock(&account).unconfirmed.is_empty());
+    assert!(lock(&account).unconfirmed().is_empty());
     let (status, released) = release(&harness, &app, &vault).await;
     assert_eq!((status, &released["value"]), (200, &json!("hunter2")));
     // Every entry of the chain is in the store.
@@ -1284,7 +1513,7 @@ async fn an_account_collects_at_most_64_pending_entries_of_calls_that_use_a_cred
 #[tokio::test]
 async fn a_call_at_the_limit_of_pending_entries_goes_on_once_the_store_made_room() {
     let (provider, store) = stand_in().await;
-    let (harness, app) = node_with_log_store(&provider).await;
+    let (harness, app) = node_without_repeated_writes(&provider).await;
     let vault = password(&app);
     let account = harness.node.account("user-1").unwrap();
     refuse(&store, 500);
@@ -1295,7 +1524,7 @@ async fn a_call_at_the_limit_of_pending_entries_goes_on_once_the_store_made_room
     let (status, released) = release(&harness, &app, &vault).await;
     assert_eq!((status, &released["value"]), (200, &json!("hunter2")));
     assert_eq!(released["log"]["seq"], 2 + PENDING_ENTRIES as u64);
-    assert!(lock(&account).unconfirmed.is_empty());
+    assert!(lock(&account).unconfirmed().is_empty());
     // The call wrote the 64 pending entries first, and its own entry after the store took
     // them.
     let seqs: Vec<u64> = writes(&provider).iter().map(seq_of).collect();
@@ -1323,14 +1552,14 @@ async fn a_call_that_ends_before_its_write_leaves_its_entry_pending() {
     // Its entry is on the chain and no call writes it: it is a pending entry, and the account
     // has no writer.
     assert_eq!(harness.head_seq("user-1"), 2);
-    assert_eq!(lock(&account).unconfirmed.len(), 1);
+    assert_eq!(lock(&account).unconfirmed().len(), 1);
     assert_eq!(lock(&account).pending_entries(), 1);
     assert!(!lock(&account).writer);
 
     // The next write of the account takes it along.
     confirm(&store);
     assert_eq!(release(&harness, &app, &vault).await.0, 200);
-    assert!(lock(&account).unconfirmed.is_empty());
+    assert!(lock(&account).unconfirmed().is_empty());
 }
 
 #[tokio::test]
@@ -1359,7 +1588,7 @@ async fn a_node_without_a_log_store_writes_nowhere() {
     assert!(writes(&provider).is_empty());
     assert_eq!(harness.health().await["log_store"], Value::Null);
     let account = harness.node.account("user-1").unwrap();
-    assert!(lock(&account).unconfirmed.is_empty());
+    assert!(lock(&account).unconfirmed().is_empty());
     assert_eq!(
         harness.platform.connections(),
         [("gmail.googleapis.com".to_string(), 443)]
@@ -1426,7 +1655,7 @@ async fn a_revoke_that_is_accepted_while_a_grant_waits_for_the_store_stands() {
     );
     assert_eq!(writes(&provider).len(), 1);
     let account = harness.node.account("user-1").unwrap();
-    assert!(lock(&account).unconfirmed.is_empty());
+    assert!(lock(&account).unconfirmed().is_empty());
     assert_eq!(harness.head_seq("user-1"), 1);
 }
 
@@ -1503,13 +1732,13 @@ async fn calls_that_run_at_the_same_time_form_one_entry_and_write_each_entry_onc
         .collect();
     assert_eq!(counts, [1, 1, 3]);
     let account = harness.node.account("user-1").unwrap();
-    assert!(lock(&account).unconfirmed.is_empty());
+    assert!(lock(&account).unconfirmed().is_empty());
 }
 
 #[tokio::test]
 async fn a_write_the_store_refuses_fails_the_writer_and_the_calls_that_waited_for_it() {
     let (provider, store) = stand_in().await;
-    let (harness, app) = node_with_log_store(&provider).await;
+    let (harness, app) = node_without_repeated_writes(&provider).await;
     let vault = password(&app);
     *lock(&store) = Script {
         status: 500,
@@ -1542,7 +1771,7 @@ async fn a_write_the_store_refuses_fails_the_writer_and_the_calls_that_waited_fo
     let (status, released) = release(&harness, &app, &vault).await;
     assert_eq!((status, &released["value"]), (200, &json!("hunter2")));
     assert_eq!(released["log"]["seq"], 4);
-    assert!(lock(&account).unconfirmed.is_empty());
+    assert!(lock(&account).unconfirmed().is_empty());
     let mut seqs: Vec<u64> = writes(&provider)[4..].iter().map(seq_of).collect();
     seqs.sort();
     assert_eq!(seqs, [2, 3, 4]);
@@ -1660,6 +1889,28 @@ async fn sequential_log_writes_share_one_tls_connection() {
             .count(),
         1,
     );
+    // Health counts the one open and the eight writes over the idle connection, and the
+    // nine confirmed attempts with their times.
+    let health = harness.health().await;
+    assert_eq!(health["egress"]["opens"], 1);
+    assert_eq!(health["egress"]["idle_reuses"]["log_store"], 8);
+    assert_eq!(health["egress"]["open_inflight"], 0);
+    assert_eq!(health["log"]["writes"], 9);
+    assert_eq!(health["log"]["write_count"], 9);
+    assert_eq!(health["log"]["write_ms_buckets"]["5000"], 9);
+    let buckets = health["log"]["write_ms_buckets"].as_object().unwrap();
+    let counts: Vec<u64> = buckets
+        .values()
+        .map(|value| value.as_u64().unwrap())
+        .collect();
+    assert!(
+        counts.windows(2).all(|pair| pair[0] <= pair[1]),
+        "{counts:?}"
+    );
+    assert_eq!(
+        buckets.keys().collect::<Vec<_>>(),
+        ["25", "50", "100", "250", "500", "1000", "2500", "5000"]
+    );
 }
 
 #[tokio::test]
@@ -1684,20 +1935,53 @@ async fn a_write_whose_idle_connection_ends_without_a_response_goes_over_a_new_c
     assert_eq!(writes.len(), 3);
     assert_eq!(seq_of(&writes[1]), seq_of(&writes[2]));
     assert_eq!(harness.platform.connections().len(), 2);
-    assert_eq!(harness.health().await["log_store"]["pending"], 0);
+    let health = harness.health().await;
+    assert_eq!(health["log_store"]["pending"], 0);
+    assert_eq!(health["log"]["write_attempt_failures"]["closed"], 1);
+    assert_eq!(health["log"]["write_retries"], 1);
 }
 
 #[tokio::test]
-async fn a_write_over_a_new_connection_is_not_repeated() {
+async fn a_write_whose_new_connection_ends_without_a_response_is_repeated_as_well() {
     let (provider, store) = stand_in().await;
     let (harness, app) = node_with_log_store(&provider).await;
+    // The idle connection and the new connection after it both close without a response: a
+    // third attempt, over another new connection, is confirmed within the budget.
     lock(&store).lost = 2;
-    unavailable(&release(&harness, &app, &password(&app)).await);
-    assert_eq!(writes(&provider).len(), 3);
-    assert_eq!(harness.health().await["log_store"]["pending"], 1);
-    confirm(&store);
     assert_eq!(release(&harness, &app, &password(&app)).await.0, 200);
-    assert_eq!(harness.health().await["log_store"]["pending"], 0);
+    assert_eq!(writes(&provider).len(), 4);
+    assert_eq!(harness.platform.connections().len(), 3);
+    let health = harness.health().await;
+    assert_eq!(health["log_store"]["pending"], 0);
+    assert_eq!(health["log"]["write_attempt_failures"]["closed"], 2);
+    assert_eq!(health["log"]["write_retries"], 2);
+    assert_eq!(health["log"]["write_failures"], 0);
+}
+
+#[tokio::test]
+async fn a_stalled_idle_log_connection_is_retried_over_a_new_connection() {
+    let (provider, store) = stand_in().await;
+    let (harness, app) = node_with_log_store(&provider).await;
+    // The idle connection of the write of the grant takes the write and never answers: after
+    // half the time limit the write goes over a new connection and is confirmed.
+    lock(&store).stalled = 1;
+    let started = std::time::Instant::now();
+    let (status, released) = release(&harness, &app, &password(&app)).await;
+    assert_eq!((status, &released["value"]), (200, &json!("hunter2")));
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_millis(2_500) && waited < Duration::from_secs(5),
+        "{waited:?}"
+    );
+    let writes = writes(&provider);
+    assert_eq!(writes.len(), 3);
+    assert_eq!(writes[1].target, writes[2].target);
+    assert_eq!(writes[1].body, writes[2].body);
+    assert_eq!(harness.platform.connections().len(), 2);
+    let health = harness.health().await;
+    assert_eq!(health["log_store"]["pending"], 0);
+    assert_eq!(health["log"]["write_attempt_failures"]["timeout"], 1);
+    assert_eq!(health["log"]["write_retries"], 1);
 }
 
 #[tokio::test]
