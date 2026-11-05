@@ -1,8 +1,9 @@
 # The checks of every change (enclave.md 11.2).
 #
 # check:    formatting, lints, the tests of the workspace, that the committed test vectors
-#           are the output of the generator, and that the functions that read a secret are the
-#           ones egress/secret-access.tsv lists (rule E2 of docs/egress-policy.md).
+#           are the output of the generator, that the functions that read a secret are the
+#           ones egress/secret-access.tsv lists (rule E2 of docs/egress-policy.md), and the
+#           tests of the secure program on the model of the bridge (secure-program/tests).
 # measure:  builds the enclave image file of the pushed commit with build/build.sh and prints
 #           its measurements. A build of the same commit on another machine gives the same
 #           PCR0, PCR1 and PCR2.
@@ -43,6 +44,8 @@ jobs:
         run: cargo run --locked -p credential-enclave-protocol --bin vectors -- --check
       - name: The functions that read a secret and the callers of the sinks are the listed ones
         run: scripts/secret-access.sh --check
+      - name: The tests of the secure program on the model of the bridge
+        run: node --test secure-program/tests/program.test.js
 
   measure:
     if: github.event_name == 'push'
