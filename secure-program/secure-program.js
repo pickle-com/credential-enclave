@@ -22,7 +22,7 @@
 
   // ---- Constants ----
 
-  const VERSION = 32;
+  const VERSION = 33;
   const MASTER_KEY_SERVICE = "com.pickle.client.secure.master-key";
   const LEDGER_SERVICE = "com.pickle.client.secure.ledger";
   const LEDGER_STORE_KEY = "ledger";
@@ -115,9 +115,13 @@
     "MQCi85sWBbJwKKXdS6BptQFuZbT73o_gBh1qUxl_nNr12UO8Yfwr6wPLb-6NIwLz3_Y";
   // The list of accepted measurements: for every enclave release its {release, pcr0, pcr1, pcr2}
   // (96 lower-case hex characters each). Every element is a build that anyone can make again from
-  // that tag of the public repository pickle-com/credential-enclave. A nitro document whose PCR0,
-  // PCR1 and PCR2 do not all equal an element of this list (or of PRERELEASE_BUILDS when the server
-  // target is in PRERELEASE_TARGETS) is refused. A node of a release with log_store true writes
+  // that tag of the public repository pickle-com/credential-enclave. A node receives a grant only
+  // when PCR0, PCR1 and PCR2 of its nitro document all equal an element of this list (or of
+  // PRERELEASE_BUILDS when the server target is in PRERELEASE_TARGETS). A document that verifies
+  // (certificate chain, signature, nonce, binding, challenge statement) with a measurement no list
+  // has is the document of a release later than this program (verifyNitro): the node receives no
+  // grant, and the verification of the log leaves its chain pending for a program that lists the
+  // release (verifyAll) instead of marking the log. A node of a release with log_store true writes
   // the log entry to the log store (storage from which nothing is deleted) before the act the entry
   // precedes, and the binding of such a node must name the value of LOG_STORES.
   const ACCEPTED_RELEASES = [
@@ -486,9 +490,15 @@
 
   /** The verification of an AWS Nitro attestation document (COSE_Sign1). document and nonce are
    *  bytes. On success it returns the binding bytes (user_data), the measurement and the time of
-   *  the document (milliseconds); on a mismatch it throws attestation_failed. When gate is false
-   *  the measurement is not checked against the accepted list (the target of a revoke: the
-   *  signature of the document, the nonce and the binding are checked as before). */
+   *  the document (milliseconds), whether the measurement is on the accepted list (listed) and
+   *  whether the binding must name the log store (logStore); on a mismatch it throws
+   *  attestation_failed. A document that verifies with a measurement no list has is not a
+   *  mismatch: it is the document of a release later than this program (the list is a constant of
+   *  the program, and a new release of the enclave reaches the app as a new program), returned with
+   *  listed false. The caller hands such a node no key (renewGrants, sendGrant). When gate is false
+   *  the measurement decides nothing (the target of a revoke: the signature of the document, the
+   *  nonce and the binding are checked as before, a zero PCR is not refused, and listed is returned
+   *  all the same). */
   function verifyNitro(document, nonce, gate) {
     const cose = cborDecode(document);
     if (!Array.isArray(cose) || cose.length !== 4) throw attestationFailure("cose shape");
@@ -550,8 +560,10 @@
 
     if (!equal(documentNonce, nonce)) throw attestationFailure("nonce");
 
-    // The measurement: PCR0, PCR1 and PCR2 must all equal one element of the accepted list. A PCR
-    // whose value is all zero is the value of a debug-mode enclave and is accepted by no list.
+    // The measurement: PCR0, PCR1 and PCR2 must all equal one element of the accepted list for the
+    // node to receive a grant. A PCR whose value is all zero is the value of a debug-mode enclave
+    // and is accepted by no list: it is refused here, so a document returned with listed false is
+    // the document of an enclave of a build this program does not list (a later release).
     const measurement = { pcr0: "", pcr1: "", pcr2: "" };
     for (const index of [0, 1, 2]) {
       const value = pcrs.get(index);
@@ -563,10 +575,11 @@
       return release.pcr0 === measurement.pcr0 && release.pcr1 === measurement.pcr1 &&
         release.pcr2 === measurement.pcr2;
     });
-    if (gate && accepted === undefined) throw attestationFailure("measurement");
     return {
-      binding: userData, measurement: measurement, timeMs: timestamp,
-      logStore: gate && accepted.log_store === true,
+      binding: userData, measurement: measurement, timeMs: timestamp, listed: accepted !== undefined,
+      // The binding of a node of a listed release that writes to the log store, and of a release
+      // later than this program (every release from v1.1.0 on writes to it), must name the store.
+      logStore: gate && (accepted === undefined || accepted.log_store === true),
     };
   }
 
@@ -599,7 +612,10 @@
    *  checked with the signing public key the document binds. When gate is false the acceptance
    *  conditions (the accepted measurements, debug mode, a build that accepts local) are not
    *  checked: used only for the target of a revoke, which hands no user key over. Returns {node,
-   *  signPk, sealPk, release, platform, custody, timeMs, measurement}. */
+   *  signPk, sealPk, release, platform, custody, timeMs, measurement, listed}. listed is false for
+   *  a nitro document that verified with a measurement no list has (a release later than this
+   *  program, verifyNitro): such a node receives no grant and its chain is left to a program that
+   *  lists the release (renewGrants, verifyAll). */
   function verifyAttestation(response, nonce, gate) {
     try {
       if (response === null || typeof response !== "object" || response.v !== 1) {
@@ -611,12 +627,14 @@
       let measurement = null;
       let timeMs = 0;
       let logStore = false;
+      let listed = true;
       if (response.platform === "nitro") {
         const verified = verifyNitro(document, sent, gate !== false);
         bindingBytes = verified.binding;
         measurement = verified.measurement;
         timeMs = verified.timeMs;
         logStore = verified.logStore;
+        listed = verified.listed;
       } else if (response.platform === "local") {
         const verified = verifyLocal(document, sent, gate !== false);
         bindingBytes = verified.binding;
@@ -665,7 +683,7 @@
         node: encode(signPk), signPk: encode(signPk), sealPk: encode(sealPk),
         release: binding.release, platform: response.platform,
         custody: response.platform === "nitro" ? "enclave" : "operator", timeMs: timeMs,
-        measurement: measurement,
+        measurement: measurement, listed: listed,
       };
     } catch (error) {
       if (error && error.code === "attestation_failed") throw error;
@@ -1080,6 +1098,8 @@
    *  not_after_ms} for the ledger, both in device clock time: not_after_ms is now plus the lifetime
    *  the node accepted (the expiry of the reply minus the time of the document). */
   async function sendGrant(node, challenge, keys, ttlMs) {
+    // The user key goes to a node of a listed release only (verifyAttestation).
+    if (node.listed !== true) throw attestationFailure("measurement");
     const reply = await sendCommand(node, {
       v: 1, type: "grant", user_id: userId(), node: node.node, challenge: challenge,
       sign_pk: keys.signPk, log_pk: keys.logPk, custody: node.custody,
@@ -3062,8 +3082,19 @@
   // absent (a debug build whose backend has no log store) or pending (no run yet).
   let logState = {
     status: "pending", verified_ms: 0, unverified_nodes: 0, missing: 0, expired: 0,
-    unknown_nodes: 0, store: "pending", store_failing_ms: 0,
+    unknown_nodes: 0, newer_release_nodes: 0, store: "pending", store_failing_ms: 0,
+    program_version: VERSION,
   };
+
+  // The nodes of a release later than this program, by node id: the release their binding names.
+  // renewGrants fills it from the attestations it verified in this runtime (a document that
+  // verifies with a measurement no list of this program has). The verification of the log
+  // (verifyAll) does not read the chain of such a node and leaves the run pending: the program
+  // that lists the release grants to the node and verifies its chain from the verified point the
+  // ledger keeps (seq 0 for a node no program walked). The runtime of a program that lists the
+  // release is a new runtime (the executor replaces the runtime with the program), so nothing here
+  // outlives the program that noted it.
+  const newerReleaseNodes = new Map();
 
   function failureCode(error) {
     return error && error.code ? String(error.code) : "program_error";
@@ -3173,8 +3204,10 @@
    *  each other and the relay writes one row per node. A node of the ledger that is not in the
    *  response list gets its gone time. offered is the node list already requested (fetchOffered:
    *  {nonce, nodes}); without it the list is requested here. Returns the Set of accepted node ids,
-   *  the number of nodes whose attestation failed to verify, and the number of nodes whose
-   *  attestation verified but did not take the grant. */
+   *  the number of nodes whose attestation failed to verify, the number of nodes whose attestation
+   *  verified but did not take the grant, and the number of nodes of a release later than this
+   *  program (their documents verified with a measurement no list has: they receive no grant and
+   *  are noted in newerReleaseNodes for the verification of the log). */
   async function renewGrants(keys, ledger, force, offered) {
     if (offered === undefined || offered === null) offered = await fetchOffered();
     const nonce = offered.nonce;
@@ -3182,6 +3215,7 @@
     const accepted = new Set();
     let rejected = 0;
     let failed = 0;
+    let later = 0;
     // The nodes that receive a grant in this run, in the order of the list.
     const wanted = [];
     for (const response of Array.isArray(offered.nodes) ? offered.nodes : []) {
@@ -3202,6 +3236,15 @@
         continue;
       }
       listed.add(node.node);
+      if (!node.listed) {
+        // A node of a release later than this program: its document verified, its measurement is
+        // on no list of this program. It receives no grant, and the verification of the log leaves
+        // its chain pending (verifyAll) until the program that lists the release judges it.
+        newerReleaseNodes.set(node.node, node.release);
+        later += 1;
+        native.log("attestation of a later release: " + node.release);
+        continue;
+      }
       accepted.add(node.node);
       wanted.push({ node: node, challenge: response.challenge });
     }
@@ -3244,13 +3287,16 @@
         existing.not_after_ms = grant.not_after_ms;
         existing.origin = "grant";
         existing.unknown_ms = 0;
+        // A node that took the grant is alive: the gone time of a run that did not list it, or that
+        // found it in the store only, is cleared (the heads of living nodes are read ahead).
+        existing.gone_ms = 0;
       }
     }
     const now = native.nowMs();
     for (const id of Object.keys(ledger.nodes)) {
       if (!listed.has(id) && ledger.nodes[id].gone_ms === 0) ledger.nodes[id].gone_ms = now;
     }
-    return { accepted: accepted, rejected: rejected, failed: failed };
+    return { accepted: accepted, rejected: rejected, failed: failed, later: later };
   }
 
   /** The published state log of one run and its bookkeeping in the ledger: store_failing_ms starts
@@ -3258,8 +3304,13 @@
    *  the store read. The state is attention when any node has a gap, a mismatch, or a part that
    *  cannot be checked, when an entry of a node no grant of this app explains verified, when a
    *  release build is refused the log store, and when the reads of the store have been failing for
-   *  LOG_STORE_STALE_MS; otherwise pending when a chain has entries left to verify or the store could
-   *  not be read in this run; otherwise verified. */
+   *  LOG_STORE_STALE_MS; otherwise pending when a chain has entries left to verify, the store could
+   *  not be read in this run, or a node of a release later than this program has a chain here
+   *  (newer_release_nodes: a program that lists the release reads it); otherwise verified. A run
+   *  that is pending keeps verified_ms, so the next synchronization runs the verification again.
+   *  program_version names the program that judged the published value: the executor keeps the
+   *  published state across runtimes, and the first synchronization of the runtime of a later
+   *  program judges it again (afterGrants: verified_ms starts at 0 in every runtime). */
   function publishLogState(ledger, store, counts, now) {
     const unread = store.state !== "verified" && store.state !== "absent" && store.state !== "refused";
     if (unread) {
@@ -3270,12 +3321,15 @@
     const stale = unread && now - ledger.store_failing_ms >= LOG_STORE_STALE_MS;
     saveLedger(ledger);
     const attention = counts.unverified > 0 || counts.unknown > 0 || store.state === "refused" || stale;
-    const status = attention ? "attention" : counts.pending || unread ? "pending" : "verified";
+    const status = attention ? "attention"
+      : counts.pending || unread || counts.later > 0 ? "pending"
+      : "verified";
     logState = {
       status: status,
       verified_ms: status === "pending" ? logState.verified_ms : now,
       unverified_nodes: counts.unverified, missing: counts.missing, expired: counts.expired,
-      unknown_nodes: counts.unknown, store: store.state, store_failing_ms: ledger.store_failing_ms,
+      unknown_nodes: counts.unknown, newer_release_nodes: counts.later, store: store.state,
+      store_failing_ms: ledger.store_failing_ms, program_version: VERSION,
     };
     native.publish({ state: { log: logState } });
     return logState;
@@ -3288,7 +3342,8 @@
     settled(api("POST", LOG_REPORT_PATH, {
       status: result.status, store: result.store, nodes: nodes, keys_checked: counts.keys,
       bodies_fetched: counts.bodies, missing: counts.missing, expired: counts.expired,
-      unknown_nodes: counts.unknown, elapsed_ms: elapsedMs, program_version: VERSION,
+      unknown_nodes: counts.unknown, newer_release_nodes: counts.later, elapsed_ms: elapsedMs,
+      program_version: VERSION,
     })).then(function (outcome) {
       if (!outcome.ok) native.log("verification report: " + failureCode(outcome.error));
     });
@@ -3312,7 +3367,8 @@
     };
     for (const id of Object.keys(ledger.nodes)) {
       const node = ledger.nodes[id];
-      if (!writesToStore(node)) continue;
+      // A node of a release later than this program is not read (verifyAll leaves it pending).
+      if (!writesToStore(node) || newerReleaseNodes.has(id)) continue;
       if (node.final !== null && node.checkpoint.seq >= node.final.seq) continue;
       if (reads.targets.length < LOG_STORE_NODES) {
         reads.targets.push({
@@ -3483,9 +3539,12 @@
    *  listing the ledger does not know (a node found in the store only is kept in the ledger, with
    *  origin store and unknown_ms, only when an entry sealed to the key of this account verified on
    *  it: a delegation the app did not make, counted as unknown in every run until a traced transfer
-   *  explains the node), publishes the state log (publishLogState) and reports the run. One run
-   *  spends at most LOG_VERIFY_KEYS keys and LOG_VERIFY_BODIES bodies over every node. A run whose
-   *  node discovery listing cannot be read verifies nothing (the verification points stay). */
+   *  explains the node), publishes the state log (publishLogState) and reports the run. A node of a
+   *  release later than this program (newerReleaseNodes), of the ledger or of the listing, is not
+   *  read: it is counted in newer_release_nodes and leaves the run pending, not attention, and the
+   *  program that lists the release reads its chain. One run spends at most LOG_VERIFY_KEYS keys
+   *  and LOG_VERIFY_BODIES bodies over every node. A run whose node discovery listing cannot be
+   *  read verifies nothing (the verification points stay). */
   async function verifyAll(ledger, keys, reads) {
     const started = native.nowMs();
     // The reads of the run were sent ahead by the caller (together with its own requests) or are
@@ -3503,7 +3562,9 @@
     await completeVerificationReads(ledger, reads, summaries);
     const store = { state: "verified" };
     const now = native.nowMs();
-    const counts = { pending: false, unverified: 0, missing: 0, expired: 0, unknown: 0, keys: 0, bodies: 0 };
+    const counts = {
+      pending: false, unverified: 0, missing: 0, expired: 0, unknown: 0, later: 0, keys: 0, bodies: 0,
+    };
     // The listing addresses of the run that the backend refused or that did not name the listings
     // requested are the store failure of the run, as the refusal of one listing address is
     // (listStorePage). A listing request that did not arrive is sent again by the judgement.
@@ -3526,8 +3587,14 @@
     }
     // The nodes of the listing the ledger does not know: examined after the nodes of the ledger (the
     // key order of the nodes object is the order of the queue), at most LOG_STORE_NODES in one run.
+    // A node of a release later than this program is not examined: its chain waits for the program
+    // that lists the release (pending), and it does not enter the ledger here.
     const unknownIds = discovered.filter(function (id) { return ledger.nodes[id] === undefined; });
-    const examined = unknownIds.slice(0, LOG_STORE_NODES);
+    const examinable = unknownIds.filter(function (id) { return !newerReleaseNodes.has(id); });
+    // The nodes of a later release this run left out, each once (a node of the listing can enter
+    // the ledger later in the run through the tracing of a transfer).
+    const later = new Set(unknownIds.filter(function (id) { return newerReleaseNodes.has(id); }));
+    const examined = examinable.slice(0, LOG_STORE_NODES);
     for (const id of examined) {
       ledger.nodes[id] = {
         sign_pk: id, seal_pk: "", platform: "", release: "", first_ms: now, granted_ms: 0,
@@ -3545,6 +3612,13 @@
     while (queue.length > 0) {
       const id = queue.shift();
       if (ledger.nodes[id] === undefined) continue;
+      if (newerReleaseNodes.has(id)) {
+        // A node of the ledger (traced from a transfer, or marked by the program that found it in
+        // the store) of a release later than this program: its chain is not read in this run and
+        // its mark is not counted; the program that lists the release judges it.
+        later.add(id);
+        continue;
+      }
       const outcome = await verifyChain(ledger, id, summaries[id], budgets, keys, store, reads);
       counts.missing += outcome.missing;
       counts.expired += outcome.expired;
@@ -3560,7 +3634,8 @@
     }
     counts.keys = LOG_VERIFY_KEYS - budgets.keys;
     counts.bodies = budgets.fetched;
-    if (unknownIds.length > examined.length && store.state === "verified") store.state = "truncated";
+    counts.later = later.size;
+    if (examinable.length > examined.length && store.state === "verified") store.state = "truncated";
     // A node found in the store only that holds an entry sealed to this key is a delegation the app
     // did not make and no verified transfer explained (a trace that reaches the node later in the
     // run changes its origin before this mark). The mark stays in the ledger; a node of the listing
@@ -3573,7 +3648,8 @@
       const node = ledger.nodes[id];
       if (node.origin !== "store") continue;
       if (node.unknown_ms !== 0) {
-        counts.unknown += 1;
+        // The mark of a node of a release later than this program was counted above (pending).
+        if (!newerReleaseNodes.has(id)) counts.unknown += 1;
       } else {
         delete ledger.nodes[id];
       }
@@ -3752,7 +3828,8 @@
    *  holds the grant of this account. The list of living nodes is fetched again and a node without
    *  a grant (a node that restarted) receives one. When delegation is off it is delegation_off; when
    *  no living node holds a grant it is grant_required (attestation_failed when every living node
-   *  failed the attestation verification). Returns the renewed ledger. */
+   *  failed the attestation verification or is of a release later than this program). Returns the
+   *  renewed ledger. */
   async function liveGrantLedger(keys, offered) {
     const ledger = loadLedger();
     if (delegationOff(ledger)) throw native.error("delegation_off", "delegation is turned off");
@@ -3761,7 +3838,7 @@
     const grant = grantState(ledger, renewed.accepted, native.nowMs());
     native.publish({ state: { grant: grant }, runtime: { rejected_nodes: renewed.rejected } });
     if (grant.state === "none") {
-      const allRejected = renewed.rejected > 0 && renewed.accepted.size === 0;
+      const allRejected = renewed.rejected + renewed.later > 0 && renewed.accepted.size === 0;
       throw native.error(allRejected ? "attestation_failed" : "grant_required", "no live node holds a grant");
     }
     return ledger;
@@ -3812,7 +3889,8 @@
     saveLedger(ledger);
     logState = {
       status: "pending", verified_ms: 0, unverified_nodes: 0, missing: 0, expired: 0,
-      unknown_nodes: 0, store: "pending", store_failing_ms: 0,
+      unknown_nodes: 0, newer_release_nodes: 0, store: "pending", store_failing_ms: 0,
+      program_version: VERSION,
     };
     publishKey("present", keys);
     const offered = await pending;
@@ -4292,7 +4370,8 @@
     publishLogPages();
     return {
       status: log.status, verified_ms: log.verified_ms, unverified_nodes: log.unverified_nodes,
-      missing: log.missing, expired: log.expired, unknown_nodes: log.unknown_nodes, store: log.store,
+      missing: log.missing, expired: log.expired, unknown_nodes: log.unknown_nodes,
+      newer_release_nodes: log.newer_release_nodes, store: log.store,
       store_failing_ms: log.store_failing_ms, has_more: first.has_more, summary: summary,
       days: displayDays(groups),
     };
