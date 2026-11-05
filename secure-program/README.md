@@ -111,6 +111,31 @@ The bytes of the statement, the entry and the release proof are specified in
    and the SHA-256 of the program it loaded, and they equal `version` and `sha256` of the
    statement.
 
+## The tests
+
+`tests/` runs the program on a model of the bridge of the apps, with Node alone:
+
+```bash
+node --test secure-program/tests/program.test.js
+```
+
+`tests/bridge.js` is the model: the global `native` on the crypto module of Node (HKDF, Ed25519,
+X25519, HPKE of RFC 9180, ChaCha20-Poly1305, ECDSA P-384), a device (the key store, the program
+store, the published state), the backend of the operator and the log store as the program reaches
+them over `native.http`, and enclave nodes with their keys, attestation documents, commands, heads
+and log chains (`docs/protocol.md` sections 4, 5 and 7). The certificate chain of a nitro document
+is modelled (one leaf of the model stands for the certificate); the signature of the document is a
+real ECDSA signature over the Sig_structure the program encodes. The loader evaluates the program
+the way the executors do: a fresh context whose globals are `native`, `SecureError` and `console`,
+the top level evaluated with the bridge closed. The first tests check the model against
+`protocol/vectors.json`, the reference the apps test their bridges against. `tests/scenarios.js`
+holds the scenarios (worlds and runs) and returns plain results; `tests/program.test.js` fixes the
+expected results of the current program.
+
+`node secure-program/tests/compare.js <program-a.js> <program-b.js>` runs the scenarios on two
+versions of the program and prints what changed between them (the file of a tag is
+`git show secure-program-v{N}:secure-program/secure-program.js`).
+
 ## Limits
 
 - The operator can write a program that leaks the master key, sign it and record it. That program

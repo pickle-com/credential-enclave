@@ -252,6 +252,17 @@ own PCR0, PCR1 and PCR2.
     not apply this step to a node it only sends a revoke to. A node that verifies a peer applies
     it with its own log store (10.1).
 
+A later release (the app). A document that passes every step but step 7, with no PCR all zero, is
+the document of a node of a release that the program of the app does not list: a release later
+than the program (4.5: the list is a constant of the signed program, and a new release of the
+enclave reaches the apps as a new program). The app applies step 10 to such a document as well (a
+node of this deployment writes to the log store of the environment). The app hands such a node no
+key, as for any measurement outside the list, and does not count the document as a failed
+verification: its verification of the log (7.4) leaves the chain of that node pending, counts the
+node as a node of a later release, and the program that lists the release verifies the chain. A
+document that fails another step, a PCR all zero, and a binding that names another log store are
+failed verifications, as before.
+
 Freshness comes from the nonce. `timestamp` is not compared with the clock of the verifier. The app
 uses the `timestamp` (milliseconds) of a document that passed the verification as the present time
 of that node (the computation of the expiry of a grant: 5.2). In a local document, `time_ms` is that
@@ -271,7 +282,7 @@ with the signing public key of that `binding` (4.2).
 
 | Stage | The app | A node (verification of a peer) |
 | --- | --- | --- |
-| 1, 2 | A constant list inside the signed program of the app (`[{release, pcr0, pcr1, pcr2}]`, each PCR as 96 lower-case hexadecimal characters). For every release of the enclave the list is changed and the program is signed again | Its own measurement. A giving node also accepts the measurement of a later release whose endorsement it verified, and a receiving node also accepts the measurements of the list of predecessors inside its program (10.3) |
+| 1, 2 | A constant list inside the signed program of the app (`[{release, pcr0, pcr1, pcr2}]`, each PCR as 96 lower-case hexadecimal characters). For every release of the enclave the list is changed and the program is signed again. An app whose program does not list a release treats the nodes of that release as nodes of a later release (4.3): no key, and a pending verification of their chains (7.4) until the app loads the program that lists it | Its own measurement. A giving node also accepts the measurement of a later release whose endorsement it verified, and a receiving node also accepts the measurements of the list of predecessors inside its program (10.3) |
 | 3 | The app obtains it by verifying the release statements of the public record (section 9) | Its own measurement, and the list of allowed measurements that the grant of that account carries (the app verifies the release statements and writes the list into the grant) |
 
 ## 5. The commands an app sends to a node
@@ -683,7 +694,13 @@ Index verification of a chain of format 2:
    that entry is sealed to the key of this account and no traced transfer explains the node, the
    node is a delegation the app did not make (attention) and stays in the list with that mark. The
    nodes of the listing that the list of nodes does not know are examined after the known nodes, at
-   most `LOG_STORE_NODES` of them in one run (more leave the run pending).
+   most `LOG_STORE_NODES` of them in one run (more leave the run pending). A node of a release later
+   than the program of the app (4.3: a node whose attestation the app verified in its last
+   synchronization with the nodes, with a measurement the program does not list) is not read in the
+   run, whether the listing or the list of nodes holds it: its chain is pending, its mark (when an
+   earlier program left one) is not counted, and the run is pending. The program that lists the
+   release reads that chain from the verified point the list of nodes keeps (`seq` 0 for a node no
+   program read).
 
 Expired entries: an object of the store cannot be deleted for 365 days (7.6), and after that its
 absence says nothing about the operator domain (the lifecycle rule of the bucket removes it at 400
@@ -718,6 +735,7 @@ is always in the listing.
 | A `seq` without a candidate whose first key after it is older than one hour, a candidate chain that does not reach the hash of the head, a control entry that does not verify | The stored log has an omission or a change |
 | A `seq` without a candidate whose first key after it is younger than one hour | Pending: the node has still to write the entry again (7.6); the next run reads the gap |
 | A node appears in the listing that no grant of the app and no traced transfer explains, with a first entry sealed to the key of this account | A node used the key of the account outside the delegations the app knows |
+| A node of a release later than the program of the app (4.3) is in the listing or in the list of nodes | Pending: the program does not list the release, so it hands the node no key and does not read its chain. The program that lists the release reads the chain from the verified point of the node. The number of such nodes is reported with the run (`newer_release_nodes`) |
 | A node that is gone has no `final` head | The entries after the verified point are read by content verification. The part the app has not read yet is pending |
 | A node that is gone has a `final` head, and a key of its prefix lies above the `seq` of that head | The stored log holds an object the node did not vouch for: attention (step 4). A node avoids this state in its orderly shutdown: it signs the final head below an unconfirmed tail only when every write attempt of those entries failed before a request byte left the node or was answered by the store with a 4xx status, and it leaves no final head for an account with an unconfirmed entry whose write may have reached the store (7.3) |
 | The store cannot be listed or read, an address the backend handed out is not one of the request, more unknown prefixes than `LOG_STORE_NODES` are listed, or a release build of the app is refused the store | The verification is pending (the app does not treat it as complete); the refusal of a release build marks the log, and reads that keep failing for `LOG_STORE_STALE_MS` mark the log |
