@@ -502,6 +502,10 @@ class World {
     this.objects = new Map();
     this.versionCounter = 0;
     this.bridgeOpen = false;
+    // The shared ledger the backend keeps for the account (GET/PUT /api/secure/ledger): the sealed
+    // value as the program uploaded it, null while none was uploaded, and the count of uploads.
+    this.sharedLedger = null;
+    this.ledgerUploads = 0;
   }
 
   get storeHost() {
@@ -635,6 +639,20 @@ class World {
     if (method === "POST" && path === "/api/secure/log/verified") {
       this.reports.push(body);
       return json(200, {});
+    }
+    if (path === "/api/secure/ledger") {
+      if (method === "GET") return json(200, { ledger: this.sharedLedger });
+      if (method === "PUT") {
+        const shaped = body !== null && typeof body.key_id === "string" &&
+          typeof body.nonce === "string" && typeof body.ct === "string";
+        if (!shaped) return json(400, { code: "invalid_input" });
+        if (this.account.key === null || body.key_id !== this.account.key.key_id) {
+          return json(409, { code: "key_mismatch" });
+        }
+        this.sharedLedger = { key_id: body.key_id, nonce: body.nonce, ct: body.ct, updated_ms: this.now };
+        this.ledgerUploads += 1;
+        return json(200, {});
+      }
     }
     if (method === "GET" && path === "/api/secure/sealing") return json(200, { items: [], more: false });
     if (method === "GET" && path === "/api/secure/transfers") return json(200, { transfers: [] });
