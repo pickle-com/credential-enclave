@@ -14,12 +14,17 @@
 //!    the provider definitions and of the log store (`egress`);
 //! 4. sends the operator configuration, with the log store of the node, to the node once the
 //!    node answers (`config`);
-//! 5. reports the state of the node and the counts of the two relays on TCP 9091, `/healthz`
-//!    and `/metrics` (`health`);
-//! 6. on SIGTERM logs the enclaves `nitro-cli` describes, asks the backend to collect the state
-//!    of the node, then ends the enclave (`drain`, `launch`).
+//! 5. reports the state of the node, the life of the enclave and the counts of the two relays
+//!    on TCP 9091, `/healthz`, `/livez` and `/metrics` (`health`);
+//! 6. watches the enclave with `nitro-cli describe-enclaves` every 10 seconds (`watch`): when
+//!    the enclave ended on its own, it asks the backend to collect what is left, ends the
+//!    enclave and exits with a status that is not 0, so that the container runtime starts it
+//!    again with a new enclave;
+//! 7. on SIGTERM logs the enclaves `nitro-cli` describes, asks the backend to collect the state
+//!    of the node and waits for a time that grows with the accounts of the node, then ends the
+//!    enclave (`drain`, `launch`).
 //!
-//! With the argument `drain` it makes the shutdown collection call of step 6 alone, logs its
+//! With the argument `drain` it makes the shutdown collection call of step 7 alone, logs its
 //! outcome and ends with the status 0 whatever the outcome: the pre-stop hook of the pod runs
 //! it before the termination signal reaches the host program.
 //!
@@ -35,6 +40,7 @@
 #![forbid(unsafe_code)]
 
 mod config;
+mod descriptors;
 mod drain;
 mod egress;
 mod health;
@@ -43,6 +49,7 @@ mod launch;
 mod relay;
 #[cfg(test)]
 mod testing;
+mod watch;
 
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -57,6 +64,7 @@ use config::{ConfigError, Injection, LogStore};
 use drain::Drain;
 use egress::{Allowlist, EgressCounters, TcpOutbound};
 use relay::{InboundCounters, NodeConnector, VsockListener, VsockNode};
+use watch::EnclaveWatch;
 
 /// The provider definitions of the node. The host program is built from the same file.
 pub const DEFINITIONS: &str = include_str!("../../enclave/src/providers/definitions.json");
@@ -128,14 +136,42 @@ async fn configure(node: Arc<dyn NodeConnector>, body: Vec<u8>) {
     }
 }
 
-/// Asks the backend to collect the state of the node, when the call is configured.
-async fn collect(drain: Option<Drain>) {
+/// The accounts of the node from its `health` call, for the wait of the shutdown collection
+/// call (`drain::response_timeout`). `None` when the node does not answer: the wait is then
+/// the base, and the collection fails at its first stage.
+async fn node_accounts(node: &dyn NodeConnector) -> Option<u64> {
+    health::node_health(node)
+        .await
+        .map(|health| health.accounts)
+}
+
+/// One line that names the wait of a shutdown collection call and what it was computed from.
+fn wait_line(accounts: Option<u64>, wait: Duration) -> String {
+    match accounts {
+        Some(accounts) => format!(
+            "waiting {} s for the collection of {accounts} accounts",
+            wait.as_secs()
+        ),
+        None => format!(
+            "waiting {} s, the node did not answer its health call",
+            wait.as_secs()
+        ),
+    }
+}
+
+/// Asks the backend to collect the state of the node, when the call is configured, and waits
+/// for the response for the time of the accounts of the node.
+async fn collect(drain: Option<Drain>, node: &dyn NodeConnector) {
     let Some(drain) = drain else {
         log("shutdown collection: skipped, its variables are not set");
         return;
     };
-    log("shutdown collection: calling the backend");
-    match drain.call().await {
+    let accounts = node_accounts(node).await;
+    log(&format!(
+        "shutdown collection: calling the backend, {}",
+        wait_line(accounts, drain::response_timeout(accounts))
+    ));
+    match drain.call(accounts).await {
         Ok(status) => log(&format!(
             "shutdown collection: the backend answered {status}"
         )),
@@ -143,8 +179,9 @@ async fn collect(drain: Option<Drain>) {
     }
 }
 
-/// Longest wait of the subcommand `drain` for the shutdown collection call, from its start.
-const DRAIN_SUBCOMMAND_LIMIT: Duration = Duration::from_secs(110);
+/// What the subcommand `drain` adds to the wait of the shutdown collection call for its own
+/// start and its health call.
+const DRAIN_SUBCOMMAND_MARGIN: Duration = Duration::from_secs(10);
 
 /// The subcommand `drain`: the shutdown collection call of [`collect`] on its own, for the
 /// pre-stop hook of the pod. It logs one line with the outcome and ends with the status 0 in
@@ -167,7 +204,10 @@ async fn run_drain() {
         }
     };
     let started = tokio::time::Instant::now();
-    let outcome = tokio::time::timeout(DRAIN_SUBCOMMAND_LIMIT, drain.call()).await;
+    let accounts = node_accounts(&VsockNode).await;
+    let wait = drain::response_timeout(accounts);
+    log(&format!("drain: {}", wait_line(accounts, wait)));
+    let outcome = tokio::time::timeout(wait + DRAIN_SUBCOMMAND_MARGIN, drain.call(accounts)).await;
     let elapsed_ms = started.elapsed().as_millis();
     match outcome {
         Ok(Ok(status)) => log(&format!(
@@ -176,7 +216,7 @@ async fn run_drain() {
         Ok(Err(reason)) => log(&format!("drain: failed after {elapsed_ms} ms, {reason}")),
         Err(_) => log(&format!(
             "drain: no response within {} seconds",
-            DRAIN_SUBCOMMAND_LIMIT.as_secs()
+            (wait + DRAIN_SUBCOMMAND_MARGIN).as_secs()
         )),
     }
 }
@@ -184,6 +224,10 @@ async fn run_drain() {
 async fn run() -> Result<(), String> {
     log(&format!("version {}", env!("CARGO_PKG_VERSION")));
     log(&launch::release_line(Path::new(launch::MEASUREMENTS_PATH)));
+    match descriptors::raise_limit() {
+        Some((soft, hard)) => log(&format!("descriptors: limit {soft}, hard limit {hard}")),
+        None => log("descriptors: the platform has no limit of open descriptors"),
+    }
     let memory_mib = launch::memory_mib(&variable)?;
     log(&format!("enclave: memory {memory_mib} MiB, 2 vCPUs"));
 
@@ -269,11 +313,13 @@ async fn run() -> Result<(), String> {
     let node: Arc<dyn NodeConnector> = Arc::new(VsockNode);
     let counters = Arc::new(EgressCounters::default());
     let inbound_counters = Arc::new(InboundCounters::default());
+    let watch = EnclaveWatch::new();
     tokio::spawn(health::serve(
         status_listener,
         node.clone(),
         counters.clone(),
         inbound_counters.clone(),
+        watch.clone(),
     ));
     tokio::spawn(egress::serve(
         egress_listener,
@@ -302,9 +348,13 @@ async fn run() -> Result<(), String> {
         inbound_counters,
     ));
     tokio::spawn(report_first_answer(node.clone()));
+    tokio::spawn(watch::keep_watching(
+        watch.clone(),
+        launch::describe_enclaves,
+    ));
     match operator_config {
         Ok(body) => {
-            tokio::spawn(configure(node, body));
+            tokio::spawn(configure(node.clone(), body));
         }
         Err(ConfigError::NoBaseUrl) => log(&format!(
             "operator configuration: not sent, {} is not set",
@@ -312,21 +362,35 @@ async fn run() -> Result<(), String> {
         )),
     }
 
-    let signal_name = termination(&mut terminate, &mut interrupt).await;
-    log(&format!("{signal_name}: shutting down"));
-    // Whether the node was alive when the signal came: the enclave object `nitro-cli`
-    // describes, or `[]`.
+    // The host program ends on a termination signal, or when the watch confirmed that the
+    // enclave ended on its own: the state of the node is gone then, and the one recovery is
+    // the restart of the container with a new enclave.
+    let enclave_ended = tokio::select! {
+        signal_name = termination(&mut terminate, &mut interrupt) => {
+            log(&format!("{signal_name}: shutting down"));
+            false
+        }
+        _ = watch.wait_ended() => {
+            log("enclave ended: shutting down, the container restarts with a new enclave");
+            true
+        }
+    };
+    // Whether the node was alive at that moment: the enclave object `nitro-cli` describes,
+    // or `[]`.
     match tokio::task::spawn_blocking(launch::describe_enclaves).await {
         Ok(Ok(line)) => log(&format!("enclave: describe-enclaves {line}")),
         Ok(Err(reason)) => log(&format!("enclave: describe-enclaves failed, {reason}")),
         Err(_) => log("enclave: describe-enclaves did not complete"),
     }
-    collect(drain).await;
+    collect(drain, node.as_ref()).await;
     log("enclave: ending");
     match tokio::task::spawn_blocking(launch::terminate_enclave).await {
         Ok(Ok(())) => log("enclave: ended"),
         Ok(Err(reason)) => log(&format!("enclave: {reason}")),
         Err(_) => log("enclave: the end of the enclave did not complete"),
+    }
+    if enclave_ended {
+        return Err("the enclave ended on its own".to_string());
     }
     Ok(())
 }

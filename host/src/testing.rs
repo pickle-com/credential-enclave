@@ -91,6 +91,28 @@ pub fn health_body_with_load(configured: bool, accounts: u64, started_ms: u64) -
     )
 }
 
+/// The `load` object of a node of release v2.2.0: [`LOAD_OBJECT`] with the two counts of the
+/// connections from the backend after the two counts of the calls, and the two values of the
+/// descriptors at the end.
+pub const LOAD_OBJECT_WITH_DESCRIPTORS: &str = r#"{"provider_inflight":4,"forward_calls":5,"inbound_connections":7,"inbound_refused":2,"cpu_user_ms":1234,"cpu_system_ms":567,"cpu_idle_ms":89012,"memory_total_bytes":4294967296,"memory_available_bytes":3221225472,"descriptors_open":321,"descriptors_limit":65536}"#;
+
+/// The `health` body of a node of release v2.2.0 with the given values:
+/// [`health_body_with_egress_and_refresh`] with the `load` object
+/// [`LOAD_OBJECT_WITH_DESCRIPTORS`].
+pub fn health_body_with_descriptors(configured: bool, accounts: u64, started_ms: u64) -> String {
+    health_body_of(
+        "v2.2.0",
+        configured,
+        accounts,
+        started_ms,
+        LOG_STORE_OBJECT,
+        LOG_WRITE_COUNTS,
+        &format!(
+            r#","load":{LOAD_OBJECT_WITH_DESCRIPTORS},"egress":{EGRESS_OBJECT},"refresh":{REFRESH_OBJECT},"state":{STATE_OBJECT}"#
+        ),
+    )
+}
+
 /// The `log_store` object of [`health_body_with_egress_and_refresh`].
 pub const LOG_STORE_OBJECT: &str = r#"{"bucket":"character-credential-log-dev-1","region":"us-west-2","credentials_expires_ms":1790000900000,"pending":6,"pending_oldest_ms":12345}"#;
 

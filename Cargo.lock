@@ -326,7 +326,7 @@ dependencies = [
 
 [[package]]
 name = "credential-enclave"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "async-imap",
  "aws-nitro-enclaves-nsm-api",
@@ -341,10 +341,12 @@ dependencies = [
  "log",
  "memchr",
  "rcgen",
+ "rlimit",
  "rustls",
  "serde",
  "serde_json",
  "sha2",
+ "socket2",
  "tokio",
  "tokio-rustls",
  "tokio-vsock",
@@ -355,12 +357,13 @@ dependencies = [
 
 [[package]]
 name = "credential-enclave-host"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
  "libc",
+ "rlimit",
  "serde",
  "serde_json",
  "socket2",
@@ -370,7 +373,7 @@ dependencies = [
 
 [[package]]
 name = "credential-enclave-protocol"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
@@ -392,7 +395,7 @@ dependencies = [
 
 [[package]]
 name = "credential-enclave-verify"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "credential-enclave-protocol",
  "getrandom",
@@ -1237,6 +1240,15 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rlimit"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7043b63bd0cd1aaa628e476b80e6d4023a3b50eb32789f2728908107bd0c793a"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

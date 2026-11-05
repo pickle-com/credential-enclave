@@ -12,6 +12,7 @@ use super::responses::{
     LogCounts, LogStoreState, OpenFailureCounts, RefreshCounts, StateCounts,
     WriteAttemptFailureCounts, WriteMsBuckets,
 };
+use crate::descriptors;
 use crate::load;
 use crate::state::Node;
 
@@ -24,8 +25,10 @@ use crate::state::Node;
 /// `log` counts the entries, events, write attempts (confirmed, failed by cause, repeated, and
 /// the time to confirmation of the confirmed ones) and batch calls since the node started.
 /// `load` is the load at the moment of the call: the provider requests in flight, the calls
-/// that hold a forward slot, and the CPU time and the memory of the kernel the node runs in,
-/// read from procfs (`crate::load`), null where the kernel exposes no value. `egress` counts
+/// that hold a forward slot, the connections from the backend open now and the ones refused
+/// at accept since the start, the CPU time and the memory of the kernel the node runs in,
+/// read from procfs (`crate::load`), null where the kernel exposes no value, and the open
+/// file descriptors of the node process and their limit (`crate::descriptors`). `egress` counts
 /// the outbound connections (opened, failed by cause, repeated, being opened, and the requests
 /// that reused an idle connection), `refresh` the token address calls of `refresh` the node
 /// continued after their time limit, by outcome and in progress, and `state` the sizes of the
@@ -97,11 +100,15 @@ pub async fn health(State(node): State<Arc<Node>>) -> Response {
         load: Load {
             provider_inflight: node.egress.provider_inflight(),
             forward_calls: node.forward_calls(),
+            inbound_connections: node.inbound.open(),
+            inbound_refused: node.inbound.refused(),
             cpu_user_ms: cpu.map(|cpu| cpu.user),
             cpu_system_ms: cpu.map(|cpu| cpu.system),
             cpu_idle_ms: cpu.map(|cpu| cpu.idle),
             memory_total_bytes: memory.map(|memory| memory.total),
             memory_available_bytes: memory.map(|memory| memory.available),
+            descriptors_open: descriptors::open_count(),
+            descriptors_limit: descriptors::soft_limit(),
         },
         egress: EgressCounts {
             opens: read(&egress.opens),

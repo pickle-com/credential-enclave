@@ -16,6 +16,7 @@
 mod api;
 mod attest;
 mod clock;
+mod descriptors;
 mod egress;
 mod frame;
 mod lineage;
@@ -96,6 +97,9 @@ async fn terminated() {
 }
 
 async fn run(platform_name: &str) -> Result<(), PlatformError> {
+    // The limit of open descriptors is raised before any connection exists (enclave.md
+    // section 8). The outcome is not logged (rule E5): `health` reports the limit in force.
+    let _ = descriptors::raise_limit();
     let platform = platform::select(platform_name)?;
     let clock = Arc::new(Clock::start(platform.as_ref())?);
     let limits = Limits::default();
@@ -112,7 +116,7 @@ async fn run(platform_name: &str) -> Result<(), PlatformError> {
     tokio::spawn(keep_calibrating(platform, clock));
     tokio::spawn(log_store::keep_sweeping(node.clone()));
     tokio::select! {
-        _ = api::serve(listener, api::router(node)) => {}
+        _ = api::serve(listener, api::router(node.clone()), node) => {}
         _ = terminated() => {}
     }
     Ok(())
