@@ -975,9 +975,13 @@ mod tests {
         "credential_enclave_idle_connections",
     ];
 
-    /// The series of a response without the series of the host program, which come last.
+    /// The series of a response without the series of the host program, which come last
+    /// and start with the gauge of the watch (the gauges of the descriptors of the host
+    /// program between it and the relays depend on the kernel that runs the test).
     fn node_part(text: &str) -> &str {
-        text.strip_suffix(HOST_SERIES_AT_START).unwrap()
+        text.split_once("# HELP credential_enclave_host_enclave_running ")
+            .unwrap()
+            .0
     }
 
     /// The counts of an inbound relay that served no connection.

@@ -351,6 +351,7 @@ async fn run() -> Result<(), String> {
     tokio::spawn(watch::keep_watching(
         watch.clone(),
         launch::describe_enclaves,
+        node.clone(),
     ));
     match operator_config {
         Ok(body) => {

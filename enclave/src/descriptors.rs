@@ -97,11 +97,17 @@ mod tests {
             // Only a Linux kernel exposes /proc/self/fd.
             return;
         }
+        // The count is that of the whole process, and the other tests of the crate run in
+        // threads at the same time: the test holds many descriptors and asserts the direction
+        // of the change, not its exact size.
         let before = open_count().expect("a Linux kernel exposes /proc/self/fd");
-        let held = fs::File::open("/proc/self/stat").unwrap();
+        let held: Vec<fs::File> = (0..32)
+            .map(|_| fs::File::open("/proc/self/stat").unwrap())
+            .collect();
         let during = open_count().unwrap();
-        assert_eq!(during, before + 1);
+        assert!(during > before, "{during} <= {before}");
         drop(held);
-        assert_eq!(open_count().unwrap(), before);
+        let after = open_count().unwrap();
+        assert!(after < during, "{after} >= {during}");
     }
 }
