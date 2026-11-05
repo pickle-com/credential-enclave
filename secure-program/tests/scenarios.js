@@ -7,10 +7,20 @@
 // same scenarios on two versions of the program and show what changed.
 "use strict";
 
+const fs = require("node:fs");
+const path = require("node:path");
+
 const bridge = require("./bridge.js");
 
 const HOUR_MS = 3600000;
 const DAY_MS = bridge.DAY_MS;
+
+/** The releases the program of this checkout lists, with their measurements (the newest program
+ *  lists every release of the public repository). A fixture built from them puts the same nodes
+ *  in front of every program compare.js runs, whether or not that program lists them. */
+function checkoutReleases() {
+  return bridge.listedMeasurements(fs.readFileSync(path.join(__dirname, "..", "secure-program.js"), "utf8"));
+}
 
 /** A world with an account whose key state is present, and node0: a node of the latest release
  *  the program lists. */
@@ -170,6 +180,39 @@ async function laterReleaseTraced(source) {
   writeForeignChain(base.world, base.keys, node1, base.node0.id);
   await start(source, base.world);
   return outcome(base.world, base.named);
+}
+
+/** The nodes of the newest three releases of the public repository side by side (the pods of one
+ *  environment while the nodes of one release are replaced by the nodes of the next): node0 of
+ *  the oldest of the three, node1 of the middle one, node2 of the newest. Before the run node1
+ *  handed the delegation of the account to node2 (protocol.md 10.3: grant_transferred_out on the
+ *  chain of node1, grant_transferred_in on the chain of node2) and node2 served one provider
+ *  request. The measurements are those of the program of this checkout (checkoutReleases): a
+ *  program that lists the newest release grants to the three nodes and verifies the three chains;
+ *  a program without it leaves node2 pending (the trace puts it into the ledger, its chain is not
+ *  read, no grant goes to it). */
+async function releasesSideBySide(source) {
+  const world = new bridge.World();
+  const keys = world.createAccount();
+  const releases = checkoutReleases().slice(-3);
+  const named = {};
+  const nodes = releases.map(function (release, index) {
+    named["node" + index] = world.addNode({ release: release.release, measurement: release });
+    return named["node" + index];
+  });
+  const seal = { logPk: keys.logPk, keyId: keys.keyId };
+  nodes[1].appendEntry(world.userId, "c", [{
+    t: "grant_accepted", time_ms: world.now - 3 * HOUR_MS,
+    not_after_ms: world.now + 29 * DAY_MS, custody: "enclave",
+  }], Object.assign({ timeMs: world.now - 3 * HOUR_MS }, seal));
+  nodes[1].appendEntry(world.userId, "c", [{
+    t: "grant_transferred_out", time_ms: world.now - 2 * HOUR_MS, to: nodes[2].id,
+  }], Object.assign({ timeMs: world.now - 2 * HOUR_MS }, seal));
+  writeForeignChain(world, keys, nodes[2], nodes[1].id);
+  await start(source, world);
+  const result = outcome(world, named);
+  result.releases = releases.map(function (release) { return release.release; });
+  return result;
 }
 
 /** The chain of node0 has a gap: the second of three entries written before the run is not in the
@@ -465,6 +508,7 @@ module.exports = {
     unlisted_other_store: unlistedOtherStore,
     unlisted_debug_enclave: unlistedDebugEnclave,
     later_release_traced: laterReleaseTraced,
+    releases_side_by_side: releasesSideBySide,
     gap: gap,
     replacement: replacement,
     second_device: secondDevice,

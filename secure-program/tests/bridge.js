@@ -877,15 +877,16 @@ function loadProgram(source, world) {
   return program;
 }
 
-/** The measurements of ACCEPTED_RELEASES of a program source, in the order of the list. */
+/** The measurements of ACCEPTED_RELEASES of a program source, in the order of the list, each with
+ *  log_store (true when the element says so: the node writes the log entry to the log store). */
 function listedMeasurements(source) {
   const start = source.indexOf("const ACCEPTED_RELEASES = [");
   const end = source.indexOf("];", start);
-  const pattern = /release: "([^"]+)",\s*pcr0: "([0-9a-f]{96})",\s*pcr1: "([0-9a-f]{96})",\s*pcr2: "([0-9a-f]{96})"/g;
+  const pattern = /release: "([^"]+)",\s*pcr0: "([0-9a-f]{96})",\s*pcr1: "([0-9a-f]{96})",\s*pcr2: "([0-9a-f]{96})",(\s*log_store: true,)?/g;
   const out = [];
   let match = pattern.exec(source.slice(start, end));
   while (match !== null) {
-    out.push({ release: match[1], pcr0: match[2], pcr1: match[3], pcr2: match[4] });
+    out.push({ release: match[1], pcr0: match[2], pcr1: match[3], pcr2: match[4], log_store: match[5] !== undefined });
     match = pattern.exec(source.slice(start, end));
   }
   return out;
