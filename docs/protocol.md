@@ -701,6 +701,19 @@ Index verification of a chain of format 2:
    earlier program left one) is not counted, and the run is pending. The program that lists the
    release reads that chain from the verified point the list of nodes keeps (`seq` 0 for a node no
    program read).
+6. The list of nodes of a device (its node ledger) holds the nodes the device delegated to and the
+   nodes the tracing of a transfer added. A device writes a node to its list before it sends a
+   grant to that node (the attestation of the node verified), so a grant whose reply never reaches
+   the device is a delegation the device made. The devices of one account share their lists
+   through the operator's backend as one value per account, sealed with a key derived from the
+   master key (ChaCha20-Poly1305, a fresh nonce, the additional data naming the purpose, the
+   account and the `key_id`): a device reads the value and merges it into its list before it
+   judges the log, and uploads the merged list when the value does not cover a node it holds a
+   grant for. The operator cannot read or forge the value, and a value the operator withholds
+   leaves the judgement of the device as it is. A node of the listing that the merged list
+   explains as a grant of a device of the account is not a delegation the app did not make. A
+   run whose judgement took longer than `LOG_RUN_STALE_MS` (the app was suspended while it ran)
+   is judged again on fresh reads before it is published.
 
 Expired entries: an object of the store cannot be deleted for 365 days (7.6), and after that its
 absence says nothing about the operator domain (the lifecycle rule of the bucket removes it at 400
@@ -1283,6 +1296,8 @@ Test vectors of the assignment; the backend of the operator computes the same fu
 | `LOG_STORE_NODES` (the app) | 16: the nodes of the listing the list of nodes does not know that one verification run examines |
 | Listing pages one verification run reads per node (the app) | 8 pages of 1,000 keys |
 | Object versions one verification run fetches at a time (the app) | 8 |
+| `LOG_RUN_STALE_MS` (the app) | 600,000: a run whose judgement took longer than this is judged again on fresh reads (7.4) |
+| `LOG_STORE_ATTEMPTS`, `LOG_STORE_RETRY_MS` (the app) | 3 attempts of one request to the store, pauses of 500 and 1,500 milliseconds between them: a transport failure, a 429 and a 5xx status are tried again |
 | Body limit | 64 MiB (67,108,864 bytes) |
 | Longest `context` | 256 characters |
 

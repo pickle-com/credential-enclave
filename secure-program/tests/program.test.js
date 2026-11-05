@@ -183,6 +183,71 @@ test("the replacement of the program: the mark of an earlier program is pending,
   assert.deepEqual(phases.listed.nodes.node1.ledger, { origin: "grant", unknown: false, checkpoint: 3, gone: false });
 });
 
+test("a node another device delegated to is known through the shared ledger, not a delegation the app did not make", async () => {
+  const result = await scenarios.second_device(source);
+  assert.equal(result.first_device.report.status, "verified");
+  assert.equal(result.first_device.ledger.node1, "grant");
+  assert.equal(result.second_device.report.status, "verified");
+  assert.equal(result.second_device.report.unknown_nodes, 0);
+  assert.equal(result.second_device.ledger.node1, "grant+gone");
+  assert.ok(result.uploads >= 1);
+});
+
+test("a grant whose reply was lost is a grant of this app: the node that ends after it is not marked", async () => {
+  const result = await scenarios.reply_lost_then_node_ends(source);
+  assert.equal(result.node_took_grant, true);
+  assert.equal(result.next_day.status, "verified");
+  assert.equal(result.next_day.unknown_nodes, 0);
+  assert.equal(result.day_after.status, "verified");
+  assert.equal(result.ledger.node1, "grant+gone");
+});
+
+test("a grant whose reply was lost to a living node verifies in the same run", async () => {
+  const result = await scenarios.reply_lost_node_lives(source);
+  assert.equal(result.first_run.status, "verified");
+  assert.equal(result.first_run.unknown_nodes, 0);
+  assert.equal(result.second_run.status, "verified");
+  assert.equal(result.ledger.node1, "grant");
+});
+
+test("the log screen renews the grants before it judges the log", async () => {
+  const result = await scenarios.log_screen_before_sync(source);
+  assert.equal(result.screen.status, "verified");
+  assert.equal(result.screen.unknown_nodes, 0);
+  assert.equal(result.published_after_screen, "verified");
+  assert.equal(result.published_after_sync, "verified");
+  assert.equal(result.ledger.node1, "grant");
+});
+
+test("a run suspended across a transfer is judged again on fresh reads before it is published", async () => {
+  const result = await scenarios.suspended_run_crosses_transfer(source);
+  assert.equal(result.suspended_run.report.status, "verified");
+  assert.equal(result.suspended_run.report.unknown_nodes, 0);
+  assert.equal(result.suspended_run.published, "verified");
+  assert.equal(result.after_next_sync, "verified");
+  assert.equal(result.ledger.node1, "grant");
+});
+
+test("a store request that failed once is made again, and a read that keeps failing is named in the report", async () => {
+  const once = await scenarios.store_answers_once_503(source);
+  assert.equal(once.failed_answers, 1);
+  assert.equal(once.report.status, "verified");
+  assert.equal(once.report.store, "verified");
+  assert.equal(once.store_failure, "");
+  const always = await scenarios.store_objects_fail(source);
+  assert.equal(always.report.status, "pending");
+  assert.equal(always.report.store, "unreachable");
+  assert.equal(always.store_failure, "object:503");
+});
+
+test("the report names the nodes counted as delegations the app did not make", async () => {
+  const result = await scenarios.listed_broken_signature(source);
+  assert.equal(result.report.unknown_nodes, 1);
+  assert.equal(result.report.unknown_node_ids.length, 1);
+  assert.match(result.report.unknown_node_ids[0], /^[A-Za-z0-9_-]{43}$/);
+  assert.equal(result.report.store_failure, "");
+});
+
 test("a verified run is not repeated within the period, and a new runtime verifies at its first synchronization", async () => {
   const world = new bridge.World();
   world.createAccount();

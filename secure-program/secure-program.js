@@ -22,10 +22,28 @@
 
   // ---- Constants ----
 
-  const VERSION = 33;
+  const VERSION = 34;
   const MASTER_KEY_SERVICE = "com.pickle.client.secure.master-key";
   const LEDGER_SERVICE = "com.pickle.client.secure.ledger";
   const LEDGER_STORE_KEY = "ledger";
+  // The shared ledger: the node ledger of this account sealed with a key derived from the master key
+  // (deriveKeys: ledgerKey) and kept by the backend (one value per account), so that every device of
+  // the account knows the grants the other devices handed out (a node another device delegated to
+  // is not a delegation the app did not make). The backend cannot read or forge it; a value it
+  // withholds leaves the judgement of this device as it is. The device store keeps the sorted ids of
+  // the nodes of origin grant the last upload or merge covered: an upload follows when this device
+  // holds a grant node the backend value did not cover.
+  const LEDGER_SHARE_PATH = "/api/secure/ledger";
+  const LEDGER_SHARE_STORE_KEY = "ledger_shared";
+  const LEDGER_SHARE_NONCE_BYTES = 12;
+  // A verification run that took longer than this (the app was suspended while it ran: the heads
+  // and listings it judged are older than the nodes it now sees) is judged again on fresh reads
+  // before anything is published or reported.
+  const LOG_RUN_STALE_MS = 600000;
+  // One request to the log store is made up to this many times: a transport failure, a 429 and a
+  // 5xx status are tried again after the pauses below (milliseconds, one per further attempt).
+  const LOG_STORE_ATTEMPTS = 3;
+  const LOG_STORE_RETRY_MS = [500, 1500];
   // The lifetime of a grant is a number of days the user chooses (an integer from 1 to 30, 30 by
   // default). The renewal interval is the smaller of 24 hours and half of that lifetime.
   const DAY_MS = 86400000;
@@ -719,9 +737,10 @@
 
   /** Every key derived from the master key (nothing is stored: the same master key gives the same
    *  values): the account signing seed and public key, the log decryption private key and public
-   *  key, the user key of each custody, and the key_id. userKeys.enclave is handed only to nitro
-   *  nodes whose attestation was verified, and userKeys.operator to local nodes: the user key of
-   *  the enclave custody never goes to an unverified party. */
+   *  key, the user key of each custody, the key that seals the shared ledger (ledgerKey: it leaves
+   *  the device in no form), and the key_id. userKeys.enclave is handed only to nitro nodes whose
+   *  attestation was verified, and userKeys.operator to local nodes: the user key of the enclave
+   *  custody never goes to an unverified party. */
   function deriveKeys(masterKey) {
     const signSeed = native.hkdf("sha256", masterKey, null, info("sign"), 32);
     const logSk = native.hkdf("sha256", masterKey, null, info("log"), 32);
@@ -735,6 +754,7 @@
         enclave: native.hkdf("sha256", masterKey, null, info("user-key"), 32),
         operator: native.hkdf("sha256", masterKey, null, info("user-key.operator"), 32),
       },
+      ledgerKey: native.hkdf("sha256", masterKey, null, info("ledger"), 32),
       keyId: hex(decode(native.sha256(signPk)).subarray(0, 8)),
     };
   }
@@ -897,6 +917,10 @@
         // For a node of origin store: the time an entry sealed to the key of this account was
         // first verified on it (a delegation the app did not make), 0 otherwise.
         unknown_ms: node.origin === "store" ? whole(node.unknown_ms) : 0,
+        // The time this app last sent a grant to the node (written before the grant goes out:
+        // renewGrants), 0 for a node that entered the ledger another way. A program before v34
+        // leaves the field out of its own ledger and drops it from one it reads.
+        attempted_ms: whole(node.attempted_ms),
       };
     }
     return ledger;
@@ -934,10 +958,12 @@
             },
             final: node.final === null ? null : { seq: node.final.seq, hash: node.final.hash },
             gone_ms: node.gone_ms, origin: node.origin, unknown_ms: node.unknown_ms,
+            attempted_ms: node.attempted_ms,
           };
           continue;
         }
         kept.first_ms = Math.min(kept.first_ms, node.first_ms);
+        kept.attempted_ms = Math.max(kept.attempted_ms, node.attempted_ms);
         if (kept.origin === "store" && node.origin !== "store") kept.origin = "grant";
         if (node.unknown_ms !== 0 && (kept.unknown_ms === 0 || node.unknown_ms < kept.unknown_ms)) {
           kept.unknown_ms = node.unknown_ms;
@@ -1005,6 +1031,123 @@
       });
     }
     if (native.storeGet(LEDGER_STORE_KEY) !== json) native.storeSet(LEDGER_STORE_KEY, json);
+  }
+
+  // ---- The shared ledger ----
+
+  /** The ids of the nodes a ledger explains as delegations of this account (origin grant: a grant
+   *  of a device, the record of a grant it sent, or a traced transfer), sorted. */
+  function grantNodeIds(ledger) {
+    return Object.keys(ledger.nodes).filter(function (id) {
+      return ledger.nodes[id].origin === "grant";
+    }).sort();
+  }
+
+  /** The ids of the nodes a ledger marks as delegations the app did not make. */
+  function unknownNodeIds(ledger) {
+    return Object.keys(ledger.nodes).filter(function (id) { return ledger.nodes[id].unknown_ms !== 0; });
+  }
+
+  /** The additional authenticated data of the shared ledger: the purpose, the account and the
+   *  key_id (a value sealed for another account or another key does not open). */
+  function ledgerShareAad(keys) {
+    return encode(utf8(purpose("ledger") + "\n" + userId() + "\n" + keys.keyId));
+  }
+
+  /** The shared value of a ledger: {key_id, nonce, ct}, the ledger JSON sealed with ledgerKey
+   *  (ChaCha20-Poly1305, a fresh nonce). */
+  function sealLedger(keys, ledger) {
+    const nonce = native.randomBytes(LEDGER_SHARE_NONCE_BYTES);
+    const ct = native.aeadSeal({
+      alg: "chacha20poly1305", key: keys.ledgerKey, nonce: nonce, aad: ledgerShareAad(keys),
+      plaintext: encode(utf8(JSON.stringify(ledger))),
+    });
+    return { key_id: keys.keyId, nonce: nonce, ct: ct };
+  }
+
+  /** The ledger of a shared value, or null when the value is absent, of another key, of another
+   *  shape, or does not open (an opened value that is not a ledger is the empty ledger). */
+  function openSharedLedger(keys, shared) {
+    if (shared === null || typeof shared !== "object" || shared.key_id !== keys.keyId ||
+        typeof shared.nonce !== "string" || typeof shared.ct !== "string") {
+      return null;
+    }
+    try {
+      return parseLedger(text(decode(native.aeadOpen({
+        alg: "chacha20poly1305", key: keys.ledgerKey, nonce: shared.nonce, aad: ledgerShareAad(keys),
+        ciphertext: shared.ct,
+      }))));
+    } catch (error) {
+      native.log("shared ledger: " + failureCode(error));
+      return null;
+    }
+  }
+
+  /** Whether the shared ledger covers this one: every grant node of this ledger is a grant node
+   *  of the shared one, and the revocation, resumption and lifetime settings are not newer here. */
+  function ledgerCovered(ledger, shared) {
+    const known = new Set(grantNodeIds(shared));
+    return grantNodeIds(ledger).every(function (id) { return known.has(id); }) &&
+      ledger.revoked_ms <= shared.revoked_ms && ledger.resumed_ms <= shared.resumed_ms &&
+      ledger.ttl_set_ms <= shared.ttl_set_ms;
+  }
+
+  /** Whether this device has a grant node the last upload or merge did not cover. */
+  function ledgerShareDue(ledger) {
+    const covered = native.storeGet(LEDGER_SHARE_STORE_KEY);
+    return covered === null || JSON.stringify(grantNodeIds(ledger)) !== covered;
+  }
+
+  /** The exchange of the ledger with the backend: the shared value is read (fetched: the settled
+   *  outcome of the GET when the caller sent it ahead, else sent here), merged into ledger (the
+   *  grants of the other devices of the account enter; a node this device found in the store only
+   *  that another device delegated to loses its mark), and, when the shared value does not cover
+   *  the merged ledger, the merged ledger is sealed and uploaded. The merged ledger replaces the
+   *  nodes and settings of ledger in place and is saved. A failure of either request is logged and
+   *  changes nothing else. Returns {cleared}: whether a mark of a delegation the app did not make
+   *  was cleared by the merge (the caller verifies the log again at once). */
+  async function shareLedger(keys, ledger, fetched) {
+    const outcome = await (fetched === undefined || fetched === null ? settled(api("GET", LEDGER_SHARE_PATH)) : fetched);
+    if (!outcome.ok) {
+      native.log("shared ledger read: " + failureCode(outcome.error));
+      return { cleared: false };
+    }
+    const shared = openSharedLedger(keys, outcome.value.json.ledger);
+    let cleared = false;
+    if (shared !== null) {
+      const marked = unknownNodeIds(ledger);
+      // store_failing_ms is not merged: the time the reads of the store of this device began to
+      // fail is a fact of this device (the stale judgement of publishLogState rests on it).
+      const merged = mergeLedger(ledger, shared);
+      // The gone time of a node this device granted to at least as recently as the shared value
+      // did is the one this device knows: a shared value from before the node was granted again
+      // does not make a living node gone.
+      for (const id of Object.keys(merged.nodes)) {
+        const mine = ledger.nodes[id];
+        const theirs = shared.nodes[id];
+        if (mine !== undefined && theirs !== undefined && mine.granted_ms >= theirs.granted_ms) {
+          merged.nodes[id].gone_ms = mine.gone_ms;
+        }
+      }
+      ledger.revoked_ms = merged.revoked_ms;
+      ledger.resumed_ms = merged.resumed_ms;
+      ledger.ttl_days = merged.ttl_days;
+      ledger.ttl_set_ms = merged.ttl_set_ms;
+      ledger.nodes = merged.nodes;
+      const still = new Set(unknownNodeIds(ledger));
+      cleared = marked.some(function (id) { return !still.has(id); });
+      saveLedger(ledger);
+    }
+    if (shared === null || !ledgerCovered(ledger, shared)) {
+      try {
+        await api("PUT", LEDGER_SHARE_PATH, sealLedger(keys, ledger));
+      } catch (error) {
+        native.log("shared ledger write: " + failureCode(error));
+        return { cleared: cleared };
+      }
+    }
+    native.storeSet(LEDGER_SHARE_STORE_KEY, JSON.stringify(grantNodeIds(ledger)));
+    return { cleared: cleared };
   }
 
   /** The lifetime of a grant as the ledger sets it (milliseconds). */
@@ -1385,9 +1528,11 @@
    *  fetched or read), url_rejected (an address the backend handed out does not name the bucket of
    *  this server target or the key, prefix, markers and query of the request), truncated (a listing
    *  went on beyond LOG_STORE_PAGES pages, or more unknown node prefixes than LOG_STORE_NODES) or
-   *  disabled (the backend of this env has no log store). */
-  function storeFailure(kind) {
-    return { log_store_failure: true, kind: kind };
+   *  disabled (the backend of this env has no log store). detail names what failed, for the report
+   *  of the run: the request (listing, object, discovery, address) and the transport failure or the
+   *  HTTP status, as "{request}:{transport | status | code}". */
+  function storeFailure(kind, detail) {
+    return { log_store_failure: true, kind: kind, detail: typeof detail === "string" ? detail : "" };
   }
 
   function isStoreFailure(error) {
@@ -1396,13 +1541,14 @@
 
   /** Records a store failure of this run in store (the state of the store reads of the run): the
    *  refusal of a backend without a log store is absent for a debug build and refused for a release
-   *  build, any other failure is its kind. */
+   *  build, any other failure is its kind. The detail of the first failure of the run is kept. */
   function storeFailed(store, error) {
     if (error.kind === "disabled") {
       store.state = native.deviceInfo().debug_build === true ? "absent" : "refused";
     } else {
       store.state = error.kind;
     }
+    if (store.detail === "") store.detail = error.detail;
   }
 
   /** The log store of this server target (an element of LOG_STORES), undefined when the target has
@@ -1517,15 +1663,27 @@
       parts.query.versionId === versionId && queryKeysAccepted(parts.query, ["versionId"]);
   }
 
-  /** One GET of the log store: {status, body}. A transport failure is unreachable. */
-  async function fetchStore(url) {
-    let response = null;
-    try {
-      response = await native.http({ method: "GET", url: url, timeoutMs: LOG_STORE_TIMEOUT_MS });
-    } catch (error) {
-      throw storeFailure("unreachable");
+  /** One GET of the log store: {status, body}. A transport failure, a 429 and a 5xx status are tried
+   *  again (LOG_STORE_ATTEMPTS attempts in all, with the pauses of LOG_STORE_RETRY_MS between them);
+   *  a transport failure that remains is unreachable, with the request named in its detail. */
+  async function fetchStore(url, request) {
+    const name = typeof request === "string" ? request : "object";
+    for (let attempt = 1; ; attempt += 1) {
+      let response = null;
+      try {
+        response = await native.http({ method: "GET", url: url, timeoutMs: LOG_STORE_TIMEOUT_MS });
+      } catch (error) {
+        if (attempt >= LOG_STORE_ATTEMPTS) throw storeFailure("unreachable", name + ":transport");
+        await native.sleep(LOG_STORE_RETRY_MS[attempt - 1]);
+        continue;
+      }
+      const again = response.status === 429 || (response.status >= 500 && response.status <= 599);
+      if (again && attempt < LOG_STORE_ATTEMPTS) {
+        await native.sleep(LOG_STORE_RETRY_MS[attempt - 1]);
+        continue;
+      }
+      return { status: response.status, body: typeof response.body === "string" ? response.body : "" };
     }
-    return { status: response.status, body: typeof response.body === "string" ? response.body : "" };
   }
 
   const XML_ENTITIES = { amp: "&", lt: "<", gt: ">", quot: "\"", apos: "'" };
@@ -1646,16 +1804,18 @@
     try {
       listing = (await api("GET", "/api/secure/log/store", null, query)).json;
     } catch (error) {
-      throw storeFailure(error && error.code === "log_store_disabled" ? "disabled" : "unreachable");
+      throw storeFailure(
+        error && error.code === "log_store_disabled" ? "disabled" : "unreachable",
+        "address:" + failureCode(error));
     }
     const expected = {
       prefix: accountPrefix() + (node === null ? "" : node + "/"), nodes: nodes,
       keyMarker: keyMarker, versionIdMarker: versionIdMarker,
     };
-    if (!listingUrlAccepted(listing.list_url, expected)) throw storeFailure("url_rejected");
-    const response = await fetchStore(listing.list_url);
+    if (!listingUrlAccepted(listing.list_url, expected)) throw storeFailure("url_rejected", "listing:url");
+    const response = await fetchStore(listing.list_url, "listing");
     const parsed = response.status === 200 ? parseListVersions(response.body) : null;
-    if (parsed === null) throw storeFailure("unreachable");
+    if (parsed === null) throw storeFailure("unreachable", "listing:" + response.status);
     return parsed;
   }
 
@@ -1680,7 +1840,7 @@
       keyMarker = listing.nextKeyMarker;
       versionIdMarker = listing.nextVersionIdMarker;
     }
-    throw storeFailure("truncated");
+    throw storeFailure("truncated", "discovery:pages");
   }
 
   /** The index of completeness of one chain after afterSeq: the object versions of the node prefix
@@ -1757,18 +1917,20 @@
         objects: wanted.map(function (item) { return { key: item.key, version_id: item.versionId }; }),
       })).json;
     } catch (error) {
-      throw storeFailure(error && error.code === "log_store_disabled" ? "disabled" : "unreachable");
+      throw storeFailure(
+        error && error.code === "log_store_disabled" ? "disabled" : "unreachable",
+        "address:" + failureCode(error));
     }
     const urls = new Map();
     for (const item of Array.isArray(signed.objects) ? signed.objects : []) {
       if (item === null || typeof item !== "object" ||
           !objectUrlAccepted(item.url, item.key, item.version_id)) {
-        throw storeFailure("url_rejected");
+        throw storeFailure("url_rejected", "object:url");
       }
       urls.set(item.key + "\n" + item.version_id, item.url);
     }
     for (const item of wanted) {
-      if (!urls.has(item.key + "\n" + item.versionId)) throw storeFailure("url_rejected");
+      if (!urls.has(item.key + "\n" + item.versionId)) throw storeFailure("url_rejected", "object:url");
     }
     return urls;
   }
@@ -1778,9 +1940,9 @@
    *  response outside 200 (a refused or expired address, a failing store) is unreachable: the run
    *  stays pending and the next one reads the version again. */
   async function fetchStoreObject(url) {
-    const response = await fetchStore(url);
+    const response = await fetchStore(url, "object");
     if (response.status === 404) return { signed: null, bytes: response.body.length };
-    if (response.status !== 200) throw storeFailure("unreachable");
+    if (response.status !== 200) throw storeFailure("unreachable", "object:" + response.status);
     let value = null;
     try {
       value = JSON.parse(response.body);
@@ -3248,16 +3410,39 @@
       accepted.add(node.node);
       wanted.push({ node: node, challenge: response.challenge });
     }
+    // A node the ledger does not know is written to it before its grant goes out (origin grant,
+    // no grant time, the attempt time): a node that takes the grant whose reply never reaches
+    // this program (the connection drops, the app is suspended, the node ends) is a delegation
+    // this app made, not one it did not make. The ledger is saved before the stage.
+    const sent = native.nowMs();
+    let recorded = false;
+    for (const item of wanted) {
+      const node = item.node;
+      if (ledger.nodes[node.node] !== undefined) continue;
+      ledger.nodes[node.node] = {
+        sign_pk: node.signPk, seal_pk: node.sealPk, platform: node.platform, release: node.release,
+        first_ms: sent, granted_ms: 0, not_after_ms: 0,
+        checkpoint: { seq: 0, hash: ZERO_HASH, time_ms: 0 }, final: null, gone_ms: 0, origin: "grant",
+        unknown_ms: 0, attempted_ms: sent,
+      };
+      recorded = true;
+    }
+    if (recorded) saveLedger(ledger);
+    // Whether a node this app found in the store only (a mark of a delegation it did not make)
+    // took a grant this time: the mark is cleared and the caller verifies the log again at once.
+    let cleared = false;
     const results = await stage(wanted.map(function (item) {
       return sendGrant(item.node, item.challenge, keys, grantTtlMs(ledger));
     }));
     for (let i = 0; i < wanted.length; i += 1) {
       const node = wanted[i].node;
       const result = results[i];
+      const existing = ledger.nodes[node.node];
       if (!result.ok) {
-        // A node that did not take the grant is not written to the ledger (the published state
-        // grant becomes partial or none).
+        // A node that did not take the grant keeps no grant time in the ledger (the published
+        // state grant becomes partial or none); the record of the attempt stays.
         failed += 1;
+        if (existing !== undefined) existing.attempted_ms = sent;
         native.log("grant failed: " + failureCode(result.error));
         continue;
       }
@@ -3265,38 +3450,28 @@
       // The grant time written to the ledger is after the last revocation time (a device clock
       // that runs backwards does not make a grant after a revoke read as one before it).
       const granted = Math.max(grant.granted_ms, ledger.revoked_ms + 1);
-      const existing = ledger.nodes[node.node];
-      if (existing !== undefined && existing.seal_pk === "") {
+      if (existing.seal_pk === "") {
         // A node that entered the ledger through the tracing of a delegation transfer: the values
         // of the attestation verified this time are filled in.
         existing.seal_pk = node.sealPk;
         existing.platform = node.platform;
         existing.release = node.release;
       }
-      if (existing === undefined) {
-        // The chain of a node seen for the first time is verified from its first entry (another
-        // device may have delegated to it first).
-        ledger.nodes[node.node] = {
-          sign_pk: node.signPk, seal_pk: node.sealPk, platform: node.platform, release: node.release,
-          first_ms: granted, granted_ms: granted, not_after_ms: grant.not_after_ms,
-          checkpoint: { seq: 0, hash: ZERO_HASH, time_ms: 0 }, final: null, gone_ms: 0, origin: "grant",
-          unknown_ms: 0,
-        };
-      } else {
-        existing.granted_ms = granted;
-        existing.not_after_ms = grant.not_after_ms;
-        existing.origin = "grant";
-        existing.unknown_ms = 0;
-        // A node that took the grant is alive: the gone time of a run that did not list it, or that
-        // found it in the store only, is cleared (the heads of living nodes are read ahead).
-        existing.gone_ms = 0;
-      }
+      if (existing.origin === "store" || existing.unknown_ms !== 0) cleared = true;
+      existing.granted_ms = granted;
+      existing.not_after_ms = grant.not_after_ms;
+      existing.attempted_ms = sent;
+      existing.origin = "grant";
+      existing.unknown_ms = 0;
+      // A node that took the grant is alive: the gone time of a run that did not list it, or that
+      // found it in the store only, is cleared (the heads of living nodes are read ahead).
+      existing.gone_ms = 0;
     }
     const now = native.nowMs();
     for (const id of Object.keys(ledger.nodes)) {
       if (!listed.has(id) && ledger.nodes[id].gone_ms === 0) ledger.nodes[id].gone_ms = now;
     }
-    return { accepted: accepted, rejected: rejected, failed: failed, later: later };
+    return { accepted: accepted, rejected: rejected, failed: failed, later: later, cleared: cleared };
   }
 
   /** The published state log of one run and its bookkeeping in the ledger: store_failing_ms starts
@@ -3329,7 +3504,7 @@
       verified_ms: status === "pending" ? logState.verified_ms : now,
       unverified_nodes: counts.unverified, missing: counts.missing, expired: counts.expired,
       unknown_nodes: counts.unknown, newer_release_nodes: counts.later, store: store.state,
-      store_failing_ms: ledger.store_failing_ms, program_version: VERSION,
+      store_failure: store.detail, store_failing_ms: ledger.store_failing_ms, program_version: VERSION,
     };
     native.publish({ state: { log: logState } });
     return logState;
@@ -3337,13 +3512,17 @@
 
   /** Reports the result of one verification run to the backend (the one way the server learns what
    *  the device verified). The run does not wait for the answer: the report is sent and a failure
-   *  is logged when it arrives; it changes nothing. */
+   *  is logged when it arrives; it changes nothing. store_failure names the first failed read of
+   *  the store (the empty string when none failed) and unknown_node_ids the nodes counted as
+   *  delegations the app did not make (node ids are public values: the attestation route lists
+   *  them). */
   function reportVerification(result, counts, nodes, elapsedMs) {
     settled(api("POST", LOG_REPORT_PATH, {
       status: result.status, store: result.store, nodes: nodes, keys_checked: counts.keys,
       bodies_fetched: counts.bodies, missing: counts.missing, expired: counts.expired,
       unknown_nodes: counts.unknown, newer_release_nodes: counts.later, elapsed_ms: elapsedMs,
-      program_version: VERSION,
+      program_version: VERSION, store_failure: result.store_failure,
+      unknown_node_ids: counts.unknownIds.slice(0, LOG_STORE_NODES),
     })).then(function (outcome) {
       if (!outcome.ok) native.log("verification report: " + failureCode(outcome.error));
     });
@@ -3398,19 +3577,21 @@
     try {
       response = (await api("POST", LOG_LISTINGS_PATH, { discovery: discovery, nodes: nodes })).json;
     } catch (error) {
-      throw storeFailure(error && error.code === "log_store_disabled" ? "disabled" : "unreachable");
+      throw storeFailure(
+        error && error.code === "log_store_disabled" ? "disabled" : "unreachable",
+        "address:" + failureCode(error));
     }
     const out = { discovery: null, nodes: new Map() };
     if (discovery) {
       const item = response.discovery;
       const expected = { prefix: accountPrefix(), nodes: true, keyMarker: null, versionIdMarker: null };
       if (item === null || typeof item !== "object" || !listingUrlAccepted(item.list_url, expected)) {
-        throw storeFailure("url_rejected");
+        throw storeFailure("url_rejected", "discovery:url");
       }
       out.discovery = item.list_url;
     }
     const listed = Array.isArray(response.nodes) ? response.nodes : [];
-    if (listed.length !== nodes.length) throw storeFailure("url_rejected");
+    if (listed.length !== nodes.length) throw storeFailure("url_rejected", "listing:url");
     for (let i = 0; i < nodes.length; i += 1) {
       const wanted = nodes[i];
       const item = listed[i];
@@ -3420,7 +3601,7 @@
       };
       if (item === null || typeof item !== "object" || item.node !== wanted.node ||
           !listingUrlAccepted(item.list_url, expected)) {
-        throw storeFailure("url_rejected");
+        throw storeFailure("url_rejected", "listing:url");
       }
       out.nodes.set(wanted.node, { url: item.list_url, keyMarker: wanted.key_marker });
     }
@@ -3460,7 +3641,7 @@
         vouched: decision.head === null ? null : decision.head.seq,
       });
     }
-    const pages = await stage(gets.map(function (item) { return fetchStore(item.url); }));
+    const pages = await stage(gets.map(function (item) { return fetchStore(item.url, "listing"); }));
     const wanted = [];
     for (let i = 0; i < gets.length; i += 1) {
       const item = gets[i];
@@ -3546,7 +3727,24 @@
    *  and LOG_VERIFY_BODIES bodies over every node. A run whose node discovery listing cannot be
    *  read verifies nothing (the verification points stay). */
   async function verifyAll(ledger, keys, reads) {
-    const started = native.nowMs();
+    let started = native.nowMs();
+    let run = await verifyRun(ledger, keys, reads);
+    if (native.nowMs() - started >= LOG_RUN_STALE_MS) {
+      // The run took longer than a run takes (the app was suspended while it ran): the heads and
+      // listings it judged are older than the nodes it now sees (a node that came up, a transfer
+      // made meanwhile), so it is judged again on fresh reads and only that judgement is published.
+      started = native.nowMs();
+      run = await verifyRun(ledger, keys, null);
+    }
+    const result = publishLogState(ledger, run.store, run.counts, run.now);
+    reportVerification(result, run.counts, Object.keys(ledger.nodes).length, native.nowMs() - started);
+    return result;
+  }
+
+  /** One judgement of the log (the body of verifyAll): returns {store, counts, now} for
+   *  publishLogState and reportVerification, which the caller does. counts.unknownIds are the ids
+   *  of the nodes counted as unknown. */
+  async function verifyRun(ledger, keys, reads) {
     // The reads of the run were sent ahead by the caller (together with its own requests) or are
     // sent now; the judgement below uses them only where they are the very responses it would request.
     if (!reads) reads = beginVerificationReads(ledger);
@@ -3560,10 +3758,11 @@
       }
     }
     await completeVerificationReads(ledger, reads, summaries);
-    const store = { state: "verified" };
+    const store = { state: "verified", detail: "" };
     const now = native.nowMs();
     const counts = {
       pending: false, unverified: 0, missing: 0, expired: 0, unknown: 0, later: 0, keys: 0, bodies: 0,
+      unknownIds: [],
     };
     // The listing addresses of the run that the backend refused or that did not name the listings
     // requested are the store failure of the run, as the refusal of one listing address is
@@ -3580,9 +3779,7 @@
       storeFailed(store, error);
       if (store.state !== "absent" && store.state !== "refused") {
         counts.pending = true;
-        const result = publishLogState(ledger, store, counts, now);
-        reportVerification(result, counts, Object.keys(ledger.nodes).length, native.nowMs() - started);
-        return result;
+        return { store: store, counts: counts, now: now };
       }
     }
     // The nodes of the listing the ledger does not know: examined after the nodes of the ledger (the
@@ -3635,7 +3832,9 @@
     counts.keys = LOG_VERIFY_KEYS - budgets.keys;
     counts.bodies = budgets.fetched;
     counts.later = later.size;
-    if (examinable.length > examined.length && store.state === "verified") store.state = "truncated";
+    if (examinable.length > examined.length && store.state === "verified") {
+      storeFailed(store, storeFailure("truncated", "discovery:nodes"));
+    }
     // A node found in the store only that holds an entry sealed to this key is a delegation the app
     // did not make and no verified transfer explained (a trace that reaches the node later in the
     // run changes its origin before this mark). The mark stays in the ledger; a node of the listing
@@ -3649,14 +3848,15 @@
       if (node.origin !== "store") continue;
       if (node.unknown_ms !== 0) {
         // The mark of a node of a release later than this program was counted above (pending).
-        if (!newerReleaseNodes.has(id)) counts.unknown += 1;
+        if (!newerReleaseNodes.has(id)) {
+          counts.unknown += 1;
+          counts.unknownIds.push(id);
+        }
       } else {
         delete ledger.nodes[id];
       }
     }
-    const result = publishLogState(ledger, store, counts, now);
-    reportVerification(result, counts, Object.keys(ledger.nodes).length, native.nowMs() - started);
-    return result;
+    return { store: store, counts: counts, now: now };
   }
 
   /** The migration of what was stored before the switch: the tokens of connections and the vault
@@ -3728,8 +3928,13 @@
    *  (afterGrants: the sealing check, the completion of an application password setup, the log
    *  verification when its period has elapsed), and runtime.ready is published. offered is the node
    *  list already requested (null: renewGrants requests it). */
-  async function delegate(keys, ledger, offered) {
-    let renewed = { accepted: new Set(), rejected: 0 };
+  async function delegate(keys, ledger, offered, shared) {
+    let renewed = { accepted: new Set(), rejected: 0, cleared: false };
+    // The ledgers of the other devices of the account enter before the grants go out (shared is
+    // the settled outcome of the request runSync sent ahead; null when the run does not exchange:
+    // shareWanted): a node they delegated to is renewed by this device (it is a grant node now),
+    // and a mark this device left on such a node is cleared (the verification runs again below).
+    const merged = shared === null ? { cleared: false } : await shareLedger(keys, ledger, shared);
     if (!delegationOff(ledger)) {
       renewed = await renewGrants(keys, ledger, undefined, offered);
     } else {
@@ -3748,19 +3953,36 @@
       state: { grant: grant, grant_days: ledger.ttl_days },
       runtime: { rejected_nodes: renewed.rejected },
     });
-    await afterGrants(keys, ledger);
+    await afterGrants(keys, ledger, merged.cleared || renewed.cleared);
     native.publish({ runtime: { ready: true } });
+    // The grants of this run (a node the backend value did not cover) are shared after the run.
+    if (ledgerShareDue(ledger)) await shareLedger(keys, ledger);
     return { grant: grant, accepted: renewed.accepted.size, rejected: renewed.rejected };
   }
 
   /** The steps of delegate after the grants: the sealing check (when this device and account have
    *  not completed one), the completion of an application password setup, and the log verification
-   *  when its period has elapsed. The query of the sealing check and the first reads of the
-   *  verification (beginVerificationReads) are sent together as one stage; the steps then run in
-   *  the order of v29 on the responses. While delegation is off only the verification runs. */
-  async function afterGrants(keys, ledger) {
+   *  when its period has elapsed or when cleared is true (a mark of a delegation the app did not
+   *  make was cleared by the grants or the shared ledger of this run: the judgement is made again
+   *  at once instead of at the next period). The query of the sealing check and the first reads of
+   *  the verification (beginVerificationReads) are sent together as one stage; the steps then run
+   *  in the order of v29 on the responses. While delegation is off only the verification runs. */
+  /** Whether the period of the log verification has elapsed for this runtime. */
+  function verifyDue() {
+    return native.nowMs() - logState.verified_ms >= LOG_VERIFY_INTERVAL_MS;
+  }
+
+  /** Whether a synchronization exchanges the ledger with the backend before its grants: when the
+   *  verification is due (the ledgers of the other devices are read before the judgement), when
+   *  this ledger marks a node as a delegation the app did not make (another device may explain
+   *  it), and when this device holds a grant node the last exchange did not cover. */
+  function shareWanted(ledger) {
+    return verifyDue() || unknownNodeIds(ledger).length > 0 || ledgerShareDue(ledger);
+  }
+
+  async function afterGrants(keys, ledger, cleared) {
     const on = !delegationOff(ledger);
-    const due = native.nowMs() - logState.verified_ms >= LOG_VERIFY_INTERVAL_MS;
+    const due = cleared === true || verifyDue();
     // The query of the sealing check is sent only when a node holds a grant: without one nothing
     // could be sealed (sealPending) and the account is not asked.
     const sealing = on && needsSealingCheck() && heldCustody(ledger, native.nowMs()) !== null
@@ -3786,15 +4008,18 @@
       // device holds a master key and delegation is on; a device without a key delegates nothing,
       // and while delegation is off the revoke is sent again with a list of its own (delegate).
       const judging = judgeKey();
-      const pending = readMasterKey() !== null && !delegationOff(loadLedger())
-        ? settled(fetchOffered())
-        : null;
+      const held = readMasterKey() !== null;
+      const current = held ? loadLedger() : null;
+      const pending = held && !delegationOff(current) ? settled(fetchOffered()) : null;
+      // The shared ledger of the account is requested along with the account query (one stage)
+      // when the run exchanges it (shareWanted).
+      const shared = held && shareWanted(current) ? settled(api("GET", LEDGER_SHARE_PATH)) : null;
       const judged = await judging;
       let outcome = { grant: { state: "none", not_after_ms: 0 }, accepted: 0, rejected: 0 };
       if (judged.keyState === "present") {
         const offered = pending === null ? null : await pending;
         outcome = await delegate(
-          judged.keys, loadLedger(), offered !== null && offered.ok ? offered.value : null);
+          judged.keys, loadLedger(), offered !== null && offered.ok ? offered.value : null, shared);
       } else {
         native.publish({ runtime: { ready: true } });
       }
@@ -4341,13 +4566,30 @@
     const textual = typeof args.limit === "string" && args.limit.trim() !== "";
     const given = textual ? Number(args.limit) : args.limit;
     const limit = Number.isFinite(given) ? Math.min(500, Math.max(1, Math.floor(given))) : 100;
-    // The first reads of the verification are sent along with the account query of presentKeys when
-    // this device holds a master key (without one the key state is not present and nothing is read).
+    // The screen judges the log on the ledger of now: the shared ledger of the account and the
+    // node list are requested along with the account query of presentKeys when this device holds a
+    // master key (without one the key state is not present and nothing is read), the grants of the
+    // living nodes are renewed (a node that came up since the last synchronization enters the
+    // ledger before the judgement), and the reads of the verification follow.
     const ledger = loadLedger();
+    const held = readMasterKey() !== null;
     const judging = presentKeys();
-    const reads = readMasterKey() !== null ? beginVerificationReads(ledger) : null;
+    const shared = held ? settled(api("GET", LEDGER_SHARE_PATH)) : null;
+    const pending = held && !delegationOff(ledger) ? settled(fetchOffered()) : null;
     const keys = await judging;
-    const log = await verifyAll(ledger, keys, reads);
+    await shareLedger(keys, ledger, shared);
+    if (pending !== null) {
+      // A node list or a grant that fails does not keep the screen from judging the log.
+      try {
+        const offered = await pending;
+        await renewGrants(keys, ledger, undefined, offered.ok ? offered.value : null);
+      } catch (error) {
+        native.log("grants before the log screen: " + failureCode(error));
+      }
+      saveLedger(ledger);
+    }
+    const log = await verifyAll(ledger, keys, null);
+    if (ledgerShareDue(ledger)) await shareLedger(keys, ledger);
     const ids = log.store === "verified" ? screenNodes(ledger) : [];
     anchorScreen(ledger, ids);
     const since = summarySince(native.nowMs());
@@ -4911,8 +5153,11 @@
     if (typeof args.request_id === "string" && args.request_id !== transferRun.requestId) {
       throw native.error("invalid_state", "request");
     }
-    await presentKeys();
+    const keys = await presentKeys();
     if (!(await native.deviceOwnerAuth(transferAuthReason(transferRun.device)))) throw native.error("auth_failed", "device owner authentication");
+    // The ledger of this device is shared before the key goes out: the device that receives the
+    // key finds the grants this device made at its first synchronization.
+    await shareLedger(keys, loadLedger());
     const code = transferCode();
     const scalar = native.randomBytes(32);
     const yb = native.x25519(scalar, transferGenerator(transferRun.requestId, code));

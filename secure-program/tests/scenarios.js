@@ -236,6 +236,226 @@ async function replacement(source) {
   return phases;
 }
 
+/** Another device of the same account on the same world: the same master key (the keychain item
+ *  of the master key is synchronized between the devices), its own empty ledger, device store and
+ *  published state. The backend, the log store and the nodes are shared. */
+function newDevice(world) {
+  world.keychain.delete("com.pickle.client.secure.ledger\n" + world.userId);
+  for (const key of ["ledger", "ledger_shared", "sealing_checked", "log_summary"]) world.store.delete(key);
+  world.state = {};
+}
+
+/** The last report of the world, reduced to what the scenarios of the unknown paths compare. */
+function lastReport(world) {
+  const report = world.reports.length === 0 ? null : world.reports[world.reports.length - 1];
+  return report === null ? null : {
+    status: report.status, unknown_nodes: report.unknown_nodes, missing: report.missing,
+    store: report.store, reports: world.reports.length,
+  };
+}
+
+/** The ledger shape of the named nodes: "{origin}[+unknown][+gone]" or "absent". */
+function ledgerShapes(world, named) {
+  const ledger = world.ledger();
+  const out = {};
+  for (const name of Object.keys(named)) {
+    const kept = ledger === null ? undefined : ledger.nodes[named[name].id];
+    out[name] = kept === undefined ? "absent"
+      : kept.origin + (kept.unknown_ms !== 0 ? "+unknown" : "") + (kept.gone_ms !== 0 ? "+gone" : "");
+  }
+  return out;
+}
+
+/** Hooks the relay of the next grant to node: the node takes the grant, the reply never reaches
+ *  the program (the connection drops after the node answered). Returns the function that restores
+ *  the relay. */
+function loseGrantReply(world, node) {
+  const original = world.http.bind(world);
+  let armed = true;
+  world.http = async function (request) {
+    const answer = await original(request);
+    if (armed && String(request.path || "").includes("/api/secure/nodes/" + node.id + "/messages")) {
+      armed = false;
+      throw new bridge.SecureError("transport", "connection lost before the reply");
+    }
+    return answer;
+  };
+  return function () { world.http = original; };
+}
+
+/** Two devices of one account. The first delegates to node0 and node1; node1 ends (the orderly
+ *  shutdown); the second device, with an empty ledger, synchronizes an hour later and finds the
+ *  chain of node1 in the store. A program that shares the ledger knows node1 as a grant of the
+ *  first device (verified); a program without it marks node1 as a delegation it did not make. */
+async function secondDevice(source) {
+  const base = baseWorld(source);
+  const node1 = base.world.addNode({ release: base.latest.release, measurement: base.latest });
+  base.named.node1 = node1;
+  await start(source, base.world);
+  const first = { report: lastReport(base.world), ledger: ledgerShapes(base.world, base.named) };
+  node1.shutDown();
+  base.world.advance(HOUR_MS);
+  newDevice(base.world);
+  await start(source, base.world);
+  return {
+    first_device: first,
+    second_device: { report: lastReport(base.world), ledger: ledgerShapes(base.world, base.named) },
+    uploads: base.world.ledgerUploads,
+  };
+}
+
+/** One device. node1 comes up after the first synchronization; the grant of the next
+ *  synchronization reaches node1 but its reply is lost; node1 then ends. The verification of the
+ *  next day finds the chain of node1 (grant_accepted under the key of the account). A program that
+ *  writes the grant to the ledger before it goes out knows node1 (verified); a program that writes
+ *  it after the reply marks node1 for as long as the ledger lives. */
+async function replyLostThenNodeEnds(source) {
+  const base = baseWorld(source);
+  await start(source, base.world);
+  const node1 = base.world.addNode({ release: base.latest.release, measurement: base.latest });
+  base.named.node1 = node1;
+  base.world.advance(HOUR_MS);
+  const restore = loseGrantReply(base.world, node1);
+  await start(source, base.world).catch(function () {});
+  restore();
+  const taken = node1.grants.size === 1;
+  node1.shutDown();
+  base.world.advance(25 * HOUR_MS);
+  await start(source, base.world);
+  const nextDay = lastReport(base.world);
+  base.world.advance(25 * HOUR_MS);
+  await start(source, base.world);
+  return {
+    node_took_grant: taken, next_day: nextDay, day_after: lastReport(base.world),
+    ledger: ledgerShapes(base.world, base.named),
+  };
+}
+
+/** One device. The grant to node1 is taken and its reply lost (as above), node1 lives on. The
+ *  verification of the same run: a program that writes the grant before it goes out verifies at
+ *  once; a program without it marks node1 until the next synchronization grants again. */
+async function replyLostNodeLives(source) {
+  const base = baseWorld(source);
+  await start(source, base.world);
+  const node1 = base.world.addNode({ release: base.latest.release, measurement: base.latest });
+  base.named.node1 = node1;
+  base.world.advance(HOUR_MS);
+  const restore = loseGrantReply(base.world, node1);
+  await start(source, base.world).catch(function () {});
+  restore();
+  const firstRun = lastReport(base.world);
+  base.world.advance(HOUR_MS);
+  await start(source, base.world);
+  return { first_run: firstRun, second_run: lastReport(base.world), ledger: ledgerShapes(base.world, base.named) };
+}
+
+/** One device, one runtime. node1 comes up; the grant of a foreground synchronization reaches it
+ *  and the reply is lost; the log screen (read_log) opens a minute later, before the next
+ *  synchronization. A program whose screen renews the grants first judges with node1 in the
+ *  ledger (verified); a program that judges on the ledger as it is marks node1 and the published
+ *  state stays attention until the next verification. */
+async function logScreenBeforeSync(source) {
+  const base = baseWorld(source);
+  const program = await start(source, base.world);
+  const node1 = base.world.addNode({ release: base.latest.release, measurement: base.latest });
+  base.named.node1 = node1;
+  base.world.advance(HOUR_MS);
+  const restore = loseGrantReply(base.world, node1);
+  await program.onEvent("foreground", {}).catch(function () {});
+  restore();
+  base.world.advance(60000);
+  const screen = await program.procedures.read_log({ limit: 5 });
+  const published = base.world.state.log.status;
+  await program.onEvent("foreground", {});
+  return {
+    screen: { status: screen.status, unknown_nodes: screen.unknown_nodes },
+    published_after_screen: published,
+    published_after_sync: base.world.state.log.status,
+    ledger: ledgerShapes(base.world, base.named),
+  };
+}
+
+/** One device. A verification run that was suspended: after it renewed its grants and read the
+ *  head of node0, the app stopped for six hours; meanwhile node1 came up, node0 handed the
+ *  delegation to it (grant_transferred_out on node0, grant_transferred_in on node1) and node1 was
+ *  used. The run then lists the store with the stale head of node0 and sees node1 without the
+ *  trace. A program that judges a stale run again on fresh reads verifies (the trace explains
+ *  node1); a program that publishes the stale judgement marks node1 until the next verification. */
+async function suspendedRunCrossesTransfer(source) {
+  const base = baseWorld(source);
+  await start(source, base.world);
+  base.world.advance(25 * HOUR_MS);
+  const original = base.world.http.bind(base.world);
+  let stopped = false;
+  let node1 = null;
+  base.world.http = async function (request) {
+    const name = String(request.path || request.url || "");
+    if (!stopped && name.includes("delimiter")) {
+      stopped = true;
+      node1 = base.world.addNode({ release: base.latest.release, measurement: base.latest });
+      base.named.node1 = node1;
+      const seal = { logPk: base.keys.logPk, keyId: base.keys.keyId };
+      base.node0.appendEntry(base.world.userId, "c", [
+        { t: "grant_transferred_out", time_ms: base.world.now, to: node1.id },
+      ], seal);
+      node1.appendEntry(base.world.userId, "c", [{
+        t: "grant_transferred_in", time_ms: base.world.now, from: base.node0.id,
+        not_after_ms: base.world.now + HOUR_MS, custody: "enclave",
+      }], seal);
+      node1.appendEntry(base.world.userId, "u", [providerRequest(base.world.now)], seal);
+      base.world.advance(6 * HOUR_MS);
+    }
+    return original(request);
+  };
+  const program = await start(source, base.world);
+  base.world.http = original;
+  const run = { report: lastReport(base.world), published: base.world.state.log.status };
+  await program.onEvent("foreground", {});
+  return { suspended_run: run, after_next_sync: base.world.state.log.status, ledger: ledgerShapes(base.world, base.named) };
+}
+
+/** The log store answers one listing request with 503 and the request after it with 200. A
+ *  program that tries a failed request again verifies with the store read; a program without
+ *  the retry leaves the run pending with the store unreachable. */
+async function storeAnswersOnce503(source) {
+  const base = baseWorld(source);
+  const original = base.world.http.bind(base.world);
+  let failed = 0;
+  base.world.http = async function (request) {
+    const url = String(request.url || "");
+    if (failed === 0 && url.includes("versions") && url.includes("delimiter")) {
+      failed += 1;
+      return { status: 503, headers: {}, body: "<Error><Code>SlowDown</Code></Error>", bodyBase64: null };
+    }
+    return original(request);
+  };
+  await start(source, base.world);
+  const report = base.world.reports[base.world.reports.length - 1];
+  return {
+    report: lastReport(base.world), store_failure: report.store_failure === undefined ? null : report.store_failure,
+    failed_answers: failed,
+  };
+}
+
+/** The log store answers every object request with 503. The run is pending with the store
+ *  unreachable; a program that names the failed read reports "object:503". */
+async function storeObjectsFail(source) {
+  const base = baseWorld(source);
+  const original = base.world.http.bind(base.world);
+  base.world.http = async function (request) {
+    const url = String(request.url || "");
+    if (url.includes("versionId=")) {
+      return { status: 503, headers: {}, body: "<Error><Code>SlowDown</Code></Error>", bodyBase64: null };
+    }
+    return original(request);
+  };
+  await start(source, base.world);
+  const report = base.world.reports[base.world.reports.length - 1];
+  return {
+    report: lastReport(base.world), store_failure: report.store_failure === undefined ? null : report.store_failure,
+  };
+}
+
 module.exports = {
   scenarios: {
     plain: plain,
@@ -247,5 +467,12 @@ module.exports = {
     later_release_traced: laterReleaseTraced,
     gap: gap,
     replacement: replacement,
+    second_device: secondDevice,
+    reply_lost_then_node_ends: replyLostThenNodeEnds,
+    reply_lost_node_lives: replyLostNodeLives,
+    log_screen_before_sync: logScreenBeforeSync,
+    suspended_run_crosses_transfer: suspendedRunCrossesTransfer,
+    store_answers_once_503: storeAnswersOnce503,
+    store_objects_fail: storeObjectsFail,
   },
 };
