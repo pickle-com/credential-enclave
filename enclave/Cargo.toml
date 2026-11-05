@@ -1,6 +1,6 @@
 [package]
 name = "credential-enclave"
-version = "2.1.0"
+version = "2.2.0"
 description = "The credential enclave node program"
 edition.workspace = true
 rust-version.workspace = true
@@ -27,6 +27,9 @@ hyper-util = { version = "0.1", features = ["service", "tokio"] }
 memchr = "2"
 # Protocol libraries must not log authentication strings, including in debug builds.
 log = { version = "0.4", features = ["max_level_off"] }
+# The limit of open file descriptors of the node process (src/descriptors.rs): the safe wrapper
+# of `getrlimit` and `setrlimit`. Its one dependency, libc, is already part of the program.
+rlimit = "0.10"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde.workspace = true
 serde_json.workspace = true
@@ -41,6 +44,9 @@ futures-util = "0.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 aws-nitro-enclaves-nsm-api = "0.5"
+# The queue of the vsock listener of the node (src/platform/nitro.rs): the second `listen`
+# call that widens it.
+socket2 = "0.6"
 tokio-vsock = "0.7"
 
 [dev-dependencies]

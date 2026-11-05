@@ -1,6 +1,6 @@
 [package]
 name = "credential-enclave-host"
-version = "2.1.0"
+version = "2.2.0"
 description = "The host program of the credential enclave: the program of the parent pod"
 edition.workspace = true
 rust-version.workspace = true
@@ -16,6 +16,8 @@ path = "src/main.rs"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+# The limit of open file descriptors of the host program (src/descriptors.rs).
+rlimit = "0.10"
 serde.workspace = true
 serde_json.workspace = true
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }

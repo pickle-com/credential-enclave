@@ -103,6 +103,9 @@ mod enclave {
     const PARENT_CID: u32 = 3;
     /// The vsock port of the egress relay in the host program.
     const EGRESS_PORT: u32 = 8443;
+    /// The queue of connections that wait for accept on the listener of the node (enclave.md
+    /// section 8).
+    const LISTEN_BACKLOG: i32 = 1024;
     /// The kernel file that names the active hardware random source.
     const RNG_CURRENT: &str = "/sys/class/misc/hw_random/rng_current";
     /// The hardware random source of the Nitro Secure Module.
@@ -207,9 +210,16 @@ mod enclave {
         }
 
         async fn listen(&self) -> Result<Listener, PlatformError> {
-            VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, u32::from(LISTEN_PORT)))
-                .map(Listener::Vsock)
-                .map_err(|_| PlatformError("cannot listen on vsock port 8080"))
+            let listener =
+                VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, u32::from(LISTEN_PORT)))
+                    .map_err(|_| PlatformError("cannot listen on vsock port 8080"))?;
+            // The queue of connections that wait for accept: the library binds with a queue
+            // of 128, and a second `listen` call widens it to LISTEN_BACKLOG (the kernel of
+            // the enclave resets a connection request that finds the queue full). A kernel
+            // that refuses the length leaves the queue at 128, and the listener works as
+            // before.
+            let _ = socket2::SockRef::from(&listener).listen(LISTEN_BACKLOG);
+            Ok(Listener::Vsock(listener))
         }
 
         async fn connect(&self, host: &str, port: u16) -> Result<Stream, ConnectError> {

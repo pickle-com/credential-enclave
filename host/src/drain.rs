@@ -13,8 +13,11 @@
 //! ```
 //!
 //! The backend makes its calls to the node inside that request, through the inbound relay of
-//! this host program, and the host program waits for the response for at most 100 seconds.
-//! Without one of the three variables the host program ends the enclave without the call.
+//! this host program, and the host program waits for the response for a time that grows with
+//! the accounts of the node ([`response_timeout`]): the backend hands the delegations over and
+//! collects the final heads page by page, 1,000 accounts a page, so the collection of a node
+//! takes a time proportional to its pages. Without one of the three variables the host
+//! program ends the enclave without the call.
 
 use std::future::Future;
 use std::io;
@@ -32,10 +35,33 @@ pub const URL_VARIABLE: &str = "CREDENTIAL_ENCLAVE_DRAIN_URL";
 pub const TOKEN_VARIABLE: &str = "CREDENTIAL_ENCLAVE_DRAIN_TOKEN";
 pub const POD_VARIABLE: &str = "CREDENTIAL_ENCLAVE_POD_NAME";
 
-/// Longest wait for the response of the backend, from the start of the connection.
+/// The accounts of one page of the collection: `peer/export` and `close/heads` of the node
+/// page by 1,000 accounts (enclave.md 5.11 and 5.13).
+pub const ACCOUNTS_PER_PAGE: u64 = 1_000;
+/// The wait for the response of the backend, from the start of the connection, for a node
+/// without accounts: the base of [`response_timeout`].
 pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(100);
+/// What the wait grows by for every page of accounts of the node: the pages of the two
+/// stages that go page by page (the handover of the delegations, measured at about 2 seconds
+/// a page, and the final heads, measured at about 1 second a page), with room.
+pub const RESPONSE_TIMEOUT_PER_PAGE: Duration = Duration::from_secs(4);
+/// The longest wait. The `terminationGracePeriodSeconds` of the pod covers this wait twice
+/// (the subcommand of the pre-stop hook and the signal path) with a margin.
+pub const RESPONSE_TIMEOUT_MAX: Duration = Duration::from_secs(600);
 /// Longest response body the host program reads.
 const REPLY_LIMIT_BYTES: usize = 1024 * 1024;
+
+/// The wait for the response of the backend for a node of `accounts` accounts (the
+/// `accounts` of its `health` call, `None` when the call gave none): the base plus
+/// [`RESPONSE_TIMEOUT_PER_PAGE`] for every started page of [`ACCOUNTS_PER_PAGE`] accounts, at
+/// most [`RESPONSE_TIMEOUT_MAX`].
+pub fn response_timeout(accounts: Option<u64>) -> Duration {
+    let pages = accounts
+        .unwrap_or(0)
+        .div_ceil(ACCOUNTS_PER_PAGE)
+        .min(u64::from(u32::MAX));
+    (RESPONSE_TIMEOUT + RESPONSE_TIMEOUT_PER_PAGE * (pages as u32)).min(RESPONSE_TIMEOUT_MAX)
+}
 
 /// The parts of an `http://host[:port]/path` address.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -152,11 +178,12 @@ impl Drain {
         }
     }
 
-    /// Makes the call over the connection that `connection` opens. The time limit covers the
-    /// opening of the connection and the whole response.
+    /// Makes the call over the connection that `connection` opens. The time limit `wait`
+    /// covers the opening of the connection and the whole response.
     async fn call_through<S>(
         &self,
         connection: impl Future<Output = io::Result<S>>,
+        wait: Duration,
     ) -> Result<u16, &'static str>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -167,16 +194,17 @@ impl Drain {
                 .map_err(|_| "cannot connect to the backend")?;
             self.call_over(stream).await
         };
-        tokio::time::timeout(RESPONSE_TIMEOUT, call)
+        tokio::time::timeout(wait, call)
             .await
-            .unwrap_or(Err("no response within 100 seconds"))
+            .unwrap_or(Err("no response within the wait"))
     }
 
-    /// Calls the backend and waits for its response, for at most 100 seconds in total. Returns
-    /// the status of the response.
-    pub async fn call(&self) -> Result<u16, &'static str> {
+    /// Calls the backend and waits for its response, for at most [`response_timeout`] of the
+    /// accounts of the node in total. Returns the status of the response.
+    pub async fn call(&self, accounts: Option<u64>) -> Result<u16, &'static str> {
         let target = (self.address.host.as_str(), self.address.port);
-        self.call_through(TcpStream::connect(target)).await
+        self.call_through(TcpStream::connect(target), response_timeout(accounts))
+            .await
     }
 }
 
@@ -323,7 +351,7 @@ mod tests {
         ]))
         .unwrap()
         .unwrap();
-        assert_eq!(drain.call().await, Ok(200));
+        assert_eq!(drain.call(Some(3)).await, Ok(200));
 
         let request = backend.await.unwrap();
         assert!(
@@ -371,7 +399,7 @@ mod tests {
         ]))
         .unwrap()
         .unwrap();
-        assert_eq!(drain.call().await, Err("cannot connect to the backend"));
+        assert_eq!(drain.call(None).await, Err("cannot connect to the backend"));
 
         // A backend that closes without a response.
         let (near, far) = tokio::io::duplex(4096);
@@ -382,18 +410,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_wait_grows_with_the_pages_of_the_node_up_to_the_longest_wait() {
+        // No accounts, or no health answer: the base.
+        assert_eq!(response_timeout(None), Duration::from_secs(100));
+        assert_eq!(response_timeout(Some(0)), Duration::from_secs(100));
+        // A started page counts as a page.
+        assert_eq!(response_timeout(Some(1)), Duration::from_secs(104));
+        assert_eq!(response_timeout(Some(1_000)), Duration::from_secs(104));
+        assert_eq!(response_timeout(Some(1_001)), Duration::from_secs(108));
+        // The node of 2026-11-05 with 46,167 accounts: 47 pages.
+        assert_eq!(response_timeout(Some(46_167)), Duration::from_secs(288));
+        // 125 pages reach the longest wait, and more pages do not pass it.
+        assert_eq!(response_timeout(Some(125_000)), RESPONSE_TIMEOUT_MAX);
+        assert_eq!(response_timeout(Some(1_000_000)), RESPONSE_TIMEOUT_MAX);
+        assert_eq!(response_timeout(Some(u64::MAX)), RESPONSE_TIMEOUT_MAX);
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn the_wait_for_the_response_ends_after_100_seconds() {
+    async fn the_wait_for_the_response_ends_after_the_wait_of_the_accounts() {
         let drain = Drain::from_variables(&environment(&FULL)).unwrap().unwrap();
-        // The backend accepts the connection and never answers.
+        // The backend accepts the connection and never answers. A node of 2,500 accounts
+        // (three pages) gets the base and three pages.
         let (near, _far) = tokio::io::duplex(4096);
         let started = tokio::time::Instant::now();
+        let wait = response_timeout(Some(2_500));
+        assert_eq!(wait, Duration::from_secs(112));
         assert_eq!(
-            drain.call_through(async { Ok(near) }).await,
-            Err("no response within 100 seconds")
+            drain.call_through(async { Ok(near) }, wait).await,
+            Err("no response within the wait")
         );
         let waited = started.elapsed();
-        assert!(waited >= RESPONSE_TIMEOUT && waited < RESPONSE_TIMEOUT + Duration::from_secs(1));
+        assert!(waited >= wait && waited < wait + Duration::from_secs(1));
     }
 
     #[tokio::test]

@@ -5,6 +5,8 @@ use credential_enclave_protocol::app::verify_challenge_statement;
 use credential_enclave_protocol::encoding::{b64u, b64u_decode, Signed};
 use credential_enclave_protocol::keys::{binding, Binding};
 use credential_enclave_protocol::{purpose, ProtocolError};
+use std::time::Duration;
+
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -12,6 +14,8 @@ use tokio::net::TcpStream;
 use super::quiet_provider;
 use crate::api;
 use crate::platform::Platform;
+use crate::providers::Definitions;
+use crate::state::Limits;
 use crate::testing::{operator_config, App, Harness};
 
 #[tokio::test]
@@ -39,15 +43,17 @@ async fn health_reports_the_node_in_the_key_order_of_5_1() {
             "\"status_4xx\":0,\"status_5xx\":0}},\"write_retries\":0,",
             "\"write_ms_buckets\":{{\"25\":0,\"50\":0,\"100\":0,\"250\":0,\"500\":0,",
             "\"1000\":0,\"2500\":0,\"5000\":0}},\"write_ms_sum\":0,\"write_count\":0}},",
-            "\"load\":{{\"provider_inflight\":0,\"forward_calls\":0,"
+            "\"load\":{{\"provider_inflight\":0,\"forward_calls\":0,",
+            "\"inbound_connections\":0,\"inbound_refused\":0,"
         ),
         harness.node.node, started_ms, time_ms
     );
     assert!(text.starts_with(&prefix), "{text}");
-    // The five values of the kernel follow. They depend on the machine that runs the test:
-    // numbers from the procfs of a Linux kernel, null on another kernel. The counts of the
-    // outbound connections, of the late token address calls and of the state of the accounts
-    // end the body.
+    // The five values of the kernel and the two values of the descriptors follow. They depend
+    // on the machine that runs the test: numbers from the procfs of a Linux kernel, null on
+    // another kernel (the limit of the descriptors is a number on every Unix kernel). The
+    // counts of the outbound connections, of the late token address calls and of the state of
+    // the accounts end the body.
     let suffix = concat!(
         "},\"egress\":{\"opens\":0,\"open_failures\":{\"transport\":0,\"relay_refused\":0,",
         "\"tls\":0,\"http\":0},\"open_retries\":0,\"open_inflight\":0,",
@@ -65,9 +71,11 @@ async fn health_reports_the_node_in_the_key_order_of_5_1() {
         "cpu_idle_ms",
         "memory_total_bytes",
         "memory_available_bytes",
+        "descriptors_open",
+        "descriptors_limit",
     ];
     assert_eq!(
-        load.keys().skip(2).collect::<Vec<_>>(),
+        load.keys().skip(4).collect::<Vec<_>>(),
         kernel_values.to_vec()
     );
     for key in kernel_values {
@@ -76,6 +84,12 @@ async fn health_reports_the_node_in_the_key_order_of_5_1() {
         if cfg!(target_os = "linux") {
             assert!(value.is_u64(), "{key}: {value}");
         }
+    }
+    // The limit of the descriptors is in force on every Unix kernel, and the node holds at
+    // least the descriptors of its listener and of this connection.
+    assert!(load["descriptors_limit"].as_u64().unwrap_or(0) >= 256);
+    if cfg!(target_os = "linux") {
+        assert!(load["descriptors_open"].as_u64().unwrap() >= 2);
     }
     assert_eq!(harness.node.node.len(), 43);
     assert!(time_ms >= started_ms && started_ms > 1_700_000_000_000);
@@ -607,7 +621,11 @@ async fn the_node_serves_http_1_1_on_the_listener_of_its_platform() {
     let harness = Harness::new(&provider);
     let listener = Platform::listen(harness.platform.as_ref()).await.unwrap();
     let address = listener.tcp_addr().unwrap();
-    tokio::spawn(api::serve(listener, api::router(harness.node.clone())));
+    tokio::spawn(api::serve(
+        listener,
+        api::router(harness.node.clone()),
+        harness.node.clone(),
+    ));
 
     // Two calls on one connection, then a second connection.
     let mut stream = TcpStream::connect(address).await.unwrap();
@@ -635,4 +653,56 @@ async fn the_node_serves_http_1_1_on_the_listener_of_its_platform() {
         (status, failure["code"].as_str()),
         (404, Some("invalid_request"))
     );
+}
+
+/// The two bounds of the connections from the backend (enclave.md section 8): a connection
+/// accepted above `inbound_connections` is closed without a byte and counted in
+/// `inbound_refused` of `load` of health, and a connection idle for `inbound_idle` is closed,
+/// which frees its place.
+#[tokio::test]
+async fn the_node_bounds_the_connections_it_holds_and_closes_an_idle_one() {
+    let provider = quiet_provider().await;
+    let harness = Harness::with(
+        &provider,
+        Definitions::embedded(),
+        Limits {
+            inbound_connections: 1,
+            inbound_idle: Duration::from_millis(300),
+            ..Limits::default()
+        },
+    );
+    let listener = Platform::listen(harness.platform.as_ref()).await.unwrap();
+    let address = listener.tcp_addr().unwrap();
+    tokio::spawn(api::serve(
+        listener,
+        api::router(harness.node.clone()),
+        harness.node.clone(),
+    ));
+
+    // The first connection takes the one place.
+    let mut first = TcpStream::connect(address).await.unwrap();
+    let (status, health) =
+        exchange(&mut first, "GET /v1/health HTTP/1.1\r\nHost: node\r\n\r\n").await;
+    assert_eq!(status, 200);
+    assert_eq!(health["load"]["inbound_connections"], 1);
+    assert_eq!(health["load"]["inbound_refused"], 0);
+
+    // The second connection is accepted and closed without a byte.
+    let mut second = TcpStream::connect(address).await.unwrap();
+    let mut buffer = [0u8; 8];
+    assert!(matches!(second.read(&mut buffer).await, Ok(0) | Err(_)));
+    let (_, health) = exchange(&mut first, "GET /v1/health HTTP/1.1\r\nHost: node\r\n\r\n").await;
+    assert_eq!(health["load"]["inbound_connections"], 1);
+    assert_eq!(health["load"]["inbound_refused"], 1);
+
+    // The first connection stays idle past the idle time: the node closes it, and the next
+    // connection takes the freed place.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(matches!(first.read(&mut buffer).await, Ok(0) | Err(_)));
+    let mut third = TcpStream::connect(address).await.unwrap();
+    let (status, health) =
+        exchange(&mut third, "GET /v1/health HTTP/1.1\r\nHost: node\r\n\r\n").await;
+    assert_eq!(status, 200);
+    assert_eq!(health["load"]["inbound_connections"], 1);
+    assert_eq!(health["load"]["inbound_refused"], 1);
 }

@@ -17,7 +17,7 @@ use axum::Router;
 use credential_enclave_protocol::encoding::wipe_json;
 use credential_enclave_protocol::{is_valid_name, limits, ProtocolError};
 use hyper::body::Body as HttpBody;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use zeroize::Zeroizing;
 
@@ -145,8 +145,13 @@ async fn unknown_method() -> Response {
 }
 
 /// Serves HTTP/1.1 on every connection of the listener. A call in progress runs to its end:
-/// nothing here cancels a connection.
-pub async fn serve(listener: Listener, router: Router) {
+/// nothing here cancels a connection. Two limits of section 8 of enclave.md bound the
+/// connections (`node.limits`): a connection accepted while `inbound_connections` are open is
+/// closed without a byte and counted in `inbound_refused` of `load` of health, and a
+/// connection that waits longer than `inbound_idle` for the head of its next request (before
+/// its first request, or idle between two requests) is closed. Both keep the descriptors of
+/// the node (`crate::descriptors`) for the writes to the log store and the provider requests.
+pub async fn serve(listener: Listener, router: Router, node: Arc<Node>) {
     loop {
         let stream = match listener.accept().await {
             Ok(stream) => stream,
@@ -155,12 +160,21 @@ pub async fn serve(listener: Listener, router: Router) {
                 continue;
             }
         };
+        let Some(place) = node.inbound.admit(node.limits.inbound_connections) else {
+            drop(stream);
+            continue;
+        };
         let service = TowerToHyperService::new(router.clone());
+        let idle = node.limits.inbound_idle;
         tokio::spawn(async move {
+            // The place of the connection is held until the connection ends.
+            let _place = place;
             // No `Date` header: it would be the only value a node takes from the system
             // clock instead of its own clock.
             let _ = hyper::server::conn::http1::Builder::new()
                 .auto_date_header(false)
+                .timer(TokioTimer::new())
+                .header_read_timeout(idle)
                 .serve_connection(TokioIo::new(stream), service)
                 .await;
         });

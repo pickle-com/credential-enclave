@@ -80,7 +80,22 @@ pub struct Limits {
     /// Entries the sweep of the node writes per second, over every account (enclave.md
     /// section 3).
     pub sweep_write_rate: u32,
+    /// Connections from the backend the node holds open at the same time (enclave.md section
+    /// 8). A connection accepted above this bound is closed without a byte and counted as
+    /// refused: every open connection holds a descriptor, and the bound keeps the connections
+    /// of the callers from taking the descriptors of the writes to the log store and of the
+    /// provider requests.
+    pub inbound_connections: usize,
+    /// Longest time an accepted connection waits for the head of its next request: the time
+    /// before the first request, and the idle time between two requests of a connection the
+    /// caller keeps open (enclave.md section 8). A connection that passes it is closed.
+    pub inbound_idle: Duration,
 }
+
+/// The connections from the backend the node holds open at the same time.
+pub const INBOUND_CONNECTIONS: usize = 16_384;
+/// The idle time after which the node closes a connection from the backend.
+pub const INBOUND_IDLE: Duration = Duration::from_secs(60);
 
 impl Default for Limits {
     fn default() -> Self {
@@ -96,7 +111,56 @@ impl Default for Limits {
             refresh_late_tasks: REFRESH_LATE_TASKS,
             open_concurrency: crate::egress::OPEN_CONCURRENCY,
             sweep_write_rate: crate::log_store::SWEEP_WRITE_RATE,
+            inbound_connections: INBOUND_CONNECTIONS,
+            inbound_idle: INBOUND_IDLE,
         }
+    }
+}
+
+/// The counts of the connections from the backend (`inbound_connections` and
+/// `inbound_refused` of `load` of `GET /v1/health`): the connections open at this moment, and
+/// the connections closed at accept because the bound `inbound_connections` of [`Limits`] was
+/// reached, since the node started. The accept loop of the call surface moves them
+/// (`crate::api::serve`).
+#[derive(Debug, Default)]
+pub struct InboundCounters {
+    /// Connections open at this moment.
+    pub connections: AtomicUsize,
+    /// Connections closed at accept because the bound was reached, since the node started.
+    pub refused: AtomicU64,
+}
+
+impl InboundCounters {
+    /// Admits one accepted connection under `bound`: `Some` with the guard that holds its
+    /// place until the connection ends, `None` when the bound is reached (the connection is
+    /// counted as refused).
+    pub fn admit(self: &Arc<Self>, bound: usize) -> Option<InboundConnection> {
+        let open = self.connections.fetch_add(1, Ordering::SeqCst) + 1;
+        if open > bound {
+            self.connections.fetch_sub(1, Ordering::SeqCst);
+            self.refused.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        Some(InboundConnection(self.clone()))
+    }
+
+    /// The connections open at this moment.
+    pub fn open(&self) -> usize {
+        self.connections.load(Ordering::SeqCst)
+    }
+
+    /// The connections refused since the node started.
+    pub fn refused(&self) -> u64 {
+        self.refused.load(Ordering::Relaxed)
+    }
+}
+
+/// The place of one accepted connection: dropped when the connection ends.
+pub struct InboundConnection(Arc<InboundCounters>);
+
+impl Drop for InboundConnection {
+    fn drop(&mut self) {
+        self.0.connections.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -953,6 +1017,9 @@ pub struct Node {
     pub log_counters: LogCounters,
     /// The counts of `refresh` of `GET /v1/health`.
     pub refresh_counters: RefreshCounters,
+    /// The counts of the connections from the backend (`load` of `GET /v1/health`), moved by
+    /// the accept loop of the call surface.
+    pub inbound: Arc<InboundCounters>,
 }
 
 /// The accounts of a node whose `user_id` sorts after a value, in `user_id` order, read from
@@ -1058,6 +1125,7 @@ impl Node {
             limits,
             log_counters: LogCounters::default(),
             refresh_counters: RefreshCounters::default(),
+            inbound: Arc::new(InboundCounters::default()),
         })
     }
 

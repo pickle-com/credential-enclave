@@ -275,6 +275,11 @@ pub struct Load {
     /// P: a count, the calls that hold one of the places of the bound of concurrent `forward`
     /// and `forward/batch` calls.
     pub forward_calls: usize,
+    /// P: a count, the connections from the backend open at this moment.
+    pub inbound_connections: usize,
+    /// P: a count, the connections from the backend closed at accept because the bound of
+    /// open connections was reached, since the node started.
+    pub inbound_refused: u64,
     /// P: the CPU time in user mode of the kernel the node runs in since it booted, in
     /// milliseconds. Null when the kernel exposes no procfs value.
     pub cpu_user_ms: Option<u64>,
@@ -287,6 +292,12 @@ pub struct Load {
     pub memory_total_bytes: Option<u64>,
     /// P: a size, the memory the kernel estimates it can give out, in the same way.
     pub memory_available_bytes: Option<u64>,
+    /// P: a count, the open file descriptors of the node process. Null when the kernel
+    /// exposes no procfs value.
+    pub descriptors_open: Option<u64>,
+    /// P: a count, the soft limit of open file descriptors of the node process in force. Null
+    /// when the platform has no such limit.
+    pub descriptors_limit: Option<u64>,
 }
 
 /// `GET /v1/health`.
