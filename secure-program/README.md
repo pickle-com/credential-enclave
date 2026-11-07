@@ -18,7 +18,12 @@ days (the retention of its Object Lock) is expired, not an omission (protocol.md
 lifecycle rule of the bucket removes entries at 400 days (7.6). The program sends the requests of one
 procedure that do not depend on each other together (the account query with the node list, the grants
 to every node, the reads of one verification run in four stages: heads and listing addresses,
-listings, object addresses, objects) and judges the results in the order protocol.md 7.4 gives.
+listings, object addresses, objects) and judges the results in the order protocol.md 7.4 gives. A
+run that finds a node in the store only, with an entry sealed to the key of the account that no
+traced transfer explains, reads the heads of the nodes of its ledger once more and walks those
+chains on before it counts the node (the second look of protocol.md 7.4 step 5: a transfer of the
+delegation that landed between the heads and the listing of the run is traced there); a run without
+such a node reads nothing twice.
 
 This file is the source of truth of the program. The repository `pickle-com/interactive-character`
 (the backend of the operator) vendors a byte-identical copy at `backend/assets/ui/secure-program.js`

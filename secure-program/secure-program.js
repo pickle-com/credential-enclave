@@ -22,7 +22,7 @@
 
   // ---- Constants ----
 
-  const VERSION = 35;
+  const VERSION = 36;
   const MASTER_KEY_SERVICE = "com.pickle.client.secure.master-key";
   const LEDGER_SERVICE = "com.pickle.client.secure.ledger";
   const LEDGER_STORE_KEY = "ledger";
@@ -3539,10 +3539,13 @@
   /** The reads of one verification run sent ahead of its judgement (one stage): the node summary of
    *  the account, the listing addresses of the node discovery listing and of every chain of the
    *  ledger the run will walk (one request: LOG_LISTINGS_PATH), and the status (head) of every living
-   *  node of the ledger. The judgement (verifyAll) uses a response only when it is the very response
-   *  the judgement would have requested (the same node, marker, nonce, object version); what did not
-   *  arrive is requested there. Returns the reads object completeVerificationReads fills. */
-  function beginVerificationReads(ledger) {
+   *  node of the ledger. nodes is null for the reads of a run (every node of the ledger, with the
+   *  node discovery listing) or the ids of the nodes of the second look of verifyRun (those nodes
+   *  alone, without the discovery listing). The judgement (verifyAll) uses a response only when it
+   *  is the very response the judgement would have requested (the same node, marker, nonce, object
+   *  version); what did not arrive is requested there. Returns the reads object
+   *  completeVerificationReads fills. */
+  function beginVerificationReads(ledger, nodes) {
     const reads = {
       summaries: settled(api("GET", "/api/secure/log/nodes")),
       heads: new Map(),
@@ -3552,10 +3555,10 @@
       pages: new Map(),
       objects: new Map(),
     };
-    for (const id of Object.keys(ledger.nodes)) {
+    for (const id of nodes === null ? Object.keys(ledger.nodes) : nodes) {
       const node = ledger.nodes[id];
       // A node of a release later than this program is not read (verifyAll leaves it pending).
-      if (!writesToStore(node) || newerReleaseNodes.has(id)) continue;
+      if (node === undefined || !writesToStore(node) || newerReleaseNodes.has(id)) continue;
       if (node.final !== null && node.checkpoint.seq >= node.final.seq) continue;
       if (reads.targets.length < LOG_STORE_NODES) {
         reads.targets.push({
@@ -3570,8 +3573,24 @@
         });
       }
     }
-    reads.listings = settled(requestListings(true, reads.targets));
+    reads.listings = settled(requestListings(nodes === null, reads.targets));
     return reads;
+  }
+
+  /** The node summary table of one verification run from its reads (the log node query sent ahead):
+   *  the node of each summary maps to it. A query that failed is thrown: the run cannot judge
+   *  without it. */
+  async function readSummaries(reads) {
+    const outcome = await reads.summaries;
+    if (!outcome.ok) throw outcome.error;
+    const listed = outcome.value.json.nodes;
+    const summaries = Object.create(null);
+    for (const summary of Array.isArray(listed) ? listed : []) {
+      if (summary !== null && typeof summary === "object" && typeof summary.node === "string") {
+        summaries[summary.node] = summary;
+      }
+    }
+    return summaries;
   }
 
   /** The listing addresses of one run in one request: the node discovery listing of the account
@@ -3727,8 +3746,9 @@
    *  checks the chain of every node of the ledger and then of at most LOG_STORE_NODES nodes of the
    *  listing the ledger does not know (a node found in the store only is kept in the ledger, with
    *  origin store and unknown_ms, only when an entry sealed to the key of this account verified on
-   *  it: a delegation the app did not make, counted as unknown in every run until a traced transfer
-   *  explains the node), publishes the state log (publishLogState) and reports the run. A node of a
+   *  it and no traced transfer explains it after the second look of verifyRun: a delegation the app
+   *  did not make, counted as unknown in every run until a traced transfer explains the node),
+   *  publishes the state log (publishLogState) and reports the run. A node of a
    *  release later than this program (newerReleaseNodes), of the ledger or of the listing, is not
    *  read: it is counted in newer_release_nodes and leaves the run pending, not attention, and the
    *  program that lists the release reads its chain. One run spends at most LOG_VERIFY_KEYS keys
@@ -3751,20 +3771,25 @@
 
   /** One judgement of the log (the body of verifyAll): returns {store, counts, now} for
    *  publishLogState and reportVerification, which the caller does. counts.unknownIds are the ids
-   *  of the nodes counted as unknown. */
+   *  of the nodes counted as unknown.
+   *
+   *  The heads of the nodes of the ledger are read in the first stage of the reads of the run and
+   *  the node discovery listing after them. A transfer of the delegation that lands between the two
+   *  (the giving node writes grant_transferred_out, the store confirms it, the grant goes over, the
+   *  receiving node writes grant_transferred_in: docs/protocol.md 10.1) shows the receiving node in
+   *  the listing while the chain of the giving node is walked to a head signed before the transfer,
+   *  so the trace does not reach the receiving node in that walk. Before a node found in the store
+   *  only is counted as a delegation the app did not make, the run therefore reads once more (the
+   *  second look): the node summary, the status of every node whose head the first stage read and
+   *  whose chain verified to that head, and the listing addresses of those nodes; it then walks
+   *  those chains on from their verification points to the new heads, within the key and body
+   *  budgets of the run. A transfer traced there explains the node (followTransfer). Only a node
+   *  still unexplained after that is marked. A run that finds no such node makes no further read. */
   async function verifyRun(ledger, keys, reads) {
     // The reads of the run were sent ahead by the caller (together with its own requests) or are
     // sent now; the judgement below uses them only where they are the very responses it would request.
-    if (!reads) reads = beginVerificationReads(ledger);
-    const summariesOutcome = await reads.summaries;
-    if (!summariesOutcome.ok) throw summariesOutcome.error;
-    const listed = summariesOutcome.value.json.nodes;
-    const summaries = Object.create(null);
-    for (const summary of Array.isArray(listed) ? listed : []) {
-      if (summary !== null && typeof summary === "object" && typeof summary.node === "string") {
-        summaries[summary.node] = summary;
-      }
-    }
+    if (!reads) reads = beginVerificationReads(ledger, null);
+    const summaries = await readSummaries(reads);
     await completeVerificationReads(ledger, reads, summaries);
     const store = { state: "verified", detail: "" };
     const now = native.nowMs();
@@ -3810,31 +3835,72 @@
     const budgets = { keys: LOG_VERIFY_KEYS, bodies: LOG_VERIFY_BODIES, fetched: 0 };
     // The nodes whose verified entries include one sealed to the key of this account.
     const ours = new Set();
-    // The verification of a chain can add nodes to the ledger (the tracing of a delegation
-    // transfer). The added nodes are verified in this run too.
-    const queue = Object.keys(ledger.nodes);
-    const queued = new Set(queue);
-    while (queue.length > 0) {
-      const id = queue.shift();
-      if (ledger.nodes[id] === undefined) continue;
-      if (newerReleaseNodes.has(id)) {
-        // A node of the ledger (traced from a transfer, or marked by the program that found it in
-        // the store) of a release later than this program: its chain is not read in this run and
-        // its mark is not counted; the program that lists the release judges it.
-        later.add(id);
-        continue;
-      }
-      const outcome = await verifyChain(ledger, id, summaries[id], budgets, keys, store, reads);
-      counts.missing += outcome.missing;
-      counts.expired += outcome.expired;
-      if (outcome.ours) ours.add(id);
-      if (outcome.state === "pending") counts.pending = true;
-      if (outcome.state === "attention") counts.unverified += 1;
-      for (const added of Object.keys(ledger.nodes)) {
-        if (!queued.has(added)) {
-          queued.add(added);
-          queue.push(added);
+    // The nodes whose last walk in this run verified the chain to its head.
+    const reached = new Set();
+    const queued = new Set();
+    /** Walks the chains of the nodes of ids on the summaries and reads given. The verification of
+     *  a chain can add nodes to the ledger (the tracing of a delegation transfer): the added nodes
+     *  are walked in this run too, each once. */
+    const walk = async function (ids, summaries, reads) {
+      const queue = ids.slice();
+      for (const id of queue) queued.add(id);
+      while (queue.length > 0) {
+        const id = queue.shift();
+        if (ledger.nodes[id] === undefined) continue;
+        if (newerReleaseNodes.has(id)) {
+          // A node of the ledger (traced from a transfer, or marked by the program that found it in
+          // the store) of a release later than this program: its chain is not read in this run and
+          // its mark is not counted; the program that lists the release judges it.
+          later.add(id);
+          continue;
         }
+        const outcome = await verifyChain(ledger, id, summaries[id], budgets, keys, store, reads);
+        counts.missing += outcome.missing;
+        counts.expired += outcome.expired;
+        if (outcome.ours) ours.add(id);
+        if (outcome.state === "pending") counts.pending = true;
+        if (outcome.state === "attention") counts.unverified += 1;
+        if (outcome.state === "verified") reached.add(id);
+        else reached.delete(id);
+        for (const added of Object.keys(ledger.nodes)) {
+          if (!queued.has(added)) {
+            queued.add(added);
+            queue.push(added);
+          }
+        }
+      }
+    };
+    await walk(Object.keys(ledger.nodes), summaries, reads);
+    // The nodes found in the store only that hold an entry sealed to this key and that no trace
+    // reached: the marks this run would make.
+    const unexplained = function () {
+      return Array.from(ours).filter(function (id) {
+        const node = ledger.nodes[id];
+        return node !== undefined && node.origin === "store" && node.unknown_ms === 0;
+      });
+    };
+    const found = unexplained();
+    if (found.length > 0 && store.state === "verified") {
+      // The second look: the nodes whose head the first stage of the reads holds (reads.heads) and
+      // whose chain verified to that head are read again (the summary, the status, the listing
+      // addresses) and walked on from their verification points. The walk of a chain whose first
+      // walk ended pending or attention is not repeated: it would count its gap or its budget twice.
+      const again = Object.keys(ledger.nodes).filter(function (id) {
+        return reads.heads.has(id) && reached.has(id);
+      });
+      if (again.length > 0) {
+        const readsAgain = beginVerificationReads(ledger, again);
+        const summariesAgain = await readSummaries(readsAgain);
+        await completeVerificationReads(ledger, readsAgain, summariesAgain);
+        const listingsAgain = await readsAgain.listings;
+        if (!listingsAgain.ok && isStoreFailure(listingsAgain.error) && listingsAgain.error.kind !== "unreachable") {
+          storeFailed(store, listingsAgain.error);
+          counts.pending = true;
+        } else {
+          await walk(again, summariesAgain, readsAgain);
+        }
+        native.log("second look: " + found.length + " node(s) found in the store only, the heads of " +
+          again.length + " node(s) read again, " + unexplained().length + " left unexplained");
       }
     }
     counts.keys = LOG_VERIFY_KEYS - budgets.keys;
@@ -3845,8 +3911,9 @@
     }
     // A node found in the store only that holds an entry sealed to this key is a delegation the app
     // did not make and no verified transfer explained (a trace that reaches the node later in the
-    // run changes its origin before this mark). The mark stays in the ledger; a node of the listing
-    // without such an entry is not kept (the next run examines it again).
+    // run, in the first walk or in the second look, changes its origin before this mark). The mark
+    // stays in the ledger; a node of the listing without such an entry is not kept (the next run
+    // examines it again).
     for (const id of ours) {
       const node = ledger.nodes[id];
       if (node !== undefined && node.origin === "store" && node.unknown_ms === 0) node.unknown_ms = now;
@@ -3996,7 +4063,7 @@
     const sealing = on && needsSealingCheck() && heldCustody(ledger, native.nowMs()) !== null
       ? settled(api("GET", "/api/secure/sealing"))
       : null;
-    const reads = due ? beginVerificationReads(ledger) : null;
+    const reads = due ? beginVerificationReads(ledger, null) : null;
     if (on) {
       await sealPending(keys, ledger, sealing);
       await finishAppPasswordSetup(keys, ledger);

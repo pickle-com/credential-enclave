@@ -457,6 +457,59 @@ async function suspendedRunCrossesTransfer(source) {
   return { suspended_run: run, after_next_sync: base.world.state.log.status, ledger: ledgerShapes(base.world, base.named) };
 }
 
+/** One device. A verification run during which the delegation of the account moves: after the run
+ *  read the head of node0 (the status request of the first stage of its reads) and before it
+ *  listed the store, node1 came up, node0 handed the delegation to it (grant_transferred_out on
+ *  node0, grant_transferred_in on node1) and node1 was used; when giverEnds is true node0 then
+ *  ended (its orderly shutdown: a final head). The run took three minutes, below
+ *  LOG_RUN_STALE_MS, so it is not judged again as a whole; its listing shows node1, and the chain
+ *  of node0 was walked to the head signed before the transfer. A program that reads the heads of
+ *  its ledger again before it counts a node found in the store only verifies in that run (the
+ *  transfer explains node1); a program that counts on the heads of the first stage marks node1
+ *  (attention) until the grant of the next synchronization clears the mark. requests_after_transfer
+ *  counts the requests of the run from the transfer on (the cost of the judgement after it). */
+async function transferAfterHeads(source, giverEnds) {
+  const base = baseWorld(source);
+  await start(source, base.world);
+  base.world.advance(HOUR_MS);
+  const original = base.world.http.bind(base.world);
+  let moved = false;
+  let node1 = null;
+  let requests = 0;
+  base.world.http = async function (request) {
+    const name = String(request.path || request.url || "");
+    if (!moved && name.includes("delimiter")) {
+      moved = true;
+      node1 = base.world.addNode({ release: base.latest.release, measurement: base.latest });
+      base.named.node1 = node1;
+      const seal = { logPk: base.keys.logPk, keyId: base.keys.keyId };
+      base.node0.appendEntry(base.world.userId, "c", [
+        { t: "grant_transferred_out", time_ms: base.world.now, to: node1.id },
+      ], seal);
+      node1.appendEntry(base.world.userId, "c", [{
+        t: "grant_transferred_in", time_ms: base.world.now, from: base.node0.id,
+        not_after_ms: base.world.now + HOUR_MS, custody: "enclave",
+      }], seal);
+      node1.appendEntry(base.world.userId, "u", [providerRequest(base.world.now)], seal);
+      if (giverEnds) base.node0.shutDown();
+      base.world.advance(3 * 60000);
+    }
+    if (moved) requests += 1;
+    return original(request);
+  };
+  const program = await start(source, base.world);
+  base.world.http = original;
+  const run = {
+    report: lastReport(base.world), published: base.world.state.log.status, requests_after_transfer: requests,
+    ledger: ledgerShapes(base.world, base.named),
+  };
+  await program.onEvent("foreground", {});
+  return {
+    run: run, after_next_sync: base.world.state.log.status, ledger: ledgerShapes(base.world, base.named),
+    node1_grants: node1.grants.size,
+  };
+}
+
 /** The log store answers one listing request with 503 and the request after it with 200. A
  *  program that tries a failed request again verifies with the store read; a program without
  *  the retry leaves the run pending with the store unreachable. */
@@ -516,6 +569,8 @@ module.exports = {
     reply_lost_node_lives: replyLostNodeLives,
     log_screen_before_sync: logScreenBeforeSync,
     suspended_run_crosses_transfer: suspendedRunCrossesTransfer,
+    transfer_after_heads: function (source) { return transferAfterHeads(source, false); },
+    transfer_after_heads_giver_ends: function (source) { return transferAfterHeads(source, true); },
     store_answers_once_503: storeAnswersOnce503,
     store_objects_fail: storeObjectsFail,
   },
