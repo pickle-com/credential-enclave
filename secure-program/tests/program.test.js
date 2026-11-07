@@ -72,6 +72,7 @@ test("the program lists the releases of the public repository in order, each wri
   const listed = bridge.listedMeasurements(source);
   assert.deepEqual(listed.map((release) => release.release), [
     "v1.1.0", "v1.2.0", "v1.3.0", "v1.4.0", "v1.5.0", "v1.5.2", "v2.0.0", "v2.0.1", "v2.1.0", "v2.2.0",
+    "v2.3.0",
   ]);
   assert.ok(listed.every((release) => release.log_store === true));
   const measurements = new Set(listed.map((release) => release.pcr0 + release.pcr1 + release.pcr2));
@@ -80,7 +81,7 @@ test("the program lists the releases of the public repository in order, each wri
 
 test("the nodes of the newest three releases side by side: each receives the grant, the transfer between them is traced, the three chains verify", async () => {
   const result = await scenarios.releases_side_by_side(source);
-  assert.deepEqual(result.releases, ["v2.0.1", "v2.1.0", "v2.2.0"]);
+  assert.deepEqual(result.releases, ["v2.1.0", "v2.2.0", "v2.3.0"]);
   assert.equal(result.report.status, "verified");
   assert.equal(result.report.nodes, 3);
   assert.equal(result.report.unknown_nodes, 0);
