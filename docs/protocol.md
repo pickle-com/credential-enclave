@@ -690,9 +690,20 @@ Index verification of a chain of format 2:
    it).
 5. The verified point moves to the cursor (`seq`, `hash` and the `time_ms` of the key). The listing
    of the account prefix (delimiter `/`) is the discovery of nodes: a node the list of the app does
-   not know is verified from `seq` 1 with its first entry (a control entry) read by content; when
+   not know is verified from `seq` 1 with its first entry (a control entry) read by content. When
    that entry is sealed to the key of this account and no traced transfer explains the node, the
-   node is a delegation the app did not make (attention) and stays in the list with that mark. The
+   app reads the heads once more before it counts the node (the second look). The heads of the
+   nodes of its list were read before the listing of the account prefix, and a transfer of the
+   delegation that landed between the two (10.1: the giving node wrote `grant_transferred_out`, the
+   store confirmed it, the grant went over, the receiving node wrote `grant_transferred_in`) puts
+   the receiving node into the listing while the chain of the giving node was walked to a head
+   signed before the transfer. The second look reads the node summary of the backend, the status
+   of every node whose head the first reads held and whose chain verified to that head, and the
+   listing addresses of those nodes, and walks those chains on from their verified points to the
+   new heads within the key and body budgets of the run (`LOG_VERIFY_KEYS`, `LOG_VERIFY_BODIES`);
+   a transfer traced there explains the node. A node that no traced transfer explains after the
+   second look is a delegation the app did not make (attention) and stays in the list with that
+   mark. A run that finds no such node reads no head twice. The
    nodes of the listing that the list of nodes does not know are examined after the known nodes, at
    most `LOG_STORE_NODES` of them in one run (more leave the run pending). A node of a release later
    than the program of the app (4.3: a node whose attestation the app verified in its last
@@ -747,7 +758,7 @@ is always in the listing.
 | Everything passes | The entries that this node wrote for this account are in the store without a gap up to the vouched end, the chain hashes agree with the head, and every control entry verifies |
 | A `seq` without a candidate whose first key after it is older than one hour, a candidate chain that does not reach the hash of the head, a control entry that does not verify | The stored log has an omission or a change |
 | A `seq` without a candidate whose first key after it is younger than one hour | Pending: the node has still to write the entry again (7.6); the next run reads the gap |
-| A node appears in the listing that no grant of the app and no traced transfer explains, with a first entry sealed to the key of this account | A node used the key of the account outside the delegations the app knows |
+| A node appears in the listing that no grant of the app and no traced transfer explains, after the second look of step 5, with a first entry sealed to the key of this account | A node used the key of the account outside the delegations the app knows |
 | A node of a release later than the program of the app (4.3) is in the listing or in the list of nodes | Pending: the program does not list the release, so it hands the node no key and does not read its chain. The program that lists the release reads the chain from the verified point of the node. The number of such nodes is reported with the run (`newer_release_nodes`) |
 | A node that is gone has no `final` head | The entries after the verified point are read by content verification. The part the app has not read yet is pending |
 | A node that is gone has a `final` head, and a key of its prefix lies above the `seq` of that head | The stored log holds an object the node did not vouch for: attention (step 4). A node avoids this state in its orderly shutdown: it signs the final head below an unconfirmed tail only when every write attempt of those entries failed before a request byte left the node or was answered by the store with a 4xx status, and it leaves no final head for an account with an unconfirmed entry whose write may have reached the store (7.3) |

@@ -258,6 +258,22 @@ test("a run suspended across a transfer is judged again on fresh reads before it
   assert.equal(result.ledger.node1, "grant");
 });
 
+test("a transfer that lands between the heads and the listing of a run is explained in that run, whether the giving node lives on or ends", async () => {
+  for (const name of ["transfer_after_heads", "transfer_after_heads_giver_ends"]) {
+    const result = await scenarios[name](source);
+    assert.equal(result.run.report.status, "verified", name);
+    assert.equal(result.run.report.unknown_nodes, 0, name);
+    assert.equal(result.run.published, "verified", name);
+    // The second look traced the transfer: node1 is a grant node of the ledger before the next
+    // synchronization grants to it.
+    assert.equal(result.run.ledger.node1, "grant", name);
+    assert.equal(result.after_next_sync, "verified", name);
+    assert.equal(result.node1_grants, 1, name);
+  }
+  const ended = await scenarios.transfer_after_heads_giver_ends(source);
+  assert.equal(ended.ledger.node0, "grant+gone");
+});
+
 test("a store request that failed once is made again, and a read that keeps failing is named in the report", async () => {
   const once = await scenarios.store_answers_once_503(source);
   assert.equal(once.failed_answers, 1);
