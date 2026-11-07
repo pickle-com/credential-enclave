@@ -506,6 +506,14 @@ class World {
     // value as the program uploaded it, null while none was uploaded, and the count of uploads.
     this.sharedLedger = null;
     this.ledgerUploads = 0;
+    // The application password connections (PUT /api/secure/connections/{provider}/app-password):
+    // every save by provider and body, the identity the backend reports for the saved password, and
+    // the provider the statement of the node names (null: the provider of the path). The one pending
+    // setup request of the account (POST/GET/DELETE .../setup), with the capture a test supplies.
+    this.appPasswordSaves = [];
+    this.appPasswordIdentity = "alice@naver.com";
+    this.appPasswordStatementProvider = null;
+    this.appPasswordSetup = null;
   }
 
   get storeHost() {
@@ -656,6 +664,53 @@ class World {
     }
     if (method === "GET" && path === "/api/secure/sealing") return json(200, { items: [], more: false });
     if (method === "GET" && path === "/api/secure/transfers") return json(200, { transfers: [] });
+    const connection = /^\/api\/secure\/connections\/([a-z_]+)\/(app-password|setup)(?:\/([A-Za-z0-9_-]+))?$/.exec(path);
+    if (connection !== null) return this.appPasswordApi(method, connection[1], connection[2], connection[3], query, body, json);
+    return json(404, { code: "not_found" });
+  }
+
+  /** The application password routes of the backend. The save answers with the statement of the
+   *  node that holds the grant of the account, over the record of the body and the provider of the
+   *  path (or appPasswordStatementProvider). The setup request is one per account: a POST of another
+   *  request while one is pending is refused, GET answers the request of its id and provider, DELETE
+   *  removes it. */
+  appPasswordApi(method, provider, tail, id, query, body, json) {
+    if (tail === "app-password" && method === "PUT" && id === undefined) {
+      const node = this.offeredNodes().find((item) => item.grants.has(this.userId));
+      if (node === undefined || this.account.key === null) return json(409, { code: "grant_required" });
+      this.appPasswordSaves.push({ provider: provider, body: body });
+      const statement = signedValue(node.signSeed, "pickle.secure.v1.statement\n", {
+        v: 1, type: "app_password_verified", node: node.id, user_id: this.userId, sign_pk: this.account.key.sign_pk,
+        provider: this.appPasswordStatementProvider === null ? provider : this.appPasswordStatementProvider,
+        record_id: body.record.id, key_id: this.account.key.key_id, identity: this.appPasswordIdentity,
+        ciphertext_sha256: b64u(sha("sha256", utf8(body.record.ct))), time_ms: this.now,
+      });
+      return json(200, {
+        provider: provider, connection_id: "connection-" + this.appPasswordSaves.length,
+        identity: this.appPasswordIdentity, node: node.id, statement: statement,
+      });
+    }
+    if (tail === "setup") {
+      const pending = this.appPasswordSetup;
+      if (method === "POST" && id === undefined) {
+        const intent = JSON.parse(bytes(body.payload).toString("utf8"));
+        if (pending !== null && pending.setup_id !== intent.id) return json(409, { code: "setup_in_progress" });
+        this.appPasswordSetup = { provider: provider, setup_id: intent.id, request: body, phase: "ready", capture: null };
+        return json(200, { setup_id: intent.id, phase: "ready" });
+      }
+      if (method === "GET" && id === undefined) {
+        const found = pending !== null && pending.setup_id === query.setup_id && pending.provider === provider;
+        return json(200, {
+          setup: !found ? null : {
+            setup_id: pending.setup_id, request: pending.request, phase: pending.phase, capture: pending.capture,
+          },
+        });
+      }
+      if (method === "DELETE" && id !== undefined) {
+        if (pending !== null && pending.setup_id === id && pending.provider === provider) this.appPasswordSetup = null;
+        return json(200, { cleared: true });
+      }
+    }
     return json(404, { code: "not_found" });
   }
 
