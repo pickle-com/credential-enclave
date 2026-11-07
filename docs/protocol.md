@@ -532,7 +532,8 @@ entry_hash = SHA-256("pickle.secure.v2.log-chain\n" || prev || body_hash || UTF-
   the requests, all into the open batch of the account in one step. The requests of one batch may
   end up in two entries when the open batch reaches a cap between them; the batch waits for the
   confirmation of every entry that holds one of its events.
-- The entry and the act. `forward`, `forward/batch`, `refresh`, `revoke-token`, `release`, the
+- The entry and the act. `forward`, `forward/batch`, `app-password/verify`, `refresh`,
+  `revoke-token`, `release`, the
   commands grant and revoke, and `peer/export` create their event before the act: the node creates
   the event, and the entry that holds it, and after that it calls the provider, hands the value
   out, changes the delegation or seals the user key to a peer. `peer/import` creates its entry
@@ -853,6 +854,7 @@ entry as a pending entry (a call that waited writes it once more, 7.1):
 | --- | --- | --- | --- |
 | `forward` | `provider_request` | The request to the provider. A request that shares the event of an identical GET request (7.2) waits for the entry that holds it: when the store confirmed it before, nothing is written, and when it is a pending entry, the call writes it again | `log_store_unavailable`. No request is sent |
 | `forward/batch` | `provider_request`, one per request | The requests to the provider, all of them, after every entry that holds one of their events is confirmed | `log_store_unavailable` for the whole call. No request is sent |
+| `app-password/verify` | `provider_request` | The request of the application password definition to the provider (enclave.md 5.8c) | `log_store_unavailable`. No request is sent |
 | `refresh` | `credential_refreshed` | The call of the token address | `log_store_unavailable`. The token address is not called |
 | `revoke-token` | `connection_removed` | The call of the revocation address | `log_store_unavailable`. The revocation address is not called |
 | `release` | `secret_released`, `totp_issued` | The value in the response | `log_store_unavailable`. The value does not leave |

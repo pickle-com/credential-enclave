@@ -62,8 +62,8 @@ const PARAM_VALUE_CHARS: usize = 1024;
 pub struct TokenResponse(Secret<Value>);
 
 /// The opened plaintext of a record of kind `oauth` or `oauth_imported`, before it is parsed.
-/// Only [`open_record`] and [`open_records`] create one, so the bytes are those of a record
-/// that opened under the grant of the account and names that kind in its AAD.
+/// Only [`open_record`], [`open_records`] and [`token_record`] create one, so the bytes are
+/// those of a record that opened under the grant of the account and names that kind in its AAD.
 pub struct OauthRecord {
     kind: TokenKind,
     plaintext: Secret<Vec<u8>>,
