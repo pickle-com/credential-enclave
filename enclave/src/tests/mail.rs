@@ -527,7 +527,13 @@ async fn partial_recipient_refusal_never_sends_data() {
 async fn authentication_refusal_is_distinct_from_temporary_mail_failure() {
     for (reply, expected) in [
         ("NO [AUTHENTICATIONFAILED] Login failed", 401),
+        // The reply of imap.naver.com to a refused name or application password.
+        (
+            "NO [AUTH] \"name\": Authentication failed. (Please check your username, password)",
+            401,
+        ),
         ("NO [UNAVAILABLE] Try later", 502),
+        ("NO Login failed", 502),
     ] {
         let server = MailServer::with_replies(false, false, Some(reply), None).await;
         let (harness, _, record) = server.harness().await;

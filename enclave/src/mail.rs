@@ -43,6 +43,17 @@ pub(crate) fn message_input_bytes(limits: &Limits) -> usize {
     limits.body_bytes + 1024 * 1024
 }
 
+/// Whether a `NO` reply to `LOGIN` says that the server refused the credentials. `text` is the
+/// SDK's rendering of the reply: its response code and its information. Two forms count: the
+/// RFC 5530 response code `AUTHENTICATIONFAILED`, and the information `Authentication failed`
+/// that imap.naver.com sends with its own response code `[AUTH]`
+/// (`NO [AUTH] "name": Authentication failed. (Please check your username, password)`). Any
+/// other `NO` is a provider failure.
+fn credentials_refused(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("authenticationfailed") || text.contains("authentication failed")
+}
+
 /// Only the mail call opens this kind. Neither field implements response serialization.
 pub struct AppPassword {
     identity: String,
@@ -137,11 +148,7 @@ impl AppPassword {
             .login(login, self.password.expose_secret())
             .await
             .map_err(|(error, _)| match error {
-                async_imap::error::Error::No(text)
-                    if text.to_ascii_lowercase().contains("authenticationfailed") =>
-                {
-                    MailError::Auth
-                }
+                async_imap::error::Error::No(text) if credentials_refused(&text) => MailError::Auth,
                 _ => MailError::Unavailable,
             })
     }

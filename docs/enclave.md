@@ -1575,7 +1575,9 @@ connection's bound ends the connection as a provider failure, because the SDK pa
 (async-imap 0.12) grows its buffer to a declared length with a zero-filled allocation of up to
 512 MiB before the octets arrive. With the guard, the parser buffer never exceeds the bound
 plus one 4 KiB block. A search whose UID set or headers exceeds the bound must be narrowed. Unknown IMAP login refusals remain provider
-failures; only AUTHENTICATIONFAILED classifies the application password as refused.
+failures; a `NO` reply to `LOGIN` classifies the application password as refused only when it
+carries the RFC 5530 response code `AUTHENTICATIONFAILED` or the information `Authentication
+failed`, which imap.naver.com sends with its own response code `[AUTH]`.
 
 A mail call reserves its request frame from the shared body budget before reading it (the
 declared length, else the frame limit), and once the operation, the action and the payload are
