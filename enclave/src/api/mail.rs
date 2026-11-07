@@ -12,7 +12,6 @@ use hyper::body::Bytes;
 use serde_json::json;
 use tokio::sync::OwnedSemaphorePermit;
 
-use super::app_password::verified_statement;
 use super::responses::forward_frame;
 use super::{invalid, read_body, record_of, respond, ApiError, JsonBody};
 use crate::frame::{self, META_LIMIT_BYTES};
@@ -207,7 +206,7 @@ async fn run(node: &Node, request: Request, operation: &str) -> Result<Response,
     let outcome = match operation {
         "verify" => credentials.verify(node).await.map(|()| {
             let identity = credentials.identity();
-            let statement = verified_statement(node, user, &record, &key_id, &sign_pk, identity);
+            let statement = credentials.verified_statement(node, user, &record, &key_id, &sign_pk);
             MailData::Json(json!({"identity": identity, "node": node.node, "statement": statement}))
         }),
         "read" => {

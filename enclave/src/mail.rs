@@ -1,4 +1,9 @@
-//! Fixed Naver IMAP/SMTP operations. Authentication bytes only reach in-node TLS streams.
+//! Application passwords: the type that holds one ([`AppPassword`]), the HTTP Basic credential
+//! and the verification statement it gives the HTTP calls (`forward`, `app-password/verify`),
+//! and the fixed NAVER IMAP/SMTP operations of the mail calls. Authentication bytes only reach
+//! in-node TLS streams. The sinks that read the password (K6, K7) live in this module with the
+//! type, so its fields stay private to the module that owns them (rule E1 of the egress
+//! policy).
 
 use std::{
     collections::BTreeMap,
@@ -13,20 +18,21 @@ use async_imap::imap_proto::{
 };
 use async_imap::{Client, Session};
 use base64::{engine::general_purpose::STANDARD, Engine};
+use credential_enclave_protocol::encoding::{b64u, to_json, Signed};
 use credential_enclave_protocol::record::{Kind, Record};
 use credential_enclave_protocol::secret::Secret;
-use credential_enclave_protocol::ProtocolError;
+use credential_enclave_protocol::{purpose, ProtocolError};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter,
     ReadBuf,
 };
 use zeroize::Zeroizing;
 
-use crate::oauth::Credential;
 use crate::platform::Stream;
-use crate::provider_response::{self, CheckedResponse};
+use crate::provider_response::{self, CheckedResponse, Credential};
 use crate::state::{open_for, GrantView, Limits, Node};
 
 /// Protocol input a verify, folder listing or search connection accepts: 4 MiB. A UID set or
@@ -89,20 +95,27 @@ impl AppPassword {
         domain: &str,
     ) -> Result<Self, ProtocolError> {
         let (kind, bytes) = open_for(grant, user, record)?;
-        if kind != Kind::AppPassword || record.provider != provider {
+        if record.provider != provider {
             return Err(ProtocolError::NotAllowed);
         }
-        Self::from_plaintext(&bytes, domain)
+        Self::from_plaintext(kind, &bytes, domain)
     }
 
-    /// The opened plaintext of a record of kind `app_password`: `{"username", "password"}`.
-    /// The username is the account name of `domain`, with or without `@` and the domain: 1 to
-    /// 64 letters, digits, `_`, `.` and `-`, compared without regard to case. The password is
-    /// 8 to 256 characters without a control character. Another form is `record_invalid`.
+    /// The opened plaintext of a record as an application password. The kind is judged first:
+    /// any kind but `app_password` is `not_allowed`, and its plaintext is not read (rule E6 of
+    /// the egress policy: this type holds the plaintext of its kind and no other). The
+    /// plaintext is `{"username", "password"}`. The username is the account name of `domain`,
+    /// with or without `@` and the domain: 1 to 64 letters, digits, `_`, `.` and `-`, compared
+    /// without regard to case. The password is 8 to 256 characters without a control
+    /// character. Another form is `record_invalid`.
     pub fn from_plaintext(
+        kind: Kind,
         plaintext: &Secret<Vec<u8>>,
         domain: &str,
     ) -> Result<Self, ProtocolError> {
+        if kind != Kind::AppPassword {
+            return Err(ProtocolError::NotAllowed);
+        }
         let value = Secret::new(
             serde_json::from_slice::<Value>(plaintext.expose_secret())
                 .map_err(|_| ProtocolError::RecordInvalid)?,
@@ -144,13 +157,38 @@ impl AppPassword {
 
     /// The credential of an HTTP request to the provider (`forward`, `app-password/verify`):
     /// the header value `Basic` and the base64 of `{login}:{password}`, and the password as
-    /// the secret the response is searched for (rule E4).
+    /// the secret the response is searched for (rule E4). Every intermediate text that holds
+    /// the password is a secret, so it is overwritten with zeros when it is dropped.
     pub fn http_credential(&self) -> Credential {
         let pair = Secret::new(format!("{}:{}", self.login, self.password.expose_secret()));
-        let header = format!("Basic {}", STANDARD.encode(pair.expose_secret().as_bytes()));
+        let encoded = Secret::new(STANDARD.encode(pair.expose_secret().as_bytes()));
         Credential::new(
-            Secret::new(header),
+            Secret::new(format!("Basic {}", encoded.expose_secret())),
             Secret::new(self.password.expose_secret().clone()),
+        )
+    }
+
+    /// The statement `app_password_verified` (protocol.md, application password statements and
+    /// records) that a verify call returns after the provider accepted the password: the node
+    /// states the acceptance and binds the record, the account key of the grant and the
+    /// identity of the account. `mail/verify` and `app-password/verify` sign the same statement.
+    pub fn verified_statement(
+        &self,
+        node: &Node,
+        user_id: &str,
+        record: &Record,
+        key_id: &str,
+        sign_pk: &[u8; 32],
+    ) -> Signed {
+        node.keys.sign(
+            purpose::STATEMENT,
+            &to_json(&json!({
+                "v": 1, "type": "app_password_verified", "node": node.node,
+                "user_id": user_id, "provider": record.provider, "record_id": record.id,
+                "key_id": key_id, "sign_pk": b64u(sign_pk),
+                "ciphertext_sha256": b64u(&Sha256::digest(record.ct.as_bytes())),
+                "identity": self.identity, "time_ms": node.now_ms(),
+            })),
         )
     }
 

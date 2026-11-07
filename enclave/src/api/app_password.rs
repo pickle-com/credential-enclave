@@ -7,55 +7,34 @@
 //! `provider_request` on the chain and in the log store before the request leaves, the TLS
 //! client, the time limit and the check of the response for the password (rule E4 of the
 //! egress policy). The response of the provider stays inside the node. What leaves is made of
-//! its status: a 2xx status gives the identity of the account and the statement
-//! `app_password_verified`, a 401 the fixed code `authentication_failed`, any other status
-//! that status and the fixed code `verification_failed`.
+//! its status: a status the definition accepts gives the identity of the account and the
+//! statement `app_password_verified`, a 401 the fixed code `authentication_failed`, any other
+//! status the fixed frame status 502 with the fixed code `verification_failed` and that status.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Request, State};
 use axum::response::Response;
-use credential_enclave_protocol::encoding::{b64u, to_json, Signed};
-use credential_enclave_protocol::record::Record;
-use credential_enclave_protocol::{purpose, ProtocolError};
+use credential_enclave_protocol::encoding::to_json;
+use credential_enclave_protocol::ProtocolError;
 use hyper::body::Bytes;
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use tokio::sync::OwnedSemaphorePermit;
 
-use super::forward::{execute, prepare, read_frame, reserve, Opened, Prepared, TIMEOUT_DEFAULT_MS};
+use super::forward::{execute, prepare, read_frame, reserve, timeout_of, Password, Prepared};
 use super::responses::forward_frame;
 use super::{invalid, record_of, respond, ApiError};
 use crate::log_store;
 use crate::state::{lock, Node};
 
+/// The frame status of an answer that is neither a status the definition accepts nor 401: the
+/// node, a gateway to the provider, received an answer that is not one of the two it reads
+/// (RFC 9110 15.6.3). The status of the provider is in the body.
+const NOT_VERIFIED: u16 = 502;
+
 pub async fn verify(State(node): State<Arc<Node>>, request: Request) -> Response {
     respond(run(&node, request).await)
-}
-
-/// The statement `app_password_verified` (protocol.md, application password statements and
-/// records): the node states that the provider of the record accepted its application
-/// password, and binds the record, the account key of the grant and the identity of the
-/// account. The mail verify call and this call sign the same statement.
-pub(super) fn verified_statement(
-    node: &Node,
-    user_id: &str,
-    record: &Record,
-    key_id: &str,
-    sign_pk: &[u8; 32],
-    identity: &str,
-) -> Signed {
-    node.keys.sign(
-        purpose::STATEMENT,
-        &to_json(&json!({
-            "v": 1, "type": "app_password_verified", "node": node.node,
-            "user_id": user_id, "provider": record.provider, "record_id": record.id,
-            "key_id": key_id, "sign_pk": b64u(sign_pk),
-            "ciphertext_sha256": b64u(&Sha256::digest(record.ct.as_bytes())),
-            "identity": identity, "time_ms": node.now_ms(),
-        })),
-    )
 }
 
 /// The permit of the provider body, grown or cut to `bytes`: the body the node answers with
@@ -84,6 +63,7 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
     let user_id = meta.user_id()?;
     let record = record_of(&meta, "record")?;
     let context = meta.context()?;
+    let timeout_ms = timeout_of(&meta)?;
     // The call takes no request of its own: the definition names the one request it sends.
     let empty_request = meta
         .get("request")
@@ -102,18 +82,14 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
     node.operator_config()?;
     let account = node.account(user_id).ok_or(ProtocolError::GrantRequired)?;
     log_store::admit(node, &account).await?;
-    let (opened, prepared, place, sign_pk, key_id) = {
+    let (password, prepared, place, sign_pk, key_id) = {
         let mut account = lock(&account);
         node.ensure_open()?;
         let now_ms = node.now_ms();
         let grant = account.active(now_ms)?;
-        let opened = Opened::open(&node.definitions, &grant, user_id, &record)?;
-        // A token record has no verification: the provider accepted the token when it issued
-        // it.
-        let Opened::AppPassword { definition, .. } = &opened else {
-            return Err(ProtocolError::NotAllowed.into());
-        };
-        let probe = &definition.verify;
+        // The record opens as an application password and nothing else (5.8c step 1).
+        let password = Password::open(&node.definitions, &grant, user_id, &record)?;
+        let probe = &password.definition.verify;
         let request = json!({
             "method": probe.method,
             "url": probe.url,
@@ -122,7 +98,7 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
         let body = Bytes::from(probe.body.clone().into_bytes());
         // 2 to 6 of `forward`: the request of the definition passes the same checks as a
         // request of the caller, and its event `provider_request` goes on the chain.
-        let prepared = prepare(&request, &body, &record, &opened, context)?;
+        let prepared = prepare(&request, &body, &record, &password, context)?;
         let place = node
             .create_events(
                 &mut account,
@@ -134,7 +110,7 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
             )?
             .pop()
             .ok_or_else(ApiError::internal)?;
-        (opened, prepared, place, grant.sign_pk, grant.key_id)
+        (password, prepared, place, grant.sign_pk, grant.key_id)
     };
     let log = log_store::commit(node, user_id, &account, &[place])
         .await?
@@ -153,23 +129,26 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
         user_id,
         outbound,
         credential,
-        Duration::from_millis(TIMEOUT_DEFAULT_MS),
+        Duration::from_millis(timeout_ms),
         Some(request_budget),
     )
     .await?;
     let (status, _, _) = checked.into_parts();
-    let credentials = opened.app_password().ok_or_else(ApiError::internal)?;
-    let (status, body) = match status {
-        200..=299 => {
-            let identity = credentials.identity();
-            let statement = verified_statement(node, user_id, &record, &key_id, &sign_pk, identity);
-            (
-                200,
-                json!({"identity": identity, "node": node.node, "statement": statement}),
-            )
-        }
-        401 => (401, json!({"code": "authentication_failed"})),
-        other => (other, json!({"code": "verification_failed"})),
+    let credentials = &password.credentials;
+    let (status, body) = if password.definition.verify.accepted.contains(&status) {
+        let identity = credentials.identity();
+        let statement = credentials.verified_statement(node, user_id, &record, &key_id, &sign_pk);
+        (
+            200,
+            json!({"identity": identity, "node": node.node, "statement": statement}),
+        )
+    } else if status == 401 {
+        (401, json!({"code": "authentication_failed"}))
+    } else {
+        (
+            NOT_VERIFIED,
+            json!({"code": "verification_failed", "status": status}),
+        )
     };
     let body = to_json(&body);
     let budget = resized(node, budget, body.len()).await?;

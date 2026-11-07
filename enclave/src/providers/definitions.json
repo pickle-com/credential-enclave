@@ -231,6 +231,7 @@
     "verify": {
       "method": "PROPFIND",
       "url": "https://caldav.calendar.naver.com/",
+      "accepted": [207],
       "headers": [["Depth", "0"], ["Content-Type", "application/xml; charset=utf-8"]],
       "body": "<?xml version=\"1.0\" encoding=\"utf-8\"?><d:propfind xmlns:d=\"DAV:\"><d:prop><d:current-user-principal/></d:prop></d:propfind>"
     }

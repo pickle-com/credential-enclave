@@ -1,6 +1,7 @@
 //! `POST /v1/forward` (enclave.md 5.8): sends a provider request with the credential of a
-//! record injected. `Opened`, `prepare` and `execute` are shared with `POST /v1/forward/batch`
-//! (`super::forward_batch`) and `POST /v1/app-password/verify` (`super::app_password`).
+//! record injected. `Opened`, `Password`, `prepare` and `execute` are shared with `POST
+//! /v1/forward/batch` (`super::forward_batch`) and `POST /v1/app-password/verify`
+//! (`super::app_password`).
 //!
 //! The credential reaches an address of the provider definition only (enclave.md section 7).
 //! The entry that holds the event `provider_request` is on the chain, and the log store
@@ -24,41 +25,17 @@ use tokio::sync::OwnedSemaphorePermit;
 
 use super::responses::forward_frame;
 use super::{invalid, read_body, record_of, respond, ApiError, JsonBody};
-use crate::egress::{self, EgressError, OutboundBody, OutboundHeader, OutboundRequest};
+use crate::egress::{
+    self, EgressError, OutboundBody, OutboundHeader, OutboundRequest, DROPPED_REQUEST_HEADERS,
+    REFUSED_REQUEST_HEADERS,
+};
 use crate::frame::{self, META_LIMIT_BYTES};
 use crate::log_store;
 use crate::mail::AppPassword;
-use crate::oauth::{self, Credential, OauthPlaintext, Withheld};
-use crate::provider_response::{self, CheckedResponse};
+use crate::oauth::{self, OauthPlaintext, Withheld};
+use crate::provider_response::{self, CheckedResponse, Credential};
 use crate::providers::{AppPasswordDefinition, Definition, Definitions, Reach, BASIC_HEADER};
 use crate::state::{events, lock, merge_key, open_for, GrantView, Node};
-
-/// Caller headers the node drops: the credential header is the node's, `Accept-Encoding` is
-/// set by the node, and the rest describe the connection or the body framing.
-const DROPPED_HEADERS: [&str; 13] = [
-    "authorization",
-    "proxy-authorization",
-    "cookie",
-    "host",
-    "content-length",
-    "transfer-encoding",
-    "connection",
-    "keep-alive",
-    "upgrade",
-    "te",
-    "trailer",
-    "expect",
-    "accept-encoding",
-];
-
-/// Caller headers that ask a provider to treat a request as one of another method than the
-/// method it is sent with. A call that carries one is refused: the entry `provider_request`
-/// names the method of the request, and the request that leaves is of that method.
-const REFUSED_HEADERS: [&str; 3] = [
-    "x-http-method-override",
-    "x-http-method",
-    "x-method-override",
-];
 
 pub(super) const TIMEOUT_DEFAULT_MS: u64 = 30_000;
 pub(super) const TIMEOUT_MIN_MS: u64 = 1_000;
@@ -91,8 +68,9 @@ pub(super) fn timeout_of(meta: &JsonBody) -> Result<u64, ApiError> {
 
 /// Reads the request headers of a request object: an array of `[name, value]` pairs under
 /// `headers`. A name that is not a token and a value with CR, LF or another control
-/// character are `invalid_request`. A header of [`REFUSED_HEADERS`] is `not_allowed`. The
-/// headers of [`DROPPED_HEADERS`] and the credential headers of the definition are dropped.
+/// character are `invalid_request`. A header of [`REFUSED_REQUEST_HEADERS`] is `not_allowed`.
+/// The headers of [`DROPPED_REQUEST_HEADERS`] and the credential headers of the definition are
+/// dropped.
 fn caller_headers(request: &Value, reach: &dyn Reach) -> Result<Vec<OutboundHeader>, ApiError> {
     let Some(value) = request.get("headers").filter(|value| !value.is_null()) else {
         return Ok(Vec::new());
@@ -112,10 +90,10 @@ fn caller_headers(request: &Value, reach: &dyn Reach) -> Result<Vec<OutboundHead
             return Err(invalid("headers"));
         }
         let lower = name.to_ascii_lowercase();
-        if REFUSED_HEADERS.contains(&lower.as_str()) {
+        if REFUSED_REQUEST_HEADERS.contains(&lower.as_str()) {
             return Err(ProtocolError::NotAllowed.into());
         }
-        if DROPPED_HEADERS.contains(&lower.as_str())
+        if DROPPED_REQUEST_HEADERS.contains(&lower.as_str())
             || injected
                 .iter()
                 .any(|header| header.eq_ignore_ascii_case(&lower))
@@ -127,28 +105,123 @@ fn caller_headers(request: &Value, reach: &dyn Reach) -> Result<Vec<OutboundHead
     Ok(headers)
 }
 
-/// The opened record of a call that sends HTTP requests with a credential: a token record with
-/// the OAuth definition of its provider, or an application password with the application
-/// password definition of its provider. The kind of the record decides which, and the
-/// plaintext of each kind is held by the type of its own module (rule E6 of the egress
-/// policy): the HTTP calls hold no plaintext of a vault record.
+/// What [`prepare`] reads from an opened record: the definition as `forward` reads it, and the
+/// credential header of a request to a host.
+pub(super) trait Source {
+    /// The definition: the address check, the methods and the credential headers.
+    fn reach(&self) -> &dyn Reach;
+    /// The credential header of a request to `host`: its name, and its value with the secret
+    /// the response is searched for (rule E4).
+    fn credential(&self, host: &str) -> Result<(&str, Credential), ProtocolError>;
+}
+
+/// A token record (kind `oauth` or `oauth_imported`) with the OAuth definition of its provider.
+pub(super) struct Token<'a> {
+    definition: &'a Definition,
+    parsed: OauthPlaintext,
+}
+
+impl<'a> Token<'a> {
+    /// A record opened as a token record: a vault kind or an application password is
+    /// `not_allowed`, a plaintext without a token object is `record_invalid`, and a provider
+    /// without an OAuth definition is `provider_unknown`.
+    fn of(
+        definitions: &'a Definitions,
+        record: &Record,
+        kind: Kind,
+        plaintext: Secret<Vec<u8>>,
+    ) -> Result<Token<'a>, ProtocolError> {
+        let parsed = oauth::token_record(kind, plaintext)?.parse()?;
+        let definition = definitions
+            .get(&record.provider)
+            .ok_or(ProtocolError::ProviderUnknown)?;
+        Ok(Token { definition, parsed })
+    }
+}
+
+impl Source for Token<'_> {
+    fn reach(&self) -> &dyn Reach {
+        self.definition
+    }
+
+    /// The rule of the host in the definition: its header, with the token at the first path of
+    /// the rule that the token object holds.
+    fn credential(&self, host: &str) -> Result<(&str, Credential), ProtocolError> {
+        let rule = self
+            .definition
+            .inject_rule(host)
+            .ok_or(ProtocolError::NotAllowed)?;
+        let credential = self
+            .parsed
+            .credential(rule)
+            .ok_or(ProtocolError::RecordInvalid)?;
+        Ok((rule.header.as_str(), credential))
+    }
+}
+
+/// An application password (kind `app_password`) with the application password definition of
+/// its provider (enclave.md 6.5).
+pub(super) struct Password<'a> {
+    pub definition: &'a AppPasswordDefinition,
+    pub credentials: AppPassword,
+}
+
+impl<'a> Password<'a> {
+    /// Step 6 of the common front for `app-password/verify`: opens the record as an
+    /// application password and nothing else. A record of a provider without an application
+    /// password definition (`naver_mail` included) is `not_allowed`, and so is a record of
+    /// another kind, before its plaintext is read.
+    pub(super) fn open(
+        definitions: &'a Definitions,
+        grant: &GrantView,
+        user_id: &str,
+        record: &Record,
+    ) -> Result<Password<'a>, ProtocolError> {
+        let (kind, plaintext) = open_for(grant, user_id, record)?;
+        Password::of(definitions, record, kind, plaintext)
+    }
+
+    fn of(
+        definitions: &'a Definitions,
+        record: &Record,
+        kind: Kind,
+        plaintext: Secret<Vec<u8>>,
+    ) -> Result<Password<'a>, ProtocolError> {
+        let definition = definitions
+            .app_password(&record.provider)
+            .ok_or(ProtocolError::NotAllowed)?;
+        let credentials =
+            AppPassword::from_plaintext(kind, &plaintext, &definition.account_domain)?;
+        Ok(Password {
+            definition,
+            credentials,
+        })
+    }
+}
+
+impl Source for Password<'_> {
+    fn reach(&self) -> &dyn Reach {
+        self.definition
+    }
+
+    /// HTTP Basic of the login and the password, on every host of the definition.
+    fn credential(&self, _host: &str) -> Result<(&str, Credential), ProtocolError> {
+        Ok((BASIC_HEADER, self.credentials.http_credential()))
+    }
+}
+
+/// The opened record of `forward` and `forward/batch`, taken by its kind: a token record with
+/// its OAuth definition, or an application password with its definition. The plaintext of each
+/// kind is held by the type of its own module (rule E6 of the egress policy): the HTTP calls
+/// hold no plaintext of a vault record.
 pub(super) enum Opened<'a> {
-    Token {
-        definition: &'a Definition,
-        parsed: OauthPlaintext,
-    },
-    AppPassword {
-        definition: &'a AppPasswordDefinition,
-        credentials: AppPassword,
-    },
+    Token(Token<'a>),
+    Password(Password<'a>),
 }
 
 impl<'a> Opened<'a> {
-    /// Step 6 of the common front of the HTTP calls: opens the record and takes it by its
-    /// kind. A token record (kind `oauth` or `oauth_imported`) of a provider without an OAuth
-    /// definition is `provider_unknown`. A record of kind `app_password` of a provider without
-    /// an application password definition is `not_allowed` (the password of `naver_mail` is
-    /// used by the mail calls only), and so is a record of a vault kind.
+    /// Step 6 of the common front of `forward` and `forward/batch`: opens the record and takes
+    /// it by its kind (enclave.md 5.8 step 1).
     pub(super) fn open(
         definitions: &'a Definitions,
         grant: &GrantView,
@@ -157,61 +230,34 @@ impl<'a> Opened<'a> {
     ) -> Result<Opened<'a>, ProtocolError> {
         let (kind, plaintext) = open_for(grant, user_id, record)?;
         match kind {
-            Kind::AppPassword => {
-                let definition = definitions
-                    .app_password(&record.provider)
-                    .ok_or(ProtocolError::NotAllowed)?;
-                let credentials =
-                    AppPassword::from_plaintext(&plaintext, &definition.account_domain)?;
-                Ok(Opened::AppPassword {
-                    definition,
-                    credentials,
-                })
-            }
-            kind => {
-                let parsed = oauth::token_record(kind, plaintext)?.parse()?;
-                let definition = definitions
-                    .get(&record.provider)
-                    .ok_or(ProtocolError::ProviderUnknown)?;
-                Ok(Opened::Token { definition, parsed })
-            }
+            Kind::AppPassword => Ok(Opened::Password(Password::of(
+                definitions,
+                record,
+                kind,
+                plaintext,
+            )?)),
+            kind => Ok(Opened::Token(Token::of(
+                definitions,
+                record,
+                kind,
+                plaintext,
+            )?)),
         }
     }
+}
 
-    /// The definition as `forward` reads it: the address check, the methods and the credential
-    /// headers.
-    pub(super) fn reach(&self) -> &'a dyn Reach {
+impl Source for Opened<'_> {
+    fn reach(&self) -> &dyn Reach {
         match self {
-            Opened::Token { definition, .. } => *definition,
-            Opened::AppPassword { definition, .. } => *definition,
+            Opened::Token(token) => token.reach(),
+            Opened::Password(password) => password.reach(),
         }
     }
 
-    /// The application password of the record, when the record holds one.
-    pub(super) fn app_password(&self) -> Option<&AppPassword> {
-        match self {
-            Opened::AppPassword { credentials, .. } => Some(credentials),
-            Opened::Token { .. } => None,
-        }
-    }
-
-    /// The credential header of a request to `host`: its name, and its value with the secret
-    /// the response is searched for (rule E4). For a token record it is the rule of that host
-    /// in the definition; for an application password it is HTTP Basic.
     fn credential(&self, host: &str) -> Result<(&str, Credential), ProtocolError> {
         match self {
-            Opened::Token { definition, parsed } => {
-                let rule = definition
-                    .inject_rule(host)
-                    .ok_or(ProtocolError::NotAllowed)?;
-                let credential = parsed
-                    .credential(rule)
-                    .ok_or(ProtocolError::RecordInvalid)?;
-                Ok((rule.header.as_str(), credential))
-            }
-            Opened::AppPassword { credentials, .. } => {
-                Ok((BASIC_HEADER, credentials.http_credential()))
-            }
+            Opened::Token(token) => token.credential(host),
+            Opened::Password(password) => password.credential(host),
         }
     }
 }
@@ -235,7 +281,7 @@ pub(super) fn prepare(
     request: &Value,
     payload: &Bytes,
     record: &Record,
-    opened: &Opened<'_>,
+    source: &dyn Source,
     context: &str,
 ) -> Result<Prepared, ApiError> {
     let method = request
@@ -246,7 +292,7 @@ pub(super) fn prepare(
         .get("url")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid("url"))?;
-    let reach = opened.reach();
+    let reach = source.reach();
     // 2
     let target = reach.check_address(address)?;
     // 3
@@ -256,7 +302,7 @@ pub(super) fn prepare(
     // 4: the credential header of the record for this host, then `Accept-Encoding: identity`
     // (the node searches the response and does not decode it), then the headers of the
     // caller.
-    let (header, credential) = opened.credential(target.host())?;
+    let (header, credential) = source.credential(target.host())?;
     let (header_value, credential) = credential.into_parts();
     let mut headers = vec![
         OutboundHeader::secret(header, header_value),
@@ -423,8 +469,8 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
         node.ensure_open()?;
         let now_ms = node.now_ms();
         let grant = account.active(now_ms)?;
-        // The record is a token record or an application password of a provider with an HTTP
-        // definition: a vault record is `not_allowed` here.
+        // The record is a token record or an application password of a provider with an
+        // application password definition: a vault record is `not_allowed` here.
         let opened = Opened::open(&node.definitions, &grant, user_id, &record)?;
         let prepared = prepare(meta.as_value(), &payload, &record, &opened, context)?;
         // 5, 6: the merge decision and the event. `place` is where the event of this request

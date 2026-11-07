@@ -1257,8 +1257,8 @@ Test vectors of the assignment; the backend of the operator computes the same fu
 | `grant_expired` | The time of the grant has passed |
 | `key_mismatch` | The `key_id` or the `custody` of a record is not that of the grant. The `sign_pk` of a pending authorization is not the `sign_pk` of the grant |
 | `record_invalid` | The form of a record is wrong, or its AEAD verification failed. The plaintext lacks the field that the call uses (no token to inject, no `refresh_token` to refresh with) |
-| `provider_unknown` | The provider has no definition |
-| `not_allowed` | An address, a method, an authorization parameter or a field that the provider definition does not allow. A record of a kind that the call does not take |
+| `provider_unknown` | The provider has no OAuth definition: the `provider` of `oauth/begin`, or the provider of a token record of `forward`, `forward/batch`, `refresh` and `revoke-token` |
+| `not_allowed` | An address, a method, an authorization parameter or a field that the provider definition does not allow. A record of a kind that the call does not take, and a record of kind `app_password` whose provider has no application password definition (enclave.md 6.5) on `forward`, `forward/batch` and `app-password/verify` |
 | `state_unknown` | There is no pending authorization, or its time (600 seconds) has passed |
 | `exchange_failed`, `refresh_failed` | The provider refused the exchange or the refresh. The failure carries the HTTP status of the provider and one word of a closed vocabulary for the error of its response (enclave.md 5.7) |
 | `provider_unreachable`, `timeout` | A transport failure, a time limit that passed |

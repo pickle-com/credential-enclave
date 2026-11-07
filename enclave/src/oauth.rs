@@ -3,10 +3,11 @@
 //!
 //! Tokens are issued to the node and stay in it. This module owns the types that hold them:
 //! the response of a token address ([`TokenResponse`]), the plaintext of a record of kind
-//! `oauth` or `oauth_imported` ([`OauthRecord`], [`OauthPlaintext`]), the credential of a
-//! request ([`Credential`]) and the PKCE verifier ([`PkceVerifier`]). Their fields are private
-//! to this module and are secrets of the protocol crate, so no other module of the node can
-//! read a token.
+//! `oauth` or `oauth_imported` ([`OauthRecord`], [`OauthPlaintext`]) and the PKCE verifier
+//! ([`PkceVerifier`]). Their fields are private to this module and are secrets of the protocol
+//! crate, so no other module of the node can read a token. The credential of a `forward`
+//! request ([`crate::provider_response::Credential`]) is made here from a token
+//! ([`OauthPlaintext::credential`]) and leaves as two secrets.
 //!
 //! The kind of a record says where its token came from (rule E6 of the egress policy). A
 //! record of kind `oauth` holds a token this node, or another node that held the user key of
@@ -43,7 +44,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::egress::{OutboundBody, OutboundHeader, OutboundRequest};
-use crate::provider_response::Forms;
+use crate::provider_response::{Credential, Forms};
 use crate::providers::{
     BodyFormat, ClientAuth, Definition, Destination, FieldType, Inject, PublicField, Revoke,
     TOKEN_KEYS,
@@ -108,28 +109,6 @@ impl TokenKind {
 pub struct OauthPlaintext {
     kind: TokenKind,
     plaintext: Secret<Value>,
-}
-
-/// The credential the HTTP calls inject: the header value for the TLS client, and the secret
-/// the response is searched for (rule E4). For a token record the secret is the token and the
-/// header value is made of the prefix of the definition and that token; for an application
-/// password the secret is the password and the header value is HTTP Basic
-/// (`crate::mail::AppPassword::http_credential`).
-pub struct Credential {
-    token: Secret<String>,
-    header: Secret<String>,
-}
-
-impl Credential {
-    /// A credential of `header` whose searched secret is `token`.
-    pub(crate) fn new(header: Secret<String>, token: Secret<String>) -> Credential {
-        Credential { token, header }
-    }
-
-    /// The header value for the TLS client, and the secret for the check of the response.
-    pub fn into_parts(self) -> (Secret<String>, Secret<String>) {
-        (self.header, self.token)
-    }
 }
 
 /// The PKCE verifier of an authorization in progress. It reaches the token address of the
@@ -323,10 +302,10 @@ impl OauthPlaintext {
             let pair = Secret::new(format!("{}:{token}", rule.basic_user));
             format!("Basic {}", STANDARD.encode(pair.expose_secret().as_bytes()))
         };
-        Some(Credential {
-            header: Secret::new(header),
-            token: Secret::new(token.to_string()),
-        })
+        Some(Credential::new(
+            Secret::new(header),
+            Secret::new(token.to_string()),
+        ))
     }
 
     /// The client identifier of a dynamically registered client. It goes into the requests to

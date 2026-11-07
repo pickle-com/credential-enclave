@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, HashSet};
 use credential_enclave_protocol::{is_valid_name, limits, ProtocolError};
 use serde::Deserialize;
 
-use crate::egress::is_token;
+use crate::egress::{is_token, DROPPED_REQUEST_HEADERS, REFUSED_REQUEST_HEADERS};
 
 /// The definitions compiled into the binary.
 const EMBEDDED: &str = include_str!("definitions.json");
@@ -195,15 +195,20 @@ pub enum CredentialKind {
 }
 
 /// The request of `app-password/verify` for a provider: one fixed request that the provider
-/// answers with a 2xx status when it accepts the password, and with 401 when it refuses it.
+/// answers with a status of `accepted` when it accepts the password, and with 401 when it
+/// refuses it.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Probe {
     pub method: String,
     /// The address, one that passes the address check of the definition.
     pub url: String,
+    /// The statuses that mean the provider accepted the password: 2xx statuses, at least one.
+    /// Any other 2xx is not an acceptance (a page that answers 200 whatever the credential is
+    /// not the provider accepting it).
+    pub accepted: Vec<u16>,
     /// `[name, value]` header pairs of the request. They follow the header rules of `forward`
-    /// (enclave.md 5.8, step 4).
+    /// (enclave.md 5.8, step 4): a header `forward` would drop or refuse is refused here.
     pub headers: Vec<(String, String)>,
     /// The body, as text.
     pub body: String,
@@ -754,9 +759,10 @@ impl Reach for AppPasswordDefinition {
 impl AppPasswordDefinition {
     /// The rules of enclave.md 6.5: the domain of the account is a DNS name with a dot, the
     /// methods are distinct upper-case HTTP tokens, the `api` rules follow section 7, and the
-    /// request of `app-password/verify` is a request `forward` would send: its method is one
-    /// of the methods, its address passes the address check, its headers are valid and none of
-    /// them is the credential header, and its body is at most 4,096 bytes.
+    /// request of `app-password/verify` is a request `forward` would send as it is: its method
+    /// is one of the methods, its address passes the address check, its headers are valid and
+    /// none of them is one `forward` drops or refuses, its body is at most 4,096 bytes, and the
+    /// statuses it accepts are distinct 2xx statuses, at least one.
     fn validate(&self, name: &str) -> Result<(), String> {
         let fail = |what: &str| Err(format!("{name}: {what}"));
         if !is_valid_name(name) {
@@ -785,8 +791,10 @@ impl AppPasswordDefinition {
             return fail("the verify address is not an address of the definition");
         }
         for (header, value) in &self.verify.headers {
+            let lower = header.to_ascii_lowercase();
             if !is_token(header)
-                || header.eq_ignore_ascii_case(BASIC_HEADER)
+                || DROPPED_REQUEST_HEADERS.contains(&lower.as_str())
+                || REFUSED_REQUEST_HEADERS.contains(&lower.as_str())
                 || value.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
             {
                 return fail("an invalid verify header");
@@ -794,6 +802,15 @@ impl AppPasswordDefinition {
         }
         if self.verify.body.len() > PROBE_BODY_LIMIT_BYTES {
             return fail("the verify body is above the limit");
+        }
+        if self.verify.accepted.is_empty() {
+            return fail("no accepted status");
+        }
+        let mut accepted = HashSet::new();
+        for status in &self.verify.accepted {
+            if !(200..=299).contains(status) || !accepted.insert(*status) {
+                return fail("an invalid or repeated accepted status");
+            }
         }
         Ok(())
     }
@@ -2308,6 +2325,7 @@ mod tests {
             Probe {
                 method: "PROPFIND".to_string(),
                 url: "https://caldav.calendar.naver.com/".to_string(),
+                accepted: vec![207],
                 headers: pairs(&[
                     ("Depth", "0"),
                     ("Content-Type", "application/xml; charset=utf-8"),
@@ -2380,7 +2398,7 @@ mod tests {
         "account_domain": "provider.test",
         "methods": ["PROPFIND", "GET"],
         "api": [{"host": "dav.provider.test", "prefixes": ["/dav/"], "exact": []}],
-        "verify": {"method": "PROPFIND", "url": "https://dav.provider.test/dav/", "headers": [["Depth", "0"]], "body": ""}
+        "verify": {"method": "PROPFIND", "url": "https://dav.provider.test/dav/", "accepted": [207], "headers": [["Depth", "0"]], "body": ""}
     }"#;
 
     fn with_password(change: impl Fn(&mut serde_json::Value)) -> Result<Definitions, String> {
@@ -2430,10 +2448,24 @@ mod tests {
             with_password(|d| d["verify"]["url"] = "https://other.provider.test/dav/".into())
                 .is_err()
         );
-        assert!(
-            with_password(|d| d["verify"]["headers"] = json!([["Authorization", "Basic x"]]))
-                .is_err()
-        );
+        // A header forward would drop (the credential header among them) or refuse is no
+        // header of the request: it would not leave as written, or the call would be refused.
+        for header in [
+            "Authorization",
+            "authorization",
+            "Cookie",
+            "Host",
+            "Content-Length",
+            "Accept-Encoding",
+            "X-HTTP-Method-Override",
+            "x-http-method",
+        ] {
+            assert!(
+                with_password(|d| d["verify"]["headers"] = json!([[header, "x"]])).is_err(),
+                "{header}"
+            );
+        }
+        assert!(with_password(|d| d["verify"]["headers"] = json!([["Prefer", "x"]])).is_ok());
         assert!(
             with_password(|d| d["verify"]["headers"] = json!([["Depth", "0\r\nX: y"]])).is_err()
         );
@@ -2441,5 +2473,16 @@ mod tests {
         assert!(with_password(|d| d["verify"]["body"] = "x".repeat(4097).into()).is_err());
         assert!(with_password(|d| d["verify"]["body"] = "x".repeat(4096).into()).is_ok());
         assert!(with_password(|d| d["verify"]["extra"] = 1.into()).is_err());
+        // The accepted statuses: distinct 2xx statuses, at least one.
+        assert!(with_password(|d| d["verify"]["accepted"] = json!([])).is_err());
+        assert!(with_password(|d| d["verify"]["accepted"] = json!([401])).is_err());
+        assert!(with_password(|d| d["verify"]["accepted"] = json!([300])).is_err());
+        assert!(with_password(|d| d["verify"]["accepted"] = json!([199])).is_err());
+        assert!(with_password(|d| d["verify"]["accepted"] = json!([207, 207])).is_err());
+        assert!(with_password(|d| d["verify"]["accepted"] = json!([200, 207])).is_ok());
+        assert!(with_password(|d| {
+            d["verify"].as_object_mut().unwrap().remove("accepted");
+        })
+        .is_err());
     }
 }

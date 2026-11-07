@@ -1,6 +1,7 @@
-//! The HTTP calls with an application password (enclave.md 5.8 and 5.8c): `forward` with a
-//! record of kind `app_password` of a provider of the application password definitions, and
-//! `app-password/verify`, against a stand-in for the CalDAV host of NAVER Calendar.
+//! The HTTP calls with an application password (enclave.md 5.8, 5.8b and 5.8c): `forward` and
+//! `forward/batch` with a record of kind `app_password` of a provider of the application
+//! password definitions, and `app-password/verify`, against a stand-in for the CalDAV host of
+//! NAVER Calendar.
 
 use std::collections::BTreeSet;
 
@@ -20,6 +21,7 @@ use crate::testing::{App, Forwarded, Harness, Provider, Reply, Seen, LOG_HOST};
 const PASSWORD: &str = "calendar-secret-marker-5b1d9f0c7a3e";
 const HOST: &str = "caldav.calendar.naver.com";
 const ROOT: &str = "https://caldav.calendar.naver.com/";
+const CALENDARS: &str = "https://caldav.calendar.naver.com/calendars/tester/";
 /// The request body of the definition (enclave.md 6.5).
 const PROPFIND: &[u8] = concat!(
     "<?xml version=\"1.0\" encoding=\"utf-8\"?>",
@@ -68,6 +70,14 @@ fn calendar_record(app: &App, username: &str) -> Value {
         "app_password",
         "naver_calendar",
         &json!({"username": username, "password": PASSWORD}),
+    )
+}
+
+fn google_record(app: &App) -> Value {
+    app.record(
+        "oauth",
+        "google_workspace",
+        &json!({"token": {"access_token": "ya29.injected"}, "obtained_ms": 1}),
     )
 }
 
@@ -183,6 +193,7 @@ async fn forward_sends_the_password_as_http_basic_and_logs_the_request() {
     );
 
     // The event is the `provider_request` of the record, as for a token record.
+    assert_eq!(forwarded.log["created"], true);
     let mut event = app.logged(&harness, &provider, &forwarded.log);
     assert!(event["time_ms"].as_u64().is_some());
     event.as_object_mut().unwrap().remove("time_ms");
@@ -195,6 +206,101 @@ async fn forward_sends_the_password_as_http_basic_and_logs_the_request() {
             "context": "cli:naver-calendar",
         })
     );
+}
+
+#[tokio::test]
+async fn the_headers_of_the_caller_pass_in_their_case_and_a_repeated_get_shares_its_event() {
+    let provider = provider_with_log_store(caldav).await;
+    let (harness, app, record) = ready(&provider).await;
+    // The headers of a conditional write, as the backend sends them, and a credential header
+    // in lower case, which is dropped like the one in canonical case.
+    let headers = json!([
+        ["DEPTH", "1"],
+        ["If-None-Match", "*"],
+        ["Prefer", "return=minimal"],
+        ["authorization", "Basic from-the-caller"],
+    ]);
+    let item = "https://caldav.calendar.naver.com/calendars/tester/default/a.ics";
+    let forwarded = harness
+        .forward(
+            meta(&app, &record, "PUT", item, headers),
+            b"BEGIN:VCALENDAR\r\n",
+        )
+        .await
+        .unwrap();
+    assert_eq!(forwarded.status, 207);
+    let seen = provider.only();
+    assert_eq!(seen.header("depth"), Some("1"));
+    assert_eq!(seen.header("if-none-match"), Some("*"));
+    assert_eq!(seen.header("prefer"), Some("return=minimal"));
+    assert_eq!(seen.header("authorization"), Some(basic("tester").as_str()));
+
+    // Two identical GET requests without a body within 300 seconds share one event, as with
+    // a token record. A third one for another path has its own.
+    let first = harness
+        .forward(meta(&app, &record, "GET", CALENDARS, json!([])), b"")
+        .await
+        .unwrap();
+    let second = harness
+        .forward(meta(&app, &record, "GET", CALENDARS, json!([])), b"")
+        .await
+        .unwrap();
+    assert_eq!(first.log["created"], true);
+    assert_eq!(second.log["created"], false);
+    assert_eq!(second.log["seq"], first.log["seq"]);
+    assert_eq!(second.log["index"], first.log["index"]);
+    let other = harness
+        .forward(meta(&app, &record, "GET", ROOT, json!([])), b"")
+        .await
+        .unwrap();
+    assert_eq!(other.log["created"], true);
+    assert_eq!(provider.requests().len(), 4);
+}
+
+#[tokio::test]
+async fn a_batch_sends_every_request_with_the_password_after_one_entry() {
+    let provider = provider_with_log_store(caldav).await;
+    let (harness, app, record) = ready(&provider).await;
+    let requests = json!([
+        {"method": "PROPFIND", "url": ROOT, "headers": [["Depth", "0"]], "body_bytes": PROPFIND.len()},
+        {"method": "GET", "url": CALENDARS, "headers": [], "body_bytes": 0},
+    ]);
+    let batch = json!({
+        "user_id": app.user_id, "record": record, "context": "cli:naver-calendar",
+        "timeout_ms": 5000, "requests": requests,
+    });
+    let outcomes = harness.forward_batch(batch, PROPFIND).await.unwrap();
+    assert_eq!(outcomes.len(), 2);
+    for outcome in &outcomes {
+        assert_eq!(outcome.status, Some(207), "{:?}", outcome.error);
+        assert_eq!(outcome.body, MULTISTATUS);
+        assert_eq!(outcome.log["created"], true);
+        assert_without_password(&outcome.body);
+    }
+    assert_eq!(outcomes[0].log["seq"], outcomes[1].log["seq"]);
+    let seen = provider.requests();
+    assert_eq!(seen.len(), 2);
+    for request in &seen {
+        assert_eq!(request.server_name, HOST);
+        assert_eq!(
+            request.header("authorization"),
+            Some(basic("tester").as_str())
+        );
+    }
+    let methods: BTreeSet<&str> = seen.iter().map(|seen| seen.method.as_str()).collect();
+    assert_eq!(methods, BTreeSet::from(["PROPFIND", "GET"]));
+    // A method the definition does not list refuses the whole batch with its index.
+    let refused = json!({
+        "user_id": app.user_id, "record": record, "context": "cli:naver-calendar",
+        "requests": [
+            {"method": "GET", "url": ROOT, "headers": [], "body_bytes": 0},
+            {"method": "PATCH", "url": ROOT, "headers": [], "body_bytes": 0},
+        ],
+    });
+    let (status, body) = harness.forward_batch(refused, b"").await.unwrap_err();
+    assert_eq!((status, body["code"].as_str()), (403, Some("not_allowed")));
+    assert_eq!(body["index"], 1);
+    assert_eq!(provider.requests().len(), 2);
 }
 
 #[tokio::test]
@@ -235,15 +341,13 @@ async fn the_definition_bounds_the_methods_and_the_hosts_the_password_reaches() 
         );
     }
     // A token of another provider does not reach the CalDAV host.
-    let google = app.record(
-        "oauth",
-        "google_workspace",
-        &json!({"token": {"access_token": "ya29.injected"}, "obtained_ms": 1}),
-    );
     assert_eq!(
         failure(
             harness
-                .forward(meta(&app, &google, "GET", ROOT, json!([])), b"")
+                .forward(
+                    meta(&app, &google_record(&app), "GET", ROOT, json!([])),
+                    b""
+                )
                 .await
         ),
         (403, "not_allowed".to_string())
@@ -252,46 +356,69 @@ async fn the_definition_bounds_the_methods_and_the_hosts_the_password_reaches() 
 }
 
 #[tokio::test]
-async fn a_mail_password_and_a_vault_record_are_not_taken_by_the_http_calls() {
+async fn records_of_another_kind_or_provider_are_not_taken_by_the_http_calls() {
     let provider = provider_with_log_store(caldav).await;
     let (harness, app, _) = ready(&provider).await;
+    let not_allowed = |status: u16, body: &Value| {
+        assert_eq!((status, body["code"].as_str()), (403, Some("not_allowed")));
+    };
+    // The password of NAVER Mail is used by the mail calls only, a vault record by `release`
+    // only, and a password of a provider that has an OAuth definition exists for no call.
     let mail = app.record(
         "app_password",
         "naver_mail",
         &json!({"username": "tester@naver.com", "password": PASSWORD}),
     );
     let vault = app.record("vault_password", "vault", &json!({"value": PASSWORD}));
-    for record in [&mail, &vault] {
-        assert_eq!(
-            failure(
-                harness
-                    .forward(meta(&app, record, "PROPFIND", ROOT, json!([])), PROPFIND)
-                    .await
-            ),
-            (403, "not_allowed".to_string())
-        );
+    let misnamed = app.record(
+        "app_password",
+        "google_workspace",
+        &json!({"username": "tester", "password": PASSWORD}),
+    );
+    for record in [&mail, &vault, &misnamed] {
+        let (status, body) = harness
+            .forward(meta(&app, record, "PROPFIND", ROOT, json!([])), PROPFIND)
+            .await
+            .err()
+            .expect("the call must fail");
+        not_allowed(status, &body);
         let (status, body) = verify(&harness, &app, record, Some(json!({})), b"")
             .await
             .unwrap_err();
-        assert_eq!((status, body["code"].as_str()), (403, Some("not_allowed")));
+        not_allowed(status, &body);
     }
-    // A token record has no verification: the provider accepted the token when it issued it.
-    let google = app.record(
+    // A token record has no verification, whatever its provider: the call refuses it by its
+    // kind before it reads the plaintext, where `forward` would look for the OAuth definition
+    // (`provider_unknown` for a provider that has none).
+    let google = google_record(&app);
+    let token_named_calendar = app.record(
         "oauth",
-        "google_workspace",
+        "naver_calendar",
         &json!({"token": {"access_token": "ya29.injected"}, "obtained_ms": 1}),
     );
+    for record in [&google, &token_named_calendar] {
+        let (status, body) = verify(&harness, &app, record, None, b"").await.unwrap_err();
+        assert_eq!(
+            (status, body),
+            (
+                403,
+                json!({
+                    "code": "not_allowed",
+                    "message": "the provider definition does not allow this",
+                })
+            )
+        );
+    }
     assert_eq!(
-        verify(&harness, &app, &google, None, b"")
-            .await
-            .unwrap_err(),
-        (
-            403,
-            json!({
-                "code": "not_allowed",
-                "message": "the provider definition does not allow this",
-            })
-        )
+        failure(
+            harness
+                .forward(
+                    meta(&app, &token_named_calendar, "GET", ROOT, json!([])),
+                    b""
+                )
+                .await
+        ),
+        (404, "provider_unknown".to_string())
     );
     assert!(provider.requests().is_empty());
 }
@@ -308,6 +435,7 @@ async fn verify_sends_the_request_of_the_definition_and_states_the_identity() {
         meta["headers"],
         json!([["content-type", "application/json"]])
     );
+    assert_eq!(meta["log"]["created"], true);
     // The response of the provider stays inside the node: the body is the identity, the node
     // and the statement.
     assert_eq!(
@@ -355,10 +483,17 @@ async fn verify_sends_the_request_of_the_definition_and_states_the_identity() {
     assert_eq!(event["body_bytes"], PROPFIND.len());
     assert_eq!(event["context"], "connect:naver_calendar");
 
-    // Without `request` the call is the same. A request of its own, or a payload, is refused
-    // before anything is opened.
+    // Without `request`, or with `null`, the call is the same. A request of its own, or a
+    // payload, is refused before anything is opened.
     assert_eq!(
         verify(&harness, &app, &record, None, b"").await.unwrap().0,
+        200
+    );
+    assert_eq!(
+        verify(&harness, &app, &record, Some(Value::Null), b"")
+            .await
+            .unwrap()
+            .0,
         200
     );
     assert_eq!(
@@ -375,11 +510,11 @@ async fn verify_sends_the_request_of_the_definition_and_states_the_identity() {
             .0,
         400
     );
-    assert_eq!(provider.requests().len(), 2);
+    assert_eq!(provider.requests().len(), 3);
 }
 
 #[tokio::test]
-async fn verify_reports_a_refused_password_and_other_answers_by_their_status() {
+async fn verify_reports_a_refused_password_and_every_other_answer_as_not_verified() {
     let provider = provider_with_log_store(caldav).await;
     let (harness, app, _) = ready(&provider).await;
     // The stand-in accepts the password of `tester` only.
@@ -394,24 +529,50 @@ async fn verify_reports_a_refused_password_and_other_answers_by_their_status() {
         Some(basic("someone.else").as_str())
     );
 
-    // Any other status is the status of the provider with a fixed code. A redirect is not
-    // followed.
-    let provider = provider_with_log_store(|seen: &Seen| match seen.target.as_str() {
-        "/" => Reply::with_body(
-            302,
-            &[("location", "https://caldav.calendar.naver.com/dav/")],
-            b"",
+    // Any other answer is the fixed frame status 502 with the status of the provider in the
+    // body: a 200 of a page that is not the provider accepting the password (the definition
+    // accepts 207 only), a redirect, which is not followed, and a failure of the provider.
+    for (answer, status) in [
+        (
+            Reply::with_body(
+                200,
+                &[("content-type", "text/html")],
+                b"<html>maintenance</html>",
+            ),
+            200,
         ),
-        _ => Reply::json(200, &json!({"ok": true})),
-    })
-    .await;
-    let (harness, app, record) = ready(&provider).await;
-    let (status, _, body) = verify(&harness, &app, &record, None, b"").await.unwrap();
-    assert_eq!(
-        (status, body),
-        (302, json!({"code": "verification_failed"}))
-    );
-    assert_eq!(provider.requests().len(), 1);
+        (
+            Reply::with_body(
+                302,
+                &[("location", "https://caldav.calendar.naver.com/dav/")],
+                b"",
+            ),
+            302,
+        ),
+        (Reply::json(503, &json!({"error": "busy"})), 503),
+    ] {
+        let answered = std::sync::Mutex::new(Some(answer));
+        let provider = provider_with_log_store(move |seen: &Seen| match seen.target.as_str() {
+            "/" => answered
+                .lock()
+                .unwrap()
+                .take()
+                .expect("the probe is sent once"),
+            _ => Reply::json(200, &json!({"ok": true})),
+        })
+        .await;
+        let (harness, app, record) = ready(&provider).await;
+        let (frame_status, _, body) = verify(&harness, &app, &record, None, b"").await.unwrap();
+        assert_eq!(
+            (frame_status, body),
+            (
+                502,
+                json!({"code": "verification_failed", "status": status})
+            ),
+            "{status}"
+        );
+        assert_eq!(provider.requests().len(), 1, "{status}");
+    }
 }
 
 #[tokio::test]
@@ -448,7 +609,8 @@ async fn a_response_that_reflects_the_password_is_withheld() {
 }
 
 /// The two cases of the route of the canary test: a verification that passes, and a refused
-/// record (a vault record is `not_allowed`). The password reaches the CalDAV host only.
+/// record (a vault record is `not_allowed`). The password reaches the CalDAV host only, and no
+/// response of the walk holds it.
 pub async fn canary_routes() -> (BTreeSet<(String, String)>, BTreeSet<(String, String)>) {
     let provider = provider_with_log_store(caldav).await;
     let (harness, app, record) = ready(&provider).await;
@@ -468,11 +630,15 @@ pub async fn canary_routes() -> (BTreeSet<(String, String)>, BTreeSet<(String, S
             .0,
         403
     );
-    let listing = "https://caldav.calendar.naver.com/calendars/tester/";
-    harness
-        .forward(meta(&app, &record, "GET", listing, json!([])), b"")
+    let forwarded = harness
+        .forward(meta(&app, &record, "GET", CALENDARS, json!([])), b"")
         .await
         .unwrap();
+    assert_without_password(&forwarded.body);
+    for (name, value) in &forwarded.headers {
+        assert_without_password(name.as_bytes());
+        assert_without_password(value.as_bytes());
+    }
     for (host, port) in harness.platform.connections() {
         assert!(host == LOG_HOST || host == HOST, "{host}");
         assert_eq!(port, 443);

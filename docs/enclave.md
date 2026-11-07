@@ -836,32 +836,39 @@ confirmation of the entry. `requests` holds 1 to 100 objects; another count is `
 
 The check, at the time a connection is made, that a provider accepts the application password of
 a record whose provider has an application password definition (6.5). The frame is the frame of
-5.8. Its meta is `{"user_id":"...","record":{...},"context":"...","request":{}}`: `request` is
-absent or the empty object and the payload is empty (anything else is `invalid_request`). Its
-response is the frame of 5.8 with `status`, `headers`, `log` and a JSON body.
+5.8. Its meta is `{"user_id":"...","record":{...},"context":"...","request":{},"timeout_ms":30000}`:
+`request` is absent, `null` or the empty object and the payload is empty (anything else is
+`invalid_request`), and `timeout_ms` is read as in 5.8 step 0. Its response is the frame of 5.8
+with `status`, `headers`, `log` and a JSON body.
 
-1. The common front of section 4, and the record opens as in step 1 of 5.8. A token record, a
-   vault record and the password of `naver_mail` are `not_allowed`: the call verifies an
-   application password of a provider of 6.5 and nothing else.
+1. The common front of section 4. The record opens as an application password and nothing else:
+   the provider must have an application password definition (the password of `naver_mail`,
+   whose calls are the mail calls, is `not_allowed`), and the kind must be `app_password`. A
+   record of another kind is `not_allowed` before its plaintext is read, whatever its provider:
+   a token record whose provider has no OAuth definition is `not_allowed` here and
+   `provider_unknown` on `forward`.
 2. The request is the `verify` request of that definition: its method, its address, its headers
    and its body. It passes steps 2 to 4 of 5.8 as a request of the caller would (the validation
-   of the definition guarantees that it does), and steps 5 and 6: the event `provider_request`
-   names it, and the request leaves only after the log store confirmed the entry that holds the
-   event.
-3. Steps 8 to 10 of 5.8, with the time limit of 30,000 milliseconds: the request leaves with the
-   credential header of the password, and the response passes the check of rule E4 with the
-   password as the searched credential (a response that reflects it is `response_withheld`).
+   of the definition guarantees that it does: 6.5), and steps 5 and 6: the event
+   `provider_request` names it, and the request leaves only after the log store confirmed the
+   entry that holds the event.
+3. Steps 8 to 10 of 5.8, within `timeout_ms`: the request leaves with the credential header of
+   the password, and the response passes the check of rule E4 with the password as the
+   searched credential (a response that reflects it is `response_withheld`).
 4. The response of the provider stays inside the node. Its status decides what leaves:
 
 | Status of the provider | `status` of the frame | Body of the frame |
 | --- | --- | --- |
-| 2xx | 200 | `{"identity":"...","node":"...","statement":{"body":"...","sig":"..."}}`: the identity of the account (`{login}@{domain}` of the definition), the identifier of the node and the statement `app_password_verified` of protocol.md (its `provider` is the provider of the record) |
+| A status of `verify.accepted` of the definition | 200 | `{"identity":"...","node":"...","statement":{"body":"...","sig":"..."}}`: the identity of the account (`{login}@{domain}` of the definition), the identifier of the node and the statement `app_password_verified` of protocol.md (its `provider` is the provider of the record) |
 | 401 | 401 | `{"code":"authentication_failed"}` |
-| Any other | That status, as it is | `{"code":"verification_failed"}` |
+| Any other | 502 | `{"code":"verification_failed","status":n}`: `n` is the status of the provider, as an integer |
 
-The node follows no redirect: a 3xx answer is a status of the last row. The `headers` of the frame
-are `[["content-type","application/json"]]` in every row. The call takes a forward slot and its
-share of the body budget as `forward` does (section 8).
+The three frame statuses are the node's: a 2xx answer that is not an accepted status (a page that
+answers 200 whatever the credential) is the last row, not the first. The node follows no
+redirect: a 3xx answer is a status of the last row too. The `headers` of the frame are
+`[["content-type","application/json"]]` in every row, and no other byte of the provider response
+leaves. The call takes a forward slot and its share of the body budget as `forward` does
+(section 8).
 
 ### 5.9 `POST /v1/release`
 
@@ -1289,7 +1296,7 @@ program carries no client values for it (section 9).
     "account_domain": "naver.com",
     "methods": ["PROPFIND", "REPORT", "GET", "PUT", "DELETE"],
     "api": [{"host": "caldav.calendar.naver.com", "prefixes": ["/"], "exact": []}],
-    "verify": {"method": "PROPFIND", "url": "https://caldav.calendar.naver.com/", "headers": [["Depth", "0"], ["Content-Type", "application/xml; charset=utf-8"]], "body": "<?xml version=\"1.0\" encoding=\"utf-8\"?><d:propfind xmlns:d=\"DAV:\"><d:prop><d:current-user-principal/></d:prop></d:propfind>"}
+    "verify": {"method": "PROPFIND", "url": "https://caldav.calendar.naver.com/", "accepted": [207], "headers": [["Depth", "0"], ["Content-Type", "application/xml; charset=utf-8"]], "body": "<?xml version=\"1.0\" encoding=\"utf-8\"?><d:propfind xmlns:d=\"DAV:\"><d:prop><d:current-user-principal/></d:prop></d:propfind>"}
   }
 }
 ```
@@ -1297,10 +1304,10 @@ program carries no client values for it (section 9).
 | Key | Meaning |
 | --- | --- |
 | `credential` | `app_password`, the one value. The key tells the two forms of definition apart: an entry without it is an OAuth definition |
-| `account_domain` | The domain of the account: a lower-case DNS name with a dot. The `username` of the plaintext of a record is the login of the account, with or without `@` and this domain, compared without regard to case: 1 to 64 letters, digits, `_`, `.` and `-` (another form is `record_invalid`). The login is the user name of the HTTP Basic credential, and `{login}@{domain}` is the identity a verification declassifies |
+| `account_domain` | The domain of the account: a lower-case DNS name with a dot. The `username` of the plaintext of a record is the login of the account, with or without `@` and this domain, compared without regard to case: 1 to 64 letters, digits, `_`, `.` and `-` (another form is `record_invalid`). The login is the user name of the HTTP Basic credential, and `{login}@{domain}` is the identity a verification declassifies. This form of the login is one rule for every application password definition (`AppPassword::from_plaintext` in `enclave/src/mail.rs`): a provider whose account names have another form needs a change of that rule, which is a release |
 | `methods` | The methods `forward` sends with the password: distinct upper-case HTTP tokens, at least one. A request of another method is `not_allowed` |
 | `api` | Section 7: the hosts and the paths a password of this provider may be sent to, under the rules of an `api` list of 6.1 |
-| `verify` | The request of `app-password/verify`: `method` (one of `methods`), `url` (an address that passes the address check of this definition), `headers` (`[name, value]` pairs under the header rules of 5.8 step 4; the credential header `Authorization` is refused) and `body` (text of at most 4,096 bytes) |
+| `verify` | The request of `app-password/verify` (5.8c): `method` (one of `methods`), `url` (an address that passes the address check of this definition), `accepted` (the statuses that mean the provider accepted the password: distinct 2xx statuses, at least one; any other 2xx is no acceptance), `headers` (`[name, value]` pairs under the header rules of 5.8 step 4; a header that `forward` drops or refuses, the credential header `Authorization` among them, is refused here, so the request leaves as it is written) and `body` (text of at most 4,096 bytes) |
 
 The values of the one definition:
 
@@ -1309,14 +1316,16 @@ The values of the one definition:
 | account_domain | `naver.com` |
 | methods | `PROPFIND`, `REPORT`, `GET`, `PUT`, `DELETE` |
 | api | `caldav.calendar.naver.com`, prefix `/` (section 7) |
-| verify | `PROPFIND https://caldav.calendar.naver.com/` with `Depth: 0` and `Content-Type: application/xml; charset=utf-8`, and the `propfind` body above, which asks for `current-user-principal` |
+| verify | `PROPFIND https://caldav.calendar.naver.com/` with `Depth: 0` and `Content-Type: application/xml; charset=utf-8`, and the `propfind` body above, which asks for `current-user-principal`. Accepted: 207 (Multi-Status, the answer of a PROPFIND that succeeded) |
 
 The definitions are validated when the node loads them, and a node with an invalid one does not
 start (`AppPasswordDefinition::validate` in `enclave/src/providers/mod.rs`): the name is a valid
 name, the domain has the form above, the methods and the `api` rules follow their rules, and the
-`verify` request is one that `forward` would send. A key the format does not define is refused,
-and so is a key of 6.1 on such an entry. `health` lists the providers of these definitions as
-`app_password_providers` (5.1).
+`verify` request is one that `forward` would send as it is written (its method is one of
+`methods`, its address passes the address check, none of its headers is one that 5.8 step 4 drops
+or refuses, its body is within its limit, its accepted statuses are distinct 2xx statuses). A key
+the format does not define is refused, and so is a key of 6.1 on such an entry. `health` lists the
+providers of these definitions as `app_password_providers` (5.1).
 
 ## 7. The address check (`forward`)
 

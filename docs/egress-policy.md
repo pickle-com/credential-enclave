@@ -217,7 +217,7 @@ as an integer, 0 for a transport failure) and `provider_error` (rule E5).
 | `Content-Encoding` of the response | Present and not `identity`: `response_withheld`. The node does not hand on a body it cannot search |
 | `Transfer-Encoding` of the response | A coding other than `chunked`: `response_withheld`. The node sends no `TE` header, so `chunked` is the one transfer coding it removes. Under another one (`gzip, chunked`) the body would leave still coded, without the header that says so |
 | Response headers | The hop-by-hop headers, `Set-Cookie` and `Set-Cookie2` are left out. The node drops the `Cookie` of every request, so no cookie is in use, and a cookie handed to the caller would be an access that no log entry records |
-| The reflection check | A header name, a header value and the body are each read as received and with their percent escapes decoded, up to three times for a value that was encoded more than once. When one of these readings holds the injected credential (the token without the prefix of the definition) in one of these forms, the call fails with `response_withheld`: as it is, base64 or base64url (each of the three byte alignments, without padding), hexadecimal (lower or upper case). Decoding the escapes finds the credential under every percent-encoding: whichever bytes an encoder escapes and whichever case its digits have. A form shorter than 8 bytes is not searched for. The check overwrites the headers and the body it withholds with zeros before it drops them. It runs off the threads that serve the calls, and it makes at most one copy of what it reads |
+| The reflection check | A header name, a header value and the body are each read as received and with their percent escapes decoded, up to three times for a value that was encoded more than once. When one of these readings holds the injected credential (the token without the prefix of the definition, or the application password) in one of these forms, the call fails with `response_withheld`: as it is, base64 or base64url (each of the three byte alignments, without padding), hexadecimal (lower or upper case). Decoding the escapes finds the credential under every percent-encoding: whichever bytes an encoder escapes and whichever case its digits have. A form shorter than 8 bytes is not searched for. The check overwrites the headers and the body it withholds with zeros before it drops them. It runs off the threads that serve the calls, and it makes at most one copy of what it reads |
 | Redirects | Not followed. A 3xx response is returned as it is |
 
 `response_withheld` is a failure after the entry `provider_request` is on the chain: the
@@ -351,7 +351,7 @@ calls, and `egress/sink-callers.tsv` (the one caller of K1).
 | `POST /v1/mail/verify` | `identity` D, `node` P, `statement` S (identity D, record bindings E/P), `log` P, after E4 |
 | `POST /v1/mail/read` | `status` P, `headers` P, bounded provider mail data R, `log` P, after E4 |
 | `POST /v1/mail/submit` | `status` P, `headers` P, submission status P, SMTP code R, `log` P, after E4. A lost reply is not a rejection |
-| `POST /v1/app-password/verify` | `status` P (200 for an accepted password, 401 for a refused one) or R (any other status of the provider, as it is), `headers` P, the body: `identity` D, `node` P and `statement` S (identity D, record bindings E/P) for an accepted password, else `code` P; `log` P, after E4 |
+| `POST /v1/app-password/verify` | `status` P (200 for an accepted password, 401 for a refused one, 502 for any other answer), `headers` P, the body: `identity` D, `node` P and `statement` S (identity D, record bindings E/P) for an accepted password, else `code` P and, for any other answer, `status` R (the status of the provider as an integer); `log` P, after E4 |
 | `POST /v1/release` | `value` V, `log` P |
 | `POST /v1/close` | `accounts` P |
 | `POST /v1/close/heads` | `heads` S, `next` E, `truncated` P, `skipped` P |
@@ -447,12 +447,13 @@ password is used by `forward`, `forward/batch` and `app-password/verify`. These 
 HTTP Basic of the login and the password, in the header `Authorization`, through sink K3 to the
 hosts of the `api` rules of that definition only, with the methods of that definition only, after
 the event `provider_request` of the request is on the chain and the log store confirmed it. The
-request of `app-password/verify` is the one the definition names (`verify`); a 2xx answer
-declassifies the identity, a 401 leaves as the fixed code `authentication_failed`, and any
-other status leaves as that status with the fixed code `verification_failed`: no byte of the
-provider response leaves that call. The response of a `forward` request passes the reflection
-check of E4 with the password as the searched credential, as the response of a token request
-does with the token.
+request of `app-password/verify` is the one the definition names (`verify`); an answer with a
+status the definition accepts declassifies the identity, a 401 leaves as the fixed code
+`authentication_failed`, and any other answer leaves as the fixed frame status 502 with the
+fixed code `verification_failed` and the status of the provider as an integer: no other byte of
+the provider response leaves that call. The response of a `forward` request passes the
+reflection check of E4 with the password as the searched credential, as the response of a token
+request does with the token.
 
 The two mail authentication sinks are K6 (`AppPassword::imap`) and K7 (`AppPassword::smtp`).
 Both use `Egress::open_mail`, whose destination check admits only imap.naver.com:993 and
@@ -464,6 +465,6 @@ assumption and the limits of E4 remain the same as for HTTP forwarding.
 All mail calls share the forward semaphore and body budget. A call reserves six body limits
 plus two metadata limits to cover MIME and JSON/base64 copies. IMAP calls also reserve the
 512 MiB maximum parser buffer of async-imap 0.12, since a declared literal can allocate
-ahead of the bounded stream. Every call has an
+ahead of the bounded stream. Every mail call has an
 end-to-end 30 second deadline including admission. IMAP reads use EXAMINE and BODY.PEEK.
 SMTP performs one transaction; no transport failure triggers a second connection or submission.
