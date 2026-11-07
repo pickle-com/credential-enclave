@@ -22,7 +22,7 @@
 
   // ---- Constants ----
 
-  const VERSION = 37;
+  const VERSION = 38;
   const MASTER_KEY_SERVICE = "com.pickle.client.secure.master-key";
   const LEDGER_SERVICE = "com.pickle.client.secure.ledger";
   const LEDGER_STORE_KEY = "ledger";
@@ -1337,7 +1337,8 @@
   const PROVIDER_NAMES = new Map([
     ["google_workspace", "Google"], ["microsoft", "Microsoft"], ["slack", "Slack"],
     ["notion", "Notion"], ["x", "X"], ["link", "Link"], ["granola", "Granola"],
-    ["mercury", "Mercury"], ["naver_mail", "NAVER Mail"], ["github", "GitHub"],
+    ["mercury", "Mercury"], ["naver_mail", "NAVER Mail"], ["naver_calendar", "NAVER Calendar"],
+    ["github", "GitHub"],
   ]);
 
   // For every service (a product inside a provider) of a provider request: the display name, the
@@ -1360,6 +1361,7 @@
     ["granola", { name: "Granola", short: "", image: "connection-icon-granola", glyph: false }],
     ["mercury", { name: "Mercury", short: "", image: "connection-icon-mercury", glyph: false }],
     ["naver_mail", { name: "NAVER Mail", short: "", image: "connection-icon-naver-mail", glyph: false }],
+    ["naver_calendar", { name: "NAVER Calendar", short: "", image: "connection-icon-naver-calendar", glyph: false }],
     ["github", { name: "GitHub", short: "", image: "connection-icon-github", glyph: false }],
   ]);
 
@@ -1399,7 +1401,8 @@
   // The kinds of context the caller (the operator domain) declared. The definition chooses its
   // wording per kind.
   const CONTEXT_KINDS = new Map([
-    ["connect:naver_mail", "connect"], ["connect:installation", "repositories"],
+    ["connect:naver_mail", "connect"], ["connect:naver_calendar", "connect"],
+    ["connect:installation", "repositories"],
     ["link:spend_watch", "payment_check"], ["browser:link_card", "checkout_card"],
     ["browser:fill", "web_fill"], ["context:today_calendar", "today_calendar"],
     ["profile:connected_profiles", "profiles"], ["profile:x_bio", "x_bio"],
@@ -4349,176 +4352,220 @@
     return { provider: provider };
   }
 
-  /** An application password is encrypted on the device, and the completion statement is checked
-   *  against the delegated node and the record. */
+  // ---- Application passwords ----
+
+  // The providers whose credential is an application password the user makes at the provider, by
+  // the provider name of the record and of the secure API path (/api/secure/connections/{provider}/
+  // app-password and /setup), with the domain of the account the identity belongs to. The argument
+  // `provider` of the procedures names one of them; absent or empty it is naver_mail, the first.
+  const APP_PASSWORD_PROVIDERS = new Map([
+    ["naver_mail", { domain: "naver.com" }],
+    ["naver_calendar", { domain: "naver.com" }],
+  ]);
+
+  function appPasswordProvider(value) {
+    const provider = stringArgument(value).trim();
+    if (provider === "") return "naver_mail";
+    if (!APP_PASSWORD_PROVIDERS.has(provider)) throw native.error("invalid_input", "app password provider");
+    return provider;
+  }
+
+  /** The account form of a provider: a local part of 1 to 64 of [a-z0-9_.-] at the domain of the
+   *  provider. */
+  function appPasswordAccountPattern(provider) {
+    const domain = APP_PASSWORD_PROVIDERS.get(provider).domain.replace(/\./g, "\\.");
+    return new RegExp("^[a-z0-9_.-]{1,64}@" + domain + "$");
+  }
+
+  function appPasswordPath(provider, tail) {
+    return "/api/secure/connections/" + encodeURIComponent(provider) + "/" + tail;
+  }
+
+  /** An application password is encrypted on the device as a record of its provider, and the
+   *  completion statement is checked against the delegated node, the provider and the record. */
   async function connectAppPassword(args) {
+    const provider = appPasswordProvider(args.provider);
     const username = stringArgument(args.username).trim().toLowerCase();
     const password = stringArgument(args.password);
-    if (!username || !password) throw native.error("invalid_input", "mail connection");
+    if (!username || !password) throw native.error("invalid_input", "app password connection");
     const { keys, offered } = await presentKeysWithNodes();
     const ledger = await liveGrantLedger(keys, offered);
     const custody = await recordCustody();
-    const record = sealRecord(keys, custody, "app_password", "naver_mail", {
+    const record = sealRecord(keys, custody, "app_password", provider, {
       username: username, password: password,
     });
-    return saveAppPasswordRecord(keys, ledger, record, args);
+    return saveAppPasswordRecord(keys, ledger, record, provider, args);
   }
 
-  async function saveAppPasswordRecord(keys, ledger, record, args) {
+  async function saveAppPasswordRecord(keys, ledger, record, provider, args) {
     const body = { record: record };
     if (typeof args.request_id === "string") body.request_id = args.request_id;
     if (typeof args.setup_id === "string") body.setup_id = args.setup_id;
-    const saved = (await api("PUT", "/api/secure/connections/naver_mail/app-password", body)).json;
+    const saved = (await api("PUT", appPasswordPath(provider, "app-password"), body)).json;
     const node = typeof saved.node === "string" ? ledger.nodes[saved.node] : undefined;
     let verified = false;
     try {
       const statement = openSigned(saved.statement, node.sign_pk, purpose("statement") + "\n");
       verified = statement.type === "app_password_verified" && statement.node === saved.node &&
         statement.user_id === userId() && sameBytes(statement.sign_pk, keys.signPk) &&
-        statement.provider === "naver_mail" && statement.record_id === record.id &&
+        statement.provider === provider && statement.record_id === record.id &&
         statement.key_id === keys.keyId && statement.identity === saved.identity &&
         sameBytes(statement.ciphertext_sha256, native.sha256(encode(utf8(record.ct))));
     } catch (error) {
       verified = false;
     }
-    if (!verified) throw native.error("unverified_connection", "mail completion statement");
-    return { provider: "naver_mail", connection_id: saved.connection_id, identity: saved.identity };
+    if (!verified) throw native.error("unverified_connection", "app password completion statement");
+    return { provider: provider, connection_id: saved.connection_id, identity: saved.identity };
   }
 
   // ---- The device-side reception of an application password issued in the browser ----
 
-  const MAIL_SETUP_CONTEXT = "pickle-app-password-setup-v1";
-  const MAIL_SETUP_PATH = "/api/secure/connections/naver_mail/setup";
-  const MAIL_SETUP_TTL_MS = 2 * 60 * 60 * 1000;
+  const APP_PASSWORD_SETUP_CONTEXT = "pickle-app-password-setup-v1";
+  const APP_PASSWORD_SETUP_TTL_MS = 2 * 60 * 60 * 1000;
 
-  function mailSetupItem() {
+  /** The one pending setup request of this device and account, whatever its provider (the backend
+   *  keeps one pending request per account). The service name is the one of the items devices hold
+   *  from the time NAVER Mail was the only provider with a setup. The published state of the request
+   *  is the tree mail_setup, for the same reason: {phase, provider, identity?, error}. */
+  function appPasswordSetupItem() {
     return {service: "com.pickle.client.secure.mail-setup", account: userId(), synchronizable: false};
   }
 
-  function readMailSetup() {
-    const raw = native.keychainGet(mailSetupItem());
+  function appPasswordSetupPath(provider) {
+    return appPasswordPath(provider, "setup");
+  }
+
+  function readAppPasswordSetup() {
+    const raw = native.keychainGet(appPasswordSetupItem());
     return raw === null ? null : JSON.parse(text(decode(raw)));
   }
 
-  function writeMailSetup(value) {
-    const item = mailSetupItem();
+  function writeAppPasswordSetup(value) {
+    const item = appPasswordSetupItem();
     native.keychainSet({service: item.service, account: item.account, synchronizable: false,
       accessible: "after_first_unlock", value: encode(utf8(JSON.stringify(value)))});
   }
 
   async function beginAppPasswordSetup(args) {
+    const provider = appPasswordProvider(args.provider);
     const { keys, offered } = await presentKeysWithNodes();
     await liveGrantLedger(keys, offered);
     let identity = stringArgument(args.identity).trim().toLowerCase();
-    if (identity && identity.indexOf("@") < 0) identity += "@naver.com";
-    if (identity && !/^[a-z0-9_.-]{1,64}@naver\.com$/.test(identity)) {
-      throw native.error("invalid_input", "NAVER account");
+    if (identity && identity.indexOf("@") < 0) identity += "@" + APP_PASSWORD_PROVIDERS.get(provider).domain;
+    if (identity && !appPasswordAccountPattern(provider).test(identity)) {
+      throw native.error("invalid_input", "app password account");
     }
-    let local = readMailSetup();
+    let local = readAppPasswordSetup();
     if (local && (local.intent.key_id !== keys.keyId || local.intent.expires_ms <= native.nowMs())) {
       // The capturing state of the server does not release its observation protection on a
       // cancellation alone.
-      await api("DELETE", MAIL_SETUP_PATH + "/" + local.intent.id);
-      native.keychainDelete(mailSetupItem());
+      await api("DELETE", appPasswordSetupPath(local.intent.provider) + "/" + local.intent.id);
+      native.keychainDelete(appPasswordSetupItem());
       local = null;
     }
     if (local) {
-      const remote = (await api("GET", MAIL_SETUP_PATH, null, {setup_id: local.intent.id})).json.setup;
+      const remote = (await api("GET", appPasswordSetupPath(local.intent.provider), null,
+        {setup_id: local.intent.id})).json.setup;
       if (remote && remote.setup_id === local.intent.id && remote.request.payload === local.signed.payload &&
           (remote.phase === "failed" || remote.phase === "cancelled")) {
-        native.keychainDelete(mailSetupItem());
+        native.keychainDelete(appPasswordSetupItem());
         local = null;
       }
     }
-    if (local && local.intent.identity !== identity) {
-      throw native.error("setup_in_progress", "another mail setup is pending");
+    if (local && (local.intent.provider !== provider || local.intent.identity !== identity)) {
+      throw native.error("setup_in_progress", "another app password setup is pending");
     }
     if (!local) {
       const sk = native.randomBytes(32);
       const now = Math.floor(native.nowMs());
       const intent = {id: native.randomBytes(16), user_id: userId(), key_id: keys.keyId,
-        provider: "naver_mail", recipient_pk: native.x25519PublicKey(sk), identity: identity,
-        request_id: stringArgument(args.request_id), issued_ms: now, expires_ms: now + MAIL_SETUP_TTL_MS};
+        provider: provider, recipient_pk: native.x25519PublicKey(sk), identity: identity,
+        request_id: stringArgument(args.request_id), issued_ms: now,
+        expires_ms: now + APP_PASSWORD_SETUP_TTL_MS};
       const payload = encode(utf8(JSON.stringify(intent)));
       const signature = native.ed25519Sign(keys.signSeed,
-        encode(concat(utf8(MAIL_SETUP_CONTEXT + "\n"), decode(payload))));
+        encode(concat(utf8(APP_PASSWORD_SETUP_CONTEXT + "\n"), decode(payload))));
       local = {intent: intent, sk: sk, signed: {payload: payload, signature: signature}, record: null};
       // The same request and reception key are used again when the POST response is lost.
-      writeMailSetup(local);
+      writeAppPasswordSetup(local);
     }
-    const saved = (await api("POST", MAIL_SETUP_PATH, local.signed)).json;
-    native.publish({state: {mail_setup: {phase: saved.phase, error: null}}});
+    const saved = (await api("POST", appPasswordSetupPath(provider), local.signed)).json;
+    native.publish({state: {mail_setup: {phase: saved.phase, provider: provider, error: null}}});
     return saved;
   }
 
   async function finishAppPasswordSetup(keys, ledger) {
-    const local = readMailSetup();
+    const local = readAppPasswordSetup();
     if (!local) return;
     const intent = local.intent;
+    const provider = intent.provider;
+    const path = appPasswordSetupPath(provider);
     if (intent.user_id !== userId() || intent.key_id !== keys.keyId || intent.expires_ms <= native.nowMs()) {
-      native.keychainDelete(mailSetupItem());
-      native.publish({state: {mail_setup: {phase: "expired", error: null}}});
+      native.keychainDelete(appPasswordSetupItem());
+      native.publish({state: {mail_setup: {phase: "expired", provider: provider, error: null}}});
       return;
     }
     try {
-      const pending = (await api("GET", MAIL_SETUP_PATH, null, {setup_id: intent.id})).json.setup;
+      const pending = (await api("GET", path, null, {setup_id: intent.id})).json.setup;
       if (!pending) {
         if (local.completed) {
-          native.keychainDelete(mailSetupItem());
-          native.publish({state: {mail_setup: {phase: "connected", identity: local.completed.identity, error: null}}});
+          native.keychainDelete(appPasswordSetupItem());
+          native.publish({state: {mail_setup: {phase: "connected", provider: provider,
+            identity: local.completed.identity, error: null}}});
         }
         return;
       }
       if (pending.setup_id !== intent.id || pending.request.payload !== local.signed.payload ||
           pending.request.signature !== local.signed.signature) {
-        throw native.error("unverified_connection", "mail setup request");
+        throw native.error("unverified_connection", "app password setup request");
       }
-      native.publish({state: {mail_setup: {phase: pending.phase, error: null}}});
+      native.publish({state: {mail_setup: {phase: pending.phase, provider: provider, error: null}}});
       if (pending.phase === "failed" || pending.phase === "cancelled") {
-        native.keychainDelete(mailSetupItem());
+        native.keychainDelete(appPasswordSetupItem());
         return;
       }
       if (pending.phase !== "captured" && pending.phase !== "connected") return;
       const custody = heldCustody(ledger, native.nowMs());
       if (custody === null) return;
       if (!local.record) {
-        if (!pending.capture) throw native.error("invalid_response", "mail setup capture");
+        if (!pending.capture) throw native.error("invalid_response", "app password setup capture");
         const opened = native.hpkeOpen({
           kem: "x25519", kdf: "sha256", aead: "chacha20poly1305", recipientPrivateKey: local.sk,
-          info: encode(utf8(MAIL_SETUP_CONTEXT)), aad: native.sha256(local.signed.payload),
+          info: encode(utf8(APP_PASSWORD_SETUP_CONTEXT)), aad: native.sha256(local.signed.payload),
           enc: pending.capture.enc, ciphertext: pending.capture.ct,
         });
         const credential = JSON.parse(text(decode(opened)));
         if (!credential || typeof credential.username !== "string" ||
-            !/^[a-z0-9_.-]{1,64}@naver\.com$/.test(credential.username) ||
+            !appPasswordAccountPattern(provider).test(credential.username) ||
             typeof credential.password !== "string" || !credential.password ||
             (intent.identity && intent.identity !== credential.username)) {
-          throw native.error("unverified_connection", "mail setup account");
+          throw native.error("unverified_connection", "app password setup account");
         }
-        local.record = sealRecordBytes(keys, custody, "app_password", "naver_mail", opened);
+        local.record = sealRecordBytes(keys, custody, "app_password", provider, opened);
         // The same ciphertext is sent again so that a lost response does not become a second
         // registration.
-        writeMailSetup(local);
+        writeAppPasswordSetup(local);
       }
-      const saved = await saveAppPasswordRecord(keys, ledger, local.record, {
+      const saved = await saveAppPasswordRecord(keys, ledger, local.record, provider, {
         setup_id: intent.id, request_id: intent.request_id,
       });
       local.completed = saved;
-      writeMailSetup(local);
-      await api("DELETE", MAIL_SETUP_PATH + "/" + intent.id);
-      native.keychainDelete(mailSetupItem());
-      native.publish({state: {mail_setup: {phase: "connected", identity: saved.identity, error: null}}});
+      writeAppPasswordSetup(local);
+      await api("DELETE", path + "/" + intent.id);
+      native.keychainDelete(appPasswordSetupItem());
+      native.publish({state: {mail_setup: {phase: "connected", provider: provider, identity: saved.identity,
+        error: null}}});
     } catch (error) {
       // Neither the remote error body nor a secret is published. The next sync resumes the stored
       // request.
-      native.publish({state: {mail_setup: {phase: "pending", error: failureCode(error)}}});
+      native.publish({state: {mail_setup: {phase: "pending", provider: provider, error: failureCode(error)}}});
     }
   }
 
   async function cancelAppPasswordSetup() {
-    const local = readMailSetup();
-    if (local) await api("DELETE", MAIL_SETUP_PATH + "/" + local.intent.id);
-    native.keychainDelete(mailSetupItem());
+    const local = readAppPasswordSetup();
+    if (local) await api("DELETE", appPasswordSetupPath(local.intent.provider) + "/" + local.intent.id);
+    native.keychainDelete(appPasswordSetupItem());
     native.publish({state: {mail_setup: null}});
     return {};
   }
@@ -4846,7 +4893,7 @@
   async function eraseAccountKeys() {
     deleteMasterKey();
     native.keychainDelete(ledgerItem());
-    native.keychainDelete(mailSetupItem());
+    native.keychainDelete(appPasswordSetupItem());
     native.storeSet(LEDGER_STORE_KEY, null);
     native.storeSet(LOG_SUMMARY_STORE_KEY, null);
     native.storeSet(SEALING_CHECK_STORE_KEY, null);

@@ -312,3 +312,114 @@ test("a verified run is not repeated within the period, and a new runtime verifi
   assert.equal(world.reports.length, 2);
   assert.equal(world.reports[1].status, "verified");
 });
+
+// ---- Application passwords: the provider of the procedures ----
+
+/** A world whose account has delegated to one node of the latest listed release (the run of
+ *  session_ready), and the program on it. */
+async function delegatedProgram() {
+  const world = new bridge.World();
+  world.createAccount();
+  const listed = bridge.listedMeasurements(source);
+  const latest = listed[listed.length - 1];
+  world.addNode({ release: latest.release, measurement: latest });
+  const program = bridge.loadProgram(source, world);
+  await program.onEvent("session_ready", {});
+  return { world: world, program: program };
+}
+
+function requestsTo(world, method, path) {
+  return world.requests.filter((request) => (request.method || "GET") === method && request.path === path);
+}
+
+/** A value the program returned, as plain data of this realm (the objects of the program belong to
+ *  the context the loader made, so a strict deep comparison would see another prototype). */
+function plain(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+test("connect_app_password seals the record for the provider of the argument, saves it on the path of that provider and checks the statement against it; the absent provider is naver_mail", async () => {
+  const { world, program } = await delegatedProgram();
+  const calendar = await program.procedures.connect_app_password({
+    username: "Alice@naver.com", password: "fixture12345", provider: "naver_calendar",
+  });
+  assert.deepEqual(plain(calendar), { provider: "naver_calendar", connection_id: "connection-1", identity: "alice@naver.com" });
+  const saves = requestsTo(world, "PUT", "/api/secure/connections/naver_calendar/app-password");
+  assert.equal(saves.length, 1);
+  const record = JSON.parse(saves[0].body).record;
+  assert.equal(record.kind, "app_password");
+  assert.equal(record.provider, "naver_calendar");
+  assert.equal(record.user_id, world.userId);
+  assert.ok(!saves[0].body.includes("fixture12345"), "the password leaves only inside the ciphertext");
+
+  const mail = await program.procedures.connect_app_password({ username: "alice@naver.com", password: "fixture12345" });
+  assert.equal(mail.provider, "naver_mail");
+  assert.equal(requestsTo(world, "PUT", "/api/secure/connections/naver_mail/app-password").length, 1);
+  assert.equal(JSON.parse(requestsTo(world, "PUT", "/api/secure/connections/naver_mail/app-password")[0].body).record.provider, "naver_mail");
+
+  const before = world.requests.length;
+  await assert.rejects(
+    program.procedures.connect_app_password({ username: "alice@naver.com", password: "fixture12345", provider: "naver_cafe" }),
+    (error) => error.code === "invalid_input");
+  assert.equal(world.requests.length, before, "an unknown provider sends nothing");
+
+  // A statement that names another provider than the path is not a verified connection.
+  world.appPasswordStatementProvider = "naver_mail";
+  await assert.rejects(
+    program.procedures.connect_app_password({ username: "alice@naver.com", password: "fixture12345", provider: "naver_calendar" }),
+    (error) => error.code === "unverified_connection");
+});
+
+test("begin_app_password_setup registers the request on the path of its provider and refuses another provider while it is pending; sync finishes the capture as a record of that provider", async () => {
+  const { world, program } = await delegatedProgram();
+  const begun = await program.procedures.begin_app_password_setup({ identity: "Alice", provider: "naver_calendar" });
+  assert.equal(begun.phase, "ready");
+  const posts = requestsTo(world, "POST", "/api/secure/connections/naver_calendar/setup");
+  assert.equal(posts.length, 1);
+  const signed = JSON.parse(posts[0].body);
+  const intent = JSON.parse(bytes(signed.payload).toString("utf8"));
+  assert.equal(intent.provider, "naver_calendar");
+  assert.equal(intent.identity, "alice@naver.com");
+  assert.equal(intent.user_id, world.userId);
+  assert.deepEqual(world.state.mail_setup, { phase: "ready", provider: "naver_calendar", error: null });
+  assert.equal(world.keychain.has("com.pickle.client.secure.mail-setup\n" + world.userId), true);
+
+  await assert.rejects(
+    program.procedures.begin_app_password_setup({ identity: "alice", provider: "naver_mail" }),
+    (error) => error.code === "setup_in_progress");
+  assert.equal(requestsTo(world, "POST", "/api/secure/connections/naver_mail/setup").length, 0);
+  // The same request again is the same registration.
+  const again = await program.procedures.begin_app_password_setup({ identity: "alice", provider: "naver_calendar" });
+  assert.deepEqual(plain(again), plain(begun));
+  assert.equal(requestsTo(world, "POST", "/api/secure/connections/naver_calendar/setup").length, 2);
+
+  // The browser issued the password: the backend holds the capture sealed to the reception key.
+  const password = "fixture12345";
+  const plaintext = utf8(JSON.stringify({ username: "alice@naver.com", password: password }));
+  const sealed = bridge.hpkeSeal("chacha20poly1305", bytes(intent.recipient_pk), utf8("pickle-app-password-setup-v1"),
+    bridge.sha("sha256", bytes(signed.payload)), plaintext);
+  world.appPasswordSetup.phase = "captured";
+  world.appPasswordSetup.capture = { enc: b64u(sealed.enc), ct: b64u(sealed.ciphertext) };
+  await program.procedures.sync();
+  assert.equal(world.appPasswordSaves.length, 1);
+  assert.equal(world.appPasswordSaves[0].provider, "naver_calendar");
+  assert.equal(world.appPasswordSaves[0].body.setup_id, intent.id);
+  assert.equal(world.appPasswordSaves[0].body.record.provider, "naver_calendar");
+  assert.deepEqual(world.state.mail_setup,
+    { phase: "connected", provider: "naver_calendar", identity: "alice@naver.com", error: null });
+  assert.equal(world.appPasswordSetup, null, "the request is deleted after the save");
+  assert.equal(world.keychain.has("com.pickle.client.secure.mail-setup\n" + world.userId), false);
+  assert.ok(!JSON.stringify(world.state).includes(password));
+  assert.ok(!JSON.stringify(world.appPasswordSaves).includes(password));
+});
+
+test("cancel_app_password_setup deletes the pending request on the path of its provider and clears the published setup", async () => {
+  const { world, program } = await delegatedProgram();
+  await program.procedures.begin_app_password_setup({ identity: "alice", provider: "naver_calendar" });
+  const setupId = world.appPasswordSetup.setup_id;
+  assert.deepEqual(plain(await program.procedures.cancel_app_password_setup()), {});
+  assert.equal(requestsTo(world, "DELETE", "/api/secure/connections/naver_calendar/setup/" + setupId).length, 1);
+  assert.equal(world.appPasswordSetup, null);
+  assert.equal(world.state.mail_setup, undefined);
+  assert.equal(world.keychain.has("com.pickle.client.secure.mail-setup\n" + world.userId), false);
+});
