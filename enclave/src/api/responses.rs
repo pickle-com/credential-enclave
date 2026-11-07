@@ -325,6 +325,10 @@ pub struct Health<'a> {
     pub grants: usize,
     /// P: mail providers compiled into the measured program.
     pub mail_providers: &'a [&'a str],
+    /// P: the providers of the application password definitions compiled into the measured
+    /// program: the providers whose records of kind `app_password` `forward` and
+    /// `app-password/verify` take.
+    pub app_password_providers: &'a [&'a str],
     /// E and P: the log store of the node, null when it has none.
     pub log_store: Option<LogStoreState<'a>>,
     /// P: the counts of the log.

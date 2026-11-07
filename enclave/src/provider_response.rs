@@ -58,8 +58,31 @@ impl CheckedResponse {
     }
 }
 
+/// The credential of an HTTP request to a provider: the value of the credential header, for the
+/// TLS client, and the secret that the response of the request is searched for with [`check`].
+/// For a token record the secret is the token and the header value is made of the prefix of the
+/// definition and that token (`crate::oauth::OauthPlaintext::credential`); for an application
+/// password the secret is the password and the header value is HTTP Basic
+/// (`crate::mail::AppPassword::http_credential`). Only those two functions create one.
+pub struct Credential {
+    header: Secret<String>,
+    secret: Secret<String>,
+}
+
+impl Credential {
+    /// A credential whose header value is `header` and whose searched secret is `secret`.
+    pub(crate) fn new(header: Secret<String>, secret: Secret<String>) -> Credential {
+        Credential { header, secret }
+    }
+
+    /// The header value for the TLS client, and the secret for the check of the response.
+    pub fn into_parts(self) -> (Secret<String>, Secret<String>) {
+        (self.header, self.secret)
+    }
+}
+
 /// Checks the response of a request that carried `credential` (the token without the prefix of
-/// the definition).
+/// the definition, or the application password).
 pub fn check(
     credential: &Secret<String>,
     status: u16,

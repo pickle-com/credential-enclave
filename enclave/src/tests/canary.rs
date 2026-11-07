@@ -2253,19 +2253,24 @@ async fn the_walk_calls_every_route_in_a_success_case_and_in_a_failure_case() {
         routes.iter().map(owned).collect()
     };
     let routes = routes();
-    assert_eq!(routes.len(), 22);
+    assert_eq!(routes.len(), 23);
     let (mail_success, mail_failure) = super::mail::canary_routes().await;
+    let (password_success, password_failure) = super::app_password::canary_routes().await;
     let mut called = canary.routes_called(|_| true);
     called.extend(mail_success.clone());
     called.extend(mail_failure.clone());
+    called.extend(password_success.clone());
+    called.extend(password_failure.clone());
     assert_eq!(called, routes);
     let mut succeeded = canary.routes_called(|status| status == 200);
     succeeded.extend(mail_success);
+    succeeded.extend(password_success);
     assert_eq!(succeeded, routes);
     let without_a_failure = set_of(&ROUTES_WITHOUT_A_FAILURE);
     let failing: BTreeSet<_> = routes.difference(&without_a_failure).cloned().collect();
     let mut refused = canary.routes_called(|status| status != 200);
     refused.extend(mail_failure);
+    refused.extend(password_failure);
     assert_eq!(refused, failing);
 }
 
@@ -2273,6 +2278,7 @@ async fn the_walk_calls_every_route_in_a_success_case_and_in_a_failure_case() {
 async fn no_marker_appears_in_a_response_of_any_route() {
     walk().await.verdict_c1();
     super::mail::canary_routes().await;
+    super::app_password::canary_routes().await;
 }
 
 #[tokio::test]

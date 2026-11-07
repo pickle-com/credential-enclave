@@ -20,11 +20,10 @@ use credential_enclave_protocol::{limits, ProtocolError};
 use hyper::body::Bytes;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use super::forward::{execute, prepare, read_frame, timeout_of, Prepared};
+use super::forward::{execute, prepare, read_frame, timeout_of, Opened, Prepared};
 use super::responses::{forward_batch_frame, BatchResult, LogRef};
 use super::{record_of, respond, ApiError};
 use crate::log_store::{self, join_all};
-use crate::oauth;
 use crate::state::{lock, Node};
 
 pub async fn forward_batch(State(node): State<Arc<Node>>, request: Request) -> Response {
@@ -106,18 +105,13 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
         node.ensure_open()?;
         let now_ms = node.now_ms();
         let grant = account.active(now_ms)?;
-        let opened = oauth::open_record(&grant, user_id, &record)?;
-        let parsed = opened.parse()?;
-        let definition = node
-            .definitions
-            .get(&record.provider)
-            .ok_or(ProtocolError::ProviderUnknown)?;
+        let opened = Opened::open(&node.definitions, &grant, user_id, &record)?;
         // 2: every request passes before any event is created. The first that fails refuses
         // the whole call with its index.
         let mut prepared: Vec<Prepared> = Vec::with_capacity(requests.len());
         for (index, (request, body)) in requests.iter().zip(&bodies).enumerate() {
             prepared.push(
-                prepare(request, body, &record, definition, &parsed, context)
+                prepare(request, body, &record, &opened, context)
                     .map_err(|error| refused(error, index))?,
             );
         }
@@ -173,7 +167,7 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
                 node,
                 user_id,
                 prepared.outbound,
-                prepared.token,
+                prepared.credential,
                 remaining,
                 share,
             )
