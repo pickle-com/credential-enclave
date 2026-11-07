@@ -220,5 +220,19 @@
       {"host": "uploads.github.com", "prefixes": ["/repos/"], "exact": []},
       {"host": "github.com", "prefixes": [], "exact": [], "suffixes": ["/info/refs", "/git-upload-pack", "/git-receive-pack"]}
     ]
+  },
+  "naver_calendar": {
+    "credential": "app_password",
+    "account_domain": "naver.com",
+    "methods": ["PROPFIND", "REPORT", "GET", "PUT", "DELETE"],
+    "api": [
+      {"host": "caldav.calendar.naver.com", "prefixes": ["/"], "exact": []}
+    ],
+    "verify": {
+      "method": "PROPFIND",
+      "url": "https://caldav.calendar.naver.com/",
+      "headers": [["Depth", "0"], ["Content-Type", "application/xml; charset=utf-8"]],
+      "body": "<?xml version=\"1.0\" encoding=\"utf-8\"?><d:propfind xmlns:d=\"DAV:\"><d:prop><d:current-user-principal/></d:prop></d:propfind>"
+    }
   }
 }

@@ -24,6 +24,7 @@ use tokio::io::{
 };
 use zeroize::Zeroizing;
 
+use crate::oauth::Credential;
 use crate::platform::Stream;
 use crate::provider_response::{self, CheckedResponse};
 use crate::state::{open_for, GrantView, Limits, Node};
@@ -54,8 +55,15 @@ fn credentials_refused(text: &str) -> bool {
     text.contains("authenticationfailed") || text.contains("authentication failed")
 }
 
-/// Only the mail call opens this kind. Neither field implements response serialization.
+/// An application password and the account it belongs to: the plaintext of a record of kind
+/// `app_password`, opened by the mail calls (`naver_mail`) and by the HTTP calls `forward` and
+/// `app-password/verify` (the providers of the application password definitions). No field
+/// implements response serialization.
 pub struct AppPassword {
+    /// The account name as the provider takes it: the account without its domain.
+    login: String,
+    /// `{login}@{domain}`: declassified by a verify call after the provider accepted the
+    /// password.
     identity: String,
     password: Secret<String>,
 }
@@ -71,13 +79,32 @@ pub enum MailError {
 }
 
 impl AppPassword {
-    pub fn open(grant: &GrantView, user: &str, record: &Record) -> Result<Self, ProtocolError> {
+    /// Opens a record of kind `app_password` of `provider`, whose account is one of `domain`.
+    /// Another kind or another provider is `not_allowed`.
+    pub fn open(
+        grant: &GrantView,
+        user: &str,
+        record: &Record,
+        provider: &str,
+        domain: &str,
+    ) -> Result<Self, ProtocolError> {
         let (kind, bytes) = open_for(grant, user, record)?;
-        if kind != Kind::AppPassword || record.provider != "naver_mail" {
+        if kind != Kind::AppPassword || record.provider != provider {
             return Err(ProtocolError::NotAllowed);
         }
+        Self::from_plaintext(&bytes, domain)
+    }
+
+    /// The opened plaintext of a record of kind `app_password`: `{"username", "password"}`.
+    /// The username is the account name of `domain`, with or without `@` and the domain: 1 to
+    /// 64 letters, digits, `_`, `.` and `-`, compared without regard to case. The password is
+    /// 8 to 256 characters without a control character. Another form is `record_invalid`.
+    pub fn from_plaintext(
+        plaintext: &Secret<Vec<u8>>,
+        domain: &str,
+    ) -> Result<Self, ProtocolError> {
         let value = Secret::new(
-            serde_json::from_slice::<Value>(bytes.expose_secret())
+            serde_json::from_slice::<Value>(plaintext.expose_secret())
                 .map_err(|_| ProtocolError::RecordInvalid)?,
         );
         let value = value.expose_secret();
@@ -86,10 +113,11 @@ impl AppPassword {
             .and_then(Value::as_str)
             .ok_or(ProtocolError::RecordInvalid)?;
         let lower = name.trim().to_ascii_lowercase();
-        let id = lower.strip_suffix("@naver.com").unwrap_or(&lower);
-        if id.is_empty()
-            || id.len() > 64
-            || !id
+        let suffix = format!("@{domain}");
+        let login = lower.strip_suffix(suffix.as_str()).unwrap_or(&lower);
+        if login.is_empty()
+            || login.len() > 64
+            || !login
                 .bytes()
                 .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c))
         {
@@ -103,14 +131,27 @@ impl AppPassword {
             return Err(ProtocolError::RecordInvalid);
         }
         Ok(Self {
-            identity: format!("{id}@naver.com"),
+            login: login.to_string(),
+            identity: format!("{login}@{domain}"),
             password: Secret::new(password.to_string()),
         })
     }
 
-    /// D: identity is returned by the verify call only after both authentications succeed.
+    /// D: identity is returned by a verify call only after the provider accepted the password.
     pub fn identity(&self) -> &str {
         &self.identity
+    }
+
+    /// The credential of an HTTP request to the provider (`forward`, `app-password/verify`):
+    /// the header value `Basic` and the base64 of `{login}:{password}`, and the password as
+    /// the secret the response is searched for (rule E4).
+    pub fn http_credential(&self) -> Credential {
+        let pair = Secret::new(format!("{}:{}", self.login, self.password.expose_secret()));
+        let header = format!("Basic {}", STANDARD.encode(pair.expose_secret().as_bytes()));
+        Credential::new(
+            Secret::new(header),
+            Secret::new(self.password.expose_secret().clone()),
+        )
     }
 
     /// E4 applies to every response, including public identity and fixed status results.
@@ -140,12 +181,8 @@ impl AppPassword {
             .await
             .map_err(|_| MailError::Unavailable)?
             .ok_or(MailError::Unavailable)?;
-        let login = self
-            .identity
-            .strip_suffix("@naver.com")
-            .ok_or(MailError::Invalid)?;
         client
-            .login(login, self.password.expose_secret())
+            .login(&self.login, self.password.expose_secret())
             .await
             .map_err(|(error, _)| match error {
                 async_imap::error::Error::No(text) if credentials_refused(&text) => MailError::Auth,
@@ -178,12 +215,8 @@ impl AppPassword {
         if smtp.command(b"AUTH LOGIN\r\n").await?.0 != 334 {
             return Err(MailError::Unavailable);
         }
-        let login = self
-            .identity
-            .strip_suffix("@naver.com")
-            .ok_or(MailError::Invalid)?;
         match smtp
-            .command(format!("{}\r\n", STANDARD.encode(login)).as_bytes())
+            .command(format!("{}\r\n", STANDARD.encode(&self.login)).as_bytes())
             .await?
             .0
         {

@@ -110,15 +110,23 @@ pub struct OauthPlaintext {
     plaintext: Secret<Value>,
 }
 
-/// The credential `forward` injects: the token of an `oauth` record, and the header value made
-/// of the prefix of the definition and that token.
+/// The credential the HTTP calls inject: the header value for the TLS client, and the secret
+/// the response is searched for (rule E4). For a token record the secret is the token and the
+/// header value is made of the prefix of the definition and that token; for an application
+/// password the secret is the password and the header value is HTTP Basic
+/// (`crate::mail::AppPassword::http_credential`).
 pub struct Credential {
     token: Secret<String>,
     header: Secret<String>,
 }
 
 impl Credential {
-    /// The header value for the TLS client, and the token for the check of the response.
+    /// A credential of `header` whose searched secret is `token`.
+    pub(crate) fn new(header: Secret<String>, token: Secret<String>) -> Credential {
+        Credential { token, header }
+    }
+
+    /// The header value for the TLS client, and the secret for the check of the response.
     pub fn into_parts(self) -> (Secret<String>, Secret<String>) {
         (self.header, self.token)
     }
@@ -160,6 +168,13 @@ pub fn open_record(
     record: &Record,
 ) -> Result<OauthRecord, ProtocolError> {
     let (kind, plaintext) = open_for(grant, user_id, record)?;
+    token_record(kind, plaintext)
+}
+
+/// The opened plaintext of a record as a token record, for a call that opened the record
+/// before it judged the kind (`forward`, which also takes an application password). The kinds
+/// `oauth` and `oauth_imported` are taken. Any other kind is `not_allowed`.
+pub fn token_record(kind: Kind, plaintext: Secret<Vec<u8>>) -> Result<OauthRecord, ProtocolError> {
     let kind = TokenKind::of(kind).ok_or(ProtocolError::NotAllowed)?;
     Ok(OauthRecord { kind, plaintext })
 }

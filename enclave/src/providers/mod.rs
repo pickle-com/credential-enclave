@@ -4,6 +4,15 @@
 //! The definitions are compiled into the binary, so they are part of the measurement of a
 //! release. The operator configuration can change client identifiers and callback addresses
 //! only: the addresses a credential may be sent to, and the token addresses, are fixed here.
+//!
+//! A definition is of one of two forms, told apart by the key `credential`. Without it, the
+//! definition is an OAuth definition ([`Definition`]): the node issues and refreshes the
+//! tokens of the provider and injects them into the requests of `forward`. With
+//! `"credential": "app_password"`, the definition is an application password definition
+//! ([`AppPasswordDefinition`]): the device encrypts a password the user made at the provider,
+//! and the node sends it as HTTP Basic to the hosts of the definition, in the requests of
+//! `forward` and in the one request of `app-password/verify`. [`Reach`] is what `forward`
+//! reads from either form.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -165,6 +174,71 @@ pub struct PublicField {
 
 /// The keys of a token object that hold a token. A definition cannot list them as public.
 pub const TOKEN_KEYS: [&str; 3] = ["access_token", "refresh_token", "id_token"];
+
+/// The methods `forward` sends with the token of an OAuth definition.
+pub const TOKEN_METHODS: [&str; 5] = ["GET", "POST", "PUT", "PATCH", "DELETE"];
+
+/// The header that carries an application password: HTTP Basic of the login and the password.
+pub const BASIC_HEADER: &str = "Authorization";
+
+/// Longest body of the request of `app-password/verify`, in bytes.
+const PROBE_BODY_LIMIT_BYTES: usize = 4096;
+
+/// How the credential of a definition is made and presented. A definition without the key
+/// `credential` is an OAuth definition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialKind {
+    /// An application password the device encrypted (a record of kind `app_password`), sent
+    /// as HTTP Basic of the login of the account and the password.
+    AppPassword,
+}
+
+/// The request of `app-password/verify` for a provider: one fixed request that the provider
+/// answers with a 2xx status when it accepts the password, and with 401 when it refuses it.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Probe {
+    pub method: String,
+    /// The address, one that passes the address check of the definition.
+    pub url: String,
+    /// `[name, value]` header pairs of the request. They follow the header rules of `forward`
+    /// (enclave.md 5.8, step 4).
+    pub headers: Vec<(String, String)>,
+    /// The body, as text.
+    pub body: String,
+}
+
+/// A provider whose credential is an application password that authenticates over HTTP
+/// (enclave.md 6.5): the addresses a password of this provider may be sent to, the methods,
+/// the domain of the account and the request of `app-password/verify`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppPasswordDefinition {
+    pub credential: CredentialKind,
+    /// The domain of the account: the account name of a record is the login of the account,
+    /// with or without `@` and this domain. The login is what the provider takes as the user
+    /// name, and `{login}@{domain}` is the identity a verification declassifies.
+    pub account_domain: String,
+    /// The methods `forward` sends with the password.
+    pub methods: Vec<String>,
+    /// Every address a password of this provider may be sent to.
+    pub api: Vec<ApiRule>,
+    pub verify: Probe,
+}
+
+/// What `forward` reads from the definition of a provider, whatever the form of the
+/// definition: the address check, the methods it sends, and the names of the credential
+/// headers the node sets itself.
+pub trait Reach {
+    /// The address check of enclave.md section 7. Every violation is `not_allowed`.
+    fn check_address(&self, address: &str) -> Result<Target, ProtocolError>;
+    /// True when `forward` sends a request of this method with the credential.
+    fn allows_method(&self, method: &str) -> bool;
+    /// The names of the headers that carry the credential. A caller header of one of these
+    /// names is dropped.
+    fn injected_headers(&self) -> Vec<&str>;
+}
 
 /// The paths of one host a credential may be sent to.
 #[derive(Clone, Debug, Deserialize)]
@@ -518,96 +592,214 @@ fn lenient_path(decoded: &[u8]) -> Vec<u8> {
     lenient
 }
 
-impl Definition {
-    /// The address check of enclave.md section 7. Every violation is `not_allowed`.
-    ///
-    /// The check reads the address as the raw string it received: nothing is normalized, and
-    /// the path and query are later sent exactly as they were checked.
-    pub fn check_address(&self, address: &str) -> Result<Target, ProtocolError> {
-        const DENIED: ProtocolError = ProtocolError::NotAllowed;
-        if address.len() > ADDRESS_LIMIT_BYTES
-            || !address.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
-        {
-            return Err(DENIED);
-        }
-        let rest = address.strip_prefix("https://").ok_or(DENIED)?;
-        if rest.contains('#') {
-            return Err(DENIED);
-        }
-        let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
-        let (authority, tail) = rest.split_at(authority_end);
-        if authority.contains(['@', '[', ']', '\\']) {
-            return Err(DENIED);
-        }
-        let raw_host = match authority.rsplit_once(':') {
-            Some((host, "443")) => host,
-            Some(_) => return Err(DENIED),
-            None => authority,
-        };
-        if raw_host.contains(':') {
-            return Err(DENIED);
-        }
-        let host = raw_host.to_ascii_lowercase();
-        if !is_host_name(&host) {
-            return Err(DENIED);
-        }
-        let (path, query, has_query) = match tail.split_once('?') {
-            Some((path, query)) => (path, query, true),
-            None => (tail, "", false),
-        };
-        if !path.starts_with('/') {
-            return Err(DENIED);
-        }
-        let rule = self
-            .api
+/// The address check of enclave.md section 7 against the `api` rules of a definition. Every
+/// violation is `not_allowed`.
+///
+/// The check reads the address as the raw string it received: nothing is normalized, and the
+/// path and query are later sent exactly as they were checked.
+fn check_address_in(api: &[ApiRule], address: &str) -> Result<Target, ProtocolError> {
+    const DENIED: ProtocolError = ProtocolError::NotAllowed;
+    if address.len() > ADDRESS_LIMIT_BYTES
+        || !address.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+    {
+        return Err(DENIED);
+    }
+    let rest = address.strip_prefix("https://").ok_or(DENIED)?;
+    if rest.contains('#') {
+        return Err(DENIED);
+    }
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    if authority.contains(['@', '[', ']', '\\']) {
+        return Err(DENIED);
+    }
+    let raw_host = match authority.rsplit_once(':') {
+        Some((host, "443")) => host,
+        Some(_) => return Err(DENIED),
+        None => authority,
+    };
+    if raw_host.contains(':') {
+        return Err(DENIED);
+    }
+    let host = raw_host.to_ascii_lowercase();
+    if !is_host_name(&host) {
+        return Err(DENIED);
+    }
+    let (path, query, has_query) = match tail.split_once('?') {
+        Some((path, query)) => (path, query, true),
+        None => (tail, "", false),
+    };
+    if !path.starts_with('/') {
+        return Err(DENIED);
+    }
+    let rule = api.iter().find(|rule| rule.host == host).ok_or(DENIED)?;
+    // An encoded `/` is refused unless the rule of the host takes it. The prefix comparison
+    // below reads the path as received either way: an encoded `/` is not a segment
+    // boundary there.
+    let encoded_slash = path.contains("%2f") || path.contains("%2F");
+    if (encoded_slash && !rule.encoded_slash)
+        || ["%5c", "%5C", "\\", "//"]
             .iter()
-            .find(|rule| rule.host == host)
-            .ok_or(DENIED)?;
-        // An encoded `/` is refused unless the rule of the host takes it. The prefix comparison
-        // below reads the path as received either way: an encoded `/` is not a segment
-        // boundary there.
-        let encoded_slash = path.contains("%2f") || path.contains("%2F");
-        if (encoded_slash && !rule.encoded_slash)
-            || ["%5c", "%5C", "\\", "//"]
-                .iter()
-                .any(|pattern| path.contains(pattern))
-            || !has_valid_escapes(path)
-            || has_twice_encoded_separator(path)
-        {
-            return Err(DENIED);
+            .any(|pattern| path.contains(pattern))
+        || !has_valid_escapes(path)
+        || has_twice_encoded_separator(path)
+    {
+        return Err(DENIED);
+    }
+    let decoded = decode_escapes(path.as_bytes());
+    if has_dot_segment(&decoded) {
+        return Err(DENIED);
+    }
+    if !rule.allows(path) || rule.denies(&decoded) {
+        return Err(DENIED);
+    }
+    // A second reading with a WHATWG URL parser must see the same host, port and path.
+    // An address that two parsers read differently is not sent anywhere.
+    let parsed = url::Url::parse(address).map_err(|_| DENIED)?;
+    if parsed.scheme() != "https"
+        || parsed.host_str() != Some(host.as_str())
+        || parsed.port_or_known_default() != Some(443)
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != path
+    {
+        return Err(DENIED);
+    }
+    let mut request_target = path.to_string();
+    if has_query {
+        request_target.push('?');
+        request_target.push_str(query);
+    }
+    Ok(Target {
+        host,
+        path: path.to_string(),
+        query: query.to_string(),
+        request_target,
+    })
+}
+
+/// The rules of an `api` list (enclave.md section 7): at least one rule, distinct DNS names,
+/// paths that start with `/` and hold no `//`, `?`, `#` or `%`, and denied paths under a
+/// prefix of their rule in the form of their comparison.
+fn validate_api(api: &[ApiRule]) -> Result<(), &'static str> {
+    if api.is_empty() {
+        return Err("no api rule");
+    }
+    let mut hosts = HashSet::new();
+    for rule in api {
+        if !is_host_name(&rule.host) || !hosts.insert(rule.host.as_str()) {
+            return Err("an invalid or repeated api host");
         }
-        let decoded = decode_escapes(path.as_bytes());
-        if has_dot_segment(&decoded) {
-            return Err(DENIED);
+        if rule.prefixes.is_empty() && rule.exact.is_empty() && rule.suffixes.is_empty() {
+            return Err("an api host without paths");
         }
-        if !rule.allows(path) || rule.denies(&decoded) {
-            return Err(DENIED);
+        let paths = rule
+            .prefixes
+            .iter()
+            .chain(&rule.exact)
+            .chain(&rule.suffixes)
+            .chain(&rule.denied);
+        for path in paths {
+            if !path.starts_with('/') || path.contains("//") || path.contains(['?', '#', '%']) {
+                return Err("an invalid api path");
+            }
         }
-        // A second reading with a WHATWG URL parser must see the same host, port and path.
-        // An address that two parsers read differently is not sent anywhere.
-        let parsed = url::Url::parse(address).map_err(|_| DENIED)?;
-        if parsed.scheme() != "https"
-            || parsed.host_str() != Some(host.as_str())
-            || parsed.port_or_known_default() != Some(443)
-            || !parsed.username().is_empty()
-            || parsed.password().is_some()
-            || parsed.path() != path
-        {
-            return Err(DENIED);
+        // A denied path takes something away from a prefix of the same rule, and it is
+        // written in the form it is compared in: lower case, without a path parameter.
+        for denied in &rule.denied {
+            if !rule.under_prefix(denied)
+                || denied.contains(';')
+                || denied.bytes().any(|byte| byte.is_ascii_uppercase())
+            {
+                return Err("an invalid denied path");
+            }
         }
-        let mut request_target = path.to_string();
-        if has_query {
-            request_target.push('?');
-            request_target.push_str(query);
-        }
-        Ok(Target {
-            host,
-            path: path.to_string(),
-            query: query.to_string(),
-            request_target,
-        })
+    }
+    Ok(())
+}
+
+impl Reach for Definition {
+    fn check_address(&self, address: &str) -> Result<Target, ProtocolError> {
+        check_address_in(&self.api, address)
     }
 
+    fn allows_method(&self, method: &str) -> bool {
+        TOKEN_METHODS.contains(&method)
+    }
+
+    fn injected_headers(&self) -> Vec<&str> {
+        self.inject
+            .iter()
+            .map(|rule| rule.header.as_str())
+            .collect()
+    }
+}
+
+impl Reach for AppPasswordDefinition {
+    fn check_address(&self, address: &str) -> Result<Target, ProtocolError> {
+        check_address_in(&self.api, address)
+    }
+
+    fn allows_method(&self, method: &str) -> bool {
+        self.methods.iter().any(|allowed| allowed == method)
+    }
+
+    fn injected_headers(&self) -> Vec<&str> {
+        match self.credential {
+            CredentialKind::AppPassword => vec![BASIC_HEADER],
+        }
+    }
+}
+
+impl AppPasswordDefinition {
+    /// The rules of enclave.md 6.5: the domain of the account is a DNS name with a dot, the
+    /// methods are distinct upper-case HTTP tokens, the `api` rules follow section 7, and the
+    /// request of `app-password/verify` is a request `forward` would send: its method is one
+    /// of the methods, its address passes the address check, its headers are valid and none of
+    /// them is the credential header, and its body is at most 4,096 bytes.
+    fn validate(&self, name: &str) -> Result<(), String> {
+        let fail = |what: &str| Err(format!("{name}: {what}"));
+        if !is_valid_name(name) {
+            return fail("the provider name is not a valid name");
+        }
+        if !is_host_name(&self.account_domain) || !self.account_domain.contains('.') {
+            return fail("account_domain is not a domain name");
+        }
+        if self.methods.is_empty() {
+            return fail("no method");
+        }
+        let mut methods = HashSet::new();
+        for method in &self.methods {
+            if !is_token(method)
+                || method.bytes().any(|byte| byte.is_ascii_lowercase())
+                || !methods.insert(method.as_str())
+            {
+                return fail("an invalid or repeated method");
+            }
+        }
+        validate_api(&self.api).map_err(|what| format!("{name}: {what}"))?;
+        if !self.allows_method(&self.verify.method) {
+            return fail("the verify method is not a method of the definition");
+        }
+        if self.check_address(&self.verify.url).is_err() {
+            return fail("the verify address is not an address of the definition");
+        }
+        for (header, value) in &self.verify.headers {
+            if !is_token(header)
+                || header.eq_ignore_ascii_case(BASIC_HEADER)
+                || value.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
+            {
+                return fail("an invalid verify header");
+            }
+        }
+        if self.verify.body.len() > PROBE_BODY_LIMIT_BYTES {
+            return fail("the verify body is above the limit");
+        }
+        Ok(())
+    }
+}
+
+impl Definition {
     /// Where a token request goes: the token address of the definition.
     pub fn token_destination(&self) -> Result<Destination, ProtocolError> {
         self.token_destination
@@ -767,47 +959,17 @@ impl Definition {
                 }
             }
         }
-        if self.api.is_empty() {
-            return fail("no api rule");
-        }
-        let mut hosts = HashSet::new();
-        for rule in &self.api {
-            if !is_host_name(&rule.host) || !hosts.insert(rule.host.as_str()) {
-                return fail("an invalid or repeated api host");
-            }
-            if rule.prefixes.is_empty() && rule.exact.is_empty() && rule.suffixes.is_empty() {
-                return fail("an api host without paths");
-            }
-            let paths = rule
-                .prefixes
-                .iter()
-                .chain(&rule.exact)
-                .chain(&rule.suffixes)
-                .chain(&rule.denied);
-            for path in paths {
-                if !path.starts_with('/') || path.contains("//") || path.contains(['?', '#', '%']) {
-                    return fail("an invalid api path");
-                }
-            }
-            // A denied path takes something away from a prefix of the same rule, and it is
-            // written in the form it is compared in: lower case, without a path parameter.
-            for denied in &rule.denied {
-                if !rule.under_prefix(denied)
-                    || denied.contains(';')
-                    || denied.bytes().any(|byte| byte.is_ascii_uppercase())
-                {
-                    return fail("an invalid denied path");
-                }
-            }
-        }
+        validate_api(&self.api).map_err(|what| format!("{name}: {what}"))?;
         Ok(())
     }
 }
 
-/// The provider definitions of a node.
+/// The provider definitions of a node: the OAuth definitions and the application password
+/// definitions, each by the name of its provider. A name is in one of the two.
 #[derive(Clone, Debug)]
 pub struct Definitions {
     providers: BTreeMap<String, Definition>,
+    app_password: BTreeMap<String, AppPasswordDefinition>,
 }
 
 impl Definitions {
@@ -822,27 +984,56 @@ impl Definitions {
     }
 
     /// Parses and validates a definitions document. The node program calls it for the document
-    /// compiled into the binary only.
+    /// compiled into the binary only. An entry with the key `credential` is an application
+    /// password definition, an entry without it an OAuth definition.
     fn parse(text: &str) -> Result<Definitions, String> {
-        let mut providers: BTreeMap<String, Definition> =
+        let entries: BTreeMap<String, serde_json::Value> =
             serde_json::from_str(text).map_err(|error| error.to_string())?;
-        for (name, definition) in &mut providers {
-            definition.validate(name)?;
-            definition.token_destination = Some(Destination::of(endpoint(&definition.token.url)?));
-            definition.revoke_destination = match &definition.revoke {
-                Some(revoke) => Some(Destination::of(endpoint(&revoke.url)?)),
-                None => None,
-            };
+        let mut providers = BTreeMap::new();
+        let mut app_password = BTreeMap::new();
+        for (name, entry) in entries {
+            let described = |error: serde_json::Error| format!("{name}: {error}");
+            if entry.get("credential").is_some() {
+                let definition: AppPasswordDefinition =
+                    serde_json::from_value(entry).map_err(described)?;
+                definition.validate(&name)?;
+                app_password.insert(name, definition);
+            } else {
+                let mut definition: Definition =
+                    serde_json::from_value(entry).map_err(described)?;
+                definition.validate(&name)?;
+                definition.token_destination =
+                    Some(Destination::of(endpoint(&definition.token.url)?));
+                definition.revoke_destination = match &definition.revoke {
+                    Some(revoke) => Some(Destination::of(endpoint(&revoke.url)?)),
+                    None => None,
+                };
+                providers.insert(name, definition);
+            }
         }
-        Ok(Definitions { providers })
+        Ok(Definitions {
+            providers,
+            app_password,
+        })
     }
 
-    /// The definition of a provider.
+    /// The OAuth definition of a provider.
     pub fn get(&self, provider: &str) -> Option<&Definition> {
         self.providers.get(provider)
     }
 
-    /// The provider names, in lexical order.
+    /// The application password definition of a provider.
+    pub fn app_password(&self, provider: &str) -> Option<&AppPasswordDefinition> {
+        self.app_password.get(provider)
+    }
+
+    /// The names of the providers of the application password definitions, in lexical order:
+    /// the providers whose records of kind `app_password` the HTTP calls take.
+    pub fn app_password_names(&self) -> Vec<&str> {
+        self.app_password.keys().map(String::as_str).collect()
+    }
+
+    /// The names of the providers of the OAuth definitions, in lexical order.
     #[cfg(test)]
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.providers.keys().map(String::as_str)
@@ -2092,5 +2283,163 @@ mod tests {
         assert!(denied(json!(["/v1/$batch;x"])).is_err());
         assert!(denied(json!("/v1/$batch")).is_err());
         assert!(denied(json!([5])).is_err());
+    }
+
+    /// The one application password definition (enclave.md 6.5).
+    #[test]
+    fn the_embedded_application_password_definition_is_the_table_of_section_6_5() {
+        let definitions = embedded();
+        assert_eq!(definitions.app_password_names(), ["naver_calendar"]);
+        let calendar = definitions.app_password("naver_calendar").unwrap();
+        assert_eq!(calendar.credential, CredentialKind::AppPassword);
+        assert_eq!(calendar.account_domain, "naver.com");
+        assert_eq!(
+            calendar.methods,
+            ["PROPFIND", "REPORT", "GET", "PUT", "DELETE"]
+        );
+        assert_eq!(calendar.api.len(), 1);
+        let rule = &calendar.api[0];
+        assert_eq!(rule.host, "caldav.calendar.naver.com");
+        assert_eq!(rule.prefixes, ["/"]);
+        assert!(rule.exact.is_empty() && rule.suffixes.is_empty() && rule.denied.is_empty());
+        assert!(!rule.encoded_slash);
+        assert_eq!(
+            calendar.verify,
+            Probe {
+                method: "PROPFIND".to_string(),
+                url: "https://caldav.calendar.naver.com/".to_string(),
+                headers: pairs(&[
+                    ("Depth", "0"),
+                    ("Content-Type", "application/xml; charset=utf-8"),
+                ]),
+                body: concat!(
+                    "<?xml version=\"1.0\" encoding=\"utf-8\"?>",
+                    "<d:propfind xmlns:d=\"DAV:\"><d:prop><d:current-user-principal/></d:prop>",
+                    "</d:propfind>"
+                )
+                .to_string(),
+            }
+        );
+        // A name is in one of the two maps.
+        assert!(definitions.get("naver_calendar").is_none());
+        assert!(definitions.app_password("google_workspace").is_none());
+    }
+
+    #[test]
+    fn an_application_password_definition_reaches_its_host_with_its_methods() {
+        let definitions = embedded();
+        let calendar = definitions.app_password("naver_calendar").unwrap();
+        for address in [
+            "https://caldav.calendar.naver.com/",
+            "https://caldav.calendar.naver.com/principals/users/tester/",
+            "https://CALDAV.calendar.naver.com:443/calendars/tester/default/a.ics?x=1",
+        ] {
+            assert!(calendar.check_address(address).is_ok(), "{address}");
+        }
+        for address in [
+            "https://calendar.naver.com/",
+            "https://caldav.calendar.naver.com:8443/",
+            "http://caldav.calendar.naver.com/",
+            "https://caldav.calendar.naver.com/a/../b",
+            "https://caldav.calendar.naver.com//a",
+            "https://gmail.googleapis.com/gmail/v1/users/me/profile",
+        ] {
+            assert_eq!(
+                calendar.check_address(address),
+                Err(ProtocolError::NotAllowed),
+                "{address}"
+            );
+        }
+        for method in ["PROPFIND", "REPORT", "GET", "PUT", "DELETE"] {
+            assert!(calendar.allows_method(method), "{method}");
+        }
+        for method in ["POST", "PATCH", "MKCALENDAR", "propfind", ""] {
+            assert!(!calendar.allows_method(method), "{method}");
+        }
+        assert_eq!(calendar.injected_headers(), [BASIC_HEADER]);
+        // An OAuth definition sends the five methods of forward and no other, and reaches its
+        // own hosts only: no token reaches the CalDAV host.
+        let google = google();
+        for method in TOKEN_METHODS {
+            assert!(google.allows_method(method), "{method}");
+        }
+        assert!(!google.allows_method("PROPFIND"));
+        for name in definitions.names() {
+            let definition = definitions.get(name).unwrap();
+            assert!(
+                definition
+                    .check_address("https://caldav.calendar.naver.com/")
+                    .is_err(),
+                "{name}"
+            );
+        }
+    }
+
+    const PASSWORD_MINIMAL: &str = r#"{
+        "credential": "app_password",
+        "account_domain": "provider.test",
+        "methods": ["PROPFIND", "GET"],
+        "api": [{"host": "dav.provider.test", "prefixes": ["/dav/"], "exact": []}],
+        "verify": {"method": "PROPFIND", "url": "https://dav.provider.test/dav/", "headers": [["Depth", "0"]], "body": ""}
+    }"#;
+
+    fn with_password(change: impl Fn(&mut serde_json::Value)) -> Result<Definitions, String> {
+        let mut definition: serde_json::Value = serde_json::from_str(PASSWORD_MINIMAL).unwrap();
+        change(&mut definition);
+        Definitions::parse(&serde_json::json!({"sample": definition}).to_string())
+    }
+
+    #[test]
+    fn an_application_password_definition_is_validated() {
+        use serde_json::json;
+        let definitions = with_password(|_| {}).unwrap();
+        assert_eq!(definitions.app_password_names(), ["sample"]);
+        assert!(definitions.get("sample").is_none());
+        // The key `credential` tells the two forms apart: without it the entry is an OAuth
+        // definition, which this entry is not, and another value is no form.
+        assert!(with_password(|d| {
+            d.as_object_mut().unwrap().remove("credential");
+        })
+        .is_err());
+        assert!(with_password(|d| d["credential"] = "oauth".into()).is_err());
+        assert!(
+            with_password(|d| d["token"] = json!({"url": "https://t.provider.test/token"}))
+                .is_err()
+        );
+        assert!(with_password(|d| d["unknown_key"] = true.into()).is_err());
+        // The domain of the account is a DNS name with a dot, in lower case.
+        assert!(with_password(|d| d["account_domain"] = "provider".into()).is_err());
+        assert!(with_password(|d| d["account_domain"] = "Provider.test".into()).is_err());
+        assert!(with_password(|d| d["account_domain"] = "".into()).is_err());
+        // The methods: distinct upper-case tokens, at least one.
+        assert!(with_password(|d| d["methods"] = json!([])).is_err());
+        assert!(with_password(|d| d["methods"] = json!(["propfind"])).is_err());
+        assert!(with_password(|d| d["methods"] = json!(["PROPFIND", "PROPFIND"])).is_err());
+        assert!(with_password(|d| d["methods"] = json!(["PROP FIND"])).is_err());
+        // The api rules follow section 7.
+        assert!(with_password(|d| d["api"] = json!([])).is_err());
+        assert!(with_password(|d| d["api"][0]["host"] = "DAV.provider.test".into()).is_err());
+        assert!(with_password(|d| d["api"][0]["prefixes"] = json!(["dav/"])).is_err());
+        // The verify request is a request forward would send with the password.
+        assert!(with_password(|d| d["verify"]["method"] = "REPORT".into()).is_err());
+        assert!(
+            with_password(|d| d["verify"]["url"] = "https://dav.provider.test/other/".into())
+                .is_err()
+        );
+        assert!(
+            with_password(|d| d["verify"]["url"] = "https://other.provider.test/dav/".into())
+                .is_err()
+        );
+        assert!(
+            with_password(|d| d["verify"]["headers"] = json!([["Authorization", "Basic x"]]))
+                .is_err()
+        );
+        assert!(
+            with_password(|d| d["verify"]["headers"] = json!([["Depth", "0\r\nX: y"]])).is_err()
+        );
+        assert!(with_password(|d| d["verify"]["headers"] = json!([["Dep th", "0"]])).is_err());
+        assert!(with_password(|d| d["verify"]["body"] = "x".repeat(4097).into()).is_err());
+        assert!(with_password(|d| d["verify"]["body"] = "x".repeat(4096).into()).is_ok());
+        assert!(with_password(|d| d["verify"]["extra"] = 1.into()).is_err());
     }
 }

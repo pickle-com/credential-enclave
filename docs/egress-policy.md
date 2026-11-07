@@ -60,7 +60,7 @@ log store and is part of none, and neither appears in a response.
 | Channel | To | What |
 | --- | --- | --- |
 | C1 | The operator domain | The response of a call: status, headers, body |
-| C2 | A provider | A TLS connection that ends inside the node. Its destination is an address of the provider definitions or one of the fixed Naver mail endpoints. A connection to a provider carries the requests of one account: the node keeps at most 8 idle connections per (account, host) for at most 30 seconds, and sends the requests of a forward batch at most 6 at a time. The operator domain sees TLS records only |
+| C2 | A provider | A TLS connection that ends inside the node. Its destination is an address of the provider definitions (an OAuth definition or an application password definition) or one of the fixed Naver mail endpoints. A connection to a provider carries the requests of one account: the node keeps at most 8 idle connections per (account, host) for at most 30 seconds, and sends the requests of a forward batch at most 6 at a time. The operator domain sees TLS records only |
 | C3 | The console | Exists in a debug-mode enclave only (its attestation has all-zero PCRs and an app refuses it). In any mode the node writes fixed strings of its source only |
 | C4 | The log store | A TLS connection that ends inside the node, to `{bucket}.s3.{region}.amazonaws.com` of the log store of the node (a node of the local platform may write to the endpoint of its configuration instead). It carries log entries (class C below), the key of each (`user_id` E, the node identifier, `seq`, `time_ms`, the kind, the count, the hash of the body and the chain hash P, `key_id` E) and the credentials of the operator for the store. The node keeps at most 32 idle connections to the store. The operator domain sees TLS records only, and it can read the bucket |
 
@@ -269,7 +269,7 @@ and the tests of `enclave/src/oauth.rs`.
 | --- | --- | --- | --- |
 | `oauth` | The node: the response of the token address that `oauth/complete` received, and after that the results of `refresh` and `oauth/merge` | enclave-use | `forward`, `refresh`, `revoke-token`, `oauth/merge` |
 | `oauth_imported` | The device of the account: it encrypted a token the operator domain held before it used this node. The plaintext has the form of kind `oauth` | enclave-use. The operator domain knew this token once: the record does not say that its token never left a node. A new connection of the account gives a record of kind `oauth` | `forward`, `refresh`, `revoke-token` |
-| `app_password` | The device encrypts a NAVER application password and account name | enclave-use; authenticated identity is declassified after verification | `mail/verify`, `mail/read`, `mail/submit` |
+| `app_password` | The device encrypts an application password the user made at the provider, and the account name | enclave-use; the authenticated identity is declassified after a verification | For `naver_mail`: `mail/verify`, `mail/read`, `mail/submit`. For a provider of an application password definition (enclave.md 6.5): `forward`, `forward/batch`, `app-password/verify` |
 | `vault_password` | The device: the app encrypts what the user entered | release | `release`, field `password` |
 | `vault_totp` | The device | enclave-use: the seed stays, the code leaves as V | `release`, field `totp` |
 | `vault_card` | The device | release | `release`, fields `card_number`, `card_cvc` |
@@ -280,12 +280,16 @@ and the tests of `enclave/src/oauth.rs`.
   kind `oauth` only: the refresh token of an imported record is not moved into an issued one.
 - The kind is an enum (`Kind` in `protocol/src/record.rs`) and part of the AAD of a record, so
   a record that opens has the kind it names. A kind the release does not know is `not_allowed`.
-- A record is opened by the function of its call family, and the two return different types.
-  `oauth::open_record` takes the two token kinds and refuses a vault kind. `vault::open_record`
-  takes the vault kinds and refuses a token kind. So the code of `release` cannot hold the
-  plaintext of a token, and the code of `forward` cannot hold a vault plaintext. The type of a
-  vault value offers one way out, `hand_out`, and for a `vault_totp` record the value it holds
-  is the code: the seed has no way out.
+- A record is opened by the function of its call family, and the families return different
+  types. `oauth::open_record` and `oauth::token_record` take the two token kinds and refuse
+  every other kind. `mail::AppPassword::open` and `mail::AppPassword::from_plaintext` take the
+  kind `app_password` and refuse every other kind. `vault::open_record` takes the vault kinds
+  and refuses a token kind and an application password. So the code of `release` cannot hold
+  the plaintext of a token or an application password, and the code of `forward` cannot hold a
+  vault plaintext: `forward` opens a record once and takes it as a token record or as an
+  application password by its kind, and for an application password only when its provider has
+  an application password definition. The type of a vault value offers one way out, `hand_out`,
+  and for a `vault_totp` record the value it holds is the code: the seed has no way out.
 
 Fixed by: the types of `enclave/src/oauth.rs` and `enclave/src/vault.rs`, the tests of the
 calls, and `egress/sink-callers.tsv` (the one caller of K1).
@@ -332,7 +336,7 @@ calls, and `egress/sink-callers.tsv` (the one caller of K1).
 
 | Call | The fields of a successful response and their classes |
 | --- | --- |
-| `GET /v1/health` | `node` P, `release` P, `platform` P, `custody` P, `started_ms` P, `time_ms` P, `configured` P, `closing` P, `accounts` P, `grants` P, `mail_providers` P, `log_store` E and P (`bucket`, `region` and `credentials_expires_ms` E, `pending` and `pending_oldest_ms` P), `log` P (seven counts, six counts of failed write attempts under constant cause names, the count of repeated attempts, eight cumulative counts of the time to confirmation under constant bounds, their sum and their count), `load` P (two counts of the calls, two counts of the connections from the backend, three CPU times and two sizes of the kernel, and two counts of the descriptors of the process; the five of the kernel are null when it exposes none, and so is each count of the descriptors when the kernel or the platform gives none), `egress` P (the count of opened connections, four counts of failed opens under constant cause names, the counts of repeated opens and of opens in progress, two counts of reused idle connections), `refresh` P (four counts of late token address calls under constant outcome names, the count of those in progress), `state` P (three counts of kept `refresh` responses, merge keys and unconfirmed entries, two counts of idle connections under constant peer names) |
+| `GET /v1/health` | `node` P, `release` P, `platform` P, `custody` P, `started_ms` P, `time_ms` P, `configured` P, `closing` P, `accounts` P, `grants` P, `mail_providers` P, `app_password_providers` P, `log_store` E and P (`bucket`, `region` and `credentials_expires_ms` E, `pending` and `pending_oldest_ms` P), `log` P (seven counts, six counts of failed write attempts under constant cause names, the count of repeated attempts, eight cumulative counts of the time to confirmation under constant bounds, their sum and their count), `load` P (two counts of the calls, two counts of the connections from the backend, three CPU times and two sizes of the kernel, and two counts of the descriptors of the process; the five of the kernel are null when it exposes none, and so is each count of the descriptors when the kernel or the platform gives none), `egress` P (the count of opened connections, four counts of failed opens under constant cause names, the counts of repeated opens and of opens in progress, two counts of reused idle connections), `refresh` P (four counts of late token address calls under constant outcome names, the count of those in progress), `state` P (three counts of kept `refresh` responses, merge keys and unconfirmed entries, two counts of idle connections under constant peer names) |
 | `POST /v1/config` | `configured` P |
 | `POST /v1/attestation` | `v` P, `platform` P, `document` S (the platform signs the two public keys of the node, the release and the nonce of the caller), `node` P, `challenge` P, `release` P, `challenge_statement` S (its body: `type`, `node`, `challenge`, `time_ms` P, the nonce of the caller E) |
 | `POST /v1/messages` | `reply` S (its body: `type`, `ok`, `code`, `node`, `time_ms` P, `user_id`, `challenge`, `key_id`, `not_after_ms` D, `head` P), `log` P, `grant` D |
@@ -347,6 +351,7 @@ calls, and `egress/sink-callers.tsv` (the one caller of K1).
 | `POST /v1/mail/verify` | `identity` D, `node` P, `statement` S (identity D, record bindings E/P), `log` P, after E4 |
 | `POST /v1/mail/read` | `status` P, `headers` P, bounded provider mail data R, `log` P, after E4 |
 | `POST /v1/mail/submit` | `status` P, `headers` P, submission status P, SMTP code R, `log` P, after E4. A lost reply is not a rejection |
+| `POST /v1/app-password/verify` | `status` P (200 for an accepted password, 401 for a refused one) or R (any other status of the provider, as it is), `headers` P, the body: `identity` D, `node` P and `statement` S (identity D, record bindings E/P) for an accepted password, else `code` P; `log` P, after E4 |
 | `POST /v1/release` | `value` V, `log` P |
 | `POST /v1/close` | `accounts` P |
 | `POST /v1/close/heads` | `heads` S, `next` E, `truncated` P, `skipped` P |
@@ -424,15 +429,30 @@ To read the source against this document: start with `protocol/src/secret.rs` (E
 `enclave/src/api/responses.rs` (E3), `enclave/src/oauth.rs` and
 `enclave/src/provider_response.rs` (E4, E5), and `enclave/src/vault.rs` (E6).
 
-## Mail credentials
+## Application passwords
 
-`app_password` of provider `naver_mail` is created on the device and is enclave-use only.
-`enclave/src/mail.rs` owns its plaintext. The authenticated account identity is declassified
-only after successful IMAP and SMTP authentication; verify binds it, the ciphertext digest,
-record id and account signing key in a node statement. OAuth forward/refresh and vault release
-refuse this kind. The three mail calls require a configured log store and confirm `mail_request`
-before authentication. The encrypted event holds the operation, request parameters and payload
-length/digest, never the application password or message body.
+A record of kind `app_password` is created on the device and is enclave-use only.
+`enclave/src/mail.rs` owns its plaintext (`AppPassword`): the login of the account, the identity
+`{login}@{domain}` and the password. The authenticated account identity is declassified only
+after the provider accepted the password; a verify call binds it, the ciphertext digest, the
+record id and the account signing key in a node statement. `refresh`, `revoke-token`,
+`oauth/merge` and `release` refuse this kind.
+
+For `naver_mail` the password is used by the three mail calls, which require a configured log
+store and confirm `mail_request` before authentication. The encrypted event holds the operation,
+request parameters and payload length/digest, never the application password or message body.
+
+For a provider of an application password definition (enclave.md 6.5: `naver_calendar`) the
+password is used by `forward`, `forward/batch` and `app-password/verify`. These calls send it as
+HTTP Basic of the login and the password, in the header `Authorization`, through sink K3 to the
+hosts of the `api` rules of that definition only, with the methods of that definition only, after
+the event `provider_request` of the request is on the chain and the log store confirmed it. The
+request of `app-password/verify` is the one the definition names (`verify`); a 2xx answer
+declassifies the identity, a 401 leaves as the fixed code `authentication_failed`, and any
+other status leaves as that status with the fixed code `verification_failed`: no byte of the
+provider response leaves that call. The response of a `forward` request passes the reflection
+check of E4 with the password as the searched credential, as the response of a token request
+does with the token.
 
 The two mail authentication sinks are K6 (`AppPassword::imap`) and K7 (`AppPassword::smtp`).
 Both use `Egress::open_mail`, whose destination check admits only imap.naver.com:993 and

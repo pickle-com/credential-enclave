@@ -1,6 +1,6 @@
 //! `POST /v1/forward` (enclave.md 5.8): sends a provider request with the credential of a
-//! record injected. The functions `prepare` and `execute` are shared with `POST
-//! /v1/forward/batch` (`super::forward_batch`).
+//! record injected. `Opened`, `prepare` and `execute` are shared with `POST /v1/forward/batch`
+//! (`super::forward_batch`) and `POST /v1/app-password/verify` (`super::app_password`).
 //!
 //! The credential reaches an address of the provider definition only (enclave.md section 7).
 //! The entry that holds the event `provider_request` is on the chain, and the log store
@@ -15,7 +15,7 @@ use axum::extract::{Request, State};
 use axum::http::header::CONTENT_LENGTH;
 use axum::http::HeaderValue;
 use axum::response::Response;
-use credential_enclave_protocol::record::Record;
+use credential_enclave_protocol::record::{Kind, Record};
 use credential_enclave_protocol::secret::Secret;
 use credential_enclave_protocol::ProtocolError;
 use hyper::body::Bytes;
@@ -27,13 +27,11 @@ use super::{invalid, read_body, record_of, respond, ApiError, JsonBody};
 use crate::egress::{self, EgressError, OutboundBody, OutboundHeader, OutboundRequest};
 use crate::frame::{self, META_LIMIT_BYTES};
 use crate::log_store;
-use crate::oauth::{self, Withheld};
+use crate::mail::AppPassword;
+use crate::oauth::{self, Credential, OauthPlaintext, Withheld};
 use crate::provider_response::{self, CheckedResponse};
-use crate::providers::Definition;
-use crate::state::{events, lock, merge_key, Node};
-
-/// The methods `forward` sends.
-const METHODS: [&str; 5] = ["GET", "POST", "PUT", "PATCH", "DELETE"];
+use crate::providers::{AppPasswordDefinition, Definition, Definitions, Reach, BASIC_HEADER};
+use crate::state::{events, lock, merge_key, open_for, GrantView, Node};
 
 /// Caller headers the node drops: the credential header is the node's, `Accept-Encoding` is
 /// set by the node, and the rest describe the connection or the body framing.
@@ -94,15 +92,13 @@ pub(super) fn timeout_of(meta: &JsonBody) -> Result<u64, ApiError> {
 /// Reads the request headers of a request object: an array of `[name, value]` pairs under
 /// `headers`. A name that is not a token and a value with CR, LF or another control
 /// character are `invalid_request`. A header of [`REFUSED_HEADERS`] is `not_allowed`. The
-/// headers of [`DROPPED_HEADERS`] and the header the definition injects are dropped.
-fn caller_headers(
-    request: &Value,
-    definition: &Definition,
-) -> Result<Vec<OutboundHeader>, ApiError> {
+/// headers of [`DROPPED_HEADERS`] and the credential headers of the definition are dropped.
+fn caller_headers(request: &Value, reach: &dyn Reach) -> Result<Vec<OutboundHeader>, ApiError> {
     let Some(value) = request.get("headers").filter(|value| !value.is_null()) else {
         return Ok(Vec::new());
     };
     let pairs = value.as_array().ok_or_else(|| invalid("headers"))?;
+    let injected = reach.injected_headers();
     let mut headers = Vec::with_capacity(pairs.len());
     for pair in pairs {
         let (name, value) = match pair.as_array().map(Vec::as_slice) {
@@ -120,10 +116,9 @@ fn caller_headers(
             return Err(ProtocolError::NotAllowed.into());
         }
         if DROPPED_HEADERS.contains(&lower.as_str())
-            || definition
-                .inject
+            || injected
                 .iter()
-                .any(|rule| lower == rule.header.to_ascii_lowercase())
+                .any(|header| header.eq_ignore_ascii_case(&lower))
         {
             continue;
         }
@@ -132,27 +127,115 @@ fn caller_headers(
     Ok(headers)
 }
 
+/// The opened record of a call that sends HTTP requests with a credential: a token record with
+/// the OAuth definition of its provider, or an application password with the application
+/// password definition of its provider. The kind of the record decides which, and the
+/// plaintext of each kind is held by the type of its own module (rule E6 of the egress
+/// policy): the HTTP calls hold no plaintext of a vault record.
+pub(super) enum Opened<'a> {
+    Token {
+        definition: &'a Definition,
+        parsed: OauthPlaintext,
+    },
+    AppPassword {
+        definition: &'a AppPasswordDefinition,
+        credentials: AppPassword,
+    },
+}
+
+impl<'a> Opened<'a> {
+    /// Step 6 of the common front of the HTTP calls: opens the record and takes it by its
+    /// kind. A token record (kind `oauth` or `oauth_imported`) of a provider without an OAuth
+    /// definition is `provider_unknown`. A record of kind `app_password` of a provider without
+    /// an application password definition is `not_allowed` (the password of `naver_mail` is
+    /// used by the mail calls only), and so is a record of a vault kind.
+    pub(super) fn open(
+        definitions: &'a Definitions,
+        grant: &GrantView,
+        user_id: &str,
+        record: &Record,
+    ) -> Result<Opened<'a>, ProtocolError> {
+        let (kind, plaintext) = open_for(grant, user_id, record)?;
+        match kind {
+            Kind::AppPassword => {
+                let definition = definitions
+                    .app_password(&record.provider)
+                    .ok_or(ProtocolError::NotAllowed)?;
+                let credentials =
+                    AppPassword::from_plaintext(&plaintext, &definition.account_domain)?;
+                Ok(Opened::AppPassword {
+                    definition,
+                    credentials,
+                })
+            }
+            kind => {
+                let parsed = oauth::token_record(kind, plaintext)?.parse()?;
+                let definition = definitions
+                    .get(&record.provider)
+                    .ok_or(ProtocolError::ProviderUnknown)?;
+                Ok(Opened::Token { definition, parsed })
+            }
+        }
+    }
+
+    /// The definition as `forward` reads it: the address check, the methods and the credential
+    /// headers.
+    pub(super) fn reach(&self) -> &'a dyn Reach {
+        match self {
+            Opened::Token { definition, .. } => *definition,
+            Opened::AppPassword { definition, .. } => *definition,
+        }
+    }
+
+    /// The application password of the record, when the record holds one.
+    pub(super) fn app_password(&self) -> Option<&AppPassword> {
+        match self {
+            Opened::AppPassword { credentials, .. } => Some(credentials),
+            Opened::Token { .. } => None,
+        }
+    }
+
+    /// The credential header of a request to `host`: its name, and its value with the secret
+    /// the response is searched for (rule E4). For a token record it is the rule of that host
+    /// in the definition; for an application password it is HTTP Basic.
+    fn credential(&self, host: &str) -> Result<(&str, Credential), ProtocolError> {
+        match self {
+            Opened::Token { definition, parsed } => {
+                let rule = definition
+                    .inject_rule(host)
+                    .ok_or(ProtocolError::NotAllowed)?;
+                let credential = parsed
+                    .credential(rule)
+                    .ok_or(ProtocolError::RecordInvalid)?;
+                Ok((rule.header.as_str(), credential))
+            }
+            Opened::AppPassword { credentials, .. } => {
+                Ok((BASIC_HEADER, credentials.http_credential()))
+            }
+        }
+    }
+}
+
 /// A request that passed steps 2 to 4 of enclave.md 5.8: the outbound request with the
-/// credential injected, the token to search the response for (rule E4), the merge key of a GET
-/// without a body, and the event `provider_request` of the request.
+/// credential injected, the credential to search the response for (rule E4), the merge key of
+/// a GET without a body, and the event `provider_request` of the request.
 pub(super) struct Prepared {
     pub outbound: OutboundRequest,
-    pub token: Secret<String>,
+    /// The token of a token record, or the application password.
+    pub credential: Secret<String>,
     pub merge_key: Option<[u8; 32]>,
     pub event: Value,
 }
 
 /// Steps 2 to 4 of enclave.md 5.8 for one request object (`method`, `url`, `headers`) with
 /// its body: the address check of the definition, the method, the credential header of the
-/// rule of the host, `Accept-Encoding: identity`, the headers of the caller, and the check
-/// that the request can be expressed in HTTP/1.1. `parsed` is the parsed plaintext of the
-/// record the credential comes from.
+/// opened record for the host, `Accept-Encoding: identity`, the headers of the caller, and the
+/// check that the request can be expressed in HTTP/1.1.
 pub(super) fn prepare(
     request: &Value,
     payload: &Bytes,
     record: &Record,
-    definition: &Definition,
-    parsed: &oauth::OauthPlaintext,
+    opened: &Opened<'_>,
     context: &str,
 ) -> Result<Prepared, ApiError> {
     let method = request
@@ -163,27 +246,23 @@ pub(super) fn prepare(
         .get("url")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid("url"))?;
+    let reach = opened.reach();
     // 2
-    let target = definition.check_address(address)?;
+    let target = reach.check_address(address)?;
     // 3
-    if !METHODS.contains(&method) {
+    if !reach.allows_method(method) {
         return Err(ProtocolError::NotAllowed.into());
     }
-    // 4: the credential header of the rule of this host, then `Accept-Encoding: identity`
+    // 4: the credential header of the record for this host, then `Accept-Encoding: identity`
     // (the node searches the response and does not decode it), then the headers of the
     // caller.
-    let rule = definition
-        .inject_rule(target.host())
-        .ok_or(ProtocolError::NotAllowed)?;
-    let (header_value, token) = parsed
-        .credential(rule)
-        .ok_or(ProtocolError::RecordInvalid)?
-        .into_parts();
+    let (header, credential) = opened.credential(target.host())?;
+    let (header_value, credential) = credential.into_parts();
     let mut headers = vec![
-        OutboundHeader::secret(&rule.header, header_value),
+        OutboundHeader::secret(header, header_value),
         OutboundHeader::plain("accept-encoding", "identity"),
     ];
-    headers.extend(caller_headers(request, definition)?);
+    headers.extend(caller_headers(request, reach)?);
     let outbound = OutboundRequest::new(
         target.destination(),
         method,
@@ -220,7 +299,7 @@ pub(super) fn prepare(
     );
     Ok(Prepared {
         outbound,
-        token,
+        credential,
         merge_key,
         event,
     })
@@ -236,7 +315,7 @@ pub(super) async fn execute(
     node: &Node,
     user_id: &str,
     outbound: OutboundRequest,
-    token: Secret<String>,
+    credential: Secret<String>,
     timeout: Duration,
     request_budget: Option<OwnedSemaphorePermit>,
 ) -> Result<(CheckedResponse, OwnedSemaphorePermit), ProtocolError> {
@@ -285,7 +364,7 @@ pub(super) async fn execute(
     // search, is not handed on. The entry of the request is already on the chain. The search
     // reads the whole body, so it runs off the threads that serve the calls.
     let checked = tokio::task::spawn_blocking(move || {
-        provider_response::check(&token, status, headers, body)
+        provider_response::check(&credential, status, headers, body)
     })
     .await
     .map_err(|_| ProtocolError::Internal)?
@@ -344,21 +423,10 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
         node.ensure_open()?;
         let now_ms = node.now_ms();
         let grant = account.active(now_ms)?;
-        // The record is an `oauth` record: a vault record is `not_allowed` here.
-        let opened = oauth::open_record(&grant, user_id, &record)?;
-        let parsed = opened.parse()?;
-        let definition = node
-            .definitions
-            .get(&record.provider)
-            .ok_or(ProtocolError::ProviderUnknown)?;
-        let prepared = prepare(
-            meta.as_value(),
-            &payload,
-            &record,
-            definition,
-            &parsed,
-            context,
-        )?;
+        // The record is a token record or an application password of a provider with an HTTP
+        // definition: a vault record is `not_allowed` here.
+        let opened = Opened::open(&node.definitions, &grant, user_id, &record)?;
+        let prepared = prepare(meta.as_value(), &payload, &record, &opened, context)?;
         // 5, 6: the merge decision and the event. `place` is where the event of this request
         // is: its own, or the one it shares.
         let place = node
@@ -388,13 +456,15 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
     // reservation of the request frame goes with it and is free once the request is on the
     // wire (`execute`).
     let Prepared {
-        outbound, token, ..
+        outbound,
+        credential,
+        ..
     } = prepared;
     let (checked, budget) = execute(
         node,
         user_id,
         outbound,
-        token,
+        credential,
         Duration::from_millis(timeout_ms),
         Some(request_budget),
     )

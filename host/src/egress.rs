@@ -68,9 +68,10 @@ pub struct Allowlist {
 
 impl Allowlist {
     /// Computes the list from the provider definitions of the node
-    /// (`enclave/src/providers/definitions.json`): the hosts of `api`, the host of the token
-    /// address and the host of the revocation address of every provider. The host of the
-    /// authorization address is not in the list: the node never connects to it.
+    /// (`enclave/src/providers/definitions.json`): the hosts of `api` of every provider, and
+    /// the host of the token address and the host of the revocation address of every OAuth
+    /// provider. The host of the authorization address is not in the list: the node never
+    /// connects to it.
     pub fn from_definitions(text: &str) -> Result<Allowlist, String> {
         let definitions: serde_json::Map<String, Value> = serde_json::from_str(text)
             .map_err(|_| "the provider definitions are not a JSON object".to_string())?;
@@ -87,6 +88,11 @@ impl Allowlist {
                     .filter(|host| is_host_name(host))
                     .ok_or_else(|| format!("{provider}: an api host is not a DNS name"))?;
                 hosts.insert(host.to_string());
+            }
+            // An application password authenticates to the api hosts: such a definition (the
+            // key `credential`) has no token address and no revocation address.
+            if definition.get("credential").is_some() {
+                continue;
             }
             let token = definition
                 .pointer("/token/url")
@@ -414,6 +420,10 @@ mod tests {
     use super::*;
 
     const DEFINITIONS: &str = r#"{
+        "passwords": {
+            "credential": "app_password",
+            "api": [{"host": "dav.third.example", "prefixes": ["/"], "exact": []}]
+        },
         "first": {
             "authorize": {"url": "https://accounts.first.example/authorize"},
             "token": {"url": "https://token.first.example/oauth/token"},
@@ -500,14 +510,17 @@ mod tests {
             "revoke.first.example",
             "api.second.example",
             "second.example",
+            "dav.third.example",
         ]
         .into_iter()
         .map(str::to_string)
         .collect();
         assert_eq!(list.hosts, expected);
-        assert_eq!(list.len(), 6);
+        assert_eq!(list.len(), 7);
 
         assert!(list.allows("api.first.example", 443));
+        // The api host of an application password definition, which has no token address.
+        assert!(list.allows("dav.third.example", 443));
         assert!(list.allows("token.first.example", 443));
         assert!(list.allows("revoke.first.example", 443));
         // The authorization address is opened by the browser of the user, never by the node.
@@ -526,7 +539,7 @@ mod tests {
         let host = "character-credential-log-dev-1.s3.us-west-2.amazonaws.com";
         assert!(!allowlist().allows(host, 443));
         let list = allowlist().with_log_store(host.to_string());
-        assert_eq!(list.len(), 7);
+        assert_eq!(list.len(), 8);
         assert!(list.allows(host, 443));
         assert!(list.allows("api.first.example", 443));
         // That host only: no other bucket, no other region, no other port.
@@ -547,6 +560,9 @@ mod tests {
         assert!(list.allows("oauth2.googleapis.com", 443));
         assert!(list.allows("login.microsoftonline.com", 443));
         assert!(list.allows("graph.microsoft.com", 443));
+        // The api host of the application password definition, on port 443 only.
+        assert!(list.allows("caldav.calendar.naver.com", 443));
+        assert!(!list.allows("caldav.calendar.naver.com", 993));
         assert!(!list.allows("accounts.google.com", 443));
         assert!(!list.allows("example.com", 443));
     }
