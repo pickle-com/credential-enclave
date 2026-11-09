@@ -704,8 +704,10 @@ Index verification of a chain of format 2:
    `LOG_VERIFY_BODIES`, `LOG_VERIFY_TIME_MS`: a run that reaches a budget leaves the chains it has
    not walked, and the rest of the chain it was walking, pending at their verified points, and the
    next synchronization of that runtime, or the next log screen, walks on from them; the app reads
-   at most `LOG_STORE_CONCURRENCY` objects of the store at once); a transfer traced there explains
-   the node. A node that no traced transfer explains after the
+   at most `LOG_STORE_CONCURRENCY` objects of the store at once; a synchronization that a user
+   procedure starts, the creation or reset of the master key, the access switch or the transfer of
+   the key, does not run the verification and leaves it to the next synchronization of that
+   runtime); a transfer traced there explains the node. A node that no traced transfer explains after the
    second look is a delegation the app did not make (attention) and stays in the list with that
    mark. A run that finds no such node reads no head twice. The
    nodes of the listing that the list of nodes does not know are examined after the known nodes, at
