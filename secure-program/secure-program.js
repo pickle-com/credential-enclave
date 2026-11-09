@@ -22,7 +22,7 @@
 
   // ---- Constants ----
 
-  const VERSION = 41;
+  const VERSION = 42;
   const MASTER_KEY_SERVICE = "com.pickle.client.secure.master-key";
   const LEDGER_SERVICE = "com.pickle.client.secure.ledger";
   const LEDGER_STORE_KEY = "ledger";
@@ -954,6 +954,10 @@
       // The time the reads of the log store began to fail, 0 while they succeed (a run that
       // completes with the store read clears it).
       store_failing_ms: 0,
+      // The discovery cursor: the id of the node the last verification run examined last among the
+      // nodes of the node discovery listing the ledger did not know ("" before the first). The
+      // window of the next run begins after it in the id order of the listing (verifyRun).
+      discovery_after: "",
       nodes: Object.create(null),
     };
   }
@@ -994,6 +998,9 @@
     ledger.ttl_days = grantDays(raw.ttl_days);
     ledger.ttl_set_ms = whole(raw.ttl_set_ms);
     ledger.store_failing_ms = whole(raw.store_failing_ms);
+    // A program before v42 leaves the cursor out of its own ledger and drops it from one it reads.
+    ledger.discovery_after = typeof raw.discovery_after === "string" && NODE_ID.test(raw.discovery_after)
+      ? raw.discovery_after : "";
     const nodes = raw.nodes !== null && typeof raw.nodes === "object" ? raw.nodes : {};
     for (const id of Object.keys(nodes)) {
       const node = nodes[id];
@@ -1012,9 +1019,16 @@
         // delegation transfer) or store (found in the log store only: no grant of this app and no
         // traced transfer explains it).
         origin: node.origin === "store" ? "store" : "grant",
-        // For a node of origin store: the time an entry sealed to the key of this account was
-        // first verified on it (a delegation the app did not make), 0 otherwise.
+        // For a node of origin store: the time the node was marked a delegation the app did not
+        // make (an entry sealed to the key of this account verified on it that no traced transfer
+        // explained), 0 otherwise.
         unknown_ms: node.origin === "store" ? whole(node.unknown_ms) : 0,
+        // For a node of origin store: the time an entry sealed to the key of this account was first
+        // verified on its chain, 0 while none was. The fact stays with the node across runs: a run
+        // cut short by its budget leaves the node at its verification point, and the run that marks
+        // it may read nothing new (verifyRun). A program before v42 leaves the field out of its own
+        // ledger and drops it from one it reads.
+        sealed_ms: node.origin === "store" ? whole(node.sealed_ms) : 0,
         // The time this app last sent a grant to the node (written before the grant goes out:
         // renewGrants), 0 for a node that entered the ledger another way. A program before v34
         // leaves the field out of its own ledger and drops it from one it reads.
@@ -1028,10 +1042,11 @@
    *  granted_ms and not_after_ms of the side with the larger granted_ms, the checkpoint of the side
    *  with the larger checkpoint.seq, the final that is not null, the smaller non-zero gone_ms, the
    *  smaller first_ms, the non-empty sealing public key (with the platform and release of that
-   *  side), the origin grant when either side has it, and the smaller non-zero unknown_ms (0 when
-   *  the origin is grant). revoked_ms and resumed_ms are each the larger value, ttl_days is the
-   *  value of the side with the larger ttl_set_ms (the one set later), and store_failing_ms is the
-   *  smaller non-zero value. */
+   *  side), the origin grant when either side has it, and the smaller non-zero unknown_ms and
+   *  sealed_ms (0 when the origin is grant). revoked_ms and resumed_ms are each the larger value,
+   *  ttl_days is the value of the side with the larger ttl_set_ms (the one set later),
+   *  store_failing_ms is the smaller non-zero value, and discovery_after is the larger id (the
+   *  window of either side moved past the nodes before it). */
   function mergeLedger(a, b) {
     const merged = emptyLedger();
     merged.revoked_ms = Math.max(a.revoked_ms, b.revoked_ms);
@@ -1042,6 +1057,7 @@
     merged.store_failing_ms = a.store_failing_ms === 0 || b.store_failing_ms === 0
       ? Math.max(a.store_failing_ms, b.store_failing_ms)
       : Math.min(a.store_failing_ms, b.store_failing_ms);
+    merged.discovery_after = a.discovery_after > b.discovery_after ? a.discovery_after : b.discovery_after;
     for (const side of [a, b]) {
       for (const id of Object.keys(side.nodes)) {
         const node = side.nodes[id];
@@ -1056,7 +1072,7 @@
             },
             final: node.final === null ? null : { seq: node.final.seq, hash: node.final.hash },
             gone_ms: node.gone_ms, origin: node.origin, unknown_ms: node.unknown_ms,
-            attempted_ms: node.attempted_ms,
+            sealed_ms: node.sealed_ms, attempted_ms: node.attempted_ms,
           };
           continue;
         }
@@ -1066,7 +1082,13 @@
         if (node.unknown_ms !== 0 && (kept.unknown_ms === 0 || node.unknown_ms < kept.unknown_ms)) {
           kept.unknown_ms = node.unknown_ms;
         }
-        if (kept.origin !== "store") kept.unknown_ms = 0;
+        if (node.sealed_ms !== 0 && (kept.sealed_ms === 0 || node.sealed_ms < kept.sealed_ms)) {
+          kept.sealed_ms = node.sealed_ms;
+        }
+        if (kept.origin !== "store") {
+          kept.unknown_ms = 0;
+          kept.sealed_ms = 0;
+        }
         // A node that entered through the tracing of a delegation transfer has an empty sealing
         // public key: the value of the side that verified the attestation is used.
         if (kept.seal_pk === "" && node.seal_pk !== "") {
@@ -1103,18 +1125,25 @@
   }
 
   /** Writes the node ledger to the keychain item and the device copy (a side whose stored value is
-   *  the same is not written). When the serialization exceeds the limit, the nodes whose
-   *  verification reached the final head (final is set and checkpoint.seq equals final.seq) are
-   *  removed, oldest gone_ms first, until it fits. */
+   *  the same is not written). When the serialization exceeds the limit, first the clean prefixes
+   *  found in the store only (origin store, nothing sealed to this key, no mark: the discovery
+   *  cursor examines them again when the listing still names them) are removed, oldest first_ms
+   *  first, then the nodes whose verification reached the final head (final is set and
+   *  checkpoint.seq equals final.seq), oldest gone_ms first, until it fits. */
   function saveLedger(ledger) {
     let json = JSON.stringify(ledger);
     if (utf8(json).length > LEDGER_LIMIT_BYTES) {
+      const clean = Object.keys(ledger.nodes).filter(function (id) {
+        const node = ledger.nodes[id];
+        return node.origin === "store" && node.unknown_ms === 0 && node.sealed_ms === 0;
+      });
+      clean.sort(function (x, y) { return ledger.nodes[x].first_ms - ledger.nodes[y].first_ms; });
       const finished = Object.keys(ledger.nodes).filter(function (id) {
         const node = ledger.nodes[id];
-        return node.final !== null && node.checkpoint.seq === node.final.seq;
+        return node.origin !== "store" && node.final !== null && node.checkpoint.seq === node.final.seq;
       });
       finished.sort(function (x, y) { return ledger.nodes[x].gone_ms - ledger.nodes[y].gone_ms; });
-      for (const id of finished) {
+      for (const id of clean.concat(finished)) {
         delete ledger.nodes[id];
         json = JSON.stringify(ledger);
         if (utf8(json).length <= LEDGER_LIMIT_BYTES) break;
@@ -1587,6 +1616,7 @@
       if (known.origin === "store") {
         known.origin = "grant";
         known.unknown_ms = 0;
+        known.sealed_ms = 0;
         known.platform = node.platform;
         known.release = node.release;
         known.first_ms = Math.min(known.first_ms, whole(body.time_ms));
@@ -1599,7 +1629,7 @@
       sign_pk: to, seal_pk: "", platform: node.platform, release: node.release,
       first_ms: whole(body.time_ms), granted_ms: 0, not_after_ms: node.not_after_ms,
       checkpoint: { seq: 0, hash: ZERO_HASH, time_ms: 0 }, final: null, gone_ms: 0, origin: "grant",
-      unknown_ms: 0,
+      unknown_ms: 0, sealed_ms: 0,
     };
   }
 
@@ -2276,14 +2306,15 @@
    *  final head when the node is gone. A node whose head equals the verification point is verified
    *  without a listing. summary is the element of the log node query for that node (undefined when
    *  absent), budgets the keys and bodies this run may still spend, store the state of the store
-   *  reads of this run (a failure changes it). Returns {state, checked, missing, expired, ours}
-   *  whose state is verified, pending (a budget ran out, the store could not be read, or the store
-   *  has pages or entries still to confirm) or attention (a gap, a mismatch, or a part that cannot
-   *  be checked). */
+   *  reads of this run (a failure changes it). Returns {state, checked, missing, expired, ours,
+   *  cutShort} whose state is verified, pending (a budget ran out, the store could not be read, or
+   *  the store has pages or entries still to confirm) or attention (a gap, a mismatch, or a part
+   *  that cannot be checked); cutShort is true when a budget of the run (time, keys, bodies, or the
+   *  listing pages of this chain) ended the walk before the head: the run is cut short (verifyRun). */
   async function verifyChain(ledger, id, summary, budgets, keys, store, reads) {
     const node = ledger.nodes[id];
     const stored = summary === undefined ? { live: false, final_head: null } : summary;
-    const outcome = { state: "verified", checked: 0, missing: 0, expired: 0, ours: false };
+    const outcome = { state: "verified", checked: 0, missing: 0, expired: 0, ours: false, cutShort: false };
     if (node.final !== null && node.checkpoint.seq >= node.final.seq) return outcome;
     if (!writesToStore(node)) {
       // A node of a build that wrote no entry to the store has no chain here. A gone one leaves
@@ -2370,6 +2401,16 @@
    *  verifying entry: the entries before it are expired when the verification point, or the entry
    *  itself, is older than the retention of the store, otherwise missing. For a node found in the
    *  store only, a prefix that is not a chain is left out. */
+  /** An entry sealed to the key of this account verified on the chain of node. The fact stays with
+   *  a node found in the store only (sealed_ms: the time it was first verified) so that the run
+   *  that marks the node may be a later one than the run that verified the entry: a run cut short
+   *  by its budget leaves the node at its verification point and the next run reads nothing new
+   *  from it (verifyRun). */
+  function sealedToThisKey(node, outcome) {
+    outcome.ours = true;
+    if (node.origin === "store" && node.sealed_ms === 0) node.sealed_ms = native.nowMs();
+  }
+
   async function walkStore(ledger, node, id, head, budgets, keys, store, outcome, reads) {
     let cursor = node.checkpoint;
     if (head !== null &&
@@ -2416,6 +2457,7 @@
         if (landed === null && (budgets.bodies <= 0 || timeBudgetSpent(budgets))) {
           // A budget of the run ran out before a landing was read: the next run reads on.
           outcome.state = "pending";
+          outcome.cutShort = true;
         } else if (!beyond) {
           if (!discovered) {
             outcome.missing += (landed === null ? nextListedSeq(index, cursor.seq) : landed.seq) - cursor.seq - 1;
@@ -2427,7 +2469,7 @@
         } else {
           outcome.expired += landed.seq - cursor.seq - 1;
           followTransfer(ledger, node, landed.body, landed.events);
-          if (landed.ours) outcome.ours = true;
+          if (landed.ours) sealedToThisKey(node, outcome);
           cursor = { seq: landed.seq, hash: landed.hash, time_ms: landed.time_ms };
           outcome.checked += 1;
         }
@@ -2437,6 +2479,7 @@
           // The time budget of the run is spent: the walk stops at its cursor (the verification
           // point moves there below) and the next run walks on from it.
           outcome.state = "pending";
+          outcome.cutShort = true;
           break;
         }
         const next = cursor.seq + 1;
@@ -2457,7 +2500,10 @@
         let step = null;
         if (linked.length === 1 && linked[0].parts.kind === "u" && vouched !== null) {
           if (budgets.keys <= 0) {
+            // The keys budget of the run is spent: as the time budget, the walk stops here and the
+            // run is cut short.
             outcome.state = "pending";
+            outcome.cutShort = true;
             break;
           }
           budgets.keys -= 1;
@@ -2467,6 +2513,7 @@
         } else if (linked.length > 0 || legacy.length > 0) {
           if (budgets.bodies <= 0) {
             outcome.state = "pending";
+            outcome.cutShort = true;
             break;
           }
           step = await contentStep(
@@ -2475,6 +2522,7 @@
           if (step === null) {
             if (budgets.bodies <= 0) {
               outcome.state = "pending";
+              outcome.cutShort = true;
             } else if (vouched !== null) {
               // Below the vouched end a seq whose objects do not verify is an entry that was
               // changed or an object someone else put there in the place of one.
@@ -2498,7 +2546,7 @@
           outcome.state = "attention";
           break;
         }
-        if (step.ours) outcome.ours = true;
+        if (step.ours) sealedToThisKey(node, outcome);
         cursor = { seq: next, hash: step.hash, time_ms: step.time_ms };
         outcome.checked += 1;
       }
@@ -2510,7 +2558,11 @@
     budgets.fetched += reader.fetched;
     if (outcome.state === "verified" &&
         (index.truncated || (vouched !== null && vouched > index.max))) {
+      // The listing of this chain goes on beyond LOG_STORE_PAGES pages (or the head lies beyond
+      // the pages listed): the walk stops at the last listed entry, the run is cut short, and the
+      // next run lists on from the verification point.
       outcome.state = "pending";
+      outcome.cutShort = true;
     }
     node.checkpoint = cursor;
     anchorDisplay(id, cursor);
@@ -3603,9 +3655,9 @@
   }
 
   /** The published state log of one run and its bookkeeping in the ledger: store_failing_ms starts
-   *  at the first run whose store reads failed and clears at the first run that read the store (every
-   *  read of the store the run made succeeded: store verified, or truncated: the store answered and
-   *  the run left nodes or listing pages to the next runs), pending at its walk or not. A run cut
+   *  at the first run whose store reads failed and clears at the first run that read the store
+   *  (storeRead: every read of the store the run made succeeded, or the node discovery window left
+   *  nodes of the listing to the next runs), pending at its walk or not. A run cut
    *  short by its time budget or by LOG_STORE_NODES reads the store and leaves entries pending, and
    *  LOG_STORE_STALE_MS marks reads that keep failing, not a walk that has entries left (the fleet of
    *  the operator writing control entries or bringing up nodes faster than a device walks them would
@@ -3619,8 +3671,17 @@
    *  program_version names the program that judged the published value: the executor keeps the
    *  published state across runtimes, and the first synchronization of the runtime of a later
    *  program judges it again (afterGrants: verified_ms starts at 0 in every runtime). */
+  /** Whether the run read the store: every read of the store it made answered (verified), or the
+   *  node discovery window left nodes of the listing to the next runs (truncated, discovery:nodes:
+   *  the chains the run examined were read). A node discovery listing that went on beyond
+   *  LOG_STORE_PAGES pages (truncated, discovery:pages) is not a read: the run saw no chain, so
+   *  the mark of failing reads runs (LOG_STORE_STALE_MS) as for a store that cannot be listed. */
+  function storeRead(store) {
+    return store.state === "verified" || (store.state === "truncated" && store.detail === "discovery:nodes");
+  }
+
   function publishLogState(ledger, store, counts, now) {
-    const read = store.state === "verified" || store.state === "truncated";
+    const read = storeRead(store);
     const unread = !read && store.state !== "absent" && store.state !== "refused";
     if (unread) {
       if (ledger.store_failing_ms === 0) ledger.store_failing_ms = now;
@@ -3895,8 +3956,7 @@
     // A run cut short by its time budget, or one that left nodes found in the store only to the
     // next runs (LOG_STORE_NODES), with the store read (verified, or truncated by that window) is
     // walked on by the next synchronization of this runtime (verifyDue), not only by the next period.
-    verificationCutShort = (run.counts.cutShort || run.counts.moreToExamine === true) &&
-      (run.store.state === "verified" || run.store.state === "truncated");
+    verificationCutShort = (run.counts.cutShort || run.counts.moreToExamine === true) && storeRead(run.store);
     verificationDeferred = false;
     const result = publishLogState(ledger, run.store, run.counts, run.now);
     reportVerification(result, run.counts, Object.keys(ledger.nodes).length, native.nowMs() - started);
@@ -3960,16 +4020,27 @@
     // A node of a release later than this program is not examined: its chain waits for the program
     // that lists the release (pending), and it does not enter the ledger here.
     const unknownIds = discovered.filter(function (id) { return ledger.nodes[id] === undefined; });
-    const examinable = unknownIds.filter(function (id) { return !newerReleaseNodes.has(id); });
+    const examinable = unknownIds.filter(function (id) { return !newerReleaseNodes.has(id); }).sort();
     // The nodes of a later release this run left out, each once (a node of the listing can enter
     // the ledger later in the run through the tracing of a transfer).
     const later = new Set(unknownIds.filter(function (id) { return newerReleaseNodes.has(id); }));
-    const examined = examinable.slice(0, LOG_STORE_NODES);
+    // The window of this run begins after the node the last run examined last (the discovery cursor
+    // of the ledger, in the id order of the listing) and wraps to the start of the listing. A node
+    // examined to its head that holds nothing sealed to this key leaves the ledger below and the
+    // listing names it again: the cursor, not the ledger, carries the window past it, so every
+    // unknown node is examined within ceil(n / LOG_STORE_NODES) + 1 runs whatever the runs leave in
+    // the ledger (a program whose window began at the start of the listing at every run never
+    // examined the nodes beyond LOG_STORE_NODES such nodes).
+    const after = ledger.discovery_after;
+    const ahead = examinable.filter(function (id) { return id > after; });
+    const behind = examinable.filter(function (id) { return id <= after; });
+    const examined = ahead.concat(behind).slice(0, LOG_STORE_NODES);
+    if (examined.length > 0) ledger.discovery_after = examined[examined.length - 1];
     for (const id of examined) {
       ledger.nodes[id] = {
         sign_pk: id, seal_pk: "", platform: "", release: "", first_ms: now, granted_ms: 0,
         not_after_ms: 0, checkpoint: { seq: 0, hash: ZERO_HASH, time_ms: 0 }, final: null, gone_ms: now,
-        origin: "store", unknown_ms: 0,
+        origin: "store", unknown_ms: 0, sealed_ms: 0,
       };
     }
     // The nodes whose verified entries include one sealed to the key of this account.
@@ -4004,6 +4075,7 @@
         counts.expired += outcome.expired;
         if (outcome.ours) ours.add(id);
         if (outcome.state === "pending") counts.pending = true;
+        if (outcome.cutShort) counts.cutShort = true;
         if (outcome.state === "attention") counts.unverified += 1;
         if (outcome.state === "verified") reached.add(id);
         else reached.delete(id);
@@ -4016,12 +4088,12 @@
       }
     };
     await walk(Object.keys(ledger.nodes), summaries, reads);
-    // The nodes found in the store only that hold an entry sealed to this key and that no trace
-    // reached: the marks this run would make.
+    // The nodes found in the store only that hold an entry sealed to this key (verified in this run
+    // or in an earlier one: sealed_ms) and that no trace reached: the marks this run would make.
     const unexplained = function () {
-      return Array.from(ours).filter(function (id) {
+      return Object.keys(ledger.nodes).filter(function (id) {
         const node = ledger.nodes[id];
-        return node !== undefined && node.origin === "store" && node.unknown_ms === 0;
+        return node.origin === "store" && node.unknown_ms === 0 && (ours.has(id) || node.sealed_ms !== 0);
       });
     };
     const found = unexplained();
@@ -4059,20 +4131,24 @@
       counts.pending = true;
       if (store.state === "verified") storeFailed(store, storeFailure("truncated", "discovery:nodes"));
     }
-    // Whether the time budget cut the run short (a walk above stopped at it, or the second look
-    // was not made): the next synchronization walks on.
-    counts.cutShort = timeBudgetSpent(budgets);
+    // Whether a budget of the run cut it short: the time budget (a walk above stopped at it, or the
+    // second look was not made), or the keys or bodies budget or the listing pages of one chain
+    // (a walk above stopped before its head: outcome.cutShort). The next synchronization walks on.
+    counts.cutShort = counts.cutShort || timeBudgetSpent(budgets);
     if (counts.cutShort) counts.pending = true;
-    // A node found in the store only that holds an entry sealed to this key is a delegation the app
-    // did not make and no verified transfer explained (a trace that reaches the node later in the
-    // run, in the first walk or in the second look, changes its origin before this mark). The mark
-    // stays in the ledger. A run cut short makes no mark: the trace that explains the node may be in
-    // a chain the run has not walked yet.
-    if (!counts.cutShort) {
-      for (const id of ours) {
-        const node = ledger.nodes[id];
-        if (node !== undefined && node.origin === "store" && node.unknown_ms === 0) node.unknown_ms = now;
-      }
+    // A node found in the store only whose chain holds an entry sealed to this key (sealed_ms: the
+    // fact stays with the node across runs) is a delegation the app did not make and no verified
+    // transfer explained (a trace that reaches the node, in the first walk or in the second look of
+    // this run or of an earlier one, changes its origin before this mark). The mark stays in the
+    // ledger. A run cut short makes no mark: the trace that explains the node may be in a chain, or
+    // in the part of a chain, the run has not walked yet (the giving node's transfer entry beyond
+    // the keys the run could walk). A node that has stayed unexplained for LOG_STORE_STALE_MS since
+    // that entry was first verified is marked by a run cut short as well: the runs of those days
+    // walked the chains that could have explained it.
+    for (const id of Object.keys(ledger.nodes)) {
+      const node = ledger.nodes[id];
+      if (node.origin !== "store" || node.unknown_ms !== 0 || node.sealed_ms === 0) continue;
+      if (!counts.cutShort || now - node.sealed_ms >= LOG_STORE_STALE_MS) node.unknown_ms = now;
     }
     for (const id of Object.keys(ledger.nodes)) {
       const node = ledger.nodes[id];
@@ -4083,16 +4159,18 @@
           counts.unknown += 1;
           counts.unknownIds.push(id);
         }
-      } else if (counts.cutShort || !reached.has(id)) {
-        // The examination of the node is not complete (the run was cut short, or the walk of its
-        // chain did not reach the head in this run): the node stays with its verification point and
-        // the next run walks on from there. Deleting it here made the next run examine it again from
-        // the start and, with more such nodes than LOG_STORE_NODES, examine the same nodes forever.
-      } else {
-        // The chain was walked to its head and holds no entry sealed to this key that a trace did
-        // not explain: nothing to keep (the next run examines it again if the listing still names it).
+      } else if (node.sealed_ms === 0 && discovered.length > 0 && discovered.indexOf(id) < 0) {
+        // A node found in the store only whose prefix the listing of this run no longer names and
+        // whose chain held nothing sealed to this key: nothing to keep.
         delete ledger.nodes[id];
       }
+      // Otherwise the node stays with its verification point: the next run walks on from there when
+      // its examination is not complete (the run was cut short, or the walk did not reach the head),
+      // and reads nothing new from it when the chain was walked to its head and holds nothing sealed
+      // to this key (a clean prefix: an object someone put under the account prefix, or the chain a
+      // node wrote under an earlier key of the account). A clean prefix that left the ledger was
+      // examined again by the next run and, with more such prefixes than LOG_STORE_NODES, kept the
+      // verification pending and running at every synchronization.
     }
     return { store: store, counts: counts, now: now };
   }

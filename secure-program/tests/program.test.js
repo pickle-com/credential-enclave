@@ -374,6 +374,88 @@ test("the node discovery window moves on across runs, the nodes beyond it are ex
   assert.ok(result.runs < 30, "runs " + result.runs);
 });
 
+test("a node whose chain a run cut short walked to its head is marked by the next run that is not cut short", async () => {
+  const result = await scenarios.rogue_walked_in_cut_short_run_is_marked(source);
+  // Run 1 (cut short after the walk): no mark, the node stays at its verification point. Run 2
+  // (not cut short, nothing new on the chain): the entry sealed to the key of the account that run
+  // 1 verified is remembered with the node, and the node is marked.
+  assert.equal(result.history[0].late, true);
+  assert.equal(result.history[0].status, "pending");
+  assert.equal(result.history[0].rogue, "store");
+  assert.equal(result.history[1].late, false);
+  assert.equal(result.history[1].status, "attention");
+  assert.equal(result.history[1].rogue, "store+unknown");
+  assert.equal(result.final, "attention");
+  assert.equal(result.unknown_nodes, 1);
+});
+
+test("a run that spends its keys budget before the transfer that explains a node is cut short: no mark, and the next synchronization walks on and explains it", async () => {
+  const result = await scenarios.keys_budget_before_transfer(source);
+  // Run 1: node0 holds 8,100 use entries before its transfer out; the keys budget ends its walk
+  // before the transfer, the receiving node is found in the store with its entry sealed to this key,
+  // and the run is cut short: pending, no mark, the store read.
+  assert.equal(result.history[0].status, "pending");
+  assert.equal(result.history[0].store, "verified");
+  assert.equal(result.history[0].unknown, 0);
+  assert.equal(result.history[0].target, "store");
+  // The next synchronization runs the verification at once, walks node0 to its head, traces the
+  // transfer and explains the node: verified, nothing unknown.
+  assert.equal(result.final, "verified");
+  assert.equal(result.unknown_nodes, 0);
+  assert.ok(result.history.length <= 3, JSON.stringify(result.history));
+  assert.equal(result.history[result.history.length - 1].target, "grant");
+});
+
+test("a node nobody transferred to is marked once the stale bound has passed, though every run is cut short by its keys budget", async () => {
+  const result = await scenarios.keys_budget_every_run_marks_at_stale_bound(source);
+  // Days 1 to 3: every run spends its keys on node0 (8,100 new use entries a day) and is cut short;
+  // the node found in the store only is kept with its verified entry and not marked.
+  for (const entry of result.history.slice(0, 3)) {
+    assert.equal(entry.status, "pending");
+    assert.equal(entry.unknown, 0);
+    assert.equal(entry.target, "store");
+  }
+  // Day 4: LOG_STORE_STALE_MS has passed since that entry was first verified: the run, cut short
+  // again, marks the node.
+  assert.equal(result.history.length, 4);
+  assert.equal(result.history[3].status, "attention");
+  assert.equal(result.history[3].target, "store+unknown");
+  assert.equal(result.final, "attention");
+  assert.equal(result.unknown_nodes, 1);
+});
+
+test("a node discovery listing beyond the page limit is not a read of the store: the mark of failing reads runs", async () => {
+  const result = await scenarios.discovery_pages_truncated_is_unread(source);
+  assert.equal(result.first.status, "pending");
+  assert.equal(result.first.store, "truncated");
+  assert.equal(result.first.store_failure, "discovery:pages");
+  assert.notEqual(result.first.store_failing_ms, 0);
+  assert.equal(result.second_day.status, "pending");
+  assert.equal(result.second_day.store_failing_ms, result.first.store_failing_ms);
+  assert.equal(result.stale.status, "attention");
+  assert.equal(result.restored.status, "verified");
+  assert.equal(result.restored.store, "verified");
+  assert.equal(result.restored.store_failing_ms, 0);
+});
+
+test("clean prefixes the list of nodes does not know settle to verified and are not examined again from the start", async () => {
+  const result = await scenarios.clean_unknown_nodes_settle_to_verified(source);
+  // The first run examined a window of the twenty (pending, the store truncated by the window);
+  // the next synchronization examined the rest; then the verification is verified, the prefixes
+  // stay at their heads, the mark of failing reads never started, and a synchronization while the
+  // verification is not due reads no object.
+  assert.equal(result.first.status, "pending");
+  assert.equal(result.first.store, "truncated");
+  assert.equal(result.first.store_failing_ms, 0);
+  assert.equal(result.settled.status, "verified");
+  assert.ok(result.settled.syncs <= 2, "syncs " + result.settled.syncs);
+  assert.equal(result.object_reads_when_not_due, 0);
+  assert.equal(result.daily.status, "verified");
+  assert.equal(result.daily.unknown_nodes, 0);
+  assert.equal(result.store_nodes_kept, 20);
+  assert.equal(result.store_failing_ms, 0);
+});
+
 test("a synchronization a user procedure starts leaves a due verification to the next synchronization", async () => {
   const result = await scenarios.user_procedure_defers_verification(source);
   assert.equal(result.after_switch.reports, 0);
