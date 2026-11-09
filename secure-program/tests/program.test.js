@@ -334,3 +334,13 @@ test("a run that reaches its time budget is pending at its verification points, 
   // more reads than entries, not multiples.
   assert.ok(result.object_reads >= 25 && result.object_reads <= 25 + 2 * 8, "object reads " + result.object_reads);
 });
+
+test("a synchronization a user procedure starts leaves a due verification to the next synchronization", async () => {
+  const result = await scenarios.user_procedure_defers_verification(source);
+  assert.equal(result.after_switch.reports, 0);
+  assert.equal(result.after_switch.grant, "active");
+  assert.equal(result.after_switch.log_published, false);
+  assert.equal(result.after_sync.reports, 1);
+  assert.equal(result.after_sync.status, "verified");
+  assert.equal(result.node0_grants, 1);
+});

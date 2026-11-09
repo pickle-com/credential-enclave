@@ -605,6 +605,22 @@ async function timeBudgetResumes(source) {
   };
 }
 
+/** One device whose verification is due (a new runtime). The user turns the access switch on
+ *  before the runtime synchronized: the procedure grants and returns without a verification run
+ *  (no report), and the next synchronization of the runtime verifies. */
+async function userProcedureDefersVerification(source) {
+  const base = baseWorld(source);
+  const program = bridge.loadProgram(source, base.world);
+  const result = await program.procedures.set_delegation({ enabled: true });
+  const afterSwitch = { reports: base.world.reports.length, grant: result.grant.state, published_log: base.world.state.log };
+  await program.onEvent("foreground", {});
+  return {
+    after_switch: { reports: afterSwitch.reports, grant: afterSwitch.grant, log_published: afterSwitch.published_log !== undefined },
+    after_sync: { reports: base.world.reports.length, status: base.world.state.log.status },
+    node0_grants: base.node0.grants.size,
+  };
+}
+
 module.exports = {
   scenarios: {
     plain: plain,
@@ -627,5 +643,6 @@ module.exports = {
     store_answers_once_503: storeAnswersOnce503,
     store_objects_fail: storeObjectsFail,
     time_budget_resumes: timeBudgetResumes,
+    user_procedure_defers_verification: userProcedureDefersVerification,
   },
 };

@@ -22,7 +22,7 @@
 
   // ---- Constants ----
 
-  const VERSION = 38;
+  const VERSION = 39;
   const MASTER_KEY_SERVICE = "com.pickle.client.secure.master-key";
   const LEDGER_SERVICE = "com.pickle.client.secure.ledger";
   const LEDGER_STORE_KEY = "ledger";
@@ -63,8 +63,10 @@
   // screen walks on from there. The procedures of the program run one after another and the
   // executors end a procedure at 120 seconds: a run of minutes (the control entries of many nodes
   // read by content after the fleet of the operator moved the delegations around) would hold the
-  // grants, the vault and the log screen behind it.
-  const LOG_VERIFY_TIME_MS = 20000;
+  // grants, the vault and the log screen behind it. A synchronization that a user procedure
+  // starts (the creation or reset of the master key, the access switch, the transfer of the key)
+  // leaves the verification to the next synchronization of the runtime (afterGrants).
+  const LOG_VERIFY_TIME_MS = 10000;
   // The least steps (keys walked, bodies read) a run makes before its time budget stops it: a run
   // moves on however slow the reads are (the reads ahead are stopped at the budget; the walk then
   // takes the objects read ahead and stops after these steps).
@@ -3884,6 +3886,7 @@
     // A run cut short by its time budget with the store read is walked on by the next
     // synchronization of this runtime (verifyDue), not only by the next period.
     verificationCutShort = run.counts.cutShort && run.store.state === "verified";
+    verificationDeferred = false;
     const result = publishLogState(ledger, run.store, run.counts, run.now);
     reportVerification(result, run.counts, Object.keys(ledger.nodes).length, native.nowMs() - started);
     return result;
@@ -4141,7 +4144,7 @@
    *  (afterGrants: the sealing check, the completion of an application password setup, the log
    *  verification when its period has elapsed), and runtime.ready is published. offered is the node
    *  list already requested (null: renewGrants requests it). */
-  async function delegate(keys, ledger, offered, shared) {
+  async function delegate(keys, ledger, offered, shared, deferVerification) {
     let renewed = { accepted: new Set(), rejected: 0, cleared: false };
     // The ledgers of the other devices of the account enter before the grants go out (shared is
     // the settled outcome of the request runSync sent ahead; null when the run does not exchange:
@@ -4166,7 +4169,7 @@
       state: { grant: grant, grant_days: ledger.ttl_days },
       runtime: { rejected_nodes: renewed.rejected },
     });
-    await afterGrants(keys, ledger, merged.cleared || renewed.cleared);
+    await afterGrants(keys, ledger, merged.cleared || renewed.cleared, deferVerification === true);
     native.publish({ runtime: { ready: true } });
     // The grants of this run (a node the backend value did not cover) are shared after the run.
     if (ledgerShareDue(ledger)) await shareLedger(keys, ledger);
@@ -4183,11 +4186,16 @@
   // Whether the last verification run of this runtime was cut short by its time budget with the
   // store read: the next synchronization walks on (a new runtime starts from the period rule).
   let verificationCutShort = false;
+  // Whether a synchronization a user procedure started left a due verification to the next
+  // synchronization of this runtime.
+  let verificationDeferred = false;
 
-  /** Whether the log verification runs in this synchronization: its period has elapsed, or the
-   *  last run of this runtime was cut short by its time budget. */
+  /** Whether the log verification runs in this synchronization: its period has elapsed, the last
+   *  run of this runtime was cut short by its time budget, or a user procedure left it to this
+   *  synchronization. */
   function verifyDue() {
-    return verificationCutShort || native.nowMs() - logState.verified_ms >= LOG_VERIFY_INTERVAL_MS;
+    return verificationDeferred || verificationCutShort ||
+      native.nowMs() - logState.verified_ms >= LOG_VERIFY_INTERVAL_MS;
   }
 
   /** Whether a synchronization exchanges the ledger with the backend before its grants: when the
@@ -4198,9 +4206,16 @@
     return verifyDue() || unknownNodeIds(ledger).length > 0 || ledgerShareDue(ledger);
   }
 
-  async function afterGrants(keys, ledger, cleared) {
+  async function afterGrants(keys, ledger, cleared, deferVerification) {
     const on = !delegationOff(ledger);
-    const due = cleared === true || verifyDue();
+    let due = cleared === true || verifyDue();
+    if (due && deferVerification === true) {
+      // A synchronization a user procedure started returns without the verification (the user is
+      // waiting for the grants, the key or the transfer): the next synchronization of the runtime
+      // (the next foreground, push or session) runs it (verifyDue).
+      verificationDeferred = true;
+      due = false;
+    }
     // The query of the sealing check is sent only when a node holds a grant: without one nothing
     // could be sealed (sealPending) and the account is not asked.
     const sealing = on && needsSealingCheck() && heldCustody(ledger, native.nowMs()) !== null
@@ -4310,7 +4325,7 @@
     writeMasterKey(masterKey);
     publishKey("present", keys);
     const offered = await pending;
-    await delegate(keys, loadLedger(), offered.ok ? offered.value : null);
+    await delegate(keys, loadLedger(), offered.ok ? offered.value : null, null, true);
     return { key_state: "present", key_id: keys.keyId };
   }
 
@@ -4337,7 +4352,7 @@
     };
     publishKey("present", keys);
     const offered = await pending;
-    await delegate(keys, ledger, offered.ok ? offered.value : null);
+    await delegate(keys, ledger, offered.ok ? offered.value : null, null, true);
     return { key_state: "present", key_id: keys.keyId };
   }
 
@@ -4960,7 +4975,7 @@
     // clock runs backwards or the clock of another device runs ahead.
     if (args.enabled) {
       ledger.resumed_ms = Math.max(native.nowMs(), ledger.revoked_ms);
-      return { grant: (await delegate(keys, ledger)).grant };
+      return { grant: (await delegate(keys, ledger, undefined, null, true)).grant };
     }
     const incomplete = await revokeEverywhere(keys, ledger);
     // The revocation time is after the resumption time and not before any grant time of the
@@ -5333,7 +5348,7 @@
       native.log("transfer ack: " + failureCode(error));
     }
     transferSettle("done");
-    await delegate(keys, loadLedger());
+    await delegate(keys, loadLedger(), undefined, null, true);
   }
 
   /** The approving device: when it has the key and no transfer is in progress, the oldest pending
