@@ -53,6 +53,39 @@ function providerRequest(timeMs) {
   };
 }
 
+/** A node id of the form the program accepts (43 base64url characters) that sorts before the id
+ *  of every node the model makes ('-' is the smallest base64url character): the prefix of a decoy,
+ *  an object someone put under the account prefix that is not a chain of any node. */
+function decoyId(i) {
+  return "-".repeat(41) + String.fromCharCode(65 + Math.floor(i / 26)) + String.fromCharCode(65 + (i % 26));
+}
+
+/** Puts count decoy prefixes under the account prefix of world: one object each whose key is not
+ *  a chain key, so a run that examines the prefix walks nothing and finds nothing sealed to any
+ *  key (the prefix is clean). */
+function putDecoys(world, count) {
+  const ids = [];
+  for (let i = 0; i < count; i += 1) {
+    ids.push(decoyId(i));
+    world.putObject("v1/accounts/" + world.userId + "/" + decoyId(i) + "/x", "x");
+  }
+  return ids;
+}
+
+/** A node of the latest release the backend does not name in the list of nodes of the account,
+ *  whose chain for the account holds a transfer in and a provider request sealed to the key of the
+ *  account while no chain holds the transfer out: a delegation the app did not make. */
+function addRogue(base) {
+  const rogue = base.world.addNode({ release: base.latest.release, measurement: base.latest, offered: false });
+  const seal = { logPk: base.keys.logPk, keyId: base.keys.keyId };
+  rogue.appendEntry(base.world.userId, "c", [{
+    t: "grant_transferred_in", time_ms: base.world.now, from: base.node0.id,
+    not_after_ms: base.world.now + 29 * DAY_MS, custody: "enclave",
+  }], seal);
+  rogue.appendEntry(base.world.userId, "u", [providerRequest(base.world.now)], seal);
+  return rogue;
+}
+
 /** The result of the runs so far on world. named maps fixture names to nodes. */
 function outcome(world, named) {
   const ledger = world.ledger();
@@ -652,22 +685,25 @@ async function staleTimerClearsOnReadStore(source) {
   };
 }
 
-/** node0 (the grant of the account) handed the delegation on to 24 nodes of the latest release the
+/** Sixteen clean decoy prefixes (LOG_STORE_NODES of them, sorted first in the node discovery
+ *  listing: objects someone put under the account prefix that are chains of no node), then node0
+ *  (the grant of the account) handed the delegation on to 24 nodes of the latest release the
  *  backend does not name in the list of nodes of the account (the delegation subset of a larger
  *  fleet: grant_transferred_out on the chain of node0, grant_transferred_in and one provider request
  *  on each), and a 25th such node holds the same chain without a transfer on node0 (a delegation the
- *  app did not make). Its id sorts last among the 25 in the node discovery listing, so no run
- *  examines it in its first window (LOG_STORE_NODES). Forty control entries on node0 before the
- *  transfers make the traces slow, and the clock advances three seconds at every read of an object,
- *  so every run that reads is cut short by its time budget. A program that deletes the nodes under
- *  examination at the end of a run cut short examines the same first window again from the start at
- *  every run and counts the window as a failing read of the store; a program that keeps them walks
- *  on, moves the window, and marks the 25th node once a run examines everything within its budget.
+ *  app did not make). Its id sorts last in the listing, so no run examines it in its first window.
+ *  Forty control entries on node0 before the transfers make the traces slow, and the clock advances
+ *  three seconds at every read of an object, so every run that reads is cut short by its time
+ *  budget. A program whose window begins at the start of the listing at every run and that drops a
+ *  clean prefix at the end of the run that examined it examines the sixteen decoys forever; a
+ *  program that carries the window past them with the discovery cursor of the ledger examines the
+ *  nodes after them, and marks the 25th node once a run examines it to its head within its budget.
  *  The first run read the store (the window truncated it): store_failing_ms does not start. */
 async function discoveryWindowProgresses(source) {
   const base = baseWorld(source);
   await start(source, base.world);
   const seal = { logPk: base.keys.logPk, keyId: base.keys.keyId };
+  putDecoys(base.world, 16);
   const nodes = [];
   for (let i = 0; i < 25; i += 1) {
     nodes.push(base.world.addNode({ release: base.latest.release, measurement: base.latest, offered: false }));
@@ -735,6 +771,150 @@ async function discoveryWindowProgresses(source) {
   };
 }
 
+/** A rogue node (a delegation the app did not make) whose chain the first run walks to its head and
+ *  whose run is then cut short: the backend answers the node summary of the second look eleven
+ *  seconds late (ten control entries on node0 at every run give the run the steps the budget asks
+ *  for before it ends). A run cut short makes no mark and leaves the node at its verification
+ *  point. The next run, a day later and not cut short, reads nothing new from the node (its head is
+ *  its verification point): a program that keeps only the verification point reads no entry sealed
+ *  to the key of the account again, deletes the node and reports verified; a program that keeps the
+ *  fact that such an entry was verified (sealed_ms) marks the node in that run. The runs alternate
+ *  (late, not late) six times. */
+async function rogueWalkedInCutShortRunIsMarked(source) {
+  const base = baseWorld(source);
+  await start(source, base.world);
+  const seal = { logPk: base.keys.logPk, keyId: base.keys.keyId };
+  const rogue = addRogue(base);
+  base.named.rogue = rogue;
+  base.world.advance(25 * HOUR_MS);
+  const original = base.world.http.bind(base.world);
+  let late = true;
+  let nodesQueries = 0;
+  base.world.http = async function (request) {
+    if (String(request.path || "") === "/api/secure/log/nodes") {
+      nodesQueries += 1;
+      if (late && nodesQueries === 2) {
+        await new Promise(function (resolve) { setImmediate(resolve); });
+        base.world.advance(11000);
+      }
+    }
+    return original(request);
+  };
+  const history = [];
+  let program = null;
+  for (let run = 0; run < 6; run += 1) {
+    if (program !== null && base.world.state.log.status === "attention") break;
+    late = run % 2 === 0;
+    nodesQueries = 0;
+    for (let i = 0; i < 10; i += 1) {
+      base.node0.appendEntry(base.world.userId, "c", [{
+        t: "grant_accepted", time_ms: base.world.now, not_after_ms: base.world.now + 29 * DAY_MS, custody: "enclave",
+      }], seal);
+    }
+    if (program === null) {
+      program = await start(source, base.world);
+    } else {
+      base.world.advance(DAY_MS);
+      await program.onEvent("foreground", {});
+    }
+    const kept = base.world.ledger().nodes[rogue.id];
+    history.push({
+      run: run + 1, late: late, status: base.world.state.log.status,
+      rogue: kept === undefined ? "absent" : kept.origin + (kept.unknown_ms !== 0 ? "+unknown" : ""),
+    });
+  }
+  base.world.http = original;
+  return { history: history, final: base.world.state.log.status, unknown_nodes: base.world.state.log.unknown_nodes };
+}
+
+/** The node discovery listing of the account goes on beyond LOG_STORE_PAGES pages (every page
+ *  truncated: more prefixes under the account than the run lists). The run walks no chain, so it
+ *  did not read the store: pending, the store truncated by the listing pages, and the mark of
+ *  failing reads started; the runs of the next days keep it, and the run after LOG_STORE_STALE_MS
+ *  marks the log (attention), as for a store that cannot be listed. A listing that ends within the
+ *  pages again clears the mark and the next run verifies. */
+async function discoveryPagesTruncatedIsUnread(source) {
+  const base = baseWorld(source);
+  await start(source, base.world);
+  base.world.advance(25 * HOUR_MS);
+  const listing = base.world.listing.bind(base.world);
+  base.world.listing = function (params) {
+    const xml = listing(params);
+    if (params.get("delimiter") === null) return xml;
+    const marker = encodeURIComponent((params.get("prefix") || "") + "~" + (params.get("key-marker") || "").length);
+    return xml.replace("<IsTruncated>false</IsTruncated>",
+      "<IsTruncated>true</IsTruncated><NextKeyMarker>" + marker + "</NextKeyMarker>");
+  };
+  const program = await start(source, base.world);
+  const snapshot = function () {
+    const report = base.world.reports[base.world.reports.length - 1];
+    return {
+      status: base.world.state.log.status, store: report.store,
+      store_failure: report.store_failure === undefined ? null : report.store_failure,
+      store_failing_ms: base.world.state.log.store_failing_ms,
+    };
+  };
+  const first = snapshot();
+  for (let day = 0; day < 2; day += 1) {
+    base.world.advance(DAY_MS);
+    await program.onEvent("foreground", {});
+  }
+  const secondDay = snapshot();
+  base.world.advance(DAY_MS + 60000);
+  await program.onEvent("foreground", {});
+  const stale = snapshot();
+  base.world.listing = listing;
+  base.world.advance(DAY_MS);
+  await program.onEvent("foreground", {});
+  return { first: first, second_day: secondDay, stale: stale, restored: snapshot() };
+}
+
+/** Twenty nodes the list of nodes does not know, each with a chain the account wrote under an
+ *  earlier key (the key was reset: nothing on them is sealed to the key of the account) and ended,
+ *  more than LOG_STORE_NODES of them. The runs examine them in two windows, keep them at their heads
+ *  (clean prefixes), and the verification settles to verified: it is not pending for them at every
+ *  synchronization, no mark of failing reads starts, and the run after that reads no object. */
+async function cleanUnknownNodesSettleToVerified(source) {
+  const base = baseWorld(source);
+  await start(source, base.world);
+  const old = bridge.deriveAccountKeys(require("node:crypto").randomBytes(32));
+  for (let i = 0; i < 20; i += 1) {
+    const node = base.world.addNode({ release: base.latest.release, measurement: base.latest, offered: false });
+    node.appendEntry(base.world.userId, "c", [{
+      t: "grant_accepted", time_ms: base.world.now - 30 * DAY_MS, not_after_ms: base.world.now, custody: "enclave",
+    }], { logPk: old.logPk, keyId: old.keyId, timeMs: base.world.now - 30 * DAY_MS });
+    node.shutDown();
+  }
+  base.world.advance(25 * HOUR_MS);
+  const program = await start(source, base.world);
+  const raw = function () { return base.world.reports[base.world.reports.length - 1]; };
+  const first = { status: raw().status, store: raw().store, store_failing_ms: base.world.state.log.store_failing_ms };
+  let syncs = 0;
+  while (base.world.state.log.status !== "verified" && syncs < 8) {
+    base.world.advance(60000);
+    await program.onEvent("foreground", {});
+    syncs += 1;
+  }
+  const settled = { status: base.world.state.log.status, reports: base.world.reports.length, syncs: syncs };
+  const before = base.world.requests.length;
+  base.world.advance(60000);
+  await program.onEvent("foreground", {});
+  const quiet = base.world.requests.slice(before).filter(function (request) {
+    return String(request.url || "").includes("versionId=");
+  }).length;
+  base.world.advance(DAY_MS);
+  await program.onEvent("foreground", {});
+  const ledger = base.world.ledger();
+  return {
+    first: first,
+    settled: settled,
+    object_reads_when_not_due: quiet,
+    daily: { status: base.world.state.log.status, store: raw().store, unknown_nodes: raw().unknown_nodes },
+    store_nodes_kept: Object.keys(ledger.nodes).filter(function (id) { return ledger.nodes[id].origin === "store"; }).length,
+    store_failing_ms: base.world.state.log.store_failing_ms,
+  };
+}
+
 /** One device whose verification is due (a new runtime). The user turns the access switch on
  *  before the runtime synchronized: the procedure grants and returns without a verification run
  *  (no report), and the next synchronization of the runtime verifies. */
@@ -748,6 +928,63 @@ async function userProcedureDefersVerification(source) {
     after_switch: { reports: afterSwitch.reports, grant: afterSwitch.grant, log_published: afterSwitch.published_log !== undefined },
     after_sync: { reports: base.world.reports.length, status: base.world.state.log.status },
     node0_grants: base.node0.grants.size,
+  };
+}
+
+/** A device that was off for long on a busy account: node0 wrote 8,100 use entries since the last
+ *  run, then `grant_transferred_out` to a node the backend does not offer, and that node wrote its
+ *  `grant_transferred_in` sealed to the key of the account. The keys budget of a run
+ *  (LOG_VERIFY_KEYS) ends the walk of node0 before the transfer, so the receiving node is found in
+ *  the store holding an entry sealed to this key with no trace explaining it yet: the run is cut
+ *  short by its keys budget and makes no mark (pending), the next synchronization walks on at once,
+ *  reaches the transfer, and the receiving node is explained (verified). With rogue true no chain
+ *  holds the transfer out and node0 writes 8,100 use entries every day, so that every run is cut
+ *  short: the node is marked once LOG_STORE_STALE_MS has passed since its entry was first verified. */
+async function keysBudgetBeforeTransfer(source, rogue) {
+  const base = baseWorld(source);
+  await start(source, base.world);
+  const seal = { logPk: base.keys.logPk, keyId: base.keys.keyId };
+  const use = function (count) {
+    for (let i = 0; i < count; i += 1) {
+      base.node0.appendEntry(base.world.userId, "u", [providerRequest(base.world.now)], seal);
+    }
+  };
+  use(8100);
+  const target = base.world.addNode({ release: base.latest.release, measurement: base.latest, offered: false });
+  if (!rogue) {
+    base.node0.appendEntry(base.world.userId, "c", [{
+      t: "grant_transferred_out", time_ms: base.world.now, to: target.id,
+    }], seal);
+  }
+  target.appendEntry(base.world.userId, "c", [{
+    t: "grant_transferred_in", time_ms: base.world.now, from: base.node0.id,
+    not_after_ms: base.world.now + 29 * DAY_MS, custody: "enclave",
+  }], seal);
+  base.world.advance(25 * HOUR_MS);
+  const program = await start(source, base.world);
+  const history = [];
+  const record = function (run) {
+    const kept = base.world.ledger().nodes[target.id];
+    history.push({
+      run: run, status: base.world.state.log.status, store: base.world.state.log.store,
+      unknown: base.world.state.log.unknown_nodes,
+      target: kept === undefined ? "absent" : kept.origin + (kept.unknown_ms !== 0 ? "+unknown" : ""),
+    });
+  };
+  record(1);
+  for (let run = 2; run <= 6; run += 1) {
+    if (base.world.state.log.status === (rogue ? "attention" : "verified")) break;
+    if (rogue) {
+      base.world.advance(DAY_MS);
+      use(8100);
+    } else {
+      base.world.advance(60000);
+    }
+    await program.onEvent("foreground", {});
+    record(run);
+  }
+  return {
+    history: history, final: base.world.state.log.status, unknown_nodes: base.world.state.log.unknown_nodes,
   };
 }
 
@@ -775,6 +1012,11 @@ module.exports = {
     time_budget_resumes: timeBudgetResumes,
     stale_timer_clears_on_read_store: staleTimerClearsOnReadStore,
     discovery_window_progresses: discoveryWindowProgresses,
+    rogue_walked_in_cut_short_run_is_marked: rogueWalkedInCutShortRunIsMarked,
+    discovery_pages_truncated_is_unread: discoveryPagesTruncatedIsUnread,
+    clean_unknown_nodes_settle_to_verified: cleanUnknownNodesSettleToVerified,
+    keys_budget_before_transfer: function (source) { return keysBudgetBeforeTransfer(source, false); },
+    keys_budget_every_run_marks_at_stale_bound: function (source) { return keysBudgetBeforeTransfer(source, true); },
     user_procedure_defers_verification: userProcedureDefersVerification,
   },
 };
