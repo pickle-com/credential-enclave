@@ -652,6 +652,89 @@ async function staleTimerClearsOnReadStore(source) {
   };
 }
 
+/** node0 (the grant of the account) handed the delegation on to 24 nodes of the latest release the
+ *  backend does not name in the list of nodes of the account (the delegation subset of a larger
+ *  fleet: grant_transferred_out on the chain of node0, grant_transferred_in and one provider request
+ *  on each), and a 25th such node holds the same chain without a transfer on node0 (a delegation the
+ *  app did not make). Its id sorts last among the 25 in the node discovery listing, so no run
+ *  examines it in its first window (LOG_STORE_NODES). Forty control entries on node0 before the
+ *  transfers make the traces slow, and the clock advances three seconds at every read of an object,
+ *  so every run that reads is cut short by its time budget. A program that deletes the nodes under
+ *  examination at the end of a run cut short examines the same first window again from the start at
+ *  every run and counts the window as a failing read of the store; a program that keeps them walks
+ *  on, moves the window, and marks the 25th node once a run examines everything within its budget.
+ *  The first run read the store (the window truncated it): store_failing_ms does not start. */
+async function discoveryWindowProgresses(source) {
+  const base = baseWorld(source);
+  await start(source, base.world);
+  const seal = { logPk: base.keys.logPk, keyId: base.keys.keyId };
+  const nodes = [];
+  for (let i = 0; i < 25; i += 1) {
+    nodes.push(base.world.addNode({ release: base.latest.release, measurement: base.latest, offered: false }));
+  }
+  nodes.sort(function (a, b) { return a.id < b.id ? -1 : a.id > b.id ? 1 : 0; });
+  const rogue = nodes[nodes.length - 1];
+  base.named.rogue = rogue;
+  for (let i = 0; i < 40; i += 1) {
+    base.node0.appendEntry(base.world.userId, "c", [{
+      t: "grant_accepted", time_ms: base.world.now, not_after_ms: base.world.now + 29 * DAY_MS, custody: "enclave",
+    }], seal);
+  }
+  for (const node of nodes) {
+    if (node !== rogue) {
+      base.node0.appendEntry(base.world.userId, "c", [{
+        t: "grant_transferred_out", time_ms: base.world.now, to: node.id,
+      }], seal);
+    }
+    node.appendEntry(base.world.userId, "c", [{
+      t: "grant_transferred_in", time_ms: base.world.now, from: base.node0.id,
+      not_after_ms: base.world.now + 29 * DAY_MS, custody: "enclave",
+    }], seal);
+    node.appendEntry(base.world.userId, "u", [providerRequest(base.world.now)], seal);
+  }
+  base.world.advance(25 * HOUR_MS);
+  const original = base.world.http.bind(base.world);
+  base.world.http = async function (request) {
+    const url = String(request.url || "");
+    if (url === "" || !url.includes("versionId=")) return original(request);
+    await new Promise(function (resolve) { setImmediate(resolve); });
+    base.world.advance(3000);
+    return original(request);
+  };
+  const program = await start(source, base.world);
+  const raw = function () { return base.world.reports[base.world.reports.length - 1]; };
+  const first = {
+    status: raw().status, store: raw().store, store_failure: raw().store_failure === undefined ? null : raw().store_failure,
+    store_failing_ms: base.world.state.log.store_failing_ms,
+  };
+  let runs = 1;
+  let falseMarks = 0;
+  while (base.world.state.log.status !== "attention" && runs < 30) {
+    base.world.advance(60000);
+    await program.onEvent("foreground", {});
+    runs += 1;
+  }
+  base.world.http = original;
+  const ledger = base.world.ledger();
+  let explained = 0;
+  for (const node of nodes) {
+    if (node === rogue || ledger === null) continue;
+    const kept = ledger.nodes[node.id];
+    if (kept !== undefined && kept.origin === "grant") explained += 1;
+    if (kept !== undefined && kept.unknown_ms !== 0) falseMarks += 1;
+  }
+  return {
+    first: first,
+    runs: runs,
+    final: base.world.state.log.status,
+    unknown_nodes: raw().unknown_nodes,
+    rogue_marked: ledger !== null && ledger.nodes[rogue.id] !== undefined && ledger.nodes[rogue.id].unknown_ms !== 0,
+    explained: explained,
+    false_marks: falseMarks,
+    store_failing_ms: base.world.state.log.store_failing_ms,
+  };
+}
+
 /** One device whose verification is due (a new runtime). The user turns the access switch on
  *  before the runtime synchronized: the procedure grants and returns without a verification run
  *  (no report), and the next synchronization of the runtime verifies. */
@@ -691,6 +774,7 @@ module.exports = {
     store_objects_fail: storeObjectsFail,
     time_budget_resumes: timeBudgetResumes,
     stale_timer_clears_on_read_store: staleTimerClearsOnReadStore,
+    discovery_window_progresses: discoveryWindowProgresses,
     user_procedure_defers_verification: userProcedureDefersVerification,
   },
 };
