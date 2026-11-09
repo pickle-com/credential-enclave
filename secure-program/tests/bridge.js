@@ -326,6 +326,11 @@ class Node {
     this.log = options.log === undefined ? { bucket: world.bucket, region: world.region } : options.log;
     // Whether the COSE signature of the attestation documents of this node is corrupted.
     this.brokenSignature = options.brokenSignature === true;
+    // Whether the backend names this node in the list of nodes of the account (GET /api/secure/nodes).
+    // A node that is not offered is one the account's node list does not hold (the delegation subset
+    // of a larger fleet, or a node this device has not synchronized with): its chain in the store is
+    // known to the program only through the node discovery listing or a traced transfer.
+    this.offered = options.offered !== false;
     this.alive = true;
     this.signSeed = crypto.randomBytes(32);
     this.signPk = ed25519PublicKey(this.signSeed);
@@ -535,7 +540,7 @@ class World {
   }
 
   offeredNodes() {
-    return Array.from(this.nodes.values()).filter((node) => node.alive);
+    return Array.from(this.nodes.values()).filter((node) => node.alive && node.offered);
   }
 
   putObject(key, body) {

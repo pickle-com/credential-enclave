@@ -352,6 +352,28 @@ test("the mark of failing store reads clears at the first run that read the stor
   assert.equal(result.cut_short.store_failing_ms, 0);
 });
 
+test("the node discovery window moves on across runs, the nodes beyond it are examined, and the window is not a failing read", async () => {
+  const result = await scenarios.discovery_window_progresses(source);
+  // The first run found 25 nodes the list of nodes does not know, examined 16 and was cut short:
+  // pending, the store truncated by the window, and the mark of failing reads not started (the
+  // store was read).
+  assert.equal(result.first.status, "pending");
+  assert.equal(result.first.store, "truncated");
+  assert.equal(result.first.store_failure, "discovery:nodes");
+  assert.equal(result.first.store_failing_ms, 0);
+  // The synchronizations that followed walked on (the nodes under examination kept their
+  // verification points), the traces on the chain of node0 explained 24 nodes, and the 25th, the
+  // last in the listing, was examined and marked: a delegation the app did not make, found beyond
+  // the first window. No explained node is marked, and the mark of failing reads stays clear.
+  assert.equal(result.final, "attention");
+  assert.equal(result.unknown_nodes, 1);
+  assert.equal(result.rogue_marked, true);
+  assert.equal(result.explained, 24);
+  assert.equal(result.false_marks, 0);
+  assert.equal(result.store_failing_ms, 0);
+  assert.ok(result.runs < 30, "runs " + result.runs);
+});
+
 test("a synchronization a user procedure starts leaves a due verification to the next synchronization", async () => {
   const result = await scenarios.user_procedure_defers_verification(source);
   assert.equal(result.after_switch.reports, 0);

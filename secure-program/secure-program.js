@@ -22,7 +22,7 @@
 
   // ---- Constants ----
 
-  const VERSION = 40;
+  const VERSION = 41;
   const MASTER_KEY_SERVICE = "com.pickle.client.secure.master-key";
   const LEDGER_SERVICE = "com.pickle.client.secure.ledger";
   const LEDGER_STORE_KEY = "ledger";
@@ -86,7 +86,10 @@
   const LOG_ENTRY_EVENTS = 128;
   const LOG_STORE_TIMEOUT_MS = 20000;
   // The nodes one verification run examines beyond the ledger (the node discovery listing). More
-  // unknown prefixes than this leave the run pending (the store state truncated).
+  // unknown prefixes than this leave the rest to the next synchronizations (the run is pending and
+  // its store state truncated for the report; the store was read): a node under examination stays
+  // in the ledger with its verification point until its chain is walked to the head, so the next
+  // run does not examine it again from the start and the window moves on to the nodes after it.
   const LOG_STORE_NODES = 16;
   // The retention of an object of the store (Object Lock, days): an entry older than this may be gone
   // (its lock ended; the lifecycle rule of the bucket removes it at 400 days), so a gap of entries
@@ -3601,11 +3604,12 @@
 
   /** The published state log of one run and its bookkeeping in the ledger: store_failing_ms starts
    *  at the first run whose store reads failed and clears at the first run that read the store (every
-   *  read of the store the run made succeeded: store verified), pending at its walk or not. A run cut
-   *  short by its time budget reads the store and leaves entries pending, and LOG_STORE_STALE_MS marks
-   *  reads that keep failing, not a walk that has entries left (the fleet of the operator writing
-   *  control entries faster than a device walks them would otherwise mark every such device after
-   *  three days). The state is attention when any node has a gap, a mismatch, or a part that
+   *  read of the store the run made succeeded: store verified, or truncated: the store answered and
+   *  the run left nodes or listing pages to the next runs), pending at its walk or not. A run cut
+   *  short by its time budget or by LOG_STORE_NODES reads the store and leaves entries pending, and
+   *  LOG_STORE_STALE_MS marks reads that keep failing, not a walk that has entries left (the fleet of
+   *  the operator writing control entries or bringing up nodes faster than a device walks them would
+   *  otherwise mark every such device after three days). The state is attention when any node has a gap, a mismatch, or a part that
    *  cannot be checked, when an entry of a node no grant of this app explains verified, when a
    *  release build is refused the log store, and when the reads of the store have been failing for
    *  LOG_STORE_STALE_MS; otherwise pending when a chain has entries left to verify, the store could
@@ -3616,10 +3620,11 @@
    *  published state across runtimes, and the first synchronization of the runtime of a later
    *  program judges it again (afterGrants: verified_ms starts at 0 in every runtime). */
   function publishLogState(ledger, store, counts, now) {
-    const unread = store.state !== "verified" && store.state !== "absent" && store.state !== "refused";
+    const read = store.state === "verified" || store.state === "truncated";
+    const unread = !read && store.state !== "absent" && store.state !== "refused";
     if (unread) {
       if (ledger.store_failing_ms === 0) ledger.store_failing_ms = now;
-    } else if (store.state === "verified") {
+    } else if (read) {
       ledger.store_failing_ms = 0;
     }
     const stale = unread && now - ledger.store_failing_ms >= LOG_STORE_STALE_MS;
@@ -3887,9 +3892,11 @@
       started = native.nowMs();
       run = await verifyRun(ledger, keys, null);
     }
-    // A run cut short by its time budget with the store read is walked on by the next
-    // synchronization of this runtime (verifyDue), not only by the next period.
-    verificationCutShort = run.counts.cutShort && run.store.state === "verified";
+    // A run cut short by its time budget, or one that left nodes found in the store only to the
+    // next runs (LOG_STORE_NODES), with the store read (verified, or truncated by that window) is
+    // walked on by the next synchronization of this runtime (verifyDue), not only by the next period.
+    verificationCutShort = (run.counts.cutShort || run.counts.moreToExamine === true) &&
+      (run.store.state === "verified" || run.store.state === "truncated");
     verificationDeferred = false;
     const result = publishLogState(ledger, run.store, run.counts, run.now);
     reportVerification(result, run.counts, Object.keys(ledger.nodes).length, native.nowMs() - started);
@@ -4044,8 +4051,13 @@
     counts.keys = LOG_VERIFY_KEYS - budgets.keys;
     counts.bodies = budgets.fetched;
     counts.later = later.size;
-    if (examinable.length > examined.length && store.state === "verified") {
-      storeFailed(store, storeFailure("truncated", "discovery:nodes"));
+    // More nodes found in the store only than this run examines (LOG_STORE_NODES): the rest are
+    // examined by the next synchronizations (verifyDue), the run is pending, and the report names
+    // the store truncated. The store was read: this is not a failing read (publishLogState).
+    counts.moreToExamine = examinable.length > examined.length;
+    if (counts.moreToExamine) {
+      counts.pending = true;
+      if (store.state === "verified") storeFailed(store, storeFailure("truncated", "discovery:nodes"));
     }
     // Whether the time budget cut the run short (a walk above stopped at it, or the second look
     // was not made): the next synchronization walks on.
@@ -4054,9 +4066,8 @@
     // A node found in the store only that holds an entry sealed to this key is a delegation the app
     // did not make and no verified transfer explained (a trace that reaches the node later in the
     // run, in the first walk or in the second look, changes its origin before this mark). The mark
-    // stays in the ledger; a node of the listing without such an entry is not kept (the next run
-    // examines it again). A run cut short makes no mark: the trace that explains the node may be in
-    // a chain the run has not walked yet (the node is not kept and the next run examines it again).
+    // stays in the ledger. A run cut short makes no mark: the trace that explains the node may be in
+    // a chain the run has not walked yet.
     if (!counts.cutShort) {
       for (const id of ours) {
         const node = ledger.nodes[id];
@@ -4072,7 +4083,14 @@
           counts.unknown += 1;
           counts.unknownIds.push(id);
         }
+      } else if (counts.cutShort || !reached.has(id)) {
+        // The examination of the node is not complete (the run was cut short, or the walk of its
+        // chain did not reach the head in this run): the node stays with its verification point and
+        // the next run walks on from there. Deleting it here made the next run examine it again from
+        // the start and, with more such nodes than LOG_STORE_NODES, examine the same nodes forever.
       } else {
+        // The chain was walked to its head and holds no entry sealed to this key that a trace did
+        // not explain: nothing to keep (the next run examines it again if the listing still names it).
         delete ledger.nodes[id];
       }
     }
