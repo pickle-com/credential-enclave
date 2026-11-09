@@ -605,6 +605,53 @@ async function timeBudgetResumes(source) {
   };
 }
 
+/** One device whose run could not read the store once (every object request answered 503: the run
+ *  is pending with the store unreachable and store_failing_ms starts), and whose next run is cut
+ *  short by the time budget (24 control entries since the last run, the clock advancing three
+ *  seconds at every read of an object) with every read of the store it made answered. The mark of
+ *  failing reads clears at that run (store read, walk pending): LOG_STORE_STALE_MS is about a store
+ *  that cannot be read, not about a walk with entries left. */
+async function staleTimerClearsOnReadStore(source) {
+  const base = baseWorld(source);
+  await start(source, base.world);
+  const seal = { logPk: base.keys.logPk, keyId: base.keys.keyId };
+  for (let i = 0; i < 24; i += 1) {
+    base.node0.appendEntry(base.world.userId, "c", [{
+      t: "grant_accepted", time_ms: base.world.now, not_after_ms: base.world.now + 29 * DAY_MS, custody: "enclave",
+    }], seal);
+  }
+  base.world.advance(25 * HOUR_MS);
+  const original = base.world.http.bind(base.world);
+  base.world.http = async function (request) {
+    const url = String(request.url || "");
+    if (url.includes("versionId=")) {
+      return { status: 503, headers: {}, body: "<Error><Code>SlowDown</Code></Error>", bodyBase64: null };
+    }
+    return original(request);
+  };
+  const program = await start(source, base.world);
+  const raw = function () { return base.world.reports[base.world.reports.length - 1]; };
+  const failed = { report: raw(), store_failing_ms: base.world.state.log.store_failing_ms };
+  base.world.http = async function (request) {
+    const url = String(request.url || "");
+    if (url === "" || !url.includes("versionId=")) return original(request);
+    await new Promise(function (resolve) { setImmediate(resolve); });
+    base.world.advance(3000);
+    return original(request);
+  };
+  base.world.advance(60000);
+  await program.onEvent("foreground", {});
+  const cutShort = { report: raw(), store_failing_ms: base.world.state.log.store_failing_ms };
+  base.world.http = original;
+  return {
+    failed: { status: failed.report.status, store: failed.report.store, store_failing_ms: failed.store_failing_ms },
+    cut_short: {
+      status: cutShort.report.status, store: cutShort.report.store, bodies: cutShort.report.bodies_fetched,
+      store_failing_ms: cutShort.store_failing_ms,
+    },
+  };
+}
+
 /** One device whose verification is due (a new runtime). The user turns the access switch on
  *  before the runtime synchronized: the procedure grants and returns without a verification run
  *  (no report), and the next synchronization of the runtime verifies. */
@@ -643,6 +690,7 @@ module.exports = {
     store_answers_once_503: storeAnswersOnce503,
     store_objects_fail: storeObjectsFail,
     time_budget_resumes: timeBudgetResumes,
+    stale_timer_clears_on_read_store: staleTimerClearsOnReadStore,
     user_procedure_defers_verification: userProcedureDefersVerification,
   },
 };
