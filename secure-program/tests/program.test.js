@@ -312,3 +312,25 @@ test("a verified run is not repeated within the period, and a new runtime verifi
   assert.equal(world.reports.length, 2);
   assert.equal(world.reports[1].status, "verified");
 });
+
+test("a run that reaches its time budget is pending at its verification points, and the synchronizations that follow walk on", async () => {
+  const result = await scenarios.time_budget_resumes(source);
+  // The chain holds the grant of the first run, the 24 control entries written since, and the
+  // grant of the new runtime: 26 entries, 25 of them read by content after the first run. The
+  // first run read the least steps of a run (the reads ahead that ended before the budget, three
+  // seconds each against a budget of twenty) and stopped with the store read; its verification
+  // point moved.
+  assert.equal(result.first.status, "pending");
+  assert.equal(result.first.store, "verified");
+  assert.equal(result.first.bodies, 8);
+  // The synchronizations that followed walked on (each within the budget) to the head.
+  assert.equal(result.final, "verified");
+  assert.equal(result.runs, 4);
+  assert.equal(result.bodies_total, 25);
+  assert.equal(result.checkpoint, 26);
+  // Reads of objects go through the gate: never more than LOG_STORE_CONCURRENCY at once.
+  assert.equal(result.in_flight_max, 8);
+  // An object read ahead but not consumed by a run cut short is read again by the next run: a few
+  // more reads than entries, not multiples.
+  assert.ok(result.object_reads >= 25 && result.object_reads <= 25 + 2 * 8, "object reads " + result.object_reads);
+});
