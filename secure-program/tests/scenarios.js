@@ -461,8 +461,9 @@ async function suspendedRunCrossesTransfer(source) {
  *  read the head of node0 (the status request of the first stage of its reads) and before it
  *  listed the store, node1 came up, node0 handed the delegation to it (grant_transferred_out on
  *  node0, grant_transferred_in on node1) and node1 was used; when giverEnds is true node0 then
- *  ended (its orderly shutdown: a final head). The run took three minutes, below
- *  LOG_RUN_STALE_MS, so it is not judged again as a whole; its listing shows node1, and the chain
+ *  ended (its orderly shutdown: a final head). The run took fifteen seconds, below the time budget
+ *  of a run (LOG_VERIFY_TIME_MS) and below LOG_RUN_STALE_MS, so it is neither cut short nor judged
+ *  again as a whole; its listing shows node1, and the chain
  *  of node0 was walked to the head signed before the transfer. A program that reads the heads of
  *  its ledger again before it counts a node found in the store only verifies in that run (the
  *  transfer explains node1); a program that counts on the heads of the first stage marks node1
@@ -492,7 +493,7 @@ async function transferAfterHeads(source, giverEnds) {
       }], seal);
       node1.appendEntry(base.world.userId, "u", [providerRequest(base.world.now)], seal);
       if (giverEnds) base.node0.shutDown();
-      base.world.advance(3 * 60000);
+      base.world.advance(15000);
     }
     if (moved) requests += 1;
     return original(request);
@@ -552,6 +553,58 @@ async function storeObjectsFail(source) {
   };
 }
 
+/** One node whose chain holds 24 control entries written since the last run (the fleet of the
+ *  operator moved the delegation around: every move is a control entry the app reads by content).
+ *  The clock of the world advances three seconds at every read of an object, so the time budget of
+ *  a run (LOG_VERIFY_TIME_MS) is spent after a few bodies: the first run is pending with the store
+ *  read and the verification point moved, and the synchronizations that follow walk on until the
+ *  chain is verified. in_flight_max is the most reads of objects in flight at once, object_reads the
+ *  reads of objects sent in all. */
+async function timeBudgetResumes(source) {
+  const base = baseWorld(source);
+  await start(source, base.world);
+  const seal = { logPk: base.keys.logPk, keyId: base.keys.keyId };
+  for (let i = 0; i < 24; i += 1) {
+    base.node0.appendEntry(base.world.userId, "c", [{
+      t: "grant_accepted", time_ms: base.world.now, not_after_ms: base.world.now + 29 * DAY_MS, custody: "enclave",
+    }], seal);
+  }
+  base.world.advance(25 * HOUR_MS);
+  const original = base.world.http.bind(base.world);
+  let inFlight = 0;
+  let inFlightMax = 0;
+  let objectReads = 0;
+  base.world.http = async function (request) {
+    const url = String(request.url || "");
+    if (url === "" || !url.includes("versionId=")) return original(request);
+    objectReads += 1;
+    inFlight += 1;
+    inFlightMax = Math.max(inFlightMax, inFlight);
+    await new Promise(function (resolve) { setImmediate(resolve); });
+    base.world.advance(3000);
+    inFlight -= 1;
+    return original(request);
+  };
+  const program = await start(source, base.world);
+  const raw = function () { return base.world.reports[base.world.reports.length - 1]; };
+  const runs = [raw()];
+  while (base.world.state.log.status !== "verified" && runs.length < 12) {
+    await program.onEvent("foreground", {});
+    runs.push(raw());
+  }
+  base.world.http = original;
+  const ledger = base.world.ledger();
+  return {
+    first: { status: runs[0].status, store: runs[0].store, bodies: runs[0].bodies_fetched },
+    runs: runs.length,
+    final: base.world.state.log.status,
+    bodies_total: runs.reduce(function (sum, report) { return sum + report.bodies_fetched; }, 0),
+    checkpoint: ledger === null ? null : ledger.nodes[base.node0.id].checkpoint.seq,
+    in_flight_max: inFlightMax,
+    object_reads: objectReads,
+  };
+}
+
 module.exports = {
   scenarios: {
     plain: plain,
@@ -573,5 +626,6 @@ module.exports = {
     transfer_after_heads_giver_ends: function (source) { return transferAfterHeads(source, true); },
     store_answers_once_503: storeAnswersOnce503,
     store_objects_fail: storeObjectsFail,
+    time_budget_resumes: timeBudgetResumes,
   },
 };

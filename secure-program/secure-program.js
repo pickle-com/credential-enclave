@@ -22,7 +22,7 @@
 
   // ---- Constants ----
 
-  const VERSION = 37;
+  const VERSION = 38;
   const MASTER_KEY_SERVICE = "com.pickle.client.secure.master-key";
   const LEDGER_SERVICE = "com.pickle.client.secure.ledger";
   const LEDGER_STORE_KEY = "ledger";
@@ -56,6 +56,19 @@
   const LOG_VERIFY_INTERVAL_MS = 86400000;
   const LOG_VERIFY_KEYS = 8000;
   const LOG_VERIFY_BODIES = 2000;
+  // The time one run of the index verification may spend (milliseconds, from its first read): a
+  // run that reaches it leaves the chains it has not walked, and the rest of the chain it was
+  // walking, pending at their verification points, and the next synchronization (every
+  // synchronization until a run ends within the budget, not only the next period) or the next log
+  // screen walks on from there. The procedures of the program run one after another and the
+  // executors end a procedure at 120 seconds: a run of minutes (the control entries of many nodes
+  // read by content after the fleet of the operator moved the delegations around) would hold the
+  // grants, the vault and the log screen behind it.
+  const LOG_VERIFY_TIME_MS = 20000;
+  // The least steps (keys walked, bodies read) a run makes before its time budget stops it: a run
+  // moves on however slow the reads are (the reads ahead are stopped at the budget; the walk then
+  // takes the objects read ahead and stops after these steps).
+  const LOG_VERIFY_LEAST_STEPS = 8;
   // The log store (docs/protocol.md 7.4 and 7.6): the most listing pages one run reads per node
   // (1,000 keys each), the most object versions one address request names (the limit of the
   // backend route), the digits of seq and of time_ms in an object key, the most events one entry
@@ -93,6 +106,11 @@
   // entries of the first listing page of every node; the limit of the address route).
   const LOG_LISTINGS_PATH = "/api/secure/log/store/listings";
   const LOG_PREFETCH_OBJECTS = 100;
+  // The most reads of objects of the store in flight at once (the objects read ahead of a run and
+  // the objects a walk reads ahead of its steps). A hundred reads sent at once starve the requests
+  // to the backend the device sends beside them (their transport fails on the device before the
+  // store answered them).
+  const LOG_STORE_CONCURRENCY = 8;
   // The key of the device store that marks the sealing check as done for this device and account: a
   // query of the pending values (GET /api/secure/sealing) that found none, or an upload that left none.
   // Writing a master key (a new key, a replaced key, a transferred key) clears it.
@@ -831,6 +849,65 @@
    *  made); the stage ends when every one of them settled. Returns their settled outcomes in order. */
   function stage(promises) {
     return Promise.all(promises.map(settled));
+  }
+
+  /** A gate of limit calls in flight at once: run(work) starts work when a place is free (the
+   *  next starts when one ended) and returns its promise. A place is handed to the next waiting
+   *  call directly, so never more than limit are in flight. */
+  function gate(limit) {
+    let active = 0;
+    const waiting = [];
+    return {
+      run: async function (work) {
+        if (active >= limit) await new Promise(function (resolve) { waiting.push(resolve); });
+        else active += 1;
+        try {
+          return await work();
+        } finally {
+          const next = waiting.shift();
+          if (next !== undefined) next();
+          else active -= 1;
+        }
+      },
+    };
+  }
+
+  // The gate of the reads of objects of the store (LOG_STORE_CONCURRENCY in flight at once).
+  const storeGate = gate(LOG_STORE_CONCURRENCY);
+
+  /** The error of a read of the store that was not sent because the time budget of its run was
+   *  spent before its turn (a skipped read ahead, never the read a step waits for). */
+  function skippedRead() {
+    return { log_store_skipped: true };
+  }
+
+  function isSkippedRead(error) {
+    return error !== null && typeof error === "object" && error.log_store_skipped === true;
+  }
+
+  /** The settled outcomes of work over items, in order, each call through the store gate (at most
+   *  LOG_STORE_CONCURRENCY in flight). An item whose turn comes when stop() is true is not sent:
+   *  its outcome is the skipped read. */
+  function pooled(items, work, stop) {
+    return Promise.all(items.map(function (item) {
+      return settled(storeGate.run(function () {
+        if (stop !== undefined && stop()) return Promise.reject(skippedRead());
+        return work(item);
+      }));
+    }));
+  }
+
+  /** Whether the time budget of a verification run has passed (budgets.deadline: the time of the
+   *  device at which the run stops reading ahead; absent for a reader without a run). */
+  function deadlinePassed(budgets) {
+    return budgets !== undefined && budgets !== null && budgets.deadline !== undefined &&
+      native.nowMs() >= budgets.deadline;
+  }
+
+  /** Whether the walk of a verification run stops: its time budget has passed and the run made
+   *  its least steps (budgets.progress: the keys walked and the bodies read in this run). */
+  function timeBudgetSpent(budgets) {
+    return deadlinePassed(budgets) && budgets.progress >= LOG_VERIFY_LEAST_STEPS;
   }
 
   // ---- Signed values ----
@@ -1975,14 +2052,25 @@
   /** A reader of object versions of the store that requests addresses in batches: object(candidate,
    *  ahead) returns the signed value of that version (null when the store has no such version) and
    *  requests, along with its address, the addresses of the candidates of ahead (the objects the
-   *  caller will read next), LOG_STORE_OBJECTS addresses per request. fetched and bytes count the
-   *  objects read and their size. */
-  function storeReader(reads) {
+   *  caller will read next), LOG_STORE_OBJECTS addresses per request, and reads the objects of the
+   *  batch ahead of the steps that want them (through the store gate, in the order of the batch;
+   *  a read ahead whose turn comes after the time budget of the run is spent is skipped and read
+   *  when a step wants it). fetched and bytes count the objects read and their size. budgets is the
+   *  budgets of the run (absent for a reader without a run). */
+  function storeReader(reads, budgets) {
     const urls = new Map();
+    // The reads ahead by object name: the settled outcome of fetchStoreObject.
+    const ahead = new Map();
+    const read = function (name, skippable) {
+      return settled(storeGate.run(function () {
+        if (skippable && deadlinePassed(budgets)) return Promise.reject(skippedRead());
+        return fetchStoreObject(urls.get(name));
+      }));
+    };
     const reader = {
       fetched: 0,
       bytes: 0,
-      object: async function (candidate, ahead) {
+      object: async function (candidate, aheadOf) {
         const name = candidate.key + "\n" + candidate.versionId;
         // An object read ahead of the judgement (completeVerificationReads) is that very version.
         const ready = reads ? reads.objects.get(name) : undefined;
@@ -1993,17 +2081,27 @@
         }
         if (!urls.has(name)) {
           const wanted = [candidate];
-          for (const other of ahead) {
+          for (const other of aheadOf) {
             if (wanted.length >= LOG_STORE_OBJECTS) break;
             if (other !== candidate && !urls.has(other.key + "\n" + other.versionId)) wanted.push(other);
           }
           const signed = await storeObjectUrls(wanted);
           signed.forEach(function (url, key) { urls.set(key, url); });
+          for (const item of wanted) {
+            const other = item.key + "\n" + item.versionId;
+            if (!ahead.has(other)) ahead.set(other, read(other, other !== name));
+          }
         }
-        const response = await fetchStoreObject(urls.get(name));
+        let outcome = ahead.get(name);
+        ahead.delete(name);
+        if (outcome === undefined) outcome = read(name, false);
+        let result = await outcome;
+        // The read ahead was skipped (the budget was spent before its turn): the step reads it.
+        if (!result.ok && isSkippedRead(result.error)) result = await read(name, false);
+        if (!result.ok) throw result.error;
         reader.fetched += 1;
-        reader.bytes += response.bytes;
-        return response.signed;
+        reader.bytes += result.value.bytes;
+        return result.value.signed;
       },
     };
     return reader;
@@ -2136,6 +2234,7 @@
     for (const candidate of ordered) {
       if (budgets.bodies <= 0) return null;
       budgets.bodies -= 1;
+      budgets.progress += 1;
       const signed = await reader.object(candidate, ahead);
       if (signed === null) continue;
       const checked = checkEntry(signed, node, id, candidate.parts, cursor, keys);
@@ -2292,7 +2391,7 @@
     const discovered = node.origin === "store";
     const headTime = head !== null && head.time_ms !== 0 ? head.time_ms : native.nowMs();
     const retention = LOG_EXPIRES_DAYS * DAY_MS;
-    const reader = storeReader(reads);
+    const reader = storeReader(reads, budgets);
     try {
       if (index.min !== 0 && index.min > cursor.seq + 1) {
         // The listing begins beyond the seq after the verification point: the entries between are
@@ -2301,7 +2400,7 @@
         let landed = null;
         for (const seq of seqs) {
           if (vouched !== null && seq > vouched) break;
-          if (budgets.bodies <= 0) break;
+          if (budgets.bodies <= 0 || timeBudgetSpent(budgets)) break;
           landed = await contentStep(
             node, id, null, index.entries.get(seq), keys, budgets, reader, contentAhead(index, seq, vouched));
           if (landed !== null) break;
@@ -2309,7 +2408,8 @@
         const beyond = landed !== null &&
           ((cursor.time_ms !== 0 && headTime - cursor.time_ms > retention) ||
            headTime - landed.time_ms > retention);
-        if (landed === null && budgets.bodies <= 0) {
+        if (landed === null && (budgets.bodies <= 0 || timeBudgetSpent(budgets))) {
+          // A budget of the run ran out before a landing was read: the next run reads on.
           outcome.state = "pending";
         } else if (!beyond) {
           if (!discovered) {
@@ -2328,6 +2428,12 @@
         }
       }
       while (outcome.state === "verified" && cursor.seq < index.max) {
+        if (timeBudgetSpent(budgets)) {
+          // The time budget of the run is spent: the walk stops at its cursor (the verification
+          // point moves there below) and the next run walks on from it.
+          outcome.state = "pending";
+          break;
+        }
         const next = cursor.seq + 1;
         if (vouched !== null && next > vouched) break;
         const candidates = index.entries.get(next);
@@ -2350,6 +2456,7 @@
             break;
           }
           budgets.keys -= 1;
+          budgets.progress += 1;
           const parts = linked[0].parts;
           step = { seq: next, hash: parts.entry_hash, time_ms: parts.time_ms, ours: parts.key_id === keys.keyId };
         } else if (linked.length > 0 || legacy.length > 0) {
@@ -3650,7 +3757,7 @@
    *  the vouched end, every candidate of a chain nobody vouches for), at most LOG_PREFETCH_OBJECTS;
    *  D, those objects. A read that fails is not kept: the judgement requests it again. Nothing here
    *  changes the ledger or the judgement; summaries is the node summary table of the run. */
-  async function completeVerificationReads(ledger, reads, summaries) {
+  async function completeVerificationReads(ledger, reads, summaries, budgets) {
     const listings = await reads.listings;
     const outcomes = new Map();
     for (const [id, entry] of reads.heads) {
@@ -3713,9 +3820,11 @@
     } catch (error) {
       return;
     }
-    const bodies = await stage(wanted.map(function (candidate) {
+    // The objects are read through the store gate; a read whose turn comes after the time budget of
+    // the run is spent is skipped (the judgement reads what it still wants, within its budget).
+    const bodies = await pooled(wanted, function (candidate) {
       return fetchStoreObject(urls.get(candidate.key + "\n" + candidate.versionId));
-    }));
+    }, function () { return deadlinePassed(budgets); });
     for (let i = 0; i < wanted.length; i += 1) {
       if (bodies[i].ok) reads.objects.set(wanted[i].key + "\n" + wanted[i].versionId, bodies[i].value);
     }
@@ -3772,6 +3881,9 @@
       started = native.nowMs();
       run = await verifyRun(ledger, keys, null);
     }
+    // A run cut short by its time budget with the store read is walked on by the next
+    // synchronization of this runtime (verifyDue), not only by the next period.
+    verificationCutShort = run.counts.cutShort && run.store.state === "verified";
     const result = publishLogState(ledger, run.store, run.counts, run.now);
     reportVerification(result, run.counts, Object.keys(ledger.nodes).length, native.nowMs() - started);
     return result;
@@ -3794,16 +3906,22 @@
    *  budgets of the run. A transfer traced there explains the node (followTransfer). Only a node
    *  still unexplained after that is marked. A run that finds no such node makes no further read. */
   async function verifyRun(ledger, keys, reads) {
+    // The budgets of the run: keys and bodies over every node, and the time from here (the reads
+    // ahead included) at which the run stops walking (LOG_VERIFY_TIME_MS).
+    const budgets = {
+      keys: LOG_VERIFY_KEYS, bodies: LOG_VERIFY_BODIES, fetched: 0, progress: 0,
+      deadline: native.nowMs() + LOG_VERIFY_TIME_MS,
+    };
     // The reads of the run were sent ahead by the caller (together with its own requests) or are
     // sent now; the judgement below uses them only where they are the very responses it would request.
     if (!reads) reads = beginVerificationReads(ledger, null);
     const summaries = await readSummaries(reads);
-    await completeVerificationReads(ledger, reads, summaries);
+    await completeVerificationReads(ledger, reads, summaries, budgets);
     const store = { state: "verified", detail: "" };
     const now = native.nowMs();
     const counts = {
       pending: false, unverified: 0, missing: 0, expired: 0, unknown: 0, later: 0, keys: 0, bodies: 0,
-      unknownIds: [],
+      unknownIds: [], cutShort: false,
     };
     // The listing addresses of the run that the backend refused or that did not name the listings
     // requested are the store failure of the run, as the refusal of one listing address is
@@ -3840,7 +3958,6 @@
         origin: "store", unknown_ms: 0,
       };
     }
-    const budgets = { keys: LOG_VERIFY_KEYS, bodies: LOG_VERIFY_BODIES, fetched: 0 };
     // The nodes whose verified entries include one sealed to the key of this account.
     const ours = new Set();
     // The nodes whose last walk in this run verified the chain to its head.
@@ -3853,6 +3970,12 @@
       const queue = ids.slice();
       for (const id of queue) queued.add(id);
       while (queue.length > 0) {
+        if (timeBudgetSpent(budgets)) {
+          // The time budget of the run is spent: the chains not walked yet stay at their
+          // verification points (pending) and the next run walks them.
+          counts.pending = true;
+          break;
+        }
         const id = queue.shift();
         if (ledger.nodes[id] === undefined) continue;
         if (newerReleaseNodes.has(id)) {
@@ -3888,7 +4011,7 @@
       });
     };
     const found = unexplained();
-    if (found.length > 0 && store.state === "verified") {
+    if (found.length > 0 && store.state === "verified" && !timeBudgetSpent(budgets)) {
       // The second look: the nodes whose head the first stage of the reads holds (reads.heads) and
       // whose chain verified to that head are read again (the summary, the status, the listing
       // addresses) and walked on from their verification points. The walk of a chain whose first
@@ -3899,7 +4022,7 @@
       if (again.length > 0) {
         const readsAgain = beginVerificationReads(ledger, again);
         const summariesAgain = await readSummaries(readsAgain);
-        await completeVerificationReads(ledger, readsAgain, summariesAgain);
+        await completeVerificationReads(ledger, readsAgain, summariesAgain, budgets);
         const listingsAgain = await readsAgain.listings;
         if (!listingsAgain.ok && isStoreFailure(listingsAgain.error) && listingsAgain.error.kind !== "unreachable") {
           storeFailed(store, listingsAgain.error);
@@ -3917,14 +4040,21 @@
     if (examinable.length > examined.length && store.state === "verified") {
       storeFailed(store, storeFailure("truncated", "discovery:nodes"));
     }
+    // Whether the time budget cut the run short (a walk above stopped at it, or the second look
+    // was not made): the next synchronization walks on.
+    counts.cutShort = timeBudgetSpent(budgets);
+    if (counts.cutShort) counts.pending = true;
     // A node found in the store only that holds an entry sealed to this key is a delegation the app
     // did not make and no verified transfer explained (a trace that reaches the node later in the
     // run, in the first walk or in the second look, changes its origin before this mark). The mark
     // stays in the ledger; a node of the listing without such an entry is not kept (the next run
-    // examines it again).
-    for (const id of ours) {
-      const node = ledger.nodes[id];
-      if (node !== undefined && node.origin === "store" && node.unknown_ms === 0) node.unknown_ms = now;
+    // examines it again). A run cut short makes no mark: the trace that explains the node may be in
+    // a chain the run has not walked yet (the node is not kept and the next run examines it again).
+    if (!counts.cutShort) {
+      for (const id of ours) {
+        const node = ledger.nodes[id];
+        if (node !== undefined && node.origin === "store" && node.unknown_ms === 0) node.unknown_ms = now;
+      }
     }
     for (const id of Object.keys(ledger.nodes)) {
       const node = ledger.nodes[id];
@@ -4050,9 +4180,14 @@
    *  at once instead of at the next period). The query of the sealing check and the first reads of
    *  the verification (beginVerificationReads) are sent together as one stage; the steps then run
    *  in the order of v29 on the responses. While delegation is off only the verification runs. */
-  /** Whether the period of the log verification has elapsed for this runtime. */
+  // Whether the last verification run of this runtime was cut short by its time budget with the
+  // store read: the next synchronization walks on (a new runtime starts from the period rule).
+  let verificationCutShort = false;
+
+  /** Whether the log verification runs in this synchronization: its period has elapsed, or the
+   *  last run of this runtime was cut short by its time budget. */
   function verifyDue() {
-    return native.nowMs() - logState.verified_ms >= LOG_VERIFY_INTERVAL_MS;
+    return verificationCutShort || native.nowMs() - logState.verified_ms >= LOG_VERIFY_INTERVAL_MS;
   }
 
   /** Whether a synchronization exchanges the ledger with the backend before its grants: when the

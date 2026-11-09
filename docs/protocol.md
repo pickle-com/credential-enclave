@@ -700,8 +700,12 @@ Index verification of a chain of format 2:
    signed before the transfer. The second look reads the node summary of the backend, the status
    of every node whose head the first reads held and whose chain verified to that head, and the
    listing addresses of those nodes, and walks those chains on from their verified points to the
-   new heads within the key and body budgets of the run (`LOG_VERIFY_KEYS`, `LOG_VERIFY_BODIES`);
-   a transfer traced there explains the node. A node that no traced transfer explains after the
+   new heads within the key, body and time budgets of the run (`LOG_VERIFY_KEYS`,
+   `LOG_VERIFY_BODIES`, `LOG_VERIFY_TIME_MS`: a run that reaches a budget leaves the chains it has
+   not walked, and the rest of the chain it was walking, pending at their verified points, and the
+   next synchronization of that runtime, or the next log screen, walks on from them; the app reads
+   at most `LOG_STORE_CONCURRENCY` objects of the store at once); a transfer traced there explains
+   the node. A node that no traced transfer explains after the
    second look is a delegation the app did not make (attention) and stays in the list with that
    mark. A run that finds no such node reads no head twice. The
    nodes of the listing that the list of nodes does not know are examined after the known nodes, at
