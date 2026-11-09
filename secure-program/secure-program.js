@@ -22,7 +22,7 @@
 
   // ---- Constants ----
 
-  const VERSION = 39;
+  const VERSION = 40;
   const MASTER_KEY_SERVICE = "com.pickle.client.secure.master-key";
   const LEDGER_SERVICE = "com.pickle.client.secure.ledger";
   const LEDGER_STORE_KEY = "ledger";
@@ -3600,8 +3600,12 @@
   }
 
   /** The published state log of one run and its bookkeeping in the ledger: store_failing_ms starts
-   *  at the first run whose store reads failed and clears at a run that completed (not pending) with
-   *  the store read. The state is attention when any node has a gap, a mismatch, or a part that
+   *  at the first run whose store reads failed and clears at the first run that read the store (every
+   *  read of the store the run made succeeded: store verified), pending at its walk or not. A run cut
+   *  short by its time budget reads the store and leaves entries pending, and LOG_STORE_STALE_MS marks
+   *  reads that keep failing, not a walk that has entries left (the fleet of the operator writing
+   *  control entries faster than a device walks them would otherwise mark every such device after
+   *  three days). The state is attention when any node has a gap, a mismatch, or a part that
    *  cannot be checked, when an entry of a node no grant of this app explains verified, when a
    *  release build is refused the log store, and when the reads of the store have been failing for
    *  LOG_STORE_STALE_MS; otherwise pending when a chain has entries left to verify, the store could
@@ -3615,7 +3619,7 @@
     const unread = store.state !== "verified" && store.state !== "absent" && store.state !== "refused";
     if (unread) {
       if (ledger.store_failing_ms === 0) ledger.store_failing_ms = now;
-    } else if (store.state === "verified" && !counts.pending) {
+    } else if (store.state === "verified") {
       ledger.store_failing_ms = 0;
     }
     const stale = unread && now - ledger.store_failing_ms >= LOG_STORE_STALE_MS;

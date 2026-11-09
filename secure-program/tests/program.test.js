@@ -335,6 +335,23 @@ test("a run that reaches its time budget is pending at its verification points, 
   assert.ok(result.object_reads >= 25 && result.object_reads <= 25 + 2 * 8, "object reads " + result.object_reads);
 });
 
+test("the mark of failing store reads clears at the first run that read the store, pending at its walk or not", async () => {
+  const result = await scenarios.stale_timer_clears_on_read_store(source);
+  // The run whose object reads were all answered 503 is pending with the store unreachable, and
+  // the time the reads of the store began to fail is kept.
+  assert.equal(result.failed.status, "pending");
+  assert.equal(result.failed.store, "unreachable");
+  assert.ok(result.failed.store_failing_ms > 0, "store_failing_ms " + result.failed.store_failing_ms);
+  // The next run read the store (every read it made answered) and stopped at its time budget with
+  // entries left: pending at the walk, but the store was read, so the mark of failing reads clears.
+  // Before v40 this run kept store_failing_ms, and a device the fleet of the operator kept behind
+  // for three days would have shown attention at its next failed read without any act of the operator.
+  assert.equal(result.cut_short.status, "pending");
+  assert.equal(result.cut_short.store, "verified");
+  assert.equal(result.cut_short.bodies, 8);
+  assert.equal(result.cut_short.store_failing_ms, 0);
+});
+
 test("a synchronization a user procedure starts leaves a due verification to the next synchronization", async () => {
   const result = await scenarios.user_procedure_defers_verification(source);
   assert.equal(result.after_switch.reports, 0);
