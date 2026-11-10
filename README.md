@@ -21,7 +21,7 @@ the master key.
 An account is one user. The app is the iOS app of that account. The operator is the company that
 runs the service, and the operator domain is everything it runs outside a node: the backend, its
 storage, the host program, the network. A provider is a service whose credentials a node holds
-(Google, Microsoft, Slack, Notion, X, Link, Granola, Mercury, NAVER Mail).
+(Google, Microsoft, Slack, Notion, X, Link, Granola, Mercury, NAVER Mail, NAVER Calendar).
 
 ```text
 device of the account (the app)
@@ -54,7 +54,7 @@ operator domain (not trusted by the node)        node (AWS Nitro Enclave, memory
 | User key | Derived from the master key | In memory, while a grant is in force | Never, for a node inside an enclave |
 | Node signing key, node sealing key | No | In memory, for the life of the process | Never |
 | OAuth token of a connection (record kind `oauth`) | Never | In memory, while a call uses it | Ciphertext only |
-| Mail application password (record kind `app_password`) | When the user enters it, encrypted on-device | In memory, while a fixed IMAP/SMTP call uses it | Ciphertext only |
+| Application password of a provider (record kind `app_password`: NAVER Mail, NAVER Calendar) | When the user enters it, encrypted on-device | In memory, while a fixed IMAP/SMTP call uses it (NAVER Mail) or while an HTTP request to the hosts of its definition carries it (NAVER Calendar) | Ciphertext only |
 | Vault value (password, card number, CVC) | When the user enters it | In memory, while `release` runs | The ciphertext, and the value after `release` handed it out |
 | TOTP seed | When the user enters it | In memory, while `release` computes a code | Ciphertext only. `release` hands out the 6-digit code |
 | Log entry | Opens it with the log decryption key | Creates it, writes it to the log store before the act, keeps it until its storage is acknowledged | Stores it sealed. Cannot delete the copy in the log store for 365 days |
