@@ -13,8 +13,9 @@ The exit status tells three results apart:
     0  every entry of the release key is the statement of a release
     1  an entry is the statement of no release, or carries another public key
     2  the comparison is not complete: the log could not be searched, an entry could not be read,
-       or an entry matches no statement that was read while the statement of at least one release
-       could not be read (that entry may belong to that release)
+       an entry matches no statement that was read while the statement of at least one release
+       could not be read (that entry may belong to that release), or the script stopped on an
+       error it did not expect
 
 A statement that could not be read is not the same as an entry that no release explains: the script
 reads a statement again before it gives up (`READ_ATTEMPTS`), and an entry that it could not compare
@@ -33,6 +34,7 @@ import os
 import subprocess
 import sys
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -240,18 +242,21 @@ def log_entries(pem: bytes) -> tuple[list[Entry], list[str]]:
         except (urllib.error.URLError, OSError, ValueError) as error:
             unreadable.append(f"`{uuid}`: {error}")
             continue
-        for logged in answer.values():
-            body = json.loads(base64.b64decode(logged["body"]))
-            signature = body.get("spec", {}).get("signature", {})
-            logged_key = base64.b64decode(signature.get("publicKey", {}).get("content", ""))
-            entries.append(
-                Entry(
-                    index=logged.get("logIndex", "?"),
-                    digest=body.get("spec", {}).get("data", {}).get("hash", {}).get("value", ""),
-                    integrated_time=logged.get("integratedTime", "?"),
-                    same_key=logged_key.strip() == pem.strip(),
+        try:
+            for logged in answer.values():
+                body = json.loads(base64.b64decode(logged["body"]))
+                signature = body.get("spec", {}).get("signature", {})
+                logged_key = base64.b64decode(signature.get("publicKey", {}).get("content", ""))
+                entries.append(
+                    Entry(
+                        index=logged.get("logIndex", "?"),
+                        digest=body.get("spec", {}).get("data", {}).get("hash", {}).get("value", ""),
+                        integrated_time=logged.get("integratedTime", "?"),
+                        same_key=logged_key.strip() == pem.strip(),
+                    )
                 )
-            )
+        except (AttributeError, KeyError, TypeError, ValueError) as error:
+            unreadable.append(f"`{uuid}`: the entry has another shape than expected ({type(error).__name__}: {error})")
     return entries, unreadable
 
 
@@ -327,5 +332,25 @@ def main(argv: list[str]) -> int:
     return comparison.exit_status(len(unreadable))
 
 
+def run(argv: list[str]) -> int:
+    """`main`, with a failure that is not a result of the comparison reported as an incomplete
+    comparison. The exit status 1 means one thing only, an entry that no release explains: a run
+    that stopped on an error it did not expect (a `git` command that failed, an answer of another
+    shape) must not end with that status, which is also the status of an uncaught Python error."""
+    try:
+        return main(argv)
+    except Exception as error:  # noqa: BLE001 - every unexpected failure is an incomplete run
+        report = [
+            "# Transparency log monitor",
+            "",
+            f"The monitor stopped before it finished the comparison: {type(error).__name__}: {error}",
+        ]
+        print("\n".join(report))
+        traceback.print_exc()
+        if "--report" in argv[:-1]:
+            Path(argv[argv.index("--report") + 1]).write_text("\n".join(report) + "\n")
+        return EXIT_INCOMPLETE
+
+
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(run(sys.argv[1:]))

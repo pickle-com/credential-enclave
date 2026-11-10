@@ -73,5 +73,19 @@ class RenderTest(unittest.TestCase):
         self.assertIn("`v1.3.0`: HTTP Error 504", report)
 
 
+class RunTest(unittest.TestCase):
+    def test_an_unexpected_failure_is_an_incomplete_run_and_not_an_unexplained_entry(self) -> None:
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as folder:
+            report = Path(folder) / "report.md"
+            with mock.patch.object(monitor, "main", side_effect=KeyError("body")):
+                status = monitor.run(["--repository", "owner/name", "--report", str(report)])
+            self.assertEqual(status, monitor.EXIT_INCOMPLETE)
+            self.assertNotEqual(status, monitor.EXIT_UNEXPLAINED)
+            self.assertIn("stopped before it finished the comparison", report.read_text())
+
+
 if __name__ == "__main__":
     unittest.main()
