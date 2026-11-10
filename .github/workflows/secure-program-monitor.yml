@@ -1,6 +1,9 @@
 # Every hour: every entry of the public transparency log that the release key signed must be the
 # statement of a release of this repository (an enclave release v* or a secure-program-v* release).
-# An entry that is not, or a log that cannot be read, opens an issue.
+# An entry that no release explains opens an issue. A run that could not complete the comparison
+# (the log or a release statement could not be read) fails without that issue, and opens another
+# issue only when the comparison stayed incomplete for six runs in a row. A run in which every
+# entry is the statement of a release closes the open issues of the monitor.
 name: secure-program-monitor
 on:
   schedule:
@@ -16,8 +19,12 @@ jobs:
     permissions:
       contents: read
       issues: write
+      actions: read
     env:
       GH_TOKEN: ${{ github.token }}
+      UNEXPLAINED_TITLE: "Transparency log: entry of the release key without a matching release"
+      INCOMPLETE_TITLE: "Transparency log monitor: the comparison could not be completed"
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -25,14 +32,42 @@ jobs:
           fetch-depth: 0
       - name: Compare the entries of the release key with the releases of this repository
         id: compare
-        run: python3 secure-program/monitor.py --repository "$GITHUB_REPOSITORY" --report report.md
-      - name: Open or update the issue
-        if: failure() && steps.compare.conclusion == 'failure'
         run: |
-          title="Transparency log: entry of the release key without a matching release"
-          number=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
+          status=0
+          python3 secure-program/monitor.py --repository "$GITHUB_REPOSITORY" --report report.md || status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+      - name: Open or update the issue of an entry that no release explains
+        if: steps.compare.outputs.status == '1'
+        run: |
+          number=$(gh issue list --state open --search "in:title \"$UNEXPLAINED_TITLE\"" --json number --jq '.[0].number')
           if [ -z "$number" ]; then
-            gh issue create --title "$title" --body-file report.md
+            gh issue create --title "$UNEXPLAINED_TITLE" --body-file report.md
           else
             gh issue comment "$number" --body-file report.md
           fi
+      - name: Open or update the issue of a comparison that stayed incomplete for six runs
+        if: steps.compare.outputs.status != '0' && steps.compare.outputs.status != '1'
+        run: |
+          # The five runs before this one, newest first. This run is still in progress and is not
+          # in the list of completed runs.
+          failed=$(gh run list --workflow secure-program-monitor.yml --status completed --limit 5 \
+            --json conclusion --jq '[.[] | select(.conclusion == "failure")] | length')
+          if [ "$failed" = "5" ]; then
+            number=$(gh issue list --state open --search "in:title \"$INCOMPLETE_TITLE\"" --json number --jq '.[0].number')
+            if [ -z "$number" ]; then
+              gh issue create --title "$INCOMPLETE_TITLE" --body-file report.md
+            else
+              gh issue comment "$number" --body-file report.md
+            fi
+          fi
+      - name: Close the open issues of the monitor
+        if: steps.compare.outputs.status == '0'
+        run: |
+          for title in "$UNEXPLAINED_TITLE" "$INCOMPLETE_TITLE"; do
+            for number in $(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[].number'); do
+              gh issue close "$number" --comment "Every entry of the release key is the statement of a release of this repository: $RUN_URL"
+            done
+          done
+      - name: Fail unless every entry of the release key is the statement of a release
+        if: steps.compare.outputs.status != '0'
+        run: exit 1
