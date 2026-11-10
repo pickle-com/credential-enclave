@@ -46,6 +46,8 @@ jobs:
         run: scripts/secret-access.sh --check
       - name: The tests of the secure program on the model of the bridge
         run: node --test secure-program/tests/program.test.js
+      - name: The tests of the comparison of the transparency log monitor
+        run: python3 -m unittest discover -s secure-program/tests -p 'test_*.py'
 
   measure:
     if: github.event_name == 'push'

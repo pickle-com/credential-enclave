@@ -160,8 +160,10 @@ versions of the program and prints what changed between them (the file of a tag 
 - The monitor [`.github/workflows/secure-program-monitor.yml`](../.github/workflows/secure-program-monitor.yml)
   asks the log every hour for the entries of the release key and compares them with the releases
   of this repository ([`monitor.py`](monitor.py)); an entry that no release explains opens an
-  issue. The guarantee of the apps does not rest on the monitor, and anyone can run the same
-  comparison, or watch the whole log for the release key with the monitor of Sigstore
-  (rekor-monitor).
+  issue. A run that could not read the log or the statement of a release reports the entries it
+  could not compare as not checked, not as unexplained, and a later run in which every entry is
+  the statement of a release closes the issue. The guarantee of the apps does not rest on the
+  monitor, and anyone can run the same comparison, or watch the whole log for the release key
+  with the monitor of Sigstore (rekor-monitor).
 - The app binaries are not open source. What this directory shows is the program, not that the
   binary runs it unchanged (README of this repository, "The honesty of the app").
