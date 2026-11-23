@@ -908,18 +908,33 @@ impl StreamCheck {
     }
 
     /// A bound of the memory the check of the response of a request holds while the body
-    /// arrives, for a credential of `credential_bytes` bytes: the buffer of the received
-    /// bytes, and for every reading its last bytes and what one step of a search adds to it.
-    /// The longest form of a credential is its hexadecimal form, two bytes for one.
+    /// arrives, for a credential of `credential_bytes` bytes: the forms of the credential,
+    /// the buffer of the received bytes, and for every reading its last bytes, the escape
+    /// that waits, and what one step of a search adds to it. The longest form of a credential
+    /// is its hexadecimal form, two bytes for one.
     pub const fn memory_bound(credential_bytes: usize) -> usize {
         let longest = credential_bytes.saturating_mul(2);
+        // The forms: the credential as it is, six base64 texts (four characters for three
+        // bytes), two hexadecimal texts (two for one), the text with `+` for its spaces, and
+        // the text a reader of ISO 8859-1 makes of it (at most two bytes for one). That is
+        // sixteen bytes for each byte of the credential, and the few characters the base64
+        // texts have more for the bytes in front of the credential.
+        let forms = credential_bytes.saturating_mul(16).saturating_add(64);
         // The bytes as received, and the layers of the two kinds of escapes.
         let readings = 1 + PERCENT_LAYERS + JSON_LAYERS;
+        // What one step adds to a reading, and the escape that waits, are written into
+        // buffers that grow by doubling: the room of each is at most twice what it holds.
+        let step = slice_of(longest)
+            .saturating_add(OPEN_ESCAPE_BYTES)
+            .saturating_mul(2);
+        let waits = OPEN_ESCAPE_BYTES.saturating_mul(4);
         let reading = longest
             .saturating_mul(2)
-            .saturating_add(slice_of(longest))
-            .saturating_add(OPEN_ESCAPE_BYTES);
-        Self::buffer_of(longest).saturating_add(reading.saturating_mul(readings))
+            .saturating_add(step)
+            .saturating_add(waits);
+        Self::buffer_of(longest)
+            .saturating_add(forms)
+            .saturating_add(reading.saturating_mul(readings))
     }
 
     /// Takes the next bytes of the body and returns the bytes that are handed on now: none
@@ -1895,6 +1910,55 @@ mod tests {
         // of a value of a common length.
         assert!(StreamCheck::memory_bound(12_000) < 3 * 1024 * 1024);
         assert!(StreamCheck::memory_bound(200) < 64 * 1024);
+    }
+
+    #[test]
+    fn a_check_holds_no_more_memory_than_the_bound_a_call_reserves_for_it() {
+        // The room of everything a check holds while a body arrives: the forms of the
+        // credential, the buffer of the received bytes, and for every reading its last bytes,
+        // the escape that waits and what a step adds to it. A credential with a space and
+        // with characters outside ASCII has every form, and a long one makes a step of the
+        // search as long as its longest form.
+        let credentials = [
+            "x".repeat(8),
+            TOKEN.to_string(),
+            "p\u{e4}ss phrase \u{d55c}\u{ae00} 0123456789".to_string(),
+            format!("{}!", "\u{d55c} ".repeat(700)),
+            "k".repeat(12_000),
+        ];
+        let mut noise = Noise(0x3c6e_f372_fe94_f82b);
+        for text in credentials {
+            let bound = StreamCheck::memory_bound(text.len());
+            let mut headers = Vec::new();
+            let mut check = StreamCheck::begin(&Secret::new(text.clone()), &mut headers).unwrap();
+            for round in 0..12 {
+                let part = match round % 3 {
+                    0 => noise.some(200),
+                    1 => noise.some(70_000),
+                    _ => noise.some(900_000),
+                };
+                check.take(&part).unwrap();
+                let forms: usize = check
+                    .forms
+                    .0
+                    .iter()
+                    .map(|form| form.expose_secret().capacity())
+                    .sum();
+                let of_the_readings: usize = check
+                    .readings
+                    .readings
+                    .iter()
+                    .map(|reading| reading.tail.capacity() + reading.open.capacity())
+                    .chain(check.readings.added.iter().map(Vec::capacity))
+                    .sum();
+                let in_use = check.held.capacity() + forms + of_the_readings;
+                assert!(
+                    in_use <= bound,
+                    "{} bytes, round {round}: {in_use} in use, bound {bound}",
+                    text.len()
+                );
+            }
+        }
     }
 
     #[test]

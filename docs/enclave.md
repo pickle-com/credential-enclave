@@ -1606,7 +1606,8 @@ The rules:
   in flight and the body budget are). A `forward`, `forward/batch` or `vault/send` call waits
   for its place and for the shares of the body budget it takes before its request leaves (the
   share its request frame occupies, and for `vault/send` the share the search of its response
-  can hold: about 20 KiB for a value of 30 bytes and 2.3 MiB for one of 12,000 bytes) for at
+  can hold with the forms of the value: about 26 KiB for a value of 30 bytes and 2.6 MiB for
+  one of 12,000 bytes) for at
   most 30 seconds together (`ADMISSION_WAIT`)
   and ends with `capacity_unavailable` when it has not got them by then: the node reads
   nothing from the connection of a call that waits, so it does not learn that the caller of
