@@ -112,8 +112,10 @@
   //                   pages of the screen by the time they begin below, 0 for the first)
   //   log.recovered   what the rounds read of the reads of the log screen that were held back,
   //                   kept for the screen, sealed
-  //   log.denied      the later pages of the log screen that were held back in a row:
-  //                   {before_ms, limit, count, first_ms, last_ms}
+  //   log.denied      the reads held back from the log screen that the screen counts itself:
+  //                   {page: {before_ms, limit, count, first_ms, last_ms}, chains: {node:
+  //                   {after, count, first_ms, last_ms}}} (the later pages of format 3, and the
+  //                   listings of the chains of format 1 and format 2)
   //   log.legacy      the chains of format 1 and format 2: {nodes: {node: {seq, time_ms, until_ms,
   //                   closed}}, waiting: {node: {until_ms, time_ms}}} (waiting: the receiving
   //                   nodes of transfers whose documents this device has still to judge)
@@ -211,6 +213,13 @@
   // keeps of one (the entries of the same millisecond as the last one stay on the page).
   const LOG_RECOVERED_PAGES = 4;
   const LOG_RECOVERED_PAGE_EVENTS = 100;
+  // The reads of the bucket of format 1 and format 2 that were held back from the screen and
+  // that the device keeps for the rounds to make again: the entries (each the object versions
+  // the screen asked for under one seq) and the listings of chains. And the chains whose
+  // listings held back the device counts (log.denied).
+  const LOG_WITHHELD_OBJECTS = 16;
+  const LOG_WITHHELD_CHAINS = 8;
+  const LOG_DENIED_CHAINS = 8;
   // The retention of an object of the store (Object Lock, days). The absence of a key older than
   // this says nothing; a key is expected in the listing while it is a day younger than this.
   const LOG_RETENTION_DAYS = 365;
@@ -3293,12 +3302,19 @@
   // delegation): the use entries are read by the log screen. A read that was held back, whoever
   // made it (a round, the first page of the screen, a later page), is kept (log.withheld: the key
   // of an entry whose document or body was held back, the key of the screen that an answer of
-  // the bodies did not reach, the listing page of the screen that was held back) and made again
-  // by every round, in front of its other reads, until it is no longer held back. So a round
-  // that reads the control entries alone does not end a count of rounds held back while a read
-  // the screen made stays held back. What a round reads that way is kept for the screen
-  // (log.recovered), which takes it from there: the backend gains nothing by answering the
-  // rounds and not the screen, because an answer to a round is an answer the user sees.
+  // the bodies did not reach, the listing page of the screen that was held back, and the reads
+  // the screen makes of the bucket of format 1 and format 2: the node discovery listing, the
+  // listing of a chain, the object versions of an entry) and made again by every round, in
+  // front of its other reads, until it is no longer held back. So a round that reads the control
+  // entries alone does not end a count of rounds held back while a read the screen made stays
+  // held back. What a round reads that way is kept for the screen (log.recovered), which takes
+  // it from there: the backend gains nothing by answering the rounds and not the screen, because
+  // an answer to a round is an answer the user sees. Two kinds of listings cannot be kept in a
+  // form that answers every later read of the screen (a later page of format 3, the listing of a
+  // chain); what is held back of them is counted by the reads of the screen themselves
+  // (log.denied), and that count marks the log as the count of the rounds does. And a round that
+  // keeps ending with more to read than a round reads is, from LOG_UNFINISHED_ROUNDS such rounds
+  // in a row on, a round whose reads are held back.
   //
   // What is an entry is decided by the listing and by the node documents. The operator domain can
   // write objects under any key of the store, so a key of the listing is the key of an entry only
@@ -3410,25 +3426,46 @@
     return control !== null ? control : parseEntryKey(key, "u");
   }
 
-  /** The reads of format 3 that were held back and that this device keeps for the rounds to make
-   *  again (log.withheld): {keys, shown, pages}. keys are the object keys of entries whose
-   *  document or body was held back, or that an answer of the bodies to the log screen did not
-   *  reach (LOG_WITHHELD_KEYS at most); shown are those of them that a read of the log screen
-   *  asked for (what a round reads under such a key is kept for the screen: log.recovered);
-   *  pages are the listing pages of the screen that were held back (LOG_WITHHELD_PAGES at most),
-   *  each the time below which the page of the two prefixes was asked for (0: the pages that
-   *  begin the two listings). */
+  /** The reads that were held back and that this device keeps for the rounds to make again
+   *  (log.withheld): {keys, shown, pages, objects, chains, nodes}. keys are the object keys of
+   *  entries of format 3 whose document or body was held back, or that an answer of the bodies
+   *  to the log screen did not reach (LOG_WITHHELD_KEYS at most); shown are those of them that a
+   *  read of the log screen asked for (what a round reads under such a key is kept for the
+   *  screen: log.recovered); pages are the listing pages of format 3 of the screen that were
+   *  held back (LOG_WITHHELD_PAGES at most), each the time below which the page of the two
+   *  prefixes was asked for (0: the pages that begin the two listings). The rest are reads of the
+   *  bucket of format 1 and format 2 that the screen made: objects are the entries whose object
+   *  versions were held back, each the list of the versions [key, version id] the screen asked
+   *  for under one seq of one chain (LOG_WITHHELD_OBJECTS at most); chains are the listings of
+   *  chains that were held back, each [node, after, below] (the seq the listing began after, and
+   *  the seq it was read below, 0 for none; LOG_WITHHELD_CHAINS at most); nodes says that the
+   *  node discovery listing was held back. */
   function loadWithheld() {
     const kept = storedObject(STORE_WITHHELD);
     const keys = (Array.isArray(kept.keys) ? kept.keys : []).filter(function (key) {
       return typeof key === "string" && key !== "";
     }).slice(0, LOG_WITHHELD_KEYS);
+    const prefix = accountPrefix();
+    const objects = [];
+    for (const group of Array.isArray(kept.objects) ? kept.objects : []) {
+      const versions = (Array.isArray(group) ? group : []).filter(function (version) {
+        return Array.isArray(version) && typeof version[0] === "string" && version[0].slice(0, prefix.length) === prefix &&
+          typeof version[1] === "string";
+      }).slice(0, 2);
+      if (versions.length > 0 && objects.length < LOG_WITHHELD_OBJECTS) objects.push(versions);
+    }
     return {
       keys: keys,
       shown: (Array.isArray(kept.shown) ? kept.shown : []).filter(function (key) { return keys.indexOf(key) >= 0; }),
       pages: (Array.isArray(kept.pages) ? kept.pages : []).filter(function (before) {
         return Number.isSafeInteger(before) && before >= 0;
       }).slice(0, LOG_WITHHELD_PAGES),
+      objects: objects,
+      chains: (Array.isArray(kept.chains) ? kept.chains : []).filter(function (chain) {
+        return Array.isArray(chain) && typeof chain[0] === "string" && NODE_ID.test(chain[0]) &&
+          Number.isSafeInteger(chain[1]) && chain[1] >= 0 && Number.isSafeInteger(chain[2]) && chain[2] >= 0;
+      }).slice(0, LOG_WITHHELD_CHAINS),
+      nodes: kept.nodes === true,
     };
   }
 
@@ -3448,12 +3485,24 @@
     return isStoreFailure(failure) && (failure.kind === "blocked" || failure.kind === "silent");
   }
 
+  /** The name of an entry of a chain whose object versions were held back: the node id and the
+   *  seq the key of its first version names ("" for a key that names none). */
+  function objectName(versions) {
+    const rest = versions[0][0].slice(accountPrefix().length);
+    const id = rest.slice(0, 43);
+    const parts = parseStoreKey(versions[0][0], accountPrefix() + id + "/");
+    return parts === null || !NODE_ID.test(id) ? "" : id + ":" + parts.seq;
+  }
+
   /** Writes the withheld reads after a read (run: withheld and settled, the keys it found held
    *  back and the keys whose read came to a judgement; shown, the keys among the former that the
-   *  log screen asked for; pagesHeld and pagesRead, the same for listing pages): what the device
-   *  kept without what that read settled, then what that read found held back, up to the limits.
-   *  A key older than the retention of the store leaves. The kept value is read at the call and
-   *  written in the same step: a round and a read of a later page of the screen may end in either
+   *  log screen asked for; pagesHeld and pagesRead, the same for listing pages; and, when the
+   *  read made them, objectsHeld and objectsRead (the entries of chains, as lists of versions,
+   *  and the names of the entries read), chainsHeld and chainsRead (the listings of chains, and
+   *  their names node:after:below), nodesHeld and nodesRead (the node discovery listing)): what
+   *  the device kept without what that read settled, then what that read found held back, up to
+   *  the limits. A key older than the retention of the store leaves. The kept value is read at
+   *  the call and written in the same step: a round and a read of the screen may end in either
    *  order. */
   function saveWithheld(run) {
     const kept = loadWithheld();
@@ -3471,13 +3520,38 @@
       if (run.pagesRead.has(before) || pages.indexOf(before) >= 0 || pages.length >= LOG_WITHHELD_PAGES) continue;
       pages.push(before);
     }
-    const same = keys.length === kept.keys.length && pages.length === kept.pages.length &&
-      shown.length === kept.shown.length &&
-      keys.every(function (key, at) { return key === kept.keys[at]; }) &&
-      shown.every(function (key, at) { return key === kept.shown[at]; }) &&
-      pages.every(function (before, at) { return before === kept.pages[at]; });
-    if (same) return;
-    storeJson(STORE_WITHHELD, keys.length === 0 && pages.length === 0 ? null : { keys: keys, shown: shown, pages: pages });
+    const objects = [];
+    const named = new Set();
+    for (const versions of kept.objects.concat(run.objectsHeld === undefined ? [] : run.objectsHeld)) {
+      const name = objectName(versions);
+      if (name === "" || named.has(name) || objects.length >= LOG_WITHHELD_OBJECTS) continue;
+      if (run.objectsRead !== undefined && run.objectsRead.has(name)) continue;
+      named.add(name);
+      objects.push(versions.slice(0, 2));
+    }
+    const chains = [];
+    const listed = new Set();
+    for (const chain of kept.chains.concat(run.chainsHeld === undefined ? [] : run.chainsHeld)) {
+      const name = chain.join(":");
+      if (listed.has(name) || chains.length >= LOG_WITHHELD_CHAINS) continue;
+      if (run.chainsRead !== undefined && run.chainsRead.has(name)) continue;
+      listed.add(name);
+      chains.push(chain);
+    }
+    const nodes = (kept.nodes || run.nodesHeld === true) && run.nodesRead !== true;
+    // The stored value names the reads of the bucket of format 1 and format 2 only when it holds
+    // some.
+    const value = function (held) {
+      const stored = { keys: held.keys, shown: held.shown, pages: held.pages };
+      if (held.objects.length > 0) stored.objects = held.objects;
+      if (held.chains.length > 0) stored.chains = held.chains;
+      if (held.nodes) stored.nodes = true;
+      return stored;
+    };
+    const next = value({ keys: keys, shown: shown, pages: pages, objects: objects, chains: chains, nodes: nodes });
+    if (JSON.stringify(next) === JSON.stringify(value(kept))) return;
+    const empty = keys.length === 0 && pages.length === 0 && objects.length === 0 && chains.length === 0 && !nodes;
+    storeJson(STORE_WITHHELD, empty ? null : next);
   }
 
   /** Whether what this device kept says that its environment has a store of format 3: it handed
@@ -4273,9 +4347,11 @@
    *      and 4 the bodies of the keys it has not judged whose nodes it has a judgement of
    *      (readEntries). The keys an earlier read found held back are read with the first page,
    *      and the listing pages of the screen an earlier read found held back after the listing
-   *      (log.withheld)
-   *    5 the chains of format 1 and format 2 this device follows (followLegacy)
-   *    6 the judgement, the published state, the report
+   *      (log.withheld), each with the entries of the page the screen would show there
+   *    5 the chains of format 1 and format 2 this device follows (followLegacy), and the reads of
+   *      that bucket the screen made that an earlier read found held back (rereadChains)
+   *    6 the judgement, the published state, the report. What the round read for the screen is
+   *      kept for it (log.recovered) before the reads it answers leave log.withheld
    *  A round that ends with reads left undone because there was more to read than a round reads
    *  (run.truncated, run.over) is not complete and the next round reads on. From the round after
    *  LOG_UNFINISHED_ROUNDS such rounds of synchronizations in a row, a round that ends that way
@@ -4299,7 +4375,8 @@
       cut: false, over: false, controlKeys: 0, checked: 0, bodies: 0, nodes: new Set(), undocumented: new Set(),
       verified: [], entries: new Map(), junk: new Set(), screenMs: null, withheld: new Set(),
       shown: new Set(), kept: new Set(), settled: new Set(), pagesHeld: new Set(), pagesRead: new Set(),
-      pagesKept: new Map(), store3: known,
+      pagesKept: new Map(), store3: known, objectsRead: new Set(), chainsRead: new Set(), nodesRead: false,
+      chainKept: [], found: null,
     };
     // What the rounds kept for the screen before this round: an entry kept there is not read
     // again.
@@ -4436,6 +4513,9 @@
     } catch (failure) {
       noteFailure(turn, run, heldBack(failure));
     }
+    // The reads of the bucket of format 1 and format 2 that the log screen made and found held
+    // back.
+    await rereadChains(turn, keys, run, withheld);
     // The judgement.
     const now = native.nowMs();
     const denied = run.blocked || (run.silent && await reachJudged(turn, started));
@@ -4496,10 +4576,10 @@
     } else if (!unreachable) {
       log.blocked = { first_ms: 0, count: 0 };
     }
-    // The later pages held back from the screen, which the reads of the screen count.
-    const pagesDenied = loadDenied();
-    const deep = heldLong(pagesDenied, now);
-    if (deep && run.detail === "") run.detail = "page:held";
+    // The reads held back from the screen that the reads of the screen count themselves.
+    const deniedMs = deniedSince(loadDenied(), now);
+    const deep = deniedMs !== 0;
+    if (deep && run.detail === "") run.detail = "screen:held";
     const held = deep || (log.blocked.count >= LOG_BLOCKED_ROUNDS && now - log.blocked.first_ms >= LOG_BLOCKED_MS);
     const reasons = [];
     if (established > 0) reasons.push("unlisted_release");
@@ -4517,7 +4597,7 @@
       newer_release_nodes: grace,
       store: blocked || deep ? "blocked" : unreachable ? "unreachable" : run.truncated ? "truncated" : "verified",
       store_failure: run.detail, program_version: VERSION,
-      store_failing_ms: log.blocked.first_ms !== 0 || !deep ? log.blocked.first_ms : pagesDenied.first_ms,
+      store_failing_ms: log.blocked.first_ms !== 0 || !deep ? log.blocked.first_ms : deniedMs,
     };
     // What the device keeps of this round.
     if (complete && !absent && !readFailed) {
@@ -4550,8 +4630,15 @@
     // A listing page the round read again is kept as well, and a listing page the screen read
     // itself in this round replaces nothing: what the rounds kept of it is dropped.
     const own = origin === "screen" && pages.c !== null && had.pages.some(function (page) { return page.before === 0; });
-    if (run.kept.size > 0 || run.pagesKept.size > 0 || own) {
+    if (run.kept.size > 0 || run.pagesKept.size > 0 || own || run.chainKept.length > 0 || run.found !== null) {
       const recovered = loadRecovered(keys);
+      for (const item of run.chainKept) {
+        recovered.entries.delete("2:" + item.name);
+        recovered.entries.set("2:" + item.name, {
+          t: now, m: item.entry.time_ms > 0 ? item.entry.time_ms : now, e: clippedEntry(item.entry),
+        });
+      }
+      if (run.found !== null) recovered.found = { t: now, ids: run.found.slice(0, 2 * LEGACY_NODES) };
       run.kept.forEach(function (key) {
         const record = run.entries.get(key);
         keepRecovered(recovered, record.parsed, record, run.junk.has(key));
@@ -4961,21 +5048,64 @@
     return { time_ms: candidates[0].parts.time_ms, count: candidates[0].parts.count };
   }
 
+  /** What a read of the log screen collects of its reads of the bucket of format 1 and format 2:
+   *  the entries and the listings of chains it found held back (objectsHeld, chainsHeld: for the
+   *  rounds, log.withheld), the ones it read itself (objectsRead, chainsRead: their names),
+   *  whether a count of the listings held back began or ceased to mark the log (judge), and
+   *  whether the backend answered another request of this runtime around the read (reached:
+   *  null until a request of the read was not answered and that was looked into, once). live(id)
+   *  says whether the store is known to hold the chain of node id: the store named its prefix
+   *  when the screen last listed the node prefixes (cache.found), or this device follows the
+   *  chain and its entries are within the retention of the store. A backend that states it has
+   *  no such store is believed for any other chain. */
+  function chainReads(cache) {
+    const legacy = loadLegacy();
+    const now = native.nowMs();
+    return {
+      objectsHeld: [], objectsRead: new Set(), chainsHeld: [], chainsRead: new Set(), judge: false, reached: null,
+      live: function (id) {
+        if (cache.found.indexOf(id) >= 0) return true;
+        const followed = legacy.nodes[id];
+        return followed !== undefined && (!followed.closed || now - followed.until_ms < LOG_RETENTION_DAYS * DAY_MS);
+      },
+    };
+  }
+
   /** Lists chains of format 1 and format 2 in one stage: targets are [{id, after, below, probe}]
    *  (the keys of node id above the seq after; with below, only the keys under that seq). The keys
    *  enter the keys the screen knows, unless probe is set (a listing that only looks where a chain
    *  ends). Each target receives last (the largest seq the listing named, after when none) and
-   *  more (whether the listing goes on); a target whose listing failed receives neither. Throws a
-   *  failure that is not one of the store. */
-  async function loadChainKeys(turn, targets) {
+   *  more (whether the listing goes on); a target whose listing failed receives neither, and
+   *  failure, the failure of its read. With reads (the listings are the ones of a read of the log
+   *  screen: chainReads), a listing that is held back goes to the rounds and is counted
+   *  (denyChain: a request that was not answered counts when the backend answered another
+   *  request of this runtime around it), and a listing that was read ends that count when it
+   *  covers what was held back (serveChain). A backend that states it has no such store holds
+   *  the listing of a chain back that the store is known to hold (reads.live). Throws a failure
+   *  that is not one of the store. */
+  async function loadChainKeys(turn, targets, reads) {
+    const started = native.nowMs();
     const listings = await legacyListings(turn, targets.map(function (target) {
       return { node: target.id, key_marker: listingMarker(target.id, target.after), version_id_marker: null };
     }));
     for (let at = 0; at < targets.length; at += 1) {
       const target = targets[at];
       const outcome = listings[at];
+      const name = [target.id, target.after, target.below === undefined ? 0 : target.below].join(":");
       if (!outcome.ok) {
-        if (!isStoreFailure(outcome.error)) throw outcome.error;
+        const failure = outcome.error;
+        if (!isStoreFailure(failure)) throw failure;
+        target.failure = failure;
+        if (reads === undefined || failure.kind === "unreachable" || !(turnLeft(turn) > 0)) continue;
+        if (failure.kind === "absent" && !reads.live(target.id)) continue;
+        // A listing that only looks for the end of a chain is not one the rounds make again.
+        if (target.probe !== true && reads.chainsHeld.length < LOG_WITHHELD_CHAINS) {
+          reads.chainsHeld.push([target.id, target.after, target.below === undefined ? 0 : target.below]);
+        }
+        if (failure.kind === "silent" && reads.reached === null) reads.reached = await reachJudged(turn, started);
+        if (failure.kind !== "silent" || reads.reached === true) {
+          if (denyChain(target.id, target.after)) reads.judge = true;
+        }
         continue;
       }
       const prefix = accountPrefix() + target.id + "/";
@@ -4993,6 +5123,10 @@
       }
       target.more = outcome.value.truncated && outcome.value.nextKeyMarker !== null;
       target.last = last;
+      if (reads !== undefined) {
+        reads.chainsRead.add(name);
+        if (serveChain(target.id, target)) reads.judge = true;
+      }
       if (target.probe === true) continue;
       const node = displayNode(target.id);
       rememberKeys(target.id, entries);
@@ -5016,7 +5150,7 @@
       if (budget.lists <= 0) return -1;
       budget.lists -= 1;
       const target = { id: id, after: probe, probe: true };
-      await loadChainKeys(turn, [target]);
+      await loadChainKeys(turn, [target], budget.reads);
       if (target.last === undefined) return -1;
       if (target.last > probe) {
         known = target.last;
@@ -5070,19 +5204,133 @@
 
   /** The object versions of the candidates of the seqs given ([{id, seq}]) that the screen has
    *  not opened, read in batches of LOG_STORE_OBJECTS: a table from key and version to the signed
-   *  value. Throws a store failure. */
-  async function readChainObjects(turn, wanted) {
+   *  value. An entry the screen holds opened (the ones the rounds read for it among them) is not
+   *  asked for. With reads (chainReads), the entries of a read that is held back go to the rounds
+   *  (the versions asked for under each seq), and the names of the entries read are noted. Throws
+   *  a store failure. */
+  async function readChainObjects(turn, wanted, reads) {
     const versions = [];
+    const groups = [];
     for (const item of wanted) {
-      if (displayEntries.has(item.id + ":" + item.seq)) continue;
-      for (const candidate of orderedCandidates(displayNode(item.id), item.seq)) versions.push(candidate);
+      const name = item.id + ":" + item.seq;
+      if (displayEntries.has(name)) continue;
+      const candidates = orderedCandidates(displayNode(item.id), item.seq);
+      if (candidates.length > 0) groups.push({ name: name, versions: candidates });
+      for (const candidate of candidates) versions.push(candidate);
     }
     const objects = new Map();
-    for (let at = 0; at < versions.length; at += LOG_STORE_OBJECTS) {
-      const batch = await legacyObjects(turn, versions.slice(at, at + LOG_STORE_OBJECTS));
-      batch.forEach(function (value, name) { objects.set(name, value); });
+    try {
+      for (let at = 0; at < versions.length; at += LOG_STORE_OBJECTS) {
+        const batch = await legacyObjects(turn, versions.slice(at, at + LOG_STORE_OBJECTS));
+        batch.forEach(function (value, name) { objects.set(name, value); });
+      }
+    } catch (failure) {
+      // A read the backend refused or did not answer (a read that failed with the network of the
+      // device is one the rounds answer then). The keys were named by a listing of the store, so
+      // a backend that states it has no such store holds them back.
+      if (reads !== undefined && isStoreFailure(failure) && failure.kind !== "unreachable" && turnLeft(turn) > 0) {
+        for (const group of groups) {
+          if (reads.objectsHeld.length >= LOG_WITHHELD_OBJECTS) break;
+          reads.objectsHeld.push(group.versions.map(function (candidate) { return [candidate.key, candidate.versionId]; }));
+        }
+      }
+      throw failure;
+    }
+    if (reads !== undefined) {
+      for (const group of groups) reads.objectsRead.add(group.name);
     }
     return objects;
+  }
+
+  /** Puts the entries of chains that the rounds opened for the screen (log.recovered) among the
+   *  entries the screen holds opened: the screen asks for none of them. */
+  function useRecoveredChains(recovered) {
+    recovered.entries.forEach(function (kept, id) {
+      if (id.slice(0, 2) !== "2:" || kept.e === null) return;
+      const name = id.slice(2);
+      if (!displayEntries.has(name)) displayEntries.set(name, kept.e);
+    });
+  }
+
+  /** Hands the reads of the bucket of format 1 and format 2 that a read of the screen found held
+   *  back to the rounds, and takes the ones it read itself from the reads the rounds make again
+   *  (reads: chainReads; nodesHeld and nodesRead: the same for the node discovery listing). When
+   *  a count of the listings held back began or ceased to mark the log, a round judges and
+   *  publishes that now. */
+  function saveChainReads(keys, reads, nodesHeld, nodesRead) {
+    if (reads.objectsHeld.length > 0 || reads.chainsHeld.length > 0 || nodesHeld || native.storeGet(STORE_WITHHELD) !== null) {
+      saveWithheld({
+        withheld: new Set(), shown: new Set(), settled: new Set(), pagesHeld: new Set(), pagesRead: new Set(),
+        objectsHeld: reads.objectsHeld, objectsRead: reads.objectsRead, chainsHeld: reads.chainsHeld,
+        chainsRead: reads.chainsRead, nodesHeld: nodesHeld, nodesRead: nodesRead,
+      });
+    }
+    if (reads.judge) requestRound(freeTurn(), keys, "sync").then(noop, noop);
+  }
+
+  /** Makes again the reads of the bucket of format 1 and format 2 that a read of the log screen
+   *  found held back (withheld: log.withheld), as a part of a round: the node discovery listing,
+   *  the listings of chains, each from the seq the screen asked for, and the entries, each the
+   *  object versions the screen asked for. A read that is still held back is noted on run (the
+   *  round is one held back) and stays with the rounds. What is read is for the screen: the
+   *  node prefixes (run.found) and the entries, opened as the screen opens them (run.chainKept),
+   *  are kept (log.recovered), and the keys of a listing enter the keys the screen knows for the
+   *  time of this runtime. */
+  async function rereadChains(turn, keys, run, withheld) {
+    if (withheld.nodes) {
+      try {
+        run.found = await discoverLegacyNodes(turn);
+        run.nodesRead = true;
+      } catch (failure) {
+        noteFailure(turn, run, heldBack(failure));
+      }
+    }
+    if (withheld.chains.length > 0) {
+      const targets = withheld.chains.map(function (chain) {
+        return chain[2] === 0 ? { id: chain[0], after: chain[1] } : { id: chain[0], after: chain[1], below: chain[2] };
+      });
+      await loadChainKeys(turn, targets);
+      for (let at = 0; at < targets.length; at += 1) {
+        if (targets[at].failure !== undefined) noteFailure(turn, run, heldBack(targets[at].failure));
+        else run.chainsRead.add(withheld.chains[at].join(":"));
+      }
+    }
+    if (withheld.objects.length === 0) return;
+    const wanted = [];
+    for (const versions of withheld.objects) {
+      for (const version of versions) wanted.push({ key: version[0], versionId: version[1] });
+    }
+    let objects = null;
+    try {
+      objects = await legacyObjects(turn, wanted.slice(0, LOG_STORE_OBJECTS));
+    } catch (failure) {
+      noteFailure(turn, run, heldBack(failure));
+      return;
+    }
+    for (const versions of withheld.objects) {
+      const name = objectName(versions);
+      if (name === "") continue;
+      const id = name.slice(0, 43);
+      const seq = Number(name.slice(44));
+      let verified = null;
+      let keyTime = 0;
+      for (const version of versions) {
+        const parts = parseStoreKey(version[0], accountPrefix() + id + "/");
+        if (parts === null) continue;
+        if (parts.format === 2 && keyTime === 0) keyTime = parts.time_ms;
+        const signed = objects.get(version[0] + "\n" + version[1]);
+        if (signed === undefined || signed === null) continue;
+        verified = checkLegacyEntry(signed, id, parts, keys);
+        if (verified !== null) break;
+      }
+      const items = openEntryItems(id, seq, verified, keyTime);
+      const entry = {
+        id: "2:" + name, time_ms: verified !== null ? verified.time_ms : keyTime, count: items.length, items: items,
+      };
+      run.chainKept.push({ name: name, entry: entry });
+      run.objectsRead.add(name);
+      displayEntries.set(name, entry);
+    }
   }
 
   /** The nodes whose chains of format 1 and format 2 the screen shows: the chains this device
@@ -5213,7 +5461,8 @@
           break;
         }
         opens -= 1;
-        const objects = await readChainObjects(turn, best.seqs.map(function (seq) { return { id: best.id, seq: seq }; }));
+        const objects = await readChainObjects(
+          turn, best.seqs.map(function (seq) { return { id: best.id, seq: seq }; }), budget.reads);
         for (const seq of best.seqs) {
           if (legacyEntry(keys, best.id, seq, objects) === null) {
             displayEntries.set(best.id + ":" + seq, {
@@ -5234,7 +5483,7 @@
         const target = { id: best.id, after: Math.max(0, top - LEGACY_DISPLAY_LIST) };
         if (top >= 0 && budget.lists > 0) {
           budget.lists -= 1;
-          await loadChainKeys(turn, [target]);
+          await loadChainKeys(turn, [target], budget.reads);
         }
         if (target.last === undefined) {
           more = true;
@@ -5246,7 +5495,7 @@
         budget.lists -= 1;
         const below = node.floor;
         const target = { id: best.id, after: Math.max(0, below - LEGACY_DISPLAY_LIST - 1), below: below };
-        await loadChainKeys(turn, [target]);
+        await loadChainKeys(turn, [target], budget.reads);
         if (target.last === undefined) {
           more = true;
           done.add(best.id);
@@ -5260,7 +5509,7 @@
       }
     }
     if (round >= turns) more = true;
-    const objects = await readChainObjects(turn, chosen);
+    const objects = await readChainObjects(turn, chosen, budget.reads);
     const entries = [];
     for (const item of chosen) {
       const entry = legacyEntry(keys, item.id, item.seq, objects);
@@ -5276,15 +5525,19 @@
   }
 
   function emptyCache() {
-    return { v: 1, saved_ms: 0, entries: [], has_more: false, tally: emptyTally(), tops: {}, found: [], found_ms: 0 };
+    return {
+      v: 1, saved_ms: 0, listed_ms: 0, entries: [], has_more: false, tally: emptyTally(), tops: {}, found: [],
+      found_ms: 0,
+    };
   }
 
   function cacheAad(keys) {
     return encode(utf8(purpose("log-cache") + "\n" + userId() + "\n" + keys.keyId));
   }
 
-  /** The kept screen of this device and key: the entries of the first page it showed last, the
-   *  summary tally, and what it knows of the chains of format 1 and format 2. The value names
+  /** The kept screen of this device and key: the entries of the first page it showed last (and
+   *  the time the screen last read the listings of that page itself, listed_ms), the summary
+   *  tally, and what it knows of the chains of format 1 and format 2. The value names
    *  services and addresses, so the program store holds it sealed with a key derived from the
    *  master key (ChaCha20-Poly1305, a fresh nonce). A value of another key, or one that does not
    *  open, is no kept screen. */
@@ -5305,6 +5558,7 @@
     }
     if (kept === null || typeof kept !== "object" || kept.v !== 1) return cache;
     cache.saved_ms = whole(kept.saved_ms);
+    cache.listed_ms = whole(kept.listed_ms);
     cache.has_more = kept.has_more === true;
     for (const entry of Array.isArray(kept.entries) ? kept.entries : []) {
       if (entry !== null && typeof entry === "object" && typeof entry.id === "string" && Array.isArray(entry.items)) {
@@ -5516,61 +5770,155 @@
     saveRecovered(keys, kept);
   }
 
-  // ---- The later pages held back from the screen (log.denied) ----
+  // ---- The reads held back from the screen that the screen counts itself (log.denied) ----
   //
-  // A listing page of the screen is asked for by the time it begins below, and that time moves
-  // with every entry that arrives above it: a listing page the rounds kept answers the read that
-  // was held back and a read near it, and not every later one. So the later pages the operator
-  // domain holds back from the screen are counted by the reads of the screen themselves: a read
-  // of a later page that is held back, and that nothing the rounds kept answers, adds to the
-  // count, whatever the rounds read in between. The count ends when the screen itself reads a
-  // listing that begins at or below the time of the last such read, for at least as many events
-  // (the page that was held back, or a page below it, was then shown). The count marks the log
-  // as the count of the rounds held back does: LOG_BLOCKED_ROUNDS reads, the first of them
-  // LOG_BLOCKED_MS old.
+  // Two kinds of listings are read by the screen alone and cannot be kept for it in a form that
+  // answers every later read: a later page of the listings of format 3, which is asked for by
+  // the time it begins below (that time moves with every entry that arrives above it, so a
+  // listing page the rounds kept answers the read that was held back and a read near it, and
+  // not every later one), and the listing of a chain of format 1 or format 2, whose keys the
+  // device keeps for a runtime only. So what the operator domain holds back of these is counted
+  // by the reads of the screen themselves, whatever the rounds read in between:
+  //   a read of a later page that is held back, and that nothing the rounds kept answers, adds
+  //   to the count of the later pages. That count ends when the screen itself reads a listing
+  //   that begins at or below the time of the last such read, for at least as many events (the
+  //   page that was held back, or a page below it, was then shown);
+  //   a listing of a chain that is held back adds to the count of that chain. The screen lists
+  //   a chain from its end downward, each listing below the one before, so the listing that was
+  //   held back stands in the way of every listing below it. The count of a chain ends when the
+  //   screen itself reads a listing of that chain that begins at or below the lowest seq a
+  //   listing held back began after, and that either continues the keys the screen knows
+  //   downward or reaches the end of the chain (a listing that only looks for the end of a
+  //   chain ends no count).
+  // A count marks the log as the count of the rounds held back does: LOG_BLOCKED_ROUNDS reads,
+  // the first of them LOG_BLOCKED_MS old.
 
-  /** The later pages held back from the screen: {before_ms, limit, count, first_ms, last_ms}
-   *  (the time the page last held back begins below, the most events a page held back was asked
-   *  for, the reads held back in a row, the time of the first and of the last of them), or null
-   *  when there is none or the last one is older than the retention of the store. */
+  /** The counts of the reads held back from the screen: {page, chains}. page is {before_ms,
+   *  limit, count, first_ms, last_ms} (the time the later page last held back begins below, the
+   *  most events a page held back was asked for, the reads held back in a row, the time of the
+   *  first and of the last of them that was counted) or null; chains maps a node id to {after, count, first_ms,
+   *  last_ms} (the lowest seq a listing held back began after). A count whose last read is
+   *  older than the retention of the store is left out. */
   function loadDenied() {
     const kept = storedObject(STORE_DENIED);
     const now = native.nowMs();
-    if (whole(kept.count) === 0 || whole(kept.before_ms) === 0) return null;
-    if (now - whole(kept.last_ms) >= LOG_RETENTION_DAYS * DAY_MS) return null;
-    return {
-      before_ms: whole(kept.before_ms), limit: whole(kept.limit), count: whole(kept.count),
-      first_ms: Math.min(whole(kept.first_ms), now), last_ms: whole(kept.last_ms),
+    const live = function (value) {
+      return value !== null && typeof value === "object" && whole(value.count) > 0 &&
+        now - whole(value.last_ms) < LOG_RETENTION_DAYS * DAY_MS;
     };
+    const denied = { page: null, chains: Object.create(null) };
+    if (live(kept.page) && whole(kept.page.before_ms) > 0) {
+      denied.page = {
+        before_ms: whole(kept.page.before_ms), limit: whole(kept.page.limit), count: whole(kept.page.count),
+        first_ms: Math.min(whole(kept.page.first_ms), now), last_ms: whole(kept.page.last_ms),
+      };
+    }
+    const chains = kept.chains !== null && typeof kept.chains === "object" ? kept.chains : {};
+    for (const id of Object.keys(chains).slice(0, LOG_DENIED_CHAINS)) {
+      if (!NODE_ID.test(id) || !live(chains[id])) continue;
+      denied.chains[id] = {
+        after: whole(chains[id].after), count: whole(chains[id].count),
+        first_ms: Math.min(whole(chains[id].first_ms), now), last_ms: whole(chains[id].last_ms),
+      };
+    }
+    return denied;
   }
 
-  /** Counts a read of a later page of the screen that was held back. Returns the count. */
+  /** Writes the counts. Above LOG_DENIED_CHAINS chains, the chain whose last read held back is
+   *  the oldest leaves. No count: no value. */
+  function saveDenied(denied) {
+    const ids = Object.keys(denied.chains);
+    ids.sort(function (x, y) { return denied.chains[x].last_ms - denied.chains[y].last_ms; });
+    for (const id of ids.slice(0, Math.max(0, ids.length - LOG_DENIED_CHAINS))) delete denied.chains[id];
+    const empty = denied.page === null && Object.keys(denied.chains).length === 0;
+    storeJson(STORE_DENIED, empty ? null : denied);
+  }
+
+  /** Whether a count of reads held back ({count, first_ms}) marks the log at the time now. */
+  function heldLong(kept, now) {
+    return kept !== null && kept !== undefined && kept.count >= LOG_BLOCKED_ROUNDS &&
+      now - kept.first_ms >= LOG_BLOCKED_MS;
+  }
+
+  /** The time of the first read of the earliest count that marks the log at the time now (0:
+   *  no count marks it). */
+  function deniedSince(denied, now) {
+    let first = 0;
+    const counts = Object.keys(denied.chains).map(function (id) { return denied.chains[id]; });
+    if (denied.page !== null) counts.push(denied.page);
+    for (const kept of counts) {
+      if (heldLong(kept, now) && (first === 0 || kept.first_ms < first)) first = Math.max(1, kept.first_ms);
+    }
+    return first;
+  }
+
+  /** Whether a read held back at the time now adds to a count ({count, last_ms}): the first one
+   *  does, and a later one when the last read counted is LOG_ROUND_RETRY_MS old (the reads one
+   *  opening of the screen makes, and the ones it repeats at once, count once, as the rounds of
+   *  synchronizations that follow one another do). */
+  function countsAgain(kept, now) {
+    return kept.count === 0 || now < kept.last_ms || now - kept.last_ms >= LOG_ROUND_RETRY_MS;
+  }
+
+  /** Counts a read of a later page of the screen that was held back. Returns whether the count
+   *  marks the log now. */
   function denyPage(beforeMs, limit) {
     const now = native.nowMs();
-    let kept = loadDenied();
-    if (kept === null) kept = { before_ms: beforeMs, limit: limit, count: 0, first_ms: now, last_ms: now };
-    kept.count += 1;
+    const denied = loadDenied();
+    const kept = denied.page === null ? { before_ms: beforeMs, limit: limit, count: 0, first_ms: now, last_ms: now } : denied.page;
+    if (countsAgain(kept, now)) {
+      kept.count += 1;
+      kept.last_ms = now;
+    }
     kept.before_ms = beforeMs;
     kept.limit = Math.max(kept.limit, limit);
-    kept.last_ms = now;
-    storeJson(STORE_DENIED, kept);
-    return kept;
+    denied.page = kept;
+    saveDenied(denied);
+    return heldLong(kept, now);
   }
 
   /** Ends the count of the later pages held back when the screen read the listing of a later
    *  page itself that begins at or below the time of the last one held back, for as many events
    *  or more. Returns whether the count it ended marked the log. */
   function servePage(beforeMs, limit) {
-    const kept = loadDenied();
+    const denied = loadDenied();
+    const kept = denied.page;
     if (kept === null || beforeMs > kept.before_ms || limit < kept.limit) return false;
-    native.storeSet(STORE_DENIED, null);
+    denied.page = null;
+    saveDenied(denied);
     return heldLong(kept, native.nowMs());
   }
 
-  /** Whether a count of reads held back ({count, first_ms}) marks the log at the time now. */
-  function heldLong(kept, now) {
-    return kept !== null && kept.count >= LOG_BLOCKED_ROUNDS && now - kept.first_ms >= LOG_BLOCKED_MS;
+  /** Counts a listing of the chain of node id that was held back from the screen (after: the
+   *  seq the listing began after). Returns whether the count marks the log now. */
+  function denyChain(id, after) {
+    const now = native.nowMs();
+    const denied = loadDenied();
+    const kept = denied.chains[id] === undefined ? { after: after, count: 0, first_ms: now, last_ms: now } : denied.chains[id];
+    if (countsAgain(kept, now)) {
+      kept.count += 1;
+      kept.last_ms = now;
+    }
+    kept.after = Math.min(kept.after, after);
+    denied.chains[id] = kept;
+    saveDenied(denied);
+    return heldLong(kept, now);
   }
+
+  /** Ends the count of the chain of node id when the screen read a listing of that chain itself
+   *  (target: {after, below, probe, more}) that begins at or below the lowest seq a listing held
+   *  back began after, and that continues the keys the screen knows downward (below) or reaches
+   *  the end of the chain. Returns whether the count it ended marked the log. */
+  function serveChain(id, target) {
+    if (target.probe === true || (target.below === undefined && target.more === true)) return false;
+    const denied = loadDenied();
+    const kept = denied.chains[id];
+    if (kept === undefined || target.after > kept.after) return false;
+    delete denied.chains[id];
+    saveDenied(denied);
+    return heldLong(kept, native.nowMs());
+  }
+
   // ---- The summary of the last LOG_SUMMARY_DAYS days ----
 
   // The summary tally: what this device counted of the entries of the window, kept with the kept
@@ -5822,10 +6170,8 @@
           // the backend answered another request of this runtime around it), and the rounds
           // kept nothing that covers it.
           if (refused || (failure.kind === "silent" && await reachJudged(turn, started))) {
-            if (heldLong(denyPage(beforeMs, limit), native.nowMs())) {
-              // The count reached its mark: a round judges and publishes it now.
-              requestRound(freeTurn(), keys, "sync").then(noop, noop);
-            }
+            // When the count reaches its mark, a round judges and publishes it now.
+            if (denyPage(beforeMs, limit)) requestRound(freeTurn(), keys, "sync").then(noop, noop);
           }
         }
       }
@@ -5866,15 +6212,25 @@
       }
     }
     const floorMs = chosen.count >= limit && first.length > 0 ? first[first.length - 1].time_ms : 0;
+    // The chains of format 1 and format 2. A read of that bucket that is held back goes to the
+    // rounds, and the entries the rounds opened for the screen stand in.
+    const reads = chainReads(cache);
     let chains = { entries: [], more: false };
+    let failed = null;
+    useRecoveredChains(recovered);
     try {
-      chains = await chainPage(turn, keys, cache, beforeMs, limit, floorMs, { lists: LEGACY_SCREEN_LISTS });
+      chains = await chainPage(turn, keys, cache, beforeMs, limit, floorMs, { lists: LEGACY_SCREEN_LISTS, reads: reads });
     } catch (failure) {
       if (!isStoreFailure(failure) || !(turnLeft(turn) > 0)) throw failure;
-      if (failure.kind !== "absent" && first.length === 0) throw native.error("log_store_unreachable", "log screen");
+      failed = failure;
+    }
+    saveChainReads(keys, reads, false, false);
+    if (failed !== null && failed.kind !== "absent" && first.length === 0) {
+      throw native.error("log_store_unreachable", "log screen");
     }
     return mergePage(first, chains.entries, limit, chosen.more || chains.more);
   }
+
   /** The first page of the screen and the summary, read from the store: one round started by the
    *  screen (the first listing pages of the control and of the use prefix, the judgement, and the
    *  bodies of the entries of the page and of the summary in the same requests), then the entries
@@ -5923,6 +6279,7 @@
     let floorMs = 0;
     let truncated = false;
     if (plan !== null) {
+      cache.listed_ms = began;
       for (const parsed of plan.chosen.chosen) {
         const kept = keptById.get("3:" + parsed.tail);
         const entry = kept !== undefined ? kept : entryOf(parsed, false);
@@ -5968,7 +6325,7 @@
       // key goes to the rounds. Otherwise the entries of format 3 the device kept of the first
       // page stand in.
       const page = recoveredPage(recovered, Infinity, limit);
-      if (page !== null && page.t >= cache.saved_ms) {
+      if (page !== null && page.t >= cache.listed_ms) {
         const missing = new Set();
         for (const parsed of page.chosen) {
           const kept = recovered.entries.get("3:" + parsed.tail);
@@ -5991,13 +6348,36 @@
       truncated = true;
     }
     // The chains of format 1 and format 2: the node prefixes of the account once in
-    // LEGACY_FOUND_INTERVAL_MS, the entries of the page, and the entries of the window.
-    const budget = { lists: LEGACY_SCREEN_LISTS };
+    // LEGACY_FOUND_INTERVAL_MS, the entries of the page, and the entries of the window. A read
+    // of that bucket that is held back goes to the rounds (reads), and what the rounds read for
+    // the screen stands in: the entries they opened, and the node prefixes they listed.
+    const reads = chainReads(cache);
+    const budget = { lists: LEGACY_SCREEN_LISTS, reads: reads };
     let chains = { entries: [], more: false };
+    let nodesHeld = false;
+    let nodesRead = false;
+    useRecoveredChains(recovered);
     try {
       if (began - cache.found_ms >= LEGACY_FOUND_INTERVAL_MS || began < cache.found_ms) {
-        cache.found = await discoverLegacyNodes(turn);
-        cache.found_ms = began;
+        try {
+          cache.found = await discoverLegacyNodes(turn);
+          cache.found_ms = began;
+          nodesRead = true;
+        } catch (failure) {
+          if (!isStoreFailure(failure) || !(turnLeft(turn) > 0)) throw failure;
+          // A backend that states it has no such store is believed by a device that knows of no
+          // chain the store holds; for a device that knows of one, that answer holds the listing
+          // back.
+          const known = chainNodes(cache).some(reads.live);
+          if (failure.kind === "absent" && !known) throw failure;
+          if (failure.kind !== "unreachable") nodesHeld = true;
+          truncated = true;
+          if (recovered.found !== null && recovered.found.t >= cache.found_ms) {
+            for (const id of recovered.found.ids) {
+              if (cache.found.indexOf(id) < 0) cache.found.push(id);
+            }
+          }
+        }
       }
       chains = await chainPage(turn, keys, cache, Infinity, limit, floorMs, budget);
       if (await countChains(turn, keys, cache, tally, since, budget)) truncated = true;
@@ -6005,6 +6385,7 @@
       if (!isStoreFailure(failure) || !(turnLeft(turn) > 0)) throw failure;
       if (failure.kind !== "absent") truncated = true;
     }
+    saveChainReads(keys, reads, nodesHeld, nodesRead);
     timing.summary = Math.max(0, native.nowMs() - began);
     const page = mergePage(first, chains.entries, limit, more || chains.more);
     // What the device keeps: the entries of the page up to LOG_KEEP_EVENTS events, and the tally.
@@ -6065,7 +6446,7 @@
     }
     if (targets.length > 0) {
       budget.lists -= targets.length;
-      await loadChainKeys(turn, targets);
+      await loadChainKeys(turn, targets, budget.reads);
     }
     const plans = [];
     const wanted = [];
@@ -6113,7 +6494,7 @@
       for (const seq of plan.above.concat(plan.below)) wanted.push({ id: id, seq: seq });
     }
     if (wanted.length === 0) return uncounted;
-    const objects = await readChainObjects(turn, wanted);
+    const objects = await readChainObjects(turn, wanted, budget.reads);
     for (const plan of plans) {
       let range = countedRange(tally, plan.id);
       const count = function (seq) {
