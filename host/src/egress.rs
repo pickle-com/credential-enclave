@@ -13,6 +13,11 @@
 //! only to the addresses of its definitions, which are part of the measured binary, and log
 //! entries only to its log store.
 //!
+//! For a node of the reserve role the relay connects to port 443 of the host of the log store
+//! when the environment names one, and to nothing else: such a node uses no credential, so it
+//! calls no provider and no mail endpoint, and what it writes is its node document and the
+//! entries of the commands and transfers it takes.
+//!
 //! For a node of the forward role the relay connects to port 443 of any host, at a public
 //! IPv4 address only. Such a node sends the value of a vault secret to the site the record of
 //! the secret names, a host the account chose, so no list names it. What the relay keeps the
@@ -79,6 +84,9 @@ fn host_of(address: &str) -> Option<&str> {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Allowlist {
     hosts: BTreeSet<String>,
+    /// True when the relay also connects to the two fixed Naver mail endpoints: the list of a
+    /// node that calls providers.
+    mail: bool,
 }
 
 impl Allowlist {
@@ -123,7 +131,17 @@ impl Allowlist {
                 }
             }
         }
-        Ok(Allowlist { hosts })
+        Ok(Allowlist { hosts, mail: true })
+    }
+
+    /// The list of a node that calls no provider: no host of a definition and no mail
+    /// endpoint. With the host of the log store ([`Allowlist::with_log_store`]) it is the
+    /// list of a node of the reserve role.
+    pub fn without_providers() -> Allowlist {
+        Allowlist {
+            hosts: BTreeSet::new(),
+            mail: false,
+        }
     }
 
     /// The list with the host of the log store of the node added: the endpoint of Amazon S3 in
@@ -137,10 +155,11 @@ impl Allowlist {
     /// True when the relay connects to `host:port`.
     pub fn allows(&self, host: &str, port: u16) -> bool {
         (port == PROVIDER_PORT && self.hosts.contains(host))
-            || matches!(
-                (host, port),
-                ("imap.naver.com", 993) | ("smtp.naver.com", 465)
-            )
+            || (self.mail
+                && matches!(
+                    (host, port),
+                    ("imap.naver.com", 993) | ("smtp.naver.com", 465)
+                ))
     }
 
     /// The number of HTTP hosts, excluding the two fixed mail endpoints.
@@ -153,8 +172,10 @@ impl Allowlist {
 /// it, and it does not change while the host program runs.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Reach {
-    /// The relay of a node of the delegation role: port 443 of the hosts of the list, and the
-    /// two mail endpoints.
+    /// The relay of a node that holds delegations: port 443 of the hosts of the list. For a
+    /// node of the delegation role the list holds the provider hosts and the log store, and
+    /// the relay connects to the two mail endpoints as well. For a node of the reserve role
+    /// the list holds the log store alone.
     Listed(Allowlist),
     /// The relay of a node of the forward role: port 443 of any host, at a public IPv4
     /// address.
@@ -766,6 +787,39 @@ mod tests {
         assert!(!list.allows("s3.eu-west-1.amazonaws.com", 443));
         assert!(!list.allows("s3.amazonaws.com", 443));
         assert!(!list.allows(host, 80));
+    }
+
+    #[test]
+    fn the_list_of_a_node_of_the_reserve_role_holds_the_log_store_alone() {
+        let host = "s3.us-west-2.amazonaws.com";
+        let list = Allowlist::without_providers().with_log_store(host.to_string());
+        assert_eq!(list.len(), 1);
+        assert!(list.allows(host, 443));
+        assert!(!list.allows(host, 80));
+        // No host of a provider definition, no mail endpoint, and no bucket of the store by
+        // its own name.
+        let providers = allowlist();
+        for provider in &providers.hosts {
+            assert!(providers.allows(provider, 443), "{provider}");
+            assert!(!list.allows(provider, 443), "{provider}");
+        }
+        assert!(providers.allows("imap.naver.com", 993) && providers.allows("smtp.naver.com", 465));
+        assert!(!list.allows("imap.naver.com", 993));
+        assert!(!list.allows("smtp.naver.com", 465));
+        assert!(!list.allows(
+            "character-credential-log-dev-1.s3.us-west-2.amazonaws.com",
+            443
+        ));
+        let reach = Reach::Listed(list);
+        assert_eq!(reach.of(host, 443), Some(Addresses::Any));
+        assert_eq!(reach.of("oauth2.googleapis.com", 443), None);
+        assert_eq!(reach.of("example.com", 443), None);
+        // A pod of the reserve role without a log store in its environment: the relay
+        // connects to nothing.
+        let nothing = Allowlist::without_providers();
+        assert_eq!(nothing.len(), 0);
+        assert!(!nothing.allows(host, 443));
+        assert!(!nothing.allows("imap.naver.com", 993));
     }
 
     #[test]
