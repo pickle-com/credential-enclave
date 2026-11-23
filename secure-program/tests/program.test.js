@@ -219,6 +219,8 @@ function vectorFixture(target) {
   assert.equal(keys.keyId, log.key_id);
   world.account.keys = keys;
   world.account.key = { key_id: keys.keyId };
+  // (The backend serves the program of the tests.)
+  world.account.servedProgram = Number(/const VERSION = (\d+);/.exec(source)[1]);
   const bucket = bridge.shardBucket(world.serverTarget, world.userId);
   for (const entry of log.entries) world.putObject(bucket, entry.key, JSON.stringify(entry.entry));
   world.putObject(bridge.shardBucket(world.serverTarget, log.node), log.node_document.key, log.node_document.object_text);
@@ -319,12 +321,17 @@ test("the program answers the objects the vectors refuse as the reference does: 
   assert.equal(other.world.state.log.unverified_nodes, 0);
 
   // signature: the body its key names, and a signature that is not one of the node of the key.
-  // The node passed its document, so the object contradicts it (A2).
+  // The node passed its document, so the object contradicts it (A2) once the answers of two
+  // rounds carried it: the first leaves the round pending, and the entry is shown as not verified.
   const forged = vectorFixture("dev");
   const signature = byName("the_signature_of_another_node");
   assert.equal(signature.result, "signature");
   handOut(forged, signature.key, signature.entry);
   await S.start(forged);
+  const doubted = await S.call(forged, "read_log", { limit: 100 });
+  assert.equal(forged.world.state.log.unverified_nodes, 0);
+  assert.equal(forged.world.state.log.status, "pending");
+  assert.equal(shownGroups(doubted.value).filter((group) => group.verified !== true).length, 1);
   const marked = await S.call(forged, "read_log", { limit: 100 });
   assert.equal(forged.world.state.log.unverified_nodes, 1);
   assert.equal(forged.world.state.log.status, "attention");
@@ -856,28 +863,123 @@ test("a transfer between nodes of an earlier release is followed: the chain of t
   assert.equal(followed[third.id].seq, 1);
 });
 
-test("A2: a body its key names without a signature of the accepted node of that key, and two bodies an accepted node signed for one seq", async () => {
-  const forged = S.fixture(source, { device: { securityStatus: true } });
-  await S.start(forged);
-  forged.nodes[0].record("c", [{ t: "connection_removed", time_ms: forged.world.now, record_id: "r", provider: "slack", provider_revoke: false }], {
-    signSeed: crypto.randomBytes(32),
-  });
-  await nextDay(forged);
-  assert.equal(forged.world.state.log.status, "attention");
-  assert.equal(forged.world.state.log.unverified_nodes, 1);
-  assert.deepEqual(forged.world.securityStatuses.slice(-1)[0].reasons, ["conflicting_signatures"]);
-  // The mark stays with the node: a round that reads nothing new keeps it.
-  await nextDay(forged);
-  assert.equal(forged.world.state.log.status, "attention");
+test("A2: the signatures of an accepted node contradict each other when the answers of two rounds carried no signature that verifies for a body its key names, and until an answer carries one that does: one such answer leaves the round pending, an object that carries no signature of its node marks the log for good, and two bodies a node signed for one seq mark it at once", async () => {
+  // Has the route of the bodies hand out another signature with the body of key, in the next
+  // answers that name it (times of them).
+  const otherSignature = (fx, key, times) => fx.world.fault("POST /api/secure/log/bodies", (request) => {
+    if (JSON.parse(request.body).keys.indexOf(key) < 0) return undefined;
+    const answer = JSON.parse(fx.world.api("POST", "/api/secure/log/bodies", null, request.body).body);
+    for (const entry of answer.entries) {
+      if (entry.key === key) entry.sig = b64u(crypto.randomBytes(64));
+    }
+    return { status: 200, body: answer };
+  }, times);
+  const removed = (world) => [{ t: "connection_removed", time_ms: world.now, record_id: "r", provider: "slack", provider_revoke: false }];
+  // A synchronization two minutes later: its round reads the keys the one before left.
+  const again = async (fx) => {
+    fx.world.advance(2 * 60000);
+    await S.event(fx, "foreground");
+  };
 
-  const twice = S.fixture(source);
+  // One answer with another signature, and the right one after it: the round of that answer is
+  // pending, the next one verifies, and nothing was told or reported but ok and pending.
+  const once = S.fixture(source, { device: { securityStatus: true } });
+  await S.start(once);
+  const entry = once.nodes[0].record("c", removed(once.world));
+  otherSignature(once, entry.key, 1);
+  await nextDay(once);
+  assert.equal(once.world.state.log.status, "pending");
+  assert.equal(once.world.state.log.unverified_nodes, 0);
+  assert.deepEqual(Object.keys(once.world.stored("log.doubted")), [entry.key]);
+  assert.deepEqual(heldReads(once.world).keys, [entry.key]);
+  await again(once);
+  assert.equal(once.world.state.log.status, "verified");
+  assert.equal(once.world.stored("log.doubted"), undefined);
+  assert.equal(heldReads(once.world), undefined);
+  assert.ok(once.world.securityStatuses.every((told) => told.status !== "attention"));
+  assert.ok(once.world.reports.every((report) => report.status !== "attention"));
+
+  // The answers of two rounds: the log is marked. The right signature then takes the mark back.
+  const twice = S.fixture(source, { device: { securityStatus: true } });
   await S.start(twice);
-  const event = (provider) => [{ t: "connection_created", time_ms: twice.world.now, record_id: "r", provider: provider, scope: "" }];
-  twice.nodes[0].record("c", event("slack"), { seq: 7 });
-  twice.nodes[0].record("c", event("notion"), { seq: 7 });
+  const doubted = twice.nodes[0].record("c", removed(twice.world));
+  otherSignature(twice, doubted.key, 2);
   await nextDay(twice);
+  assert.equal(twice.world.state.log.status, "pending");
+  await again(twice);
   assert.equal(twice.world.state.log.status, "attention");
   assert.equal(twice.world.state.log.unverified_nodes, 1);
+  assert.deepEqual(twice.world.securityStatuses.slice(-1)[0].reasons, ["conflicting_signatures"]);
+  await again(twice);
+  assert.equal(twice.world.state.log.status, "verified");
+  assert.equal(twice.world.state.log.unverified_nodes, 0);
+  assert.equal(twice.world.securityStatuses.slice(-1)[0].status, "ok");
+  assert.equal(twice.world.stored("log.doubted"), undefined);
+
+  // An object that carries no signature of its node: every answer hands out what the store
+  // holds. The second round marks the log, and the mark stays.
+  const forged = S.fixture(source, { device: { securityStatus: true } });
+  await S.start(forged);
+  forged.nodes[0].record("c", removed(forged.world), { signSeed: crypto.randomBytes(32) });
+  await nextDay(forged);
+  assert.equal(forged.world.state.log.status, "pending");
+  const states = [];
+  for (let day = 0; day < 4; day += 1) {
+    await nextDay(forged);
+    states.push(forged.world.state.log.status + ":" + forged.world.state.log.unverified_nodes);
+  }
+  assert.deepEqual(states, ["attention:1", "attention:1", "attention:1", "attention:1"]);
+  assert.deepEqual(forged.world.securityStatuses.slice(-1)[0].reasons, ["conflicting_signatures"]);
+
+  // A backend that hands the body of such a key out no more holds the read back: the key is the
+  // first the rounds ask for, and each round it is kept from is counted (A3).
+  const hidden = S.fixture(source, { device: { securityStatus: true } });
+  await S.start(hidden);
+  const kept = hidden.nodes[0].record("c", removed(hidden.world), { signSeed: crypto.randomBytes(32) });
+  await nextDay(hidden);
+  assert.equal(hidden.world.state.log.status, "pending");
+  hidden.world.fault("POST /api/secure/log/bodies", (request) => {
+    if (JSON.parse(request.body).keys.indexOf(kept.key) < 0) return undefined;
+    const answer = JSON.parse(hidden.world.api("POST", "/api/secure/log/bodies", null, request.body).body);
+    return {
+      status: 200,
+      body: { entries: answer.entries.filter((item) => item.key !== kept.key), missing: answer.missing.concat([kept.key]) },
+    };
+  });
+  const counted = [];
+  for (let day = 0; day < 4; day += 1) {
+    await nextDay(hidden);
+    counted.push(hidden.world.state.log.status + ":" + hidden.world.state.log.store + ":" + hidden.world.stored("log.blocked").count);
+  }
+  assert.deepEqual(counted, ["pending:blocked:1", "pending:blocked:2", "pending:blocked:3", "attention:blocked:4"]);
+  assert.deepEqual(hidden.world.securityStatuses.slice(-1)[0].reasons, ["verification_blocked"]);
+
+  // An entry of a node of no accepted measurement whose signature an answer did not carry marks
+  // nothing for its signature. It is shown as not verified in that answer and is not kept with
+  // the first page: the next read of the screen asks for it again and shows what the node wrote.
+  const outside = S.fixture(source);
+  await S.start(outside);
+  const later = outside.world.addNode({ release: "v9.0.0", measurement: bridge.randomMeasurement(), offered: false });
+  outside.world.advance(1000);
+  const used = later.record("u", [S.providerRequest(outside.world.now, "/gmail/v1/users/me/messages/1", "POST")]);
+  otherSignature(outside, used.key, 1);
+  const kinds = (result) => shownGroups(result.value).map((group) => group.kind);
+  assert.equal(kinds(await S.call(outside, "read_log", { limit: 10 })).indexOf("request"), -1);
+  assert.ok(kinds(await S.call(outside, "read_log", { limit: 10 })).indexOf("request") >= 0);
+  assert.equal(outside.world.state.log.unverified_nodes, 0);
+
+  // Two bodies a node signed for one seq: no answer can make that up, and the log is marked at
+  // once and for good.
+  const two = S.fixture(source);
+  await S.start(two);
+  const event = (provider) => [{ t: "connection_created", time_ms: two.world.now, record_id: "r", provider: provider, scope: "" }];
+  two.nodes[0].record("c", event("slack"), { seq: 7 });
+  two.nodes[0].record("c", event("notion"), { seq: 7 });
+  await nextDay(two);
+  assert.equal(two.world.state.log.status, "attention");
+  assert.equal(two.world.state.log.unverified_nodes, 1);
+  await nextDay(two);
+  assert.equal(two.world.state.log.status, "attention");
 });
 
 test("A3: reads the backend holds back mark the log after three days and three rounds, and one round that reads the store clears the count", async () => {
@@ -1323,7 +1425,7 @@ test("a read that ends because the app was suspended counts nothing: a round who
   assert.equal(world.stored("log.denied").pages.length, 1);
 });
 
-test("A1: a measurement that held the key marks the log at the next event of the app once the device first saw it a day ago, whatever the backend answers after that", async () => {
+test("A1: a measurement that held the key marks the log at an event of the app once the device first saw it a day ago and this runtime read within the hour that no later program is served, whatever the reads of the log answer: a runtime states nothing before it has read what is served", async () => {
   // Sends an event to the runtime and lets what needs no answer go on.
   const unanswered = (fx, name) => {
     Promise.resolve(fx.program.onEvent(name, {})).then(() => {}, () => {});
@@ -1343,17 +1445,27 @@ test("A1: a measurement that held the key marks the log at the next event of the
     assert.equal(world.state.log.status, "pending", name);
     assert.equal(world.state.log.newer_release_nodes, 1, name);
     const reports = world.reports.length;
-    // From here on no request of the device is answered. Within the day the log stays pending.
-    world.fault(() => true, "hang");
+    // From here on no read of the log is answered. Within the day the log stays pending.
+    world.fault((line) => line.indexOf("/api/secure/log/") >= 0, "hang");
     world.advance(HOUR_MS);
     if (name === "session_ready") S.load(fx);
     await unanswered(fx, name);
     assert.equal(world.state.log.status, "pending", name);
-    // A day after the device first saw the measurement, the event itself marks the log: no
-    // request was answered and no round ended (a new runtime judges from what the device kept).
+    // (The round that waits for its answers ends when its time has passed.)
+    await world.settle(3 * 60000);
+    assert.equal(world.state.log.status, "pending", name);
+    // A day after the device first saw the measurement. What this runtime read of the served
+    // program is a day old (a new runtime has read nothing): the event states nothing. The
+    // synchronization of that event reads that no later program is served.
     world.advance(25 * HOUR_MS);
     if (name === "session_ready") S.load(fx);
-    await unanswered(fx, name);
+    await unanswered(fx, name === "background" ? "foreground" : name);
+    assert.equal(world.state.log.status, "pending", name);
+    assert.ok(world.securityStatuses.every((told) => told.status !== "attention"), name);
+    // The next event, seconds later, marks the log itself: no read of the log was answered, and
+    // no round ended.
+    world.advance(5000);
+    await unanswered(fx, name === "session_ready" ? "foreground" : name);
     assert.equal(world.state.log.status, "attention", name);
     assert.equal(world.state.log.unknown_nodes, 1, name);
     const told = world.securityStatuses.slice(-1)[0];
@@ -1402,6 +1514,14 @@ test("a receiving node whose document this device has not seen waits for it: no 
   assert.deepEqual(world.stored("log.legacy").waiting, {});
   assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
   assert.ok(world.securityStatuses.every((told) => told.status !== "attention"));
+  // A transfer to a node id of which neither the backend nor the store holds a document: the
+  // request for its document is answered without one, and the round is one held back.
+  const ghost = b64u(crypto.randomBytes(32));
+  fx.nodes[0].record("c", [{ t: "grant_transferred_out", time_ms: world.now, to: ghost, release: "v2.4.0" }]);
+  await nextDay(fx);
+  assert.equal(world.state.log.status + ":" + world.state.log.store + ":" + world.state.log.store_failure, "pending:blocked:receiver:missing");
+  assert.equal(world.stored("log.blocked").count, 1);
+  assert.deepEqual(Object.keys(world.stored("log.legacy").waiting), [ghost]);
 });
 
 test("a round ends its reading when the app goes to the background: it sends nothing more, judges what it read within that event, and leaves the keys it listed and did not judge to the next round, which asks for them before its listing", async () => {
@@ -1470,9 +1590,14 @@ test("a round ends its reading when the app goes to the background: it sends not
   assert.equal(world.state.log.newer_release_nodes, 1);
   assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
   assert.ok(world.securityStatuses.every((told) => told.status !== "attention"));
-  // A day later the next event of the app marks the log, however slowly the backend answers.
+  // A day later. The synchronization of the next event reads that no later program is served,
+  // and when the app leaves, the round that still waits for its answers judges: the
+  // measurement marks the log, however slowly the backend answers.
   world.advance(25 * HOUR_MS);
   Promise.resolve(fx.program.onEvent("foreground", {})).then(() => {}, () => {});
+  await world.settle(1000);
+  assert.equal(world.state.log.status, "pending");
+  fx.program.onEvent("background", {});
   await world.drain();
   assert.equal(world.state.log.status, "attention");
   assert.deepEqual(world.securityStatuses.slice(-1)[0].reasons, ["unlisted_release"]);
@@ -1647,12 +1772,19 @@ test("A4: an entry this device verified that left the listing within its retenti
   const world = fx.world;
   const seen = fx.nodes[0].chains.get(world.userId)[0].key;
   assert.equal(world.stored("log.sample").length, 1);
+  const object = world.entries3.get(seen);
   world.entries3.delete(seen);
   const before = world.sent("POST /api/secure/log/read").length;
   await nextDay(fx);
   assert.equal(world.sent("POST /api/secure/log/read").length, before + 2);
   assert.equal(world.state.log.status, "attention");
   assert.equal(world.state.log.missing, 1);
+  // The listing names the key again: the mark is taken back.
+  world.entries3.set(seen, object);
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(world.state.log.missing, 0);
+  assert.deepEqual(world.stored("log.missing"), []);
   // An entry older than the retention of the store is expected by nobody.
   const aged = S.fixture(source);
   await S.start(aged);
@@ -2804,9 +2936,13 @@ test("that the store holds no document of a node id is judged for the keys liste
   const shown = await S.call(fx, "read_log", { limit: 50 });
   const groups = shownGroups(shown.value);
   assert.deepEqual(groups.filter((group) => group.verified === true).map((group) => group.kind), ["request", "connected", "grant_renewed"]);
-  // The object that was there before the document is one the node did not sign: under a node
-  // that passed attestation, it contradicts the node (A2).
+  // The object that was there before the document is one the node did not sign: it is shown as
+  // not verified, and under a node that passed attestation it contradicts the node (A2) once
+  // two rounds read it so.
   assert.equal(groups.filter((group) => group.verified !== true).length, 1);
+  assert.equal(world.state.log.unverified_nodes, 0);
+  const again = await S.call(fx, "read_log", { limit: 50 });
+  assert.equal(shownGroups(again.value).filter((group) => group.verified !== true).length, 1);
   assert.equal(world.state.log.unverified_nodes, 1);
   assert.equal(world.state.log.status, "attention");
 });
@@ -3654,6 +3790,12 @@ test("the log screen shows the entries a node wrote into its chain of format 2 w
       // the node prefixes of the account.
       const node = followed ? fx.legacy[0] : world.addNode({ release: fx.latest.release, measurement: fx.latest, offered: false });
       await S.start(fx);
+      // Sixty entries of the node of format 3, and after them five entries of the chain: the
+      // first page of the screen is full, and the entries of the chain are the latest on it.
+      for (let i = 0; i < 60; i += 1) {
+        world.advance(60000);
+        fx.nodes[0].record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/messages/n" + i, "GET")]);
+      }
       const used = [];
       for (let i = 0; i < 5; i += 1) {
         world.advance(HOUR_MS);
@@ -3661,6 +3803,9 @@ test("the log screen shows the entries a node wrote into its chain of format 2 w
       }
       const chain = used[0].key.slice(0, used[0].key.lastIndexOf("/") + 1);
       const end = used[4].seq;
+      // The request events of the chain a result of read_log shows.
+      const ofChain = (result) => shownGroups(result.value).filter((group) => group.kind === "request")
+        .reduce((sum, group) => sum + group.requests.filter((row) => /\/messages\/\d+$/.test(row.target)).length, 0);
       // Objects someone else wrote above the end of the chain, each under a seq of its own, with
       // keys that name the first millisecond: one far beyond the end, or twelve on top of it.
       if (where === "far") strayObject(fx, chain, end + 100000, 1, "u");
@@ -3668,7 +3813,8 @@ test("the log screen shows the entries a node wrote into its chain of format 2 w
       await nextDay(fx);
       assert.equal(world.stored("log.legacy").nodes[node.id] !== undefined, followed, label);
       const first = await S.call(fx, "read_log", { limit: 50 });
-      assert.equal(shownRequests(first), 5, label);
+      assert.equal(ofChain(first), 5, label);
+      assert.equal(first.value.has_more, true, label);
       assert.equal(first.value.status, "verified", label);
       assert.equal(world.stored("log.denied"), undefined, label);
       assert.equal(heldReads(world), undefined, label);
@@ -3678,12 +3824,12 @@ test("the log screen shows the entries a node wrote into its chain of format 2 w
       world.advance(HOUR_MS);
       node.record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/messages/5", "POST")]);
       const second = await S.call(fx, "read_log", { limit: 50 });
-      assert.equal(shownRequests(second), 6, label);
+      assert.equal(ofChain(second), 6, label);
       assert.equal(world.stored("log.denied"), undefined, label);
       // The summary counts the entries of the node as well: a key above them that names a time
       // before the window does not end the count.
       const summary = second.value.summary;
-      assert.equal(summary.reads + summary.sends + summary.changes, 6, label);
+      assert.equal(summary.reads + summary.sends + summary.changes, 66, label);
       assert.equal(summary.truncated, false, label);
     }
   }
@@ -3966,6 +4112,638 @@ test("the chain of a node of an earlier release is closed once its grant ran out
   assert.equal(world.state.log.status, "verified");
 });
 
+test("a node the backend lists for its revokes alone is handed no grant and asked for no attestation, changes nothing of the state of the grants, and takes the revoke when the user turns the delegation off or shortens the lifetime of a grant", async () => {
+  const fx = S.fixture(source, { nodes: 1, legacy: 1 });
+  const world = fx.world;
+  const guard = fx.legacy[0];
+  // A node of an earlier release outside the nodes that serve calls. Another device of the
+  // account handed it a grant, and the backend lists it for this account as revoke_only.
+  const hand = () => guard.grants.set(world.userId, {
+    sign_pk: b64u(fx.keys.signPk), log_pk: b64u(fx.keys.logPk), key_id: fx.keys.keyId, custody: "enclave",
+    not_after_ms: world.now + 20 * DAY_MS,
+  });
+  guard.revokeOnly = true;
+  hand();
+  const attested = () => world.sent("GET /api/secure/nodes")
+    .filter((request) => request.query.nodes === undefined || String(request.query.nodes).split(",").indexOf(guard.id) >= 0).length;
+  await S.start(fx);
+  assert.equal(world.state.grant.state, "active");
+  assert.deepEqual(guard.commands, []);
+  assert.equal(attested(), 0);
+  assert.equal(fx.nodes[0].commands.filter((command) => command.type === "grant").length, 1);
+  // The grants are renewed over the weeks, and a push says that a grant is required: nothing
+  // goes to that node, and the ledger of the earlier programs does not name it.
+  for (let week = 0; week < 6; week += 1) {
+    world.advance(7 * DAY_MS);
+    await S.event(fx, "push", { reason: "grant_required" });
+    assert.equal(world.state.grant.state, "active", "week " + week);
+  }
+  assert.deepEqual(guard.commands, []);
+  assert.equal(attested(), 0);
+  assert.equal(JSON.stringify(readLedger(fx)).indexOf(guard.id), -1);
+  assert.equal(world.stored("log.grants")[guard.id], undefined);
+  assert.ok(fx.nodes[0].commands.filter((command) => command.type === "grant").length >= 3);
+  // The user shortens the lifetime: the grant that node holds is of the lifetime before, and
+  // the revoke goes to it (with the attestation a revoke needs). The other node takes a grant of
+  // the new lifetime.
+  const shorter = await S.call(fx, "set_grant_days", { days: 7 });
+  assert.equal(shorter.value.days, 7);
+  assert.deepEqual(guard.commands.map((command) => command.type), ["revoke"]);
+  assert.equal(guard.grants.has(world.userId), false);
+  assert.equal(attested(), 1);
+  assert.equal(world.state.grant.state, "active");
+  // The other device hands that node its grant again. A longer lifetime sends that node nothing.
+  hand();
+  assert.equal((await S.call(fx, "set_grant_days", { days: 14 })).value.days, 14);
+  assert.deepEqual(guard.commands.map((command) => command.type), ["revoke"]);
+  assert.equal(attested(), 1);
+  // A revoke that node does not confirm leaves the lifetime as it was: grant_incomplete.
+  world.fault("POST /api/secure/nodes/" + guard.id + "/messages", { status: 503, body: {} }, 1);
+  assert.deepEqual(await S.call(fx, "set_grant_days", { days: 3 }), { ok: false, code: "grant_incomplete" });
+  assert.equal(world.state.grant_days, 14);
+  assert.equal(guard.grants.has(world.userId), true);
+  // The user turns the delegation off: the revoke goes to every listed node, that one among
+  // them. Turned on again, the node of the pool takes a grant and that node takes nothing.
+  const before = guard.commands.length;
+  assert.equal((await S.call(fx, "set_delegation", { enabled: false })).ok, true);
+  assert.deepEqual(guard.commands.slice(before).map((command) => command.type), ["revoke"]);
+  assert.equal(guard.grants.has(world.userId), false);
+  assert.equal(fx.nodes[0].grants.has(world.userId), false);
+  const revoked = guard.commands.length;
+  assert.equal((await S.call(fx, "set_delegation", { enabled: true })).ok, true);
+  assert.equal(guard.commands.length, revoked);
+  assert.equal(fx.nodes[0].grants.has(world.userId), true);
+  assert.equal(world.state.grant.state, "active");
+});
+
+// ---- The program the backend serves, and a runtime behind it ----
+
+/** What the program store holds of the values the rounds judge by, as stored: every value under
+ *  log. but the grants this device handed out (log.grants) and the kept screen (log.cache). */
+function judgedStores(world) {
+  const kept = {};
+  for (const key of Array.from(world.store.keys()).sort()) {
+    if (key.startsWith("log.") && key !== "log.grants" && key !== "log.cache") kept[key] = world.store.get(key);
+  }
+  return kept;
+}
+
+/** Has a node of a measurement no list of the program has take the key of the account over from
+ *  the node of the fixture, and write an entry. Returns the measurement. */
+function moveKeyToUnlisted(fx) {
+  const world = fx.world;
+  const other = bridge.randomMeasurement();
+  const receiver = world.addNode({ release: "v9.0.0", measurement: other, offered: false });
+  fx.nodes[0].record("c", [{
+    t: "grant_transferred_out", time_ms: world.now, to: receiver.id, release: "v9.0.0",
+    pcr0: other.pcr0, pcr1: other.pcr1, pcr2: other.pcr2,
+  }]);
+  world.advance(1000);
+  receiver.record("c", [{ t: "connection_created", time_ms: world.now, record_id: "r9", provider: "slack", scope: "" }]);
+  return other;
+}
+
+test("a runtime that knows a later program is served judges nothing: a node of a release this program does not list that holds the key of the account marks nothing while the backend names a later version, over days and runtimes, nothing the rounds judge by is written, and the runtime reports once that it is stale", async () => {
+  const fx = S.fixture(source, { nodes: 1, legacy: 1, device: { securityStatus: true } });
+  await S.start(fx);
+  const world = fx.world;
+  for (let i = 0; i < 6; i += 1) {
+    world.advance(HOUR_MS);
+    fx.nodes[0].record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/messages/n" + i, "POST")]);
+    fx.legacy[0].record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/messages/l" + i, "GET")]);
+  }
+  // The next release is put out: a node of a measurement no list of this program has takes the
+  // key of the account over and writes an entry. This runtime read that its own program is the
+  // one served, so its round sees the measurement, and the log is pending for a day.
+  const other = moveKeyToUnlisted(fx);
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "pending");
+  assert.equal(world.state.log.newer_release_nodes, 1);
+  assert.equal(Object.values(world.stored("log.unaccepted"))[0].held, true);
+  // From here on the backend serves the next program, and lists a node of the new release.
+  world.account.servedProgram = fx.version + 1;
+  const listed = world.addNode({ release: "v9.0.0", measurement: other });
+  const kept = judgedStores(world);
+  const state = JSON.stringify(world.state.log);
+  const reports = world.reports.length;
+  const told = world.securityStatuses.length;
+  const refused = { status: 503, body: { detail: "log_store_unreachable" } };
+  const attested = () => world.sent("GET /api/secure/nodes")
+    .filter((request) => String(request.query.nodes || "").split(",").indexOf(listed.id) >= 0).length;
+  let runtimes = 0;
+  const unchanged = (label) => {
+    assert.equal(JSON.stringify(world.state.log), state, label);
+    assert.deepEqual(judgedStores(world), kept, label);
+    assert.equal(world.securityStatuses.length, told, label);
+    const sent = world.reports.slice(reports);
+    assert.equal(sent.length, runtimes, label);
+    assert.ok(sent.every((report) => report.status === "pending" && report.store_failure === "program:stale" &&
+      report.program_version === fx.version), label);
+  };
+  for (let day = 0; day < 5; day += 1) {
+    // A new runtime, more than a day after the device first saw the measurement: the event
+    // session_ready states nothing of what the device kept, and its synchronization learns that
+    // the runtime is stale.
+    world.advance(25 * HOUR_MS);
+    const before = attested();
+    const listings = world.sent("POST /api/secure/log/read").length;
+    await S.start(fx);
+    runtimes += 1;
+    // The events of the app, a synchronization the user asks for, and the screen with reads
+    // held back from it: its first page, a later page, a listing of a chain.
+    await S.event(fx, "foreground");
+    await S.event(fx, "push", { reason: "unknown" });
+    // (No round started: no listing was asked for.)
+    assert.equal(world.sent("POST /api/secure/log/read").length, listings, "day " + day);
+    // The screen goes on reading the store: an entry a node wrote now is on its first page.
+    fx.nodes[0].record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/messages/s" + day, "POST")]);
+    const fresh = await S.call(fx, "read_log", { limit: 3 });
+    assert.equal(shownGroups(fresh.value).filter((group) => group.kind === "request")[0].requests[0].target.slice(-2), "s" + day);
+    world.fault("POST /api/secure/log/bodies", refused, 1);
+    const first = await S.call(fx, "read_log", { limit: 3 });
+    assert.equal(first.ok, true, "day " + day);
+    assert.equal(first.value.status, "pending", "day " + day);
+    world.fault("POST /api/secure/log/read", refused, 1);
+    await S.call(fx, "read_security_record", { limit: 3, before_ms: world.now - HOUR_MS });
+    world.fault("POST /api/secure/log/store/listings", refused, 1);
+    await S.call(fx, "read_log", { limit: 3 });
+    await S.call(fx, "sync", {});
+    await S.event(fx, "background");
+    await world.settle(1000);
+    unchanged("day " + day);
+    // The node of the new release was asked for its attestation once in the runtime, and
+    // holds no grant.
+    assert.equal(attested(), before + 1, "day " + day);
+    assert.equal(listed.grants.has(world.userId), false, "day " + day);
+    world.clearFaults();
+  }
+  // A runtime whose screen starts a round before the runtime has read what is served: the round
+  // reads, the synchronization learns that the runtime is stale, and the round judges nothing
+  // and writes nothing of what it read.
+  world.advance(25 * HOUR_MS);
+  S.load(fx);
+  const early = fx.program.procedures.read_log({ limit: 3 });
+  await world.run(fx.program.onEvent("session_ready", {}));
+  await world.run(early);
+  await world.settle(1000);
+  runtimes += 1;
+  unchanged("a round in flight");
+  // The backend names this program as the one it serves again: the round of the next
+  // synchronization judges, and the measurement, long past its day, marks the log.
+  world.account.servedProgram = fx.version;
+  world.advance(2 * 60000);
+  await S.event(fx, "foreground");
+  assert.equal(world.state.log.status, "attention");
+  assert.deepEqual(world.securityStatuses.slice(-1)[0].reasons, ["unlisted_release"]);
+  assert.equal(world.reports.slice(-1)[0].status, "attention");
+  // A round the screen starts two hours later, with no synchronization in between: what the
+  // runtime read of the served program is older than an hour, so the round asks for the account
+  // once before it judges, and the mark stays.
+  world.advance(2 * HOUR_MS);
+  const asked = world.sent("GET /api/secure/account").length;
+  const shown = await S.call(fx, "read_log", { limit: 3 });
+  assert.equal(shown.value.status, "attention");
+  assert.equal(world.state.log.status, "attention");
+  assert.equal(world.sent("GET /api/secure/account").length, asked + 1);
+});
+
+test("a backend that names no served program leaves a measurement no list has pending: nothing marks the log for it and no round counts as held back, and the rounds judge everything else as before", async () => {
+  for (const served of [null, "44", 44.5]) {
+    const label = String(served);
+    const fx = S.fixture(source, { served: served, device: { securityStatus: true } });
+    await S.start(fx);
+    const world = fx.world;
+    assert.equal(world.state.log.status, "verified", label);
+    moveKeyToUnlisted(fx);
+    const states = [];
+    for (let day = 0; day < 5; day += 1) {
+      const judged = judgedKeys(world);
+      world.advance(HOUR_MS);
+      fx.nodes[0].record("c", [{ t: "connection_created", time_ms: world.now, record_id: "d" + day, provider: "slack", scope: "" }]);
+      await nextDay(fx);
+      states.push(world.state.log.status + ":" + world.state.log.newer_release_nodes + ":" + world.state.log.unknown_nodes + ":" +
+        world.stored("log.blocked").count);
+      assert.ok(judgedKeys(world) > judged, label);
+    }
+    assert.deepEqual(states, ["pending:1:0:0", "pending:1:0:0", "pending:1:0:0", "pending:1:0:0", "pending:1:0:0"], label);
+    assert.ok(world.securityStatuses.every((told) => told.status !== "attention"), label);
+    assert.ok(world.reports.every((report) => report.status !== "attention" && report.store_failure !== "program:stale"), label);
+  }
+});
+
+test("a build that knows the delivery of the program itself judges by what the app verified: the word of the backend counts until the check of the app that follows it has ended, a measurement no list has marks the log once such a check ended after the device first saw it, and checks that fail on the side of the server are rounds held back", async () => {
+  const build = async (served) => {
+    const delivery = { verified: 0, settled_ms: 0, failed_ms: 0, failed_status: 0 };
+    const fx = S.fixture(source, { device: { securityStatus: true, delivery: delivery } });
+    delivery.verified = fx.version;
+    fx.world.account.servedProgram = served === "later" ? fx.version + 1 : fx.version;
+    await S.start(fx);
+    return { fx: fx, world: fx.world, delivery: delivery };
+  };
+  const stale = (world) => world.reports.filter((report) => report.store_failure === "program:stale").length;
+
+  // The backend names a later version from the start, and goes on naming it.
+  const lied = await build("later");
+  // The runtime began before a check of the app had ended: the word of the backend counts, and
+  // no round runs.
+  assert.equal(lied.world.reports.length, 1);
+  assert.equal(stale(lied.world), 1);
+  // The check of the app ends, with no later program. The word of the backend counts no more,
+  // however often it is said again: the round of the next synchronization runs.
+  lied.delivery.settled_ms = lied.world.now;
+  lied.world.advance(2 * 60000);
+  await S.event(lied.fx, "foreground");
+  assert.equal(lied.world.state.log.status, "verified");
+  moveKeyToUnlisted(lied.fx);
+  await nextDay(lied.fx);
+  assert.equal(lied.world.state.log.status, "pending");
+  assert.equal(lied.world.state.log.newer_release_nodes, 1);
+  // A day later, in a new runtime. The check the app made as it began ended with no later
+  // program, after the device first saw the measurement: the log is marked, by the event
+  // session_ready itself and by the round, whatever the backend names.
+  lied.world.advance(25 * HOUR_MS);
+  lied.delivery.settled_ms = lied.world.now;
+  lied.world.advance(30000);
+  S.load(lied.fx);
+  Promise.resolve(lied.fx.program.onEvent("session_ready", {})).then(() => {}, () => {});
+  assert.equal(lied.world.state.log.status, "attention");
+  await lied.world.settle(1000);
+  assert.equal(lied.world.state.log.status, "attention");
+  assert.deepEqual(lied.world.securityStatuses.slice(-1)[0].reasons, ["unlisted_release"]);
+  assert.equal(lied.world.reports.slice(-1)[0].status, "attention");
+  assert.equal(stale(lied.world), 1);
+
+  // The same backend, and the checks of the app fail on the side of the server from the day the
+  // key moved: the word of the backend does not keep the runtime from its rounds, and once the
+  // measurement is past its day, each round that cannot judge it is a round held back.
+  const held = await build("later");
+  held.delivery.settled_ms = held.world.now;
+  moveKeyToUnlisted(held.fx);
+  const states = [];
+  for (let day = 0; day < 5; day += 1) {
+    held.world.advance(25 * HOUR_MS);
+    held.delivery.failed_ms = held.world.now;
+    held.delivery.failed_status = 503;
+    await S.start(held.fx);
+    states.push(held.world.state.log.status + ":" + held.world.stored("log.blocked").count + ":" + held.world.state.log.store_failure);
+  }
+  assert.deepEqual(states, [
+    "pending:0:", "pending:1:delivery:503", "pending:2:delivery:503", "pending:3:delivery:503", "attention:4:delivery:503",
+  ]);
+  assert.deepEqual(held.world.securityStatuses.slice(-1)[0].reasons, ["verification_blocked"]);
+  assert.equal(held.world.state.log.unknown_nodes, 0);
+  // A check that ends with no later program: the count ends, and the measurement marks the log.
+  held.world.advance(2 * 60000);
+  held.delivery.settled_ms = held.world.now;
+  await S.event(held.fx, "foreground");
+  assert.deepEqual(held.world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  assert.deepEqual(held.world.securityStatuses.slice(-1)[0].reasons, ["unlisted_release"]);
+
+  // A check of the app that ended after the device first saw the measurement, within its day,
+  // and none since: the checks fail on the side of the server. A check older than an hour says
+  // nothing of what is served now, so each round past that day is a round held back as well.
+  const late = await build("same");
+  late.delivery.settled_ms = late.world.now;
+  moveKeyToUnlisted(late.fx);
+  await nextDay(late.fx);
+  late.delivery.settled_ms = late.world.now;
+  const waits = [];
+  for (let day = 0; day < 2; day += 1) {
+    late.world.advance(25 * HOUR_MS);
+    late.delivery.failed_ms = late.world.now;
+    late.delivery.failed_status = 500;
+    await S.event(late.fx, "foreground");
+    waits.push(late.world.state.log.status + ":" + late.world.stored("log.blocked").count + ":" + late.world.state.log.store_failure);
+  }
+  assert.deepEqual(waits, ["pending:1:delivery:500", "pending:2:delivery:500"]);
+
+  // A backend that names this program, and checks that fail without a response. While the
+  // backend answered nothing around the check, the device was without a network: the round is
+  // pending and counts nothing. When the backend answered other requests of the runtime around
+  // it, the check was held back.
+  const quiet = await build("same");
+  quiet.delivery.settled_ms = quiet.world.now;
+  moveKeyToUnlisted(quiet.fx);
+  await nextDay(quiet.fx);
+  const counts = [];
+  for (let day = 0; day < 2; day += 1) {
+    quiet.world.advance(25 * HOUR_MS);
+    quiet.delivery.failed_ms = quiet.world.now - 10 * 60000;
+    quiet.delivery.failed_status = 0;
+    await S.event(quiet.fx, "foreground");
+    counts.push(quiet.world.state.log.status + ":" + quiet.world.stored("log.blocked").count);
+  }
+  quiet.world.advance(25 * HOUR_MS);
+  quiet.delivery.failed_ms = quiet.world.now;
+  await S.event(quiet.fx, "foreground");
+  counts.push(quiet.world.state.log.status + ":" + quiet.world.stored("log.blocked").count + ":" + quiet.world.state.log.store_failure);
+  assert.deepEqual(counts, ["pending:0", "pending:0", "pending:1:delivery:silent"]);
+
+  // An installation that verified a later program is stale whatever the backend names: no round
+  // runs, and nothing is stated of what the device kept.
+  const ahead = await build("same");
+  assert.equal(ahead.world.state.log.status, "verified");
+  const rounds = ahead.world.reports.length;
+  ahead.delivery.verified = ahead.fx.version + 1;
+  await nextDay(ahead.fx);
+  assert.equal(ahead.world.reports.length, rounds + 1);
+  assert.equal(stale(ahead.world), 1);
+});
+
+test("every request to the backend under /api/secure/ names the version of the program, and no other request does: by it the backend names a node this device handed its grant to for a connection and for a mail password, in an account with a node listed for its revokes alone", async () => {
+  const fx = S.fixture(source, { nodes: 1, legacy: 1 });
+  const world = fx.world;
+  // A node listed for its revokes alone that holds a grant another device handed it. The
+  // backend of the model names it for a request that does not say which program asks.
+  const guard = fx.legacy[0];
+  guard.revokeOnly = true;
+  guard.grants.set(world.userId, {
+    sign_pk: b64u(fx.keys.signPk), log_pk: b64u(fx.keys.logPk), key_id: fx.keys.keyId, custody: "enclave",
+    not_after_ms: world.now + 20 * DAY_MS,
+  });
+  await S.start(fx);
+  for (let i = 0; i < 4; i += 1) {
+    world.advance(HOUR_MS);
+    fx.nodes[0].record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/messages/" + i, "POST")]);
+    guard.record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/messages/g" + i, "GET")]);
+  }
+  await nextDay(fx);
+  // A connection: the backend names the node of the pool, whose statements the device verifies.
+  world.device.webAuth = (args) => {
+    const state = new URL(args.url).searchParams.get("state").split(".")[0];
+    world.connections.get(state).completed = true;
+    return "pickle://oauth?oauth_status=connected&oauth_state=" + state;
+  };
+  assert.deepEqual(await S.call(fx, "connect", { target: "github" }),
+    { ok: true, value: { connection_id: "connection-1", provider: "github", reward: 0 } });
+  // A mail password: the same.
+  const mail = await S.call(fx, "connect_app_password", { username: "user@naver.com", password: "abcd efgh ijkl" });
+  assert.deepEqual(mail, { ok: true, value: { provider: "naver_mail", connection_id: "connection-mail", identity: "user@naver.com" } });
+  // More of what the program sends: the screen and a later page, a vault item, the lifetime of
+  // a grant, the switch of the delegation, a push, and a request to a route outside
+  // /api/secure/.
+  const shown = await S.call(fx, "read_log", { limit: 2 });
+  await S.call(fx, "read_log_page", { before_ms: world.runtime.log_pages[0].before_ms });
+  assert.equal(shown.ok, true);
+  await S.call(fx, "store_secret", { label: "key", sites: "api.example.com", slots: "header:authorization", value: "sk-0123456789" });
+  await S.call(fx, "set_grant_days", { days: 7 });
+  await S.call(fx, "set_delegation", { enabled: false });
+  await S.call(fx, "set_delegation", { enabled: true });
+  await S.event(fx, "push", { reason: "grant_required" });
+  await S.call(fx, "set_connection_writes", { provider: "github", connection_id: "connection-1", kind: "issues", enabled: true });
+  await world.settle(6000);
+  const routes = new Set();
+  let others = 0;
+  for (const request of world.requests) {
+    if (typeof request.path === "string" && request.path.startsWith("/api/secure/")) {
+      assert.equal(request.query.program, String(fx.version), (request.method || "GET") + " " + request.path);
+      routes.add((request.method || "GET") + " " + request.path.replace(/\/nodes\/[^/]+\//, "/nodes/{id}/").replace(/\/secret\/.*/, "/secret/{name}"));
+    } else if (typeof request.path === "string") {
+      assert.ok(request.query === undefined || request.query.program === undefined, request.path);
+      others += 1;
+    } else {
+      assert.equal(new URL(request.url).searchParams.get("program"), null);
+      others += 1;
+    }
+  }
+  assert.ok(others > 10);
+  for (const route of ["GET /api/secure/account", "GET /api/secure/grants", "GET /api/secure/nodes",
+    "POST /api/secure/nodes/{id}/messages", "POST /api/secure/connections/begin", "GET /api/secure/connections/completion",
+    "PUT /api/secure/connections/naver_mail/app-password", "POST /api/secure/log/read", "POST /api/secure/log/bodies",
+    "POST /api/secure/log/store/listings", "POST /api/secure/log/verified", "POST /api/secure/vault/secret",
+    "POST /api/secure/sync/report"]) {
+    assert.ok(routes.has(route), route);
+  }
+});
+
+test("a procedure that needs a node holding the grant ends with program_stale in a stale runtime that no listed node takes a grant of, and the runtime publishes that it is stale: a runtime that is not stale fails as before", async () => {
+  for (const nodes of ["later", "none"]) {
+    for (const stale of [true, false]) {
+      const label = nodes + (stale ? ", stale" : ", not stale");
+      const fx = S.fixture(source, { nodes: 0 });
+      const world = fx.world;
+      // Every node the backend lists is of a release this program does not list, or it lists none.
+      if (nodes === "later") world.addNode({ release: "v9.0.0", measurement: bridge.randomMeasurement() });
+      if (stale) world.account.servedProgram = fx.version + 1;
+      await S.start(fx);
+      assert.equal(world.runtime.program_stale, stale, label);
+      const code = stale ? "program_stale" : nodes === "later" ? "attestation_failed" : "grant_required";
+      assert.deepEqual(await S.call(fx, "connect", { target: "github" }), { ok: false, code: code }, label);
+      assert.deepEqual(await S.call(fx, "store_login", { name: "example.com", username: "u", password: "p" }), { ok: false, code: code }, label);
+      assert.deepEqual(
+        await S.call(fx, "store_secret", { label: "x", sites: "example.com", slots: "field", value: "v" }), { ok: false, code: code }, label);
+      // The outcome of the procedure is reported as a failure with that code.
+      await world.settle(6000);
+      const events = world.outcomeReports.reduce((all, report) => all.concat(report.events), []);
+      assert.deepEqual(events.filter((event) => event.name === "connect").map((event) => event.code), [code], label);
+    }
+  }
+  // A runtime that is stale no more says so: the backend names this program as the one served.
+  const fx = S.fixture(source);
+  fx.world.account.servedProgram = fx.version + 1;
+  await S.start(fx);
+  assert.equal(fx.world.runtime.program_stale, true);
+  // (A node of a listed release holds the grant: the procedures of a stale runtime go on.)
+  assert.equal((await S.call(fx, "store_secret", { label: "x", sites: "example.com", slots: "field", value: "v" })).ok, true);
+  fx.world.account.servedProgram = fx.version;
+  fx.world.advance(60000);
+  await S.event(fx, "foreground");
+  assert.equal(fx.world.runtime.program_stale, false);
+});
+
+test("the state the app keeps over its restarts says whether the backend names vault items for the account: true once the account query says so, false again once it says so no more, and an account that was never told so has no such key", async () => {
+  // An account the backend never turned the items on for: the state holds no such key.
+  const off = S.fixture(source);
+  await S.start(off);
+  await nextDay(off);
+  await S.start(off);
+  assert.equal("named_secrets" in off.world.state, false);
+  assert.equal(off.world.store.has("vault.named"), false);
+  // An account it turned them on for.
+  const on = S.fixture(source);
+  const world = on.world;
+  world.account.namedSecrets = true;
+  await S.start(on);
+  assert.equal(world.state.named_secrets, true);
+  assert.equal(world.runtime.named_secrets, true);
+  // A new runtime: the state the app kept says true before the query of that runtime is
+  // answered (the runtime value is false until then), and a query that fails changes nothing.
+  world.fault("GET /api/secure/account", "transport");
+  S.load(on);
+  await world.run(Promise.resolve(on.program.onEvent("session_ready", {})).then(() => {}, () => {}));
+  assert.equal(world.state.named_secrets, true);
+  assert.equal(world.runtime.named_secrets, false);
+  world.clearFaults();
+  // The backend turns the items off for the account: the synchronization that reads so takes
+  // the value back, and a later one turns it on again.
+  world.account.namedSecrets = false;
+  world.advance(60000);
+  await S.event(on, "foreground");
+  assert.equal(world.state.named_secrets, false);
+  assert.equal(world.store.has("vault.named"), false);
+  world.account.namedSecrets = true;
+  world.advance(60000);
+  await S.event(on, "foreground");
+  assert.equal(world.state.named_secrets, true);
+  assert.equal(world.store.has("vault.named"), true);
+  // The end of the account erases what the device kept of it.
+  await S.event(on, "account_end", { reason: "account_deleted" });
+  assert.equal(world.store.has("vault.named"), false);
+});
+
+test("the transfer of the master key goes on through answers of the backend that fail for a moment: a 503 that names a dependency and a 429 among the answers to the polls of either device leave the transfer in progress, and the key arrives", async () => {
+  const giving = S.fixture(source);
+  const taking = S.fixture(source, { account: false });
+  // One account: the device that takes the key has none, and the account has the key of the
+  // device that gives it registered.
+  taking.world.account.key = giving.world.account.key;
+  // The routes of the transfer, on the backend the two devices share.
+  const transfers = new Map();
+  const answer = (status, body) => ({ status: status, body: body });
+  // The answers that fail for a moment, handed out to the next polls of each device.
+  const failing = { giving: [], taking: [] };
+  const backend = (side, world) => (request) => {
+    const method = request.method || "GET";
+    const body = typeof request.body === "string" && request.body !== "" ? JSON.parse(request.body) : {};
+    if (method === "POST" && request.path === "/api/secure/transfers") {
+      const id = b64u(crypto.randomBytes(16));
+      transfers.set(id, { request_id: id, phase: "requested", device: body.device, expires_ms: world.now + 15 * 60000 });
+      return answer(200, { transfer: transfers.get(id) });
+    }
+    if (method === "GET" && request.path === "/api/secure/transfers") {
+      return answer(200, { transfers: Array.from(transfers.values()).filter((transfer) => transfer.phase === "requested") });
+    }
+    const match = /^\/api\/secure\/transfers\/([^/]+)(?:\/([a-z]+))?$/.exec(request.path);
+    if (match === null) return undefined;
+    const transfer = transfers.get(match[1]);
+    if (transfer === undefined) return answer(404, { code: "not_found" });
+    if (method === "GET" && match[2] === undefined) {
+      return failing[side].length > 0 ? failing[side].shift() : answer(200, { transfer: transfer });
+    }
+    if (method === "PUT" && match[2] === "approval") Object.assign(transfer, { phase: "approved", yb: body.yb, approver: body.device });
+    else if (method === "PUT" && match[2] === "reply") Object.assign(transfer, { phase: "replied", ya: body.ya, ta: body.ta });
+    else if (method === "PUT" && match[2] === "envelope") Object.assign(transfer, { phase: "sealed", ciphertext: body.ciphertext, tb: body.tb });
+    else if (method === "POST" && match[2] === "ack") transfers.delete(match[1]);
+    else return answer(400, { code: "invalid_input" });
+    return answer(200, {});
+  };
+  giving.world.fault((line) => line.indexOf("/api/secure/transfers") >= 0, backend("giving", giving.world));
+  taking.world.fault((line) => line.indexOf("/api/secure/transfers") >= 0, backend("taking", taking.world));
+  await S.start(giving);
+  await S.start(taking);
+  assert.equal(taking.world.state.key_state, "waiting");
+  const begun = await S.call(taking, "begin_transfer", {});
+  assert.equal(begun.value.transfer.phase, "requested");
+  // The device with the key learns of the request, and its user approves it.
+  await S.event(giving, "push", { reason: "transfer_request" });
+  assert.equal(giving.world.state.transfer.phase, "pending_approval");
+  const moment = () => [answer(503, { detail: "postgresql_unavailable" }), answer(429, { detail: "too_many_requests" })];
+  failing.taking = moment();
+  failing.giving = moment();
+  assert.equal((await S.call(giving, "approve_transfer", {})).value.transfer.phase, "approved");
+  const code = giving.world.runtime.transfer_code;
+  assert.match(code, /^[0-9]{6}$/);
+  // The polls of the two devices, two seconds apart.
+  const pass = async (turns) => {
+    for (let turn = 0; turn < turns; turn += 1) {
+      await taking.world.settle(2500);
+      await giving.world.settle(2500);
+    }
+  };
+  await pass(5);
+  assert.equal(taking.world.state.transfer.phase, "code_entry");
+  assert.deepEqual(failing, { giving: [], taking: [] });
+  // The user enters the code, and the polls that follow meet such answers once more.
+  failing.taking = moment();
+  failing.giving = moment();
+  await S.call(taking, "enter_transfer_code", { code: code });
+  await pass(8);
+  assert.deepEqual(failing, { giving: [], taking: [] });
+  assert.equal(taking.world.state.transfer.phase, "done");
+  assert.equal(giving.world.state.transfer.phase, "done");
+  assert.equal(taking.world.state.key_state, "present");
+  const item = "com.pickle.client.secure.master-key\n" + taking.world.userId;
+  assert.equal(taking.world.keychain.get(item).value, giving.world.keychain.get(item).value);
+});
+
+test("the first page of the screen shows the entries of a node its round judges, however many entries of other nodes the summary asks for: one request for bodies is left to them", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  // 850 use entries of the node of the device within the window of the summary, and after them
+  // three of a node of the accepted measurement that this runtime has no judgement of.
+  for (let i = 0; i < 850; i += 1) {
+    world.advance(1000);
+    fx.nodes[0].record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/messages/a" + i, "GET")]);
+  }
+  const other = world.addNode({ release: "v2.4.0", measurement: fx.measurement, offered: false });
+  for (let i = 0; i < 3; i += 1) {
+    world.advance(1000);
+    other.record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/messages/b" + i, "POST")]);
+  }
+  const shown = await S.call(fx, "read_log", { limit: 3 });
+  const groups = shownGroups(shown.value);
+  assert.ok(groups.every((group) => group.verified === true));
+  assert.equal(groups.filter((group) => group.kind === "request").reduce((sum, group) => sum + group.count, 0), 3);
+});
+
+test("an entry of a node the runtime has no judgement of is read with the page that shows it: the first read of a later page shows it verified", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  // A node of the accepted measurement that took the delegation from the node of the device (a
+  // transfer between nodes of one measurement writes no entry), and wrote use entries only.
+  const other = world.addNode({ release: "v2.4.0", measurement: fx.measurement, offered: false });
+  for (let i = 0; i < 6; i += 1) {
+    world.advance(60000);
+    fx.nodes[0].record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/messages/a" + i, "POST")]);
+    world.advance(60000);
+    other.record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/messages/b" + i, "GET")]);
+  }
+  // Ten days later (the entries lie before the window of the summary), three newer entries of
+  // the node of the device, and a new runtime: no round judges the other node.
+  world.advance(10 * DAY_MS);
+  for (let i = 0; i < 3; i += 1) {
+    world.advance(60000);
+    fx.nodes[0].record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/messages/c" + i, "POST")]);
+  }
+  await S.start(fx);
+  await S.call(fx, "read_log", { limit: 3 });
+  assert.equal(world.stored("log.nodes")[other.id], undefined);
+  const bodies = world.sent("POST /api/secure/log/bodies").length;
+  const page = await S.call(fx, "read_log_page", { before_ms: world.runtime.log_pages[0].before_ms });
+  const groups = shownGroups(page.value);
+  assert.equal(groups.filter((group) => group.kind === "request").reduce((sum, group) => sum + group.count, 0), 12);
+  assert.ok(groups.every((group) => group.verified === true));
+  // (The bodies of the node the device knew go out with the request for the document, and the
+  // bodies of the node that document judged after it.)
+  assert.equal(world.sent("POST /api/secure/log/bodies").length, bodies + 2);
+});
+
+test("turning the delegation off sends the revoke to a listed node whatever role its binding names, and none to a node that holds no delegation: a node of a role this program does not know is handed no grant, and takes the revoke", async () => {
+  const fx = S.fixture(source);
+  const world = fx.world;
+  // A node whose binding names a role this program does not know, which holds the delegation of
+  // the account (a node of its release handed it on), and a node of the role forward.
+  const relay = world.addNode({ release: "v2.4.0", measurement: fx.measurement, role: "relay" });
+  const forward = world.addNode({ release: "v2.4.0", measurement: fx.measurement, role: "forward" });
+  relay.grants.set(world.userId, {
+    sign_pk: b64u(fx.keys.signPk), log_pk: b64u(fx.keys.logPk), key_id: fx.keys.keyId, custody: "enclave",
+    not_after_ms: world.now + 20 * DAY_MS,
+  });
+  await S.start(fx);
+  assert.deepEqual(relay.commands, []);
+  assert.deepEqual(forward.commands, []);
+  assert.equal(fx.nodes[0].grants.has(world.userId), true);
+  const off = await S.call(fx, "set_delegation", { enabled: false });
+  assert.equal(off.ok, true);
+  assert.deepEqual(relay.commands.map((command) => command.type), ["revoke"]);
+  assert.equal(relay.grants.has(world.userId), false);
+  assert.deepEqual(forward.commands, []);
+  assert.equal(fx.nodes[0].grants.has(world.userId), false);
+  assert.equal(world.state.grant.state, "off");
+});
+
 // ---- The judgement the app is told ----
 
 test("the app is told ok, pending and attention, and an attention is not covered by a round that did not complete", async () => {
@@ -3976,6 +4754,8 @@ test("the app is told ok, pending and attention, and an attention is not covered
   fx.nodes[0].record("c", [{ t: "connection_removed", time_ms: world.now, record_id: "r", provider: "slack", provider_revoke: false }], {
     signSeed: crypto.randomBytes(32),
   });
+  await nextDay(fx);
+  assert.equal(world.securityStatuses.slice(-1)[0].status, "pending");
   await nextDay(fx);
   assert.equal(world.securityStatuses.slice(-1)[0].status, "attention");
   const told = world.securityStatuses.length;

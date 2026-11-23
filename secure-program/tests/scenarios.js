@@ -21,18 +21,24 @@ const DAY_MS = bridge.DAY_MS;
  *                fixture under a measurement of the fixture; 1 when absent
  *    account     false for a device without a master key and an account without a registered key
  *    device      the build of the device (bridge.js World.device)
- *  Returns {world, keys, source, release, measurement, latest, nodes, legacy}: source is the
- *  program with release v2.4.0 listed. */
+ *    served      what the backend says of the program it serves (served_program_version of the
+ *                account query): the version of the program of the fixture when absent (a backend
+ *                that serves this program), and null for a backend that names no version
+ *  Returns {world, keys, source, release, measurement, latest, nodes, legacy, version}: source is
+ *  the program with release v2.4.0 listed, and version the VERSION of the program. */
 function fixture(source, options) {
   const given = options || {};
   const world = new bridge.World({ serverTarget: given.target || "prod", device: given.device });
   const keys = given.account === false ? null : world.createAccount();
+  const version = Number(/const VERSION = (\d+);/.exec(source)[1]);
+  world.account.servedProgram = given.served === undefined ? version : given.served === null ? undefined : given.served;
   const listed = bridge.listedMeasurements(source).filter((item) => !bridge.writesFormat3(item.release));
   const latest = listed[listed.length - 1];
   const measurement = bridge.randomMeasurement();
   const out = {
     world: world, keys: keys, source: bridge.withListedRelease(source, "v2.4.0", measurement),
     release: "v2.4.0", measurement: measurement, latest: latest, nodes: [], legacy: [], program: null,
+    version: version,
   };
   for (let i = 0; i < (given.legacy === undefined ? 0 : given.legacy); i += 1) {
     out.legacy.push(world.addNode({ release: latest.release, measurement: latest }));

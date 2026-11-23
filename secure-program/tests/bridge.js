@@ -621,7 +621,10 @@ class World {
     this.requests = [];
     // How often the program asked the bridge for the device (native.deviceInfo, a synchronous call).
     this.deviceInfoCalls = 0;
-    this.account = { key: null, keys: null };
+    // The account: its registered key, and what the backend says of the program it serves
+    // (servedProgram: the value of served_program_version in the answer of the account query;
+    // undefined for a backend that names none).
+    this.account = { key: null, keys: null, servedProgram: undefined };
     this.nodes = new Map();
     this.buckets = new Map();
     this.versionCounter = 0;
@@ -633,6 +636,10 @@ class World {
       platform: "ios", debug_build: false, locale: "en-US", sheets: false, securityStatus: false,
       ownerAuth: true, ownerAuths: [], prompts: [], presented: [], promptAnswer: null, webAuth: null,
       confirmations: false, confirmAnswer: true, confirmed: [],
+      // What the app knows of the delivery of the program itself (the bridge primitive
+      // programDelivery, in a build that has it): {verified, settled_ms, failed_ms,
+      // failed_status}, or a function that returns it. null: a build without the primitive.
+      delivery: null,
     };
     if (given.device) Object.assign(this.device, given.device);
     // The backend: which routes it has, and the faults of a fixture (see fault).
@@ -862,6 +869,18 @@ class World {
       crypto.randomBytes(8).toString("hex");
   }
 
+  /** The node the backend names for a connection of the account: one that holds a grant of it.
+   *  A request that names the program that asks (the query program) is answered with a node of
+   *  the nodes that serve calls; a request that names none comes from a device that runs an
+   *  earlier program, and is answered with a node listed for its revokes alone (revokeOnly)
+   *  when one holds a grant. */
+  namedNode(query) {
+    const holders = this.offeredNodes().filter((candidate) => candidate.grants.has(this.userId));
+    const guard = holders.find((candidate) => candidate.revokeOnly === true);
+    const pool = holders.find((candidate) => candidate.revokeOnly !== true);
+    return query !== null && query !== undefined && query.program !== undefined ? (pool || guard) : (guard || pool);
+  }
+
   api(method, path, query, bodyText) {
     const json = (status, value) => ({ status: status, headers: {}, body: JSON.stringify(value), bodyBase64: null });
     const body = typeof bodyText === "string" && bodyText !== "" ? JSON.parse(bodyText) : null;
@@ -870,6 +889,7 @@ class World {
       const account = { user_id: this.userId, key: this.account.key === null ? null : { key_id: this.account.key.key_id } };
       // The backend names the vault items with a name only for an account it turned them on for.
       if (this.account.namedSecrets === true) account.named_secrets = true;
+      if (this.account.servedProgram !== undefined) account.served_program_version = this.account.servedProgram;
       return json(200, account);
     }
     if (method === "PUT" && path === "/api/secure/account/key") {
@@ -885,7 +905,11 @@ class World {
       return json(200, {
         nodes: this.offeredNodes().map((node) => {
           const grant = node.grants.get(this.userId);
-          return { node: node.id, not_after_ms: grant === undefined ? null : grant.not_after_ms };
+          const item = { node: node.id, not_after_ms: grant === undefined ? null : grant.not_after_ms };
+          // A node the backend lists for its revokes alone (node.revokeOnly: a node of an earlier
+          // release outside the nodes that serve calls, which holds a grant of the account).
+          if (node.revokeOnly === true) item.revoke_only = true;
+          return item;
         }),
       });
     }
@@ -1080,7 +1104,7 @@ class World {
     }
     if (method === "POST" && path === "/api/secure/connections/begin") {
       // A node that holds the grant of the account states the authorization it began (8.2).
-      const node = this.offeredNodes().find((candidate) => candidate.grants.has(this.userId));
+      const node = this.namedNode(query);
       if (node === undefined) return json(409, { code: "grant_required" });
       const grant = node.grants.get(this.userId);
       const nodeState = b64u(crypto.randomBytes(16));
@@ -1093,6 +1117,20 @@ class World {
           v: 1, type: "oauth_begin", node: node.id, user_id: this.userId, key_id: grant.key_id,
           sign_pk: grant.sign_pk, provider: body.target, state: state,
           url_sha256: b64u(sha("sha256", utf8(url))), time_ms: this.now,
+        }),
+      });
+    }
+    if (method === "PUT" && path === "/api/secure/connections/naver_mail/app-password") {
+      const node = this.namedNode(query);
+      if (node === undefined) return json(409, { code: "grant_required" });
+      const grant = node.grants.get(this.userId);
+      const identity = "user@naver.com";
+      return json(200, {
+        node: node.id, connection_id: "connection-mail", identity: identity,
+        statement: signedValue(node.signSeed, "pickle.secure.v1.statement\n", {
+          v: 1, type: "app_password_verified", node: node.id, user_id: this.userId, key_id: grant.key_id,
+          sign_pk: grant.sign_pk, provider: "naver_mail", record_id: body.record.id, identity: identity,
+          ciphertext_sha256: b64u(sha("sha256", utf8(body.record.ct))), time_ms: this.now,
         }),
       });
     }
@@ -1239,8 +1277,8 @@ function keychainName(item) {
 /** The global native of one runtime on world: the functions of the bridge tables that the flows of
  *  the tests reach, and a stub that fails with invalid_argument for the ones they do not (the
  *  hardware key of the device, RSA). The functions a later build of the apps adds
- *  (securityStatus, promptSecret, presentSecret, confirmDestinations) exist only when the device
- *  of the world has them.
+ *  (securityStatus, promptSecret, presentSecret, confirmDestinations, programDelivery) exist only
+ *  when the device of the world has them.
  *  While world.bridgeOpen is false (the top-level evaluation) every call fails with cancelled. */
 function makeNative(world) {
   const device = world.device;
@@ -1376,6 +1414,12 @@ function makeNative(world) {
       if (!valid) return Promise.reject(new SecureError("invalid_argument", "presentSecret"));
       device.presented.push(JSON.parse(JSON.stringify(args)));
       return Promise.resolve(null);
+    };
+  }
+  if (device.delivery !== null && device.delivery !== undefined) {
+    functions.programDelivery = () => {
+      const value = typeof world.device.delivery === "function" ? world.device.delivery() : world.device.delivery;
+      return value === null || typeof value !== "object" ? value : Object.assign({}, value);
     };
   }
   if (device.confirmations) {
