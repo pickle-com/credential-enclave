@@ -30,9 +30,10 @@ under a key the screen asked for, the listing pages, the entries and the node pr
 chains of formats 1 and 2. The screen takes an entry from there before it asks for it, and a
 listing page when its own read is held back again, so an answer the backend gives a round is an
 answer the user sees. The reads of the screen that cannot be kept in a form that answers every
-later read (a later listing page, the listing of a chain of formats 1 and 2) are counted by the
-screen itself when they are held back, and rounds that keep ending with more to read than a round
-reads count as rounds held back. The
+later read (a later listing page, the listing of a chain of formats 1 and 2) are noted by the
+screen itself when they are held back, and mark the log when such reads of three days stay
+unread by the screen; rounds that keep ending with more to read than a round reads count as
+rounds held back. The
 entries of the nodes of the releases before v2.4.0 (formats 1 and 2) are read from the bucket
 their bindings name, for display and to follow a transfer of the delegation a node of such a
 release made. The storage of the operator holds no entry. An entry older than 365 days (the
