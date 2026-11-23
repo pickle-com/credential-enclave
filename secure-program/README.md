@@ -15,10 +15,16 @@ app".
 The program lists the log store itself (protocol.md 7.4): the listing of the two prefixes of its
 account, read from Amazon S3 through addresses it checks, names every act that took place with the
 key of the account. It judges the log by that listing and by the node documents of the nodes that
-wrote the entries. For the entries of format 3 it reads no head, verifies no chain equation and
-traces no transfer from node to node. A round reads the control entries; the log screen reads the entries it shows and counts the
-summary of the last seven days from the use entries of that window (each counted once per device
-and kept, sealed with a key derived from the master key, with the first page of the screen). The
+wrote the entries. A node document proves itself and reaches the program through the backend.
+Whether the store holds no node document of a node id is read from the store: the listing of the
+versions under the key of that document, in the bucket of the node id, through an address the
+program checks. An object under a node id without a node document is no entry of a node and is
+left out; a key whose node document is withheld is a read held back. For the entries of format 3
+the program reads no head, verifies no chain equation and traces no transfer from node to node. A
+round reads the control entries; the log screen reads the entries it shows and counts the summary
+of the last seven days from the use entries of that window (each counted once per device and kept,
+sealed with a key derived from the master key, with the first page of the screen). A read that was
+held back, whoever made it, is made again by every round until it is not. The
 entries of the nodes of the releases before v2.4.0 (formats 1 and 2) are read from the bucket
 their bindings name, for display and to follow a transfer of the delegation a node of such a
 release made. The storage of the operator holds no entry. An entry older than 365 days (the
@@ -148,7 +154,9 @@ node --test secure-program/tests/program.test.js
 X25519, HPKE of RFC 9180, ChaCha20-Poly1305, ECDSA P-384), a device (the key store, the program
 store, the published state, the build of the app with or without the bridge primitives of a later
 build), the backend of the operator and the buckets of the log store as the program reaches them
-over `native.http`, and enclave nodes with their keys, attestation documents, node documents,
+over `native.http` (the listings of object versions with their delete markers, and the route of
+the node documents with the origin of a document and the addresses of the listings of the node
+document keys), and enclave nodes with their keys, attestation documents, node documents,
 commands and log entries of formats 2 and 3 (`docs/protocol.md` sections 4, 5 and 7). The time of
 the model moves only when nothing else can happen, so a test runs a wait of minutes at once. The
 certificate chain of a nitro document is modelled (one leaf of the model stands for the
