@@ -1131,6 +1131,43 @@ test("a round whose time runs out is judged on what it read and keeps it: slow a
   assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
 });
 
+test("a round whose time passed judges and writes what it kept before the next round begins: the round of the log screen that waits behind it starts after the report of that round", async () => {
+  const fx = S.fixture(source);
+  const world = fx.world;
+  world.pageSize = 3;
+  for (let i = 0; i < 20; i += 1) {
+    world.advance(1000);
+    fx.nodes[0].record("c", [{ t: "connection_created", time_ms: world.now, record_id: "r" + i, provider: "slack", scope: "" }]);
+  }
+  world.fault("POST /api/secure/log/read", { delay_ms: 9000 });
+  world.fault("POST /api/secure/log/bodies", { delay_ms: 9000 });
+  world.fault("S3 " + world.shardHost, { delay_ms: 9000 });
+  // The round of the first synchronization reads slowly. Thirty seconds in, the user opens the
+  // log screen: its round waits for the round that runs.
+  S.load(fx);
+  const started = Promise.resolve(fx.program.onEvent("session_ready", {}));
+  started.then(() => {}, () => {});
+  await world.settle(30000);
+  const shown = fx.program.procedures.read_log({ limit: 10 });
+  shown.then(() => {}, () => {});
+  await world.settle(10 * 60000);
+  // The requests in the order they were sent: the report of the first round, whose time passed,
+  // stands before the request for listing addresses of the round of the screen (the one that
+  // names the first pages of both prefixes).
+  const order = world.requests.map((request) => {
+    if (request.path === "/api/secure/log/verified") return "report";
+    if (request.path === "/api/secure/log/read" && JSON.parse(request.body).pages.length === 2) return "screen";
+    return "";
+  });
+  assert.ok(order.indexOf("report") >= 0);
+  assert.ok(order.indexOf("screen") > order.indexOf("report"));
+  assert.equal(world.reports[0].store_failure, "round:time");
+  // What the first round judged is kept: the rounds after it read on, and the log verifies.
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(world.stored("log.seen").length, 21);
+  assert.equal(world.stored("log.round").unfinished, 0);
+});
+
 test("a device without a network, and a store that fails, leave the log pending and count no blocked round, however long", async () => {
   const offline = S.fixture(source);
   await S.start(offline);

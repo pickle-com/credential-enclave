@@ -4863,15 +4863,29 @@
   // the result of the one that runs.
   let roundFlight = null;
 
-  /** Starts a round in a turn of its own (LOG_ROUND_LIMIT_MS from its start) behind the rounds
-   *  that run or wait (the round lock) and returns its promise. first and follow: runRound. */
+  /** Starts a round behind the rounds that run or wait (the round lock) and returns its promise.
+   *  The round reads in a turn of its own (LOG_ROUND_LIMIT_MS from its start), and its promise
+   *  fails with timeout when that time passes. The lock is held until the round has ended: a
+   *  round whose time passed judges and writes what it kept after that (runRound), and no other
+   *  round reads or writes those values in between. first and follow: runRound. */
   function startRound(keys, origin, extra, first, follow) {
-    const own = newTurn(LOG_ROUND_LIMIT_MS, "");
-    const flight = roundLock.run(own, function () { return runRound(own, keys, origin, extra, first, follow); }, true);
+    let settle = null;
+    const flight = new Promise(function (resolve, reject) { settle = { resolve: resolve, reject: reject }; });
     const ended = function () {
       if (roundFlight === flight) roundFlight = null;
     };
-    flight.then(ended, ended);
+    // The lock has a longer limit than the round: the time of the round, and the time its
+    // judgement may take after it (the question whether the backend can be reached).
+    const held = newTurn(LOG_ROUND_LIMIT_MS + 4 * LOG_API_TIMEOUT_MS, "");
+    roundLock.run(held, function () {
+      const own = newTurn(LOG_ROUND_LIMIT_MS, "");
+      const work = runRound(own, keys, origin, extra, first, follow);
+      limited(own, work, Infinity, "procedure").then(settle.resolve, settle.reject);
+      return work;
+    }, true).then(ended, function (error) {
+      ended();
+      settle.reject(error);
+    });
     roundFlight = flight;
     return flight;
   }

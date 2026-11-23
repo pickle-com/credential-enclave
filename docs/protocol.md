@@ -1540,7 +1540,7 @@ pages the rounds go on reading for the screen make no round due by themselves). 
 synchronization that ends with more to read than a round reads is followed at once by the next
 round, eight in a row at most. The log screen runs a round with its first page, and starts one
 when the reads it notes as held back from it begin or cease to mark the log. One round runs at a
-time.
+time: a round whose time passed judges and writes what it kept before the next round begins.
 
 1. The listing addresses from the backend (`POST /api/secure/log/read`). The program calls an
    address only when its host is the host of the bucket the program computed from its own
