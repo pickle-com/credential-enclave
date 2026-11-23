@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use crate::platform::Measurement;
 use crate::providers::Definitions;
 use crate::state::{lock, Limits};
-use crate::testing::{App, Harness, Provider, Reply, Seen, Sent, LOG_HOST};
+use crate::testing::{App, Harness, Provider, Reply, Seen, Streamed, LOG_HOST};
 
 /// The host of the site of the secret.
 const SITE: &str = "api.site.example";
@@ -135,7 +135,7 @@ fn code(outcome: &(u16, Value)) -> (u16, &str) {
     (outcome.0, outcome.1["code"].as_str().unwrap_or_default())
 }
 
-fn sent_code(outcome: &Result<Sent, (u16, Value)>) -> (u16, String) {
+fn sent_code(outcome: &Result<Streamed, (u16, Value)>) -> (u16, String) {
     match outcome {
         Ok(sent) => panic!("the call handed a response of status {} on", sent.status),
         Err((status, failure)) => (

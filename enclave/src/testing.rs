@@ -802,67 +802,14 @@ impl Forwarded {
     }
 }
 
-/// The response stream of a `vault/send` call (enclave.md 5.16).
+/// The 200 response that is a stream (of a `forward` call that asked for one, of a
+/// `vault/send` call), read to its end.
 #[derive(Clone, Debug)]
-pub struct Sent {
-    pub status: u16,
-    pub headers: Vec<(String, String)>,
-    /// The parts of the body, in the order they were written.
-    pub parts: Vec<Vec<u8>>,
-    /// The end record. Null when the stream ended without one.
-    pub end: Value,
-}
-
-impl Sent {
-    /// The body: the parts one after another.
-    pub fn body(&self) -> Vec<u8> {
-        self.parts.concat()
-    }
-
-    /// The value of a response header of the host.
-    pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(header, _)| header == name)
-            .map(|(_, value)| value.as_str())
-    }
-}
-
-/// Reads the response stream of `vault/send`: the meta behind its length, the parts of the
-/// body, each behind its length, and the end record behind the length 0.
-pub fn decode_stream(bytes: &[u8]) -> Sent {
-    let length = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
-    let meta_length = length(0);
-    let meta: Value = serde_json::from_slice(&bytes[4..4 + meta_length]).unwrap();
-    let mut at = 4 + meta_length;
-    let mut parts = Vec::new();
-    let mut end = Value::Null;
-    while at + 4 <= bytes.len() {
-        let part_length = length(at);
-        at += 4;
-        if part_length == 0 {
-            end = serde_json::from_slice(&bytes[at..]).unwrap();
-            at = bytes.len();
-            break;
-        }
-        parts.push(bytes[at..at + part_length].to_vec());
-        at += part_length;
-    }
-    assert_eq!(at, bytes.len(), "the stream is whole records");
-    Sent {
-        status: meta["status"].as_u64().unwrap() as u16,
-        headers: header_pairs(&meta["headers"]),
-        parts,
-        end,
-    }
-}
-
-/// The 200 response of a `forward` call that asked for a stream, read to its end.
-#[derive(Debug)]
 pub struct Streamed {
     pub status: u16,
     pub headers: Vec<(String, String)>,
-    /// The `log` object of the head: where the event of the request is.
+    /// The `log` object of the head: where the event of the request is. Null for a
+    /// `vault/send` call, whose head has none.
     pub log: Value,
     /// The parts of the body, in order.
     pub parts: Vec<Vec<u8>>,
@@ -874,6 +821,14 @@ impl Streamed {
     /// The bytes of the body that were handed on.
     pub fn body(&self) -> Vec<u8> {
         self.parts.concat()
+    }
+
+    /// The value of a response header of the provider.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(header, _)| header == name)
+            .map(|(_, value)| value.as_str())
     }
 }
 
@@ -1190,7 +1145,7 @@ impl Harness {
 
     /// A `vault/send` call. `Err` carries the status and the failure body of a call that sent
     /// no response of a host on.
-    pub async fn vault_send(&self, meta: Value, payload: &[u8]) -> Result<Sent, (u16, Value)> {
+    pub async fn vault_send(&self, meta: Value, payload: &[u8]) -> Result<Streamed, (u16, Value)> {
         let mut request = frame::encode_head(&meta);
         request.extend_from_slice(payload);
         let (status, content_type, bytes) =
@@ -1200,7 +1155,7 @@ impl Harness {
             return Err((status.as_u16(), serde_json::from_slice(&bytes).unwrap()));
         }
         assert_eq!(content_type, frame::STREAM_CONTENT_TYPE);
-        Ok(decode_stream(&bytes))
+        Ok(read_stream(&bytes))
     }
 
     /// Sends one request to the router and returns the response as the router gives it: the

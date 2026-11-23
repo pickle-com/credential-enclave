@@ -502,6 +502,16 @@ pub mod events {
     use super::PROVIDER;
     use crate::state::events as base;
 
+    /// `event`, an object, with `members` behind its keys, in their order.
+    fn with(mut event: Value, members: Vec<(&str, Value)>) -> Value {
+        if let Some(object) = event.as_object_mut() {
+            for (key, value) in members {
+                object.insert(key.to_string(), value);
+            }
+        }
+        event
+    }
+
     /// The event of `vault/store` for a record of kind `vault_secret`: a node made the record
     /// `record_id` of a value its caller gave and hands that record out. It is a
     /// `connection_created` event, as `oauth/complete` creates one when it hands out the
@@ -509,11 +519,14 @@ pub mod events {
     /// provider `vault` and the empty scope, and `kind`, `name` (the name the call gave the
     /// value) and `context` follow them.
     pub fn secret_stored(record_id: &str, name: &str, context: &str) -> Value {
-        let mut event = base::connection_created(record_id, PROVIDER, "");
-        event["kind"] = json!(Kind::VaultSecret.as_str());
-        event["name"] = json!(name);
-        event["context"] = json!(context);
-        event
+        with(
+            base::connection_created(record_id, PROVIDER, ""),
+            vec![
+                ("kind", json!(Kind::VaultSecret.as_str())),
+                ("name", json!(name)),
+                ("context", json!(context)),
+            ],
+        )
     }
 
     /// The event of `vault/store` for a record of kind `vault_password`: the keys of
@@ -521,11 +534,14 @@ pub mod events {
     /// stated for the login the password belongs to: the node writes the value it received,
     /// as it writes the `origin` of a release.
     pub fn password_stored(record_id: &str, site: &str, context: &str) -> Value {
-        let mut event = base::connection_created(record_id, PROVIDER, "");
-        event["kind"] = json!(Kind::VaultPassword.as_str());
-        event["site"] = json!(site);
-        event["context"] = json!(context);
-        event
+        with(
+            base::connection_created(record_id, PROVIDER, ""),
+            vec![
+                ("kind", json!(Kind::VaultPassword.as_str())),
+                ("site", json!(site)),
+                ("context", json!(context)),
+            ],
+        )
     }
 
     /// The event of a release: `secret_released`, and behind its keys `name` for a record of
@@ -539,11 +555,11 @@ pub mod events {
         context: &str,
         name: Option<&str>,
     ) -> Value {
-        let mut event = base::secret_released(record_id, kind.as_str(), field, origin, context);
-        if let Some(name) = name {
-            event["name"] = json!(name);
+        let event = base::secret_released(record_id, kind.as_str(), field, origin, context);
+        match name {
+            Some(name) => with(event, vec![("name", json!(name))]),
+            None => event,
         }
-        event
     }
 
     /// The event of `vault/handoff`: the value of the record `record_id` goes into `request`,

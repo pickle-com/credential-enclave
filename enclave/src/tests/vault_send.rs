@@ -22,7 +22,7 @@ use super::quiet_provider;
 use crate::frame;
 use crate::provider_response::{Forms, StreamCheck, ESCAPED_BYTE_SPAN};
 use crate::state::lock;
-use crate::testing::{decode_stream, operator_config, Harness, Provider, Reply, Seen, Sent};
+use crate::testing::{operator_config, read_stream, Harness, Provider, Reply, Seen, Streamed};
 
 /// The host of the site of the secret.
 const SITE: &str = "api.site.example";
@@ -106,7 +106,7 @@ fn envelope(forward: &Harness, request: &Value, value: &str, nonce: u8) -> Value
     envelope_aged(forward, request, value, nonce, 0)
 }
 
-fn code(outcome: &Result<Sent, (u16, Value)>) -> (u16, String) {
+fn code(outcome: &Result<Streamed, (u16, Value)>) -> (u16, String) {
     match outcome {
         Ok(sent) => panic!("the call handed a response of status {} on", sent.status),
         Err((status, failure)) => (
@@ -1409,7 +1409,7 @@ async fn a_response_is_handed_on_while_it_arrives() {
     let early_after = early_after.expect("the first events came before the last one");
     assert!(early_after < Duration::from_millis(450), "{early_after:?}");
     assert!(started.elapsed() >= Duration::from_millis(600));
-    let sent = decode_stream(&received);
+    let sent = read_stream(&received);
     assert_eq!(sent.header("content-type"), Some("text/event-stream"));
     assert_eq!(sent.body(), [first, last].concat());
     assert_eq!(sent.end, json!({"complete": true}));
@@ -1750,7 +1750,7 @@ async fn a_closing_node_begins_no_request_and_ends_the_one_it_had_begun() {
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
-    let sent = decode_stream(&bytes);
+    let sent = read_stream(&bytes);
     assert_eq!(sent.body(), parts.concat());
     assert_eq!(sent.end, json!({"complete": true}));
     // The node holds no call any more: whoever closed it may end it without cutting one.

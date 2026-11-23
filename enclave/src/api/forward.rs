@@ -23,6 +23,7 @@ use axum::http::HeaderValue;
 use axum::response::Response;
 use credential_enclave_protocol::record::Record;
 use credential_enclave_protocol::secret::Secret;
+use credential_enclave_protocol::secret_use::{header_key, names_no_other_charset};
 use credential_enclave_protocol::ProtocolError;
 use hyper::body::Bytes;
 use serde_json::Value;
@@ -199,47 +200,13 @@ fn failure_of(error: EgressError) -> ProtocolError {
     }
 }
 
-/// The form a header name is compared in: lower case, with `-` for every `_`. Some servers
-/// read the two characters as one, so `X_HTTP_Method_Override` is the header that overrides
-/// the method for them, and `Content_Length` a second length of the body.
-fn header_key(name: &str) -> String {
-    name.to_ascii_lowercase().replace('_', "-")
-}
-
-/// True when the value of an `Accept` header names no character encoding but UTF-8: every
-/// place of the word `charset` in it (in any case of its letters) is followed by `=` and
-/// `utf-8` or `utf8`, with or without quotes and blanks.
-fn names_no_other_charset(value: &str) -> bool {
-    let value = value.to_ascii_lowercase();
-    let mut rest = value.as_str();
-    while let Some(at) = rest.find("charset") {
-        let after = rest.get(at + "charset".len()..).unwrap_or_default();
-        let named = after
-            .trim_start()
-            .strip_prefix('=')
-            .map(|named| named.trim_start().trim_start_matches('"'));
-        let utf8 = named.and_then(|named| {
-            named
-                .strip_prefix("utf-8")
-                .or_else(|| named.strip_prefix("utf8"))
-        });
-        match utf8 {
-            // The name ends there: `utf-80` is another name.
-            Some(end)
-                if !end.starts_with(|next: char| next.is_ascii_alphanumeric() || next == '-') => {}
-            _ => return false,
-        }
-        rest = after;
-    }
-    true
-}
-
 /// Reads the request headers of a request object: an array of `[name, value]` pairs under
 /// `headers`. A name that is not a token and a value with CR, LF or another control
 /// character are `invalid_request`. A header of [`REFUSED_HEADERS`] is `not_allowed`, and
 /// so is an `Accept` header that names another character encoding than UTF-8. The headers
 /// of [`DROPPED_HEADERS`] and the header the definition injects are dropped. A name is
-/// compared in the form of [`header_key`].
+/// compared in the form of [`header_key`], and the two rules are those of the request of a
+/// vault secret (`credential_enclave_protocol::secret_use`).
 fn caller_headers(
     request: &Value,
     definition: &Definition,
