@@ -24,37 +24,52 @@ use crate::faults;
 use crate::log_store::{self, SWEEP_INTERVAL};
 use crate::platform::Platform;
 use crate::state::{lock, GrantState};
-use crate::testing::{quiet_panics, App, Harness, Provider, Reply};
+use crate::testing::{log_credentials, quiet_panics, App, Harness, Provider, Reply};
 use credential_enclave_protocol::subset::Subset;
 
 /// What the log store stand-in does with the write of an entry: it answers it after `pause`,
 /// with `status` when `status` is not 0 and with a confirmation otherwise. The script is read
-/// when the write arrives. The write of a node document is confirmed at once. Every answer
-/// ends its connection.
+/// when the write arrives. The write of a node document is answered at once: with
+/// `document_status` when that is not 0, and with a confirmation otherwise. Every answer ends
+/// its connection.
 #[derive(Default)]
 struct Script {
     status: u16,
     pause: Duration,
+    document_status: u16,
 }
 
 type Store = Arc<Mutex<Script>>;
 
-/// A stand-in for the providers and for the log store.
+/// A stand-in for the providers and for the log store. A provider answers a request and ends
+/// its connection.
 async fn scripted_store() -> (Provider, Store) {
+    scripted_store_with(|| Reply::json(200, &json!({"ok": true}))).await
+}
+
+/// A stand-in for the providers, which answer every request with `answer`, and for the log
+/// store.
+async fn scripted_store_with(
+    answer: impl Fn() -> Reply + Send + Sync + 'static,
+) -> (Provider, Store) {
     let store: Store = Arc::default();
     let script = store.clone();
     let provider = provider_and_log_store(
-        |_| Reply::json(200, &json!({"ok": true})),
+        move |_| answer(),
         move |seen| {
             let script = lock(&script);
             let entry = seen.target.contains("/a3/");
-            if entry && script.status != 0 {
-                return Reply::with_body(
-                    script.status,
-                    &[("connection", "close")],
-                    b"<Error></Error>",
-                )
-                .after(script.pause);
+            let refused = match entry {
+                true => script.status,
+                false => script.document_status,
+            };
+            if refused != 0 {
+                let refusal =
+                    Reply::with_body(refused, &[("connection", "close")], b"<Error></Error>");
+                return match entry {
+                    true => refusal.after(script.pause),
+                    false => refusal,
+                };
             }
             let confirmed =
                 Reply::with_body(200, &[("etag", "\"0\""), ("connection", "close")], b"");
@@ -600,8 +615,8 @@ async fn a_sweep_that_panicked_is_followed_by_the_next_sweep() {
         tokio::time::resume();
     };
 
-    // The first sweep panics at its first draw, outside every lock: that sweep ends, and the
-    // entry stays pending.
+    // The first sweep panics at its first draw, outside every lock: the step that writes the
+    // pending entries ends there, and the entry stays pending.
     let panics = faults::panics();
     harness.platform.fault_at_draw(0);
     next_sweep().await;
@@ -629,4 +644,132 @@ async fn a_sweep_that_panicked_is_followed_by_the_next_sweep() {
     let after = harness.health().await;
     assert_eq!(after["load"]["halted_accounts"], 0);
     assert_eq!(after["grants"], 1);
+}
+
+/// A request of `app` to a provider through `forward`: the status the provider answered
+/// with, or the status of the failure of the call.
+async fn forwarded(harness: &Harness, app: &App) -> u16 {
+    let token = app.record(
+        "oauth",
+        "google_workspace",
+        &json!({"token": {"access_token": "ya29.token", "refresh_token": "1//refresh"}, "obtained_ms": 1}),
+    );
+    let call = json!({
+        "user_id": app.user_id, "record": token, "method": "GET",
+        "url": "https://gmail.googleapis.com/gmail/v1/users/me/profile", "context": "",
+    });
+    match harness.forward(call, b"").await {
+        Ok(forwarded) => forwarded.status,
+        Err((status, _)) => status,
+    }
+}
+
+#[tokio::test]
+async fn a_step_of_a_sweep_that_panics_leaves_the_steps_after_it_their_work() {
+    quiet_panics();
+    // The providers of this stand-in keep the connection of a request open.
+    let (provider, store) =
+        scripted_store_with(|| Reply::json(200, &json!({"ok": true})).keep_alive()).await;
+    let harness = node_with_log_store(&provider).await;
+    let app = App::new("user-1", 1);
+    app.grant(&harness).await;
+    let account = harness.node.account("user-1").unwrap();
+    let idle = |health: &Value| health["state"]["idle_connections"]["provider"].clone();
+    let document_ms = |health: &Value| health["log_store"]["node_document_ms"].as_u64().unwrap();
+
+    // What the four steps of a sweep find on this node thirty days from now. An idle
+    // connection to a provider: a request of the account. A pending entry: a release the
+    // store refused.
+    assert_eq!(forwarded(&harness, &app).await, 200);
+    lock(&store).status = 403;
+    assert_eq!(
+        code(&harness.post("/v1/release", release_body(&app)).await),
+        (503, "log_store_unavailable")
+    );
+    lock(&store).status = 0;
+    let pending = harness.last_seq("user-1");
+    let refused = writes_of(&provider, "user-1", pending);
+    // Thirty days later the grant of the account is over and the node document is due. The
+    // node receives new credentials while the store refuses its document, so the document
+    // stays due.
+    harness.node.clock.advance(limits::GRANT_MAX_MS + 1_000);
+    lock(&store).document_status = 403;
+    let expires_ms = harness.node.now_ms() + 3_600_000;
+    assert_eq!(
+        harness
+            .post("/v1/log-store/credentials", log_credentials(expires_ms))
+            .await
+            .0,
+        200
+    );
+    lock(&store).document_status = 0;
+    let before = harness.health().await;
+    assert_eq!(before["grants"], 1);
+    assert_eq!(before["log_store"]["pending"], 1);
+    assert_eq!(idle(&before), 1);
+    let documents = provider.documents().len();
+
+    // The first step panics: the node document is made with the attestation device, which
+    // panics. The document is not written, and the three steps after it do their work in
+    // the same sweep.
+    harness.platform.fault_attestation(true);
+    let panics = faults::panics();
+    log_store::sweep(&harness.node).await;
+    assert!(faults::panics() > panics);
+    let after = harness.health().await;
+    assert_eq!(document_ms(&after), document_ms(&before));
+    assert_eq!(provider.documents().len(), documents);
+    // The second step: the grant whose time passed is ended, and its user key is gone.
+    assert_eq!(after["grants"], 0);
+    assert!(matches!(lock(&account).grant(), GrantState::Expired { .. }));
+    // The third step: the pending entry is written, and the store confirmed it.
+    assert_eq!(after["log_store"]["pending"], 0);
+    assert_eq!(writes_of(&provider, "user-1", pending), refused + 1);
+    // The fourth step: the idle connection whose time passed is ended.
+    assert_eq!(idle(&after), 0);
+    assert_eq!(after["load"]["halted_accounts"], 0);
+
+    // The attestation device answers again: the next sweep writes the node document.
+    harness.platform.fault_attestation(false);
+    log_store::sweep(&harness.node).await;
+    assert!(document_ms(&harness.health().await) > document_ms(&before));
+
+    // The third step panics. Another account with a grant within its time has an idle
+    // connection and a pending entry that is older than the interval of the sweep.
+    let other = App::new("user-2", 2);
+    other.grant(&harness).await;
+    assert_eq!(forwarded(&harness, &other).await, 200);
+    lock(&store).status = 403;
+    assert_eq!(
+        code(&harness.post("/v1/release", release_body(&other)).await),
+        (503, "log_store_unavailable")
+    );
+    lock(&store).status = 0;
+    let pending = harness.last_seq("user-2");
+    let refused = writes_of(&provider, "user-2", pending);
+    let interval_ms = u64::try_from(SWEEP_INTERVAL.as_millis()).unwrap();
+    harness.node.clock.advance(interval_ms + 1_000);
+    // The first draw of this sweep is the jitter the third step draws for the account,
+    // outside every lock.
+    let panics = faults::panics();
+    harness.platform.fault_at_draw(0);
+    log_store::sweep(&harness.node).await;
+    assert!(faults::panics() > panics);
+    let after = harness.health().await;
+    // The step ended before it wrote: the entry is pending, and health reports the age of
+    // the entry the step found before it ended.
+    assert_eq!(after["log_store"]["pending"], 1);
+    assert_eq!(writes_of(&provider, "user-2", pending), refused);
+    assert!(after["log_store"]["pending_oldest_ms"].as_u64().unwrap() >= interval_ms);
+    // The fourth step did its work all the same, and nothing else was given up.
+    assert_eq!(idle(&after), 0);
+    assert_eq!(after["load"]["halted_accounts"], 0);
+    assert_eq!(after["grants"], 1);
+
+    // The next sweep writes the entry.
+    log_store::sweep(&harness.node).await;
+    let after = harness.health().await;
+    assert_eq!(after["log_store"]["pending"], 0);
+    assert_eq!(after["log_store"]["pending_oldest_ms"], 0);
+    assert_eq!(writes_of(&provider, "user-2", pending), refused + 1);
 }

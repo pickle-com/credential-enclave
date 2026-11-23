@@ -512,12 +512,21 @@ pub struct StoredDocument {
     pub retain_until: String,
 }
 
+/// The connections a stand-in holds open, and the word that ends the ones that wait for a
+/// request.
+#[derive(Default)]
+struct Connections {
+    open: AtomicUsize,
+    closing: tokio::sync::Notify,
+}
+
 /// A provider stand-in: a TLS server on the loopback interface with a certificate for the
 /// given host names, signed by its own certificate authority.
 pub struct Provider {
     pub address: SocketAddr,
     seen: Arc<Mutex<Vec<Seen>>>,
     in_flight: Arc<InFlight>,
+    connections: Arc<Connections>,
     authority: CertificateDer<'static>,
     hosts: Vec<String>,
 }
@@ -565,9 +574,11 @@ impl Provider {
         let address = listener.local_addr().unwrap();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let in_flight = Arc::new(InFlight::default());
+        let connections = Arc::new(Connections::default());
         let handler: Handler = Arc::new(handler);
         let recorded = seen.clone();
         let counted = in_flight.clone();
+        let held = connections.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -577,8 +588,11 @@ impl Provider {
                 let handler = handler.clone();
                 let recorded = recorded.clone();
                 let counted = counted.clone();
+                let held = held.clone();
                 tokio::spawn(async move {
-                    let _ = serve_one(acceptor, stream, handler, recorded, counted).await;
+                    held.open.fetch_add(1, Ordering::SeqCst);
+                    let _ = serve_one(acceptor, stream, handler, recorded, counted, &held).await;
+                    held.open.fetch_sub(1, Ordering::SeqCst);
                 });
             }
         });
@@ -586,9 +600,22 @@ impl Provider {
             address,
             seen,
             in_flight,
+            connections,
             authority: authority.der().clone(),
             hosts: names,
         }
+    }
+
+    /// The connections the stand-in holds open at this moment: from the moment it accepted
+    /// one to the moment that connection ended, from either side.
+    pub fn open_connections(&self) -> usize {
+        self.connections.open.load(Ordering::SeqCst)
+    }
+
+    /// Ends every connection of the stand-in that waits for a request, from the side of the
+    /// stand-in: what a server does with a connection it kept open for long enough.
+    pub fn close_idle_connections(&self) {
+        self.connections.closing.notify_waiters();
     }
 
     /// The trust roots that accept this stand-in only.
@@ -733,6 +760,7 @@ impl PlainStore {
         let handler: Handler = Arc::new(handler);
         let recorded = seen.clone();
         let in_flight = Arc::new(InFlight::default());
+        let connections = Arc::new(Connections::default());
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -741,8 +769,17 @@ impl PlainStore {
                 let handler = handler.clone();
                 let recorded = recorded.clone();
                 let in_flight = in_flight.clone();
+                let connections = connections.clone();
                 tokio::spawn(async move {
-                    let _ = serve_stream(stream, String::new(), handler, recorded, in_flight).await;
+                    let _ = serve_stream(
+                        stream,
+                        String::new(),
+                        handler,
+                        recorded,
+                        in_flight,
+                        &connections,
+                    )
+                    .await;
                 });
             }
         });
@@ -771,6 +808,7 @@ async fn serve_one(
     handler: Handler,
     recorded: Arc<Mutex<Vec<Seen>>>,
     in_flight: Arc<InFlight>,
+    connections: &Connections,
 ) -> std::io::Result<()> {
     let tls = acceptor.accept(stream).await?;
     let server_name = tls
@@ -779,16 +817,18 @@ async fn serve_one(
         .server_name()
         .unwrap_or_default()
         .to_string();
-    serve_stream(tls, server_name, handler, recorded, in_flight).await
+    serve_stream(tls, server_name, handler, recorded, in_flight, connections).await
 }
 
-/// Serves the requests of one connection, TLS or plain, until it ends.
+/// Serves the requests of one connection, TLS or plain, until it ends. A connection that
+/// waits for a request ends when the stand-in is told to close its idle connections.
 async fn serve_stream<IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     mut tls: IO,
     server_name: String,
     handler: Handler,
     recorded: Arc<Mutex<Vec<Seen>>>,
     in_flight: Arc<InFlight>,
+    connections: &Connections,
 ) -> std::io::Result<()> {
     /// Counts one request from its reading to its reply, also when the connection ends.
     struct Counted(Arc<InFlight>);
@@ -811,7 +851,14 @@ async fn serve_stream<IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                 break position + 4;
             }
             let mut chunk = [0u8; 4096];
-            let read = tls.read(&mut chunk).await?;
+            let read = tokio::select! {
+                read = tls.read(&mut chunk) => read?,
+                // No byte of a request has arrived: the connection is idle.
+                _ = connections.closing.notified(), if buffer.is_empty() => {
+                    tls.shutdown().await?;
+                    return Ok(());
+                }
+            };
             if read == 0 {
                 return Ok(());
             }

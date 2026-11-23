@@ -144,6 +144,8 @@ pub mod limits {
     pub const PROVIDER_INFLIGHT: usize = 512;
     /// Idle HTTP/1.1 connections a node keeps to its log store (enclave.md 5.14).
     pub const LOG_STORE_IDLE_CONNECTIONS: usize = 32;
+    /// How long an idle connection to the log store is kept: 30 seconds.
+    pub const LOG_STORE_IDLE_MS: u64 = 30_000;
     /// Idle connections a node keeps to one provider host for one account (enclave.md 5.8
     /// step 8).
     pub const PROVIDER_IDLE_CONNECTIONS: usize = 8;

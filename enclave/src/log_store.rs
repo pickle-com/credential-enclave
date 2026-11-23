@@ -70,8 +70,6 @@ pub const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// `Limits::sweep_write_rate`. The class of the peak write rate of a node, so the recovery
 /// after an outage of the store does not more than double the live load on it.
 pub const SWEEP_WRITE_RATE: u32 = 64;
-/// Open connections to the log store that carry no write ([`IdleConnections`]).
-const IDLE_CONNECTIONS: usize = 32;
 /// Pending entries of one account at which a call that uses a credential creates no further
 /// entry before the store confirmed some of them ([`admit`]).
 pub const PENDING_ENTRIES: usize = 64;
@@ -370,30 +368,73 @@ pub struct LogStore {
     document_writer: tokio::sync::Mutex<()>,
 }
 
-/// The open HTTP/1.1 connections to the log store that carry no write, the most recently used
-/// last.
+/// The open HTTP/1.1 connections to the log store that carry no write, each with the node
+/// time it became idle, the most recently used last. At most
+/// [`limits::LOG_STORE_IDLE_CONNECTIONS`] are kept, each for at most
+/// [`limits::LOG_STORE_IDLE_MS`].
+///
+/// A connection whose idle time passed carries no further write. The node closes it when the
+/// next write asks for a connection, when the next response of the store ends, and in its
+/// sweep ([`IdleConnections::end_idle`]): a node that writes no further entry holds no
+/// connection to the store for longer than the idle time and one sweep interval.
 #[derive(Default)]
-struct IdleConnections(NodeLock<Vec<SendRequest<OnceBody>>>);
+struct IdleConnections(NodeLock<Vec<IdleConnection>>);
+
+/// An idle connection to the log store, and the node time it became idle.
+type IdleConnection = (SendRequest<OnceBody>, u64);
 
 impl IdleConnections {
-    /// The most recently used connection that is still open, once it is ready for a request.
-    async fn take(&self) -> Option<SendRequest<OnceBody>> {
+    /// True for a connection that became idle at `since_ms` and is open and within its idle
+    /// time at `now_ms`.
+    fn carries(sender: &SendRequest<OnceBody>, since_ms: u64, now_ms: u64) -> bool {
+        !sender.is_closed() && now_ms < since_ms.saturating_add(limits::LOG_STORE_IDLE_MS)
+    }
+
+    /// The most recently used connection that is open and within its idle time, once it is
+    /// ready for a request. The connections it passes over end.
+    async fn take(&self, now_ms: u64) -> Option<SendRequest<OnceBody>> {
         loop {
-            let mut sender = lock(&self.0).pop()?;
-            if sender.ready().await.is_ok() {
+            let (mut sender, since_ms) = lock(&self.0).pop()?;
+            if IdleConnections::carries(&sender, since_ms, now_ms) && sender.ready().await.is_ok() {
                 return Some(sender);
             }
         }
     }
 
-    /// Keeps a connection whose response has ended, while fewer than [`IDLE_CONNECTIONS`] are
-    /// kept.
-    fn put(&self, sender: SendRequest<OnceBody>) {
+    /// Keeps a connection whose response has ended at `now_ms`, while fewer than
+    /// [`limits::LOG_STORE_IDLE_CONNECTIONS`] are kept.
+    fn put(&self, sender: SendRequest<OnceBody>, now_ms: u64) {
         let mut connections = lock(&self.0);
-        connections.retain(|sender| !sender.is_closed());
-        if connections.len() < IDLE_CONNECTIONS {
-            connections.push(sender);
+        connections
+            .retain(|(sender, since_ms)| IdleConnections::carries(sender, *since_ms, now_ms));
+        if connections.len() < limits::LOG_STORE_IDLE_CONNECTIONS {
+            connections.push((sender, now_ms));
         }
+    }
+
+    /// Ends every idle connection whose idle time passed at `now_ms`, and drops every
+    /// connection the store closed: the step of the sweep of the node for a node that writes
+    /// no further entry ([`sweep`]). The connections leave the list inside its lock and end
+    /// after the lock is free.
+    fn end_idle(&self, now_ms: u64) {
+        let mut connections = lock(&self.0);
+        let (kept, ended): (Vec<IdleConnection>, Vec<IdleConnection>) =
+            std::mem::take(&mut *connections)
+                .into_iter()
+                .partition(|(sender, since_ms)| {
+                    IdleConnections::carries(sender, *since_ms, now_ms)
+                });
+        *connections = kept;
+        drop(connections);
+        drop(ended);
+    }
+
+    /// The idle connections that are open at this moment.
+    fn open(&self) -> usize {
+        lock(&self.0)
+            .iter()
+            .filter(|(sender, _)| !sender.is_closed())
+            .count()
     }
 }
 
@@ -533,10 +574,17 @@ impl LogStore {
         }
     }
 
-    /// The idle connections to the log store at this moment (`log_store` of
-    /// `idle_connections` of health).
+    /// The idle connections to the log store that are open at this moment (`log_store` of
+    /// `idle_connections` of health). A connection the store closed is not one of them, also
+    /// while it waits in the list for the sweep to drop it.
     pub fn idle_connections(&self) -> usize {
-        lock(&self.idle.0).len()
+        self.idle.open()
+    }
+
+    /// Ends the idle connections to the log store whose idle time passed at `now_ms`
+    /// ([`IdleConnections::end_idle`]).
+    pub fn end_idle_connections(&self, now_ms: u64) {
+        self.idle.end_idle(now_ms);
     }
 }
 
@@ -803,7 +851,7 @@ async fn write_once(
     limit: Duration,
 ) -> Result<(), AttemptFailure> {
     let idle = match first {
-        true => node.log_store.idle.take().await,
+        true => node.log_store.idle.take(node.now_ms()).await,
         false => None,
     };
     let attempt_limit = match idle.is_some() {
@@ -829,7 +877,7 @@ async fn write_once(
             .await
             .map_err(|_| (WriteFailure::Closed, true))?;
         if response.body().is_end_stream() {
-            node.log_store.idle.put(sender);
+            node.log_store.idle.put(sender, node.now_ms());
         }
         match response.status() {
             StatusCode::OK => Ok(()),
@@ -994,35 +1042,85 @@ pub async fn write_node_document(node: &Node) -> u64 {
     store.document_ms()
 }
 
-/// The sweep of the node (enclave.md section 3): every [`SWEEP_INTERVAL`], for every account, a
-/// grant whose time passed is ended, the merge keys whose window passed and the kept `refresh`
-/// responses whose time passed are dropped, and the pending entries are written again. A pending
-/// entry is otherwise written again with the next write of its account only, so without the sweep
-/// an account that makes no further call would leave a gap in the store for as long as it is
-/// idle, and a reader of the store would take that gap for an omission. The task ends when the
-/// orderly shutdown of the node starts.
+/// The sweep of the node (enclave.md section 3): every [`SWEEP_INTERVAL`] the node writes its
+/// node document when that is due, ends what the time of its accounts ended (a grant whose
+/// time passed, the merge keys whose window passed, the kept `refresh` responses whose time
+/// passed), writes the pending entries again, and ends the idle connections whose time passed.
+/// A pending entry is otherwise written again with the next write of its account only, so
+/// without the sweep an account that makes no further call would leave a gap in the store for
+/// as long as it is idle, and a reader of the store would take that gap for an omission. The
+/// task ends when the orderly shutdown of the node starts.
 ///
-/// The node cannot do without this task (`crate::faults::vital`). Each sweep runs on a task of
-/// its own: a panic inside one ends that sweep, as a panic inside a call ends that call, and
-/// the next sweep starts at its time. What the sweep that panicked did not reach waits for the
-/// next one, and an account under whose lock it panicked is halted.
+/// The node cannot do without this task (`crate::faults::vital`). Each step of a sweep runs on
+/// a task of its own ([`sweep`]): a panic inside a step ends that step, as a panic inside a
+/// call ends that call, the sweep goes on with its next step, and the next sweep starts at its
+/// time. What the step that panicked did not reach waits for the next sweep, and an account
+/// under whose lock it panicked is halted.
 pub async fn keep_sweeping(node: Arc<Node>) {
     loop {
         tokio::time::sleep(SWEEP_INTERVAL).await;
         if node.ensure_open().is_err() {
             return;
         }
-        let swept = node.clone();
-        let _ = tokio::spawn(async move { sweep(&swept).await }).await;
+        sweep(&node).await;
     }
 }
 
-/// One sweep ([`keep_sweeping`]), in three passes.
+/// One sweep ([`keep_sweeping`]): four steps, one after another.
+///
+/// 1. The node document ([`write_node_document`]): a node whose document the store has not
+///    confirmed, or whose latest confirmed write is 30 days old, writes it here when no call
+///    did (protocol.md 7.7).
+/// 2. The accounts ([`end_what_passed`]): a grant whose time passed ends and its user key is
+///    overwritten with zeros, and the merge keys and the kept `refresh` responses whose time
+///    passed are dropped.
+/// 3. The pending entries ([`write_pending_entries`]).
+/// 4. The idle connections ([`end_idle_connections`]): the connections to the providers and
+///    to the log store whose idle time passed end.
+///
+/// Each step runs on a task of its own, and the sweep waits for it ([`step`]): a panic inside
+/// a step ends that step and no other. No step reads what another step left, so the steps
+/// after a step that panicked do all of their work: a node whose node document cannot be
+/// written still ends the grants whose time passed and still writes its pending entries
+/// again.
+pub async fn sweep(node: &Arc<Node>) {
+    step(renew_node_document(node.clone())).await;
+    step(end_what_passed(node.clone())).await;
+    step(write_pending_entries(node.clone())).await;
+    step(end_idle_connections(node.clone())).await;
+}
+
+/// Runs one step of a sweep on a task of its own and waits for its end. A panic inside the
+/// step ends that task and nothing else (`crate::faults`): the sweep goes on.
+async fn step(step: impl Future<Output = ()> + Send + 'static) {
+    let _ = tokio::spawn(step).await;
+}
+
+/// The first step of a sweep: [`write_node_document`].
+async fn renew_node_document(node: Arc<Node>) {
+    write_node_document(&node).await;
+}
+
+/// The second step of a sweep: visits every account of the node once, in the order of the
+/// sorted index, one chunk of the index at a time. It ends a grant whose time passed (as every
+/// read of the state of an account does) and drops the merge keys whose window passed and the
+/// kept `refresh` responses whose time passed.
+async fn end_what_passed(node: Arc<Node>) {
+    let now_ms = node.now_ms();
+    for (_, account) in node.accounts_after("") {
+        let mut account = lock(&account);
+        account.expire(now_ms);
+        account.prune_recent(now_ms);
+        account.prune_refreshes(now_ms);
+    }
+}
+
+/// The third step of a sweep, in three passes.
 ///
 /// The first pass visits every account of the node once, in the order of the sorted index,
-/// one chunk of the index at a time: it ends a grant whose time passed (as every read of the
-/// state of an account does), drops the merge keys whose window passed and the kept `refresh`
-/// responses whose time passed, and collects the accounts that have a pending entry.
+/// one chunk of the index at a time, and collects the accounts that have a pending entry. The
+/// `pending_since_ms` of the oldest pending entry it found is kept in the counts of the node
+/// (0 when there is none): `pending_oldest_ms` of health is computed from it.
 ///
 /// The second pass visits the collected accounts one at a time, in an order the random source
 /// of the platform shuffles. The pending entries of an account are written with the rules of
@@ -1035,35 +1133,28 @@ pub async fn keep_sweeping(node: Arc<Node>) {
 /// again. An entry the store does not confirm stays pending for the next sweep.
 ///
 /// The third pass reads the oldest pending entry of the collected accounts again and keeps its
-/// `pending_since_ms` in the counts of the node (0 when none is left): `pending_oldest_ms` of
-/// health is computed from it until the next sweep.
+/// `pending_since_ms` in the counts of the node (0 when none is left), until the next sweep.
 ///
 /// The random order and the jitter spread the writes of the accounts whose entries became
 /// pending at one moment (an outage of the store) over two sweeps instead of one burst, and
 /// the rate keeps the recovery from more than doubling the live load on the store.
-pub async fn sweep(node: &Node) {
-    // The node document first: a node whose document the store has not confirmed, or whose
-    // latest confirmed write is 30 days old, writes it here when no call did (protocol.md 7.7).
-    write_node_document(node).await;
+async fn write_pending_entries(node: Arc<Node>) {
+    let node = node.as_ref();
     let now_ms = node.now_ms();
-    let platform = node.platform.as_ref();
-    let mut random = RandomDraws::new(platform);
-    let mut pending_accounts: Vec<(String, Arc<AccountLock>)> = Vec::new();
-    for (user_id, account) in node.accounts_after("") {
-        let mut guard = lock(&account);
-        guard.expire(now_ms);
-        guard.prune_recent(now_ms);
-        guard.prune_refreshes(now_ms);
-        if guard.oldest_pending_since_ms().is_some() {
-            drop(guard);
-            pending_accounts.push((user_id, account));
-        }
-    }
+    let mut pending_accounts: Vec<Arc<AccountLock>> = node
+        .accounts_after("")
+        .map(|(_, account)| account)
+        .filter(|account| lock(account).oldest_pending_since_ms().is_some())
+        .collect();
+    // Kept before the writes as well: a pass that ends early leaves the age of the entries it
+    // found, not the age the sweep before it found.
+    keep_oldest_pending(node, &pending_accounts);
+    let mut random = RandomDraws::new(node.platform.as_ref());
     shuffle(&mut pending_accounts, &mut random);
     let deadline = Instant::now() + SWEEP_INTERVAL;
     let mut bucket = TokenBucket::new(node.limits.sweep_write_rate);
     let interval_ms = u64::try_from(SWEEP_INTERVAL.as_millis()).unwrap_or(u64::MAX);
-    for (_, account) in &pending_accounts {
+    for account in &pending_accounts {
         let waiting = {
             let guard = lock(account);
             guard
@@ -1086,14 +1177,32 @@ pub async fn sweep(node: &Node) {
         let notify = lock(account).notify.clone();
         notify.notify_waiters();
     }
-    let oldest_since_ms = pending_accounts
+    keep_oldest_pending(node, &pending_accounts);
+}
+
+/// Keeps the `pending_since_ms` of the oldest pending entry of `accounts` in the counts of
+/// the node, 0 when none of them has a pending entry (`pending_oldest_ms` of health).
+fn keep_oldest_pending(node: &Node, accounts: &[Arc<AccountLock>]) {
+    let oldest_since_ms = accounts
         .iter()
-        .filter_map(|(_, account)| lock(account).oldest_pending_since_ms())
+        .filter_map(|account| lock(account).oldest_pending_since_ms())
         .min()
         .unwrap_or(0);
     node.counters
         .pending_oldest_since_ms
         .store(oldest_since_ms, Ordering::Relaxed);
+}
+
+/// The fourth step of a sweep: ends the idle connections to the providers and to the log
+/// store whose idle time passed, and drops the ones their peer closed. A connection is
+/// otherwise looked at when a call asks for one or gives one back only, so without this step
+/// a node that receives no further call would hold its idle connections until their peers
+/// close them. The IMAP sessions the node keeps end at their time by a task of each
+/// (`crate::mail_sessions`).
+async fn end_idle_connections(node: Arc<Node>) {
+    let now_ms = node.now_ms();
+    node.egress.provider_idle.end_idle(now_ms);
+    node.log_store.end_idle_connections(now_ms);
 }
 
 /// Random values from the random source of the platform, read 512 bytes at a time. When the

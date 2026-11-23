@@ -25,6 +25,7 @@ use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use super::mail_stand_in::until;
 use super::provider_and_log_store;
 use crate::api::peer::{export_to, import_from};
 use crate::attest::{Peer, Program};
@@ -2106,6 +2107,67 @@ async fn a_reused_connection_carries_the_current_credentials() {
         writes[1].header("authorization")
     );
     assert_eq!(harness.platform.connections().len(), 1);
+}
+
+#[tokio::test]
+async fn an_idle_connection_to_the_store_ends_at_its_idle_time_without_a_further_write() {
+    let (provider, _store) = stand_in().await;
+    let (harness, app) = node_with_log_store(&provider).await;
+    let idle = || async {
+        harness.health().await["state"]["idle_connections"]["log_store"]
+            .as_u64()
+            .unwrap()
+    };
+    let opened = || harness.platform.connections().len();
+
+    // The node document and the entry of the grant went over one connection, which is idle
+    // now, in the node and at the store.
+    assert_eq!(
+        (idle().await, opened(), provider.open_connections()),
+        (1, 1, 1)
+    );
+
+    // A write within the idle time goes over it. The node writes no further entry: a sweep
+    // before the idle time passed leaves the connection, and the sweep after it ends the
+    // connection, and the store reads its end.
+    let half = limits::LOG_STORE_IDLE_MS / 2;
+    harness.node.clock.advance(half);
+    assert_eq!(release(&harness, &app, &password(&app)).await.0, 200);
+    assert_eq!((idle().await, opened()), (1, 1));
+    harness.node.clock.advance(half);
+    log_store::sweep(&harness.node).await;
+    assert_eq!((idle().await, provider.open_connections()), (1, 1));
+    harness.node.clock.advance(half);
+    log_store::sweep(&harness.node).await;
+    assert_eq!(idle().await, 0);
+    until("the idle connection ended", || {
+        provider.open_connections() == 0
+    })
+    .await;
+
+    // The next write opens a connection. A connection whose idle time passed carries no
+    // write, also before a sweep ended it.
+    assert_eq!(release(&harness, &app, &password(&app)).await.0, 200);
+    assert_eq!((idle().await, opened()), (1, 2));
+    harness.node.clock.advance(limits::LOG_STORE_IDLE_MS);
+    assert_eq!(release(&harness, &app, &password(&app)).await.0, 200);
+    assert_eq!((idle().await, opened()), (1, 3));
+    until("the connection that was passed over ended", || {
+        provider.open_connections() == 1
+    })
+    .await;
+
+    // A connection the store closed is no idle connection of the node, also before a write
+    // or a sweep looks at it.
+    provider.close_idle_connections();
+    until("the node read the end of the connection", || {
+        harness.node.log_store.idle_connections() == 0
+    })
+    .await;
+    assert_eq!(idle().await, 0);
+    assert_eq!(release(&harness, &app, &password(&app)).await.0, 200);
+    assert_eq!(opened(), 4);
+    assert_eq!(harness.health().await["log_store"]["pending"], 0);
 }
 
 /// One day in milliseconds.

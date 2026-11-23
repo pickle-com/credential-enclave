@@ -39,7 +39,7 @@ use crate::state::Node;
 /// that reused an idle connection), `refresh` the token address calls of `refresh` the node
 /// continued after their time limit, by outcome and in progress, and `state` the sizes of the
 /// variable state of the accounts (kept `refresh` responses, merge keys, unconfirmed entries)
-/// and the idle connections by peer.
+/// and the idle connections the node holds open at the moment of the call, by peer.
 ///
 /// Every count of the accounts is a count the node keeps with the state it counts
 /// (`crate::state::StateCounters`): the call walks no account, so its time does not grow with
