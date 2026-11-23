@@ -33,7 +33,9 @@
 //!    credential. In a pod of the delegation role or of the reserve role it then asks the
 //!    backend to collect the state of the node and waits for a time that grows with the
 //!    delegations of the node (`drain`). In a pod of each of the three roles it waits for the
-//!    calls the node is in the middle of and for the connections of their callers (`calls`).
+//!    calls the node is in the middle of, makes the inbound relay take no further connection,
+//!    and waits for the connections of callers the relay holds (`calls`): no caller reaches
+//!    the pod while its enclave ends.
 //!
 //! With the argument `drain` it makes the shutdown collection call of step 7 alone, logs its
 //! outcome and ends with the status 0 whatever the outcome: the pre-stop hook of the pod runs
@@ -107,7 +109,7 @@ use drain::Drain;
 use egress::{Allowlist, EgressCounters, Reach, TcpOutbound};
 use faults::vital;
 use ready::Readiness;
-use relay::{InboundCounters, NodeConnector, VsockListener, VsockNode};
+use relay::{InboundCounters, InboundDoor, NodeConnector, VsockListener, VsockNode};
 use watch::EnclaveWatch;
 
 /// The provider definitions of the node. The host program is built from the same file.
@@ -257,23 +259,32 @@ async fn collect(drain: Option<Drain>, node: &dyn NodeConnector) {
 /// its calls in progress end within a time that counts from here. In a pod of the delegation
 /// role or of the reserve role the backend then collects the state of the node, and moves its
 /// delegations while its calls in progress end. A node of the forward role holds nothing to
-/// collect. Then the calls the node is in the middle of, and the connections of their
-/// callers, are waited for.
+/// collect. Then the calls the node is in the middle of are waited for, the inbound relay
+/// closes its listener (`door`), and the connections of callers it holds are waited for.
 ///
 /// With `enclave_ended` the watch confirmed that the enclave ended on its own: the node is
 /// gone and holds no call, so it is not closed and not waited for, and the collection tells
-/// the backend that the node of the pod is gone.
+/// the backend that the node of the pod is gone. The inbound relay closes its listener
+/// first: a connection it took would reach no node.
+///
+/// When this returns the inbound relay takes no connection, however the waits ended: a
+/// caller that connects while the enclave ends is refused, and a refused connection did not
+/// open.
 async fn hand_on_and_finish(
     role: Role,
     drain: Option<Drain>,
     node: &dyn NodeConnector,
     callers: &relay::Pipes,
+    door: &InboundDoor,
     watch: &EnclaveWatch,
     enclave_ended: bool,
 ) {
     let wait = match enclave_ended {
-        true => None,
-        false => Some(calls::Wait::begin(node, callers).await),
+        true => {
+            close_the_door(door).await;
+            None
+        }
+        false => Some(calls::Wait::begin(node, callers, door).await),
     };
     match role {
         Role::Delegation | Role::Reserve => collect(drain, node).await,
@@ -281,6 +292,17 @@ async fn hand_on_and_finish(
     }
     if let Some(wait) = wait {
         log(&wait.finish_unless_ended(watch).await.line());
+    }
+    // The wait closed the door when the node held no place. A wait that ended at the limit
+    // of the calls, or with an enclave that ended on its own, closes it here.
+    close_the_door(door).await;
+}
+
+/// Makes the inbound relay take no further connection, and logs one line when this call is
+/// the one that did it.
+async fn close_the_door(door: &InboundDoor) {
+    if door.close().await {
+        log("calls: the inbound relay takes no further connection");
     }
 }
 
@@ -595,10 +617,13 @@ async fn run() -> Result<(), String> {
             config::BASE_URL_VARIABLE
         )),
     }
+    // The shutdown closes the door of the inbound relay before the enclave ends.
+    let (inbound_door, door_order) = relay::inbound_door();
     tokio::spawn(vital(relay::serve(
         inbound_listener,
         node.clone(),
         inbound_counters.clone(),
+        door_order,
     )));
 
     // The host program ends on a termination signal, or when the watch confirmed that the
@@ -628,6 +653,7 @@ async fn run() -> Result<(), String> {
         drain,
         node.as_ref(),
         inbound_counters.pipes(),
+        &inbound_door,
         &watch,
         enclave_ended,
     )
@@ -703,11 +729,14 @@ mod shutdown_tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use std::io;
+    use std::net::{Ipv4Addr, SocketAddr};
+
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
 
     use super::{hand_on_and_finish, Drain, EnclaveWatch, Role};
-    use crate::relay::Pipes;
+    use crate::relay::{self, inbound_door, InboundCounters, InboundDoor, Pipes};
     use crate::testing::{health_body_with_limit, Behavior, Call, FakeNode};
 
     /// A node that answers `close` with 200 and whose `health` says that `calls` forward calls
@@ -770,11 +799,13 @@ mod shutdown_tests {
             let (node, callers) = (node.clone(), callers.clone());
             tokio::spawn(async move {
                 let watch = EnclaveWatch::new();
+                let (door, _) = inbound_door();
                 hand_on_and_finish(
                     Role::Delegation,
                     Some(drain),
                     node.as_ref(),
                     &callers,
+                    &door,
                     &watch,
                     false,
                 )
@@ -817,6 +848,7 @@ mod shutdown_tests {
         let drain = drain_to(listener.local_addr().unwrap().port());
         let backend = tokio::spawn(backend(listener, node.clone()));
         let watch = EnclaveWatch::new();
+        let (door, _) = inbound_door();
         tokio::time::timeout(
             Duration::from_secs(5),
             hand_on_and_finish(
@@ -824,6 +856,7 @@ mod shutdown_tests {
                 Some(drain),
                 node.as_ref(),
                 &callers,
+                &door,
                 &watch,
                 false,
             ),
@@ -846,7 +879,8 @@ mod shutdown_tests {
             let node = node_with(Arc::new(AtomicU64::new(0)));
             let callers = Pipes::new(16);
             let watch = EnclaveWatch::new();
-            hand_on_and_finish(role, None, node.as_ref(), &callers, &watch, false).await;
+            let (door, _) = inbound_door();
+            hand_on_and_finish(role, None, node.as_ref(), &callers, &door, &watch, false).await;
             let paths: Vec<String> = node.calls().into_iter().map(|call| call.path).collect();
             assert_eq!(paths, ["/v1/close", "/v1/health"], "{role:?}");
         }
@@ -862,6 +896,7 @@ mod shutdown_tests {
         let drain = drain_to(listener.local_addr().unwrap().port());
         let backend = tokio::spawn(backend(listener, node.clone()));
         let watch = EnclaveWatch::new();
+        let (door, _) = inbound_door();
         tokio::time::timeout(
             Duration::from_secs(5),
             hand_on_and_finish(
@@ -869,6 +904,7 @@ mod shutdown_tests {
                 Some(drain),
                 node.as_ref(),
                 &callers,
+                &door,
                 &watch,
                 true,
             ),
@@ -879,6 +915,178 @@ mod shutdown_tests {
         // nothing up.
         assert!(backend.await.unwrap().is_empty());
         assert_eq!(callers.held(), 1);
+    }
+
+    /// The inbound relay of a pod in front of `node`, on a port of this machine: its address,
+    /// its counts, and the half of its door that the shutdown holds.
+    fn relay_in_front_of(node: Arc<FakeNode>) -> (SocketAddr, Arc<InboundCounters>, InboundDoor) {
+        let listener = relay::listen_tcp(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            relay::LISTEN_BACKLOG,
+        )
+        .unwrap();
+        let address = listener.local_addr().unwrap();
+        let counters = Arc::new(InboundCounters::default());
+        let (door, order) = inbound_door();
+        tokio::spawn(relay::serve(listener, node, counters.clone(), order));
+        (address, counters, door)
+    }
+
+    /// One call of a caller through the relay at `address`: the status line of its response.
+    async fn status_of_a_call(address: SocketAddr, path: &str) -> String {
+        let mut caller = TcpStream::connect(address).await.unwrap();
+        let request = format!("GET {path} HTTP/1.1\r\nhost: node\r\nconnection: close\r\n\r\n");
+        caller.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        caller.read_to_string(&mut response).await.unwrap();
+        response.lines().next().unwrap_or_default().to_string()
+    }
+
+    #[tokio::test]
+    async fn a_pod_that_shuts_down_refuses_its_callers_before_its_enclave_ends() {
+        let node = node_with(Arc::new(AtomicU64::new(0)));
+        let (address, counters, door) = relay_in_front_of(node.clone());
+        // Before the shutdown a caller reaches the node through the relay.
+        assert_eq!(
+            status_of_a_call(address, "/v1/health").await,
+            "HTTP/1.1 200 OK"
+        );
+        // The connection of a caller that is open when the signal comes, and stays open.
+        let mut held = TcpStream::connect(address).await.unwrap();
+        for _ in 0..200 {
+            if counters.pipes().held() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(counters.pipes().held(), 1);
+
+        let shutdown = {
+            let (node, counters) = (node.clone(), counters.clone());
+            tokio::spawn(async move {
+                let watch = EnclaveWatch::new();
+                hand_on_and_finish(
+                    Role::Forward,
+                    None,
+                    node.as_ref(),
+                    counters.pipes(),
+                    &door,
+                    &watch,
+                    false,
+                )
+                .await;
+            })
+        };
+
+        // The node holds no place: the relay closed its listener, and the shutdown waits for
+        // the connection the relay holds. A caller that connects meanwhile is refused: its
+        // connection did not open, and nothing of it reaches a node that is about to end.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(!shutdown.is_finished());
+        let refused = TcpStream::connect(address).await.unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::ConnectionRefused);
+        // The connection that was open still reaches the node: its call is answered.
+        held.write_all(b"GET /v1/health HTTP/1.1\r\nhost: node\r\nconnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        held.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        drop(held);
+
+        // The relay holds no connection: the shutdown goes on to the end of the enclave, and
+        // the pod still refuses its callers.
+        tokio::time::timeout(Duration::from_secs(5), shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(counters.pipes().held(), 0);
+        let refused = TcpStream::connect(address).await.unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::ConnectionRefused);
+        assert_eq!(counters.node_connect_failures(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_pod_whose_wait_ended_at_another_end_refuses_its_callers_all_the_same() {
+        // An enclave that ended on its own: the relay closes its listener before the backend
+        // is told, and a caller is refused instead of reaching no node.
+        let node = FakeNode::new(Behavior::Unreachable);
+        let (address, counters, door) = relay_in_front_of(node.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let drain = drain_to(listener.local_addr().unwrap().port());
+        let refused_at_the_collection = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(stream.read_u8().await.unwrap());
+            }
+            let refused = TcpStream::connect(address)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.kind());
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 17\r\n\r\n{\"complete\":true}")
+                .await
+                .unwrap();
+            refused
+        });
+        let watch = EnclaveWatch::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            hand_on_and_finish(
+                Role::Delegation,
+                Some(drain),
+                node.as_ref(),
+                counters.pipes(),
+                &door,
+                &watch,
+                true,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            refused_at_the_collection.await.unwrap(),
+            Err(io::ErrorKind::ConnectionRefused)
+        );
+        assert_eq!(counters.node_connect_failures(), 0);
+
+        // The enclave ends on its own while a call holds its place: the wait ends there, and
+        // the relay closes its listener before the enclave is ended.
+        let node = node_with(Arc::new(AtomicU64::new(1)));
+        let (address, counters, door) = relay_in_front_of(node.clone());
+        let watch = EnclaveWatch::new();
+        let shutdown = {
+            let (node, counters, watch) = (node.clone(), counters.clone(), watch.clone());
+            tokio::spawn(async move {
+                hand_on_and_finish(
+                    Role::Forward,
+                    None,
+                    node.as_ref(),
+                    counters.pipes(),
+                    &door,
+                    &watch,
+                    false,
+                )
+                .await;
+            })
+        };
+        // The call holds its place: the relay is open, and a caller reaches the closed node.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(!shutdown.is_finished());
+        assert_eq!(
+            status_of_a_call(address, "/v1/health").await,
+            "HTTP/1.1 200 OK"
+        );
+        for _ in 0..crate::watch::GONE_POLLS {
+            watch.observe(Some(false));
+        }
+        tokio::time::timeout(Duration::from_secs(5), shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+        let refused = TcpStream::connect(address).await.unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::ConnectionRefused);
     }
 }
 

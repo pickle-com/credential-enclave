@@ -2015,6 +2015,7 @@ mod tests {
             relay_listener,
             FakeNode::new(Behavior::Unreachable),
             inbound_counters.clone(),
+            relay::inbound_door().1,
         ));
         let mut caller = TcpStream::connect(relay_address).await.unwrap();
         let mut buffer = [0u8; 8];

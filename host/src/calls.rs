@@ -17,11 +17,17 @@
 //!    call holds its place from before it reads the closing flag to the end of its response
 //!    body. So a closed node that holds no place has no such request in progress and begins
 //!    none;
-//! 3. waits until every connection of a caller that the inbound relay held at that moment has
-//!    ended: the last part of a response and the end record of its stream may still be on
-//!    their way to the caller, and a call that holds no place (`refresh`, `oauth/complete`,
-//!    `release`, a command of an app) ends within the time of this wait. A connection the
-//!    relay takes later is not waited for.
+//! 3. closes the door of the inbound relay ([`InboundDoor::close`]): the relay takes the
+//!    connections that wait in the queue of its listener and closes the listener. A caller
+//!    that connects from then on is refused by the kernel. A connection the relay took while
+//!    the enclave ended would end without a response, and its caller could not tell whether
+//!    the node had acted on its request: a refused connection did not open, and its caller
+//!    takes any call to another node, as it does with the answer `closing`;
+//! 4. waits until the inbound relay holds no connection of a caller: the last part of a
+//!    response and the end record of its stream may still be on their way to the caller, a
+//!    call that holds no place (`refresh`, `oauth/complete`, `release`, a command of an app)
+//!    ends within the time of this wait, and a call that reached the closed node last gets
+//!    its answer `closing`.
 //!
 //! In a pod of the delegation role or of the reserve role the shutdown collection call
 //! (`drain`) runs between step 1 and step 2: the backend moves the delegations of the node
@@ -31,7 +37,8 @@
 //!
 //! Each of the two waits has a limit ([`CALLS_WAIT`], [`CALLERS_WAIT`]), and the enclave ends
 //! after them whatever the node said. A node that does not answer is asked again until the
-//! limit: its calls may be going on all the same.
+//! limit: its calls may be going on all the same. The door of the relay is closed before the
+//! enclave ends however the waits ended (`main.rs`).
 
 use std::time::Duration;
 
@@ -41,7 +48,7 @@ use tokio::time::Instant;
 use crate::health::node_health;
 use crate::http;
 use crate::log;
-use crate::relay::{NodeConnector, Pipes};
+use crate::relay::{InboundDoor, NodeConnector, Pipes};
 use crate::watch::EnclaveWatch;
 
 /// The longest wait for the node to hold no place of a forward call, from the termination
@@ -58,9 +65,10 @@ use crate::watch::EnclaveWatch;
 /// A place that is held after that time is the place of no request to a provider or a site.
 pub const CALLS_WAIT: Duration = Duration::from_secs(660);
 /// The longest wait for the connections of the callers, from the moment the node holds no
-/// place: 60 seconds, the time for which the node itself waits for a caller to take bytes of a
-/// response (`inbound_idle`, enclave.md section 8). The calls that hold no place end within
-/// it as well: the time limit of a token address call is 15 seconds (enclave.md 6.3).
+/// place and the inbound relay takes no further connection: 60 seconds, the time for which
+/// the node itself waits for a caller to take bytes of a response (`inbound_idle`, enclave.md
+/// section 8). The calls that hold no place end within it as well: the time limit of a token
+/// address call is 15 seconds (enclave.md 6.3).
 pub const CALLERS_WAIT: Duration = Duration::from_secs(60);
 /// The longest time from the termination signal to the end of the two waits. The
 /// `terminationGracePeriodSeconds` of a pod covers it with a margin (enclave.md section 9).
@@ -77,8 +85,8 @@ const CLOSE_REPLY_LIMIT_BYTES: usize = 4096;
 /// How the wait for the calls of a node ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
-    /// The node is closed and holds no place of a forward call, and every connection of a
-    /// caller that was open at that moment has ended.
+    /// The node is closed and holds no place of a forward call, the inbound relay takes no
+    /// further connection, and every connection of a caller it held has ended.
     Finished,
     /// The node did not say within [`CALLS_WAIT`] that it holds no place.
     CallsLeft {
@@ -88,8 +96,8 @@ pub enum Outcome {
         /// no answer after the close.
         calls: Option<u64>,
     },
-    /// The node holds no place, and connections of callers that were open at that moment are
-    /// still open [`CALLERS_WAIT`] later.
+    /// The node holds no place, and connections of callers the inbound relay held when it
+    /// closed its listener are still open [`CALLERS_WAIT`] later.
     CallersLeft {
         /// The number of these connections.
         callers: usize,
@@ -153,11 +161,13 @@ async fn calls_in_progress(node: &dyn NodeConnector) -> Option<u64> {
     Some(health.load?.forward_calls)
 }
 
-/// The wait of one shutdown for the calls in progress of the node (the three steps of the
+/// The wait of one shutdown for the calls in progress of the node (the four steps of the
 /// module). It begins with the termination signal, and its limits count from there.
 pub struct Wait<'a> {
     node: &'a dyn NodeConnector,
     callers: &'a Pipes,
+    /// The door of the inbound relay that holds `callers`.
+    door: &'a InboundDoor,
     /// The moment of the termination signal.
     started: Instant,
     /// Whether the node took the `close` call.
@@ -168,7 +178,11 @@ impl<'a> Wait<'a> {
     /// Step 1, at the termination signal: closes the node, in one attempt. A node that does
     /// not take the call is asked again by [`Wait::finish`]. One line of the log names the
     /// limits of the wait, and one the close.
-    pub async fn begin(node: &'a dyn NodeConnector, callers: &'a Pipes) -> Wait<'a> {
+    pub async fn begin(
+        node: &'a dyn NodeConnector,
+        callers: &'a Pipes,
+        door: &'a InboundDoor,
+    ) -> Wait<'a> {
         let started = Instant::now();
         log(&format!(
             "calls: closing the node, then waiting {} s at the most for its calls in progress \
@@ -179,6 +193,7 @@ impl<'a> Wait<'a> {
         let mut wait = Wait {
             node,
             callers,
+            door,
             started,
             closed: false,
         };
@@ -203,18 +218,19 @@ impl<'a> Wait<'a> {
         }
     }
 
-    /// Steps 2 and 3: waits for the calls in progress of the node and for the connections of
-    /// their callers, for [`CALLS_WAIT`] at the most from the termination signal until the
-    /// node holds no place, and from then on for [`CALLERS_WAIT`] at the most. One line of
-    /// the log names each step that is done, with the milliseconds since the signal.
+    /// Steps 2 to 4: waits for the calls in progress of the node, for [`CALLS_WAIT`] at the
+    /// most from the termination signal until the node holds no place, then closes the door
+    /// of the inbound relay and waits for the connections the relay holds, for
+    /// [`CALLERS_WAIT`] at the most. One line of the log names each step that is done, with
+    /// the milliseconds since the signal.
     pub async fn finish(mut self) -> Outcome {
         let mut calls: Option<u64> = None;
-        // Set when the closed node first holds no place: the mark of the connections of
-        // callers that are open at that moment, and the limit of the wait for them.
-        let mut ended: Option<(u64, Instant)> = None;
+        // Set when the closed node first holds no place and the relay has closed its
+        // listener: the limit of the wait for the connections of callers the relay holds.
+        let mut ended: Option<Instant> = None;
         loop {
             // The limit of the wait that is going on. No call to the node outlasts it.
-            let limit = ended.map_or(self.started + CALLS_WAIT, |(_, limit)| limit);
+            let limit = ended.unwrap_or(self.started + CALLS_WAIT);
             if !self.closed {
                 self.close().await;
             }
@@ -225,10 +241,13 @@ impl<'a> Wait<'a> {
                     .unwrap_or(None);
                 match answer {
                     Some(0) => {
-                        ended = Some((self.callers.mark(), Instant::now() + CALLERS_WAIT));
+                        // The relay closes its listener at once. A relay that does not is
+                        // not waited for past the limit of the calls.
+                        let _ = tokio::time::timeout_at(limit, self.door.close()).await;
+                        ended = Some(Instant::now() + CALLERS_WAIT);
                         log(&format!(
-                            "calls: none in progress after {} ms, {} connections of callers \
-                             are open",
+                            "calls: none in progress after {} ms, the inbound relay takes no \
+                             further connection, {} connections of callers are open",
                             self.elapsed_ms(),
                             self.callers.held()
                         ));
@@ -243,8 +262,8 @@ impl<'a> Wait<'a> {
             }
             let now = Instant::now();
             match ended {
-                Some((mark, limit)) => {
-                    let left = self.callers.held_before(mark);
+                Some(limit) => {
+                    let left = self.callers.held();
                     if left == 0 {
                         log(&format!(
                             "calls: the connections of the callers have ended after {} ms",
@@ -286,6 +305,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::relay::inbound_door;
     use crate::testing::{health_body_with_limit, Behavior, Call, FakeNode};
 
     /// The answers of a node: `close` is answered with 200, and `health` says that `calls`
@@ -311,9 +331,11 @@ mod tests {
             .count()
     }
 
-    /// The whole wait of a pod whose shutdown has nothing between the close and the wait.
+    /// The whole wait of a pod whose shutdown has nothing between the close and the wait. No
+    /// relay holds the other half of the door: it is closed at once when the wait closes it.
     async fn finish(node: &FakeNode, callers: &Pipes) -> Outcome {
-        Wait::begin(node, callers).await.finish().await
+        let (door, _) = inbound_door();
+        Wait::begin(node, callers, &door).await.finish().await
     }
 
     #[tokio::test(start_paused = true)]
@@ -357,14 +379,67 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(5)).await;
         assert_eq!(node.calls().len(), asked);
 
-        // A connection the relay takes from here on does not hold the shutdown: the closed
-        // node begins no request for it. The wait ends with the connection that was open.
-        let later = callers.admit().unwrap();
+        // The wait ends when the relay holds no connection of a caller.
         drop(caller);
         assert_eq!(waiting.await.unwrap(), Outcome::Finished);
-        assert_eq!(callers.held(), 1);
-        drop(later);
+        assert_eq!(callers.held(), 0);
         assert_eq!(close_calls(&node), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_relay_closes_its_door_when_the_node_holds_no_place_and_is_waited_for() {
+        let calls = Arc::new(AtomicU64::new(1));
+        let node = FakeNode::new(answers(calls.clone()));
+        let callers = Pipes::new(16);
+        // The connection of the caller of the call in progress, and the connection of a
+        // caller that reached the closed node and is reading its answer `closing`.
+        let caller = callers.admit().unwrap();
+        let refused = callers.admit().unwrap();
+        let (door, mut order) = inbound_door();
+        let started = Instant::now();
+        // The relay: it closes its listener when it is told, 300 milliseconds after the
+        // order in this test, and says when the order came.
+        let relay = tokio::spawn(async move {
+            order.told_to_close().await;
+            let told = Instant::now();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            told
+        });
+        let waiting = {
+            let (node, callers) = (node.clone(), callers.clone());
+            tokio::spawn(async move {
+                Wait::begin(node.as_ref(), &callers, &door)
+                    .await
+                    .finish()
+                    .await
+            })
+        };
+
+        // A call holds its place: the backend may still be calling the node through the
+        // relay, and the door stays open.
+        tokio::time::sleep(Duration::from_secs(100)).await;
+        assert!(!relay.is_finished());
+        assert!(!waiting.is_finished());
+
+        // The node holds no place: the relay is told at the next look at the node, and the
+        // wait goes on only after the relay has closed its listener.
+        calls.store(0, Ordering::SeqCst);
+        let told = relay.await.unwrap();
+        let waited = told - started;
+        assert!(
+            waited >= Duration::from_secs(100) && waited <= Duration::from_secs(100) + POLL_PAUSE,
+            "{waited:?}"
+        );
+        assert!(!waiting.is_finished());
+
+        // Every connection the relay holds is waited for: the one of the call that was in
+        // progress, and the one that reached the closed node last.
+        drop(caller);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(!waiting.is_finished());
+        drop(refused);
+        assert_eq!(waiting.await.unwrap(), Outcome::Finished);
+        assert_eq!(callers.held(), 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -425,8 +500,9 @@ mod tests {
         let calls = Arc::new(AtomicU64::new(3));
         let node = FakeNode::new(answers(calls.clone()));
         let callers = Pipes::new(16);
+        let (door, _) = inbound_door();
         let started = Instant::now();
-        let wait = Wait::begin(node.as_ref(), &callers).await;
+        let wait = Wait::begin(node.as_ref(), &callers, &door).await;
         // The node is closed before anything else happens: one call, the close.
         assert_eq!(started.elapsed(), Duration::ZERO);
         let paths: Vec<String> = node.calls().into_iter().map(|call| call.path).collect();
@@ -454,7 +530,7 @@ mod tests {
         let node = FakeNode::new(answers(calls.clone()));
         let caller = callers.admit().unwrap();
         let started = Instant::now();
-        let wait = Wait::begin(node.as_ref(), &callers).await;
+        let wait = Wait::begin(node.as_ref(), &callers, &door).await;
         tokio::time::sleep(Duration::from_secs(20)).await;
         calls.store(0, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_secs(280)).await;
@@ -514,7 +590,8 @@ mod tests {
 
         // A node that did not take the close at the signal takes it after the collection.
         let node = FakeNode::new(Behavior::Unreachable);
-        let wait = Wait::begin(node.as_ref(), &callers).await;
+        let (door, _) = inbound_door();
+        let wait = Wait::begin(node.as_ref(), &callers, &door).await;
         assert!(node.calls().is_empty());
         node.set(answers(Arc::new(AtomicU64::new(0))));
         assert_eq!(wait.finish().await, Outcome::Finished);
@@ -530,7 +607,8 @@ mod tests {
         let waiting = {
             let (node, callers, watch) = (node.clone(), callers.clone(), watch.clone());
             tokio::spawn(async move {
-                Wait::begin(node.as_ref(), &callers)
+                let (door, _) = inbound_door();
+                Wait::begin(node.as_ref(), &callers, &door)
                     .await
                     .finish_unless_ended(&watch)
                     .await
@@ -546,8 +624,9 @@ mod tests {
         // Without the end of the enclave the outcome is that of the wait.
         let node = FakeNode::new(answers(Arc::new(AtomicU64::new(0))));
         let watch = EnclaveWatch::new();
+        let (door, _) = inbound_door();
         assert_eq!(
-            Wait::begin(node.as_ref(), &callers)
+            Wait::begin(node.as_ref(), &callers, &door)
                 .await
                 .finish_unless_ended(&watch)
                 .await,

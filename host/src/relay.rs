@@ -23,6 +23,12 @@
 //! its connection itself. When the side that asks is gone, nobody waits for anything, and the
 //! pipe ends at once.
 //!
+//! The inbound relay takes connections until the shutdown of the pod closes its door
+//! ([`InboundDoor`]). It then takes the connections that wait in the queue of its listener,
+//! closes the listener, and holds its pipes until they end: a caller that connects from then
+//! on is refused by the kernel, which is a connection that did not open, and no connection the
+//! relay took is left without the node behind it (`crate::calls`).
+//!
 //! One of the two streams of a pipe is the node, and the end of its bytes says more than the
 //! end of a direction: a node that closed its write side is done with the connection. It
 //! keeps the connection open only until its peer ended too, because the kernel of an enclave
@@ -45,7 +51,8 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::{TcpListener, TcpSocket};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
+use tokio::sync::watch;
 use tokio::time::Instant;
 
 /// The vsock context id the host program gives the enclave.
@@ -539,19 +546,6 @@ impl Pipes {
     /// The connections the relay holds at this moment.
     pub fn held(&self) -> usize {
         self.open().len()
-    }
-
-    /// A mark between the connections the relay took so far and the connections it takes
-    /// from here on: [`Pipes::held_before`] counts the first kind.
-    pub fn mark(&self) -> u64 {
-        // A place gets its number and enters the map under the lock of the map.
-        let _open = self.open();
-        self.next.load(Ordering::Relaxed)
-    }
-
-    /// The connections the relay took before `mark` and still holds.
-    pub fn held_before(&self, mark: u64) -> usize {
-        self.open().range(..mark).count()
     }
 
     /// The age of the connection the relay has held longest, and the longest time one of its
@@ -1136,6 +1130,51 @@ impl InboundCounters {
     }
 }
 
+/// The door of an inbound relay, open until the shutdown of the pod closes it: the half the
+/// shutdown holds, and the half the relay holds ([`serve`]).
+///
+/// An enclave that is ending answers nothing, so a connection the relay took then would end
+/// without a response, and its caller could not tell whether the node had acted on its
+/// request. A connection the kernel refuses did not open, and its caller takes any call to
+/// another node. So the relay stops taking connections before the enclave ends, and the
+/// shutdown waits for the connections it holds (`crate::calls`).
+pub fn inbound_door() -> (InboundDoor, DoorOrder) {
+    let (order, told) = watch::channel(false);
+    (InboundDoor(order), DoorOrder(told))
+}
+
+/// The half of the door of an inbound relay that the shutdown holds ([`inbound_door`]).
+#[derive(Debug)]
+pub struct InboundDoor(watch::Sender<bool>);
+
+impl InboundDoor {
+    /// Tells the relay to take no further connection, and resolves when the relay has closed
+    /// its listener: the connections it holds then ([`Pipes::held`]) are all the connections
+    /// of callers it will ever hold. It resolves at once when the door is closed already, and
+    /// when no relay holds the other half. True when this call is the one that closed the
+    /// door.
+    pub async fn close(&self) -> bool {
+        let closed_before = self.0.send_replace(true);
+        // The relay drops its half after it closed its listener.
+        self.0.closed().await;
+        !closed_before
+    }
+}
+
+/// The half of the door of an inbound relay that the relay holds ([`inbound_door`]).
+#[derive(Debug)]
+pub struct DoorOrder(watch::Receiver<bool>);
+
+impl DoorOrder {
+    /// Resolves when the shutdown closes the door. It does not resolve when the other half is
+    /// gone without having closed it: a relay whose door nobody holds stays open.
+    pub(crate) async fn told_to_close(&mut self) {
+        if self.0.wait_for(|close| *close).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 /// The inbound relay: pipes every connection of `listener` to a new connection to the node. It
 /// holds at most the connections of its counts at once: a connection accepted while it holds
 /// that many is closed without a byte and counted, as the node does with a connection above
@@ -1146,38 +1185,89 @@ impl InboundCounters {
 /// their body (a call it refuses because it is closing, a body above a limit, a path it does
 /// not have), and the caller of such a call gets the answer whole, whenever the rest of its
 /// request arrives.
+///
+/// The relay returns when the shutdown closes `door`: it takes the connections that wait in
+/// the queue of the listener, closes the listener, and drops its half of the door
+/// ([`close_listener`]). The pipes it started go on until they end.
 pub async fn serve(
     listener: TcpListener,
     node: Arc<dyn NodeConnector>,
     counters: Arc<InboundCounters>,
+    mut door: DoorOrder,
 ) {
     loop {
-        let (caller, _) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            Err(error) => {
-                pause_after_failed_accept(AcceptFailure::of(&error)).await;
-                continue;
-            }
+        let accepted = tokio::select! {
+            biased;
+            () = door.told_to_close() => break,
+            accepted = listener.accept() => accepted,
         };
-        let Some(place) = counters.pipes.admit() else {
-            counters.refused.fetch_add(1, Ordering::Relaxed);
-            continue;
-        };
-        let _ = caller.set_nodelay(true);
-        let node = node.clone();
-        let counters = counters.clone();
-        tokio::spawn(async move {
-            match node.connect().await {
-                Ok(stream) => {
-                    pipe(caller, stream, &place, Relay::Inbound).await;
-                }
-                Err(_) => {
-                    counters
-                        .node_connect_failures
-                        .fetch_add(1, Ordering::Relaxed);
+        match accepted {
+            Ok((caller, _)) => take(caller, &node, &counters),
+            Err(error) => pause_after_failed_accept(AcceptFailure::of(&error)).await,
+        }
+    }
+    close_listener(listener, &node, &counters);
+}
+
+/// Takes one connection of a caller: a place of the relay and a pipe to a new connection to
+/// the node, on a task of its own.
+fn take(caller: TcpStream, node: &Arc<dyn NodeConnector>, counters: &Arc<InboundCounters>) {
+    let Some(place) = counters.pipes.admit() else {
+        counters.refused.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let _ = caller.set_nodelay(true);
+    let node = node.clone();
+    let counters = counters.clone();
+    tokio::spawn(async move {
+        match node.connect().await {
+            Ok(stream) => {
+                pipe(caller, stream, &place, Relay::Inbound).await;
+            }
+            Err(_) => {
+                counters
+                    .node_connect_failures
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    });
+}
+
+/// Closes the listener of the inbound relay. The kernel resets every connection that waits in
+/// the queue of a listener when the listener is closed, and the caller of such a connection
+/// reads a connection that opened and ended without a response. So the relay first takes the
+/// connections of the queue, as it took every connection before, and closes the listener when
+/// an accept finds none: the node behind them is alive (the shutdown ends the enclave only
+/// after the relay holds no connection, `crate::calls`). A connection whose handshake the
+/// kernel completes between that accept and the close is still reset: nothing a program can
+/// call closes that gap, which is the time between two system calls.
+fn close_listener(
+    listener: TcpListener,
+    node: &Arc<dyn NodeConnector>,
+    counters: &Arc<InboundCounters>,
+) {
+    // The listener leaves the runtime: an accept on it from here on answers at once, with a
+    // connection of the queue or with the answer that the queue holds none. A listener that
+    // does not leave the runtime is closed as it is.
+    let Ok(listener) = listener.into_std() else {
+        return;
+    };
+    // The queue holds at most the connections the listener was opened for.
+    for _ in 0..INBOUND_LISTEN_BACKLOG {
+        match listener.accept() {
+            Ok((caller, _)) => {
+                // An accepted connection does not take the mode of its listener on Linux.
+                if caller.set_nonblocking(true).is_ok() {
+                    if let Ok(caller) = TcpStream::from_std(caller) {
+                        take(caller, node, counters);
+                    }
                 }
             }
-        });
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+            // The connection was gone before accept returned it: the next one is asked for.
+            Err(error) if AcceptFailure::of(&error) == AcceptFailure::Aborted => {}
+            Err(_) => break,
+        }
     }
 }
 
@@ -1219,14 +1309,33 @@ mod tests {
         relay_holding(node, INBOUND_PIPES).await
     }
 
-    /// An inbound relay that holds at most `limit` connections of callers at once.
+    /// An inbound relay that holds at most `limit` connections of callers at once. Nobody
+    /// holds the other half of its door: it stays open.
     async fn relay_holding(node: EchoNode, limit: usize) -> (SocketAddr, Arc<InboundCounters>) {
         let listener =
             listen_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), LISTEN_BACKLOG).unwrap();
         let address = listener.local_addr().unwrap();
         let counters = Arc::new(InboundCounters::holding(limit));
-        tokio::spawn(serve(listener, Arc::new(node), counters.clone()));
+        let (_, door) = inbound_door();
+        tokio::spawn(serve(listener, Arc::new(node), counters.clone(), door));
         (address, counters)
+    }
+
+    /// An inbound relay in front of a node that echoes, and the half of its door that the
+    /// shutdown holds.
+    async fn relay_with_door() -> (SocketAddr, Arc<InboundCounters>, InboundDoor) {
+        let listener =
+            listen_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), LISTEN_BACKLOG).unwrap();
+        let address = listener.local_addr().unwrap();
+        let counters = Arc::new(InboundCounters::default());
+        let (door, order) = inbound_door();
+        tokio::spawn(serve(
+            listener,
+            Arc::new(EchoNode { reachable: true }),
+            counters.clone(),
+            order,
+        ));
+        (address, counters, door)
     }
 
     /// Runs a pipe of the egress relay between the node `a` and the provider `b` as its own
@@ -2408,7 +2517,8 @@ mod tests {
             answer: answer.to_vec(),
             after_answer: after_answer.clone(),
         };
-        tokio::spawn(serve(listener, Arc::new(node), counters.clone()));
+        let (_, door) = inbound_door();
+        tokio::spawn(serve(listener, Arc::new(node), counters.clone(), door));
         (address, counters, after_answer)
     }
 
@@ -2641,6 +2751,114 @@ mod tests {
         pause_after_failed_accept(AcceptFailure::Other).await;
         let waited = started.elapsed();
         assert!(waited >= 2 * ACCEPT_RETRY_PAUSE && waited < 2 * ACCEPT_RETRY_PAUSE + slack);
+    }
+
+    #[tokio::test]
+    async fn an_inbound_relay_whose_door_is_closed_refuses_a_caller_and_keeps_its_pipes() {
+        let (address, counters, door) = relay_with_door().await;
+        let mut held = TcpStream::connect(address).await.unwrap();
+        held.write_all(b"before").await.unwrap();
+        let mut buffer = [0u8; 6];
+        held.read_exact(&mut buffer).await.unwrap();
+        assert_eq!(&buffer, b"before");
+
+        // The shutdown closes the door: when the call returns the listener is closed.
+        assert!(tokio::time::timeout(Duration::from_secs(5), door.close())
+            .await
+            .unwrap());
+        // A caller that connects now is refused: its connection does not open.
+        for _ in 0..3 {
+            let refused = TcpStream::connect(address).await.unwrap_err();
+            assert_eq!(refused.kind(), io::ErrorKind::ConnectionRefused);
+        }
+        // The connection the relay held goes on: its node is still behind it.
+        assert_eq!(counters.pipes().held(), 1);
+        held.write_all(b"after!").await.unwrap();
+        held.read_exact(&mut buffer).await.unwrap();
+        assert_eq!(&buffer, b"after!");
+        held.shutdown().await.unwrap();
+        assert_eq!(held.read(&mut buffer).await.unwrap(), 0);
+        closed_pipes(&counters, 1).await;
+        assert_eq!(counters.refused(), 0);
+        assert_eq!(counters.node_connect_failures(), 0);
+
+        // A door that is closed is closed: the second call returns at once, and says that it
+        // was not the one that closed the door.
+        assert!(!tokio::time::timeout(Duration::from_secs(5), door.close())
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_inbound_relay_takes_the_connections_that_wait_when_its_door_closes() {
+        let listener =
+            listen_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), LISTEN_BACKLOG).unwrap();
+        let address = listener.local_addr().unwrap();
+        let counters = Arc::new(InboundCounters::default());
+        let (door, order) = inbound_door();
+
+        // Three callers connect while nothing accepts: the kernel completes their
+        // connections, which wait in the queue of the listener, and takes their requests.
+        let mut waiting = Vec::new();
+        for number in 0..3u8 {
+            let mut caller = TcpStream::connect(address).await.unwrap();
+            caller.write_all(&[b'a' + number; 5]).await.unwrap();
+            waiting.push(caller);
+        }
+
+        // The door is closed before the relay accepted once: the relay takes the three
+        // connections of the queue, and only then closes the listener.
+        let closing = tokio::spawn(async move {
+            door.close().await;
+            door
+        });
+        tokio::spawn(serve(
+            listener,
+            Arc::new(EchoNode { reachable: true }),
+            counters.clone(),
+            order,
+        ));
+        let _door = tokio::time::timeout(Duration::from_secs(5), closing)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // None of the three was reset: each reads the answer of the node.
+        for (number, caller) in waiting.iter_mut().enumerate() {
+            let mut buffer = [0u8; 5];
+            caller.read_exact(&mut buffer).await.unwrap();
+            assert_eq!(buffer, [b'a' + number as u8; 5]);
+        }
+        assert_eq!(counters.pipes().held(), 3);
+        assert_eq!(counters.refused(), 0);
+        // A caller that connects after the door closed is refused.
+        let refused = TcpStream::connect(address).await.unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::ConnectionRefused);
+        for caller in &mut waiting {
+            caller.shutdown().await.unwrap();
+        }
+        closed_pipes(&counters, 3).await;
+    }
+
+    #[tokio::test]
+    async fn an_inbound_relay_whose_door_nobody_holds_stays_open() {
+        // The half of the shutdown is dropped without a close: the relay goes on.
+        let (address, counters, door) = relay_with_door().await;
+        drop(door);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut caller = TcpStream::connect(address).await.unwrap();
+        caller.write_all(b"open").await.unwrap();
+        let mut buffer = [0u8; 4];
+        caller.read_exact(&mut buffer).await.unwrap();
+        assert_eq!(&buffer, b"open");
+        assert_eq!(counters.pipes().held(), 1);
+
+        // A door no relay holds is closed at once.
+        let (door, order) = inbound_door();
+        drop(order);
+        assert!(tokio::time::timeout(Duration::from_secs(5), door.close())
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
