@@ -192,8 +192,8 @@
   const LOG_SCREEN_BODIES = 200;
 
   // ---- The chains of format 1 and format 2 (the bucket the binding names) ----
-  // The chains one round follows, the nodes one address request names, the listing pages of one
-  // chain and the entry bodies one round reads, the pages of the node discovery listing, the time
+  // The chains one round follows, the nodes one address request names, the passes of listings
+  // and the entry bodies one round spends, the pages of the node discovery listing, the time
   // after the end of a grant at which the chain of its node is read for the last time, the reads
   // of the store in flight at once, the object versions one address request names, the digits of
   // seq and of time_ms in an object key, the listings one call of the screen spends on going down
@@ -201,7 +201,7 @@
   // screen keeps opened in a runtime.
   const LEGACY_NODES = 64;
   const LEGACY_LISTING_NODES = 16;
-  const LEGACY_ROUND_PAGES = 2;
+  const LEGACY_ROUND_PASSES = 4;
   const LEGACY_ROUND_BODIES = 64;
   const LEGACY_DISCOVERY_PAGES = 2;
   const LEGACY_CLOSE_SLACK_MS = DAY_MS;
@@ -431,32 +431,21 @@
   // node of a release with log_store true is accepted only when the log of its binding equals this
   // value: every node that receives a user key is a node that writes to the log store of this
   // environment first. The entries of format 3 are in shards buckets: bucket number i of them is
-  // named "{h8}-{shard_base}-{i as four digits}", where h8 is the first 8 characters of the
-  // lower-case hexadecimal SHA-256 of the rest of the name (shardBucket). The entries of an
-  // account are in the bucket whose number is the first two bytes of SHA-256(user_id), read as a
+  // named "{h8}-{bucket}-{i as four digits}", where h8 is the first 8 characters of the lower-case
+  // hexadecimal SHA-256 of "{bucket}-{i as four digits}" (shardBucket). The entries of an account
+  // are in the bucket whose number is the first two bytes of SHA-256(user_id), read as a
   // big-endian integer, modulo shards; the node document of a node is in the bucket of its node id
-  // by the same rule.
+  // by the same rule. shards is a constant of the name of the log store, the one the nodes
+  // compile in: 1,024 for the store of prod, 4 for the store of the local stack, 32 for any other.
   // local is the S3 stand-in of the local stack. It is not the store of a server target (the bridge
   // of a debug build reports the server target prod whatever backend the app talks to): it names
   // the buckets of the path-style addresses a debug build accepts (storeAddressAccepted). A release
   // build pins every address to the host of a bucket of its server target.
   const LOG_STORES = {
-    alpha: {
-      bucket: "character-credential-log-alpha-1", region: "us-west-2",
-      shards: 32, shard_base: "character-credential-log-alpha-2",
-    },
-    dev: {
-      bucket: "character-credential-log-dev-1", region: "us-west-2",
-      shards: 32, shard_base: "character-credential-log-dev-2",
-    },
-    prod: {
-      bucket: "character-credential-log-prod-1", region: "us-west-2",
-      shards: 1024, shard_base: "character-credential-log-prod-2",
-    },
-    local: {
-      bucket: "character-credential-log-local-1", region: "us-west-2",
-      shards: 4, shard_base: "character-credential-log-local-2",
-    },
+    alpha: { bucket: "character-credential-log-alpha-1", region: "us-west-2", shards: 32 },
+    dev: { bucket: "character-credential-log-dev-1", region: "us-west-2", shards: 32 },
+    prod: { bucket: "character-credential-log-prod-1", region: "us-west-2", shards: 1024 },
+    local: { bucket: "character-credential-log-local-1", region: "us-west-2", shards: 4 },
   };
   // The server targets that accept a node of platform local (an ordinary process that no
   // attestation verifies: the custody operator). A build whose server target is outside this list
@@ -971,11 +960,12 @@
    *  inside an enclave of the measurement the document states: the document is verified like an
    *  attestation response without a requester (the certificate chain at the time of the document,
    *  the signature, the measurement, the binding and its log store), the signing key of its
-   *  binding is id, and the nonce of the document of a node that writes format 3 is the one of
-   *  nodeDocumentNonce (a node of an earlier release wrote no node document: its document answered
-   *  a request, and its nonce is not compared). Returns {platform, release, measure, listed,
-   *  format} and throws attestation_failed for a document that does not verify. */
-  function verifyNodeDocument(object, id) {
+   *  binding is id, and the nonce of the document is the one of nodeDocumentNonce. With written
+   *  false (the document of a node that a chain of format 2 names: such a node may be of a release
+   *  that wrote no node document, and the backend hands out a document that answered a request)
+   *  the nonce is compared only for a release that writes format 3. Returns {platform, release,
+   *  measure, listed, format} and throws attestation_failed for a document that does not verify. */
+  function verifyNodeDocument(object, id, written) {
     try {
       if (object === null || typeof object !== "object" || object.v !== 1) {
         throw attestationFailure("node document shape");
@@ -998,7 +988,7 @@
       if (object.release !== binding.release) throw attestationFailure("another release");
       const format = object.platform === "nitro" ? (build === undefined ? 3 : logFormatOf(build.release))
         : logFormatOf(binding.release);
-      if (format === 3 && !equal(verified.nonce, nodeDocumentNonce(binding.signPk))) {
+      if ((written || format === 3) && !equal(verified.nonce, nodeDocumentNonce(binding.signPk))) {
         throw attestationFailure("node document nonce");
       }
       return {
@@ -2260,7 +2250,7 @@
   function shardBucket(store, owner) {
     const digest = decode(native.sha256(encode(utf8(owner))));
     const index = ((digest[0] << 8) | digest[1]) % store.shards;
-    const tail = store.shard_base + "-" + String(index).padStart(4, "0");
+    const tail = store.bucket + "-" + String(index).padStart(4, "0");
     return hex(decode(native.sha256(encode(utf8(tail)))).subarray(0, 4)) + "-" + tail;
   }
 
@@ -3228,11 +3218,12 @@
   }
 
   /** Asks for the node documents of ids (LOG_DOCUMENT_NODES per request, budget.documents requests
-   *  at most, sent together) and keeps what they say in log.nodes. Returns a table from node id to
+   *  at most, sent together) and keeps what they say in log.nodes. written says that the nodes
+   *  wrote entries of format 3, and so their node documents (verifyNodeDocument). Returns a table from node id to
    *  "missing" (the backend has none), "rejected" (the document does not verify) or "unasked" (the
    *  budget was spent) for the nodes that got no judgement. A failed request is noted on run and
    *  leaves its nodes unasked. */
-  async function learnNodes(turn, log, run, ids, budget) {
+  async function learnNodes(turn, log, run, ids, budget, written) {
     const left = new Map();
     const requests = [];
     for (let at = 0; at < ids.length; at += LOG_DOCUMENT_NODES) {
@@ -3258,7 +3249,7 @@
           continue;
         }
         try {
-          const facts = verifyNodeDocument(document, id);
+          const facts = verifyNodeDocument(document, id, written);
           log.nodes[id] = { m: facts.measure, p: facts.platform, r: facts.release, f: native.nowMs(), c: 0 };
         } catch (error) {
           if (failureCode(error) !== "attestation_failed") throw error;
@@ -3296,7 +3287,7 @@
       const id = item.parsed.node;
       if (nodeVerdict(log.grants, log.nodes, id) === null && unknown.indexOf(id) < 0) unknown.push(id);
     }
-    const learning = learnNodes(turn, log, run, unknown, budget);
+    const learning = learnNodes(turn, log, run, unknown, budget, true);
     const wanted = items.map(function (item) { return item.parsed.key; });
     const requests = [];
     for (let at = 0; at < wanted.length && budget.bodies > 0; at += LOG_BODY_KEYS) {
@@ -3400,7 +3391,7 @@
       for (const transfer of transfers) {
         if (ids.indexOf(transfer.to) < 0) ids.push(transfer.to);
       }
-      await learnNodes(turn, log, run, ids, budget);
+      await learnNodes(turn, log, run, ids, budget, true);
       for (const transfer of transfers) {
         const verdict = nodeVerdict(log.grants, log.nodes, transfer.to);
         if (verdict === null) noteUnaccepted(log, "node:" + transfer.to, transfer.event.release, transfer.to, true);
@@ -3481,12 +3472,14 @@
   /** The part of a round that reads the chains of format 1 and format 2 this device follows: the
    *  chains of the nodes of releases before LOG_FORMAT_3_FROM that it handed a grant to, and of
    *  the nodes such a node handed the delegation on to. Each open chain is listed from the seq up
-   *  to which it was read (LEGACY_ROUND_PAGES pages per round), the control entries of the new keys
-   *  are read (LEGACY_ROUND_BODIES per round), and a transfer of the delegation (the event
+   *  to which it was read, the control entries of the new keys are read (LEGACY_ROUND_BODIES per
+   *  round), and a transfer of the delegation (the event
    *  grant_transferred_out of this key) is followed: a receiving node whose document verifies with
    *  a measurement no list has is noted (A1), a receiving node of a release that writes format 3
    *  has its entries in the listing of format 3, and any other receiving node is a node of the
-   *  release of the giving node (it wrote no node document), whose chain is followed in turn. A
+   *  release of the giving node (it wrote no node document), whose chain is followed in turn, in
+   *  the same round (LEGACY_ROUND_PASSES passes of listings per round: a pass lists the chains
+   *  whose listing went on and the chains the pass before found). A
    *  chain is closed by the first reading that reached its end after the grant of its node ran
    *  out (LEGACY_CLOSE_SLACK_MS later): a node holds no key after that. The keys read are handed
    *  to the log screen (rememberKeys). */
@@ -3506,8 +3499,10 @@
       run.cut = true;
     }
     let bodiesLeft = LEGACY_ROUND_BODIES;
-    const receivers = new Map();
-    for (let pass = 0; pass < LEGACY_ROUND_PAGES && open.length > 0; pass += 1) {
+    const asked = { documents: 1, bodies: 0 };
+    // Each pass lists the chains that have keys left to read: the open chains first, then the
+    // chains whose listing went on and the chains of the receiving nodes the pass before found.
+    for (let pass = 0; pass < LEGACY_ROUND_PASSES && open.length > 0; pass += 1) {
       const targets = open.map(function (id) {
         return { node: id, key_marker: listingMarker(id, legacy.nodes[id].seq), version_id_marker: null };
       });
@@ -3568,7 +3563,8 @@
         noteFailure(turn, run, failure);
         objects = null;
       }
-      const again = [];
+      const next = [];
+      const receivers = new Map();
       for (const plan of plans) {
         const chain = legacy.nodes[plan.id];
         let reached = chain.seq;
@@ -3610,35 +3606,34 @@
         chain.time_ms = reachedMs;
         if (held) continue;
         if (plan.more) {
-          again.push(plan.id);
+          next.push(plan.id);
           continue;
         }
         if (now > chain.until_ms + LEGACY_CLOSE_SLACK_MS) chain.closed = true;
       }
-      open = again;
+      // The receiving nodes this device has no judgement of: their documents, when the backend
+      // has any. A node without one is a node of the release of the giving node.
+      const unknown = [];
+      receivers.forEach(function (untilMs, id) {
+        if (nodeVerdict(log.grants, log.nodes, id) === null) unknown.push(id);
+      });
+      const left = unknown.length === 0 ? new Map()
+        : await learnNodes(turn, log, run, unknown.slice(0, LOG_DOCUMENT_NODES), asked, false);
+      receivers.forEach(function (untilMs, id) {
+        const verdict = nodeVerdict(log.grants, log.nodes, id);
+        if (verdict !== null && verdict.state === "unaccepted") {
+          noteUnaccepted(log, verdict.measure, verdict.release, id, true);
+          return;
+        }
+        if (verdict !== null && verdict.format === 3) return;
+        if (verdict === null && left.get(id) === "unasked") run.cut = true;
+        const known = legacy.nodes[id] !== undefined;
+        followChain(log, id, untilMs);
+        if (!known && next.indexOf(id) < 0) next.push(id);
+      });
+      open = next.slice(0, LEGACY_NODES);
     }
     if (open.length > 0) run.cut = true;
-    if (receivers.size === 0) return;
-    // The receiving nodes this device has no judgement of: their documents, when the backend has
-    // any. A node without one is a node of the release of the giving node.
-    const unknown = [];
-    receivers.forEach(function (untilMs, id) {
-      if (nodeVerdict(log.grants, log.nodes, id) === null) unknown.push(id);
-    });
-    const asked = { documents: 1, bodies: 0 };
-    const left = unknown.length === 0 ? new Map()
-      : await learnNodes(turn, log, run, unknown.slice(0, LOG_DOCUMENT_NODES), asked);
-    receivers.forEach(function (untilMs, id) {
-      const verdict = nodeVerdict(log.grants, log.nodes, id);
-      if (verdict === null) {
-        if (left.get(id) === "unasked") run.cut = true;
-        followChain(log, id, untilMs);
-      } else if (verdict.state === "unaccepted") {
-        noteUnaccepted(log, verdict.measure, verdict.release, id, true);
-      } else if (verdict.format !== 3) {
-        followChain(log, id, untilMs);
-      }
-    });
   }
 
   // ---- The state a round publishes ----
@@ -3674,14 +3669,15 @@
   }
 
   /** Whether a round is due: this program has ended none on this installation, the last one that
-   *  ended verified or attention is LOG_ROUND_INTERVAL_MS old, or the last one ended pending (then
-   *  not sooner than LOG_ROUND_RETRY_MS after it). */
+   *  completed is LOG_ROUND_INTERVAL_MS old, or the last one did not complete (it ended pending,
+   *  or it could not read the store while a mark of an earlier round stood; then not sooner than
+   *  LOG_ROUND_RETRY_MS after it). */
   function roundDue() {
     const round = storedObject(STORE_ROUND);
     const now = native.nowMs();
     if (round.v !== VERSION) return true;
     const tried = whole(round.tried_ms);
-    if (round.last !== "verified" && round.last !== "attention") {
+    if (round.open === true || (round.last !== "verified" && round.last !== "attention")) {
       return now < tried || now - tried >= LOG_ROUND_RETRY_MS;
     }
     const done = whole(round.done_ms);
@@ -3889,8 +3885,10 @@
     if (conflicts > 0) reasons.push("conflicting_signatures");
     if (held) reasons.push("verification_blocked");
     if (log.missing.length > 0) reasons.push("missing_entries");
-    const status = reasons.length > 0 ? "attention"
-      : blocked || unreachable || run.truncated || run.cut || grace > 0 ? "pending" : "verified";
+    // A round that did not read everything it had to read, or that waits for a release to be
+    // listed, is not complete: the next synchronization runs a round again.
+    const incomplete = blocked || unreachable || run.truncated || run.cut || grace > 0;
+    const status = reasons.length > 0 ? "attention" : incomplete ? "pending" : "verified";
     const before = keptLogState();
     const state = {
       status: status, verified_ms: status === "pending" ? before.verified_ms : now,
@@ -3934,7 +3932,7 @@
     native.storeSet(STORE_CURSOR, log.cursor === "" ? null : log.cursor);
     storeJson(STORE_RESUME, log.resume);
     storeJson(STORE_ROUND, {
-      v: VERSION, tried_ms: now, last: status, told: told, state: state,
+      v: VERSION, tried_ms: now, last: status, open: incomplete, told: told, state: state,
       done_ms: status === "pending" ? (log.round.v === VERSION ? whole(log.round.done_ms) : 0) : now,
     });
     logState = state;
@@ -4849,7 +4847,12 @@
     merged = merged.filter(function (parsed) {
       return parsed.time_ms < beforeMs && (bound === null || parsed.tail <= bound);
     });
-    merged.sort(function (a, b) { return a.tail < b.tail ? -1 : a.tail > b.tail ? 1 : 0; });
+    // The latest first; among the entries of one millisecond, the later seq of a node first.
+    merged.sort(function (a, b) {
+      if (a.time_ms !== b.time_ms) return b.time_ms - a.time_ms;
+      if (a.node === b.node && a.seq !== b.seq) return b.seq - a.seq;
+      return a.tail < b.tail ? -1 : a.tail > b.tail ? 1 : 0;
+    });
     const chosen = [];
     let count = 0;
     let at = 0;

@@ -144,7 +144,8 @@ test("the program reads the entries and the node document of format 3 of the vec
     // A refused case stands under a key of its own, so that it is judged apart from the entries.
     if (!log.entries.some((entry) => entry.key === refused.key)) world.putObject(bucket, refused.key, JSON.stringify(refused.entry));
   }
-  world.putObject(bridge.shardBucket("dev", log.node), log.node_document.key, log.node_document.object_text);
+  assert.equal(bridge.shardBucket("dev", log.node), log.node_document.bucket);
+  world.putObject(log.node_document.bucket, log.node_document.key, log.node_document.object_text);
   const fx = { world: world, keys: keys, program: null, source: source };
   await S.start(fx);
   const shown = await S.call(fx, "read_log", { limit: 100 });
@@ -161,6 +162,30 @@ test("the program reads the entries and the node document of format 3 of the vec
     const host = new URL(world.sent("S3 ")[0].url).host;
     assert.ok(host.split(".")[0].endsWith("-" + String(owner.index).padStart(4, "0")), host);
   }
+});
+
+test("the program calls the bucket of an account that the vectors name, for every log store and owner of the vectors", { skip: vectors.log_store === undefined }, async () => {
+  const targets = { "character-credential-log-prod-1": "prod", "character-credential-log-dev-1": "dev",
+    "character-credential-log-alpha-1": "alpha" };
+  let checked = 0;
+  for (const store of vectors.log_store.stores) {
+    const target = targets[store.bucket];
+    if (target === undefined) continue;
+    assert.equal(bridge.SHARDS[target].count, store.shards);
+    for (const owner of store.owners) {
+      assert.equal(bridge.shardBucket(target, owner.owner), owner.bucket);
+      const fx = S.fixture(source, { target: target });
+      fx.world.userId = owner.owner;
+      fx.world.keychain.clear();
+      fx.keys = fx.world.createAccount();
+      await S.start(fx);
+      const hosts = fx.world.sent("S3 ").map((request) => new URL(request.url).host);
+      assert.deepEqual(hosts, [owner.bucket + ".s3." + store.region + ".amazonaws.com"], target + " " + owner.owner);
+      assert.equal(fx.world.state.log.status, "verified", target + " " + owner.owner);
+      checked += 1;
+    }
+  }
+  assert.equal(checked, 12);
 });
 
 test("the program refuses the node documents the vectors refuse", { skip: vectors.log_v3 === undefined }, async () => {
@@ -475,4 +500,430 @@ test("a grant to a node of a release before v2.4.0 is written into the ledger an
   await nextDay(fx);
   await world.settle(1000);
   assert.equal(world.ledgerUploads, 1);
+});
+
+// ---- The round: the four conditions that mark the log ----
+
+test("A1: the key of the account at a measurement no list has is pending for a day and marks the log after it; the program that lists the release clears the mark", async () => {
+  const fx = S.fixture(source, { device: { securityStatus: true } });
+  await S.start(fx);
+  const world = fx.world;
+  const other = bridge.randomMeasurement();
+  const receiver = world.addNode({ release: "v9.0.0", measurement: other, offered: false });
+  fx.nodes[0].record("c", [{
+    t: "grant_transferred_out", time_ms: world.now, to: receiver.id, release: "v9.0.0",
+    pcr0: other.pcr0, pcr1: other.pcr1, pcr2: other.pcr2,
+  }]);
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "pending");
+  assert.equal(world.state.log.newer_release_nodes, 1);
+  assert.equal(world.state.log.unknown_nodes, 0);
+  assert.deepEqual(world.reports.slice(-1)[0].unaccepted_releases, ["v9.0.0"]);
+  assert.deepEqual(world.securityStatuses.slice(-1)[0].status, "pending");
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "attention");
+  assert.equal(world.state.log.unknown_nodes, 1);
+  assert.equal(world.state.log.newer_release_nodes, 0);
+  assert.deepEqual(world.reports.slice(-1)[0].unknown_node_ids, [receiver.id]);
+  const told = world.securityStatuses.slice(-1)[0];
+  assert.deepEqual({ status: told.status, reasons: told.reasons }, { status: "attention", reasons: ["unlisted_release"] });
+  await S.start(fx, bridge.withListedRelease(fx.source, "v9.0.0", other, 44));
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(world.state.log.unknown_nodes, 0);
+});
+
+test("A1: an entry of the key of the account written by a node whose document verifies with a measurement no list has", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  const later = world.addNode({ release: "v9.0.0", measurement: bridge.randomMeasurement(), offered: false });
+  later.record("c", [{ t: "connection_created", time_ms: world.now, record_id: "r", provider: "slack", scope: "" }]);
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "pending");
+  assert.equal(world.state.log.newer_release_nodes, 1);
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "attention");
+  assert.equal(world.state.log.unknown_nodes, 1);
+  // An entry of another key written by such a node says nothing of the key of this account.
+  const quiet = S.fixture(source);
+  await S.start(quiet);
+  const stranger = quiet.world.addNode({ release: "v9.0.0", measurement: bridge.randomMeasurement(), offered: false });
+  stranger.write(quiet.world.userId, "c", [{ t: "grant_revoked", time_ms: quiet.world.now }], {
+    logPk: bridge.x25519PublicKey(crypto.randomBytes(32)), keyId: "0123456789abcdef",
+  });
+  await nextDay(quiet);
+  await nextDay(quiet);
+  assert.equal(quiet.world.state.log.status, "verified");
+});
+
+test("A1: a transfer a node of an earlier release made is followed through its chain of format 2 to the node document of the receiving node", async () => {
+  const fx = S.fixture(source, { nodes: 0, legacy: 1 });
+  await S.start(fx);
+  const world = fx.world;
+  const giver = fx.legacy[0];
+  const receiver = world.addNode({ release: "v9.0.0", measurement: bridge.randomMeasurement(), offered: false });
+  giver.record("c", [{ t: "grant_transferred_out", time_ms: world.now, to: receiver.id }]);
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "pending");
+  assert.equal(world.state.log.newer_release_nodes, 1);
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "attention");
+  assert.equal(world.state.log.unknown_nodes, 1);
+});
+
+test("a transfer between nodes of an earlier release is followed: the chain of the receiving node is read, and nothing marks the log", async () => {
+  const fx = S.fixture(source, { nodes: 0, legacy: 1 });
+  await S.start(fx);
+  const world = fx.world;
+  const giver = fx.legacy[0];
+  const receiver = world.addNode({ release: fx.latest.release, measurement: fx.latest, offered: false });
+  const third = world.addNode({ release: fx.latest.release, measurement: fx.latest, offered: false });
+  giver.record("c", [{ t: "grant_transferred_out", time_ms: world.now, to: receiver.id }]);
+  receiver.record("c", [{ t: "grant_transferred_in", time_ms: world.now, from: giver.id, not_after_ms: world.now + DAY_MS, custody: "enclave" }]);
+  receiver.record("c", [{ t: "grant_transferred_out", time_ms: world.now, to: third.id }]);
+  third.record("c", [{ t: "grant_transferred_in", time_ms: world.now, from: receiver.id, not_after_ms: world.now + DAY_MS, custody: "enclave" }]);
+  await nextDay(fx);
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "verified");
+  const followed = world.stored("log.legacy").nodes;
+  assert.deepEqual(Object.keys(followed).sort(), [giver.id, receiver.id, third.id].sort());
+  assert.equal(followed[receiver.id].seq, 2);
+  assert.equal(followed[third.id].seq, 1);
+});
+
+test("A2: a body its key names without a signature of the accepted node of that key, and two bodies an accepted node signed for one seq", async () => {
+  const forged = S.fixture(source, { device: { securityStatus: true } });
+  await S.start(forged);
+  forged.nodes[0].record("c", [{ t: "connection_removed", time_ms: forged.world.now, record_id: "r", provider: "slack", provider_revoke: false }], {
+    signSeed: crypto.randomBytes(32),
+  });
+  await nextDay(forged);
+  assert.equal(forged.world.state.log.status, "attention");
+  assert.equal(forged.world.state.log.unverified_nodes, 1);
+  assert.deepEqual(forged.world.securityStatuses.slice(-1)[0].reasons, ["conflicting_signatures"]);
+  // The mark stays with the node: a round that reads nothing new keeps it.
+  await nextDay(forged);
+  assert.equal(forged.world.state.log.status, "attention");
+
+  const twice = S.fixture(source);
+  await S.start(twice);
+  const event = (provider) => [{ t: "connection_created", time_ms: twice.world.now, record_id: "r", provider: provider, scope: "" }];
+  twice.nodes[0].record("c", event("slack"), { seq: 7 });
+  twice.nodes[0].record("c", event("notion"), { seq: 7 });
+  await nextDay(twice);
+  assert.equal(twice.world.state.log.status, "attention");
+  assert.equal(twice.world.state.log.unverified_nodes, 1);
+});
+
+test("A3: reads the backend holds back mark the log after three days and three rounds, and one round that reads the store clears the count", async () => {
+  const fx = S.fixture(source, { device: { securityStatus: true } });
+  await S.start(fx);
+  const world = fx.world;
+  world.fault("POST /api/secure/log/read", { status: 503, body: { detail: "log_store_unreachable" } });
+  const states = [];
+  for (let day = 0; day < 4; day += 1) {
+    await nextDay(fx);
+    states.push(world.state.log.status + ":" + world.state.log.store + ":" + world.reports.slice(-1)[0].blocked_attempts);
+  }
+  assert.deepEqual(states, ["pending:blocked:1", "pending:blocked:2", "pending:blocked:3", "attention:blocked:4"]);
+  assert.equal(world.state.log.store_failure, "read:503");
+  assert.ok(world.state.log.store_failing_ms > 0);
+  assert.deepEqual(world.securityStatuses.slice(-1)[0].reasons, ["verification_blocked"]);
+  world.clearFaults();
+  world.advance(HOUR_MS);
+  await S.event(fx, "foreground");
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(world.state.log.store_failing_ms, 0);
+  assert.equal(world.securityStatuses.slice(-1)[0].status, "ok");
+  assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
+});
+
+test("A3: three blocked rounds within three days do not mark the log", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  world.fault("POST /api/secure/log/read", { status: 500 });
+  await nextDay(fx);
+  for (let turn = 0; turn < 5; turn += 1) {
+    world.advance(10 * 60000);
+    await S.event(fx, "foreground");
+  }
+  assert.equal(world.reports.slice(-1)[0].blocked_attempts, 6);
+  assert.equal(world.state.log.status, "pending");
+});
+
+test("A3: what counts as a read the operator domain holds back", async () => {
+  const blocked = async (name, arrange, expected) => {
+    const fx = S.fixture(source);
+    await S.start(fx);
+    await arrange(fx);
+    await nextDay(fx);
+    assert.equal(fx.world.state.log.store, "blocked", name);
+    assert.equal(fx.world.state.log.status, "pending", name);
+    assert.equal(fx.world.state.log.store_failure, expected, name);
+    assert.equal(fx.world.stored("log.blocked").count, 1, name);
+  };
+  await blocked("an address of another bucket", async (fx) => {
+    fx.world.fault("POST /api/secure/log/read", (request) => ({
+      status: 200, body: {
+        store: {}, expires_ms: 0,
+        pages: JSON.parse(request.body).pages.map((page) => ({
+          prefix: page.prefix, url: fx.world.readUrl(page).replace(fx.world.shardHost, fx.world.storeHost),
+        })),
+      },
+    }));
+  }, "read:url");
+  await blocked("an address of the prefix of another account", async (fx) => {
+    fx.world.fault("POST /api/secure/log/read", (request) => ({
+      status: 200, body: {
+        pages: JSON.parse(request.body).pages.map((page) => ({
+          prefix: page.prefix, url: fx.world.readUrl(page).replace(encodeURIComponent("a3/" + fx.world.userId + "/"), encodeURIComponent("a3/someone-else/")),
+        })),
+      },
+    }));
+  }, "read:url");
+  await blocked("an address with a marker the program did not ask for", async (fx) => {
+    fx.world.fault("POST /api/secure/log/read", (request) => ({
+      status: 200, body: {
+        pages: JSON.parse(request.body).pages.map((page) => ({
+          prefix: page.prefix, url: fx.world.readUrl(Object.assign({}, page, { key_marker: "a3/" + fx.world.userId + "/c/5" })),
+        })),
+      },
+    }));
+  }, "read:url");
+  await blocked("the store refuses the address the backend signed", async (fx) => {
+    fx.world.fault("S3 " + fx.world.shardHost, { status: 403, body: "" });
+  }, "listing:403");
+  await blocked("the backend hands out no body for a key the listing names", async (fx) => {
+    fx.nodes[0].record("c", [{ t: "connection_created", time_ms: fx.world.now, record_id: "r", provider: "slack", scope: "" }]);
+    fx.world.fault("POST /api/secure/log/bodies", (request) => ({
+      status: 200, body: { entries: [], missing: JSON.parse(request.body).keys },
+    }));
+  }, "bodies:missing");
+  await blocked("the backend hands out another body than the key names", async (fx) => {
+    const kept = fx.nodes[0].chains.get(fx.world.userId)[0];
+    fx.nodes[0].record("c", [{ t: "connection_created", time_ms: fx.world.now, record_id: "r", provider: "slack", scope: "" }]);
+    fx.world.fault("POST /api/secure/log/bodies", (request) => ({
+      status: 200, body: {
+        entries: JSON.parse(request.body).keys.map((key) => Object.assign({ key: key }, JSON.parse(kept.object))), missing: [],
+      },
+    }));
+  }, "bodies:hash");
+  await blocked("the route of the bodies does not answer while the backend answers other requests", async (fx) => {
+    fx.nodes[0].record("c", [{ t: "connection_created", time_ms: fx.world.now, record_id: "r", provider: "slack", scope: "" }]);
+    fx.world.fault("POST /api/secure/log/bodies", "hang");
+  }, "bodies:timeout");
+  await blocked("a signed entry of a node without a node document", async (fx) => {
+    const silent = fx.world.addNode({ release: "v2.4.0", measurement: fx.measurement, offered: false, document: false });
+    silent.record("c", [{ t: "connection_created", time_ms: fx.world.now, record_id: "r", provider: "slack", scope: "" }]);
+  }, "documents:missing");
+  await blocked("a signed entry of a node whose document does not verify", async (fx) => {
+    const broken = fx.world.addNode({ release: "v2.4.0", measurement: fx.measurement, offered: false, brokenSignature: true });
+    broken.record("c", [{ t: "connection_created", time_ms: fx.world.now, record_id: "r", provider: "slack", scope: "" }]);
+  }, "documents:rejected");
+  await blocked("a backend that states it has no store of format 3 after this device handed a grant to a node that writes it", async (fx) => {
+    fx.world.routes.log = "disabled";
+  }, "read:log_store_disabled");
+});
+
+test("a device without a network, and a store that fails, leave the log pending and count no blocked round, however long", async () => {
+  const offline = S.fixture(source);
+  await S.start(offline);
+  offline.world.advance(2 * HOUR_MS);
+  offline.world.fault(() => true, "transport");
+  for (let day = 0; day < 5; day += 1) {
+    offline.world.advance(25 * HOUR_MS);
+    const shown = await S.call(offline, "read_log", { limit: 10 });
+    assert.equal(shown.ok, true);
+    assert.equal(shown.value.status, "pending");
+    await offline.world.settle(40000);
+  }
+  assert.equal(offline.world.state.log.status, "pending");
+  assert.equal(offline.world.state.log.store, "unreachable");
+  assert.deepEqual(offline.world.stored("log.blocked"), { first_ms: 0, count: 0 });
+
+  const failing = S.fixture(source);
+  await S.start(failing);
+  failing.world.fault("S3 ", { status: 503, body: "" });
+  for (let day = 0; day < 5; day += 1) await nextDay(failing);
+  assert.equal(failing.world.state.log.status, "pending");
+  assert.equal(failing.world.state.log.store, "unreachable");
+  assert.equal(failing.world.state.log.store_failure, "listing:503");
+  assert.deepEqual(failing.world.stored("log.blocked"), { first_ms: 0, count: 0 });
+});
+
+test("A4: an entry this device verified that left the listing within its retention marks the log, after the listing was read a second time", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  const seen = fx.nodes[0].chains.get(world.userId)[0].key;
+  assert.equal(world.stored("log.sample").length, 1);
+  world.entries3.delete(seen);
+  const before = world.sent("POST /api/secure/log/read").length;
+  await nextDay(fx);
+  assert.equal(world.sent("POST /api/secure/log/read").length, before + 2);
+  assert.equal(world.state.log.status, "attention");
+  assert.equal(world.state.log.missing, 1);
+  // An entry older than the retention of the store is expected by nobody.
+  const aged = S.fixture(source);
+  await S.start(aged);
+  aged.world.entries3.delete(aged.nodes[0].chains.get(aged.world.userId)[0].key);
+  aged.world.advance(366 * DAY_MS);
+  await S.event(aged, "foreground");
+  assert.equal(aged.world.state.log.missing, 0);
+});
+
+test("what does not mark the log: an object nobody signed under a node id without a document, an empty seq, a node that ended without a shutdown, an entry of another key", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  const node = fx.nodes[0];
+  // An object under a node id no document exists for, with a body the key names and no signature
+  // of that node id.
+  const ghost = new bridge.Node(world, { release: "v2.4.0", measurement: fx.measurement, document: false });
+  ghost.record("c", [{ t: "grant_revoked", time_ms: world.now }], { signSeed: crypto.randomBytes(32) });
+  // A seq the store never confirmed, between two entries.
+  node.record("c", [{ t: "connection_created", time_ms: world.now, record_id: "r1", provider: "slack", scope: "" }], { stored: false });
+  node.record("c", [{ t: "connection_created", time_ms: world.now, record_id: "r2", provider: "notion", scope: "" }]);
+  // An entry sealed to an earlier key of the account.
+  node.write(world.userId, "c", [{ t: "grant_revoked", time_ms: world.now }], {
+    logPk: bridge.x25519PublicKey(crypto.randomBytes(32)), keyId: "0123456789abcdef",
+  });
+  // The node ends without an orderly shutdown.
+  node.alive = false;
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(world.state.log.store, "verified");
+  assert.equal(world.reports.slice(-1)[0].undocumented_nodes, 1);
+  const shown = await S.call(fx, "read_log", { limit: 50 });
+  const kinds = shownGroups(shown.value).map((group) => group.kind);
+  assert.deepEqual(kinds, ["other_key", "connected", "grant_renewed"]);
+  assert.equal(world.state.log.status, "verified");
+});
+
+test("a listing longer than the pages of one round is read on by the next round, and the keys judged once are not read again", async () => {
+  const fx = S.fixture(source);
+  const world = fx.world;
+  world.pageSize = 3;
+  for (let i = 0; i < 20; i += 1) {
+    world.advance(1000);
+    fx.nodes[0].record("c", [{ t: "connection_created", time_ms: world.now, record_id: "r" + i, provider: "slack", scope: "" }]);
+  }
+  await S.start(fx);
+  assert.equal(world.state.log.status, "pending");
+  assert.equal(world.state.log.store, "truncated");
+  assert.equal(world.reports.slice(-1)[0].keys_checked, 12);
+  world.advance(2 * 60000);
+  await S.event(fx, "foreground");
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(world.stored("log.seen").length, 21);
+  // A round after it reads the listing from its start and asks for no body.
+  const bodies = world.sent("POST /api/secure/log/bodies").length;
+  world.pageSize = 1000;
+  await nextDay(fx);
+  assert.equal(world.sent("POST /api/secure/log/bodies").length, bodies);
+  assert.equal(world.state.log.status, "verified");
+});
+
+test("an entry that lands below the entries this device saw is judged by the next round", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  const other = bridge.randomMeasurement();
+  const late = world.now - 10 * 60000;
+  world.advance(HOUR_MS);
+  fx.nodes[0].record("c", [{ t: "connection_created", time_ms: world.now, record_id: "r", provider: "slack", scope: "" }]);
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "verified");
+  // The node wrote this entry at an earlier time of its clock and the store confirmed it only now.
+  fx.nodes[0].record("c", [{
+    t: "grant_transferred_out", time_ms: late, to: world.addNode({ release: "v9.0.0", measurement: other, offered: false }).id,
+    release: "v9.0.0", pcr0: other.pcr0, pcr1: other.pcr1, pcr2: other.pcr2,
+  }], { timeMs: late });
+  await nextDay(fx);
+  assert.equal(world.state.log.newer_release_nodes, 1);
+  assert.equal(world.state.log.status, "pending");
+});
+
+// ---- An environment whose nodes write format 2 ----
+
+test("an environment without a node of format 3 and without the routes of this program: the grants, the round and the screen work on the routes of the program before, and nothing marks the log however long", async () => {
+  const fx = S.fixture(source, { nodes: 0, legacy: 2 });
+  const world = fx.world;
+  world.routes = { grants: false, log: "absent", outcomes: false, syncReport: false };
+  const node = fx.legacy[0];
+  await S.start(fx);
+  assert.equal(world.state.grant.state, "active");
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(world.state.log.store, "verified");
+  for (let i = 0; i < 6; i += 1) {
+    world.advance(60000);
+    node.record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/messages/" + i, i % 2 === 0 ? "GET" : "POST")]);
+  }
+  // A seq the store never confirmed and a node that ended without its final head mark nothing.
+  node.record("u", [S.providerRequest(world.now)], { stored: false });
+  node.record("u", [S.providerRequest(world.now + 1, "/gmail/v1/users/me/labels")]);
+  fx.legacy[1].alive = false;
+  const shown = await S.call(fx, "read_log", { limit: 100 });
+  assert.equal(shown.ok, true);
+  assert.equal(shown.value.status, "verified");
+  const groups = shownGroups(shown.value);
+  assert.equal(groups.reduce((sum, group) => sum + group.count, 0), 9);
+  assert.deepEqual(shown.value.summary, { reads: 4, sends: 0, changes: 3, providers_text: "Google · Gmail", truncated: false });
+  for (let day = 0; day < 6; day += 1) {
+    await nextDay(fx);
+    assert.equal(world.state.log.status, "verified", "day " + day);
+  }
+  assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  assert.equal(world.reports.every((report) => report.status === "verified"), true);
+});
+
+test("an environment whose backend has the routes and holds the store of format 3 closed: the round reads the chains of format 2 and verifies", async () => {
+  const outcome = await S.scenarios.formatTwoOnly(source);
+  assert.equal(outcome.log.status, "verified");
+  assert.equal(outcome.grant, "active");
+  assert.deepEqual(outcome.granted, [true]);
+  assert.equal(outcome.report.control_keys, 0);
+  assert.equal(outcome.report.keys_checked, 1);
+});
+
+test("the chain of a node of an earlier release is closed once its grant ran out and its end was read", async () => {
+  const fx = S.fixture(source, { nodes: 1, legacy: 1 });
+  await S.start(fx);
+  const world = fx.world;
+  const id = fx.legacy[0].id;
+  fx.legacy[0].alive = false;
+  assert.equal(world.stored("log.legacy").nodes[id].closed, false);
+  world.advance(32 * DAY_MS);
+  await S.event(fx, "foreground");
+  assert.equal(world.stored("log.legacy").nodes[id].closed, true);
+  const listings = world.sent("POST /api/secure/log/store/listings").length;
+  await nextDay(fx);
+  assert.equal(world.sent("POST /api/secure/log/store/listings").length, listings);
+  assert.equal(world.state.log.status, "verified");
+});
+
+// ---- The judgement the app is told ----
+
+test("the app is told ok, pending and attention, and an attention is not covered by a round that did not complete", async () => {
+  const fx = S.fixture(source, { device: { securityStatus: true } });
+  await S.start(fx);
+  const world = fx.world;
+  assert.deepEqual(world.securityStatuses.map((told) => told.status), ["ok"]);
+  fx.nodes[0].record("c", [{ t: "connection_removed", time_ms: world.now, record_id: "r", provider: "slack", provider_revoke: false }], {
+    signSeed: crypto.randomBytes(32),
+  });
+  await nextDay(fx);
+  assert.equal(world.securityStatuses.slice(-1)[0].status, "attention");
+  const told = world.securityStatuses.length;
+  world.fault("S3 ", { status: 503, body: "" });
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "attention");
+  assert.equal(world.securityStatuses.length, told + 1);
+  assert.equal(world.securityStatuses.slice(-1)[0].status, "attention");
+  // A build without the primitive is told nothing, and the round runs the same.
+  const plain = S.fixture(source);
+  await S.start(plain);
+  assert.equal(plain.world.securityStatuses.length, 0);
+  assert.equal(plain.world.state.log.status, "verified");
 });

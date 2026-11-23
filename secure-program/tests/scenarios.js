@@ -71,7 +71,8 @@ async function call(fx, name, args) {
   try {
     const value = await fx.world.run(fx.program.procedures[name](args === undefined ? {} : args));
     await fx.world.settle(0);
-    return { ok: true, value: value };
+    // The result as plain values of this realm (the program runs in a context of its own).
+    return { ok: true, value: value === undefined ? undefined : JSON.parse(JSON.stringify(value)) };
   } catch (error) {
     await fx.world.settle(0);
     return { ok: false, code: error && error.code ? error.code : String(error) };

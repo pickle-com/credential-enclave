@@ -311,13 +311,13 @@ const SEQ_DIGITS = 20;
 const TIME_DIGITS = 13;
 const RTIME_MAX = 9999999999999;
 
-// The buckets of format 3 per server target (docs/protocol.md 7.6): the number of buckets and the
-// name the bucket names are made from.
+// The buckets of format 3 per server target (docs/protocol.md 7.6): the number of buckets, and the
+// name of the log store (the bucket the binding of a node names) the bucket names are made from.
 const SHARDS = {
-  prod: { count: 1024, base: "character-credential-log-prod-2" },
-  dev: { count: 32, base: "character-credential-log-dev-2" },
-  alpha: { count: 32, base: "character-credential-log-alpha-2" },
-  local: { count: 4, base: "character-credential-log-local-2" },
+  prod: { count: 1024, base: "character-credential-log-prod-1" },
+  dev: { count: 32, base: "character-credential-log-dev-1" },
+  alpha: { count: 32, base: "character-credential-log-alpha-1" },
+  local: { count: 4, base: "character-credential-log-local-1" },
 };
 
 function zeros(value, digits) {
@@ -1304,7 +1304,7 @@ function makeNative(world) {
         (args.reasons === undefined || (Array.isArray(args.reasons) && args.reasons.length <= 8 &&
           args.reasons.every((reason) => /^[a-z0-9_]{1,64}$/.test(reason))));
       if (!valid) throw new SecureError("invalid_argument", "securityStatus");
-      world.securityStatuses.push({ status: args.status, reasons: args.reasons || [], at_ms: world.now });
+      world.securityStatuses.push({ status: args.status, reasons: Array.from(args.reasons || []), at_ms: world.now });
       return null;
     };
   }
