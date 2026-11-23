@@ -169,14 +169,17 @@ impl WriteMsBuckets {
     }
 }
 
-/// The `log_store` object of the `health` call: the two values the host program reads. The
+/// The `log_store` object of the `health` call: the three values the host program reads. The
 /// object names the bucket and the region too: they are not read. `pending_oldest_ms` is absent
-/// in the response of a node of a release before v2.1.0.
+/// in the response of a node of a release before v2.1.0, and `node_document_ms` in the
+/// response of a node of a release before v2.4.0.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct LogStoreState {
     pub pending: u64,
     #[serde(default)]
     pub pending_oldest_ms: Option<u64>,
+    #[serde(default)]
+    pub node_document_ms: Option<u64>,
 }
 
 /// The `egress` object of the `health` call: the outbound connections of the node since it
@@ -587,6 +590,14 @@ fn log_store_series(text: &mut String, log_store: &LogStoreState) {
             oldest_ms,
         );
     }
+    if let Some(document_ms) = log_store.node_document_ms {
+        seconds_gauge(
+            text,
+            "credential_enclave_log_store_node_document_timestamp_seconds",
+            "Time of the latest write of its node document that the log store confirmed to the enclave node, in seconds since the Unix epoch, 0 when the store confirmed none.",
+            document_ms,
+        );
+    }
 }
 
 /// The series of the `load` object: two gauges, then the gauge and the counter of the
@@ -954,13 +965,15 @@ mod tests {
 
     /// The names of the series that a node of release v2.1.0 adds, the gauge of `grants`
     /// among them (the value is in the answer of every release, and the gauge follows the
-    /// series of the objects).
-    const NEW_SERIES: [&str; 17] = [
+    /// series of the objects), and the gauge of the node document that a node of release
+    /// v2.4.0 adds.
+    const NEW_SERIES: [&str; 18] = [
         "credential_enclave_log_store_write_attempt_failures_total",
         "credential_enclave_log_store_write_retries_total",
         "credential_enclave_log_store_write_seconds",
         "credential_enclave_log_store_pending_accounts",
         "credential_enclave_log_store_pending_oldest_seconds",
+        "credential_enclave_log_store_node_document_timestamp_seconds",
         "credential_enclave_egress_opens_total",
         "credential_enclave_egress_open_failures_total",
         "credential_enclave_egress_open_retries_total",
@@ -1125,6 +1138,7 @@ mod tests {
                 log_store: Some(LogStoreState {
                     pending: 6,
                     pending_oldest_ms: Some(12_345),
+                    node_document_ms: Some(1_790_000_100_250),
                 }),
                 egress: Some(EgressCounts {
                     opens: 100,
@@ -1174,6 +1188,7 @@ mod tests {
             Some(LogStoreState {
                 pending: 3,
                 pending_oldest_ms: None,
+                node_document_ms: None,
             })
         );
         let node = FakeNode::answering(|_| {
@@ -1411,7 +1426,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(text.matches("# TYPE ").count(), 18 + 17 + 5);
+        assert_eq!(text.matches("# TYPE ").count(), 18 + 18 + 5);
 
         // The series of the write counts follow the seven series of the log, the two gauges of
         // the log store follow them, and the series of the load come next.
@@ -1452,7 +1467,10 @@ mod tests {
              credential_enclave_log_store_pending_accounts 6\n\
              # HELP credential_enclave_log_store_pending_oldest_seconds Age of the oldest pending log entry of the enclave node in seconds, 0 when there is none.\n\
              # TYPE credential_enclave_log_store_pending_oldest_seconds gauge\n\
-             credential_enclave_log_store_pending_oldest_seconds 12.345\n"
+             credential_enclave_log_store_pending_oldest_seconds 12.345\n\
+             # HELP credential_enclave_log_store_node_document_timestamp_seconds Time of the latest write of its node document that the log store confirmed to the enclave node, in seconds since the Unix epoch, 0 when the store confirmed none.\n\
+             # TYPE credential_enclave_log_store_node_document_timestamp_seconds gauge\n\
+             credential_enclave_log_store_node_document_timestamp_seconds 1790000100.250\n"
         );
         // The `+Inf` bucket and the count of the histogram are `write_count`.
         let write_count = health.log.as_ref().unwrap().write_count.unwrap();
@@ -1531,6 +1549,7 @@ mod tests {
             log_store: Some(LogStoreState {
                 pending: 2,
                 pending_oldest_ms: None,
+                node_document_ms: None,
             }),
             egress: None,
             refresh: None,
@@ -1549,6 +1568,7 @@ mod tests {
         assert!(!text.contains("credential_enclave_log_store_write_seconds"));
         assert!(!text.contains("credential_enclave_log_store_write_attempt_failures_total"));
         assert!(!text.contains("credential_enclave_log_store_pending_oldest_seconds"));
+        assert!(!text.contains("credential_enclave_log_store_node_document_timestamp_seconds"));
         assert!(!text.contains("credential_enclave_egress_"));
         assert!(!text.contains("credential_enclave_refresh_"));
         assert!(!text.contains("credential_enclave_kept_refreshes"));
@@ -1838,7 +1858,7 @@ mod tests {
             ]
             .concat()
         ), "{text}");
-        assert_eq!(text.matches("# TYPE ").count(), 18 + 17 + 4 + 5 + 2);
+        assert_eq!(text.matches("# TYPE ").count(), 18 + 18 + 4 + 5 + 2);
         // A node of a release before v2.2.0 gives none of the four series, and a last
         // describe-enclaves without a running enclave turns the gauge of the watch to 0.
         let earlier = NodeHealth {

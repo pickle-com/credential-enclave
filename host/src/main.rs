@@ -21,7 +21,7 @@
 //!    enclave and exits with a status that is not 0, so that the container runtime starts it
 //!    again with a new enclave;
 //! 7. on SIGTERM logs the enclaves `nitro-cli` describes, asks the backend to collect the state
-//!    of the node and waits for a time that grows with the accounts of the node, then ends the
+//!    of the node and waits for a time that grows with the delegations of the node, then ends the
 //!    enclave (`drain`, `launch`).
 //!
 //! With the argument `drain` it makes the shutdown collection call of step 7 alone, logs its
@@ -136,20 +136,21 @@ async fn configure(node: Arc<dyn NodeConnector>, body: Vec<u8>) {
     }
 }
 
-/// The accounts of the node from its `health` call, for the wait of the shutdown collection
-/// call (`drain::response_timeout`). `None` when the node does not answer: the wait is then
-/// the base, and the collection fails at its first stage.
-async fn node_accounts(node: &dyn NodeConnector) -> Option<u64> {
+/// The delegations of the node from its `health` call (`grants`: the accounts with a grant
+/// within its time), for the wait of the shutdown collection call (`drain::response_timeout`).
+/// `None` when the node does not answer: the wait is then the base, and the collection fails
+/// at its first stage.
+async fn node_delegations(node: &dyn NodeConnector) -> Option<u64> {
     health::node_health(node)
         .await
-        .map(|health| health.accounts)
+        .and_then(|health| health.grants)
 }
 
 /// One line that names the wait of a shutdown collection call and what it was computed from.
-fn wait_line(accounts: Option<u64>, wait: Duration) -> String {
-    match accounts {
-        Some(accounts) => format!(
-            "waiting {} s for the collection of {accounts} accounts",
+fn wait_line(delegations: Option<u64>, wait: Duration) -> String {
+    match delegations {
+        Some(delegations) => format!(
+            "waiting {} s for the handover of {delegations} delegations",
             wait.as_secs()
         ),
         None => format!(
@@ -160,18 +161,18 @@ fn wait_line(accounts: Option<u64>, wait: Duration) -> String {
 }
 
 /// Asks the backend to collect the state of the node, when the call is configured, and waits
-/// for the response for the time of the accounts of the node.
+/// for the response for the time of the delegations of the node.
 async fn collect(drain: Option<Drain>, node: &dyn NodeConnector) {
     let Some(drain) = drain else {
         log("shutdown collection: skipped, its variables are not set");
         return;
     };
-    let accounts = node_accounts(node).await;
+    let delegations = node_delegations(node).await;
     log(&format!(
         "shutdown collection: calling the backend, {}",
-        wait_line(accounts, drain::response_timeout(accounts))
+        wait_line(delegations, drain::response_timeout(delegations))
     ));
-    match drain.call(accounts).await {
+    match drain.call(delegations).await {
         Ok(status) => log(&format!(
             "shutdown collection: the backend answered {status}"
         )),
@@ -204,10 +205,11 @@ async fn run_drain() {
         }
     };
     let started = tokio::time::Instant::now();
-    let accounts = node_accounts(&VsockNode).await;
-    let wait = drain::response_timeout(accounts);
-    log(&format!("drain: {}", wait_line(accounts, wait)));
-    let outcome = tokio::time::timeout(wait + DRAIN_SUBCOMMAND_MARGIN, drain.call(accounts)).await;
+    let delegations = node_delegations(&VsockNode).await;
+    let wait = drain::response_timeout(delegations);
+    log(&format!("drain: {}", wait_line(delegations, wait)));
+    let outcome =
+        tokio::time::timeout(wait + DRAIN_SUBCOMMAND_MARGIN, drain.call(delegations)).await;
     let elapsed_ms = started.elapsed().as_millis();
     match outcome {
         Ok(Ok(status)) => log(&format!(
@@ -243,7 +245,7 @@ async fn run() -> Result<(), String> {
     let log_store = match LogStore::from_variables(&variable) {
         Ok(Some(log_store)) => {
             log(&format!(
-                "log store: bucket {} in {}, egress to port 443 of {}",
+                "log store: {} in {}, egress to port 443 of {}",
                 log_store.bucket,
                 log_store.region,
                 log_store.host()
