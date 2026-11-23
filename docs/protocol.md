@@ -1660,13 +1660,13 @@ listing goes on beyond its four pages, more nodes are without a judgement than i
 requests name, more bodies are to be read than its body requests name, an answer of the bodies
 ends before its last key, the chains of formats 1 and 2 hold more control entries than it reads,
 the listing of such a chain goes on over pages that name few `seq`, or its time of 60 s passes
-before it has read everything) is pending, and the next round reads on from where it
-stopped: a round whose time passes is judged on what it read and keeps what it judged. Eight such rounds read 32 listing pages, the
-documents of 1,024 nodes and 6,400 bodies, which an account in normal use does not hold within the
-retention of the store. The rounds of synchronizations that end that way in a row are counted, a
-round that reads everything ends the row, and from the ninth on such a round is a round whose
-reads are held back: someone writes objects under the prefix of the account faster than the device
-reads them, or the answers of the backend never reach their end.
+before it has read everything) is pending, and the next round reads on from where it stopped: a
+round whose time passes is judged on what it read and keeps what it judged. Eight such rounds read
+32 listing pages, the documents of 1,024 nodes and 6,400 bodies, which an account in normal use
+does not hold within the retention of the store. The rounds of synchronizations that end that way
+in a row are counted, a round that reads everything ends the row, and from the ninth on such a
+round is a round whose reads are held back: someone writes objects under the prefix of the account
+faster than the device reads them, or the answers of the backend never reach their end.
 
 The result of a round is `verified`, `pending` or `attention`. It is `attention` when one of four
 conditions holds, and each holds only in a situation that is a problem:
