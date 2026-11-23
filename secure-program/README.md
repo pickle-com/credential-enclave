@@ -8,7 +8,8 @@ calls "the app": the device side of the credential protocol. It creates the mast
 the account keys from it (protocol.md section 3), verifies the attestation of enclave nodes
 (section 4), seals grants and revokes to a verified node (section 5), encrypts credential records
 (section 6) and vault secrets, reads and judges the credential log (section 7), keeps the grants it
-handed to nodes, and transfers the master key between the devices of one account. What the program
+handed to nodes (a node the backend lists for its revokes alone is handed none), and transfers
+the master key between the devices of one account. What the program
 does, in which order and under which limits, is specified in protocol.md, "The program of the
 app".
 
@@ -32,17 +33,24 @@ listing page when its own read is held back again, so an answer the backend give
 answer the user sees. The reads of the screen that cannot be kept in a form that answers every
 later read (a later listing page, the listing of a chain of formats 1 and 2) are noted by the
 screen itself when they are held back, and mark the log when such reads of three days stay
-unread by the screen; rounds that keep ending with more to read than a round reads count as
-rounds held back. A round ends its reading when the app goes to the background and is judged on
-what it read, and the keys it listed and did not come to judge are the first the next round asks
-for, so a device whose stays in the app are short reads the log on with every stay; a
-measurement no list of the program has that held the key of the account marks the log at the next
-event of the app once the device first saw it a day ago, without a read. The
+unread by the screen: with every opening the screen reads its listings on from their start down
+to what was noted, so a read that failed once ends with the next opening the backend answers.
+Rounds that keep ending with more to read than a round reads count as rounds held back. A round
+ends its reading when the app goes to the background and is judged on what it read, and the keys
+it listed and did not come to judge are the first the next round asks for, so a device whose
+stays in the app are short reads the log on with every stay. A measurement no list of the
+program has that held the key of the account marks the log once the device first saw it a day
+ago and the runtime knows that no later program than this one is served: a runtime that knows
+that a later program is served judges nothing, writes none of the values the rounds judge by,
+and reports once that it is behind. The signature of an object reaches the device through the
+backend, so a body handed out with a signature that does not verify marks the log only when the
+answers of two rounds carried none that does, and until one does. The
 entries of the nodes of the releases before v2.4.0 (formats 1 and 2) are read from the bucket
 their bindings name, for display and to follow a transfer of the delegation a node of such a
 release made: under one `seq` of such a chain the program reads eight objects at most until one
-is the entry of the node, and a round reads a chain on only where its node wrote. The storage of
-the operator holds no entry. An entry older than 365 days (the
+is the entry of the node, a round reads a chain on only where its node wrote, and the screen
+takes a range of a chain as known only from a listing that was read as far as the range reaches.
+The storage of the operator holds no entry. An entry older than 365 days (the
 retention of its Object Lock) is expected by nobody, and the lifecycle rule of a bucket removes
 entries at 400 days (7.6).
 
@@ -95,7 +103,9 @@ the program store sealed with a key derived from the master key.
 What the program reports to the backend about itself names no secret and nothing of the content of
 an account: the result of a round (the status, counts, the names of releases, node ids), the
 outcomes of its procedures (the names of procedures, failure codes, times) and the result of a
-synchronization a push started (the key state, the state of the grants, counts, a time).
+synchronization a push started (the key state, the state of the grants, counts, a time). Every
+request to a route of the backend under `/api/secure/` names the version of the program (the
+query `program`), and no other request does.
 
 A reader checks this in the file. The search terms: `keychainSet` and `keychainGet` (where the
 master key is stored and read), `hpkeSeal` (what is sealed to a node), `aeadSeal` (what is
