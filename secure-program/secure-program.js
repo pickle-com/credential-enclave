@@ -752,12 +752,14 @@
   // A round asks the backend for the release proofs of the measurements no list has and no
   // proofs showed that it met, by the digests of the measurements (PROOFS_PATH): of
   // PROOF_REQUEST_MEASURES measurements in one request, in PROOF_ROUND_REQUESTS requests of one
-  // round at most, and for one measurement not sooner than PROOF_RETRY_MS after the runtime
-  // asked last. A round that leaves such a measurement unasked has more to read than it read.
-  // No request goes out while the device has met no such measurement.
+  // round at most, and for one measurement not sooner than PROOF_SEEK_RETRY_MS after the
+  // runtime asked last (the request calls no node, and the proofs of a release may reach the
+  // backend after its nodes). A round that leaves such a measurement unasked has more to read
+  // than it read. No request goes out while the device has met no such measurement.
   const PROOFS_PATH = "/api/secure/release-proofs";
   const PROOF_REQUEST_MEASURES = 8;
   const PROOF_ROUND_REQUESTS = 4;
+  const PROOF_SEEK_RETRY_MS = 300000;
 
   // The record kinds this program makes in the migration (the device-side sealing of what was
   // stored before the switch), and the most rounds of fetching and uploading one sync runs (one
@@ -2443,7 +2445,7 @@
    *  commas; the answer is {proofs: [{measure, release_proofs}]}). A round asks so for the
    *  measurements no list has and no proofs showed that it met: release proofs are public
    *  values, so whoever hands them over, the verdict is that of the five checks alone. A
-   *  measurement is asked for when this runtime did not ask for it within PROOF_RETRY_MS. One
+   *  measurement is asked for when this runtime did not ask for it within PROOF_SEEK_RETRY_MS. One
    *  call sends one request, for PROOF_REQUEST_MEASURES measurements at most, and a round
    *  (run) sends PROOF_ROUND_REQUESTS of them at most. Of the answer, an element counts when it
    *  names a measurement of the request for the first time and carries proofs whose statement
@@ -2464,7 +2466,7 @@
       if (typeof digest !== "string" || !canonical32(digest) || wanted.indexOf(digest) >= 0) continue;
       if (buildOfMeasure(digest) !== undefined || provenLater(digest) || run.proofsAsked.has(digest)) continue;
       const last = proofSought.get(digest) || 0;
-      if (last !== 0 && last <= now && now - last < PROOF_RETRY_MS) continue;
+      if (last !== 0 && last <= now && now - last < PROOF_SEEK_RETRY_MS) continue;
       if (wanted.length >= PROOF_REQUEST_MEASURES || whole(run.proofRequests) >= PROOF_ROUND_REQUESTS) {
         left = true;
         break;

@@ -1338,7 +1338,7 @@ Test vectors of the assignment; the backend of the operator computes the same fu
 | `LOG_RELEASE_GRACE_MS`, `SERVED_FRESH_MS` (the app) | 24 hours: the time a measurement no list of the program has may hold the key of the account before it marks the log (A1). 1 hour: the age up to which a reading of the served version, or in a build that knows it itself the last check of the app for a new program, says that no later program is served |
 | `LOG_DOUBT_ROUNDS` (the app) | 2: the rounds whose answers carried no signature that verifies for a key before the signatures of its node contradict each other (A2) |
 | `PROOF_STATEMENT_BYTES`, `PROOF_ATTESTATION_BYTES`, `PROOF_PATH_HASHES`, `PROOF_DEPLOY_SIGNATURES`, `PROOF_JSON_DEPTH` (the app) | 16,384, 65,536, 64, 8 and 32: the bytes of a release statement, the bytes of the attestation of release proofs as JSON without white space, the hashes of its audit path, the elements of `deploy_signatures`, and the arrays and objects inside one another of a JSON value of release proofs ("The release proofs") |
-| `PROOF_REQUEST_NODES`, `PROOF_REQUEST_MEASURES`, `PROOF_ROUND_REQUESTS`, `PROOF_RETRY_MS` (the app) | 4: the nodes one grant step asks for the release proofs of their release, one of each measurement. 8 and 4: the measurements one request to the backend for release proofs names, and such requests per round. 1 hour: the time after which a measurement is asked for again, by a node and by a round each |
+| `PROOF_REQUEST_NODES`, `PROOF_RETRY_MS`, `PROOF_REQUEST_MEASURES`, `PROOF_ROUND_REQUESTS`, `PROOF_SEEK_RETRY_MS` (the app) | 4 and 1 hour: the nodes one grant step asks for the release proofs of their release, one of each measurement, and the time after which a node of a measurement is asked again. 8, 4 and 5 minutes: the measurements one request to the backend for release proofs names, such requests per round, and the time after which a round asks for a measurement again |
 | `PROOF_FAILURES`, `PROOF_FAILURE_SPAN_MS`, `PROOF_REFUSED_KEPT` (the app) | 8 and 1 hour: a runtime verifies no further release proofs while this many failed within this time. 8: the measurements for which a runtime remembers the proofs it refused last, which it does not verify again |
 | `PROOF_KEPT_VERDICTS`, `PROOF_KEPT_PROOFS`, `PROOF_KEPT_CHARS` (the app) | 256: the measurements whose verdicts of release proofs the device keeps (beyond them the verdict of the earliest release leaves). 4 and 65,536: the releases whose proofs are kept with the verdict, the latest ones the program accepts, and the characters of the JSON of proofs that are kept |
 | `LOG_BLOCKED_ROUNDS`, `LOG_BLOCKED_MS`, `LOG_REACH_MS`, `LOG_URL_FRESH_MS` (the app) | 3 and 3 days: the rounds in a row whose reads were held back (or the reads of one kind the log screen notes as held back from it), and the age of the first of them, at which the log is marked (A3). 60,000: a request that was not answered counts as held back when the backend answered another request of the runtime within this time. 240,000: the age of a signed address from which a refusal of the store is the age of the address |
@@ -1724,8 +1724,9 @@ Where the proofs come from. Whoever hands them over, the checks above decide.
   nodes are judged; and before its judgement, for the measurements it noted. One request names
   eight measurements at most, and a round sends four such requests at most; a round that leaves
   a measurement unasked has more to read than it read ("The round"). A runtime asks for one
-  measurement not sooner than an hour after it asked last, and a round asks for a measurement
-  once. No request goes out while the device has met no such measurement, and a stale runtime
+  measurement not sooner than five minutes after it asked last (the request calls no node, and
+  the proofs of a release may reach the backend after its nodes), and a round asks for a
+  measurement once. No request goes out while the device has met no such measurement, and a stale runtime
   sends none.
 
   What the answer means for A1 (7.4). A measurement no list has marks the log only for a runtime
@@ -1736,7 +1737,7 @@ Where the proofs come from. Whoever hands them over, the checks above decide.
   verify because eight had failed within the hour). A backend without the route (the status 404
   and no code of its own) answers so. A request that fails any other way is no answer: the
   measurement waits, the round is pending, and the next round asks again without waiting for
-  the hour. Past the 24 hours of A1, a round whose request for the proofs failed on the side of
+  the five minutes. Past the 24 hours of A1, a round whose request for the proofs failed on the side of
   the server (an error status, an answer that is no JSON object, or no answer while the backend
   answered another request of the runtime within 60 s) is a round held back (A3), whether or
   not the runtime knows what program is served; a request that failed with the network of the

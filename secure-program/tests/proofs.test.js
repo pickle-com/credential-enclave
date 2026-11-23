@@ -928,7 +928,7 @@ test("the release of a closed node whose node document carries no release proofs
   assert.deepEqual(none.world.stored("log.unaccepted"), {});
 });
 
-test("a backend that hands release proofs out for a digest is asked again for a measurement not sooner than an hour after the last request of the runtime", async () => {
+test("a backend that hands release proofs out for a digest is asked again for a measurement not sooner than five minutes after the last request of the runtime", async () => {
   const fx = partiesFixture();
   const world = fx.world;
   await S.start(fx);
@@ -937,19 +937,19 @@ test("a backend that hands release proofs out for a digest is asked again for a 
   await nextDay(fx);
   assert.deepEqual(proofRequests(world), [[digestOf(closed.measurement)]]);
   assert.equal(world.state.log.status, "pending");
-  // Within the hour: the rounds of the next events, a procedure of the user and the log screen
-  // ask for none.
+  // Within the five minutes: the rounds of the next events, a procedure of the user and the
+  // log screen ask for none.
   for (let step = 0; step < 3; step += 1) {
-    world.advance(10 * 60000);
+    world.advance(61000);
     await S.event(fx, "foreground");
   }
   await S.call(fx, "sync", {});
   await S.call(fx, "read_log", { limit: 10 });
   assert.deepEqual(proofRequests(world), [[digestOf(closed.measurement)]]);
-  // After the hour, with the proofs at the backend: the round asks, the measurement is shown,
-  // and the entries of its node are judged as those of an accepted node.
+  // After the five minutes, with the proofs at the backend: the round asks, the measurement is
+  // shown, and the entries of its node are judged as those of an accepted node.
   world.releaseProofs.set("v2.5.0", closed.proofs);
-  world.advance(31 * 60000);
+  world.advance(2 * 60000);
   await S.event(fx, "foreground");
   assert.equal(proofRequests(world).length, 2);
   assert.equal(world.state.log.status, "verified");
