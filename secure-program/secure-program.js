@@ -3347,19 +3347,50 @@
       if (nodeVerdict(log.grants, log.nodes, id) === null && unknown.indexOf(id) < 0) unknown.push(id);
     }
     const learning = learnNodes(turn, log, run, unknown, budget, true);
-    const wanted = items.map(function (item) { return item.parsed.key; });
+    // The keys whose bodies are asked for: each key once, in the order of items, as many as the
+    // requests left to this read carry. They are sent with the earliest entry first, so that a
+    // key an answer left out stands at the front of the next read however many later entries
+    // arrive.
+    const named = new Set();
+    let wanted = [];
+    for (const item of items) {
+      if (named.has(item.parsed.key) || wanted.length >= budget.bodies * LOG_BODY_KEYS) continue;
+      named.add(item.parsed.key);
+      wanted.push(item.parsed);
+    }
+    wanted.sort(function (a, b) {
+      if (a.time_ms !== b.time_ms) return a.time_ms - b.time_ms;
+      return a.tail < b.tail ? 1 : a.tail > b.tail ? -1 : 0;
+    });
+    wanted = wanted.map(function (parsed) { return parsed.key; });
     const requests = [];
     for (let at = 0; at < wanted.length && budget.bodies > 0; at += LOG_BODY_KEYS) {
       budget.bodies -= 1;
-      requests.push(settled(readBodies(turn, wanted.slice(at, at + LOG_BODY_KEYS))));
+      const batch = wanted.slice(at, at + LOG_BODY_KEYS);
+      requests.push({ keys: batch, sent: settled(readBodies(turn, batch)) });
     }
     const left = await learning;
     const bodies = new Map();
-    for (const sent of requests) {
-      const outcome = await sent;
+    for (const asked of requests) {
+      const outcome = await asked.sent;
       if (!outcome.ok) {
         noteFailure(turn, run, outcome.error);
         continue;
+      }
+      // An answer may end early (the backend bounds the size of an answer): the keys after the
+      // last key it names are asked for again by the next read. An answer that names none of the
+      // keys, or names a key and not one before it in the request, held a body back.
+      let last = -1;
+      for (let at = 0; at < asked.keys.length; at += 1) {
+        if (outcome.value.has(asked.keys[at])) last = at;
+      }
+      let skipped = last < 0;
+      for (let at = 0; at < last; at += 1) {
+        if (!outcome.value.has(asked.keys[at])) skipped = true;
+      }
+      if (skipped) {
+        run.blocked = true;
+        if (run.detail === "") run.detail = "bodies:skipped";
       }
       outcome.value.forEach(function (value, key) { bodies.set(key, value); });
     }

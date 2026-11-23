@@ -1553,3 +1553,51 @@ test("the state of the log a program before published is not shown as a judgemen
   await S.start(fx);
   assert.equal(world.state.log.status, "verified");
 });
+
+// ---- An answer of the bodies that does not name every key ----
+
+test("A3: an answer of the bodies that ends early is asked on, and an answer that names no key, or a key and not one before it, is a read held back", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  const node = fx.nodes[0];
+  const written = [];
+  for (const id of ["r1", "r2", "r3"]) {
+    world.advance(1000);
+    written.push(node.record("c", [{ t: "connection_created", time_ms: world.now, record_id: id, provider: "slack", scope: "" }]));
+  }
+  const answerOnly = (keep) => {
+    world.clearFaults();
+    world.fault("POST /api/secure/log/bodies", (request) => {
+      const answer = JSON.parse(world.api("POST", "/api/secure/log/bodies", null, request.body).body);
+      return { status: 200, body: { entries: answer.entries.filter((item) => keep(item.key)), missing: [] } };
+    });
+  };
+  const asked = () => JSON.parse(world.sent("POST /api/secure/log/bodies").slice(-1)[0].body).keys;
+  // The backend answers the first key of the request and ends there: the keys are asked for with
+  // the earliest entry first, the round is not complete, and nothing was held back.
+  answerOnly((key) => key === written[0].key);
+  await nextDay(fx);
+  assert.deepEqual(asked(), written.map((entry) => entry.key));
+  assert.equal(world.state.log.status, "pending");
+  assert.equal(world.state.log.store, "verified");
+  assert.equal(world.stored("log.blocked").count, 0);
+  // The next round asks for the keys that were left, the earliest first. The backend names the
+  // later one and not the one before it.
+  answerOnly((key) => key === written[2].key);
+  await nextDay(fx);
+  assert.deepEqual(asked(), [written[1].key, written[2].key]);
+  assert.equal(world.state.log.store, "blocked");
+  assert.equal(world.state.log.store_failure, "bodies:skipped");
+  // The key that was left out stands first in the next request, and an answer that names no key
+  // holds it back again.
+  answerOnly(() => false);
+  await nextDay(fx);
+  assert.deepEqual(asked(), [written[1].key]);
+  assert.equal(world.state.log.store, "blocked");
+  assert.equal(world.stored("log.blocked").count, 2);
+  world.clearFaults();
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(world.stored("log.blocked").count, 0);
+});

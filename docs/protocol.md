@@ -1535,7 +1535,10 @@ log screen runs a round with its first page. One round runs at a time.
    read on by the next round. A key older than 365 days is left out.
 3. The node documents of the nodes the device has no judgement of (`POST
    /api/secure/log/documents`, verified by 7.7), and
-4. the bodies of the keys it has not judged (`POST /api/secure/log/bodies`), in the same stage.
+4. the bodies of the keys it has not judged (`POST /api/secure/log/bodies`), in the same stage. A
+   request names its keys with the earliest entry first. An answer may end early: the keys after
+   the last key it names are asked for again by the next round, and the key that was left out
+   stands first in that request.
    Each object is verified by 7.4: the SHA-256 of the body against the `body_hash` of the key, the
    signature under the node id of the key, and the fields of the body against the key and the
    account. The events of an entry of the device's own `key_id` are opened.
@@ -1557,7 +1560,7 @@ conditions holds, and each holds only in a situation that is a problem:
 | --- | --- | --- |
 | A1 | The key of the account went to a node of a release the program does not accept | A node of an accepted measurement wrote `grant_transferred_out` under the device's own `key_id` naming a measurement no list of the program has, or a node whose document states such a measurement wrote an entry under that `key_id`, and 24 hours have passed since the device first saw that measurement. Within the 24 hours the round is pending: a program that lists a new release is served before a node of that release takes a grant, and a runtime loads the served program at its next start or return to the foreground. The program that lists the release clears the condition |
 | A2 | The signatures of a node that passed attestation contradict each other | Under a key of a node of an accepted measurement: the body the key names with a signature that does not verify, an entry of the device's own `key_id` that does not open, or two different bodies of one `seq` that both verify |
-| A3 | The operator domain has held the reads back for three days | Three rounds in a row or more were held back and the first of them is three days old. A round is held back when a route of the reads answers with an error status, or does not answer within its limit while the backend answered another request of the runtime within 60 s; when an address is not the one of the request; when the store answers an address not older than 240 s with a status other than 200, 429 and 5xx; when the backend hands out no body, or another body, for a key of the listing; and when it hands out no verifying document for the node of a key of the listing. A round that read the store clears the count |
+| A3 | The operator domain has held the reads back for three days | Three rounds in a row or more were held back and the first of them is three days old. A round is held back when a route of the reads answers with an error status, or does not answer within its limit while the backend answered another request of the runtime within 60 s; when an address is not the one of the request; when the store answers an address not older than 240 s with a status other than 200, 429 and 5xx; when the backend hands out no body, or another body, for a key of the listing; when an answer of the bodies names none of the keys of a request, or names a key and not one before it in the request; and when it hands out no verifying document for the node of a key of the listing. A round that read the store clears the count |
 | A4 | An entry the device saw left the listing within its retention | A key of the sample that is younger than 364 days and lies in the range the listing covered is in neither of two readings of the listing |
 
 A device without a network, a store that answers 5xx or 429, and an address that aged while the
