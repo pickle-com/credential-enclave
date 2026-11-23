@@ -9,6 +9,26 @@
 //! standard output.
 
 #![forbid(unsafe_code)]
+// A node is built to abort on a panic (the release profile), and a node that ends takes the
+// delegations it holds with it. So:
+// No input ends the program. Its code (not the code of its tests) holds no `unwrap`, no
+// `expect`, no `panic!`, and no index or slice expression that can fail. A place that keeps
+// one of them says, where it stands, why no input reaches its failure
+// (`#[expect(clippy::.., reason = "..")]`).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::get_unwrap
+    )
+)]
 // Rule E5 of the egress policy: the node writes no output of its own making. The one exception
 // is `diagnostic`, which takes a fixed string.
 #![deny(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
@@ -22,12 +42,32 @@ mod frame;
 mod inbound;
 mod lineage;
 mod load;
+// The rule on input that ends the program is not in force in this module.
+#[cfg_attr(
+    not(test),
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::string_slice
+    )
+)]
 mod log_store;
 mod mail;
 mod oauth;
 mod platform;
 mod provider_response;
 mod providers;
+// The rule on input that ends the program is not in force in this module.
+#[cfg_attr(
+    not(test),
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::string_slice
+    )
+)]
 mod state;
 mod subset;
 #[cfg(test)]

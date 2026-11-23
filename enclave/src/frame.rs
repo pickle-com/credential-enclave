@@ -53,7 +53,10 @@ pub const META_LIMIT_BYTES: usize = 1024 * 1024;
 /// The length prefix and the meta of a frame. The payload follows these bytes.
 pub fn encode_head<T: Serialize>(meta: &T) -> Vec<u8> {
     let meta = to_json(meta);
-    let length = u32::try_from(meta.len()).expect("a frame meta is far below 4 GiB");
+    // The meta of a response is its head, which has the bound of the HTTP connection it
+    // arrived on, far below 4 GiB. A length the prefix cannot state would be written as the
+    // largest one, which every reader refuses (`META_LIMIT_BYTES`).
+    let length = u32::try_from(meta.len()).unwrap_or(u32::MAX);
     let mut head = Vec::with_capacity(4 + meta.len());
     head.extend_from_slice(&length.to_be_bytes());
     head.extend_from_slice(&meta);
@@ -69,15 +72,21 @@ pub fn decode(frame: &Bytes) -> Result<(serde_json::Value, Bytes), ProtocolError
         .and_then(|bytes| bytes.try_into().ok())
         .ok_or(ProtocolError::InvalidRequest)?;
     let meta_length = u32::from_be_bytes(prefix) as usize;
-    if meta_length > META_LIMIT_BYTES || meta_length > frame.len() - 4 {
+    if meta_length > META_LIMIT_BYTES {
         return Err(ProtocolError::InvalidRequest);
     }
-    let meta: serde_json::Value = serde_json::from_slice(&frame[4..4 + meta_length])
-        .map_err(|_| ProtocolError::InvalidRequest)?;
+    // The meta lies in the frame whole, behind the four bytes of its length.
+    let payload_at = 4 + meta_length;
+    let meta = frame
+        .get(4..payload_at)
+        .ok_or(ProtocolError::InvalidRequest)?;
+    let meta: serde_json::Value =
+        serde_json::from_slice(meta).map_err(|_| ProtocolError::InvalidRequest)?;
     if !meta.is_object() {
         return Err(ProtocolError::InvalidRequest);
     }
-    Ok((meta, frame.slice(4 + meta_length..)))
+    // `payload_at` is not behind the end of the frame: the meta was read up to it.
+    Ok((meta, frame.slice(payload_at..)))
 }
 
 #[cfg(test)]

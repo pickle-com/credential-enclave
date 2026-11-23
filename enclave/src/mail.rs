@@ -611,19 +611,21 @@ async fn search_uids(
 
 fn imap_date(date: &str) -> Result<String, MailError> {
     let parts: Vec<_> = date.split('-').collect();
-    if parts.len() != 3
-        || parts[0].len() != 4
-        || parts[1].len() != 2
-        || parts[2].len() != 2
+    let [year, month, day] = parts.as_slice() else {
+        return Err(MailError::Invalid);
+    };
+    if year.len() != 4
+        || month.len() != 2
+        || day.len() != 2
         || parts
             .iter()
             .any(|part| !part.bytes().all(|b| b.is_ascii_digit()))
     {
         return Err(MailError::Invalid);
     }
-    let year: u32 = parts[0].parse().map_err(|_| MailError::Invalid)?;
-    let month: usize = parts[1].parse().map_err(|_| MailError::Invalid)?;
-    let day: u32 = parts[2].parse().map_err(|_| MailError::Invalid)?;
+    let year: u32 = year.parse().map_err(|_| MailError::Invalid)?;
+    let month: usize = month.parse().map_err(|_| MailError::Invalid)?;
+    let day: u32 = day.parse().map_err(|_| MailError::Invalid)?;
     let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
     let days = [
         31,
@@ -639,13 +641,17 @@ fn imap_date(date: &str) -> Result<String, MailError> {
         30,
         31,
     ];
-    if year == 0 || !(1..=12).contains(&month) || day == 0 || day > days[month - 1] {
+    // The month is 1 to 12, or it names no place of the two tables.
+    let place = month.checked_sub(1).ok_or(MailError::Invalid)?;
+    let days_of_month = *days.get(place).ok_or(MailError::Invalid)?;
+    if year == 0 || day == 0 || day > days_of_month {
         return Err(MailError::Invalid);
     }
     let names = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
-    Ok(format!("{day}-{}-{year}", names[month - 1]))
+    let name = names.get(place).ok_or(MailError::Invalid)?;
+    Ok(format!("{day}-{name}-{year}"))
 }
 
 fn email(value: &str) -> bool {
@@ -661,9 +667,12 @@ fn email(value: &str) -> bool {
 fn validate_message(body: &[u8], identity: &str) -> Result<(), MailError> {
     if !body.is_ascii()
         || !body.ends_with(b"\r\n")
-        || body
-            .windows(2)
-            .any(|w| (w[0] == b'\r' && w[1] != b'\n') || (w[1] == b'\n' && w[0] != b'\r'))
+        || body.windows(2).any(|pair| match pair {
+            [first, second] => {
+                (*first == b'\r' && *second != b'\n') || (*second == b'\n' && *first != b'\r')
+            }
+            _ => false,
+        })
     {
         return Err(MailError::Invalid);
     }
@@ -826,7 +835,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for LiteralGuard<R> {
         let this = self.get_mut();
         let filled = buf.filled().len();
         std::task::ready!(Pin::new(&mut this.inner).poll_read(cx, buf))?;
-        if this.scan.feed(&buf.filled()[filled..], this.bound).is_err() {
+        let arrived = buf.filled().get(filled..).unwrap_or_default();
+        if this.scan.feed(arrived, this.bound).is_err() {
             return Poll::Ready(Err(io::Error::other(
                 "a literal declaration above the response bound",
             )));

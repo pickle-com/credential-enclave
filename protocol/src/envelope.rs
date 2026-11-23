@@ -635,6 +635,13 @@ impl RngCore for SeedSource {
         u64::from_le_bytes(bytes)
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "the HPKE sender of the pinned crate reads the key material of its one \
+                  ephemeral key pair, 32 bytes, once; a sender that read anything else must \
+                  not get bytes that are no fresh key material, and every seal of the tests \
+                  and of the test vectors passes through here"
+    )]
     fn fill_bytes(&mut self, destination: &mut [u8]) {
         self.try_fill_bytes(destination)
             .expect("the HPKE sender reads its 32-byte key material exactly once");
@@ -644,7 +651,7 @@ impl RngCore for SeedSource {
         if self.used || destination.len() != self.seed.len() {
             return Err(hpke::rand_core::Error::from(
                 core::num::NonZeroU32::new(hpke::rand_core::Error::CUSTOM_START)
-                    .expect("CUSTOM_START is not zero"),
+                    .unwrap_or(core::num::NonZeroU32::MAX),
             ));
         }
         destination.copy_from_slice(self.seed.as_slice());

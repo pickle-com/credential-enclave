@@ -584,6 +584,11 @@ impl Egress {
             .saturating_sub(self.opens.available_permits())
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "runs once at the start of the node, with the provider and the protocol \
+                  versions the program is built with: no input of a call reaches this place"
+    )]
     fn build(clock: Arc<Clock>, roots: RootCertStore, open_concurrency: usize) -> Egress {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut config = ClientConfig::builder_with_details(provider, Arc::new(TlsTime(clock)))

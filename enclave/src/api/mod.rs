@@ -58,6 +58,11 @@ const JSON_BODY_LIMIT_BYTES: usize = 1024 * 1024;
 
 type Route = (Method, &'static str, MethodRouter<Arc<Node>>);
 
+#[expect(
+    clippy::expect_used,
+    reason = "runs once at the start of the node, for the rows of the table of `routes`: every \
+              method of the table is GET or POST, and no input of a call reaches this place"
+)]
 fn route<H, T>(method: Method, path: &'static str, handler: H) -> Route
 where
     H: axum::handler::Handler<T, Arc<Node>>,

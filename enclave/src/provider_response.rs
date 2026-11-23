@@ -347,28 +347,31 @@ fn decode_in_place(bytes: &mut Vec<u8>) -> bool {
 /// The bytes behind the result are overwritten before the length is cut.
 fn decode_from(bytes: &mut Vec<u8>, first: usize) {
     let (mut read, mut write) = (first, first);
-    while read < bytes.len() {
-        match escape_at(bytes, read) {
-            Some(byte) => {
-                bytes[write] = byte;
-                read += 3;
-            }
-            None => {
-                bytes[write] = bytes[read];
-                read += 1;
-            }
+    while let Some(literal) = bytes.get(read).copied() {
+        let (byte, taken) = match escape_at(bytes, read) {
+            Some(byte) => (byte, 3),
+            None => (literal, 1),
+        };
+        // The place that is written lies at or in front of the place that was read.
+        if let Some(place) = bytes.get_mut(write) {
+            *place = byte;
         }
+        read += taken;
         write += 1;
     }
-    bytes[write..].zeroize();
+    if let Some(behind) = bytes.get_mut(write..) {
+        behind.zeroize();
+    }
     bytes.truncate(write);
 }
 
 fn hex(bytes: &[u8], digits: &[u8; 16]) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        encoded.push(digits[usize::from(byte >> 4)]);
-        encoded.push(digits[usize::from(byte & 0x0f)]);
+        // A half of a byte is below 16, the length of the table.
+        for half in [byte >> 4, byte & 0x0f] {
+            encoded.extend(digits.get(usize::from(half)));
+        }
     }
     encoded
 }

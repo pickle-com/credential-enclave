@@ -264,26 +264,36 @@ impl EgressCounters {
     }
 
     fn count_accept_error(&self, failure: AcceptFailure) {
-        self.accept_errors[failure as usize].fetch_add(1, Ordering::Relaxed);
+        // One counter per class, in the order of the classes.
+        if let Some(count) = self.accept_errors.get(failure as usize) {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn count_relay(&self, outcome: &Outcome) {
-        self.relays[outcome.index()].fetch_add(1, Ordering::Relaxed);
+        // One counter per outcome, in the order of the labels.
+        if let Some(count) = self.relays.get(outcome.index()) {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// The failed accepts by class: the value of the `cause` label and the count.
     pub fn accept_errors(&self) -> [(&'static str, u64); 3] {
-        std::array::from_fn(|index| {
-            let count = self.accept_errors[index].load(Ordering::Relaxed);
-            (AcceptFailure::ALL[index].label(), count)
+        let mut classes = AcceptFailure::ALL.iter().zip(&self.accept_errors);
+        std::array::from_fn(|_| {
+            classes.next().map_or(("", 0), |(class, count)| {
+                (class.label(), count.load(Ordering::Relaxed))
+            })
         })
     }
 
     /// The served connections by outcome: the value of the `outcome` label and the count.
     pub fn relays(&self) -> [(&'static str, u64); 5] {
-        std::array::from_fn(|index| {
-            let count = self.relays[index].load(Ordering::Relaxed);
-            (Outcome::LABELS[index], count)
+        let mut outcomes = Outcome::LABELS.iter().zip(&self.relays);
+        std::array::from_fn(|_| {
+            outcomes.next().map_or(("", 0), |(label, count)| {
+                (*label, count.load(Ordering::Relaxed))
+            })
         })
     }
 

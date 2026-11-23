@@ -38,6 +38,25 @@
 //! `CREDENTIAL_ENCLAVE_DRAIN_TOKEN` and `CREDENTIAL_ENCLAVE_POD_NAME` of `drain`.
 
 #![forbid(unsafe_code)]
+// The host program is built to abort on a panic, and the enclave ends with it. So:
+// No input ends the program. Its code (not the code of its tests) holds no `unwrap`, no
+// `expect`, no `panic!`, and no index or slice expression that can fail. A place that keeps
+// one of them says, where it stands, why no input reaches its failure
+// (`#[expect(clippy::.., reason = "..")]`).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::get_unwrap
+    )
+)]
 
 mod config;
 mod descriptors;
