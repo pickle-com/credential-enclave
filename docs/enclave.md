@@ -819,7 +819,10 @@ which form it holds. The order of the processing:
    a response body above 64 MiB is `too_large`.
 10. The response check (rule E4 of egress-policy.md, `enclave/src/provider_response.rs`). A
     response with a `Content-Encoding` other than `identity`, or with a transfer coding other than
-    `chunked`, fails the check: the node does not hand on a body it cannot search. A response
+    `chunked`, fails the check: the node does not hand on a body it cannot search. The two
+    headers are read as they arrived, before the headers that the `Connection` header of the
+    response lists are left out (step 8), and a response under an instance manipulation (RFC
+    3229: the status 226, or a header `IM`) fails the check as well. A response
     fails the check when a header name, a header value or the body holds the injected credential
     (the token without the prefix of the definition). Each of the three is read as it was
     received and with its percent escapes decoded (up to three times, for a value that was

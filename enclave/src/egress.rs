@@ -29,7 +29,9 @@ use credential_enclave_protocol::limits;
 use credential_enclave_protocol::secret::Secret;
 use hyper::body::{Body, Bytes, Frame, Incoming, SizeHint};
 use hyper::client::conn::http1::SendRequest;
-use hyper::header::{HeaderName, HeaderValue, CONNECTION, CONTENT_LENGTH, HOST, TRANSFER_ENCODING};
+use hyper::header::{
+    HeaderName, HeaderValue, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, HOST, TRANSFER_ENCODING,
+};
 use hyper::{Method, Request, Uri};
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
@@ -110,8 +112,9 @@ pub enum EgressError {
     Unreachable,
     /// The response body is above the limit.
     TooLarge,
-    /// The response body is under a transfer coding other than `chunked`: the node cannot read
-    /// it.
+    /// The response body is under a coding the node does not remove, so it cannot search it:
+    /// a transfer coding other than `chunked`, a content coding other than `identity`, or an
+    /// instance manipulation.
     Coded,
 }
 
@@ -858,7 +861,22 @@ impl Egress {
                         .any(|coding| !coding.trim().eq_ignore_ascii_case("chunked"))
                 })
             });
-        if coded {
+        // The same holds, for a response that is handed on to the caller of `forward` (a
+        // request of an account), for a body under a content coding (the node asks for
+        // `identity`) and for a body under an instance manipulation (RFC 3229: the status
+        // 226, the header `IM`), which a caller can ask a server for with a header of its
+        // own. Both are read here, from the headers as they arrived: a response that lists
+        // `Content-Encoding` in its `Connection` header would lose that header below, and
+        // reach the check of the response as a body that says no coding. A response the node
+        // reads itself (of a token address, of a revocation address) is not handed on: the
+        // node parses its body as it stands.
+        let encoded = parts.headers.get_all(CONTENT_ENCODING).iter().any(|value| {
+            value.to_str().map_or(true, |coding| {
+                !coding.trim().eq_ignore_ascii_case("identity")
+            })
+        });
+        let manipulated = parts.status.as_u16() == 226 || parts.headers.contains_key("im");
+        if coded || (account.is_some() && (encoded || manipulated)) {
             return Err(EgressError::Coded);
         }
 

@@ -1836,3 +1836,49 @@ async fn the_stream_key_and_the_time_limit_of_a_stream_are_checked() {
     places_are_free(&harness).await;
     assert_budget_is_free(&harness);
 }
+
+#[tokio::test]
+async fn a_coded_response_is_withheld_whatever_its_connection_header_lists() {
+    let answers = std::sync::Mutex::new(vec![
+        // The header that names the coding is listed as a header of the connection: the node
+        // drops the headers of that list, and judges the coding before it does.
+        Reply::with_body(
+            200,
+            &[
+                ("connection", "content-encoding"),
+                ("content-encoding", "gzip"),
+            ],
+            b"\x1f\x8b",
+        ),
+        // An instance manipulation (RFC 3229): the body is not the representation.
+        Reply::with_body(226, &[("im", "gzip")], b"\x1f\x8b"),
+        Reply::with_body(200, &[("IM", "vcdiff")], b"delta"),
+        // `identity` is no coding.
+        Reply::with_body(200, &[("content-encoding", "identity")], b"{}"),
+    ]);
+    let provider = provider_with_log_store(move |_| answers.lock().unwrap().remove(0)).await;
+    let (harness, app, record) = ready(&provider).await;
+    let call = |query: &str| {
+        meta(
+            &app,
+            &record,
+            "POST",
+            &format!("{PROFILE}?{query}"),
+            json!([]),
+        )
+    };
+    for query in ["n=1", "n=2", "n=3"] {
+        assert_eq!(
+            failure(harness.forward(call(query), b"{}").await),
+            (502, "response_withheld".to_string()),
+            "{query}"
+        );
+    }
+    // The stream form judges the same head.
+    let streamed = harness
+        .forward_stream(stream_meta(&app, &record, "POST", PROFILE), b"{}")
+        .await
+        .unwrap();
+    assert_eq!(streamed.body(), b"{}");
+    assert_budget_is_free(&harness);
+}
