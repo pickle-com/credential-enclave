@@ -44,6 +44,10 @@
   const LOG_API_TIMEOUT_MS = 10000;
   const LOG_STORE_TIMEOUT_MS = 10000;
   const NODE_TIMEOUT_MS = 30000;
+  // The two requests at the front of a synchronization and of a procedure that needs the grants
+  // (the account query and the list of the nodes) are sent once more, this long after an answer
+  // that fails for a moment (frontQuery).
+  const FRONT_RETRY_MS = 500;
   // The longest time one procedure takes, from its call to its end, without the time the device
   // spent in an operation that waits for the user (webAuth, deviceOwnerAuth, promptSecret,
   // presentSecret). The executors end a procedure at 120 seconds from outside the queue of the
@@ -141,8 +145,9 @@
   //                   closed, read_ms}}, waiting: {node: {until_ms, time_ms, strict}}} (waiting:
   //                   the receiving nodes of transfers whose documents this device has still to
   //                   judge; strict: nothing but a document judges the node)
-  //   log.round       the last round: {v, done_ms, tried_ms, last, told, state, unfinished}
-  //                   (unfinished: the rounds in a row that had more to read than they read)
+  //   log.round       the last round: {v, done_ms, tried_ms, last, told, state, unfinished,
+  //                   row_ms} (unfinished: the rounds in a row that had more to read than they
+  //                   read and were not catching up; row_ms: the time that row began, 0 for none)
   //   log.cache       the kept screen, sealed (the first page, the time the screen last read
   //                   its listings itself, the summary tally, what it knows of the chains)
   //   log.migrated    the mark that the ledger of the program before was carried over
@@ -353,7 +358,7 @@
   const LEGACY_NODES = 64;
   const LEGACY_LISTING_NODES = 16;
   const LEGACY_ROUND_PASSES = 4;
-  const LEGACY_ROUND_BODIES = 64;
+  const LEGACY_ROUND_BODIES = 512;
   const LEGACY_SEQ_READS = 8;
   // The seqs at the end of a listing page of a chain that a round reads to see how far the node
   // wrote, when their keys name no control entry.
@@ -2664,6 +2669,9 @@
   }
 
   function storeJson(key, value) {
+    // (Once the account ended, the program store takes no value: a step that was under way when
+    // the values of the account were erased writes none of them back.)
+    if (accountClosed && value !== null && value !== undefined) return;
     native.storeSet(key, value === null || value === undefined ? null : JSON.stringify(value));
   }
 
@@ -3017,6 +3025,24 @@
     return Promise.all(promises.map(settled));
   }
 
+  /** A request at the front of a synchronization or of a procedure (ask sends it and returns
+   *  its promise: the account query accountQuery, the list of the nodes fetchListed), sent once
+   *  more when it fails for a moment: a failure of the transport and an answer with the status 429 or
+   *  500 to 599 are asked again once, FRONT_RETRY_MS later. A backend that is being deployed
+   *  answers one request with a 503, and a procedure the user started does not end with that
+   *  answer. No other request is sent twice: an outage would double them. */
+  async function frontQuery(turn, ask) {
+    try {
+      return await ask();
+    } catch (error) {
+      const status = failureStatus(error);
+      const moment = failureCode(error) === "transport" || status === 429 || (status >= 500 && status <= 599);
+      if (!moment || !(turnLeft(turn) > FRONT_RETRY_MS)) throw error;
+      await native.sleep(FRONT_RETRY_MS);
+      return ask();
+    }
+  }
+
   /** A gate of limit calls in flight at once: run(work) starts work when a place is free (the
    *  next starts when one ended) and returns its promise. A place is handed to the next waiting
    *  call directly, so never more than limit are in flight. */
@@ -3245,12 +3271,61 @@
     return merged;
   }
 
-  /** Reads the node ledger: the merge of the keychain item and the device copy (when the
-   *  synchronization between devices overwrites one side's write, the other side remains). */
-  function loadLedger() {
+  /** Whether a stored ledger value is one this program does not read: a value that is there and
+   *  is no JSON object whose v is 1. A program after this one wrote it (the keychain item is shared
+   *  by the devices of the account, and the device copy is written by the program this device ran
+   *  last). Such a value may hold what this program must not lose and cannot see: the time the
+   *  user turned the delegation off, a shorter lifetime. A value without content is none. */
+  function ledgerUnknown(json) {
+    if (json === null || json === undefined || json === "") return false;
+    let raw = null;
+    try {
+      raw = JSON.parse(json);
+    } catch (error) {
+      raw = null;
+    }
+    return raw === null || typeof raw !== "object" || Array.isArray(raw) || raw.v !== 1;
+  }
+
+  /** The two stored values of the node ledger as texts, and whether each is one this program
+   *  does not read: {item, copy, itemUnknown, copyUnknown}. A keychain value that is no base64url
+   *  text is one it does not read. */
+  function ledgerSides() {
     const kept = native.keychainGet(ledgerItem());
-    const keychainLedger = parseLedger(kept === null ? null : text(decode(kept)));
-    return mergeLedger(keychainLedger, parseLedger(native.storeGet(LEDGER_STORE_KEY)));
+    let item = null;
+    let undecoded = false;
+    if (kept !== null) {
+      try {
+        item = text(decode(kept));
+      } catch (error) {
+        undecoded = true;
+      }
+    }
+    const copy = native.storeGet(LEDGER_STORE_KEY);
+    return { item: item, copy: copy, itemUnknown: undecoded || ledgerUnknown(item), copyUnknown: ledgerUnknown(copy) };
+  }
+
+  /** Whether the node ledger holds a value this program does not read (ledgerUnknown), on either
+   *  side. A runtime that reads such a ledger does not know whether the delegation is on: it
+   *  hands no grant to any node (a grant it handed would undo a revoke another device of the
+   *  account made with a later program), sends no revoke of its own accord, leaves the value as
+   *  it is (saveLedger), and ends a procedure that needs the delegation with program_stale: the
+   *  program that wrote the value is one that is served to this account, and the app loads it.
+   *  An account without a ledger value (a new account) is not such a runtime. A runtime that
+   *  read a sealed ledger of the backend it does not read (sharedForeign) is one as well. */
+  function ledgerForeign() {
+    if (sharedForeign) return true;
+    const sides = ledgerSides();
+    return sides.itemUnknown || sides.copyUnknown;
+  }
+
+  /** Reads the node ledger: the merge of the keychain item and the device copy (when the
+   *  synchronization between devices overwrites one side's write, the other side remains). A side
+   *  this program does not read (ledgerUnknown) adds nothing to the merge. */
+  function loadLedger() {
+    const sides = ledgerSides();
+    return mergeLedger(
+      parseLedger(sides.itemUnknown ? null : sides.item), parseLedger(sides.copyUnknown ? null : sides.copy));
   }
 
   /** Writes the node ledger to the keychain item and the device copy (a side whose stored value is
@@ -3279,15 +3354,19 @@
         if (utf8(json).length <= LEDGER_LIMIT_BYTES) break;
       }
     }
+    // A side that holds a value this program does not read is left as it is: what a later
+    // program wrote there (a revocation time, a lifetime) is not replaced by a ledger that was
+    // made without it.
+    const sides = ledgerSides();
     const item = ledgerItem();
     const value = encode(utf8(json));
-    if (native.keychainGet(item) !== value) {
+    if (!sides.itemUnknown && native.keychainGet(item) !== value) {
       native.keychainSet({
         service: item.service, account: item.account, value: value,
         synchronizable: true, accessible: "after_first_unlock",
       });
     }
-    if (native.storeGet(LEDGER_STORE_KEY) !== json) native.storeSet(LEDGER_STORE_KEY, json);
+    if (!sides.copyUnknown && sides.copy !== json) native.storeSet(LEDGER_STORE_KEY, json);
   }
 
   // ---- The shared ledger (for the devices of the account that run a program before v43) ----
@@ -3316,22 +3395,37 @@
     return { key_id: keys.keyId, nonce: nonce, ct: ct };
   }
 
-  /** The ledger of a shared value, or null when the value is absent, of another key, of another
-   *  shape, or does not open (an opened value that is not a ledger is the empty ledger). */
-  function openSharedLedger(keys, shared) {
-    if (shared === null || typeof shared !== "object" || shared.key_id !== keys.keyId ||
-        typeof shared.nonce !== "string" || typeof shared.ct !== "string") {
-      return null;
+  // Whether the sealed ledger of the backend, as this runtime read it last, is a value of this
+  // key that this program does not read (a later program sealed it). Such a runtime is one whose
+  // ledger holds a value it does not read (ledgerForeign).
+  let sharedForeign = false;
+
+  /** What a sealed ledger value of the backend is to this device: {ledger, unknown}. ledger is
+   *  the ledger it holds (null when there is none to merge: no value, or a value of another
+   *  key, which belongs to the records of that key). unknown says that the value is one of this
+   *  key that this program does not read: another shape, a value that does not open, or an
+   *  opened text that is no ledger of the form this program reads (ledgerUnknown). Such a value
+   *  may hold what this program cannot see (a revocation, a lifetime), and is not read as the
+   *  empty ledger. */
+  function sharedValue(keys, shared) {
+    if (shared === null || shared === undefined) return { ledger: null, unknown: false };
+    if (typeof shared !== "object") return { ledger: null, unknown: true };
+    if (typeof shared.key_id === "string" && shared.key_id !== keys.keyId) return { ledger: null, unknown: false };
+    if (shared.key_id !== keys.keyId || typeof shared.nonce !== "string" || typeof shared.ct !== "string") {
+      return { ledger: null, unknown: true };
     }
+    let opened = null;
     try {
-      return parseLedger(text(decode(native.aeadOpen({
+      opened = text(decode(native.aeadOpen({
         alg: "chacha20poly1305", key: keys.ledgerKey, nonce: shared.nonce, aad: ledgerShareAad(keys),
         ciphertext: shared.ct,
-      }))));
+      })));
     } catch (error) {
       native.log("shared ledger: " + failureCode(error));
-      return null;
+      return { ledger: null, unknown: true };
     }
+    if (ledgerUnknown(opened)) return { ledger: null, unknown: true };
+    return { ledger: parseLedger(opened), unknown: false };
   }
 
   /** Whether the shared ledger covers this one: every grant node of this ledger is a grant node
@@ -3343,29 +3437,61 @@
       ledger.ttl_set_ms <= shared.ttl_set_ms;
   }
 
-  /** Whether the ledger of this device holds a grant node the last exchange did not cover. */
-  function ledgerShareDue(ledger) {
-    const ids = grantNodeIds(ledger);
-    if (ids.length === 0) return false;
-    const covered = native.storeGet(LEDGER_SHARE_STORE_KEY);
-    return covered === null || JSON.stringify(ids) !== covered;
+  /** What an exchange covered, as the device keeps it: the grant nodes and the times of the
+   *  settings of the delegation. */
+  function shareMark(ledger) {
+    return JSON.stringify({
+      nodes: grantNodeIds(ledger), revoked_ms: ledger.revoked_ms, resumed_ms: ledger.resumed_ms,
+      ttl_set_ms: ledger.ttl_set_ms,
+    });
   }
 
-  /** The exchange of the ledger with the backend, as the programs before v43 make it: the shared
-   *  value is read and merged into the ledger of this device (the nodes and the settings of the
-   *  other devices enter the ledger, which this program judges nothing by), and, when the shared
-   *  value does not cover the merged ledger, the merged ledger is sealed and uploaded. The upload
-   *  replaces the value of the backend, so the value is read first: an upload of this ledger alone
-   *  would drop the nodes the other devices wrote. A failure of either request is logged and
-   *  changes nothing else. */
-  async function shareLedger(turn, keys) {
-    const fetched = await settled(api(turn, "GET", LEDGER_SHARE_PATH));
-    if (!fetched.ok) {
-      native.log("shared ledger read: " + failureCode(fetched.error));
-      return;
+  /** Whether a ledger holds something the other devices of the account are to learn: a grant
+   *  node of a release before LOG_FORMAT_3_FROM, or a setting of the delegation the user made. */
+  function ledgerToShare(ledger) {
+    return grantNodeIds(ledger).length > 0 || ledger.revoked_ms > 0 || ledger.resumed_ms > 0 || ledger.ttl_set_ms > 0;
+  }
+
+  /** Whether the ledger of this device holds a grant node or a setting of the delegation the
+   *  last exchange did not cover. */
+  function ledgerShareDue(ledger) {
+    return ledgerToShare(ledger) && native.storeGet(LEDGER_SHARE_STORE_KEY) !== shareMark(ledger);
+  }
+
+  /** Reads the sealed ledger of the backend and merges it into ledger (the ledger of this device,
+   *  changed in place and written when the sealed one held anything): the settings of the
+   *  delegation the other devices of the account made (the later of the revocation times and of
+   *  the resumption times, the lifetime that was set last) and their nodes, as the programs
+   *  before v43 merge them. The keychain item of the ledger does not reach every device of an
+   *  account (it is not carried between the devices of every platform), and the sealed ledger
+   *  does. The request is sent once more after an answer that fails for a moment (frontQuery).
+   *  Returns "covered" (the sealed ledger holds everything this device has to share),
+   *  "uncovered" (it does not: the caller uploads), or "unknown" (the sealed value is one this
+   *  program does not read: sharedForeign is set, and nothing is merged). A backend without a
+   *  sealed ledger of this key, and one without the route, has nothing to merge. Throws the
+   *  failure of the read. */
+  async function mergeSharedLedger(turn, keys, ledger) {
+    let answer = null;
+    try {
+      answer = (await frontQuery(turn, function () { return api(turn, "GET", LEDGER_SHARE_PATH); })).json;
+    } catch (error) {
+      if (failureStatus(error) !== 404) throw error;
+      answer = { ledger: null };
     }
-    const ledger = loadLedger();
-    const shared = openSharedLedger(keys, fetched.value.json.ledger);
+    const value = sharedValue(keys, answer.ledger);
+    if (value.unknown) {
+      sharedForeign = true;
+      return "unknown";
+    }
+    sharedForeign = false;
+    // What this device holds may have changed while the request was open (a setting the user
+    // made, an exchange that ended): the ledger is read again in this step, and the sealed one
+    // is merged into that.
+    const current = loadLedger();
+    for (const field of ["revoked_ms", "resumed_ms", "ttl_days", "ttl_set_ms", "store_failing_ms", "discovery_after", "nodes"]) {
+      ledger[field] = current[field];
+    }
+    const shared = value.ledger;
     if (shared !== null) {
       const merged = mergeLedger(ledger, shared);
       // The gone time of a node this device granted to at least as recently as the shared value
@@ -3384,24 +3510,55 @@
       ledger.nodes = merged.nodes;
       saveLedger(ledger);
     }
-    if (shared === null || !ledgerCovered(ledger, shared)) {
-      try {
-        await api(turn, "PUT", LEDGER_SHARE_PATH, sealLedger(keys, ledger));
-      } catch (error) {
-        native.log("shared ledger write: " + failureCode(error));
-        return;
-      }
+    const covered = shared !== null ? ledgerCovered(ledger, shared) : !ledgerToShare(ledger);
+    if (covered) native.storeSet(LEDGER_SHARE_STORE_KEY, shareMark(ledger));
+    return covered ? "covered" : "uncovered";
+  }
+
+  /** Seals the ledger of this device and uploads it. The upload replaces the value of the
+   *  backend, so the value is read and merged first (mergeSharedLedger): an upload of this ledger
+   *  alone would drop what the other devices wrote. */
+  async function uploadLedger(turn, keys, ledger) {
+    await api(turn, "PUT", LEDGER_SHARE_PATH, sealLedger(keys, ledger));
+    native.storeSet(LEDGER_SHARE_STORE_KEY, shareMark(ledger));
+  }
+
+  /** The exchange of the ledger with the backend, as the programs before v43 make it: the sealed
+   *  value is read and merged into the ledger of this device (the nodes and the settings of the
+   *  other devices enter the ledger), and, when the sealed value does not cover the merged ledger,
+   *  the merged ledger is sealed and uploaded. A failure of either request is logged and changes
+   *  nothing else. A sealed value this program does not read is left as it is. */
+  async function shareLedger(turn, keys) {
+    const ledger = loadLedger();
+    let state = null;
+    try {
+      state = await mergeSharedLedger(turn, keys, ledger);
+    } catch (error) {
+      if (failureCode(error) === "cancelled") throw error;
+      native.log("shared ledger read: " + failureCode(error));
+      return;
     }
-    native.storeSet(LEDGER_SHARE_STORE_KEY, JSON.stringify(grantNodeIds(ledger)));
+    if (state !== "uncovered") return;
+    try {
+      await uploadLedger(turn, keys, ledger);
+    } catch (error) {
+      if (failureCode(error) === "cancelled") throw error;
+      native.log("shared ledger write: " + failureCode(error));
+    }
   }
 
   // Whether an exchange of the ledger is in flight (one at a time).
   let ledgerShareFlight = false;
 
-  /** Starts the exchange of the ledger when this device holds a grant node the last exchange did
-   *  not cover, or when force is set (a setting of the delegation changed). Nothing waits for it. */
+  /** Starts the exchange of the ledger when this device holds a grant node or a setting of the
+   *  delegation the last exchange did not cover, or when force is set (a setting of the
+   *  delegation changed). An exchange that failed is so made again by the next step that asks.
+   *  Nothing waits for it. */
   function shareLedgerSoon(keys, force) {
-    if (ledgerShareFlight || accountClosed || (force !== true && !ledgerShareDue(loadLedger()))) return;
+    // (A ledger this program does not read in full is not exchanged: the upload replaces the
+    // value of the backend.)
+    if (ledgerShareFlight || accountClosed || ledgerForeign()) return;
+    if (force !== true && !ledgerShareDue(loadLedger())) return;
     ledgerShareFlight = true;
     shareLedger(freeTurn(), keys).then(noop, function (error) {
       try {
@@ -3410,6 +3567,28 @@
         // The bridge is closed.
       }
     }).then(function () { ledgerShareFlight = false; });
+  }
+
+  /** The reading of the sealed ledger before a step sends a command to a node (a grant, or the
+   *  revokes of a delegation that is off): what another device of the account set (the delegation
+   *  turned off or on, a lifetime) reaches this device before it acts. ledger is changed in
+   *  place. When this device holds a setting or a node the sealed ledger does not, the merged
+   *  ledger is uploaded (nothing waits for the upload: a setting whose upload failed when it was
+   *  made is so uploaded by the next step). Returns what mergeSharedLedger returns, and throws
+   *  the failure of the read. */
+  async function sharedBefore(turn, keys, ledger) {
+    const state = await mergeSharedLedger(turn, keys, ledger);
+    if (state === "uncovered" && !ledgerShareFlight && !accountClosed) {
+      ledgerShareFlight = true;
+      uploadLedger(freeTurn(), keys, ledger).then(noop, function (error) {
+        try {
+          native.log("shared ledger write: " + failureCode(error));
+        } catch (closed) {
+          // The bridge is closed.
+        }
+      }).then(function () { ledgerShareFlight = false; });
+    }
+    return state;
   }
 
   /** Writes a node of a release before LOG_FORMAT_3_FROM that this device handed a grant to into
@@ -4492,6 +4671,56 @@
     storeJson(STORE_NODES, nodes);
   }
 
+  /** Writes the judgements of the nodes (log.nodes) and the measurements no list has
+   *  (log.unaccepted) that a step holds, merged with what the store holds at the time of the
+   *  write. A round and the step of the grants of a synchronization run side by side, and each
+   *  reads these values before it waits for answers: a step that wrote the copy it read would
+   *  take back what the other wrote in between (a measurement a round noted as one that held
+   *  the key would be one that never held it). nodes and unaccepted are what this step holds
+   *  (changed in place), and gone the measurements it dropped. A node or a measurement the
+   *  store holds and this step does not is kept. Of a node both hold, the mark of contradicting
+   *  signatures is the one that is set, and the first time the earlier one; of a measurement
+   *  both hold, held is true when either says so, and the first time the earlier one. */
+  function saveJudged(nodes, unaccepted, gone) {
+    mergeJudged(nodes, unaccepted, gone);
+    saveNodes(nodes);
+    storeJson(STORE_UNACCEPTED, unaccepted);
+  }
+
+  /** The merge of saveJudged without the write: what the store holds of the nodes and of the
+   *  measurements no list has is taken into what a step holds (a round judges by the merged
+   *  values: a mark an event of the app set while the round read is one it judges by). */
+  function mergeJudged(nodes, unaccepted, gone) {
+    const keptNodes = loadNodes();
+    for (const id of Object.keys(keptNodes)) {
+      const mine = nodes[id];
+      const theirs = keptNodes[id];
+      if (mine === undefined) {
+        nodes[id] = theirs;
+        continue;
+      }
+      if (mine.c === 0 && theirs.c !== 0) mine.c = theirs.c;
+      if (theirs.f > 0 && (mine.f === 0 || theirs.f < mine.f)) mine.f = theirs.f;
+    }
+    const kept = storedObject(STORE_UNACCEPTED);
+    for (const digest of Object.keys(kept)) {
+      const theirs = kept[digest];
+      if (theirs === null || typeof theirs !== "object" || gone.has(digest)) continue;
+      const mine = unaccepted[digest];
+      if (mine === undefined || mine === null || typeof mine !== "object") {
+        unaccepted[digest] = theirs;
+        continue;
+      }
+      if (theirs.held === true) mine.held = true;
+      if (theirs.stood === true) mine.stood = true;
+      // (The time the grant step last asked a node for the release proofs of the measurement:
+      // the later one.)
+      if (whole(theirs.asked_ms) > whole(mine.asked_ms)) mine.asked_ms = theirs.asked_ms;
+      const first = whole(theirs.first_ms);
+      if (first > 0 && (whole(mine.first_ms) === 0 || first < whole(mine.first_ms))) mine.first_ms = first;
+    }
+  }
+
   /** What this device knows of the node id: {state, release, platform, format, measure}, or null
    *  for a node it has no judgement of. state is accepted for a node this device verified and
    *  handed a grant to, and for a node whose document verified with a measurement of the accepted
@@ -5185,6 +5414,8 @@
    *  screen may end in either order. */
   function saveWithheld(run) {
     if (staleRuntime()) return;
+    // (A read that began before what the device keeps of the log was erased hands nothing on.)
+    if (run.epoch !== undefined && run.epoch !== logEpoch) return;
     const kept = loadWithheld();
     const horizon = native.nowMs() - LOG_RETENTION_DAYS * DAY_MS;
     const keys = [];
@@ -5577,6 +5808,7 @@
           // so no act of a node stands behind this object: it is no entry.
           run.entries.set(parsed.key, { parsed: parsed, state: "absent", verdict: null, ours: false, events: null });
           run.junk.add(parsed.key);
+          run.spoiled += 1;
           run.settled.add(parsed.key);
           if (item.keep === true) run.kept.add(parsed.key);
           if (item.fresh) markSeen(log, digest);
@@ -5647,6 +5879,7 @@
         // A body the node signed, under a key the node did not write for it: not an entry.
         record.state = "fields";
         run.junk.add(parsed.key);
+        run.spoiled += 1;
         continue;
       }
       const name = parsed.node + ":" + parsed.seq;
@@ -5673,6 +5906,12 @@
       if (parsed.letter === "c") {
         run.checked += 1;
         run.verified.push(parsed.tail);
+        // An entry an accepted node wrote that this read judged for the first time: the reading
+        // moved on by it (run.gained, with the time of the entry).
+        if (item.fresh && verdict.state === "accepted") {
+          run.gained += 1;
+          if (parsed.time_ms < run.oldest) run.oldest = parsed.time_ms;
+        }
       }
     }
     // A key the log screen asked for that no answer reached is asked for by the rounds, in front
@@ -5745,6 +5984,11 @@
       run.controlKeys += 1;
       run.nodes.add(parsed.node);
       const seen = log.seen.set.has(keyDigest(parsed.key));
+      // (A key judged before is one the reading passes: run.passed, with the time of its entry.)
+      if (seen) {
+        run.passed += 1;
+        if (parsed.time_ms < run.oldest) run.oldest = parsed.time_ms;
+      }
       if (!seen) items.push({ parsed: parsed, fresh: true });
       else if (bySeq.get(parsed.node + ":" + parsed.seq) > 1) items.push({ parsed: parsed, fresh: false });
     }
@@ -5983,13 +6227,22 @@
             const signed = objects.get(candidate.key + "\n" + candidate.versionId);
             const body = signed === undefined || signed === null ? null : legacyBody(signed, plan.id, candidate.parts);
             run.bodies += 1;
-            if (body === null) continue;
+            if (body === null) {
+              // An object version that was read and is nothing the node signed for this seq:
+              // someone else wrote it there (run.spoiled).
+              if (signed !== undefined) run.spoiled += 1;
+              continue;
+            }
             // The node signed this object for this seq: it wrote up to here.
             written = true;
             if (whole(body.time_ms) > 0) reachedMs = body.time_ms;
             const entry = control === undefined ? null : checkLegacyEntry(signed, plan.id, candidate.parts, keys);
             if (entry === null) break;
             run.checked += 1;
+            // A control entry the node wrote, read for the first time (run.gained).
+            // (An entry that names no time counts as an old one.)
+            run.gained += 1;
+            if (entry.time_ms < run.oldest) run.oldest = entry.time_ms;
             if (entry.events !== null) {
               for (const event of entry.events) {
                 if (event.t === "grant_transferred_out" && typeof event.to === "string" && NODE_ID.test(event.to)) {
@@ -6102,7 +6355,11 @@
     // goes on over pages that hold many object versions for each seq does.
     if (open.length > 0) {
       run.cut = true;
-      if (thin) run.over = true;
+      if (thin) {
+        run.over = true;
+        // (Such pages hold objects no node wrote.)
+        run.spoiled += 1;
+      }
     }
   }
 
@@ -6250,9 +6507,14 @@
    *  runtime is stale. */
   function noteStale() {
     const stale = staleRuntime();
-    if (stale !== staleShown) {
-      staleShown = stale;
-      native.publish({ runtime: { program_stale: stale } });
+    // The screens are told the same when the node ledger holds a value this program does not
+    // read (ledgerForeign): a later program wrote it, and the app is to load that program. That
+    // runtime is not stale for the rounds (they judge by what is served), so the value returned
+    // is the one of staleRuntime.
+    const shown = stale || ledgerForeign();
+    if (shown !== staleShown) {
+      staleShown = shown;
+      native.publish({ runtime: { program_stale: shown } });
     }
     if (stale) tellStale();
     return stale;
@@ -6290,9 +6552,9 @@
     };
   }
 
-  /** The account query. */
+  /** The account query, sent once more after an answer that fails for a moment (frontQuery). */
   function accountQuery(turn) {
-    return api(turn, "GET", ACCOUNT_PATH);
+    return frontQuery(turn, function () { return api(turn, "GET", ACCOUNT_PATH); });
   }
 
   /** Asks the account query for what it says of the served program alone (a round that is
@@ -6365,6 +6627,7 @@
       const kept = storedObject(STORE_UNACCEPTED);
       const now = native.nowMs();
       let established = 0;
+      let marked = false;
       for (const digest of Object.keys(kept)) {
         const item = kept[digest];
         if (item === null || typeof item !== "object" || item.held !== true) continue;
@@ -6373,8 +6636,15 @@
         if (first > 0 && first <= now && now - first >= LOG_RELEASE_GRACE_MS && releaseConfirmed(first, now) &&
             proofsDenied(digest, first, now)) {
           established += 1;
+          if (item.stood !== true) {
+            item.stood = true;
+            marked = true;
+          }
         }
       }
+      // (A measurement this event found to mark the log is kept as one that did: the rounds
+      // take that mark back no more. The value is read and written within this step.)
+      if (marked) storeJson(STORE_UNACCEPTED, kept);
       const before = keptLogState();
       if (established === 0 || before.status === "attention") return;
       const state = Object.assign({}, before, { status: "attention", unknown_nodes: established, program_version: VERSION });
@@ -6508,6 +6778,7 @@
    *  store of format 3. */
   async function runRound(turn, keys, origin, extra, first, follow) {
     const started = native.nowMs();
+    const epoch = logEpoch;
     const log = loadLog();
     // The reads an earlier read found held back, and whether what this device kept before this
     // round says that its environment has a store of format 3.
@@ -6520,6 +6791,11 @@
       shown: new Set(), kept: new Set(), settled: new Set(), pagesHeld: new Set(), pagesRead: new Set(),
       pagesKept: new Map(), pageOf: new Map(), store3: known, objectsRead: new Set(), chainsRead: new Set(),
       crowdedRead: new Set(), nodesRead: false, chainKept: [], found: null, listed: [],
+      // What the reads of the round were spent on: the entries of accepted nodes it judged for
+      // the first time (gained), the keys it listed that were judged before (passed), the
+      // objects it read that no node wrote (spoiled), and the earliest time among the entries
+      // of the first two (oldest).
+      gained: 0, passed: 0, spoiled: 0, oldest: Infinity,
     };
     // What the rounds kept for the screen before this round: an entry kept there is not read
     // again.
@@ -6820,8 +7096,11 @@
     // SERVED_FRESH_MS ago, that no later program is served (releaseConfirmed). A round that
     // holds such a measurement and no such reading asks for the account once: a round the
     // screen started long after a synchronization read it.
+    // Whether this round asked for the account (a round asks once).
+    let askedServed = false;
     if (!away && programDelivery() === null && heldPastGrace(log.unaccepted, now) &&
         (servedProgram === null || now - servedProgram.read_ms > SERVED_FRESH_MS)) {
+      askedServed = true;
       try {
         await readServed(judging);
       } catch (failure) {
@@ -6838,14 +7117,38 @@
     // LOG_UNFINISHED_ROUNDS such rounds, the reads are held back: the first round of a
     // synchronization that ends that way counts as a round held back, and the rounds that follow
     // it in that synchronization read on and neither add to that count nor end it.
+    //
+    // A round that left reads undone is one that catches up, and adds nothing to the row, when
+    // its reads were spent on what nodes wrote and on nothing else: it judged entries of accepted
+    // nodes for the first time or passed keys it had judged before (gained, passed), it read no
+    // object that no node wrote (spoiled), and one of those entries was written before the row
+    // began (row_ms: the start of the first round of the row). A device that was away has as many
+    // entries to read as its nodes wrote in that time, and reads them over as many rounds as that
+    // takes without a round of them counting. What counts as before: objects no node wrote that
+    // take the reads of a round, a round that read nothing, and rounds that read only entries
+    // written after the row began and still do not reach the end (entries arrive faster than the
+    // device reads them, and it never comes to the end of what its nodes wrote). A round that
+    // catches up beyond LOG_UNFINISHED_ROUNDS neither adds to the count of the rounds held back
+    // nor ends it.
     const over = !unreachable && (run.truncated || run.over);
-    let unfinished = log.round.v === VERSION ? whole(log.round.unfinished) : 0;
+    // (The record of the last round is read in this step, not taken from the start of the round:
+    // an event of the app may have written it since. judgeKept)
+    const record = storedObject(STORE_ROUND);
+    let unfinished = record.v === VERSION ? whole(record.unfinished) : 0;
+    let rowMs = record.v === VERSION ? whole(record.row_ms) : 0;
+    if (rowMs > now) rowMs = 0;
+    const catching = over && run.spoiled === 0 && run.gained + run.passed > 0 &&
+      run.oldest < (rowMs > 0 ? rowMs : started);
     if (over) {
-      if (origin === "sync") unfinished += 1;
+      if (origin === "sync") {
+        if (rowMs === 0) rowMs = started;
+        if (!catching) unfinished += 1;
+      }
     } else if (!denied && !unreachable) {
       unfinished = 0;
+      rowMs = 0;
     }
-    const beyond = over && unfinished > LOG_UNFINISHED_ROUNDS;
+    const beyond = over && !catching && unfinished > LOG_UNFINISHED_ROUNDS;
     const overrun = beyond && first === true;
     if (beyond && run.detail === "") run.detail = "round:unfinished";
     let blocked = denied || overrun;
@@ -6860,12 +7163,19 @@
     let unproved = "";
     const releases = [];
     const heldNodes = [];
+    // The measurements this round drops (saveJudged does not take them back from the store).
+    const dropped = new Set();
+    // What the store holds of the nodes and of the measurements now is taken in before the
+    // round judges: the step of the grants of a synchronization, or an event of the app, may
+    // have written them while this round read.
+    mergeJudged(log.nodes, log.unaccepted, dropped);
     for (const digest of Object.keys(log.unaccepted)) {
       const item = log.unaccepted[digest];
       const node = item !== null && typeof item === "object" && typeof item.node === "string" ? item.node : "";
       const listed = item === null || typeof item !== "object" ? true : buildOfMeasure(digest) !== undefined;
       if (listed) {
         delete log.unaccepted[digest];
+        dropped.add(digest);
         continue;
       }
       // A first time that lies after now is the clock of the device having run backwards: the
@@ -6875,19 +7185,32 @@
       const within = age < LOG_RELEASE_GRACE_MS;
       if (item.held !== true && !within) {
         // A measurement that was listed to this device and never held its key: nothing to judge.
-        if (age >= 30 * DAY_MS) delete log.unaccepted[digest];
+        if (age >= 30 * DAY_MS) {
+          delete log.unaccepted[digest];
+          dropped.add(digest);
+        }
         continue;
       }
       // Past its grace, the measurement marks the log when this runtime knows that no later
       // program is served and that the backend hands out no release proofs that show the
       // measurement. Otherwise it waits as within its grace: the round is not complete.
+      // A measurement that marked the log before (stood) marks it on: the runtime that marked
+      // it knew that no later program was served and that the backend handed out no proofs,
+      // and a round that cannot say so now (its reading of what is served, or the answer to its
+      // request for the proofs, is older than SERVED_FRESH_MS and no new one arrived) takes no
+      // mark back. Release proofs that show the measurement take it back (the measurement is
+      // dropped above). A runtime that knows a later program is served judges nothing.
       const confirmed = !within && releaseConfirmed(whole(item.first_ms), now);
       const denied = !within && proofsDenied(digest, whole(item.first_ms), now);
-      const stands = confirmed && denied;
-      if (stands) established += 1;
-      else grace += 1;
-      if (!within && !confirmed) waiting = true;
-      if (!within && !denied) {
+      const stands = !within && (item.stood === true || (confirmed && denied));
+      if (stands) {
+        established += 1;
+        item.stood = true;
+      } else {
+        grace += 1;
+      }
+      if (!within && !stands && !confirmed) waiting = true;
+      if (!within && !stands && !denied) {
         unanswered = true;
         if (unproved === "") unproved = proofsRefused(digest);
       }
@@ -6930,7 +7253,7 @@
     if (blocked) {
       if (log.blocked.count === 0 || log.blocked.first_ms === 0 || log.blocked.first_ms > now) log.blocked.first_ms = now;
       log.blocked.count += 1;
-    } else if (!unreachable && !beyond && !unanswered) {
+    } else if (!unreachable && !beyond && !unanswered && !(catching && unfinished > LOG_UNFINISHED_ROUNDS)) {
       log.blocked = { first_ms: 0, count: 0 };
     }
     // The reads held back from the screen that the reads of the screen count themselves.
@@ -6948,6 +7271,30 @@
     const incomplete = blocked || unreachable || run.truncated || run.cut || grace > 0;
     const status = reasons.length > 0 ? "attention" : incomplete ? "pending" : "verified";
     const before = keptLogState();
+    // A round that is about to mark a log that is not marked judges by what is served now. When
+    // what this runtime read of the served program is none, or older than SERVED_FRESH_MS (a
+    // round the screen started long after a synchronization), the round asks for the account
+    // once before it writes, publishes or tells anything. An answer that names a later version
+    // ends the round as one of a stale runtime: what a later release writes is nothing this
+    // program marks the log by. Without an answer the round stands as it was judged: a backend
+    // that leaves the account query unanswered puts off no mark that way (the mark of a
+    // measurement no list has waits for that answer by itself: releaseConfirmed). A round of a
+    // log that is marked already, and a round that marks nothing, send no such request.
+    if (status === "attention" && before.status !== "attention" && !away && !askedServed &&
+        (servedProgram === null || native.nowMs() - servedProgram.read_ms > SERVED_FRESH_MS)) {
+      try {
+        await readServed(judging);
+      } catch (failure) {
+        if (failureCode(failure) === "cancelled") throw failure;
+      }
+      if (staleRuntime()) return staleRound(run, pages);
+    }
+    // What the device keeps of the log was erased while this round read (the key of the account
+    // was replaced, or the account ended): the round read under the values of before. It writes
+    // none of them back, and publishes, tells and reports nothing.
+    if (logEpoch !== epoch || accountClosed) {
+      return { log: keptLogState(), pages: pages, entries: run.entries, junk: run.junk, absent: false, report: noop };
+    }
     const state = {
       status: status, verified_ms: status === "pending" ? before.verified_ms : now,
       unverified_nodes: conflicts, missing: log.missing.length, expired: 0, unknown_nodes: established,
@@ -7010,12 +7357,17 @@
       });
       saveRecovered(keys, recovered);
     }
-    const told = tellStatus(status, reasons, typeof log.round.told === "string" && log.round.v === VERSION ? log.round.told : "");
-    saveNodes(log.nodes);
-    storeJson(STORE_UNACCEPTED, log.unaccepted);
+    // What the app was told last is read in this step: an event of the app may have told it of
+    // a measurement that marks the log while this round read (judgeKept), and a round that is
+    // not complete does not cover that with pending.
+    const last = storedObject(STORE_ROUND);
+    const told = tellStatus(status, reasons, typeof last.told === "string" && last.v === VERSION ? last.told : "");
+    // (The judgements of the nodes and the measurements no list has are merged with what the
+    // store holds now: the step of the grants of a synchronization may have written them while
+    // this round read.)
+    saveJudged(log.nodes, log.unaccepted, dropped);
     storeJson(STORE_BLOCKED, log.blocked);
     storeJson(STORE_SAMPLE, log.sample);
-    saveSeen(log.seen);
     storeJson(STORE_MISSING, log.missing);
     storeJson(STORE_DOUBTED, Object.keys(log.doubted).length === 0 ? null : log.doubted);
     saveWithheld(run);
@@ -7026,9 +7378,14 @@
       // (A round that ended because the runtime did not run is tried again by the next
       // synchronization, however soon.)
       v: VERSION, tried_ms: away ? 0 : now, last: status, open: incomplete, told: told, state: state,
-      done_ms: status === "pending" ? (log.round.v === VERSION ? whole(log.round.done_ms) : 0) : now,
-      unfinished: unfinished,
+      done_ms: status === "pending" ? (last.v === VERSION ? whole(last.done_ms) : 0) : now,
+      unfinished: unfinished, row_ms: rowMs,
     });
+    // The keys this round judged are remembered last: what the round took from them (the
+    // receiving nodes that wait, the keys held back, the measurements no list has) is written
+    // before. A runtime that ends between these writes leaves keys that are judged again, and
+    // none that is remembered as judged while what followed from it is lost.
+    saveSeen(log.seen);
     logState = state;
     native.publish({ state: { log: state } });
     run.elapsedMs = Math.max(0, now - started);
@@ -7620,7 +7977,7 @@
     const now = native.nowMs();
     return {
       objectsHeld: [], objectsRead: new Set(), chainsHeld: [], chainsRead: new Set(), judge: false, reached: null,
-      crowdedHeld: [], crowdedRead: new Set(),
+      crowdedHeld: [], crowdedRead: new Set(), epoch: logEpoch,
       live: function (id) {
         if (cache.found.indexOf(id) >= 0) return true;
         const followed = legacy.nodes[id];
@@ -7957,6 +8314,7 @@
     if (reads.objectsHeld.length > 0 || reads.chainsHeld.length > 0 || reads.crowdedHeld.length > 0 || nodesHeld ||
         native.storeGet(STORE_WITHHELD) !== null) {
       saveWithheld({
+        epoch: reads.epoch,
         withheld: new Set(), shown: new Set(), settled: new Set(), pagesHeld: new Set(), pagesRead: new Set(),
         objectsHeld: reads.objectsHeld, objectsRead: reads.objectsRead, chainsHeld: reads.chainsHeld,
         chainsRead: reads.chainsRead, nodesHeld: nodesHeld, nodesRead: nodesRead,
@@ -9352,7 +9710,7 @@
       detail: "", blocked: false, silent: false, unreachable: false, cut: false, over: false, checked: 0, bodies: 0,
       nodes: new Set(), undocumented: new Set(), verified: [], entries: records, junk: junk,
       withheld: new Set(), shown: new Set(), kept: new Set(), settled: new Set(), pagesHeld: new Set(),
-      pagesRead: new Set(), store3: true,
+      pagesRead: new Set(), store3: true, gained: 0, passed: 0, spoiled: 0, oldest: Infinity, epoch: logEpoch,
     };
     const log = loadLog();
     // What the rounds read for the screen: an entry kept there is not asked for.
@@ -9514,6 +9872,7 @@
   async function readScreen(turn, keys, limit) {
     if (noteStale()) return readStaleScreen(turn, keys, limit);
     const began = native.nowMs();
+    const epoch = logEpoch;
     const cache = loadCache(keys);
     const since = summarySince(began);
     const tally = cache.tally;
@@ -9626,7 +9985,9 @@
         more = page.more;
         floorMs = pageFloor(page, first, limit);
         if (missing.size > 0) {
-          saveWithheld({ withheld: missing, shown: missing, settled: new Set(), pagesHeld: new Set(), pagesRead: new Set() });
+          saveWithheld({
+            epoch: epoch, withheld: missing, shown: missing, settled: new Set(), pagesHeld: new Set(), pagesRead: new Set(),
+          });
         }
       } else {
         first = cache.entries.filter(function (entry) { return entry.id.slice(0, 2) === "3:"; });
@@ -9868,6 +10229,11 @@
   let outcomesDue = false;
   // Whether the account of this runtime ended: nothing is counted or kept after that.
   let accountClosed = false;
+  // How often this runtime erased what the device keeps of the log of the account (a new key:
+  // clearLog; the end of the account: eraseAccountKeys). A round, and a read of the log screen,
+  // that began before such an erasure writes nothing it read under the values of before, and a
+  // round publishes and tells nothing of them.
+  let logEpoch = 0;
 
   function emptyOutcomes(now) {
     return { v: 1, since_ms: now, open: {}, done: {}, events: [], interrupted: [], dropped: 0, background_ms: 0 };
@@ -10202,7 +10568,8 @@
    *  one). This program hands such a node no grant (an entry of a grant this program made there
    *  is one the programs before it cannot explain), and sends it the revokes. */
   async function fetchListed(turn) {
-    const listed = (await api(turn, "GET", GRANTS_PATH)).json.nodes;
+    // (Sent once more after an answer that fails for a moment: frontQuery.)
+    const listed = (await frontQuery(turn, function () { return api(turn, "GET", GRANTS_PATH); })).json.nodes;
     const out = [];
     for (const item of Array.isArray(listed) ? listed : []) {
       if (item === null || typeof item !== "object" || typeof item.node !== "string" || !NODE_ID.test(item.node)) continue;
@@ -10252,6 +10619,8 @@
    *    the backend reports no grant row of the account on it, and the last grant this device sent
    *    it is GRANT_REFILL_MS old, or
    *    options.force is set (a new lifetime applies at once).
+   *  With options.whole, no grant goes out when a listed node is one this runtime sends no grant
+   *  command to (a node of a later release, a node whose attestation did not verify).
    *  A synchronization without such a node sends no request that calls a node. A node whose
    *  attestation is requested has it verified and receives a grant with the lifetime the ledger
    *  sets; the grants go out together (one stage). A node is kept among the grants of this device
@@ -10283,8 +10652,11 @@
     const accepted = new Set();
     const guards = [];
     const nodes = loadNodes();
+    // What the device keeps of the measurements no list has, read for the times the grant step
+    // last asked for their release proofs (proofsDue). The step writes nothing of this copy.
     const unaccepted = storedObject(STORE_UNACCEPTED);
-    let noted = false;
+    // The nodes of a later release this step met: {node, measure, release}.
+    const noted = [];
     let later = 0;
     const now = native.nowMs();
     const fresh = function (id) {
@@ -10441,15 +10813,26 @@
       // proofs of its measurement again) has nothing new to be noted: what the device keeps of
       // it and of its measurement is not written by this step.
       if (retried.has(node.node)) continue;
-      nodes[node.node] = { m: node.measure, p: "nitro", r: node.release, f: now, c: 0 };
-      if (unaccepted[node.measure] === undefined) {
-        unaccepted[node.measure] = { first_ms: now, release: String(node.release).slice(0, 64), held: false, node: node.node };
-      }
-      noted = true;
+      if (nodes[node.node] === undefined) nodes[node.node] = { m: node.measure, p: "nitro", r: node.release, f: now, c: 0 };
+      noted.push({ node: node.node, measure: node.measure, release: String(node.release).slice(0, 64) });
     }
-    if (noted) {
-      saveNodes(nodes);
-      storeJson(STORE_UNACCEPTED, unaccepted);
+    if (noted.length > 0) {
+      // What the store holds now is read in this step, and the nodes this step met are added to
+      // it: the step read these values before it waited for the list and the attestations, and
+      // a round that ended in between wrote them (saveJudged). What the store holds of a node or
+      // of a measurement is left as it is (a measurement a round noted as one that held the key
+      // stays one).
+      const keptNodes = loadNodes();
+      const keptUnaccepted = storedObject(STORE_UNACCEPTED);
+      for (const item of noted) {
+        if (keptNodes[item.node] === undefined) keptNodes[item.node] = { m: item.measure, p: "nitro", r: item.release, f: now, c: 0 };
+        const kept = keptUnaccepted[item.measure];
+        if (kept === undefined || kept === null || typeof kept !== "object") {
+          keptUnaccepted[item.measure] = { first_ms: now, release: item.release, held: false, node: item.node };
+        }
+      }
+      saveNodes(keptNodes);
+      storeJson(STORE_UNACCEPTED, keptUnaccepted);
     }
     // The time of the request for the release proofs of a measurement that no proofs showed is
     // kept with that measurement (proofsDue). It is written into what the program store holds
@@ -10466,6 +10849,43 @@
         }
       });
       if (asked) storeJson(STORE_UNACCEPTED, kept);
+    }
+    // options.whole: the grants go out to every listed node or to none. When a listed node is
+    // one this runtime sends no grant command to (a node of a later release, a node whose
+    // attestation did not verify), no grant goes out: the caller applies a setting to all the
+    // nodes that hold the grant of the account, or does not apply it (setGrantDays).
+    if (options.whole === true && later + rejected > 0) {
+      return {
+        accepted: accepted, rejected: rejected, failed: failed, later: later, granted: 0,
+        ledgerChanged: false, guards: guards, unread: null,
+      };
+    }
+    // Before the first grant of the step goes out, the sealed ledger of the backend is read and
+    // merged (sharedBefore), unless the caller read it for this step (options.shared): another
+    // device of the account may have turned the delegation off, or set another lifetime, and the
+    // keychain item of the ledger does not carry that to every device. A step that hands no
+    // grant sends no such request. When the merged ledger says that the delegation is off, or
+    // when the sealed ledger is one this program does not read, no grant goes out (the caller
+    // sends the revokes, or tells the screens that the program is behind). When the read fails,
+    // no grant goes out either (unread: the failure): a grant handed without it would turn a
+    // delegation on again that another device turned off, for one answer of the backend that
+    // failed. The next step asks again, and a grant that waits a step loses nothing within its
+    // lifetime.
+    if (wanted.length > 0 && options.shared !== true) {
+      let unread = null;
+      try {
+        await sharedBefore(turn, keys, ledger);
+      } catch (error) {
+        if (failureCode(error) === "cancelled" || !(turnLeft(turn) > 0)) throw error;
+        native.log("shared ledger read: " + failureCode(error));
+        unread = error;
+      }
+      if (unread !== null || ledgerForeign() || delegationOff(ledger)) {
+        return {
+          accepted: accepted, rejected: rejected, failed: failed, later: later, granted: 0,
+          ledgerChanged: false, guards: guards, unread: unread,
+        };
+      }
     }
     const sentMs = native.nowMs();
     for (const item of wanted) {
@@ -10507,7 +10927,7 @@
     }
     return {
       accepted: accepted, rejected: rejected, failed: failed, later: later, granted: granted,
-      ledgerChanged: ledgerChanged, guards: guards,
+      ledgerChanged: ledgerChanged, guards: guards, unread: null,
     };
   }
 
@@ -10562,10 +10982,36 @@
   async function grantStep(turn, keys, options) {
     const ledger = loadLedger();
     const grants = loadGrants();
-    let renewed = { accepted: new Set(), rejected: 0, failed: 0, later: 0, granted: 0, ledgerChanged: false, guards: [] };
-    if (!delegationOff(ledger)) {
-      renewed = await renewGrants(turn, keys, ledger, grants, options);
-    } else {
+    let renewed = {
+      accepted: new Set(), rejected: 0, failed: 0, later: 0, granted: 0, ledgerChanged: false, guards: [], unread: null,
+    };
+    // Whether the sealed ledger was read for this step (options.shared: the caller read it).
+    let shared = options.shared === true;
+    if (!ledgerForeign() && delegationOff(ledger) && !shared) {
+      // The delegation is off by what this device keeps. Another device of the account may have
+      // turned it on again since: the sealed ledger is read before the revokes go out. When
+      // that read fails, the revokes go out as this device knows the switch.
+      try {
+        await sharedBefore(turn, keys, ledger);
+      } catch (error) {
+        if (failureCode(error) === "cancelled" || !(turnLeft(turn) > 0)) throw error;
+        native.log("shared ledger read: " + failureCode(error));
+      }
+      shared = true;
+    }
+    if (!ledgerForeign() && !delegationOff(ledger)) {
+      // (The sealed ledger is read before the first grant goes out, unless it was read for this
+      // step: renewGrants. What it says may turn the delegation off.)
+      renewed = await renewGrants(turn, keys, ledger, grants, Object.assign({}, options, { shared: shared }));
+    }
+    if (ledgerForeign()) {
+      // The ledger holds a value this program does not read (the keychain item, the device copy,
+      // or the sealed ledger of the backend): whether the delegation is on is not known to this
+      // runtime. No grant goes out (the renewals and the grants a push asks for among them),
+      // and no revoke of the step's own accord (a later program may have turned the delegation
+      // on again). The screens are told that the program is behind.
+      noteStale();
+    } else if (delegationOff(ledger)) {
       try {
         await revokeEverywhere(turn, keys);
       } catch (error) {
@@ -10576,34 +11022,57 @@
     saveGrants(grants);
     if (renewed.ledgerChanged) saveLedger(ledger);
     const grant = grantState(ledger, grants, renewed.accepted, native.nowMs());
-    native.publish({
-      state: { grant: grant, grant_days: ledger.ttl_days },
-      runtime: { rejected_nodes: renewed.rejected },
-    });
+    // (A runtime that does not read the ledger publishes no state of the grants: the app keeps
+    // what the last runtime that read it published.)
+    if (!ledgerForeign()) {
+      native.publish({
+        state: { grant: grant, grant_days: ledger.ttl_days },
+        runtime: { rejected_nodes: renewed.rejected },
+      });
+    }
     return { ledger: ledger, grants: grants, renewed: renewed, grant: grant };
   }
 
+  /** The failure of a procedure that needs the delegation in a runtime whose ledger holds a value
+   *  this program does not read (ledgerForeign): program_stale, with the runtime value published
+   *  that tells the screens so. */
+  function ledgerStale() {
+    noteStale();
+    return native.error("program_stale", "the ledger is one of a later program");
+  }
+
   /** The front of a procedure that needs a node holding the grant of this account: under the grant
-   *  lock, the account query and the list of the nodes are sent together, the key is judged, and
-   *  the grants are handed to the nodes that are to receive one. When delegation is off it is
-   *  delegation_off; when no listed node holds a grant it is grant_required (attestation_failed
-   *  when every listed node failed the attestation verification or is of a release later than this
-   *  program). Returns {keys, ledger, grants}. */
+   *  lock, the account query and the list of the nodes are sent together (each once more after an
+   *  answer that fails for a moment: frontQuery), the key is judged, and the grants are handed to
+   *  the nodes that are to receive one. When delegation is off it is delegation_off; when no
+   *  listed node holds a grant it is grant_required (attestation_failed when every listed node
+   *  failed the attestation verification or is of a release later than this program); in a stale
+   *  runtime that no listed node takes a grant of, and in a runtime whose ledger holds a value
+   *  this program does not read, it is program_stale. Returns {keys, ledger, grants}. */
   function withGrants(turn) {
     return grantLock.run(turn, async function () {
       const account = accountQuery(turn);
       account.then(noop, noop);
       const held = readMasterKey() !== null;
-      if (held && delegationOff(loadLedger())) {
+      const foreign = held && ledgerForeign();
+      if (held && (foreign || delegationOff(loadLedger()))) {
         const judged = await judgeKey(turn, account);
         if (judged.keyState !== "present") throw native.error("key_required", judged.keyState);
+        if (foreign) throw ledgerStale();
         throw native.error("delegation_off", "delegation is turned off");
       }
       const listed = held ? settled(fetchListed(turn)) : null;
       const judged = await judgeKey(turn, account);
       if (judged.keyState !== "present") throw native.error("key_required", judged.keyState);
       const step = await grantStep(turn, judged.keys, { listed: listed });
+      // (The step may have read a sealed ledger this program does not read, or one that says
+      // that the delegation is off.)
+      if (ledgerForeign()) throw ledgerStale();
       if (delegationOff(step.ledger)) throw native.error("delegation_off", "delegation is turned off");
+      // The step was about to hand a grant and handed none because the sealed ledger could not
+      // be read: the procedure fails with that failure, and the user tries again (what this
+      // device keeps of its grants says nothing of a delegation another device turned off).
+      if (step.renewed.unread !== null) throw step.renewed.unread;
       if (step.grant.state === "none") {
         const refused = step.renewed.rejected + step.renewed.later > 0 && step.renewed.accepted.size === 0;
         // In a stale runtime no listed node takes a grant of this program because the program
@@ -10626,6 +11095,9 @@
    *  custody that no node can open). */
   async function recordCustody(turn) {
     let ledger = loadLedger();
+    // (A ledger this program does not read may say that the delegation is off: no record is made
+    // for a node to open on what this device kept alone.)
+    if (ledgerForeign()) throw ledgerStale();
     if (delegationOff(ledger)) throw native.error("delegation_off", "delegation is turned off");
     let custody = heldCustody(ledger, loadGrants(), native.nowMs());
     if (custody === null) {
@@ -10719,10 +11191,13 @@
   async function runSync(turn, trigger) {
     try {
       const step = await grantLock.run(turn, async function () {
+        // (The account query and the list of the nodes are each sent once more after an answer
+        // that fails for a moment: frontQuery.)
         const account = accountQuery(turn);
         account.then(noop, noop);
         const held = readMasterKey() !== null;
-        const listed = held && !delegationOff(loadLedger()) ? settled(fetchListed(turn)) : null;
+        const listed = held && !ledgerForeign() && !delegationOff(loadLedger())
+          ? settled(fetchListed(turn)) : null;
         const judged = await judgeKey(turn, account);
         if (judged.keyState !== "present") return { judged: judged, grants: null };
         return { judged: judged, grants: await grantStep(turn, judged.keys, { listed: listed, refill: trigger.refill === true }) };
@@ -10862,6 +11337,7 @@
    *  grants, the judgements, the kept screen. The ledger of the earlier programs is not carried
    *  over again. */
   function clearLog() {
+    logEpoch += 1;
     forgetSeen();
     for (const key of [STORE_GRANTS, STORE_CURSOR, STORE_RESUME, STORE_NODES, STORE_UNACCEPTED, STORE_BLOCKED,
       STORE_SAMPLE, STORE_MISSING, STORE_DOUBTED, STORE_WITHHELD, STORE_RECOVERED, STORE_DENIED, STORE_LEGACY,
@@ -10944,6 +11420,31 @@
     }
   }
 
+  /** The grants of this device for the statement of the node the backend named (node). When that
+   *  node is none this device handed a grant to, the step of the grants runs once more
+   *  (withGrants): the delegation of the account may have moved to a node the list did not name
+   *  when the procedure read it, and the backend named that node. The device then verifies the
+   *  attestation of that node and hands it a grant, as it does for every listed node, and its
+   *  statement is judged as before. A node this device still did not verify and hand a grant to
+   *  makes no statement it accepts: the caller fails as before, and in a stale runtime the
+   *  failure is program_stale. The step runs once. Returns the grants. */
+  async function grantsNaming(turn, grants, node) {
+    if (typeof node !== "string" || !NODE_ID.test(node) || grants[node] !== undefined) return grants;
+    let held = null;
+    try {
+      held = await withGrants(turn);
+    } catch (error) {
+      const code = failureCode(error);
+      if (code === "cancelled" || code === "program_stale" || !(turnLeft(turn) > 0)) throw error;
+      native.log("grant step for the named node: " + code);
+      return grants;
+    }
+    if (held.grants[node] === undefined && noteStale()) {
+      throw native.error("program_stale", "the backend named a node this program hands no grant to");
+    }
+    return held.grants;
+  }
+
   /** A connection: opens the authorization address a node made in the web authentication session
    *  and, after the callback, checks the completion statement of the node. The authorization address
    *  is opened only after a statement of a node this device handed a grant to verified over its
@@ -10966,7 +11467,10 @@
     }
     const begin = (await api(turn, "POST", "/api/secure/connections/begin", sent)).json;
     const user = userId();
-    const opening = nodeStatement(held.grants, begin.node, begin.statement);
+    // (The node the backend named may be one the delegation moved to since the list was read:
+    // grantsNaming.)
+    const grants = await grantsNaming(turn, held.grants, begin.node);
+    const opening = nodeStatement(grants, begin.node, begin.statement);
     const authorized = opening !== null && opening.type === "oauth_begin" && opening.node === begin.node &&
       opening.user_id === user && sameBytes(opening.sign_pk, keys.signPk) &&
       typeof begin.state === "string" && opening.state === begin.state &&
@@ -11002,7 +11506,7 @@
     if (!query.oauth_state) throw native.error("unverified_connection", "callback state");
     const completion = (await api(
       turn, "GET", "/api/secure/connections/completion", null, { state: query.oauth_state })).json;
-    const closing = nodeStatement(held.grants, begin.node, completion.statement);
+    const closing = nodeStatement(grants, begin.node, completion.statement);
     const completed = closing !== null && closing.type === "oauth_complete" && closing.node === begin.node &&
       closing.user_id === user && sameBytes(closing.sign_pk, keys.signPk) && closing.state === begin.state;
     if (!completed) throw native.error("unverified_connection", "completion statement");
@@ -11079,7 +11583,7 @@
     if (typeof args.request_id === "string") body.request_id = args.request_id;
     if (typeof args.setup_id === "string") body.setup_id = args.setup_id;
     const saved = (await api(turn, "PUT", "/api/secure/connections/naver_mail/app-password", body)).json;
-    const statement = nodeStatement(grants, saved.node, saved.statement);
+    const statement = nodeStatement(await grantsNaming(turn, grants, saved.node), saved.node, saved.statement);
     const verified = statement !== null && statement.type === "app_password_verified" &&
       statement.node === saved.node && statement.user_id === userId() &&
       sameBytes(statement.sign_pk, keys.signPk) && statement.provider === "naver_mail" &&
@@ -12067,17 +12571,33 @@
     }
     return grantLock.run(turn, async function () {
       const keys = await presentKeys(turn);
+      // (A ledger this program does not read takes no setting of this program.)
+      if (ledgerForeign()) throw ledgerStale();
       const ledger = loadLedger();
+      // The sealed ledger is read before the setting is made: the lifetime another device set
+      // is the one this setting replaces, and a delegation another device turned off takes no
+      // grant of the new lifetime. A read that fails is the failure of the call.
+      await sharedBefore(turn, keys, ledger);
+      if (ledgerForeign()) throw ledgerStale();
       const kept = { ttl_days: ledger.ttl_days, ttl_set_ms: ledger.ttl_set_ms };
       ledger.ttl_days = days;
       ledger.ttl_set_ms = Math.max(native.nowMs(), ledger.ttl_set_ms + 1);
       saveLedger(ledger);
       let grant = grantState(ledger, loadGrants(), new Set(), native.nowMs());
       let failed = 0;
+      // A shorter lifetime in a stale runtime: a listed node this runtime sends no grant command
+      // to (a node of a release this program does not list, a node whose attestation it does not
+      // verify) may hold the grant of the account with the lifetime before. The step then sends
+      // no grant at all (whole), and the call ends with program_stale and the lifetime as it
+      // was: the setting is not applied to a part of the nodes without a word. No revoke goes to
+      // such a node (the work the account has that node do would stop until the app has loaded
+      // the program that is served).
+      const whole = days < kept.ttl_days && staleRuntime();
+      let behind = false;
       if (!delegationOff(ledger)) {
         let step = null;
         try {
-          step = await grantStep(turn, keys, { force: true });
+          step = await grantStep(turn, keys, { force: true, whole: whole, shared: true });
         } catch (error) {
           const back = loadLedger();
           back.ttl_days = kept.ttl_days;
@@ -12087,10 +12607,11 @@
         }
         grant = step.grant;
         failed = step.renewed.failed;
+        behind = whole && step.renewed.later + step.renewed.rejected > 0;
         // A node listed for its revokes alone takes no grant of the new lifetime. When the
         // lifetime was shortened, the grant it holds may end later than a grant of the new
         // lifetime: the revoke goes to it. A longer lifetime sends it nothing.
-        if (days < kept.ttl_days && step.renewed.guards.length > 0) {
+        if (!behind && days < kept.ttl_days && step.renewed.guards.length > 0) {
           let unconfirmed = true;
           try {
             unconfirmed = await revokeNodes(turn, keys, step.renewed.guards);
@@ -12102,13 +12623,17 @@
         }
       }
       const written = loadLedger();
-      if (failed > 0) {
+      if (failed > 0 || behind) {
         written.ttl_days = kept.ttl_days;
         written.ttl_set_ms = kept.ttl_set_ms;
         saveLedger(written);
       }
       native.publish({ state: { grant: grant, grant_days: written.ttl_days } });
       shareLedgerSoon(keys, true);
+      if (behind) {
+        noteStale();
+        throw native.error("program_stale", "a listed node takes no grant command of this program");
+      }
       if (failed > 0) throw native.error("grant_incomplete", "a listed node did not take the grant");
       return { grant: grant, days: written.ttl_days };
     });
@@ -12124,13 +12649,27 @@
     const done = await grantLock.run(turn, async function () {
       const keys = await presentKeys(turn);
       const ledger = loadLedger();
+      // A ledger that holds a value this program does not read (ledgerForeign) takes no setting
+      // of this program. Turning the delegation on hands no grant and ends with program_stale.
+      // Turning it off sends the revoke to every listed node, as the user asked (a revoke hands
+      // no key over), writes the revocation time to the side of the ledger this program reads
+      // (the later program reads it from there when this device runs it), and ends with
+      // program_stale as well: the devices that run the later program do not learn of it from
+      // this one, and may hand their grants again.
+      const foreign = ledgerForeign();
+      if (foreign && args.enabled) throw ledgerStale();
       // The resumption time is not before the revocation time and the revocation time is after the
       // resumption time: the last operation decides the state of the switch even when the device
       // clock runs backwards or the clock of another device runs ahead.
       if (args.enabled) {
+        // The sealed ledger is read before the switch is written: the resumption time is not
+        // before a revocation time another device wrote. A read that fails is the failure of
+        // the call (no grant is handed without it).
+        await sharedBefore(turn, keys, ledger);
+        if (ledgerForeign()) throw ledgerStale();
         ledger.resumed_ms = Math.max(native.nowMs(), ledger.revoked_ms);
         saveLedger(ledger);
-        const step = await grantStep(turn, keys, {});
+        const step = await grantStep(turn, keys, { shared: true });
         shareLedgerSoon(keys, true);
         return { grant: step.grant, keys: keys, step: step };
       }
@@ -12146,6 +12685,7 @@
       written.revoked_ms = revoked;
       saveLedger(written);
       const grant = grantState(written, grants, new Set(), revoked);
+      if (foreign) throw ledgerStale();
       native.publish({ state: { grant: grant } });
       shareLedgerSoon(keys, true);
       if (incomplete) throw native.error("revoke_incomplete", "a listed node did not confirm");
@@ -12163,6 +12703,7 @@
    *  (the keychain item and the device copy), the reception key of a mail setup, and everything
    *  the program store holds of the account. */
   async function eraseAccountKeys() {
+    logEpoch += 1;
     deleteMasterKey();
     forgetProven();
     native.keychainDelete(ledgerItem());
