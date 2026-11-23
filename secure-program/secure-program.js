@@ -7760,6 +7760,9 @@
         // sheets.
         resetTransfer();
         native.publish({ runtime: { protected_sheets: protectedSheets() } });
+        // The state of the log that a program before this one published is not a judgement of
+        // this program: until this program ended a round on this installation, the log is pending.
+        if (storedObject(STORE_ROUND).v !== VERSION) native.publish({ state: { log: keptLogState() } });
         outcomes();
         return eventSync(null, true);
       }

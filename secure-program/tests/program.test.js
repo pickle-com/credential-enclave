@@ -1524,3 +1524,32 @@ test("the form of a name, a host, a slot and a reach of a vault secret is the on
     ok: true, value: { name: plaintext.name, value: plaintext.value, sites: plaintext.sites, slots: plaintext.slots, source: plaintext.source },
   });
 });
+
+// ---- The state a program before this one left ----
+
+test("the state of the log a program before published is not shown as a judgement of this program: the log is pending until this program ends a round", async () => {
+  const fx = S.fixture(source);
+  const world = fx.world;
+  // What a program before version 43 left on the device: a published attention, and no round of
+  // this program.
+  world.state.log = {
+    status: "attention", verified_ms: world.now - DAY_MS, unverified_nodes: 0, missing: 2, expired: 0, unknown_nodes: 3,
+    newer_release_nodes: 0, store: "verified", store_failing_ms: 0, program_version: 42,
+  };
+  // The device is without a network at the start of the runtime: no round can run.
+  world.fault(() => true, "transport");
+  S.load(fx);
+  await world.run(outcomeOf(Promise.resolve(fx.program.onEvent("session_ready", {}))));
+  assert.equal(world.state.log.status, "pending");
+  assert.equal(world.state.log.unknown_nodes, 0);
+  assert.equal(world.state.log.missing, 0);
+  assert.equal(world.state.log.program_version, 43);
+  // The first round of this program judges by its own conditions.
+  world.clearFaults();
+  world.advance(HOUR_MS);
+  await S.event(fx, "foreground");
+  assert.equal(world.state.log.status, "verified");
+  // A later runtime keeps what this program judged.
+  await S.start(fx);
+  assert.equal(world.state.log.status, "verified");
+});
