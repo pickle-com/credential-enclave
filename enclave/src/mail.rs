@@ -188,7 +188,15 @@ fn credentials_refused(status: &Status) -> bool {
     status.mentions(b"authenticationfailed") || status.mentions(b"authentication failed")
 }
 
-/// Only the mail call opens this kind. Neither field implements response serialization.
+/// A record of kind `app_password` that opened under the grant of its account. Its plaintext
+/// is not read yet: [`MailRecord::credentials`] reads it, after the log store confirmed the
+/// entry of the call.
+pub struct MailRecord {
+    plaintext: Secret<Vec<u8>>,
+}
+
+/// The account name and the application password of a record. Only a mail call reads them.
+/// Neither field implements response serialization.
 pub struct AppPassword {
     identity: String,
     password: Secret<String>,
@@ -207,14 +215,33 @@ pub enum MailError {
     Capacity,
 }
 
-impl AppPassword {
-    pub fn open(grant: &GrantView, user: &str, record: &Record) -> Result<Self, ProtocolError> {
-        let (kind, bytes) = open_for(grant, user, record)?;
-        if kind != Kind::AppPassword || record.provider != "naver_mail" {
-            return Err(ProtocolError::NotAllowed);
-        }
+/// Opens the record of a mail call for the account of the call, before the event of the call
+/// is created. What is judged here is the same for every value the record can hold: the
+/// grant, the AEAD verification, and the kind and the provider of the record. The plaintext
+/// is not read.
+pub fn open_record(
+    grant: &GrantView,
+    user: &str,
+    record: &Record,
+) -> Result<MailRecord, ProtocolError> {
+    let (kind, plaintext) = open_for(grant, user, record)?;
+    if kind != Kind::AppPassword || record.provider != "naver_mail" {
+        return Err(ProtocolError::NotAllowed);
+    }
+    Ok(MailRecord { plaintext })
+}
+
+impl MailRecord {
+    /// Reads the plaintext of the record. A mail call does this after the log store confirmed
+    /// the entry that holds its event, so every answer that depends on the content of the
+    /// plaintext has an entry. A plaintext that is no JSON object, a `username` that is no
+    /// NAVER account name, and a `password` that is shorter than 8 bytes, longer than 256
+    /// bytes or holds a control character are `record_invalid` at that point: nothing goes
+    /// to the provider, and the entry stays on the chain as the entry of a mail call that did
+    /// not take place.
+    pub fn credentials(&self) -> Result<AppPassword, ProtocolError> {
         let value = Secret::new(
-            serde_json::from_slice::<Value>(bytes.expose_secret())
+            serde_json::from_slice::<Value>(self.plaintext.expose_secret())
                 .map_err(|_| ProtocolError::RecordInvalid)?,
         );
         let value = value.expose_secret();
@@ -239,12 +266,14 @@ impl AppPassword {
         if password.len() < 8 || password.len() > 256 || password.chars().any(char::is_control) {
             return Err(ProtocolError::RecordInvalid);
         }
-        Ok(Self {
+        Ok(AppPassword {
             identity: format!("{id}@naver.com"),
             password: Secret::new(password.to_string()),
         })
     }
+}
 
+impl AppPassword {
     /// D: identity is returned by the verify call only after both authentications succeed.
     pub fn identity(&self) -> &str {
         &self.identity
@@ -416,17 +445,6 @@ impl AppPassword {
         (data, session)
     }
 
-    pub(crate) fn validate_submission(
-        &self,
-        recipients: &[String],
-        body: &[u8],
-    ) -> Result<(), MailError> {
-        if recipients.is_empty() || recipients.len() > 50 || recipients.iter().any(|v| !email(v)) {
-            return Err(MailError::Invalid);
-        }
-        validate_message(body, &self.identity)
-    }
-
     /// A single authenticated SMTP transaction through K7. No retry follows DATA.
     pub async fn submit(
         &self,
@@ -434,7 +452,12 @@ impl AppPassword {
         recipients: &[String],
         body: &[u8],
     ) -> Result<MailData, MailError> {
-        self.validate_submission(recipients, body)?;
+        // The sender of the message is the account of the record. This judgement depends on
+        // the content of the record: the call makes it here, after its entry, and not with
+        // the form of the submission before it.
+        if submission_sender(recipients, body)? != self.identity {
+            return Err(MailError::Invalid);
+        }
         let mut smtp = self.smtp(node).await?;
         if smtp
             .size
@@ -935,7 +958,18 @@ fn email(value: &str) -> bool {
         && !value.ends_with('@')
 }
 
-fn validate_message(body: &[u8], identity: &str) -> Result<(), MailError> {
+/// The form of a submission, which a call judges before it creates its event: one to 50
+/// recipients that are addresses, and a message of ASCII lines that end in CRLF whose header
+/// block holds exactly one `From` field. Returns the value of that field. Whether it names
+/// the account of the record is judged after the entry of the call ([`AppPassword::submit`]):
+/// that answer depends on the content of the record.
+pub(crate) fn submission_sender<'a>(
+    recipients: &[String],
+    body: &'a [u8],
+) -> Result<&'a str, MailError> {
+    if recipients.is_empty() || recipients.len() > 50 || recipients.iter().any(|v| !email(v)) {
+        return Err(MailError::Invalid);
+    }
     if !body.is_ascii()
         || !body.ends_with(b"\r\n")
         || body.windows(2).any(|pair| match pair {
@@ -956,10 +990,10 @@ fn validate_message(body: &[u8], identity: &str) -> Result<(), MailError> {
             key.eq_ignore_ascii_case("from").then_some(value.trim())
         })
         .collect();
-    if from != [identity] {
-        return Err(MailError::Invalid);
+    match from.as_slice() {
+        [sender] => Ok(sender),
+        _ => Err(MailError::Invalid),
     }
-    Ok(())
 }
 
 struct Smtp {

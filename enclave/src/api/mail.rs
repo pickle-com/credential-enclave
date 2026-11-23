@@ -1,4 +1,5 @@
-//! Typed mail calls. Passwords are opened only after grant checks and used after logging.
+//! Typed mail calls. A record is opened after the grant checks, and its plaintext is read and
+//! used after the log store confirmed the entry of the call.
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -17,7 +18,7 @@ use super::responses::forward_frame;
 use super::{invalid, read_body, record_of, respond, ApiError, JsonBody};
 use crate::frame::{self, META_LIMIT_BYTES};
 use crate::log_store;
-use crate::mail::{self, AppPassword, MailData, MailError, ReadMail, Share};
+use crate::mail::{self, MailData, MailError, ReadMail, Share};
 use crate::mail_sessions::{Delegation, SessionKey};
 use crate::state::{events, lock, Account, GrantState, Node};
 
@@ -167,6 +168,11 @@ async fn run(node: &Node, request: Request, operation: &str) -> Result<Response,
     if operation != "submit" && !payload.is_empty() {
         return Err(invalid("mail payload"));
     }
+    if operation == "submit" {
+        // The form of the submission. Whether its sender is the account of the record is
+        // judged after the entry: that answer depends on the content of the record.
+        mail::submission_sender(&recipients, &payload).map_err(|_| invalid("mail submission"))?;
+    }
 
     node.ensure_open()?;
     if node.log_store.id().is_none() {
@@ -178,18 +184,15 @@ async fn run(node: &Node, request: Request, operation: &str) -> Result<Response,
     // values of the caller. The record opens under the grant of the account below, so a call
     // with this key carries the application password the session was authenticated with.
     let session_key = SessionKey::of(user, &record);
-    let (credentials, place, sign_pk, key_id, delegation) = {
+    let (opened, place, sign_pk, key_id, delegation) = {
         let mut account = lock(&account);
         node.ensure_open()?;
         let now_ms = node.now_ms();
         let grant = account.active(now_ms)?;
         let delegation = Delegation::of(&grant);
-        let credentials = AppPassword::open(&grant, user, &record)?;
-        if operation == "submit" {
-            credentials
-                .validate_submission(&recipients, &payload)
-                .map_err(|_| invalid("mail submission"))?;
-        }
+        // What is judged before the event is the same for every value the record can hold:
+        // the grant, the AEAD verification, and the kind and the provider of the record.
+        let opened = mail::open_record(&grant, user, &record)?;
         let place = node.create_event(
             &mut account,
             user,
@@ -199,13 +202,18 @@ async fn run(node: &Node, request: Request, operation: &str) -> Result<Response,
             EntryKind::Use,
             events::mail_request(&record.id, operation, &params, &payload, context),
         )?;
-        (credentials, place, grant.sign_pk, grant.key_id, delegation)
+        (opened, place, grant.sign_pk, grant.key_id, delegation)
     };
     let log = log_store::commit(node, user, &account, &[(place, true)])
         .await?
         .into_iter()
         .next()
         .ok_or_else(ApiError::internal)?;
+    // The plaintext of the record is read only now, after the log store confirmed the entry
+    // that holds the event: an answer that depends on the content of the plaintext has an
+    // entry. A plaintext the call cannot use is `record_invalid` here: nothing goes to the
+    // provider, and the entry stays.
+    let credentials = opened.credentials()?;
     let outcome = match operation {
         "verify" => credentials.verify(node).await.map(|()| {
             let identity = credentials.identity();

@@ -17,7 +17,7 @@ use super::quiet_provider_and_log_store;
 use crate::frame;
 use crate::mail;
 use crate::state::Limits;
-use crate::testing::{App, Harness};
+use crate::testing::{App, Harness, Provider, LOG_HOST};
 
 pub(super) const PASSWORD: &str = "naver-secret-marker-2e7c06830e6f";
 const MESSAGE: &[u8] = b"From: tester@naver.com\r\nTo: friend@example.com\r\nSubject: a test\r\nMessage-ID: <one@pickle.com>\r\n\r\nhello\r\n";
@@ -304,6 +304,16 @@ pub(super) async fn harness_at(
     address: std::net::SocketAddr,
     limits: Limits,
 ) -> (Harness, App, Value) {
+    let (harness, app, record, _store) = harness_and_store_at(roots, address, limits).await;
+    (harness, app, record)
+}
+
+/// [`harness_at`], and the stand-in of the log store of the node.
+async fn harness_and_store_at(
+    roots: RootCertStore,
+    address: std::net::SocketAddr,
+    limits: Limits,
+) -> (Harness, App, Value, Provider) {
     let provider = quiet_provider_and_log_store().await;
     let harness = Harness::with_mail_roots(&provider, roots, limits);
     harness.platform.route("imap.naver.com", address);
@@ -316,7 +326,23 @@ pub(super) async fn harness_at(
         "naver_mail",
         &json!({"username":"tester@naver.com","password":PASSWORD}),
     );
-    (harness, app, record)
+    (harness, app, record, provider)
+}
+
+/// The events of the last entry of the chain of the account in the log store.
+fn last_stored_events(harness: &Harness, app: &App, store: &Provider) -> Vec<Value> {
+    app.stored_events(harness, store)
+        .pop()
+        .expect("the store holds an entry of the account")
+}
+
+/// True when the node asked for no connection but those to its log store.
+fn reached_the_log_store_alone(harness: &Harness) -> bool {
+    harness
+        .platform
+        .connections()
+        .iter()
+        .all(|(host, _)| host == LOG_HOST)
 }
 
 /// The request frame of a mail call of the account `mail-user`.
@@ -411,6 +437,121 @@ pub async fn canary_routes() -> (BTreeSet<(String, String)>, BTreeSet<(String, S
 #[tokio::test]
 async fn mail_calls_use_tls_and_return_no_password() {
     canary_routes().await;
+}
+
+/// A judgement that depends on the content of the plaintext of a record follows the entry of
+/// the call: the answer `record_invalid` to a plaintext the call cannot use has an entry in
+/// the log store, and nothing went to the provider.
+#[tokio::test]
+async fn a_plaintext_a_mail_call_cannot_use_is_refused_after_the_entry_of_the_call() {
+    let server = MailServer::start(false, false).await;
+    let (harness, app, _, store) =
+        harness_and_store_at(server.roots.clone(), server.address, Limits::default()).await;
+    let plaintexts = [
+        // A password of 7 bytes, of 257 bytes, and one with a control character.
+        json!({"username":"tester@naver.com","password":"short7!"}),
+        json!({"username":"tester@naver.com","password":"p".repeat(257)}),
+        json!({"username":"tester@naver.com","password":"a password\nof two lines"}),
+        // No password, a name that is no account name, a plaintext that is no object.
+        json!({"username":"tester@naver.com"}),
+        json!({"username":"not an account","password":"long enough"}),
+        json!(["tester@naver.com", "long enough"]),
+    ];
+    for (operation, params, payload) in [
+        ("verify", json!({}), &b""[..]),
+        ("read", json!({"action":"folders"}), &b""[..]),
+        (
+            "submit",
+            json!({"recipients":["friend@example.com"]}),
+            MESSAGE,
+        ),
+    ] {
+        for plaintext in &plaintexts {
+            let record = app.record("app_password", "naver_mail", plaintext);
+            let before = harness.last_seq("mail-user");
+            let (status, meta, _) =
+                request(&harness, &record, operation, params.clone(), payload).await;
+            assert_eq!(
+                (status, meta["code"].as_str()),
+                (422, Some("record_invalid")),
+                "{operation} {plaintext}"
+            );
+            assert_eq!(harness.last_seq("mail-user"), before + 1);
+            let events = last_stored_events(&harness, &app, &store);
+            assert_eq!(events.len(), 1);
+            assert_eq!(
+                (&events[0]["t"], &events[0]["operation"]),
+                (&json!("mail_request"), &json!(operation))
+            );
+            assert_eq!(events[0]["record_id"], record["id"]);
+        }
+    }
+    assert!(server.passwords.lock().unwrap().is_empty());
+    assert!(server.submissions.lock().unwrap().is_empty());
+    assert!(reached_the_log_store_alone(&harness));
+    assert_eq!(
+        harness.node.body_budget.available_permits(),
+        harness.node.limits.body_budget_bytes
+    );
+}
+
+/// What is the same for every value a record can hold is judged before the event: a record
+/// of another kind and a submission of another form leave no entry. Whether the sender of a
+/// submission is the account of the record depends on the content of the record: that answer
+/// has an entry, and no connection is opened for it.
+#[tokio::test]
+async fn the_form_of_a_call_is_judged_before_its_entry_and_the_sender_of_a_submission_after() {
+    let server = MailServer::start(false, false).await;
+    let (harness, app, record, store) =
+        harness_and_store_at(server.roots.clone(), server.address, Limits::default()).await;
+    let recipients = json!({"recipients":["friend@example.com"]});
+    let entries = harness.last_seq("mail-user");
+
+    let other_kind = app.record("vault_password", "vault", &json!({"value":PASSWORD}));
+    let (status, meta, _) = request(
+        &harness,
+        &other_kind,
+        "read",
+        json!({"action":"folders"}),
+        b"",
+    )
+    .await;
+    assert_eq!((status, meta["code"].as_str()), (403, Some("not_allowed")));
+    for message in [
+        // No `From` field, two of them, a line that does not end in CRLF.
+        &b"To: friend@example.com\r\nSubject: a test\r\n\r\nhello\r\n"[..],
+        &b"From: tester@naver.com\r\nFrom: other@naver.com\r\n\r\nhello\r\n"[..],
+        &b"From: tester@naver.com\n\nhello\n"[..],
+    ] {
+        let (status, meta, _) =
+            request(&harness, &record, "submit", recipients.clone(), message).await;
+        assert_eq!(
+            (status, meta["code"].as_str()),
+            (400, Some("invalid_request"))
+        );
+    }
+    assert_eq!(harness.last_seq("mail-user"), entries);
+
+    let (status, meta, body) = request(
+        &harness,
+        &record,
+        "submit",
+        recipients,
+        b"From: other@naver.com\r\nTo: friend@example.com\r\n\r\nhello\r\n",
+    )
+    .await;
+    assert_eq!((status, meta["status"].as_u64()), (200, Some(400)));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap(),
+        json!({"code":"invalid_mail_request"})
+    );
+    assert_eq!(harness.last_seq("mail-user"), entries + 1);
+    assert_eq!(meta["log"]["seq"].as_u64(), Some(entries + 1));
+    let events = last_stored_events(&harness, &app, &store);
+    assert_eq!(events[0]["operation"], "submit");
+    assert!(server.passwords.lock().unwrap().is_empty());
+    assert!(server.submissions.lock().unwrap().is_empty());
+    assert!(reached_the_log_store_alone(&harness));
 }
 
 #[tokio::test]
