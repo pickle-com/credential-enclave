@@ -129,38 +129,170 @@ test("the model verifies the signed values of the vectors as the vectors say", (
   }
 });
 
-test("the program reads the entries and the node document of format 3 of the vectors, and refuses what the vectors refuse", { skip: vectors.log_v3 === undefined }, async () => {
+/** A fixture of the account of the vectors of format 3 on the server target given: the device
+ *  holds the master key of the vectors, the bucket of the account holds the entries of the
+ *  vectors, and the bucket of the node of the vectors holds its node document. The node of the
+ *  vectors is of platform local and its binding names the log store of dev, so a build for dev
+ *  accepts it. */
+function vectorFixture(target) {
   const log = vectors.log_v3;
-  const world = new bridge.World({ serverTarget: "dev", userId: log.user_id });
+  const world = new bridge.World({ serverTarget: target || "dev", userId: log.user_id });
   const masterKey = bytes(vectors.key_derivation.master_key);
   world.keychain.set("com.pickle.client.secure.master-key\n" + world.userId, { value: b64u(masterKey), synchronizable: true });
   const keys = bridge.deriveAccountKeys(masterKey);
   assert.equal(keys.keyId, log.key_id);
   world.account.keys = keys;
   world.account.key = { key_id: keys.keyId };
-  const bucket = bridge.shardBucket("dev", world.userId);
+  const bucket = bridge.shardBucket(world.serverTarget, world.userId);
   for (const entry of log.entries) world.putObject(bucket, entry.key, JSON.stringify(entry.entry));
-  for (const refused of log.rejected) {
-    // A refused case stands under a key of its own, so that it is judged apart from the entries.
-    if (!log.entries.some((entry) => entry.key === refused.key)) world.putObject(bucket, refused.key, JSON.stringify(refused.entry));
-  }
+  world.putObject(bridge.shardBucket(world.serverTarget, log.node), log.node_document.key, log.node_document.object_text);
+  return { world: world, keys: keys, program: null, source: source };
+}
+
+/** Has the backend of a fixture hand out the object given for one key of format 3, and what it
+ *  holds for every other key. */
+function handOut(fx, key, object) {
+  fx.world.fault("POST /api/secure/log/bodies", (request) => {
+    const answer = JSON.parse(fx.world.api("POST", "/api/secure/log/bodies", null, request.body).body);
+    if (JSON.parse(request.body).keys.indexOf(key) < 0) return { status: 200, body: answer };
+    return {
+      status: 200, body: {
+        entries: answer.entries.filter((item) => item.key !== key).concat([Object.assign({ key: key }, object)]),
+        missing: answer.missing.filter((item) => item !== key),
+      },
+    };
+  });
+}
+
+test("the program reads the keys, the bodies, the sealed events and the node document of format 3 of the vectors", { skip: vectors.log_v3 === undefined }, async () => {
+  const log = vectors.log_v3;
+  assert.equal(log.verifies, true);
+  assert.equal(log.node_document.accepted, true);
+  const fx = vectorFixture("dev");
+  const world = fx.world;
   assert.equal(bridge.shardBucket("dev", log.node), log.node_document.bucket);
-  world.putObject(log.node_document.bucket, log.node_document.key, log.node_document.object_text);
-  const fx = { world: world, keys: keys, program: null, source: source };
   await S.start(fx);
+  // The round reads the control prefix: the keys the vectors list under it, each a verified entry
+  // of the node of the vectors. The last of them hands the delegation on to a measurement no list
+  // has, so the round is pending within the grace and names the release of the event.
+  const report = world.reports[world.reports.length - 1];
+  assert.equal(report.control_keys, log.control_listing.length);
+  assert.equal(report.keys_checked, log.control_listing.length);
+  assert.equal(report.undocumented_nodes, 0);
+  assert.equal(report.store, "verified");
+  const moved = JSON.parse(log.entries.find((entry) => entry.key === log.control_listing[0]).events_text)[0];
+  assert.deepEqual(report.unaccepted_releases, [moved.release]);
+  assert.deepEqual(report.unknown_node_ids, [moved.to]);
+  assert.equal(world.state.log.status, "pending");
+  assert.equal(world.state.log.newer_release_nodes, 1);
+  assert.equal(world.state.log.unverified_nodes, 0);
+  // The screen opens every entry: the events of the vectors, the latest first.
   const shown = await S.call(fx, "read_log", { limit: 100 });
   assert.equal(shown.ok, true);
   const groups = shownGroups(shown.value);
   const events = log.entries.reduce((sum, entry) => sum + entry.count, 0);
   assert.equal(groups.reduce((sum, group) => sum + group.count, 0), events);
   assert.ok(groups.every((group) => group.verified === true));
-  assert.equal(world.state.log.unverified_nodes, 0);
-  // The listing address the program called is the one of the bucket whose number the vectors give.
+  assert.deepEqual(groups.map((group) => group.kind), ["moved", "filled", "request", "grant_renewed"]);
+  const opened = log.entries.map((entry) => JSON.parse(entry.events_text));
+  const filled = opened.find((list) => list[0].t === "secret_released")[0];
+  assert.equal(groups[1].field, filled.field);
+  assert.equal(groups[1].detail, new URL(filled.origin).host);
+  const requests = opened.find((list) => list[0].t === "provider_request");
+  assert.deepEqual(
+    groups[2].requests.map((row) => row.target).sort(),
+    requests.map((event) => event.host + event.path).sort());
+  assert.deepEqual(groups.map((group) => group.time_ms), [
+    opened[3][0].time_ms, filled.time_ms, Math.max.apply(null, requests.map((event) => event.time_ms)), opened[0][0].time_ms,
+  ]);
+  // The listing addresses the program called are the ones of the bucket the vectors give for
+  // this account, one per prefix.
   if (vectors.log_store !== undefined) {
     const store = vectors.log_store.stores.find((item) => item.bucket === "character-credential-log-dev-1");
     const owner = store.owners.find((item) => item.owner === log.user_id);
-    const host = new URL(world.sent("S3 ")[0].url).host;
-    assert.ok(host.split(".")[0].endsWith("-" + String(owner.index).padStart(4, "0")), host);
+    const called = world.sent("S3 ").map((request) => new URL(request.url))
+      .filter((url) => String(url.searchParams.get("prefix")).startsWith("a3/"));
+    assert.ok(called.every((url) => url.host === owner.bucket + ".s3." + store.region + ".amazonaws.com"));
+    assert.deepEqual(
+      Array.from(new Set(called.map((url) => url.searchParams.get("prefix")))).sort(),
+      [log.control_prefix, log.use_prefix]);
+  }
+  // A day later the measurement of the event still is on no list: the log is marked (A1).
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "attention");
+  assert.equal(world.state.log.unknown_nodes, 1);
+});
+
+test("the program answers the objects the vectors refuse as the reference does: another body, another signature, a key of another seq", { skip: vectors.log_v3 === undefined }, async () => {
+  const log = vectors.log_v3;
+  const byName = (name) => log.rejected.find((item) => item.name === name);
+  assert.deepEqual(log.rejected.map((item) => item.result).sort(), ["body", "fields", "signature"]);
+  const events = log.entries.reduce((sum, entry) => sum + entry.count, 0);
+  const count = (shown) => shownGroups(shown.value).reduce((sum, group) => sum + group.count, 0);
+
+  // body: the object does not hold the body its key names. The listing of the store named the
+  // key, so the body the backend handed out is a read held back.
+  const other = vectorFixture("dev");
+  const body = byName("the_body_of_another_entry");
+  assert.equal(body.result, "body");
+  handOut(other, body.key, body.entry);
+  await S.start(other);
+  await S.call(other, "read_log", { limit: 100 });
+  assert.equal(other.world.state.log.store, "blocked");
+  assert.equal(other.world.state.log.store_failure, "bodies:hash");
+  assert.equal(other.world.state.log.unverified_nodes, 0);
+
+  // signature: the body its key names, and a signature that is not one of the node of the key.
+  // The node passed its document, so the object contradicts it (A2).
+  const forged = vectorFixture("dev");
+  const signature = byName("the_signature_of_another_node");
+  assert.equal(signature.result, "signature");
+  handOut(forged, signature.key, signature.entry);
+  await S.start(forged);
+  const marked = await S.call(forged, "read_log", { limit: 100 });
+  assert.equal(forged.world.state.log.unverified_nodes, 1);
+  assert.equal(forged.world.state.log.status, "attention");
+  assert.equal(shownGroups(marked.value).filter((group) => group.verified !== true).length, 1);
+
+  // fields: a body the node signed, under a key the node did not write for it. It is no entry:
+  // the screen leaves it out and nothing is marked.
+  const moved = vectorFixture("dev");
+  const fields = byName("a_key_of_another_seq");
+  assert.equal(fields.result, "fields");
+  assert.ok(!log.entries.some((entry) => entry.key === fields.key));
+  moved.world.putObject(bridge.shardBucket("dev", log.user_id), fields.key, JSON.stringify(fields.entry));
+  await S.start(moved);
+  const left = await S.call(moved, "read_log", { limit: 100 });
+  assert.equal(count(left), events);
+  assert.ok(shownGroups(left.value).every((group) => group.verified === true));
+  assert.equal(moved.world.state.log.store, "verified");
+  assert.equal(moved.world.state.log.unverified_nodes, 0);
+});
+
+test("a key the vectors give as no key of format 3 is no entry to the program", { skip: vectors.log_v3 === undefined }, async () => {
+  const log = vectors.log_v3;
+  assert.equal(log.a_key_of_not_keys_parses, false);
+  const fx = vectorFixture("dev");
+  const world = fx.world;
+  // Every such key under a prefix of this account holds the object of a real entry: a reader
+  // that took it for a key would verify the object and count it.
+  const listed = log.not_keys.filter((key) => key.startsWith(log.control_prefix) || key.startsWith(log.use_prefix));
+  assert.equal(listed.length, 3);
+  for (const key of listed) {
+    const real = log.entries.find((entry) => key.endsWith(entry.body_hash));
+    world.putObject(bridge.shardBucket("dev", log.user_id), key, JSON.stringify(real.entry));
+  }
+  await S.start(fx);
+  const report = world.reports[world.reports.length - 1];
+  assert.equal(report.control_keys, log.control_listing.length);
+  assert.equal(report.store, "verified");
+  const shown = await S.call(fx, "read_log", { limit: 100 });
+  const events = log.entries.reduce((sum, entry) => sum + entry.count, 0);
+  assert.equal(shownGroups(shown.value).reduce((sum, group) => sum + group.count, 0), events);
+  assert.equal(world.state.log.store, "verified");
+  // The bodies of those keys were asked of nobody.
+  for (const request of world.sent("POST /api/secure/log/bodies")) {
+    for (const key of JSON.parse(request.body).keys) assert.ok(listed.indexOf(key) < 0, key);
   }
 });
 
@@ -186,6 +318,60 @@ test("the program calls the bucket of an account that the vectors name, for ever
     }
   }
   assert.equal(checked, 12);
+});
+
+test("a debug build calls the bucket of the local stack the vectors name for an account, in the path-style form, and no other", { skip: vectors.log_store === undefined }, async () => {
+  const store = vectors.log_store.stores.find((item) => item.bucket === "character-credential-log-local-1");
+  assert.equal(store.shards, 4);
+  const empty = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListVersionsResult><IsTruncated>false</IsTruncated></ListVersionsResult>";
+  for (const owner of store.owners) {
+    for (const bucket of [owner.bucket, store.first_bucket === owner.bucket ? store.last_bucket : store.first_bucket]) {
+      // The bridge of a debug build reports the server target prod whatever backend it talks to.
+      const fx = S.fixture(source, { target: "prod", nodes: 0, device: { debug_build: true } });
+      fx.world.userId = owner.owner;
+      fx.world.keychain.clear();
+      fx.keys = fx.world.createAccount();
+      const local = fx.world.addNode({ release: "v2.4.0", measurement: fx.measurement, platform: "local", log: { bucket: store.bucket, region: store.region } });
+      fx.world.fault("POST /api/secure/log/read", (request) => ({
+        status: 200, body: {
+          pages: JSON.parse(request.body).pages.map((page) => ({
+            prefix: page.prefix,
+            url: "http://localhost:4566/" + bucket + "?versions&prefix=" +
+              encodeURIComponent("a3/" + owner.owner + "/" + page.prefix + "/") + "&max-keys=1000&encoding-type=url",
+          })),
+        },
+      }));
+      fx.world.fault("S3 localhost:4566", { status: 200, body: empty });
+      await S.start(fx);
+      const called = fx.world.sent("S3 localhost:4566").length;
+      if (bucket === owner.bucket) {
+        assert.equal(called, 1, owner.owner);
+        assert.equal(fx.world.state.log.store, "verified", owner.owner);
+      } else {
+        assert.equal(called, 0, owner.owner);
+        assert.equal(fx.world.state.log.store_failure, "read:url", owner.owner);
+      }
+      assert.equal(local.grants.has(owner.owner), true);
+    }
+  }
+});
+
+test("the node document of the vectors, a document of platform local, is accepted by a build that takes local nodes and by no other", { skip: vectors.log_v3 === undefined }, async () => {
+  assert.equal(vectors.log_v3.node_document.accepted, true);
+  // dev and alpha take a node of platform local (the custody operator): its document is no
+  // attestation, and the program judges nothing by it.
+  for (const target of ["dev", "alpha"]) {
+    const taken = vectorFixture(target);
+    await S.start(taken);
+    assert.equal(taken.world.reports.slice(-1)[0].undocumented_nodes, 0, target);
+    assert.equal(taken.world.state.log.store, "verified", target);
+  }
+  // prod takes no node of platform local: the entries of that node id are entries of no node the
+  // device accepts, and the read counts as held back.
+  const refused = vectorFixture("prod");
+  await S.start(refused);
+  assert.equal(refused.world.reports.slice(-1)[0].undocumented_nodes, 1);
+  assert.equal(refused.world.state.log.store_failure, "documents:rejected");
 });
 
 test("the program refuses the node documents the vectors refuse", { skip: vectors.log_v3 === undefined }, async () => {
