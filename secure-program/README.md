@@ -51,9 +51,10 @@ ends its reading when the app goes to the background and is judged on what it re
 it listed and did not come to judge are the first the next round asks for, so a device whose
 stays in the app are short reads the log on with every stay. A measurement no list of the
 program has that held the key of the account marks the log once the device first saw it a day
-ago and the runtime knows that no later program than this one is served: a runtime that knows
-that a later program is served judges nothing, writes none of the values the rounds judge by,
-and reports once that it is behind. The signature of an object reaches the device through the
+ago, the runtime knows that no later program than this one is served, and the backend answered
+its request for the release proofs of that measurement without proofs that show it: a runtime
+that knows that a later program is served judges nothing, writes none of the values the rounds
+judge by, and reports once that it is behind. The signature of an object reaches the device through the
 backend, so a body handed out with a signature that does not verify marks the log only when the
 answers of two rounds carried none that does, and until one does. The
 entries of the nodes of the releases before v2.4.0 (formats 1 and 2) are read from the bucket
