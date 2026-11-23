@@ -91,8 +91,8 @@
 
   // ---- The log (docs/protocol.md section 7) ----
   // The keys of the program store that hold what this device knows of the log of the account. No
-  // secret value is among them; what names services and addresses (the kept screen) is sealed with
-  // a key derived from the master key.
+  // secret value is among them; what names services and addresses (the kept screen, and what the
+  // rounds read for the screen) is sealed with a key derived from the master key.
   //   log.grants      the nodes this device handed a grant to: {node: {granted_ms, not_after_ms,
   //                   release, first_ms, platform, attempted_ms}}
   //   log.cursor      the newest control key of the last round that covered the whole listing
@@ -106,22 +106,28 @@
   //   log.sample      the newest control keys the last round verified (LOG_SAMPLE_KEYS at most)
   //   log.seen        the digests of the control keys judged (LOG_SEEN_KEYS at most)
   //   log.missing     the keys of log.sample that left the listing within their retention
-  //   log.withheld    the reads of format 3 that were held back and are made again by every
-  //                   round: {keys: [key], shown: [key], pages: [before_ms]} (the keys of
-  //                   entries, those of them a read of the log screen asked for, and the listing
-  //                   pages of the screen by the time they begin below, 0 for the first)
+  //   log.withheld    the reads that were held back and are made again by every round: {keys:
+  //                   [key], shown: [key], pages: [before_ms], watch_ms, objects, chains, nodes}
+  //                   (the keys of entries of format 3, those of them a read of the log screen
+  //                   asked for, the listing pages of the screen by the time they begin below, 0
+  //                   for the first, the time until which the rounds read the first listing pages
+  //                   for the screen, and the reads the screen made of the bucket of format 1
+  //                   and format 2: the object versions of entries, the listings of chains, the
+  //                   node discovery listing)
   //   log.recovered   what the rounds read of the reads of the log screen that were held back,
-  //                   kept for the screen, sealed
+  //                   kept for the screen, sealed: the entries, the listing pages, the node
+  //                   prefixes of the bucket of format 1 and format 2
   //   log.denied      the reads held back from the log screen that the screen counts itself:
   //                   {page: {before_ms, limit, count, first_ms, last_ms}, chains: {node:
-  //                   {after, count, first_ms, last_ms}}} (the later pages of format 3, and the
-  //                   listings of the chains of format 1 and format 2)
+  //                   {after, deep, count, first_ms, last_ms}}} (the later pages of format 3,
+  //                   and the listings of the chains of format 1 and format 2)
   //   log.legacy      the chains of format 1 and format 2: {nodes: {node: {seq, time_ms, until_ms,
   //                   closed, read_ms}}, waiting: {node: {until_ms, time_ms}}} (waiting: the receiving
   //                   nodes of transfers whose documents this device has still to judge)
   //   log.round       the last round: {v, done_ms, tried_ms, last, told, state, unfinished}
   //                   (unfinished: the rounds in a row that had more to read than they read)
-  //   log.cache       the kept screen, sealed
+  //   log.cache       the kept screen, sealed (the first page, the time the screen last read
+  //                   its listings itself, the summary tally, what it knows of the chains)
   //   log.migrated    the mark that the ledger of the program before was carried over
   const STORE_GRANTS = "log.grants";
   const STORE_CURSOR = "log.cursor";
