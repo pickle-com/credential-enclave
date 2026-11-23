@@ -112,7 +112,8 @@
   //   log.legacy      the chains of format 1 and format 2: {nodes: {node: {seq, time_ms, until_ms,
   //                   closed}}, waiting: {node: {until_ms, time_ms}}} (waiting: the receiving
   //                   nodes of transfers whose documents this device has still to judge)
-  //   log.round       the last round: {v, done_ms, tried_ms, last, told, state}
+  //   log.round       the last round: {v, done_ms, tried_ms, last, told, state, unfinished}
+  //                   (unfinished: the rounds in a row that had more to read than they read)
   //   log.cache       the kept screen, sealed
   //   log.migrated    the mark that the ledger of the program before was carried over
   const STORE_GRANTS = "log.grants";
@@ -170,6 +171,14 @@
   // blocked and the first of them is this old.
   const LOG_BLOCKED_ROUNDS = 3;
   const LOG_BLOCKED_MS = 3 * DAY_MS;
+  // A round that leaves reads undone because there was more to read than one round reads (more
+  // listing pages, more nodes without a judgement, more bodies than its requests name, an answer
+  // of the bodies that ended before its last key) is not complete, and the next round reads on.
+  // An account in normal use is read to its end within a few such rounds, whatever it holds: the
+  // rounds of a synchronization that end that way in a row, beyond this many, are rounds whose
+  // reads are held back (someone writes objects under the prefix of the account faster than the
+  // device reads them, or the answers of the backend never reach the end).
+  const LOG_UNFINISHED_ROUNDS = 8;
   // A request of a round that was not answered counts as held back by the operator domain when
   // the backend answered another request of this runtime within this time of it.
   const LOG_REACH_MS = 60000;
@@ -3643,6 +3652,9 @@
     const left = await learning;
     ask(function (node) { return nodeVerdict(log.grants, log.nodes, node) !== null; });
     const bodies = new Map();
+    // The keys of the requests that failed: their bodies are missing for that failure, not
+    // because the read had more keys than its requests name.
+    const failed = new Set();
     for (const asked of requests) {
       const outcome = await asked.sent;
       if (!outcome.ok) {
@@ -3650,6 +3662,7 @@
         // rounds (a request that failed with the network of the device is one they answer then).
         const failure = heldBack(outcome.error);
         noteFailure(turn, run, failure);
+        for (const key of asked.keys) failed.add(key);
         if (failure.kind === "blocked" || failure.kind === "silent") {
           for (const key of asked.keys) run.withheld.add(key);
         }
@@ -3713,7 +3726,10 @@
       }
       const entry = bodies.get(parsed.key);
       if (entry === undefined) {
+        // The body was not asked for (the requests of this read were spent) or the answer ended
+        // before this key: the read has more to read than it read.
         run.cut = true;
+        if (!failed.has(parsed.key)) run.over = true;
         continue;
       }
       const checked = entry === null ? { body: null, failure: "body" } : checkEntry(parsed, entry);
@@ -3891,6 +3907,7 @@
     if (open.length > LEGACY_NODES) {
       open = open.slice(0, LEGACY_NODES);
       run.cut = true;
+      run.over = true;
     }
     // A control entry names one receiving node at most, and the nodes that wait are asked for
     // with the first pass: the entries of a round and the nodes that wait fit one request.
@@ -3944,6 +3961,7 @@
             // The entries of this round are spent: the chain is read on from here by the next.
             plan.stop = seq;
             run.cut = true;
+            run.over = true;
             break;
           }
           bodiesLeft -= candidates.length;
@@ -4041,9 +4059,11 @@
           const why = left.get(id);
           const state = why === undefined ? "unasked" : why.state;
           if (state === "unasked" || state === "failed") {
-            // Its document could not be asked for: the next round asks again.
+            // Its document could not be asked for: the next round asks again. A node that was
+            // left out of the one request of this pass is one more than a round asks for.
             legacy.waiting[id] = receiver;
             run.cut = true;
+            if (why === undefined) run.over = true;
             return;
           }
           const kept = receiver.time_ms >= LEGACY_TRANSFER_DOCUMENTS_FROM_MS &&
@@ -4065,7 +4085,10 @@
       });
       open = next.slice(0, LEGACY_NODES);
     }
-    if (open.length > 0) run.cut = true;
+    if (open.length > 0) {
+      run.cut = true;
+      run.over = true;
+    }
   }
 
   // ---- The state a round publishes ----
@@ -4190,6 +4213,10 @@
    *      (log.withheld)
    *    5 the chains of format 1 and format 2 this device follows (followLegacy)
    *    6 the judgement, the published state, the report
+   *  A round that ends with reads left undone because there was more to read than a round reads
+   *  (run.truncated, run.over) is not complete and the next round reads on. From the round after
+   *  LOG_UNFINISHED_ROUNDS such rounds of synchronizations in a row, a round that ends that way
+   *  counts as a round whose reads are held back.
    *  A backend that states it has no store of format 3 (the route is absent, or it answers
    *  log_store_disabled) is read as an environment without entries of format 3, unless this device
    *  knows otherwise: it handed a grant to a node of a release that writes format 3, or it read
@@ -4206,7 +4233,7 @@
     const known = storeKnown(log, withheld);
     const run = {
       origin: origin, detail: "", blocked: false, silent: false, unreachable: false, truncated: false,
-      cut: false, controlKeys: 0, checked: 0, bodies: 0, nodes: new Set(), undocumented: new Set(),
+      cut: false, over: false, controlKeys: 0, checked: 0, bodies: 0, nodes: new Set(), undocumented: new Set(),
       verified: [], entries: new Map(), junk: new Set(), screenMs: null, withheld: new Set(),
       settled: new Set(), pagesHeld: new Set(), pagesRead: new Set(), store3: known,
     };
@@ -4319,8 +4346,23 @@
     }
     // The judgement.
     const now = native.nowMs();
-    const blocked = run.blocked || (run.silent && await reachJudged(turn, started));
-    const unreachable = !blocked && (run.unreachable || run.silent);
+    const denied = run.blocked || (run.silent && await reachJudged(turn, started));
+    const unreachable = !denied && (run.unreachable || run.silent);
+    // The rounds of a synchronization in a row that left reads undone because there was more to
+    // read than a round reads. A round that read everything it had to read ends the row; a round
+    // whose reads were held back, or that could not reach the store, leaves it as it is. Beyond
+    // LOG_UNFINISHED_ROUNDS such rounds, a round that ends that way is one whose reads are held
+    // back (a round the log screen started reads one listing page and adds nothing to the row).
+    const over = !unreachable && (run.truncated || run.over);
+    let unfinished = log.round.v === VERSION ? whole(log.round.unfinished) : 0;
+    if (over) {
+      if (origin === "sync") unfinished += 1;
+    } else if (!denied && !unreachable) {
+      unfinished = 0;
+    }
+    const overrun = over && unfinished > LOG_UNFINISHED_ROUNDS;
+    if (overrun && run.detail === "") run.detail = "round:unfinished";
+    const blocked = denied || overrun;
     let grace = 0;
     let established = 0;
     const releases = [];
@@ -4418,6 +4460,7 @@
     storeJson(STORE_ROUND, {
       v: VERSION, tried_ms: now, last: status, open: incomplete, told: told, state: state,
       done_ms: status === "pending" ? (log.round.v === VERSION ? whole(log.round.done_ms) : 0) : now,
+      unfinished: unfinished,
     });
     logState = state;
     native.publish({ state: { log: state } });
@@ -5398,7 +5441,7 @@
     const records = new Map();
     const junk = new Set();
     const run = {
-      detail: "", blocked: false, silent: false, unreachable: false, cut: false, checked: 0, bodies: 0,
+      detail: "", blocked: false, silent: false, unreachable: false, cut: false, over: false, checked: 0, bodies: 0,
       nodes: new Set(), undocumented: new Set(), verified: [], entries: records, junk: junk,
       withheld: new Set(), settled: new Set(), pagesHeld: new Set(), pagesRead: new Set(), store3: true,
     };

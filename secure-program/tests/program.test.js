@@ -993,6 +993,85 @@ test("A3: what counts as a read the operator domain holds back", async () => {
   }, "read:log_store_disabled");
 });
 
+test("A3: rounds that keep ending with more to read than a round reads are reads held back from the ninth in a row on: objects that keep piling up under the prefix of an account mark the log three rounds and three days later", async () => {
+  const fx = S.fixture(source, { device: { securityStatus: true } });
+  await S.start(fx);
+  const world = fx.world;
+  // Before every round, 130 objects under 130 node ids no node has: more than the 128 nodes one
+  // round asks the documents of. No round reaches the end of what there is to read.
+  const pile = () => {
+    for (let i = 0; i < 130; i += 1) {
+      world.advance(1000);
+      new bridge.Node(world, { release: "v2.4.0", measurement: fx.measurement, document: false })
+        .record("c", [{ t: "grant_revoked", time_ms: world.now }]);
+    }
+  };
+  const states = [];
+  for (let day = 0; day < 12; day += 1) {
+    pile();
+    await nextDay(fx);
+    states.push(world.state.log.status + ":" + world.state.log.store + ":" + world.reports.slice(-1)[0].blocked_attempts);
+  }
+  // Eight rounds are read on by the next one without a count. The ninth, the tenth and the
+  // eleventh are counted, and the twelfth is three days after the ninth.
+  assert.deepEqual(states.slice(0, 8), Array(8).fill("pending:verified:0"));
+  assert.deepEqual(states.slice(8), ["pending:blocked:1", "pending:blocked:2", "pending:blocked:3", "attention:blocked:4"]);
+  assert.equal(world.state.log.store_failure, "round:unfinished");
+  assert.equal(world.stored("log.round").unfinished, 12);
+  assert.deepEqual(world.securityStatuses.slice(-1)[0].reasons, ["verification_blocked"]);
+  // A round the log screen starts during that time ends no count: it has more to read as well.
+  await S.call(fx, "read_log", { limit: 10 });
+  assert.equal(world.state.log.status, "attention");
+  assert.equal(world.stored("log.blocked").count, 5);
+  assert.equal(world.stored("log.round").unfinished, 12);
+  // The objects stop arriving: the rounds reach the end, and the first that does clears the mark.
+  world.advance(2 * 60000);
+  await S.event(fx, "foreground");
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(world.state.log.store, "verified");
+  assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  assert.equal(world.stored("log.round").unfinished, 0);
+  assert.equal(world.securityStatuses.slice(-1)[0].status, "ok");
+});
+
+test("an account with more to read than one round reads is read to its end by the rounds that follow, days apart, and nothing is counted: a long listing of control entries, and entries of more nodes than a round asks the documents of", async () => {
+  // 61 control entries in listing pages of three: 21 pages, four per round.
+  const long = S.fixture(source);
+  long.world.pageSize = 3;
+  for (let i = 0; i < 60; i += 1) {
+    long.world.advance(1000);
+    long.nodes[0].record("c", [{ t: "connection_created", time_ms: long.world.now, record_id: "r" + i, provider: "slack", scope: "" }]);
+  }
+  await S.start(long);
+  const walked = [long.world.state.log.status + ":" + long.world.state.log.store];
+  for (let day = 0; day < 5; day += 1) {
+    await nextDay(long);
+    walked.push(long.world.state.log.status + ":" + long.world.state.log.store);
+    assert.equal(long.world.stored("log.blocked").count, 0, "day " + day);
+  }
+  assert.deepEqual(walked, Array(5).fill("pending:truncated").concat(["verified:verified"]));
+  assert.equal(long.world.stored("log.seen").length, 61);
+  assert.equal(long.world.stored("log.round").unfinished, 0);
+
+  // Control entries of 300 nodes of the accepted measurement that this device has no judgement
+  // of (a device that reads the log of its account for the first time).
+  const wide = S.fixture(source);
+  for (let i = 0; i < 300; i += 1) {
+    wide.world.advance(1000);
+    wide.world.addNode({ release: "v2.4.0", measurement: wide.measurement, offered: false })
+      .record("c", [{ t: "connection_created", time_ms: wide.world.now, record_id: "r" + i, provider: "slack", scope: "" }]);
+  }
+  await S.start(wide);
+  const learned = [wide.world.state.log.status + ":" + wide.world.state.log.store];
+  for (let day = 0; day < 2; day += 1) {
+    await nextDay(wide);
+    learned.push(wide.world.state.log.status + ":" + wide.world.state.log.store);
+    assert.equal(wide.world.stored("log.blocked").count, 0, "day " + day);
+  }
+  assert.deepEqual(learned, ["pending:verified", "pending:verified", "verified:verified"]);
+  assert.equal(wide.world.reports.slice(-1)[0].undocumented_nodes, 0);
+});
+
 test("a device without a network, and a store that fails, leave the log pending and count no blocked round, however long", async () => {
   const offline = S.fixture(source);
   await S.start(offline);
