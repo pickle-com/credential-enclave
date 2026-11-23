@@ -158,10 +158,16 @@ pub struct PublicField {
     pub path: String,
     #[serde(rename = "type")]
     pub kind: FieldType,
-    /// Longest value of a `string` field, in bytes of UTF-8. Absent for the other types.
+    /// Longest value of a `string` field, in bytes of UTF-8: 1 to [`PUBLIC_STRING_BYTES`].
+    /// Absent for the other types.
     #[serde(default)]
     pub max: Option<usize>,
 }
+
+/// The largest `max` of a public field of type `string`: 8,192 bytes. A node keeps no string
+/// of a token response that is longer, unless it is a token (`crate::oauth`), so a public
+/// field with a larger limit would name values a node does not keep.
+pub const PUBLIC_STRING_BYTES: usize = 8192;
 
 /// The keys of a token object that hold a token. A definition cannot list them as public.
 pub const TOKEN_KEYS: [&str; 3] = ["access_token", "refresh_token", "id_token"];
@@ -743,7 +749,9 @@ impl Definition {
                     vec![field.path.as_str()]
                 };
                 let valid_limit = match field.kind {
-                    FieldType::String => field.max.is_some_and(|max| max >= 1),
+                    FieldType::String => field
+                        .max
+                        .is_some_and(|max| (1..=PUBLIC_STRING_BYTES).contains(&max)),
                     FieldType::Integer | FieldType::Boolean => field.max.is_none(),
                 };
                 if segments.iter().any(|segment| segment.is_empty())
@@ -2269,9 +2277,14 @@ mod tests {
         assert!(claims(json!([{"path": "email", "type": "string", "max": 320}])).is_ok());
         // The form of v1.0.0: a bare path.
         assert!(public(json!(["scope"])).is_err());
-        // A string without a limit, a limit of zero, a limit on another type.
+        // A string without a limit, a limit of zero, a limit above the longest string a node
+        // keeps of a token response beside its tokens, a limit on another type.
         assert!(public(json!([{"path": "scope", "type": "string"}])).is_err());
         assert!(public(json!([{"path": "scope", "type": "string", "max": 0}])).is_err());
+        assert_eq!(PUBLIC_STRING_BYTES, 8192);
+        assert!(public(json!([{"path": "scope", "type": "string", "max": 8193}])).is_err());
+        assert!(claims(json!([{"path": "email", "type": "string", "max": 8193}])).is_err());
+        assert!(claims(json!([{"path": "email", "type": "string", "max": 8192}])).is_ok());
         assert!(public(json!([{"path": "expires_in", "type": "integer", "max": 5}])).is_err());
         assert!(public(json!([{"path": "ok", "type": "boolean", "max": 5}])).is_err());
         // An unknown type, an unknown key, an empty path or segment.

@@ -9,10 +9,9 @@ use credential_enclave_protocol::log::EntryKind;
 use credential_enclave_protocol::ProtocolError;
 use tokio::task::JoinHandle;
 
-use super::responses::Refreshed;
+use super::responses::{json_refreshed, Refreshed, RefreshedBody};
 use super::{
-    above_bounds, json_ok, narrowed, provider_credentials, record_of, respond, Admission, ApiError,
-    JsonBody,
+    above_bounds, narrowed, provider_credentials, record_of, respond, Admission, ApiError, JsonBody,
 };
 use crate::faults::joined;
 use crate::log_store;
@@ -35,7 +34,10 @@ pub async fn refresh(State(node): State<Arc<Node>>, request: Request) -> Respons
 /// that was sent. When the same account sends the same record again within that time, the
 /// node answers with the kept response: it calls no provider and creates no entry. A provider
 /// that rotates refresh tokens invalidates the old token at the first call, so without this a
-/// response that never reached the caller would end the connection.
+/// response that never reached the caller would end the connection. The node keeps those
+/// responses up to a sum over every account and drops the ones it kept first above it
+/// (`Node::bound_kept_refreshes`): a repeated call with the record of a response that was
+/// dropped calls the token address once more.
 ///
 /// The token address call runs on a task of its own. The call waits for it for the time limit
 /// of a token address call and then fails with `refresh_failed` and `provider_status` 0; the
@@ -74,7 +76,7 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
         // The record opened under the grant of this account: a kept response of this record
         // is the answer.
         if let Some(kept) = account.kept_refresh(&replay_key, now_ms) {
-            return Ok(json_ok(kept));
+            return Ok(json_refreshed(kept));
         }
         let definition = node
             .definitions
@@ -194,14 +196,29 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
                 .ok_or_else(|| {
                     ApiError::provider(ProtocolError::RefreshFailed, 200, ProviderError::NONE)
                 })?;
+            // The body of the response is made once: the call answers with it, and the node
+            // keeps the same bytes for a repeated call.
             let refreshed = Refreshed {
                 record,
                 public,
                 log,
-            };
+            }
+            .body();
             let kept = node.ensure_open().is_ok()
-                && lock(&account).keep_refresh(&grant, replay_key, now_ms, refreshed.clone());
-            Ok::<(Refreshed, bool), ApiError>((refreshed, kept))
+                && lock(&account).keep_refresh(
+                    &grant,
+                    &user_id,
+                    replay_key,
+                    now_ms,
+                    refreshed.clone(),
+                );
+            if kept {
+                // The lock of the account is given back: the node drops the responses it
+                // kept first while their sum is above its bound, whichever account holds
+                // them.
+                node.bound_kept_refreshes();
+            }
+            Ok::<(RefreshedBody, bool), ApiError>((refreshed, kept))
         }
     };
     // The failure of a call whose exchange gave no answer: the token address was called, and
@@ -214,7 +231,7 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
     // A panic of the exchange is a panic of this call (`joined`): the token address may have
     // answered, and a failure response would say that the call can be made again.
     match tokio::time::timeout(node.limits.token_timeout, joined(task)).await {
-        Ok(Some(outcome)) => outcome.map(|(refreshed, _)| json_ok(&refreshed)),
+        Ok(Some(outcome)) => outcome.map(|(refreshed, _)| json_refreshed(&refreshed)),
         Ok(None) => Err(no_answer()),
         Err(_) => {
             // The time limit passed. The task goes on in a place among the late tasks, and the
@@ -252,7 +269,7 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
 /// ends with it: no task outlives a call outside the places for late calls. The task of a call
 /// that reached its time limit is taken out of the guard first.
 struct ExchangeGuard {
-    task: Option<JoinHandle<Result<(Refreshed, bool), ApiError>>>,
+    task: Option<JoinHandle<Result<(RefreshedBody, bool), ApiError>>>,
 }
 
 impl Drop for ExchangeGuard {

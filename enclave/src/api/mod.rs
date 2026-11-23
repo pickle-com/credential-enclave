@@ -926,8 +926,9 @@ fn missing(key: &str) -> ApiError {
         "limit" => "limit is missing or invalid",
         "subset" => {
             "subset is missing or invalid: pods 1 to 1024, pod below pods, copies at least 1, \
-             and groups, when present, one name per ordinal with at least skip plus copies \
-             different names"
+             groups, when present, one name per ordinal with at least skip plus copies \
+             different names, and span, when present, two integers below 4294967296, the \
+             first not above the last"
         }
         _ => "a field is missing or invalid",
     };

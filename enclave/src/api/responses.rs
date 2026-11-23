@@ -256,6 +256,9 @@ pub struct LateRefreshCounts {
 pub struct StateCounts {
     /// P: a count, the kept `refresh` responses over every account.
     pub kept_refreshes: usize,
+    /// P: a size, the bytes the node counts for those responses: the sum its bound of kept
+    /// responses is about.
+    pub kept_refresh_bytes: usize,
     /// P: a count, the merge keys over every account.
     pub merge_keys: usize,
     /// P: a count, the entries the log store has not confirmed over every account.
@@ -323,6 +326,9 @@ pub struct Load {
     /// P: a count, the accounts the node halted since it started: a panic began while the
     /// lock of their state was held.
     pub halted_accounts: usize,
+    /// P: a count, the kept `refresh` responses the node dropped before their time because
+    /// the sum of its kept responses was above its bound, since the node started.
+    pub kept_refreshes_dropped: u64,
 }
 
 /// `GET /v1/health`.
@@ -489,9 +495,8 @@ pub struct Merged {
     pub public: PublicFields,
 }
 
-/// `POST /v1/refresh`. A node keeps the value of a successful refresh for a repeated call
-/// with the same record, so the type is cloned.
-#[derive(Clone, Serialize)]
+/// `POST /v1/refresh`.
+#[derive(Serialize)]
 pub struct Refreshed {
     /// C
     pub record: Record,
@@ -499,6 +504,27 @@ pub struct Refreshed {
     pub public: PublicFields,
     /// P
     pub log: LogRef,
+}
+
+impl Refreshed {
+    /// The body of the response as the node sends it.
+    pub fn body(&self) -> RefreshedBody {
+        RefreshedBody(Bytes::from(to_json(self).into_boxed_slice()))
+    }
+}
+
+/// The body of a successful `refresh` response: the JSON of a [`Refreshed`], which only
+/// [`Refreshed::body`] creates. A node keeps it for a repeated call with the same record
+/// (enclave.md 5.7), so the first call and a repeated one are answered with the same bytes.
+/// The buffer holds those bytes and no room beyond them, and a copy of the value shares it.
+#[derive(Clone)]
+pub struct RefreshedBody(Bytes);
+
+impl RefreshedBody {
+    /// The number of the bytes of the body.
+    pub fn bytes(&self) -> usize {
+        self.0.len()
+    }
 }
 
 /// `POST /v1/revoke-token`.
@@ -774,8 +800,8 @@ pub struct ErrorBody<'a> {
     pub index: Option<usize>,
 }
 
-pub(super) fn json_bytes(status: StatusCode, body: Vec<u8>) -> Response {
-    let mut response = Response::new(Body::from(body));
+pub(super) fn json_bytes(status: StatusCode, body: impl Into<Body>) -> Response {
+    let mut response = Response::new(body.into());
     *response.status_mut() = status;
     response
         .headers_mut()
@@ -786,6 +812,11 @@ pub(super) fn json_bytes(status: StatusCode, body: Vec<u8>) -> Response {
 /// A 200 response with a JSON body. The keys are in the order the type declares them.
 pub fn json_ok<T: OperatorResponse>(value: &T) -> Response {
     json_bytes(StatusCode::OK, to_json(value))
+}
+
+/// A 200 response with the body of a `refresh` response.
+pub fn json_refreshed(body: &RefreshedBody) -> Response {
+    json_bytes(StatusCode::OK, body.0.clone())
 }
 
 /// A failure response.

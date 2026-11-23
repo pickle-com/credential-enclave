@@ -25,6 +25,14 @@
 //! (`peer/import`) and to drop the grants outside its share (`grants/prune`). A node does not
 //! know its own ordinal: the caller names it.
 //!
+//! A pool names at most [`PODS_MAX`] nodes, and a fleet of more nodes is several pools, each
+//! with the accounts of its span. Every account has a span number, the first four bytes of
+//! `SHA-256(user_id || "\n" || "span")` as an unsigned integer, and the span of a pool is a
+//! range of those numbers ([`Span`]). A `subset` object with a `span` holds the accounts of
+//! that range alone: an account outside it is outside the subset whatever the assignment
+//! says. Ranges that do not overlap share no account, and two ranges that divide a third one
+//! hold its accounts between them.
+//!
 //! No function here takes a secret: the inputs are the `user_id` of an account and the values
 //! of the `subset` object of a request.
 
@@ -59,6 +67,61 @@ pub fn group_rank(user_id: &str, group: &str) -> [u8; 32] {
     hasher.update(b"\nzone\n");
     hasher.update(group.as_bytes());
     hasher.finalize().into()
+}
+
+/// The span number of an account: the first four bytes of
+/// `SHA-256(UTF-8(user_id) || "\n" || "span")` as a big-endian unsigned integer.
+///
+/// The input has one line feed and then a word that is no decimal number, the input of
+/// [`rank`] one line feed and then decimal digits, the input of [`group_rank`] two line
+/// feeds, and the input of the hash that places an account in a bucket of a log store
+/// (`crate::keys::shard_hash`) none: no two of them are equal for any account, so the span
+/// number of an account says nothing of its ranks or of its bucket.
+pub fn span_number(user_id: &str) -> u32 {
+    let mut hasher = Sha256::new();
+    hasher.update(user_id.as_bytes());
+    hasher.update(b"\nspan");
+    let digest = hasher.finalize();
+    let mut first = [0u8; 4];
+    for (byte, digest_byte) in first.iter_mut().zip(digest.iter()) {
+        *byte = *digest_byte;
+    }
+    u32::from_be_bytes(first)
+}
+
+/// A range of span numbers: the accounts one pool holds. Both ends belong to the range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Span {
+    first: u32,
+    last: u32,
+}
+
+impl Span {
+    /// The range from `first` to `last`, both included. `None` when `first` is above `last`:
+    /// a range holds at least one number.
+    pub fn new(first: u32, last: u32) -> Option<Span> {
+        (first <= last).then_some(Span { first, last })
+    }
+
+    /// The smallest number of the range.
+    pub fn first(&self) -> u32 {
+        self.first
+    }
+
+    /// The largest number of the range.
+    pub fn last(&self) -> u32 {
+        self.last
+    }
+
+    /// True when the range holds `number`.
+    pub fn contains(&self, number: u32) -> bool {
+        (self.first..=self.last).contains(&number)
+    }
+
+    /// True when the range holds the span number of `user_id` ([`span_number`]).
+    pub fn holds(&self, user_id: &str) -> bool {
+        self.contains(span_number(user_id))
+    }
 }
 
 /// True for the name of a group: 1 to 63 bytes, each an ASCII letter, a digit, `-`, `_` or
@@ -270,12 +333,14 @@ pub fn assign(
     Placement::new(pods, copies, groups, skip).map(|placement| placement.assign(user_id))
 }
 
-/// The `subset` object of a request: the placement of a pool and the ordinal of the node of
-/// that pool the request is about (`pod`).
+/// The `subset` object of a request: the placement of a pool, the ordinal of the node of
+/// that pool the request is about (`pod`), and the span of the pool when the object names
+/// one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Subset {
     placement: Placement,
     pod: u32,
+    span: Option<Span>,
 }
 
 impl Subset {
@@ -286,7 +351,9 @@ impl Subset {
     /// ([`is_group_name`]), absent or null for a pool without groups. `skip` is optional: an
     /// integer, absent or null for 0, and with `groups` the names are at least
     /// `skip + copies` different ones. Without `groups` the value of `skip` changes nothing.
-    /// Other keys are not read. `None` for any other value.
+    /// `span` is optional: an array of exactly two integers below 4,294,967,296, the first
+    /// and the last span number of the pool, the first not above the last. Absent or null:
+    /// a pool of every account. Other keys are not read. `None` for any other value.
     pub fn from_value(value: &Value) -> Option<Subset> {
         let object = value.as_object()?;
         let integer = |key: &str| -> Option<u32> {
@@ -300,6 +367,16 @@ impl Subset {
             None | Some(Value::Null) => 0,
             Some(_) => integer("skip")?,
         };
+        let span = match object.get("span") {
+            None | Some(Value::Null) => None,
+            Some(span) => {
+                let number = |end: &Value| end.as_u64().and_then(|end| u32::try_from(end).ok());
+                match span.as_array()?.as_slice() {
+                    [first, last] => Some(Span::new(number(first)?, number(last)?)?),
+                    _ => return None,
+                }
+            }
+        };
         let groups: Option<Vec<&str>> = match object.get("groups") {
             None | Some(Value::Null) => None,
             Some(groups) => Some(
@@ -311,7 +388,11 @@ impl Subset {
             ),
         };
         let placement = Placement::new(pods, copies, groups.as_deref(), skip)?;
-        (pod < pods).then_some(Subset { placement, pod })
+        (pod < pods).then_some(Subset {
+            placement,
+            pod,
+            span,
+        })
     }
 
     /// The placement of the pool.
@@ -324,9 +405,17 @@ impl Subset {
         self.pod
     }
 
-    /// True when the node of ordinal `pod` is one of the nodes of `user_id`.
+    /// The span of the pool, `None` for a pool of every account.
+    pub fn span(&self) -> Option<Span> {
+        self.span
+    }
+
+    /// True when the node of ordinal `pod` is one of the nodes of `user_id`: the account is
+    /// an account of the span of the pool (every account, for an object without `span`), and
+    /// the assignment of the account in the pool contains `pod`. An account outside the
+    /// span is outside the subset whatever its assignment is.
     pub fn contains(&self, user_id: &str) -> bool {
-        self.placement.holds(user_id, self.pod)
+        self.span.is_none_or(|span| span.holds(user_id)) && self.placement.holds(user_id, self.pod)
     }
 }
 
@@ -696,6 +785,162 @@ mod tests {
             json!({"pods": 3, "pod": 0, "copies": 1, "skip": 4294967295u32, "groups": ["a", "b", "c"]}),
             json!({"pods": 3, "pod": 0, "copies": 4294967295u32, "skip": 4294967295u32, "groups": ["a", "b", "c"]}),
         ] {
+            assert_eq!(read(value.clone()), None, "{value}");
+        }
+    }
+
+    #[test]
+    fn the_span_number_of_an_account_is_the_start_of_a_hash_of_its_own() {
+        // The hash of the bytes of the account, a line feed and the word `span`, and of it
+        // the first four bytes as a big-endian unsigned integer.
+        let mut hasher = Sha256::new();
+        hasher.update("사용자 1\nspan".as_bytes());
+        let digest: [u8; 32] = hasher.finalize().into();
+        let expected = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
+        assert_eq!(span_number("사용자 1"), expected);
+        // The vectors of protocol.md 10.4.
+        for (user_id, number) in [
+            ("user-1", 2_518_581_323u32),
+            ("00000000-0000-4000-8000-000000000007", 2_233_096_642),
+            ("alice", 4_154_312_765),
+            ("bob", 1_836_545_875),
+            ("사용자 1", 1_136_083_252),
+            ("carol", 3_992_269_495),
+        ] {
+            assert_eq!(span_number(user_id), number, "{user_id}");
+        }
+        // The hash is no hash of the assignment and not the hash of a bucket: its start is
+        // neither the start of the rank of an ordinal, nor of the rank of a group, nor of the
+        // hash of the account alone.
+        for user_id in users(40) {
+            let own = span_number(&user_id).to_be_bytes();
+            let starts = |hash: [u8; 32]| hash.starts_with(&own);
+            assert!(!(0..16).any(|ordinal| starts(rank(&user_id, ordinal))));
+            assert!(!THREE
+                .iter()
+                .any(|group| starts(group_rank(&user_id, group))));
+            let alone: [u8; 32] = Sha256::digest(user_id.as_bytes()).into();
+            assert!(!starts(alone));
+        }
+    }
+
+    #[test]
+    fn spans_that_divide_a_span_hold_its_accounts_between_them() {
+        assert_eq!(Span::new(5, 4), None);
+        let only = Span::new(7, 7).unwrap();
+        assert!(only.contains(7) && !only.contains(6) && !only.contains(8));
+        let whole = Span::new(0, u32::MAX).unwrap();
+        assert_eq!((whole.first(), whole.last()), (0, u32::MAX));
+        // Both ends belong to a span.
+        let span = Span::new(1_136_083_252, 2_518_581_323).unwrap();
+        assert!(span.holds("사용자 1") && span.holds("user-1") && span.holds("bob"));
+        assert!(!span.holds("alice") && !span.holds("carol"));
+        assert!(!Span::new(1_136_083_253, 2_518_581_322)
+            .unwrap()
+            .holds("사용자 1"));
+        assert!(!Span::new(1_136_083_253, 2_518_581_322)
+            .unwrap()
+            .holds("user-1"));
+        // Two halves, and the two halves of the lower half: every account is in exactly one
+        // span of a division, and the spans take about their part of the accounts.
+        let lower = Span::new(0, 0x7fff_ffff).unwrap();
+        let upper = Span::new(0x8000_0000, u32::MAX).unwrap();
+        let first = Span::new(0, 0x3fff_ffff).unwrap();
+        let second = Span::new(0x4000_0000, 0x7fff_ffff).unwrap();
+        let (mut in_lower, mut in_first) = (0, 0);
+        for user_id in users(2000) {
+            assert!(whole.holds(&user_id));
+            assert_ne!(lower.holds(&user_id), upper.holds(&user_id), "{user_id}");
+            assert_eq!(
+                lower.holds(&user_id),
+                first.holds(&user_id) || second.holds(&user_id)
+            );
+            assert!(!(first.holds(&user_id) && second.holds(&user_id)));
+            in_lower += usize::from(lower.holds(&user_id));
+            in_first += usize::from(first.holds(&user_id));
+        }
+        assert!((900..=1100).contains(&in_lower), "{in_lower}");
+        assert!((420..=580).contains(&in_first), "{in_first}");
+    }
+
+    #[test]
+    fn a_subset_with_a_span_holds_the_accounts_of_the_span_alone() {
+        let read = |value: Value| Subset::from_value(&value);
+        let without = read(json!({"pods": 3, "pod": 1, "copies": 2})).unwrap();
+        assert_eq!(without.span(), None);
+        let lower = read(json!({"pods": 3, "pod": 1, "copies": 2, "span": [0, 2147483647]}));
+        let upper = read(json!({
+            "pods": 3, "pod": 1, "copies": 2, "span": [2147483648u32, 4294967295u32],
+        }));
+        let (lower, upper) = (lower.unwrap(), upper.unwrap());
+        assert_eq!(lower.span(), Span::new(0, 0x7fff_ffff));
+        assert_eq!(lower.placement(), without.placement());
+        let (mut held, mut outside) = (0, 0);
+        for user_id in users(600) {
+            let number = span_number(&user_id);
+            let assigned = without.contains(&user_id);
+            // An account of the span is in the subset when its assignment says so, and an
+            // account outside the span is not, whatever its assignment says.
+            assert_eq!(lower.contains(&user_id), assigned && number <= 0x7fff_ffff);
+            assert_eq!(upper.contains(&user_id), assigned && number > 0x7fff_ffff);
+            held += usize::from(lower.contains(&user_id));
+            outside += usize::from(assigned && !lower.contains(&user_id));
+        }
+        // The pool holds two of three accounts on this node, and the span a half of those.
+        assert!((150..=250).contains(&held), "{held}");
+        assert!((150..=250).contains(&outside), "{outside}");
+        // The whole range of the numbers, and a null, are a pool of every account.
+        let whole = read(json!({"pods": 3, "pod": 1, "copies": 2, "span": [0, 4294967295u32]}));
+        let null = read(json!({"pods": 3, "pod": 1, "copies": 2, "span": null})).unwrap();
+        assert_eq!(null, without);
+        for user_id in users(100) {
+            assert_eq!(
+                whole.as_ref().unwrap().contains(&user_id),
+                without.contains(&user_id)
+            );
+        }
+        // A span with groups: the same rule.
+        let grouped = json!({
+            "pods": 6, "pod": 4, "copies": 2, "skip": 1,
+            "groups": ["us-west-2a", "us-west-2b", "us-west-2c", "us-west-2a", "us-west-2b", "us-west-2c"],
+        });
+        let mut spanned = grouped.clone();
+        spanned["span"] = json!([1_000_000_000, 3_000_000_000u32]);
+        let (grouped, spanned) = (read(grouped).unwrap(), read(spanned).unwrap());
+        for user_id in users(300) {
+            let number = span_number(&user_id);
+            let inside = (1_000_000_000..=3_000_000_000u32).contains(&number);
+            assert_eq!(
+                spanned.contains(&user_id),
+                inside && grouped.contains(&user_id)
+            );
+        }
+
+        // A span is two integers below 4,294,967,296, the first not above the last.
+        for span in [
+            json!([0, 0]),
+            json!([4294967295u32, 4294967295u32]),
+            json!([5, 6]),
+        ] {
+            let value = json!({"pods": 3, "pod": 1, "copies": 2, "span": span});
+            assert!(read(value.clone()).is_some(), "{value}");
+        }
+        for span in [
+            json!([]),
+            json!([0]),
+            json!([0, 1, 2]),
+            json!([6, 5]),
+            json!([0, 4294967296u64]),
+            json!([-1, 5]),
+            json!([0.5, 5]),
+            json!(["0", "5"]),
+            json!([null, 5]),
+            json!({"first": 0, "last": 5}),
+            json!("0-5"),
+            json!(5),
+            json!(true),
+        ] {
+            let value = json!({"pods": 3, "pod": 1, "copies": 2, "span": span});
             assert_eq!(read(value.clone()), None, "{value}");
         }
     }

@@ -1,12 +1,13 @@
 //! The pools of a fleet (protocol.md 10.4): the delegation subset with `groups` and `skip` in
 //! `peer/export`, `peer/import` and `grants/prune`, a pool of nodes of the reserve role that
-//! takes the third group of every account, and a change of the placement of a pool, in which
-//! no account loses a node before its new nodes hold its delegation.
+//! takes the third group of every account, a change of the placement of a pool, in which
+//! no account loses a node before its new nodes hold its delegation, and a fleet of two
+//! pools that divide the accounts by their spans.
 
 use std::collections::BTreeSet;
 
 use credential_enclave_protocol::encoding::b64u;
-use credential_enclave_protocol::subset::Placement;
+use credential_enclave_protocol::subset::{span_number, Placement};
 use serde_json::{json, Value};
 
 use super::quiet_provider;
@@ -367,4 +368,141 @@ async fn a_fleet_takes_a_reserve_pool_and_then_its_groups_and_no_account_loses_a
         placed.extend(of_reserve.iter().map(|ordinal| GROUPS[*ordinal as usize]));
         assert_eq!(placed.len(), 3, "{}", app.user_id);
     }
+}
+
+/// The `subset` object of the node of ordinal `pod` of a pool of two nodes with one node per
+/// account, with the span `span`.
+fn spanned(pod: u32, span: Value) -> Value {
+    json!({"pods": 2, "pod": pod, "copies": 1, "span": span})
+}
+
+#[tokio::test]
+async fn a_fleet_of_two_pools_divides_the_accounts_by_their_spans() {
+    let provider = quiet_provider().await;
+    // One node holds the delegation of every account. The fleet becomes two pools of two
+    // nodes each, with one node per account: the pool of the lower half of the span numbers
+    // and the pool of the upper half.
+    let giving = Harness::new(&provider);
+    let apps = apps(40);
+    for app in &apps {
+        app.grant(&giving).await;
+    }
+    let (lower, upper) = (
+        json!([0, 2147483647]),
+        json!([2147483648u32, 4294967295u32]),
+    );
+    let in_lower = |user_id: &str| span_number(user_id) <= 2_147_483_647;
+    let pool = placement(&json!({"pods": 2, "copies": 1}));
+    assert!(apps.iter().filter(|app| in_lower(&app.user_id)).count() >= 10);
+    assert!(apps.iter().filter(|app| !in_lower(&app.user_id)).count() >= 10);
+
+    // Every node is filled with the subset of its pool: the giving node hands over the
+    // accounts of the span of that pool whose assignment names the node, and no other.
+    let mut nodes = Vec::new();
+    for (span, of_lower) in [(&lower, true), (&upper, false)] {
+        for pod in 0..2u32 {
+            let node = Harness::new(&provider);
+            let (placed, taken) = fill(&giving, &node, &spanned(pod, span.clone())).await;
+            let expected: Vec<String> = apps
+                .iter()
+                .map(|app| app.user_id.clone())
+                .filter(|user_id| in_lower(user_id) == of_lower && pool.holds(user_id, pod))
+                .collect();
+            assert!(!expected.is_empty());
+            assert_eq!((placed, &taken), (expected.len(), &expected), "{pod}");
+            assert_eq!(node.health().await["grants"], expected.len());
+            nodes.push(node);
+        }
+    }
+    // Every account is on one node of the fleet: a node of the pool of its span.
+    for app in &apps {
+        let on = holders(&nodes, &app.user_id).await;
+        let of_lower = in_lower(&app.user_id);
+        let expected = pool.assign(&app.user_id)[0] + if of_lower { 0 } else { 2 };
+        assert_eq!(on, [expected], "{}", app.user_id);
+    }
+
+    // A node that holds the accounts of its assignment of both halves, as a node filled
+    // without a span does: the import with the span of its pool keeps the accounts of that
+    // span alone, and the prune with the span drops the others.
+    let whole = Harness::new(&provider);
+    let (placed, _) = fill(&giving, &whole, &json!({"pods": 2, "pod": 0, "copies": 1})).await;
+    let of_pod: Vec<String> = apps
+        .iter()
+        .map(|app| app.user_id.clone())
+        .filter(|user_id| pool.holds(user_id, 0))
+        .collect();
+    assert_eq!(placed, of_pod.len());
+    let pruned = prune(&whole, &spanned(0, lower.clone())).await;
+    let expected: Vec<String> = of_pod
+        .iter()
+        .filter(|user_id| !in_lower(user_id))
+        .cloned()
+        .collect();
+    assert!(!expected.is_empty());
+    assert_eq!(pruned, expected);
+    for user_id in &of_pod {
+        assert_eq!(holds(&whole, user_id).await, in_lower(user_id), "{user_id}");
+    }
+    assert!(prune(&whole, &spanned(0, lower.clone())).await.is_empty());
+    // An envelope of every account of the assignment, taken with the span of the upper
+    // half: the receiving node keeps the accounts of that half.
+    let receiving = Harness::new(&provider);
+    let (to, from) = (attestation(&receiving).await, attestation(&giving).await);
+    let without = json!({"pods": 2, "pod": 0, "copies": 1});
+    let export = json!({"peer": to, "after": "", "limit": 1000, "subset": without});
+    let (status, page) = giving.post("/v1/peer/export", export).await;
+    assert_eq!(status, 200, "{page}");
+    let import = |subset: Value| {
+        receiving.post(
+            "/v1/peer/import",
+            json!({"peer": from, "envelope": page["envelope"], "subset": subset}),
+        )
+    };
+    let (status, imported) = import(spanned(0, upper.clone())).await;
+    assert_eq!(status, 200, "{imported}");
+    assert_eq!(imported["imported"], expected.len());
+    assert_eq!(imported["accounts"], json!(expected));
+
+    // A span that is not two integers below 4,294,967,296, the first not above the last, is
+    // refused by the three calls: no call computes another share from it, and nothing
+    // changes.
+    let grants = (
+        giving.health().await["grants"].clone(),
+        whole.health().await["grants"].clone(),
+        receiving.health().await["grants"].clone(),
+    );
+    for span in [
+        json!([5, 4]),
+        json!([0]),
+        json!([0, 1, 2]),
+        json!([0, 4294967296u64]),
+        json!([-1, 5]),
+        json!("0-5"),
+        json!({"first": 0, "last": 5}),
+    ] {
+        let refused = (400, "invalid_request");
+        let subset = spanned(0, span);
+        let export = json!({"peer": to, "after": "", "limit": 7, "subset": subset});
+        assert_eq!(
+            code(&giving.post("/v1/peer/export", export).await),
+            refused,
+            "{subset}"
+        );
+        assert_eq!(code(&import(subset.clone()).await), refused, "{subset}");
+        let body = json!({"subset": subset, "after": "", "limit": 1000});
+        assert_eq!(
+            code(&whole.post("/v1/grants/prune", body).await),
+            refused,
+            "{subset}"
+        );
+    }
+    assert_eq!(
+        grants,
+        (
+            giving.health().await["grants"].clone(),
+            whole.health().await["grants"].clone(),
+            receiving.health().await["grants"].clone(),
+        )
+    );
 }

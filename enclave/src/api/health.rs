@@ -33,14 +33,16 @@ use crate::state::Node;
 /// that hold a forward slot, the connections from the backend open now and the ones refused
 /// at accept since the start, the CPU time and the memory of the kernel the node runs in,
 /// read from procfs (`crate::load`), null where the kernel exposes no value, the open
-/// file descriptors of the node process and their limit (`crate::descriptors`), and the faults
+/// file descriptors of the node process and their limit (`crate::descriptors`), the faults
 /// the node contained: the panics of the program since it started and the accounts it halted
-/// (`crate::faults`). `egress` counts
+/// (`crate::faults`), and the kept `refresh` responses the node dropped for the bound of
+/// their sum since it started. `egress` counts
 /// the outbound connections (opened, failed by cause, repeated, being opened, and the requests
 /// that reused an idle connection), `refresh` the token address calls of `refresh` the node
 /// continued after their time limit, by outcome and in progress, and `state` the sizes of the
-/// variable state of the accounts (kept `refresh` responses, merge keys, unconfirmed entries)
-/// and the idle connections the node holds open at the moment of the call, by peer.
+/// variable state of the accounts (kept `refresh` responses and the bytes the node counts for
+/// them, merge keys, unconfirmed entries) and the idle connections the node holds open at the
+/// moment of the call, by peer.
 ///
 /// Every count of the accounts is a count the node keeps with the state it counts
 /// (`crate::state::StateCounters`): the call walks no account, so its time does not grow with
@@ -126,6 +128,7 @@ pub async fn health(State(node): State<Arc<Node>>) -> Response {
             lingering_cut: lingering.map(|(_, cut)| cut),
             contained_panics: faults::panics(),
             halted_accounts: node.halted_accounts(),
+            kept_refreshes_dropped: node.kept_refreshes_dropped(),
         },
         egress: EgressCounts {
             opens: read(&egress.opens),
@@ -154,6 +157,7 @@ pub async fn health(State(node): State<Arc<Node>>) -> Response {
         },
         state: StateCounts {
             kept_refreshes: count(&state.kept_refreshes),
+            kept_refresh_bytes: node.kept_refresh_bytes(),
             merge_keys: count(&state.merge_keys),
             pending_entries: count(&state.pending_entries),
             idle_connections: IdleConnectionCounts {

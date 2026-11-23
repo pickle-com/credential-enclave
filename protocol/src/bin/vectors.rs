@@ -2915,7 +2915,146 @@ fn subset_vectors() -> Value {
             json!({"subset": object, "valid": valid})
         })
         .collect();
-    json!({"cases": cases, "pools": pools, "objects": objects})
+    json!({"cases": cases, "pools": pools, "objects": objects, "spans": span_vectors()})
+}
+
+/// The spans of the delegation subset (protocol.md 10.4): the span number of an account,
+/// `subset` objects with a `span` and whether they hold an account, a fleet of three pools
+/// whose spans divide the numbers, and `span` values with the verdict of their form. The
+/// verdicts are written here by hand, and the generator stops when the library gives another
+/// one.
+fn span_vectors() -> Value {
+    let uuid = "00000000-0000-4000-8000-000000000007";
+    let users = ["user-1", uuid, "alice", "bob", "사용자 1", "carol"];
+    let numbers: Vec<Value> = users
+        .into_iter()
+        .map(|user_id| json!({"user_id": user_id, "number": subset::span_number(user_id)}))
+        .collect();
+
+    // `contains`: whether the node of `pod` holds the account under the object. The first
+    // six pairs are one pool with the lower half and with the upper half of the numbers.
+    let lower = json!([0, 2147483647]);
+    let upper = json!([2147483648u32, 4294967295u32]);
+    let pool = |pod: u32, span: Value| json!({"pods": 3, "pod": pod, "copies": 2, "span": span});
+    let grouped = |span: Value| {
+        json!({
+            "pods": 6, "pod": 2, "copies": 2, "skip": 0, "span": span,
+            "groups": ["us-west-2a", "us-west-2b", "us-west-2c", "us-west-2a", "us-west-2b", "us-west-2c"],
+        })
+    };
+    let contains = [
+        // The assignment of `user-1` among three nodes is {0, 1}, and its number lies in
+        // the upper half.
+        (pool(1, upper.clone()), "user-1", true),
+        (pool(1, lower.clone()), "user-1", false),
+        (pool(2, upper.clone()), "user-1", false),
+        // The number of `bob` lies in the lower half, and its assignment is {1, 0}.
+        (pool(0, lower.clone()), "bob", true),
+        (pool(0, upper.clone()), "bob", false),
+        (pool(2, lower.clone()), "bob", false),
+        // Both ends belong to a span.
+        (
+            pool(1, json!([2518581323u32, 2518581323u32])),
+            "user-1",
+            true,
+        ),
+        (
+            pool(1, json!([2518581324u32, 4294967295u32])),
+            "user-1",
+            false,
+        ),
+        (pool(1, json!([0, 2518581322u32])), "user-1", false),
+        (pool(1, json!([0, 4294967295u32])), "user-1", true),
+        // A pool with groups: the assignment of `user-1` there is the ordinals 2 and 0.
+        (grouped(upper.clone()), "user-1", true),
+        (grouped(lower.clone()), "user-1", false),
+        // An object without the key, and one whose value is null, hold every account of the
+        // assignment.
+        (json!({"pods": 3, "pod": 1, "copies": 2}), "user-1", true),
+        (
+            json!({"pods": 3, "pod": 1, "copies": 2, "span": null}),
+            "user-1",
+            true,
+        ),
+    ];
+    let contains: Vec<Value> = contains
+        .into_iter()
+        .map(|(object, user_id, held)| {
+            let read = subset::Subset::from_value(&object).expect("a subset object");
+            assert_eq!(read.contains(user_id), held, "{object} {user_id}");
+            json!({"subset": object, "user_id": user_id, "contains": held})
+        })
+        .collect();
+
+    // A fleet of three pools whose spans divide the numbers: every account is an account of
+    // exactly one of them.
+    let spans = [
+        ("first", json!([0, 1431655764])),
+        ("second", json!([1431655765, 2863311529u32])),
+        ("third", json!([2863311530u32, 4294967295u32])),
+    ];
+    let pool_of: Vec<Value> = users
+        .into_iter()
+        .map(|user_id| {
+            let holding: Vec<&str> = spans
+                .iter()
+                .filter(|(_, span)| {
+                    let ends = span.as_array().expect("a span of two numbers");
+                    let end = |index: usize| {
+                        u32::try_from(ends[index].as_u64().expect("a number")).expect("a number")
+                    };
+                    subset::Span::new(end(0), end(1))
+                        .expect("a span")
+                        .holds(user_id)
+                })
+                .map(|(name, _)| *name)
+                .collect();
+            assert_eq!(holding.len(), 1, "{user_id}");
+            json!({"user_id": user_id, "pool": holding[0]})
+        })
+        .collect();
+    let fleet: Map<String, Value> = spans
+        .iter()
+        .map(|(name, span)| ((*name).to_string(), span.clone()))
+        .collect();
+
+    let objects = [
+        (json!([0, 0]), true),
+        (json!([0, 4294967295u32]), true),
+        (json!([4294967295u32, 4294967295u32]), true),
+        (json!([1431655765, 2863311529u32]), true),
+        (json!(null), true),
+        (json!([]), false),
+        (json!([0]), false),
+        (json!([0, 1, 2]), false),
+        (json!([6, 5]), false),
+        (json!([0, 4294967296u64]), false),
+        (json!([-1, 5]), false),
+        (json!([0.5, 5]), false),
+        (json!(["0", "5"]), false),
+        (json!([null, 5]), false),
+        (json!({"first": 0, "last": 5}), false),
+        (json!("0-5"), false),
+        (json!(5), false),
+    ];
+    let objects: Vec<Value> = objects
+        .into_iter()
+        .map(|(span, valid)| {
+            let object = json!({"pods": 3, "pod": 1, "copies": 2, "span": span});
+            assert_eq!(
+                subset::Subset::from_value(&object).is_some(),
+                valid,
+                "{object}"
+            );
+            json!({"subset": object, "valid": valid})
+        })
+        .collect();
+    json!({
+        "numbers": numbers,
+        "contains": contains,
+        "fleet": {"pools": fleet, "accounts": pool_of},
+        "objects": objects,
+    })
 }
 
 fn generate() -> String {
@@ -2969,7 +3108,12 @@ fn generate() -> String {
             "their rank. `pools` holds two pools whose nodes run in the same groups, and for ",
             "each account its nodes in both and the three groups those nodes run in. `objects` ",
             "holds `subset` objects of a request: `valid` says whether a node reads the object ",
-            "or answers `invalid_request`."
+            "or answers `invalid_request`. `spans` holds the spans of a `subset`: `numbers` the ",
+            "span number of an account, `contains` `subset` objects with a `user_id` and whether ",
+            "the node of their `pod` holds that account (`contains`), `fleet` three pools whose ",
+            "spans divide the numbers (`pools`) with the pool of each account (`accounts`), and ",
+            "`objects` `subset` objects whose `span` a node reads or answers `invalid_request` ",
+            "for (`valid`)."
         ),
         "key_derivation": key_derivation(),
         "record": record(),

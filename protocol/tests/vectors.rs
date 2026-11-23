@@ -1198,4 +1198,79 @@ fn delegation_subset() {
             .count(),
         11
     );
+
+    // The spans: the number of an account, the accounts a `subset` with a span holds, a fleet
+    // whose spans divide the numbers, and the form of a span.
+    let spans = &vector["spans"];
+    let span_numbers = spans["numbers"].as_array().unwrap();
+    assert_eq!(span_numbers.len(), 6);
+    for account in span_numbers {
+        let user_id = text(account, "user_id");
+        assert_eq!(
+            u64::from(subset::span_number(user_id)),
+            account["number"].as_u64().unwrap(),
+            "{account}"
+        );
+    }
+    assert_eq!(span_numbers[0]["number"], 2_518_581_323u32);
+    let held = spans["contains"].as_array().unwrap();
+    assert_eq!(held.len(), 14);
+    for case in held {
+        let read = subset::Subset::from_value(&case["subset"]).expect("a subset object");
+        let user_id = text(case, "user_id");
+        assert_eq!(
+            read.contains(user_id),
+            case["contains"].as_bool().unwrap(),
+            "{case}"
+        );
+        // An account a subset with a span holds is one its assignment holds.
+        if read.contains(user_id) {
+            assert!(read.placement().holds(user_id, read.pod()), "{case}");
+        }
+    }
+    assert_eq!(
+        held.iter().filter(|case| case["contains"] == true).count(),
+        7
+    );
+    let fleet = &spans["fleet"];
+    let pools = fleet["pools"].as_object().unwrap();
+    assert_eq!(pools.len(), 3);
+    let span_of = |value: &Value| -> subset::Span {
+        let ends = numbers(value);
+        subset::Span::new(ends[0], ends[1]).expect("a span")
+    };
+    // The three spans follow one another from the smallest number to the largest.
+    let mut ordered: Vec<subset::Span> = pools.values().map(span_of).collect();
+    ordered.sort_by_key(subset::Span::first);
+    assert_eq!((ordered[0].first(), ordered[2].last()), (0, u32::MAX));
+    assert_eq!(ordered[0].last() + 1, ordered[1].first());
+    assert_eq!(ordered[1].last() + 1, ordered[2].first());
+    let fleet_accounts = fleet["accounts"].as_array().unwrap();
+    assert_eq!(fleet_accounts.len(), 6);
+    for account in fleet_accounts {
+        let user_id = text(account, "user_id");
+        let holding: Vec<&String> = pools
+            .iter()
+            .filter(|(_, span)| span_of(span).holds(user_id))
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(holding, [text(account, "pool")], "{account}");
+    }
+    let span_objects = spans["objects"].as_array().unwrap();
+    assert_eq!(span_objects.len(), 17);
+    for object in span_objects {
+        let valid = object["valid"].as_bool().unwrap();
+        assert_eq!(
+            subset::Subset::from_value(&object["subset"]).is_some(),
+            valid,
+            "{object}"
+        );
+    }
+    assert_eq!(
+        span_objects
+            .iter()
+            .filter(|object| object["valid"] == true)
+            .count(),
+        5
+    );
 }

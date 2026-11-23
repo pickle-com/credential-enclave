@@ -565,8 +565,8 @@ async fn a_refresh_holds_the_share_of_its_plaintext_and_of_the_token_response() 
         let room = Marks::of(&serde_json::to_vec(&plaintext).unwrap()).value_room();
         (app.record("oauth", "google_workspace", &plaintext), room)
     };
-    assert_eq!(REFRESH_SHARE_BYTES, TOKEN_OBJECT_ROOM_BYTES + 3 * 65_536);
-    assert_eq!(TOKEN_RESPONSE_SHARE_BYTES, 3 * 65_536);
+    assert_eq!(REFRESH_SHARE_BYTES, TOKEN_OBJECT_ROOM_BYTES + 1_048_576);
+    assert_eq!(TOKEN_RESPONSE_SHARE_BYTES, 1_048_576);
 
     // The call waits for the token address. It holds the share of its request, and the
     // share of what it holds while it waits: its parsed plaintext, and the response while
@@ -722,18 +722,35 @@ async fn a_token_response_above_the_bounds_of_a_node_makes_no_record() {
     };
 
     // An exchange. A response within the bounds becomes a record: tokens of 16,384 bytes,
-    // and a long string that is no token.
-    set(json!({"access_token": longest, "refresh_token": longest, "icon": "i".repeat(20_000)}));
+    // a scope of 8,192 bytes, and two strings of 400,000 bytes that are no token. Those
+    // strings are no reason of a failure, and the node does not keep them: the record holds
+    // the tokens and the scope, and the scope is a public field as it is without them.
+    let scope = "s".repeat(8192);
+    let icon = "i".repeat(400_000);
+    set(json!({
+        "access_token": longest, "refresh_token": longest, "scope": scope,
+        "workspace_icon": icon, "owner": {"name": "Ada", "avatar_url": icon},
+    }));
     let state = begun(&harness, &app).await;
     let (status, issued) = harness
         .post("/v1/oauth/complete", complete_body(&app, &state))
         .await;
     assert_eq!(status, 200, "{issued}");
     let record = issued["record"].clone();
+    assert_eq!(
+        app.open(&record)["token"],
+        json!({
+            "access_token": longest, "refresh_token": longest, "scope": scope,
+            "owner": {"name": "Ada"},
+        })
+    );
+    assert_eq!(issued["public"]["token"]["scope"], json!(scope));
+    assert_eq!(held(&harness), 0);
     let entries = harness.last_seq("user-1");
-    // A token of one byte more, a response whose parsed form would take more room than a
-    // token object may take, and a response of more bytes than a node reads: the exchange
-    // fails, and the node creates no record and no entry.
+    // A token of one byte more, a response of more values than a token object may hold, and
+    // a response of more bytes than a node reads (1 MiB): the exchange fails, and the node
+    // creates no record and no entry.
+    let above_the_read = json!({"access_token": "ya29.a", "icon": "i".repeat(1_048_576)});
     for (response, status) in [
         (json!({"access_token": longer}), 200),
         (
@@ -742,10 +759,7 @@ async fn a_token_response_above_the_bounds_of_a_node_makes_no_record() {
         ),
         (json!({"access_token": "ya29.a", "id_token": longer}), 200),
         (of_many_values(400), 200),
-        (
-            json!({"access_token": "ya29.a", "icon": "i".repeat(70_000)}),
-            0,
-        ),
+        (above_the_read.clone(), 0),
     ] {
         set(response);
         let state = begun(&harness, &app).await;
@@ -765,10 +779,7 @@ async fn a_token_response_above_the_bounds_of_a_node_makes_no_record() {
             200,
         ),
         (of_many_values(400), 200),
-        (
-            json!({"access_token": "ya29.a", "icon": "i".repeat(70_000)}),
-            0,
-        ),
+        (above_the_read, 0),
     ] {
         set(response);
         let entries = harness.last_seq("user-1");
@@ -778,21 +789,54 @@ async fn a_token_response_above_the_bounds_of_a_node_makes_no_record() {
         not_taken(&outcome, "refresh_failed", status);
         assert_eq!(harness.last_seq("user-1"), entries + 1);
     }
-    // A response within the bounds whose merge with the token of the record is a plaintext
-    // above them: the record holds 20,000 bytes that are no token, and the response adds
-    // 30,000 under another key.
-    set(json!({"access_token": "ya29.renewed", "other": "o".repeat(30_000)}));
-    let outcome = harness
-        .post("/v1/refresh", refresh_body(&app, &record))
-        .await;
-    not_taken(&outcome, "refresh_failed", 200);
-    // The same record with a response that fits is renewed.
-    set(json!({"access_token": "ya29.renewed", "expires_in": 3599}));
+    // A refresh whose response holds a long string that is no token renews the record, and
+    // the record does not hold that string.
+    set(json!({"access_token": "ya29.renewed", "expires_in": 3599, "workspace_icon": icon}));
     let (status, renewed) = harness
         .post("/v1/refresh", refresh_body(&app, &record))
         .await;
     assert_eq!(status, 200, "{renewed}");
     assert_eq!(renewed["record"]["id"], record["id"]);
+    assert_eq!(
+        app.open(&renewed["record"])["token"],
+        json!({
+            "access_token": "ya29.renewed", "refresh_token": longest, "scope": scope,
+            "owner": {"name": "Ada"}, "expires_in": 3599,
+        })
+    );
+
+    // A response a node takes whose merge with the token of the record is a plaintext above
+    // the bounds of a record: the record of an earlier release holds 40,000 bytes that are
+    // no token, and the response adds four strings of 8,192 bytes under other keys.
+    let earlier = app.record(
+        "oauth",
+        "google_workspace",
+        &json!({
+            "token": {
+                "access_token": "ya29.access", "refresh_token": "1//refresh",
+                "old": "o".repeat(40_000),
+            },
+            "obtained_ms": 1,
+        }),
+    );
+    set(json!({
+        "access_token": "ya29.renewed", "a": scope, "b": scope, "c": scope, "d": scope,
+    }));
+    let outcome = harness
+        .post("/v1/refresh", refresh_body(&app, &earlier))
+        .await;
+    not_taken(&outcome, "refresh_failed", 200);
+    // The same record with a response that fits is renewed, and keeps the string it held.
+    set(json!({"access_token": "ya29.renewed", "expires_in": 3599}));
+    let (status, renewed) = harness
+        .post("/v1/refresh", refresh_body(&app, &earlier))
+        .await;
+    assert_eq!(status, 200, "{renewed}");
+    assert_eq!(renewed["record"]["id"], earlier["id"]);
+    assert_eq!(
+        app.open(&renewed["record"])["token"]["old"],
+        json!("o".repeat(40_000))
+    );
     assert_eq!(held(&harness), 0);
 }
 

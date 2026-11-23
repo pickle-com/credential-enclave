@@ -1,7 +1,7 @@
 //! The state of a node (enclave.md section 3). Everything lives in memory: a node writes
 //! nothing to disk and shares no state with other nodes.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -21,7 +21,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, Semaphore};
 
-use crate::api::responses::Refreshed;
+use crate::api::responses::RefreshedBody;
 use crate::api::ApiError;
 use crate::attest::ForwardNodes;
 use crate::clock::Clock;
@@ -40,6 +40,23 @@ use crate::role::{RoleCell, UsedNonces};
 pub const REFRESH_KEPT_MS: u64 = 3_600 * 1000;
 /// The responses of `refresh` a node keeps per account: the most recent 16.
 pub const REFRESH_KEPT_ENTRIES: usize = 16;
+/// The sum a node keeps `refresh` responses up to, over every account (enclave.md 5.7): the
+/// default of `Limits::kept_refresh_bytes`, 512 MiB of the bytes it counts for them
+/// ([`kept_refresh_bytes`]). Above it the node drops the responses it kept first.
+pub const REFRESH_KEPT_BYTES: usize = 512 * 1024 * 1024;
+/// The bytes a node counts for a kept `refresh` response beside its body and the `user_id`
+/// of its account: its place among the kept responses of its account and in the order of the
+/// node.
+pub const REFRESH_KEPT_ENTRY_BYTES: usize = 384;
+
+/// The bytes a node counts for one kept `refresh` response: the bytes of its body and of the
+/// `user_id` of its account, a quarter more (an allocation is up to a quarter larger than
+/// what it holds, as `crate::room` states), and [`REFRESH_KEPT_ENTRY_BYTES`].
+pub fn kept_refresh_bytes(user_id: &str, body: &RefreshedBody) -> usize {
+    let held = body.bytes().saturating_add(user_id.len());
+    held.saturating_add(held / 4)
+        .saturating_add(REFRESH_KEPT_ENTRY_BYTES)
+}
 /// Time limit of a token address call (enclave.md 6.3): the default of
 /// `Limits::token_timeout`.
 pub const TOKEN_TIMEOUT: Duration = Duration::from_secs(15);
@@ -110,6 +127,9 @@ pub struct Limits {
     /// (protocol.md 7.2). A request beyond it has an event of its own that no later request
     /// shares, so the table of one account has a bounded size whatever the account sends.
     pub merge_keys: usize,
+    /// Sum of the bytes the node counts for its kept `refresh` responses, over every account
+    /// (enclave.md 5.7). Above it the node drops the responses it kept first.
+    pub kept_refresh_bytes: usize,
 }
 
 /// The connections from the backend the node holds open at the same time.
@@ -135,6 +155,7 @@ impl Default for Limits {
             inbound_connections: INBOUND_CONNECTIONS,
             inbound_idle: INBOUND_IDLE,
             merge_keys: limits::MERGE_KEYS,
+            kept_refresh_bytes: REFRESH_KEPT_BYTES,
         }
     }
 }
@@ -487,6 +508,12 @@ pub struct StateCounters {
     pub pending_entries: AtomicUsize,
     /// Kept `refresh` responses, over every account.
     pub kept_refreshes: AtomicUsize,
+    /// The kept `refresh` responses of every account in the order the node kept them, with
+    /// the bytes it counts for each and their sum.
+    pub kept_order: NodeLock<KeptOrder>,
+    /// Kept `refresh` responses the node dropped before their time because the sum of its
+    /// kept responses was above its bound ([`Node::bound_kept_refreshes`]), since it started.
+    pub kept_refreshes_dropped: AtomicU64,
     /// Merge keys, over every account.
     pub merge_keys: AtomicUsize,
     /// Accounts whose open batch holds events.
@@ -516,13 +543,67 @@ fn lower(counter: &AtomicUsize, count: usize) {
     });
 }
 
-/// The response of a successful `refresh`, kept for a repeated call with the same record. It
-/// holds what the response held: a record (ciphertext), public fields and a log entry.
+/// The kept `refresh` responses of a node over every account, in the order the node kept
+/// them: for each its account and the bytes the node counts for it ([`kept_refresh_bytes`]),
+/// and the sum of those bytes (`kept_refresh_bytes` of `state` of health).
+///
+/// An account changes the order under its own lock with every response it keeps and every
+/// response it drops, so the sum is that of the responses the accounts hold. The lock of the
+/// order is taken inside the lock of an account and never around one.
+#[derive(Default)]
+pub struct KeptOrder {
+    /// The serial of the response kept last. A serial is given once.
+    last: u64,
+    /// The sum of the bytes of the responses of `kept`.
+    bytes: usize,
+    /// Serial to the account of the response and the bytes counted for it. The smallest
+    /// serial is the response kept first.
+    kept: BTreeMap<u64, (String, usize)>,
+}
+
+impl KeptOrder {
+    /// Takes in a response of the account `user_id` that counts `bytes`, and returns its
+    /// serial.
+    fn add(&mut self, user_id: &str, bytes: usize) -> u64 {
+        self.last = self.last.saturating_add(1);
+        self.kept.insert(self.last, (user_id.to_string(), bytes));
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.last
+    }
+
+    /// Takes the response with this serial out. Nothing changes when the order holds none.
+    fn remove(&mut self, serial: u64) {
+        if let Some((_, bytes)) = self.kept.remove(&serial) {
+            self.bytes = self.bytes.saturating_sub(bytes);
+        }
+    }
+
+    /// The sum of the bytes of the kept responses.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// The serial and the account of the response kept first, while the sum is above `bound`.
+    fn first_above(&self, bound: usize) -> Option<(u64, String)> {
+        if self.bytes <= bound {
+            return None;
+        }
+        self.kept
+            .first_key_value()
+            .map(|(serial, (user_id, _))| (*serial, user_id.clone()))
+    }
+}
+
+/// The response of a successful `refresh`, kept for a repeated call with the same record: the
+/// body of the response as the node sent it, which holds a record (ciphertext), public fields
+/// and a log entry.
 struct KeptRefresh {
     /// The hash of the `ct` of the record the call sent.
     key: [u8; 32],
     kept_ms: u64,
-    response: Refreshed,
+    /// The serial of the response in the order of the node ([`KeptOrder`]).
+    serial: u64,
+    body: RefreshedBody,
 }
 
 /// The key under which the response of a `refresh` is kept: `SHA-256(the ct of the record that
@@ -564,10 +645,12 @@ pub struct Account {
     /// the keys it has: it gives back the memory of the keys it drops
     /// ([`Account::prune_recent`], [`Account::clear_recent`]).
     recent: HashMap<[u8; 32], Recent>,
-    /// The responses of the successful `refresh` calls of the last 3,600 seconds, at most 16.
-    /// A revoke, an expiry and a grant of another key drop them, and the queue holds no memory
-    /// once the last of them left.
-    kept_refreshes: VecDeque<KeptRefresh>,
+    /// The responses of the successful `refresh` calls of the last 3,600 seconds, at most 16,
+    /// in the order they were kept. A revoke, an expiry and a grant of another key drop them,
+    /// and the bound of the node drops those the node kept first
+    /// ([`Node::bound_kept_refreshes`]). The list holds room for the responses it has and no
+    /// more, and none once the last of them left.
+    kept_refreshes: Vec<KeptRefresh>,
     /// The counts of the node this account is part of.
     counters: Arc<StateCounters>,
     /// The `time_ms` of the last entry of the chain. An entry is never dated before the entry
@@ -602,7 +685,7 @@ impl Account {
             notify: Arc::new(Notify::new()),
             unconfirmed: Vec::new(),
             recent: HashMap::new(),
-            kept_refreshes: VecDeque::new(),
+            kept_refreshes: Vec::new(),
             counters,
             last_entry_ms: 0,
             last_event_ms: 0,
@@ -656,10 +739,14 @@ impl Account {
             &self.counters.merge_keys,
             std::mem::take(&mut self.recent).len(),
         );
-        lower(
-            &self.counters.kept_refreshes,
-            std::mem::take(&mut self.kept_refreshes).len(),
-        );
+        let kept = std::mem::take(&mut self.kept_refreshes);
+        {
+            let mut order = lock(&self.counters.kept_order);
+            for kept in &kept {
+                order.remove(kept.serial);
+            }
+        }
+        lower(&self.counters.kept_refreshes, kept.len());
         self.writer = false;
         self.counters.halted.fetch_add(1, Ordering::Relaxed);
         self.notify.notify_waiters();
@@ -746,44 +833,62 @@ impl Account {
 
     /// The kept response of a `refresh` of the record with this key, when it was kept less
     /// than 3,600 seconds ago.
-    pub fn kept_refresh(&mut self, key: &[u8; 32], now_ms: u64) -> Option<&Refreshed> {
+    pub fn kept_refresh(&mut self, key: &[u8; 32], now_ms: u64) -> Option<&RefreshedBody> {
         self.prune_refreshes(now_ms);
         self.kept_refreshes
             .iter()
             .find(|kept| &kept.key == key)
-            .map(|kept| &kept.response)
+            .map(|kept| &kept.body)
     }
 
     /// Drops the kept `refresh` responses whose 3,600 seconds passed. A `refresh` of the
     /// account drops them on its way, and the sweep of the node drops them for an account
     /// that makes no call.
     pub fn prune_refreshes(&mut self, now_ms: u64) {
-        let before = self.kept_refreshes.len();
-        self.kept_refreshes
-            .retain(|kept| now_ms < kept.kept_ms.saturating_add(REFRESH_KEPT_MS));
-        if self.kept_refreshes.is_empty() && before > 0 {
-            // The queue of an account lives as long as the node: without a response it holds
-            // no memory.
-            self.kept_refreshes = VecDeque::new();
-        }
-        adjust(
-            &self.counters.kept_refreshes,
-            before,
-            self.kept_refreshes.len(),
-        );
+        self.unkeep(|kept| now_ms >= kept.kept_ms.saturating_add(REFRESH_KEPT_MS));
     }
 
-    /// Keeps the response of a successful `refresh` that ran under `grant` and returns true.
-    /// Nothing is kept, and false is returned, when that grant is no longer in force: a revoke
-    /// that was answered while the provider call ran leaves no kept response behind it, also
-    /// when a grant of the same key followed that revoke (the revoke serial of the view is then
-    /// behind the one of the account).
+    /// Drops the kept `refresh` responses that `dropped` names and returns their number. The
+    /// order of the node and its count follow, and the list gives back the room of the
+    /// responses that left: an account lives as long as the node, and without a kept response
+    /// it holds no memory for one.
+    fn unkeep(&mut self, dropped: impl Fn(&KeptRefresh) -> bool) -> usize {
+        if !self.kept_refreshes.iter().any(&dropped) {
+            return 0;
+        }
+        let before = self.kept_refreshes.len();
+        {
+            let mut order = lock(&self.counters.kept_order);
+            self.kept_refreshes.retain(|kept| {
+                let leaves = dropped(kept);
+                if leaves {
+                    order.remove(kept.serial);
+                }
+                !leaves
+            });
+        }
+        self.kept_refreshes.shrink_to_fit();
+        let after = self.kept_refreshes.len();
+        adjust(&self.counters.kept_refreshes, before, after);
+        before.saturating_sub(after)
+    }
+
+    /// Keeps the body of the response of a successful `refresh` that ran under `grant` for
+    /// the account `user_id`, and returns true. Nothing is kept, and false is returned, when
+    /// that grant is no longer in force: a revoke that was answered while the provider call
+    /// ran leaves no kept response behind it, also when a grant of the same key followed that
+    /// revoke (the revoke serial of the view is then behind the one of the account).
+    ///
+    /// The response takes its place in the order of the node. The caller holds the node
+    /// within its bound afterwards, outside the lock of this account
+    /// ([`Node::bound_kept_refreshes`]).
     pub fn keep_refresh(
         &mut self,
         grant: &GrantView,
+        user_id: &str,
         key: [u8; 32],
         now_ms: u64,
-        response: Refreshed,
+        body: RefreshedBody,
     ) -> bool {
         self.expire(now_ms);
         let in_force = self.revoke_serial == grant.revoke_serial
@@ -794,30 +899,37 @@ impl Account {
         if !in_force {
             return false;
         }
-        let before = self.kept_refreshes.len();
-        self.kept_refreshes.retain(|kept| kept.key != key);
+        self.unkeep(|kept| kept.key == key);
+        // The list is in the order of keeping: its first response is the one kept first.
         while self.kept_refreshes.len() >= REFRESH_KEPT_ENTRIES {
-            self.kept_refreshes.pop_front();
+            let first = self.kept_refreshes.first().map(|kept| kept.serial);
+            if self.unkeep(|kept| Some(kept.serial) == first) == 0 {
+                break;
+            }
         }
-        self.kept_refreshes.push_back(KeptRefresh {
+        let serial =
+            lock(&self.counters.kept_order).add(user_id, kept_refresh_bytes(user_id, &body));
+        self.kept_refreshes.reserve_exact(1);
+        self.kept_refreshes.push(KeptRefresh {
             key,
             kept_ms: now_ms,
-            response,
+            serial,
+            body,
         });
-        adjust(
-            &self.counters.kept_refreshes,
-            before,
-            self.kept_refreshes.len(),
-        );
+        self.counters.kept_refreshes.fetch_add(1, Ordering::Relaxed);
         true
     }
 
-    /// Drops the kept `refresh` responses, and the memory of their queue: the delegation they
+    /// Drops the kept `refresh` responses, and the memory of their list: the delegation they
     /// were made under ended.
     pub fn forget_refreshes(&mut self) {
-        let before = self.kept_refreshes.len();
-        self.kept_refreshes = VecDeque::new();
-        adjust(&self.counters.kept_refreshes, before, 0);
+        self.unkeep(|_| true);
+    }
+
+    /// Drops the kept `refresh` response with this serial, for the bound of the node
+    /// ([`Node::bound_kept_refreshes`]). True when the account held it.
+    fn drop_kept_refresh(&mut self, serial: u64) -> bool {
+        self.unkeep(|kept| kept.serial == serial) > 0
     }
 
     /// The event an identical GET request of the last 300 seconds created, when there is one
@@ -1350,6 +1462,44 @@ impl Node {
         self.limits
             .refresh_late_tasks
             .saturating_sub(self.late_refreshes.available_permits())
+    }
+
+    /// Holds the kept `refresh` responses of the node within their bound (enclave.md 5.7).
+    /// While the sum of the bytes the node counts for them is above
+    /// `Limits::kept_refresh_bytes`, the response the node kept first is dropped, whichever
+    /// account holds it, and counted (`kept_refreshes_dropped` of `load` of health). The call
+    /// that kept a response calls this, and holds the lock of no account when it does.
+    pub fn bound_kept_refreshes(&self) {
+        loop {
+            // The lock of the order is given back before the lock of an account is taken.
+            let first = lock(&self.counters.kept_order).first_above(self.limits.kept_refresh_bytes);
+            let Some((serial, user_id)) = first else {
+                return;
+            };
+            let dropped = self
+                .account(&user_id)
+                .is_some_and(|account| lock(&account).drop_kept_refresh(serial));
+            if dropped {
+                self.counters
+                    .kept_refreshes_dropped
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                // No account holds this response any more: its place in the order goes.
+                lock(&self.counters.kept_order).remove(serial);
+            }
+        }
+    }
+
+    /// The bytes the node counts for its kept `refresh` responses at this moment
+    /// (`kept_refresh_bytes` of `state` of health).
+    pub fn kept_refresh_bytes(&self) -> usize {
+        lock(&self.counters.kept_order).bytes()
+    }
+
+    /// The kept `refresh` responses the node dropped for their bound since it started
+    /// (`kept_refreshes_dropped` of `load` of health).
+    pub fn kept_refreshes_dropped(&self) -> u64 {
+        self.counters.kept_refreshes_dropped.load(Ordering::Relaxed)
     }
 
     /// `N` random bytes that may appear in a response: a challenge, the node part of a state,
@@ -2345,20 +2495,36 @@ mod tests {
             index: 0,
             created: true,
         };
+        let body = |sealed: Record| {
+            crate::api::responses::Refreshed {
+                record: sealed,
+                public: crate::oauth::tests::empty_public_fields(),
+                log,
+            }
+            .body()
+        };
+        // Every body of this test has the same length: the bytes the node counts for one.
+        let counted = kept_refresh_bytes("user-1", &body(response(0).1));
+        assert_eq!(
+            counted,
+            (body(response(0).1).bytes() + 6) * 5 / 4 + REFRESH_KEPT_ENTRY_BYTES
+        );
+        let sum = || lock(&counters.kept_order).bytes();
         let keys: Vec<[u8; 32]> = (0..17u8)
             .map(|index| {
                 let (key, sealed) = response(index);
-                let public = crate::oauth::tests::empty_public_fields();
-                account.keep_refresh(
+                assert!(account.keep_refresh(
                     &grant([1; 32]),
+                    "user-1",
                     key,
                     1_000 + u64::from(index),
-                    Refreshed {
-                        record: sealed,
-                        public,
-                        log,
-                    },
-                );
+                    body(sealed),
+                ));
+                // The list of the account holds room for the responses it has and no more,
+                // and the order of the node holds their sum.
+                let kept = usize::from(index + 1).min(REFRESH_KEPT_ENTRIES);
+                assert_eq!(account.rooms().1, kept);
+                assert_eq!(sum(), kept * counted);
                 key
             })
             .collect();
@@ -2368,6 +2534,11 @@ mod tests {
         for key in &keys[1..] {
             assert!(account.kept_refresh(key, 2_000).is_some());
         }
+        // The response of a record that is kept again takes the place of the earlier one.
+        let (key, sealed) = response(5);
+        assert!(account.keep_refresh(&grant([1; 32]), "user-1", key, 1_005, body(sealed)));
+        assert_eq!(counters.kept_refreshes.load(Ordering::Relaxed), 16);
+        assert_eq!(sum(), 16 * counted);
         // A response is kept for 3,600 seconds.
         assert!(account
             .kept_refresh(&keys[1], 1_001 + REFRESH_KEPT_MS - 1)
@@ -2379,23 +2550,17 @@ mod tests {
             .kept_refresh(&keys[16], 1_001 + REFRESH_KEPT_MS)
             .is_some());
         assert_eq!(counters.kept_refreshes.load(Ordering::Relaxed), 15);
+        assert_eq!((account.rooms().1, sum()), (15, 15 * counted));
         // A response of a grant that is no longer in force is not kept.
         let (key, sealed) = response(40);
-        account.keep_refresh(
-            &grant([9; 32]),
-            key,
-            3_000,
-            Refreshed {
-                record: sealed,
-                public: crate::oauth::tests::empty_public_fields(),
-                log,
-            },
-        );
+        assert!(!account.keep_refresh(&grant([9; 32]), "user-1", key, 3_000, body(sealed)));
         assert!(account.kept_refresh(&key, 3_000).is_none());
+        assert_eq!(sum(), 15 * counted);
         // The end of the grant drops what was kept.
         account.expire(10_000_000);
         assert!(account.kept_refresh(&keys[16], 3_000).is_none());
         assert_eq!(counters.kept_refreshes.load(Ordering::Relaxed), 0);
+        assert_eq!((account.rooms().1, sum()), (0, 0));
     }
 
     #[test]

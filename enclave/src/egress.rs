@@ -545,18 +545,39 @@ pub struct Exchange {
 
 impl Exchange {
     /// Reads the response body. `Transfer-Encoding: chunked` is already decoded. A body above
-    /// `limit` bytes is [`EgressError::TooLarge`].
-    pub async fn read_body(mut self, limit: usize) -> Result<Vec<u8>, EgressError> {
+    /// `limit` bytes is [`EgressError::TooLarge`]. The buffer of a body that declares its
+    /// length has room for that length, and the buffer of a body that declares none grows
+    /// with the body.
+    pub async fn read_body(self, limit: usize) -> Result<Vec<u8>, EgressError> {
+        let room = self
+            .content_length
+            .map_or(0, |length| length.min(limit as u64) as usize);
+        self.read_into(limit, room).await
+    }
+
+    /// Reads the response body into a buffer that has room for the whole of it from the
+    /// start: the length of a body whose framing gives one, or `limit` bytes for a body
+    /// without it (a chunked body, or one the close of the connection ends). The length is
+    /// the one the HTTP connection reads the body by, not the text of a header, so no more
+    /// bytes arrive than the buffer has room for: the buffer does not grow, and the body
+    /// holds `limit` bytes at the most while it arrives. A body above `limit` bytes is
+    /// [`EgressError::TooLarge`].
+    pub async fn read_body_within(self, limit: usize) -> Result<Vec<u8>, EgressError> {
+        let room = Body::size_hint(&self.body)
+            .exact()
+            .map_or(limit, |length| length.min(limit as u64) as usize);
+        self.read_into(limit, room).await
+    }
+
+    /// Reads the response body into a buffer with `room` bytes of room at its start.
+    async fn read_into(mut self, limit: usize, room: usize) -> Result<Vec<u8>, EgressError> {
         if self
             .content_length
             .is_some_and(|length| length > limit as u64)
         {
             return Err(EgressError::TooLarge);
         }
-        let capacity = self
-            .content_length
-            .map_or(0, |length| length.min(limit as u64) as usize);
-        let mut collected = Vec::with_capacity(capacity);
+        let mut collected = Vec::with_capacity(room);
         loop {
             let frame =
                 std::future::poll_fn(|context| Pin::new(&mut self.body).poll_frame(context)).await;

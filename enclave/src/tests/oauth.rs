@@ -1744,6 +1744,124 @@ async fn a_revoke_drops_the_kept_refresh_responses() {
     assert_eq!(provider.requests().len(), 4);
 }
 
+/// The kept `refresh` responses of a node as health reports them: their number, the bytes
+/// the node counts for them, and the number it dropped for the bound of their sum.
+async fn kept_counts(harness: &Harness) -> (u64, u64, u64) {
+    let health = harness.health().await;
+    (
+        health["state"]["kept_refreshes"].as_u64().unwrap(),
+        health["state"]["kept_refresh_bytes"].as_u64().unwrap(),
+        health["load"]["kept_refreshes_dropped"].as_u64().unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn a_node_keeps_refresh_responses_up_to_a_sum_and_drops_the_ones_it_kept_first() {
+    // What a node counts for one kept response: the bytes of its body and of the `user_id`
+    // of its account, a quarter more, and 384 bytes.
+    let provider = rotating_provider().await;
+    let measuring = Harness::configured(&provider).await;
+    let app = App::new("user-1", 1);
+    app.grant(&measuring).await;
+    let record = connected(&measuring, &app).await;
+    let request = credential_enclave_protocol::encoding::to_json(
+        &json!({"user_id": "user-1", "record": record, "context": "refresh:scheduled"}),
+    );
+    let call = || measuring.send(axum::http::Method::POST, "/v1/refresh", request.clone());
+    let (status, _, body) = call().await;
+    assert_eq!(status.as_u16(), 200);
+    let one = ((body.len() + "user-1".len()) * 5 / 4 + 384) as u64;
+    assert_eq!(kept_counts(&measuring).await, (1, one, 0));
+    // A repeated call is answered with the bytes of the first response.
+    assert_eq!(call().await.2, body);
+    assert_eq!(provider.requests().len(), 2);
+    // A node keeps 512 MiB of responses.
+    assert_eq!(measuring.node.limits.kept_refresh_bytes, 512 * 1024 * 1024);
+
+    // A node that keeps two such responses and not three, with three accounts.
+    let provider = rotating_provider().await;
+    let harness = Harness::with(
+        &provider,
+        Definitions::embedded(),
+        Limits {
+            kept_refresh_bytes: usize::try_from(2 * one + one / 2).unwrap(),
+            ..Limits::default()
+        },
+    );
+    let (status, _) = harness
+        .post("/v1/config", operator_config(&harness.node.definitions))
+        .await;
+    assert_eq!(status, 200);
+    let apps = [
+        App::new("user-1", 1),
+        App::new("user-2", 2),
+        App::new("user-3", 3),
+    ];
+    let mut records = Vec::new();
+    for app in &apps {
+        app.grant(&harness).await;
+        records.push(connected(&harness, app).await);
+    }
+    assert_eq!(provider.requests().len(), 3);
+
+    // Below the bound every response is kept. The third takes the sum above it: the node
+    // drops the response it kept first, the one of the first account, and counts it.
+    let mut firsts = Vec::new();
+    for (index, expected) in [(1, one, 0), (2, 2 * one, 0), (2, 2 * one, 1)]
+        .into_iter()
+        .enumerate()
+    {
+        let (status, first) = refresh(&harness, &apps[index].user_id, &records[index]).await;
+        assert_eq!(status, 200, "{first}");
+        assert_eq!(
+            kept_counts(&harness).await,
+            expected,
+            "after refresh {index}"
+        );
+        firsts.push(first);
+    }
+    assert_eq!(provider.requests().len(), 6);
+
+    // The two responses the node still keeps answer a repeated call: no provider call.
+    for index in [1, 2] {
+        let again = refresh(&harness, &apps[index].user_id, &records[index]).await;
+        assert_eq!(again, (200, firsts[index].clone()));
+    }
+    assert_eq!(provider.requests().len(), 6);
+
+    // The response that was dropped answers none: the call with the same record calls the
+    // token address once more. Its response is kept, and the node drops the one it kept
+    // first of the rest, the response of the second account.
+    let (status, again) = refresh(&harness, "user-1", &records[0]).await;
+    assert_eq!(status, 200, "{again}");
+    assert_ne!(again["record"]["ct"], firsts[0]["record"]["ct"]);
+    assert_eq!(provider.requests().len(), 7);
+    let (kept, bytes, dropped) = kept_counts(&harness).await;
+    assert_eq!((kept, dropped), (2, 2));
+    assert!(bytes <= 2 * one + one / 2, "{bytes}");
+    assert_eq!(
+        refresh(&harness, "user-3", &records[2]).await,
+        (200, firsts[2].clone())
+    );
+    assert_eq!(refresh(&harness, "user-1", &records[0]).await, (200, again));
+    assert_eq!(provider.requests().len(), 7);
+    let (status, _) = refresh(&harness, "user-2", &records[1]).await;
+    assert_eq!(status, 200);
+    assert_eq!(provider.requests().len(), 8);
+    assert_eq!(kept_counts(&harness).await.2, 3);
+
+    // A response an account drops itself is not one the node dropped for its bound, and the
+    // sum follows it: a revoke takes the kept response of its account out.
+    let (kept, bytes, _) = kept_counts(&harness).await;
+    assert_eq!(kept, 2);
+    apps[0].revoke(&harness).await;
+    let after = kept_counts(&harness).await;
+    assert_eq!((after.0, after.2), (1, 3));
+    assert!(after.1 < bytes && after.1 > 0, "{after:?}");
+    apps[1].revoke(&harness).await;
+    assert_eq!(kept_counts(&harness).await, (0, 0, 3));
+}
+
 #[tokio::test]
 async fn an_imported_record_is_used_like_an_oauth_record_and_stays_imported() {
     let provider = provider(|seen: &Seen| match seen.target.as_str() {

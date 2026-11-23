@@ -1282,8 +1282,8 @@ of another signing key whose first 8 hash bytes are equal would pass that compar
 
 | Situation | Rule |
 | --- | --- |
-| First exchange | `token` = the token response object of the provider |
-| Refresh | `token` = the old `token` with the keys of the response written over it. When the response has no `scope`, the old value stays. When the response has no `expires_in`, that key is removed |
+| First exchange | `token` = what the node keeps of the token response object of the provider (below) |
+| Refresh | `token` = the old `token` with the keys of what the node keeps of the response written over it. When the response has no `scope`, the old value stays. When the response has no `expires_in`, that key is removed |
 | A provider whose token place is nested (`token_container` of the definition, `authed_user` for slack) | The `access_token`, the `refresh_token` and the `expires_in` of the refresh response are written into that place. When the response has no `expires_in`, that key is removed from that place |
 | The merge of a reconnect (`oauth/merge`) | When the new `token` has no `refresh_token`, the `refresh_token` of the old record is moved into it (at the token place). Only the `refresh_token` moves (the `client_id` of a dynamically registered client stays the value of the new record) |
 
@@ -1293,10 +1293,21 @@ not there (the exchange response of slack is nested and its refresh response is 
 response is accepted when `access_token` is at one of the two places. A `scope` of a refresh
 response that is the empty string counts as absent (the old value stays).
 
+What a node keeps of a token response. A node reads at most 1 MiB (1,048,576 bytes) of a
+response. Of the response object it keeps every value but the strings it reads from no token
+object: a member whose value is a string of more than 8,192 bytes is left out unless that
+string is a token (the strings at `access_token`, `refresh_token` and `id_token` of the object,
+at its top level and in the token place of the provider, and the string a provider definition
+injects as the credential), and so are a member whose name is longer than 8,192 bytes and an
+element of an array that is such a string, at every depth. 8,192 bytes is the longest value a
+public field holds (enclave.md 6.4). So a response with a long string that is no token gives a
+record, and that record does not hold the string.
+
 A node takes a token response within the bounds of a token object (section 6) and makes no
-record above them. It reads at most 65,536 bytes of a response. A response whose parsed form
-would take more than 262,144 bytes by the count of section 6, and a response with a token of
-more than 16,384 bytes, is not taken: the call fails as for a response that is no JSON object
+record above them. A response whose parsed form would take more than 1,572,864 bytes by the
+count of section 6 is not parsed. A response with a token of more than 16,384 bytes, and a
+response of which the node would keep more than 262,144 bytes by that count, is not taken. In
+each case the call fails as for a response that is no JSON object
 (`exchange_failed`, `refresh_failed`, with the status of the provider). When the plaintext a
 rule of the table above gives is longer than 65,536 bytes, or its parsed form would take more
 than 262,144 bytes by that count, the node makes no record of it:
@@ -1766,13 +1777,39 @@ their hash.
   whose `groups` hold a name the other pool lacks ranks that name among the others, and the
   positions of the two pools then no longer name different groups.
 
-The `subset` object of a request names the placement of a pool and the ordinal of the node of
-that pool the request is about:
+One placement numbers 1,024 nodes at the most, so the nodes of one role of a larger fleet are
+several pools, and each of those pools holds the accounts of its span, a range of span numbers:
+
+```text
+span_number(user_id) = the first four bytes of SHA-256(UTF-8(user_id) || "\n" || "span"), as an
+                       unsigned integer with the most significant byte first: 0 to 4,294,967,295
+span                 = [first, last] with first <= last
+a span holds user_id when first <= span_number(user_id) <= last
+```
+
+- An account that the span of a pool does not hold has no node in that pool, whatever its
+  assignment there says. A pool without a span holds every account, so the nodes of an account in
+  a pool with a span are its nodes under the placement of that pool, when the span holds it, and
+  none otherwise.
+- Both ends are part of a span. The spans `[first, m]` and `[m + 1, last]` therefore hold every
+  account of `[first, last]`, and no account twice: a pool is divided by dividing its span, and
+  the pools of one role hold every account once when their spans divide the numbers 0 to
+  4,294,967,295 between them.
+- The input of the span number is the input of no other hash of an account: after the line feed,
+  the input of a rank holds decimal digits, that of a group rank a second line feed, and the
+  input of the bucket of an account in a log store (7.6) holds no line feed. The span of an
+  account therefore tells nothing about its nodes in a pool, the order of its groups or its
+  bucket: the accounts of one span spread over the ordinals, the groups and the buckets as the
+  accounts of every span do.
+
+The `subset` object of a request names the placement of a pool, the span of that pool when it
+has one, and the ordinal of the node of that pool the request is about:
 
 ```text
 subset = {"pods": 3, "pod": 1, "copies": 2}
 subset = {"pods": 6, "pod": 4, "copies": 2, "skip": 0,
           "groups": ["us-west-2a", "us-west-2b", "us-west-2c", "us-west-2a", "us-west-2b", "us-west-2c"]}
+subset = {"pods": 3, "pod": 1, "copies": 2, "span": [0, 2147483647]}
 ```
 
 | Key | Value |
@@ -1782,31 +1819,39 @@ subset = {"pods": 6, "pod": 4, "copies": 2, "skip": 0,
 | `copies` | An integer of at least 1. Without `groups`, a `copies` at or above `pods` names every node |
 | `groups` | Optional: an array of exactly `pods` strings, the name of the group of every ordinal. A name is 1 to 63 bytes, each an ASCII letter, a digit, `-`, `_` or `.`, and two names are the same group when their bytes are equal. Absent or `null`: a pool without groups |
 | `skip` | Optional: an integer below 4,294,967,296, absent or `null` for 0. With `groups`, the different names are at least `skip + copies`. Without `groups` its value changes nothing |
+| `span` | Optional: an array of exactly two integers below 4,294,967,296, the first and the last span number of the pool, the first not above the last. Absent or `null`: a pool without a span |
 
 Another value is `invalid_request`, also `groups` with fewer different names than
 `skip + copies`: an account would have fewer nodes than its copies there, or two of them in one
-group. The caller gives such a pool a placement without groups. Keys the object does not define
-are not read. A node does not know its own ordinal or its group: the caller names them. A false
-value from the caller makes a node hold fewer grants, never more: the receiving node of a
-transfer and the node that prunes still verify every other rule.
+group. The caller gives such a pool a placement without groups. A `span` of another form is
+`invalid_request` as well: a node computes no share from a span it does not read, so a prune with
+such a span drops nothing. Keys the object does not define are not read. A node does not know its
+own ordinal, its group or the span of its pool: the caller names them. A false value from the
+caller makes a node hold fewer grants, never more: the receiving node of a transfer and the node
+that prunes still verify every other rule.
+
+The share of a node is the set of the accounts a `subset` selects: those whose assignment under
+the placement contains `pod` and, with a `span`, that the span holds.
 
 A node of a release before v2.4.0 reads the three integers and no other key: for an object with
-`groups` it computes the assignment without groups. A caller therefore sends `groups`, and a
-`skip` that it means, only in calls to nodes of release v2.4.0 or later. An object without
-`groups` selects the same accounts on a node of every release that reads the key `subset`.
+`groups` it computes the assignment without groups, and for an object with a `span` the share of
+a pool without a span. A caller therefore sends `groups`, a `skip` that it means and a `span`
+only in calls to nodes of release v2.4.0 or later. An object without `groups` and without a
+`span` selects the same accounts on a node of every release that reads the key `subset`.
 
 | Call | What `subset` does |
 | --- | --- |
-| `peer/export` (`pod` is the ordinal of the receiving node, and the placement that of its pool) | The page selects the accounts whose assignment contains `pod` alone, and `limit` counts those. Without the key the page selects every account with a grant, as 10.1 states. The giving node can be a node of another pool than the receiving node: it selects by the placement the call names |
-| `peer/import` (`pod` is the ordinal of this node) | A grant of the envelope whose account's assignment does not contain `pod` is left out: not put in place, no entry, not counted in `imported`. Without the key every grant of the envelope is taken. A giving node of a release without this rule hands every account over, and the receiving node keeps its share all the same |
-| `grants/prune` (`pod` is the ordinal of this node; the key is required) | The node walks its accounts in `user_id` order after `after` and drops the grant, within its time or expired, of every account whose assignment does not contain `pod`: the user key is overwritten with zeros and the account has no grant, as at the end of a grant. No entry is created (nothing is used: the operator chose which nodes hold a key). A revocation marker and the chain of the account stay. The response lists the `user_id` of every pruned account and the `user_id` the walk continues after, the empty string when it reached the end (enclave.md 5.15) |
+| `peer/export` (`pod` is the ordinal of the receiving node, and the placement and the span those of its pool) | The page selects the accounts of the share of `pod` alone, and `limit` counts those. Without the key the page selects every account with a grant, as 10.1 states. The giving node can be a node of another pool than the receiving node: it selects by the placement and the span the call names |
+| `peer/import` (`pod` is the ordinal of this node) | A grant of the envelope whose account is outside the share of `pod` is left out: not put in place, no entry, not counted in `imported`. Without the key every grant of the envelope is taken. A giving node of a release without this rule hands every account over, and the receiving node keeps its share all the same |
+| `grants/prune` (`pod` is the ordinal of this node; the key is required) | The node walks its accounts in `user_id` order after `after` and drops the grant, within its time or expired, of every account outside the share of `pod`: the user key is overwritten with zeros and the account has no grant, as at the end of a grant. No entry is created (nothing is used: the operator chose which nodes hold a key). A revocation marker and the chain of the account stay. The response lists the `user_id` of every pruned account and the `user_id` the walk continues after, the empty string when it reached the end (enclave.md 5.15) |
 
 A change of the placement of a pool (a node more or less, a group for every node, another
-`copies`) moves delegations in two steps that the caller orders. First every node whose share
-grows is filled with the subset of the new placement, from the nodes that hold its accounts
+`copies`) or of its span (a pool divided into two, or two pools with adjoining spans made one)
+moves delegations in two steps that the caller orders. First every node whose share grows is
+filled with the subset of the new placement and span, from the nodes that hold its accounts
 (`peer/export` and `peer/import`): a giving node drops nothing. Then the nodes are pruned with
-the subset of the new placement. Between the two steps an account is on its nodes of both
-placements, so no account has fewer nodes than before at any moment.
+the subset of the new placement and span. Between the two steps an account is on its nodes of
+both, so no account has fewer nodes than before at any moment.
 
 Test vectors of the assignment without groups, each as the set of its ordinals; the backend of
 the operator computes the same function:
@@ -1832,8 +1877,22 @@ them (`a`, `b` and `c` stand for `us-west-2a`, `us-west-2b` and `us-west-2c`):
 
 The first two rows are the two pools of one fleet: the account `user-1` has the ordinals 2 and 0
 of the first pool, in the groups c and a, and the ordinal 1 of the second pool, in the group b.
+
+The span numbers of the same accounts, and the one of three pools that holds each when the spans
+of the pools are `[0, 1431655764]`, `[1431655765, 2863311529]` and `[2863311530, 4294967295]`:
+
+| `user_id` | `span_number` | Pool |
+| --- | --- | --- |
+| `user-1` | 2,518,581,323 | The second |
+| `00000000-0000-4000-8000-000000000007` | 2,233,096,642 | The second |
+| `alice` | 4,154,312,765 | The third |
+| `bob` | 1,836,545,875 | The second |
+| `사용자 1` | 1,136,083,252 | The first |
+| `carol` | 3,992,269,495 | The third |
+
 The key `subset` of `protocol/vectors.json` holds these cases and further ones, with the rank
-order of every group, and `subset` objects with the verdict of their form (section 13).
+order of every group, `subset` objects with the verdict of their form, and under `spans` the span
+numbers, shares with a span and `span` values with the verdict of their form (section 13).
 
 ### 10.5 The use of a vault secret in a request
 
@@ -2013,6 +2072,7 @@ redirect. The response passes rule E4 of the egress policy before any part of it
 | Merge window of identical GET requests | 300 seconds |
 | Time a node keeps the response of a successful `refresh` (enclave.md 5.7) | 3,600 seconds |
 | Kept `refresh` responses per account | 16 (the most recent ones) |
+| Sum of the kept `refresh` responses of a node over every account, above which the node drops the ones it kept first (`REFRESH_KEPT_BYTES`, enclave.md 5.7) | 512 MiB of what the node counts for them: for each the bytes of its body and of the `user_id` of its account, a quarter more, and 384 bytes |
 | Longest time a node keeps receiving the response of a token address call of `refresh` after the time limit of the call, counted from the start of the call (`TOKEN_LATE_LIMIT`, enclave.md 5.7) | 120 seconds |
 | Token address calls of `refresh` a node continues after their time limit at once (`REFRESH_LATE_TASKS`) | 128 |
 | Most accounts in one delegation transfer | 1,000 |
@@ -2020,6 +2080,7 @@ redirect. The response passes rule E4 of the egress policy before any part of it
 | Nodes a delegation subset names (`pods`, 10.4) | 1 to 1,024 |
 | Nodes per account of a delegation subset (`copies`, 10.4) | Without `groups`: 1 to `pods` (a larger value names every node). With `groups`: at least 1, and `skip + copies` at most the number of different group names |
 | Longest name of a group of a delegation subset (10.4) | 63 bytes |
+| Span numbers of a delegation subset (`span_number` and the two ends of `span`, 10.4) | 0 to 4,294,967,295 |
 | Most pruned accounts in one page of `grants/prune` (10.4, enclave.md 5.15) | 1,000 |
 | Most accounts one `grants/prune` call looks at (`SCAN_LIMIT`) | 10,000 |
 | Longest release statement (10.3) | 16,384 bytes |
@@ -2058,7 +2119,8 @@ redirect. The response passes rule E4 of the egress policy before any part of it
 | Longest token a node handles (`TOKEN_BYTES`, section 6) | 16,384 bytes |
 | Longest plaintext of a record a node opens or creates, and the longest `ct` of a record (`RECORD_PLAINTEXT_BYTES`, `RECORD_CT_CHARS`, section 6) | 65,536 bytes, 87,403 characters |
 | Most memory the parsed form of a token object may take, by the count of section 6 | 262,144 bytes |
-| Longest response of a token address a node reads (8.3) | 65,536 bytes |
+| Longest response of a token address a node reads, and the most memory its parsed form may take by the count of section 6 (8.3) | 1,048,576 bytes, 1,572,864 bytes |
+| Longest string a node keeps of the response of a token address beside its tokens, and longest name of a member it keeps (8.3) | 8,192 bytes |
 | Hosts in `sites`, slots in `slots` of a record of kind `vault_secret` (section 6) | 1 to 8, 1 to 4 |
 | Longest name of such a record, longest name inside a slot | 64 characters, 64 bytes |
 | Longest `value` that `vault/store` takes, longest plaintext of a record it makes | 12,000 bytes, 12,272 bytes |
@@ -2098,7 +2160,7 @@ name ends with `_text` holds the same value again as UTF-8 text.
 | `sealed_release` | A `release` call that named a key to seal to: `receiver_private` and `seal_to` (the key pair of the caller), `hpke_seed`, `user_id`, `record_id`, `field`, `origin`, `info_text`, `aad_text`, `value_text` and `sealed` | `sealed` opens with `receiver_private` to `value_text`, and does not open under another `aad` |
 | `basic_credentials` | `placeholder_text`, `value_text` and `cases`: values of an `Authorization` header (`authorization_text`) with the `slot` of the half the placeholder is (`basic:user`, `basic:password`, or null for a header a node sends under neither), and `written_text`, the header a node of the forward role writes for the value | The caller of a node tells from a header which of the two slots it is |
 | `header_values` | `placeholder_text`, `refused_schemes` and `cases`: values of the header of a slot `header:<name>` with `valid`, whether a node of the forward role puts the value in the place of the placeholder (10.5) | The same |
-| `subset` | `cases`: a pool of `pods` nodes with `copies` nodes per account, `skip`, and with or without `groups`, each with `assign`, the ordinals that hold the delegation of `user_id` in the order the account takes them; without `groups` also `ranked`, every ordinal in the order of its rank; with `groups` also `group_order`, the groups in the order of the account, and `group_ranked`, the ordinals of each of those groups by their rank. `pools`: the placements of two pools with the same groups (`calls`: `copies` 2, `skip` 0; `reserve`: `copies` 1, `skip` 2) and, for six accounts, the nodes of the account in both and the three groups of those nodes. `objects`: `subset` objects of a request, each with `valid` | A node and the backend of the operator compute `assign` for every case (10.4): the node to select the share of a node, the backend to list the nodes of an account. The nodes of an account in the two pools lie in three different groups. A node reads an object with `valid` true and answers `invalid_request` to one with `valid` false |
+| `subset` | `cases`: a pool of `pods` nodes with `copies` nodes per account, `skip`, and with or without `groups`, each with `assign`, the ordinals that hold the delegation of `user_id` in the order the account takes them; without `groups` also `ranked`, every ordinal in the order of its rank; with `groups` also `group_order`, the groups in the order of the account, and `group_ranked`, the ordinals of each of those groups by their rank. `pools`: the placements of two pools with the same groups (`calls`: `copies` 2, `skip` 0; `reserve`: `copies` 1, `skip` 2) and, for six accounts, the nodes of the account in both and the three groups of those nodes. `objects`: `subset` objects of a request, each with `valid`. `spans`: `numbers`, the `number` of the span of six accounts; `contains`, `subset` objects with and without a `span`, each with a `user_id` and whether the share of `pod` holds that account (`contains`); `fleet`, the spans of three pools that divide the span numbers (`pools`) and the one pool of each of the six accounts (`accounts`); `objects`, `subset` objects with a `span`, each with `valid` | A node and the backend of the operator compute `assign` for every case (10.4): the node to select the share of a node, the backend to list the nodes of an account. The nodes of an account in the two pools lie in three different groups. A node reads an object with `valid` true and answers `invalid_request` to one with `valid` false. Both compute `number` for every account of `spans`, and `contains` from the span and the assignment: the node to select the share of a node of a pool with a span, the backend to name the pool of an account. Every account of `fleet` is in the span of its pool and in no other |
 | `transfer` | The keys of the giving node and of the receiving node, `payload_text`, `signed`, `envelope`, `hpke_seed`, the result that the receiving node opened (`grants`), and `cases`: an envelope with a changed ciphertext (`opens: false`), a transfer signed by another key (`signature_valid: false`), an envelope for another node | A receiving node implementation opens the envelope and obtains the same list of grants (10.1) |
 | `endorsement` | The endorsements of one release statement (`statement_text`, of the release `release`) for a giving node with the release key `release_key_pem` and the table `logs`: a log of the form Rekor v1 (`form` `rekor_v1`, `key_pem`, `log_id`) and a log of the form Rekor v2 (`form` `rekor_v2`, `origin`, `key_pem`, `log_id`). `cases`: `name`, the release of the giving node (`own_release`), its clock in seconds (`now_s`), the `endorsement` in the encodings of 10.3 (not all in b64u: the body of an entry is standard base64 and a hash is hexadecimal), `accepted`, and `check`, the number of the check of 10.3 that fails (null for an accepted one). The cases hold an entry of each form that is accepted and, for each of the checks 1 to 6, entries that fail it. The two ECDSA signatures of the vectors (of the release key over the statement, of the log of the form Rekor v1 over its entry) are constants of the generator | A verifier of an endorsement gives `accepted` on every case and, for a refusal, fails at the check `check`. The script of the operator that makes an endorsement verifies its output with the same rules (10.3) |
 

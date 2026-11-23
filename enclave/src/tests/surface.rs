@@ -55,20 +55,22 @@ async fn health_reports_the_node_in_the_key_order_of_5_1() {
     // two values of the connections that wait for the end of their peer are null: the
     // local platform closes a connection when the node is done with it. The count of the
     // panics is that of the process, which other tests of this program raise. The count of
-    // the halted accounts, and the counts of the outbound connections, of the late token
-    // address calls and of the state of the accounts, end the body.
+    // the halted accounts and of the kept responses the node dropped for their bound, and the
+    // counts of the outbound connections, of the late token address calls and of the state of
+    // the accounts, end the body.
     let (_, faults) = text
         .split_once("\"lingering_connections\":null,\"lingering_cut\":null,\"contained_panics\":")
         .unwrap();
     assert!(faults.starts_with(|first: char| first.is_ascii_digit()));
     let suffix = concat!(
-        ",\"halted_accounts\":0",
+        ",\"halted_accounts\":0,\"kept_refreshes_dropped\":0",
         "},\"egress\":{\"opens\":0,\"open_failures\":{\"transport\":0,\"relay_refused\":0,",
         "\"tls\":0,\"http\":0},\"open_retries\":0,\"open_inflight\":0,",
         "\"idle_reuses\":{\"provider\":0,\"log_store\":0,\"mail\":0}},",
         "\"refresh\":{\"late\":{\"kept\":0,\"dropped\":0,\"failed\":0,\"abandoned\":0},",
         "\"late_inflight\":0},",
-        "\"state\":{\"kept_refreshes\":0,\"merge_keys\":0,\"pending_entries\":0,",
+        "\"state\":{\"kept_refreshes\":0,\"kept_refresh_bytes\":0,\"merge_keys\":0,",
+        "\"pending_entries\":0,",
         "\"idle_connections\":{\"provider\":0,\"log_store\":0,\"mail\":0}}}"
     );
     assert!(text.ends_with(suffix), "{text}");
@@ -148,7 +150,7 @@ async fn health_reports_the_node_in_the_key_order_of_5_1() {
     assert_eq!(
         health["state"],
         json!({
-            "kept_refreshes": 0, "merge_keys": 0, "pending_entries": 0,
+            "kept_refreshes": 0, "kept_refresh_bytes": 0, "merge_keys": 0, "pending_entries": 0,
             "idle_connections": {"provider": 0, "log_store": 0, "mail": 0},
         })
     );

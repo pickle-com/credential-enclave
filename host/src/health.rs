@@ -97,6 +97,10 @@ pub struct NodeHealth {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct StateCounts {
     pub kept_refreshes: u64,
+    /// The bytes the node counts for its kept `refresh` responses. A node of a release
+    /// before v2.4.0 does not say it.
+    #[serde(default)]
+    pub kept_refresh_bytes: Option<u64>,
     pub merge_keys: u64,
     pub pending_entries: u64,
     pub idle_connections: IdleConnections,
@@ -298,6 +302,11 @@ pub struct Load {
     pub contained_panics: Option<u64>,
     #[serde(default)]
     pub halted_accounts: Option<u64>,
+    /// The kept `refresh` responses the node dropped before their time because the sum of its
+    /// kept responses was above its bound, since it started. A node of a release before
+    /// v2.4.0 does not say it.
+    #[serde(default)]
+    pub kept_refreshes_dropped: Option<u64>,
 }
 
 /// Calls `GET /v1/health` of the node. `None` when the connection, the call or the reading of
@@ -524,6 +533,14 @@ fn state_series(text: &mut String, state: &StateCounts) {
         "Kept refresh responses of the enclave node over every account at this moment.",
         format_args!("{}", state.kept_refreshes),
     );
+    if let Some(bytes) = state.kept_refresh_bytes {
+        gauge(
+            text,
+            "credential_enclave_kept_refresh_bytes",
+            "Bytes the enclave node counts for its kept refresh responses over every account at this moment: the sum its bound of kept responses is about.",
+            format_args!("{bytes}"),
+        );
+    }
     gauge(
         text,
         "credential_enclave_merge_keys",
@@ -775,6 +792,14 @@ fn load_series(text: &mut String, load: &Load) {
             "credential_enclave_halted_accounts",
             "Accounts the enclave node halted after a panic under the lock of their state: an account stays halted for as long as the node lives.",
             format_args!("{halted}"),
+        );
+    }
+    if let Some(dropped) = load.kept_refreshes_dropped {
+        counter(
+            text,
+            "credential_enclave_kept_refreshes_dropped_total",
+            "Kept refresh responses the enclave node dropped before their time because the sum of its kept responses was above its bound, since it started.",
+            dropped,
         );
     }
 }
@@ -1445,6 +1470,7 @@ mod tests {
                 }),
                 state: Some(StateCounts {
                     kept_refreshes: 11,
+                    kept_refresh_bytes: None,
                     merge_keys: 22,
                     pending_entries: 33,
                     idle_connections: IdleConnections {
@@ -2272,7 +2298,18 @@ mod tests {
              credential_enclave_contained_panics_total 2\n\
              # HELP credential_enclave_halted_accounts Accounts the enclave node halted after a panic under the lock of their state: an account stays halted for as long as the node lives.\n\
              # TYPE credential_enclave_halted_accounts gauge\n\
-             credential_enclave_halted_accounts 1\n"
+             credential_enclave_halted_accounts 1\n\
+             # HELP credential_enclave_kept_refreshes_dropped_total Kept refresh responses the enclave node dropped before their time because the sum of its kept responses was above its bound, since it started.\n\
+             # TYPE credential_enclave_kept_refreshes_dropped_total counter\n\
+             credential_enclave_kept_refreshes_dropped_total 9\n"
+        ), "{text}");
+        // The bytes the node counts for its kept responses follow their number.
+        assert!(text.contains(
+            "\ncredential_enclave_kept_refreshes 11\n\
+             # HELP credential_enclave_kept_refresh_bytes Bytes the enclave node counts for its kept refresh responses over every account at this moment: the sum its bound of kept responses is about.\n\
+             # TYPE credential_enclave_kept_refresh_bytes gauge\n\
+             credential_enclave_kept_refresh_bytes 45678\n\
+             # HELP credential_enclave_merge_keys "
         ), "{text}");
 
         // The mail reads over a kept session and the kept sessions follow the two other
@@ -2319,6 +2356,15 @@ mod tests {
         );
         assert!(
             !text.contains("credential_enclave_halted_accounts"),
+            "{text}"
+        );
+        // Nor the two values of the bound of its kept responses: such a node has none.
+        assert!(
+            !text.contains("credential_enclave_kept_refreshes_dropped_total"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("credential_enclave_kept_refresh_bytes"),
             "{text}"
         );
     }
