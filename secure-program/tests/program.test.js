@@ -122,6 +122,16 @@ function withhold(fx, ids, field) {
   });
 }
 
+/** The reads held back that the device keeps for the rounds (log.withheld), without the time
+ *  until which the rounds read the first listing pages for the screen (undefined when the device
+ *  keeps nothing but that time, or nothing). */
+function heldReads(world) {
+  const kept = world.stored("log.withheld");
+  if (kept === undefined) return undefined;
+  delete kept.watch_ms;
+  return kept.keys.length + kept.pages.length === 0 && Object.keys(kept).length === 3 ? undefined : kept;
+}
+
 /** The addresses of the listings of node documents the program called at the store. */
 function documentListings(world) {
   return world.sent("S3 ").map((request) => new URL(request.url))
@@ -1164,7 +1174,7 @@ test("A3: the control entry of a node whose document the backend withholds is a 
   assert.equal(world.state.log.store, "verified");
   assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
   assert.equal(world.securityStatuses.slice(-1)[0].status, "ok");
-  assert.equal(world.stored("log.withheld"), undefined);
+  assert.equal(heldReads(world), undefined);
   const after = await S.call(fx, "read_log", { limit: 50 });
   assert.deepEqual(shownGroups(after.value).map((group) => group.kind).sort(), ["connected", "grant_renewed"]);
   assert.ok(shownGroups(after.value).every((group) => group.verified === true));
@@ -1187,7 +1197,7 @@ test("A3: a use entry of a node whose document the backend withholds, which only
   assert.deepEqual(shownGroups(shown.value).map((group) => group.kind), ["unverified", "grant_renewed"]);
   assert.equal(world.state.log.store, "blocked");
   assert.equal(world.state.log.store_failure, "documents:missing");
-  assert.deepEqual(world.stored("log.withheld"), { keys: [used.key], shown: [used.key], pages: [] });
+  assert.deepEqual(heldReads(world), { keys: [used.key], shown: [used.key], pages: [] });
   // The rounds after it ask for that key again, though they read the control entries only: the
   // count of the rounds held back goes on, and the log is marked after three days.
   const states = [];
@@ -1202,7 +1212,7 @@ test("A3: a use entry of a node whose document the backend withholds, which only
   fault.times = 0;
   await nextDay(fx);
   assert.equal(world.state.log.status, "verified");
-  assert.equal(world.stored("log.withheld"), undefined);
+  assert.equal(heldReads(world), undefined);
   assert.ok(askedBodies(world).indexOf(used.key) >= 0);
   const after = await S.call(fx, "read_log", { limit: 50 });
   assert.deepEqual(shownGroups(after.value).map((group) => group.kind), ["request", "grant_renewed"]);
@@ -1258,7 +1268,7 @@ test("a backend that answers the rounds and not the screen shows the user what i
   const first = await onScreen(fx, mode, "read_log", { limit: 50 });
   assert.deepEqual(shownGroups(first.value).map((group) => group.kind), ["unverified", "grant_renewed"]);
   assert.equal(world.state.log.store, "blocked");
-  assert.deepEqual(world.stored("log.withheld"), { keys: [used.key], shown: [used.key], pages: [] });
+  assert.deepEqual(heldReads(world), { keys: [used.key], shown: [used.key], pages: [] });
   assert.equal(world.stored("log.recovered"), undefined);
   // The next round reads that key again, and the backend answers it: nothing is held back, and
   // the count ends. What the round read is kept for the screen, sealed.
@@ -1266,7 +1276,7 @@ test("a backend that answers the rounds and not the screen shows the user what i
   await S.event(fx, "foreground");
   assert.equal(world.state.log.status, "verified");
   assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
-  assert.equal(world.stored("log.withheld"), undefined);
+  assert.equal(heldReads(world), undefined);
   const kept = world.store.get("log.recovered");
   assert.equal(typeof kept, "string");
   assert.equal(kept.indexOf("gmail"), -1);
@@ -1287,7 +1297,7 @@ test("a backend that answers the rounds and not the screen shows the user what i
   assert.equal(second.value.status, "verified");
   assert.equal(world.sent("POST /api/secure/log/documents").length, documents);
   assert.equal(askedBodies(world).filter((key) => key === used.key).length, bodies);
-  assert.equal(world.stored("log.withheld"), undefined);
+  assert.equal(heldReads(world), undefined);
   assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
   // The security record the app draws reads the same.
   const record = await onScreen(fx, mode, "read_security_record", { limit: 50 });
@@ -1316,18 +1326,18 @@ test("the same for an entry of a later page of the screen, and a key that a roun
   const before = world.runtime.log_pages[0].before_ms;
   const page = await onScreen(fx, mode, "read_log_page", { before_ms: before });
   assert.ok(shownGroups(page.value).some((group) => group.kind === "unverified"));
-  assert.deepEqual(world.stored("log.withheld"), { keys: [old.key], shown: [old.key], pages: [] });
+  assert.deepEqual(heldReads(world), { keys: [old.key], shown: [old.key], pages: [] });
   world.advance(2 * 60000);
   await S.event(fx, "foreground");
   assert.equal(world.state.log.status, "verified");
-  assert.equal(world.stored("log.withheld"), undefined);
+  assert.equal(heldReads(world), undefined);
   const bodies = askedBodies(world).filter((key) => key === old.key).length;
   const again = await onScreen(fx, mode, "read_log_page", { before_ms: before });
   const groups = shownGroups(again.value);
   assert.ok(groups.every((group) => group.kind !== "unverified"));
   assert.ok(groups.some((group) => group.kind === "request" && group.action === "delete"));
   assert.equal(askedBodies(world).filter((key) => key === old.key).length, bodies);
-  assert.equal(world.stored("log.withheld"), undefined);
+  assert.equal(heldReads(world), undefined);
   const older = await onScreen(fx, mode, "read_security_record", { limit: 50, before_ms: before });
   assert.ok(older.value.items.some((item) => item.kind === "deleted"));
 
@@ -1340,10 +1350,10 @@ test("the same for an entry of a later page of the screen, and a key that a roun
     status: 200, body: { entries: [], missing: JSON.parse(request.body).keys },
   }), 1);
   await nextDay(own);
-  assert.deepEqual(own.world.stored("log.withheld"), { keys: [written.key], shown: [], pages: [] });
+  assert.deepEqual(heldReads(own.world), { keys: [written.key], shown: [], pages: [] });
   await nextDay(own);
   assert.equal(own.world.state.log.status, "verified");
-  assert.equal(own.world.stored("log.withheld"), undefined);
+  assert.equal(heldReads(own.world), undefined);
   assert.equal(own.world.stored("log.recovered"), undefined);
 });
 
@@ -1376,7 +1386,7 @@ test("A3: a key of the screen that an answer of the bodies ends in front of is a
   assert.deepEqual(shownGroups(first.value).map((group) => group.kind), ["unverified", "unverified", "request", "grant_renewed"]);
   assert.equal(world.state.log.store, "verified");
   assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
-  assert.deepEqual(world.stored("log.withheld"), {
+  assert.deepEqual(heldReads(world), {
     keys: [written[1].key, written[2].key], shown: [written[1].key, written[2].key], pages: [],
   });
   // Every round asks for those keys in front of everything else. An answer that ends in front
@@ -1395,13 +1405,13 @@ test("A3: a key of the screen that an answer of the bodies ends in front of is a
   ending.times = 0;
   await nextDay(fx);
   assert.equal(world.state.log.status, "verified");
-  assert.equal(world.stored("log.withheld"), undefined);
+  assert.equal(heldReads(world), undefined);
   ending.times = Infinity;
   const second = await S.call(fx, "read_log", { limit: 50 });
   const groups = shownGroups(second.value);
   assert.deepEqual(groups.map((group) => group.kind), ["request", "grant_renewed"]);
   assert.equal(groups[0].count, 3);
-  assert.equal(world.stored("log.withheld"), undefined);
+  assert.equal(heldReads(world), undefined);
   assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
 });
 
@@ -1439,13 +1449,13 @@ test("a backend that gives the rounds the listings of the first page and not the
   assert.equal(first.value.status, "pending");
   assert.deepEqual(shownGroups(first.value), []);
   assert.equal(world.state.log.store, "blocked");
-  assert.deepEqual(world.stored("log.withheld"), { keys: [], shown: [], pages: [0] });
+  assert.deepEqual(heldReads(world), { keys: [], shown: [], pages: [0] });
   // The next round reads the two listings as the screen asks for them, and the entries of the
   // page: the count ends, and what it read is kept.
   world.advance(2 * 60000);
   await S.event(fx, "foreground");
   assert.equal(world.state.log.status, "verified");
-  assert.equal(world.stored("log.withheld"), undefined);
+  assert.equal(heldReads(world), undefined);
   const kept = openRecovered(fx);
   assert.deepEqual(kept.pages.map((page) => [page[0], page[2], page[3].length]), [[0, false, 4]]);
   assert.equal(kept.entries.length, 4);
@@ -1458,6 +1468,21 @@ test("a backend that gives the rounds the listings of the first page and not the
   assert.equal(groups[0].count, 3);
   assert.ok(groups.every((group) => group.verified === true));
   assert.equal(world.sent("POST /api/secure/log/bodies").length, bodies);
+  // From the read that was held back on, every round of a synchronization reads those listing
+  // pages for the screen, until the screen reads them itself: an entry written after the round
+  // that followed the read of the screen is on the screen at its next opening.
+  assert.ok(world.stored("log.withheld").watch_ms > world.now + 29 * DAY_MS);
+  world.advance(2 * 60000);
+  await S.event(fx, "foreground");
+  assert.equal(heldReads(world), undefined);
+  world.advance(HOUR_MS);
+  fx.nodes[0].record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/labels", "GET")]);
+  const listings = world.sent("POST /api/secure/log/read").length;
+  await nextDay(fx);
+  assert.deepEqual(JSON.parse(world.sent("POST /api/secure/log/read").slice(-1)[0].body).pages.map((page) => page.prefix), ["c", "u"]);
+  assert.equal(world.sent("POST /api/secure/log/read").length, listings + 2);
+  const watched = await onScreen(fx, mode, "read_log", { limit: 50 });
+  assert.ok(shownGroups(watched.value).some((group) => group.kind === "request" && group.action === "read"));
   // That read of the screen was held back again: the rounds read the page again, and a new entry
   // is on the screen after the round that follows it. The count never passes one.
   for (let day = 0; day < 5; day += 1) {
@@ -1468,7 +1493,7 @@ test("a backend that gives the rounds the listings of the first page and not the
     assert.equal(world.state.log.status, "verified", "day " + day);
     const shown = await onScreen(fx, mode, "read_log", { limit: 50 });
     const requests = shownGroups(shown.value).filter((group) => group.kind === "request");
-    assert.equal(requests.reduce((sum, group) => sum + group.count, 0), 4 + day, "day " + day);
+    assert.equal(requests.reduce((sum, group) => sum + group.count, 0), 5 + day, "day " + day);
     assert.equal(world.state.log.status, "pending", "day " + day);
     assert.equal(world.stored("log.blocked").count, 1, "day " + day);
   }
@@ -1480,6 +1505,10 @@ test("a backend that gives the rounds the listings of the first page and not the
   assert.equal(own.value.status, "verified");
   assert.deepEqual(openRecovered(fx).pages, []);
   assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  assert.equal(world.stored("log.withheld"), undefined);
+  const after = world.sent("POST /api/secure/log/read").length;
+  await nextDay(fx);
+  assert.equal(world.sent("POST /api/secure/log/read").length, after + 1);
 });
 
 test("A3: a later page of the screen that is held back is made from the listing page a round kept for it, and later pages that keep being held back where the rounds kept nothing mark the log after three such reads and three days, whatever the rounds read in between", async () => {
@@ -1511,14 +1540,14 @@ test("A3: a later page of the screen that is held back is made from the listing 
   const before = await open();
   const held = await onScreen(fx, mode, "read_log_page", { before_ms: before });
   assert.deepEqual(held, { ok: false, code: "log_store_unreachable" });
-  assert.deepEqual(world.stored("log.withheld"), { keys: [], shown: [], pages: [before] });
+  assert.deepEqual(heldReads(world), { keys: [], shown: [], pages: [before] });
   assert.equal(world.stored("log.denied").page.count, 1);
   assert.equal(world.stored("log.denied").page.before_ms, before);
   // The round reads that page as the screen asks for it and keeps it.
   world.advance(2 * 60000);
   await S.event(fx, "foreground");
   assert.equal(world.state.log.status, "verified");
-  assert.equal(world.stored("log.withheld"), undefined);
+  assert.equal(heldReads(world), undefined);
   assert.deepEqual(openRecovered(fx).pages.map((page) => [page[0], page[3].length]), [[before, 5]]);
   // The same page again, held back again: it is made from what the round kept, and it does not
   // add to the count.
@@ -1588,7 +1617,7 @@ test("a later page of the screen that fails for the network of the device, or on
   world.advance(HOUR_MS);
   await S.event(fx, "foreground");
   assert.equal(world.state.log.status, "verified");
-  assert.equal(world.stored("log.withheld"), undefined);
+  assert.equal(heldReads(world), undefined);
 
   // The backend answers one request for the listings of a later page with an error.
   const once = S.fixture(source);
@@ -1606,7 +1635,7 @@ test("a later page of the screen that fails for the network of the device, or on
   const retried = await S.call(once, "read_log_page", { before_ms: below });
   assert.equal(retried.ok, true);
   assert.equal(once.world.stored("log.denied"), undefined);
-  assert.equal(once.world.stored("log.withheld"), undefined);
+  assert.equal(heldReads(once.world), undefined);
   for (let day = 0; day < 4; day += 1) {
     await nextDay(once);
     assert.equal(once.world.state.log.status, "verified", "day " + day);
@@ -1631,7 +1660,7 @@ test("an entry of a chain of format 2 whose object the backend gives the rounds 
   // versions it asked for go to the rounds.
   const first = await onScreen(fx, mode, "read_log", { limit: 50 });
   assert.deepEqual(shownGroups(first.value), []);
-  const held = world.stored("log.withheld");
+  const held = heldReads(world);
   assert.deepEqual(Object.keys(held).sort(), ["keys", "objects", "pages", "shown"]);
   assert.equal(held.objects.length, 4);
   assert.ok(held.objects.every((versions) => versions.length === 1 && versions[0][0].startsWith("v1/accounts/" + world.userId + "/" + node.id + "/")));
@@ -1639,7 +1668,7 @@ test("an entry of a chain of format 2 whose object the backend gives the rounds 
   world.advance(2 * 60000);
   await S.event(fx, "foreground");
   assert.equal(world.state.log.status, "verified");
-  assert.equal(world.stored("log.withheld"), undefined);
+  assert.equal(heldReads(world), undefined);
   assert.equal(openRecovered(fx).entries.filter((item) => item[0].startsWith("2:" + node.id + ":")).length, 4);
   // The screen again: the entries are shown with what they say, and no object is asked for.
   const asked = world.sent("POST /api/secure/log/store/objects").length;
@@ -1649,7 +1678,7 @@ test("an entry of a chain of format 2 whose object the backend gives the rounds 
   assert.equal(groups[0].count, 3);
   assert.equal(groups[0].requests[0].target, "gmail.googleapis.com/gmail/v1/users/me/messages/0");
   assert.equal(world.sent("POST /api/secure/log/store/objects").length, asked);
-  assert.equal(world.stored("log.withheld"), undefined);
+  assert.equal(heldReads(world), undefined);
   // A runtime after it has the same.
   await S.start(fx);
   const third = await onScreen(fx, mode, "read_log", { limit: 50 });
@@ -1662,7 +1691,7 @@ test("an entry of a chain of format 2 whose object the backend gives the rounds 
   fault.times = 0;
   world.fault("POST /api/secure/log/store/objects", { status: 503, body: { detail: "log_store_unreachable" } });
   await S.call(fx, "read_log", { limit: 50 });
-  assert.equal(world.stored("log.withheld").objects.length, 1);
+  assert.equal(heldReads(world).objects.length, 1);
   const states = [];
   for (let day = 0; day < 4; day += 1) {
     await nextDay(fx);
@@ -1674,7 +1703,7 @@ test("an entry of a chain of format 2 whose object the backend gives the rounds 
   world.clearFaults();
   await nextDay(fx);
   assert.equal(world.state.log.status, "verified");
-  assert.equal(world.stored("log.withheld"), undefined);
+  assert.equal(heldReads(world), undefined);
 });
 
 test("A3: the listing of a chain of format 2 that is held back from the screen is read again by the rounds for the runtime, and listings of that chain that keep being held back mark the log after three such reads and three days, whatever the rounds read in between", async () => {
@@ -1696,7 +1725,7 @@ test("A3: the listing of a chain of format 2 that is held back from the screen i
   await S.start(fx);
   const first = await onScreen(fx, mode, "read_log", { limit: 50 });
   assert.deepEqual(shownGroups(first.value), []);
-  assert.deepEqual(world.stored("log.withheld").chains, [[node.id, 0, 0]]);
+  assert.deepEqual(heldReads(world).chains, [[node.id, 0, 0]]);
   assert.deepEqual(Object.keys(world.stored("log.denied").chains), [node.id]);
   assert.equal(world.stored("log.denied").chains[node.id].count, 1);
   // The next round lists the chain as the screen asked for it: in this runtime the screen knows
@@ -1704,7 +1733,7 @@ test("A3: the listing of a chain of format 2 that is held back from the screen i
   world.advance(2 * 60000);
   await S.event(fx, "foreground");
   assert.equal(world.state.log.status, "verified");
-  assert.equal(world.stored("log.withheld"), undefined);
+  assert.equal(heldReads(world), undefined);
   const second = await onScreen(fx, mode, "read_log", { limit: 50 });
   assert.equal(shownGroups(second.value)[0].count, 3);
   assert.equal(world.stored("log.denied").chains[node.id].count, 1);
@@ -1751,18 +1780,18 @@ test("the node prefixes of the chains of format 2 that a round listed for the sc
     (mode.screen && JSON.parse(request.body).discovery === true ? { status: 503, body: { detail: "log_store_unreachable" } } : undefined));
   const first = await onScreen(fx, mode, "read_log", { limit: 50 });
   assert.ok(shownGroups(first.value).every((group) => group.kind !== "request"));
-  assert.equal(world.stored("log.withheld").nodes, true);
+  assert.equal(heldReads(world).nodes, true);
   world.advance(2 * 60000);
   await S.event(fx, "foreground");
   assert.equal(world.state.log.status, "verified");
-  assert.equal(world.stored("log.withheld"), undefined);
+  assert.equal(heldReads(world), undefined);
   assert.deepEqual(openRecovered(fx).found.ids.slice().sort(), [fx.legacy[0].id, other.id].sort());
   const second = await onScreen(fx, mode, "read_log", { limit: 50 });
   const requests = shownGroups(second.value).filter((group) => group.kind === "request");
   assert.equal(requests.length, 1);
   assert.equal(requests[0].action, "delete");
   // That read of the screen was held back again, and the rounds make it again.
-  assert.equal(world.stored("log.withheld").nodes, true);
+  assert.equal(heldReads(world).nodes, true);
 });
 
 test("a node whose document the backend hands out is judged without a read of the store, and a document the node registry kept verifies without the nonce of a node document", async () => {
@@ -1839,7 +1868,7 @@ test("an object under a node id the store holds no node document of is no entry:
   assert.equal(world.state.log.status, "verified");
   assert.deepEqual(world.securityStatuses.map((told) => told.status), ["ok", "ok", "ok", "ok", "ok", "ok"]);
   assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
-  assert.equal(world.stored("log.withheld"), undefined);
+  assert.equal(heldReads(world), undefined);
   assert.equal(world.stored("log.nodes")[ghost.id], undefined);
   // The screen leaves both objects out, and asks the store again (the judgement is not kept).
   const shown = await S.call(fx, "read_log", { limit: 50 });
@@ -2128,7 +2157,7 @@ test("a key whose read was held back is asked for before the new keys of a round
   const used = hidden.record("u", [S.providerRequest(world.now)]);
   withhold(fx, [hidden.id], "missing");
   await S.call(fx, "read_log", { limit: 50 });
-  assert.deepEqual(world.stored("log.withheld"), { keys: [used.key], shown: [used.key], pages: [] });
+  assert.deepEqual(heldReads(world), { keys: [used.key], shown: [used.key], pages: [] });
   assert.equal(world.stored("log.blocked").count, 1);
   // 130 objects under 130 node ids no node has, all later than the entry: one round asks for the
   // documents of 128 nodes.
@@ -2165,12 +2194,12 @@ test("a later page of the screen that finds a read held back hands the key to th
   const first = await S.call(fx, "read_log", { limit: 3 });
   assert.equal(first.value.has_more, true);
   assert.equal(world.state.log.store, "verified");
-  assert.equal(world.stored("log.withheld"), undefined);
+  assert.equal(heldReads(world), undefined);
   const before = world.runtime.log_pages[0].before_ms;
   const page = await S.call(fx, "read_log_page", { before_ms: before });
   assert.equal(page.ok, true);
   assert.ok(shownGroups(page.value).some((group) => group.kind === "unverified"));
-  assert.deepEqual(world.stored("log.withheld"), { keys: [old.key], shown: [old.key], pages: [] });
+  assert.deepEqual(heldReads(world), { keys: [old.key], shown: [old.key], pages: [] });
   // The next synchronization runs a round for that key, though the last round completed.
   world.advance(2 * 60000);
   await S.event(fx, "foreground");
@@ -2206,7 +2235,7 @@ test("A3: a listing only the screen reads that is held back is read again by eve
   assert.deepEqual(shownGroups(shown.value), []);
   assert.equal(world.state.log.store, "blocked");
   assert.equal(world.state.log.store_failure, "read:url");
-  assert.deepEqual(world.stored("log.withheld"), { keys: [], shown: [], pages: [0] });
+  assert.deepEqual(heldReads(world), { keys: [], shown: [], pages: [0] });
   // Every round after it asks for the two listings as the screen does.
   const states = [];
   for (let day = 0; day < 3; day += 1) {
@@ -2220,7 +2249,7 @@ test("A3: a listing only the screen reads that is held back is read again by eve
   elsewhere.times = 0;
   await nextDay(fx);
   assert.equal(world.state.log.status, "verified");
-  assert.equal(world.stored("log.withheld"), undefined);
+  assert.equal(heldReads(world), undefined);
   assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
 
   // An environment without a store of format 3, on a device that knows of none: a read of the
@@ -2230,12 +2259,12 @@ test("A3: a listing only the screen reads that is held back is read again by eve
   await S.start(closed);
   closed.world.fault("POST /api/secure/log/read", { status: 503, body: { detail: "log_store_unreachable" } }, 1);
   await S.call(closed, "read_log", { limit: 50 });
-  assert.deepEqual(closed.world.stored("log.withheld"), { keys: [], shown: [], pages: [0] });
+  assert.deepEqual(heldReads(closed.world), { keys: [], shown: [], pages: [0] });
   for (let day = 0; day < 4; day += 1) {
     await nextDay(closed);
     assert.equal(closed.world.state.log.status, "verified", "day " + day);
   }
-  assert.equal(closed.world.stored("log.withheld"), undefined);
+  assert.equal(heldReads(closed.world), undefined);
   assert.deepEqual(closed.world.stored("log.blocked"), { first_ms: 0, count: 0 });
 
   // A later page: the backend answers the request for the listings below a time with an error,
@@ -2254,7 +2283,7 @@ test("A3: a listing only the screen reads that is held back is read again by eve
       (JSON.parse(request.body).pages.some((page) => page.key_marker !== "") ? answer : undefined));
     const page = await S.call(later, "read_log_page", { before_ms: before });
     assert.deepEqual(page, { ok: false, code: "log_store_unreachable" });
-    assert.deepEqual(later.world.stored("log.withheld"), { keys: [], shown: [], pages: [before] });
+    assert.deepEqual(heldReads(later.world), { keys: [], shown: [], pages: [before] });
     later.world.advance(2 * 60000);
     await S.event(later, "foreground");
     assert.equal(later.world.state.log.store, "blocked", JSON.stringify(answer));
@@ -2263,7 +2292,7 @@ test("A3: a listing only the screen reads that is held back is read again by eve
     later.world.advance(2 * 60000);
     await S.event(later, "foreground");
     assert.equal(later.world.state.log.status, "verified");
-    assert.equal(later.world.stored("log.withheld"), undefined);
+    assert.equal(heldReads(later.world), undefined);
   }
 });
 
@@ -3105,14 +3134,14 @@ test("an answer of the bodies that reports keys as unread is read as an answer t
   assert.equal(world.state.log.status, "pending");
   assert.equal(world.state.log.store, "verified");
   assert.equal(world.stored("log.blocked").count, 0);
-  assert.equal(world.stored("log.withheld"), undefined);
+  assert.equal(heldReads(world), undefined);
   // Every key of the next request is unread: its first key is held back.
   answerUntil(0);
   await nextDay(fx);
   assert.deepEqual(asked(), [written[1].key, written[2].key]);
   assert.equal(world.state.log.store, "blocked");
   assert.equal(world.state.log.store_failure, "bodies:skipped");
-  assert.deepEqual(world.stored("log.withheld"), { keys: [written[1].key], shown: [], pages: [] });
+  assert.deepEqual(heldReads(world), { keys: [written[1].key], shown: [], pages: [] });
   // An unread key in front of a key the answer names.
   world.clearFaults();
   world.fault("POST /api/secure/log/bodies", (request) => {
@@ -3129,7 +3158,7 @@ test("an answer of the bodies that reports keys as unread is read as an answer t
   world.clearFaults();
   await nextDay(fx);
   assert.equal(world.state.log.status, "verified");
-  assert.equal(world.stored("log.withheld"), undefined);
+  assert.equal(heldReads(world), undefined);
 });
 
 // ---- An entry of the screen whose object was not read ----

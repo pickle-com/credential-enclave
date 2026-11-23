@@ -202,6 +202,9 @@
   // of entries, and the listing pages of the screen.
   const LOG_WITHHELD_KEYS = 32;
   const LOG_WITHHELD_PAGES = 2;
+  // The time the rounds go on reading the listing pages that begin the two listings for the
+  // screen after that read was held back from the screen, unless the screen makes it sooner.
+  const LOG_WATCH_MS = 30 * DAY_MS;
   // What the rounds read of the reads of the log screen that were held back, kept for the screen
   // (log.recovered): the entries kept at most, the events of those entries at most (an entry
   // holds LOG_ENTRY_EVENTS at most, so one entry is always kept), and the characters kept of one
@@ -3439,7 +3442,10 @@
    *  for under one seq of one chain (LOG_WITHHELD_OBJECTS at most); chains are the listings of
    *  chains that were held back, each [node, after, below] (the seq the listing began after, and
    *  the seq it was read below, 0 for none; LOG_WITHHELD_CHAINS at most); nodes says that the
-   *  node discovery listing was held back. */
+   *  node discovery listing was held back. watch_ms is the time until which every round of a
+   *  synchronization reads the listing pages that begin the two listings for the screen (0: no
+   *  such time): from the read of the screen that was held back to LOG_WATCH_MS after it, or to
+   *  the read the screen makes itself. */
   function loadWithheld() {
     const kept = storedObject(STORE_WITHHELD);
     const keys = (Array.isArray(kept.keys) ? kept.keys : []).filter(function (key) {
@@ -3466,6 +3472,7 @@
           Number.isSafeInteger(chain[1]) && chain[1] >= 0 && Number.isSafeInteger(chain[2]) && chain[2] >= 0;
       }).slice(0, LOG_WITHHELD_CHAINS),
       nodes: kept.nodes === true,
+      watch_ms: whole(kept.watch_ms) > native.nowMs() ? whole(kept.watch_ms) : 0,
     };
   }
 
@@ -3483,6 +3490,12 @@
    *  of the same kind makes it. */
   function heldKind(failure) {
     return isStoreFailure(failure) && (failure.kind === "blocked" || failure.kind === "silent");
+  }
+
+  /** Whether the withheld reads hold a read the rounds have still to make again (the page the
+   *  rounds watch for the screen alone is none: it is read when a round runs). */
+  function withheldDue(held) {
+    return held.keys.length > 0 || held.pages.length > 0 || held.objects.length > 0 || held.chains.length > 0 || held.nodes;
   }
 
   /** The name of an entry of a chain whose object versions were held back: the node id and the
@@ -3539,6 +3552,9 @@
       chains.push(chain);
     }
     const nodes = (kept.nodes || run.nodesHeld === true) && run.nodesRead !== true;
+    // The time until which the rounds read the first listing pages for the screen: it begins
+    // anew when that read is held back from the screen, and ends when the screen makes it.
+    const watch = run.pageSeen === true ? 0 : run.pageWatch === true ? native.nowMs() + LOG_WATCH_MS : kept.watch_ms;
     // The stored value names the reads of the bucket of format 1 and format 2 only when it holds
     // some.
     const value = function (held) {
@@ -3546,11 +3562,15 @@
       if (held.objects.length > 0) stored.objects = held.objects;
       if (held.chains.length > 0) stored.chains = held.chains;
       if (held.nodes) stored.nodes = true;
+      if (held.watch_ms > 0) stored.watch_ms = held.watch_ms;
       return stored;
     };
-    const next = value({ keys: keys, shown: shown, pages: pages, objects: objects, chains: chains, nodes: nodes });
+    const next = value({
+      keys: keys, shown: shown, pages: pages, objects: objects, chains: chains, nodes: nodes, watch_ms: watch,
+    });
     if (JSON.stringify(next) === JSON.stringify(value(kept))) return;
-    const empty = keys.length === 0 && pages.length === 0 && objects.length === 0 && chains.length === 0 && !nodes;
+    const empty = keys.length === 0 && pages.length === 0 && objects.length === 0 && chains.length === 0 && !nodes &&
+      watch === 0;
     storeJson(STORE_WITHHELD, empty ? null : next);
   }
 
@@ -4269,7 +4289,7 @@
     const now = native.nowMs();
     if (round.v !== VERSION) return true;
     const tried = whole(round.tried_ms);
-    const nominated = native.storeGet(STORE_WITHHELD) !== null;
+    const nominated = withheldDue(loadWithheld());
     if (round.open === true || nominated || (round.last !== "verified" && round.last !== "attention")) {
       return now < tried || now - tried >= LOG_ROUND_RETRY_MS;
     }
@@ -4405,19 +4425,29 @@
           }
           run.blocked = true;
           if (run.detail === "") run.detail = failure.detail.slice(0, 64);
-          if (origin === "screen") run.pagesHeld.add(0);
+          if (origin === "screen") {
+            run.pagesHeld.add(0);
+            run.pageWatch = true;
+          }
           break;
         }
         noteFailure(turn, run, failure);
         // The pages that begin the two listings, which the screen reads and a round of a
-        // synchronization does not: the rounds make that read again.
-        if (origin === "screen" && heldKind(failure)) run.pagesHeld.add(0);
+        // synchronization does not: the rounds make that read again, and go on making it with
+        // every round until the screen reads those pages itself (pageWatch).
+        if (origin === "screen" && heldKind(failure)) {
+          run.pagesHeld.add(0);
+          run.pageWatch = true;
+        }
         break;
       }
       const control = listings[0];
       // The store of format 3 answered: the routes of its bodies and documents exist.
       run.store3 = true;
-      if (origin === "screen") run.pagesRead.add(0);
+      if (origin === "screen") {
+        run.pagesRead.add(0);
+        run.pageSeen = true;
+      }
       if (place.key_marker === "") {
         pages.c = control;
         if (listings.length > 1) pages.u = listings[1];
@@ -4483,14 +4513,22 @@
     // that time (LOG_RECOVERED_PAGE_EVENTS events), and the entries of that page, which the
     // round reads as the screen would. An entry of the page whose read is held back, or that no
     // answer reaches, is a key the rounds ask for again.
-    for (const before of withheld.pages) {
+    // The page that begins the two listings is read with every round of a synchronization from
+    // the time it was held back from the screen until the screen reads it itself
+    // (withheld.watch_ms): the first page the screen falls back on is then as new as the last
+    // round, and not as old as the round after the screen last asked.
+    const again = withheld.pages.slice();
+    if (origin === "sync" && withheld.watch_ms > started && again.indexOf(0) < 0) again.push(0);
+    for (const before of again) {
       if (run.pagesRead.has(before) || run.pagesHeld.has(before)) continue;
       let listings = null;
       try {
         listings = await readListings(turn, screenPages(before));
       } catch (failure) {
         if (isStoreFailure(failure) && failure.kind === "absent" && !run.store3 && turnLeft(turn) > 0) {
+          // No store of format 3, and so no such page: the rounds read it no longer.
           run.pagesRead.add(before);
+          if (before === 0) run.pageSeen = true;
           continue;
         }
         noteFailure(turn, run, heldBack(failure));
