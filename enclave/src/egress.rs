@@ -406,6 +406,33 @@ impl Exchange {
         }
     }
 
+    /// The next part of the response body, for a body that is handed on while it arrives
+    /// (the stream form of `forward`). `Transfer-Encoding: chunked` is already decoded.
+    /// `None` is the end of the body: the connection goes back to the idle connections of its
+    /// account and host when the provider did not close it.
+    pub fn poll_part(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Bytes, EgressError>>> {
+        loop {
+            match std::task::ready!(Pin::new(&mut self.body).poll_frame(context)) {
+                None => {
+                    self.keep_connection();
+                    return Poll::Ready(None);
+                }
+                Some(Err(_)) => return Poll::Ready(Some(Err(EgressError::Unreachable))),
+                Some(Ok(frame)) => {
+                    // A frame that is no data (the trailers of a chunked body) is passed over.
+                    if let Ok(data) = frame.into_data() {
+                        if !data.is_empty() {
+                            return Poll::Ready(Some(Ok(data)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Puts the connection among the idle connections of its account and host, when the
     /// response has ended on an open connection.
     fn keep_connection(&mut self) {

@@ -4,6 +4,15 @@
 //! ```text
 //! frame = meta_len (unsigned 32 bit, big-endian) || meta (UTF-8 JSON, meta_len bytes) || payload
 //! ```
+//!
+//! And the stream, the response body of a `forward` call that asked for one: the head of a
+//! frame, then the body of the provider in parts while it arrives, then an end record.
+//!
+//! ```text
+//! stream = meta_len (unsigned 32 bit, big-endian) || meta (UTF-8 JSON, meta_len bytes) || part* || end
+//! part   = part_len (unsigned 32 bit, big-endian, at least 1) || part_len bytes of the body
+//! end    = 0 (unsigned 32 bit) || end record (UTF-8 JSON, all the rest)
+//! ```
 
 use credential_enclave_protocol::encoding::to_json;
 use credential_enclave_protocol::ProtocolError;
@@ -12,6 +21,30 @@ use serde::Serialize;
 
 /// The content type of a frame.
 pub const CONTENT_TYPE: &str = "application/vnd.pickle.frame";
+
+/// The content type of a stream.
+pub const STREAM_CONTENT_TYPE: &str = "application/vnd.pickle.stream";
+
+/// The most bytes of one part of a stream: a part is a length of four bytes and its bytes.
+pub const STREAM_PART_LIMIT_BYTES: usize = 1024 * 1024;
+
+/// The length prefix of one part of a stream. `None` for a part of no byte (the prefix 0 is
+/// the mark of the end record) and for a part above [`STREAM_PART_LIMIT_BYTES`].
+pub fn stream_part_prefix(part: &[u8]) -> Option<[u8; 4]> {
+    if part.is_empty() || part.len() > STREAM_PART_LIMIT_BYTES {
+        return None;
+    }
+    u32::try_from(part.len()).ok().map(u32::to_be_bytes)
+}
+
+/// The end of a stream: the mark of the end and the end record.
+pub fn encode_stream_end<T: Serialize>(record: &T) -> Vec<u8> {
+    let record = to_json(record);
+    let mut end = Vec::with_capacity(4 + record.len());
+    end.extend_from_slice(&0u32.to_be_bytes());
+    end.extend_from_slice(&record);
+    end
+}
 
 /// Longest `meta` a node reads: 1 MiB. A request meta holds one record, one address and the
 /// request headers.

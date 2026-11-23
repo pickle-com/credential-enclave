@@ -537,6 +537,7 @@ fn missing(key: &str) -> ApiError {
         "url" => "url is missing or invalid",
         "headers" => "headers is missing or invalid",
         "timeout_ms" => "timeout_ms is missing or invalid",
+        "stream" => "stream is missing or invalid",
         "requests" => "requests is missing or invalid: 1 to 100 request objects",
         "body_bytes" => "body_bytes of the requests do not add up to the payload",
         "endpoint" => "endpoint is missing or invalid",

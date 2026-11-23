@@ -95,8 +95,16 @@ async fn the_node_sets_the_credential_and_drops_the_headers_it_owns() {
         ["TE", "trailers"],
         ["Trailer", "x-checksum"],
         ["Expect", "100-continue"],
-        ["Accept", "application/json"],
+        ["Accept", "application/json; charset=UTF-8"],
         ["Accept-Encoding", "gzip"],
+        // The node asks for the whole of a response, in no other character encoding.
+        ["Range", "bytes=0-9"],
+        ["If-Range", "\"etag\""],
+        ["Accept-Charset", "utf-16"],
+        // A name with `_` is the name with `-` for some servers.
+        ["Accept_Encoding", "gzip"],
+        ["Content_Length", "5"],
+        ["If_Range", "\"etag\""],
         ["User-Agent", "python-httpx/0.28"],
         ["X-Goog-Api-Client", "gog/0.38.1"],
         ["X-Upload-Name", "보고서.pdf"],
@@ -397,6 +405,9 @@ async fn a_header_that_overrides_the_method_is_refused() {
         "X-HTTP-Method",
         "X-Method-Override",
         "x-METHOD-override",
+        // A name with `_` is the name with `-` for some servers.
+        "X_HTTP_Method_Override",
+        "x-http_method",
     ] {
         for headers in [
             json!([[name, "DELETE"]]),
@@ -419,10 +430,55 @@ async fn a_header_that_overrides_the_method_is_refused() {
             }
         }
     }
+    // An `Accept` header that names another character encoding than UTF-8 asks the provider
+    // for a body the search of rule E4 cannot read: the call is refused as well.
+    for value in [
+        "text/plain; charset=utf-16",
+        "application/json;CHARSET=\"UTF-16LE\"",
+        "text/html, text/plain;q=0.5;charset = iso-2022-jp",
+        "text/plain; charset=utf-8, text/csv; charset=utf-7",
+        "text/plain; charset=utf-80",
+        "text/plain; charset",
+    ] {
+        assert_eq!(
+            failure(
+                harness
+                    .forward(
+                        meta(&app, &record, "GET", PROFILE, json!([["Accept", value]])),
+                        b""
+                    )
+                    .await
+            ),
+            (403, "not_allowed".to_string()),
+            "{value}"
+        );
+    }
     // Nothing was sent and no entry was created.
     assert!(provider.requests().is_empty());
     assert_eq!(harness.head_seq("user-1"), 1);
     assert_budget_is_free(&harness);
+
+    // An `Accept` header that names UTF-8, in any spelling, is sent as it is.
+    for value in [
+        "application/json",
+        "text/plain; charset=utf-8",
+        "text/plain;charset=\"UTF8\", application/json; q=0.9; Charset=UTF-8",
+    ] {
+        let forwarded = harness
+            .forward(
+                meta(&app, &record, "POST", PROFILE, json!([["Accept", value]])),
+                b"{}",
+            )
+            .await
+            .unwrap();
+        assert_eq!(forwarded.status, 200, "{value}");
+        assert_eq!(
+            provider.requests().last().unwrap().header("accept"),
+            Some(value)
+        );
+    }
+    let provider = quiet_provider_and_log_store().await;
+    let (harness, app, record) = ready(&provider).await;
 
     // A header whose name is not one of the three is a header like any other.
     let headers = json!([["X-HTTP-Method-Overrides", "DELETE"]]);
@@ -1445,5 +1501,338 @@ async fn a_call_that_is_not_admitted_within_the_limit_ends_and_holds_nothing() {
     // A call that is admitted within the time runs as before.
     drop(budget);
     assert_eq!(harness.forward(call(), b"").await.unwrap().status, 200);
+    assert_budget_is_free(&harness);
+}
+
+/// The meta of a call that asks for its response as a stream.
+fn stream_meta(app: &App, record: &Value, method: &str, url: &str) -> Value {
+    let mut request = meta(app, record, method, url, json!([]));
+    request["stream"] = json!(true);
+    request
+}
+
+/// Waits until every place of the forward calls of the node is free: the task of a stream
+/// frees the place of its call after the response body has ended.
+async fn places_are_free(harness: &Harness) {
+    for _ in 0..400 {
+        if harness.node.forward_slots.available_permits() == harness.node.limits.forward_concurrency
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("a place of the forward calls stayed taken");
+}
+
+#[tokio::test]
+async fn a_stream_hands_on_a_body_above_the_body_limit_in_parts() {
+    // The body limit of this node is 64 KiB, and the provider sends 5 MiB: with a declared
+    // length, and as a chunked body.
+    const SMALL: usize = 64 * 1024;
+    const BODY: usize = 5 * 1024 * 1024;
+    let body: Vec<u8> = (0..BODY).map(|index| (index % 251) as u8).collect();
+    let chunked = {
+        let mut response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        for chunk in body.chunks(100_000) {
+            response.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            response.extend_from_slice(chunk);
+            response.extend_from_slice(b"\r\n");
+        }
+        response.extend_from_slice(b"0\r\n\r\n");
+        response
+    };
+    let answers = std::sync::Mutex::new(vec![
+        Reply::with_body(200, &[("content-type", "application/octet-stream")], &body),
+        Reply::Raw(chunked),
+        Reply::with_body(200, &[], &body),
+        Reply::Raw(b"HTTP/1.1 204 No Content\r\n\r\n".to_vec()),
+    ]);
+    let provider = provider_with_log_store(move |_| answers.lock().unwrap().remove(0)).await;
+    let harness = Harness::with(
+        &provider,
+        Definitions::embedded(),
+        Limits {
+            body_bytes: SMALL,
+            ..Limits::default()
+        },
+    );
+    harness.use_log_store().await;
+    let app = App::new("user-1", 1);
+    app.grant(&harness).await;
+    let record = google_record(&app);
+
+    for query in ["n=1", "n=2"] {
+        let request = stream_meta(&app, &record, "POST", &format!("{PROFILE}?{query}"));
+        let streamed = harness.forward_stream(request, b"{}").await.unwrap();
+        assert_eq!(streamed.status, 200);
+        assert_eq!(streamed.end, json!({"complete": true}), "{query}");
+        assert_eq!(streamed.body().len(), BODY, "{query}");
+        assert!(streamed.body() == body, "{query}");
+        assert!(streamed.parts.len() > 1, "{query}");
+        // The head carries the headers of the provider and the place of the event of the
+        // request, as a frame does.
+        let typed = (
+            "content-type".to_string(),
+            "application/octet-stream".to_string(),
+        );
+        assert_eq!(streamed.headers.contains(&typed), query == "n=1");
+        assert_eq!(streamed.log["created"], true);
+    }
+    // The entry of the request was in the store before the request left.
+    assert_eq!(harness.head_seq("user-1"), 3);
+
+    // The same response without `stream` is a frame, and above the body limit.
+    assert_eq!(
+        failure(
+            harness
+                .forward(
+                    meta(&app, &record, "POST", &format!("{PROFILE}?n=3"), json!([])),
+                    b"{}"
+                )
+                .await
+        ),
+        (413, "too_large".to_string())
+    );
+
+    // A response without a body is a stream of no part.
+    let request = stream_meta(&app, &record, "POST", &format!("{PROFILE}?n=4"));
+    let streamed = harness.forward_stream(request, b"{}").await.unwrap();
+    assert_eq!(streamed.status, 204);
+    assert!(streamed.parts.is_empty());
+    assert_eq!(streamed.end, json!({"complete": true}));
+
+    places_are_free(&harness).await;
+    assert_budget_is_free(&harness);
+}
+
+#[tokio::test]
+async fn a_stream_that_reflects_the_credential_is_cut_in_front_of_it() {
+    let token = "ya29.injected";
+    let front = vec![b'x'; 700_000];
+    let mut reflecting = front.clone();
+    reflecting.extend_from_slice(b"{\"echo\":\"Bearer ");
+    reflecting.extend_from_slice(token.as_bytes());
+    reflecting.extend_from_slice(b"\"}");
+    reflecting.extend_from_slice(&vec![b'y'; 300_000]);
+    let hex: String = token.bytes().map(|byte| format!("{byte:02x}")).collect();
+    let escaped: String = hex.bytes().map(|byte| format!("%{byte:02X}")).collect();
+    let mut under_escapes = front.clone();
+    under_escapes.extend_from_slice(escaped.as_bytes());
+    let answers = std::sync::Mutex::new(vec![
+        // The credential in the body, as it is.
+        Reply::with_body(200, &[], &reflecting),
+        // Its hexadecimal form under percent escapes, at the end of the body.
+        Reply::with_body(200, &[], &under_escapes),
+        // The credential in a header: the head is withheld.
+        Reply::with_body(200, &[("x-echo", token)], b"{}"),
+        // A body under a content coding the node cannot search.
+        Reply::with_body(200, &[("content-encoding", "gzip")], b"\x1f\x8b"),
+        Reply::json(200, &json!({"ok": true})),
+    ]);
+    let provider = provider_with_log_store(move |_| answers.lock().unwrap().remove(0)).await;
+    let (harness, app, record) = ready(&provider).await;
+    let call = |query: &str| stream_meta(&app, &record, "POST", &format!("{PROFILE}?{query}"));
+
+    for query in ["n=1", "n=2"] {
+        let streamed = harness.forward_stream(call(query), b"{}").await.unwrap();
+        assert_eq!(streamed.status, 200);
+        assert_eq!(streamed.end["complete"], false, "{query}");
+        assert_eq!(streamed.end["code"], "response_withheld", "{query}");
+        assert_eq!(
+            streamed.end["message"],
+            "the provider response was withheld by the egress policy"
+        );
+        // What was handed on is a front part of the body that ends in front of the
+        // credential.
+        let handed_on = streamed.body();
+        assert!(
+            handed_on.len() <= front.len(),
+            "{query}: {}",
+            handed_on.len()
+        );
+        assert!(handed_on.iter().all(|byte| *byte == b'x'), "{query}");
+    }
+
+    // A head that is withheld is a failure of the call: no stream begins.
+    for query in ["n=3", "n=4"] {
+        let (status, body) = harness
+            .forward_stream(call(query), b"{}")
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (502, Some("response_withheld"))
+        );
+    }
+    // The entries of the four requests are on the chain: the requests went to the provider.
+    assert_eq!(harness.head_seq("user-1"), 5);
+    assert_eq!(provider.requests().len(), 4);
+
+    let streamed = harness.forward_stream(call("n=5"), b"{}").await.unwrap();
+    assert_eq!(streamed.body(), b"{\"ok\":true}");
+    assert_eq!(streamed.end, json!({"complete": true}));
+    places_are_free(&harness).await;
+    assert_budget_is_free(&harness);
+}
+
+#[tokio::test]
+async fn a_stream_ends_with_the_failure_of_a_body_that_does_not_arrive() {
+    let answers = std::sync::Mutex::new(vec![
+        // A body that ends before its declared length: the connection closes.
+        Reply::Raw(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nshort".to_vec()),
+        // A head, and then nothing.
+        Reply::KeepAlive(
+            Duration::ZERO,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\npart".to_vec(),
+        ),
+        // No answer at all.
+        Reply::Hang,
+    ]);
+    let provider = provider_with_log_store(move |_| answers.lock().unwrap().remove(0)).await;
+    let (harness, app, record) = ready(&provider).await;
+    let call = |query: &str| {
+        let mut request = stream_meta(&app, &record, "POST", &format!("{PROFILE}?{query}"));
+        request["timeout_ms"] = json!(1000);
+        request
+    };
+
+    let streamed = harness.forward_stream(call("n=1"), b"{}").await.unwrap();
+    assert_eq!(streamed.end["complete"], false);
+    assert_eq!(streamed.end["code"], "provider_unreachable");
+
+    // The time limit of the call reaches to the end of the body.
+    let started = Instant::now();
+    let streamed = harness.forward_stream(call("n=2"), b"{}").await.unwrap();
+    assert_eq!(streamed.end["complete"], false);
+    assert_eq!(streamed.end["code"], "timeout");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(1000) && elapsed < Duration::from_secs(4),
+        "{elapsed:?}"
+    );
+
+    // Before the head of the provider response the failure is the failure of the call.
+    let (status, body) = harness
+        .forward_stream(call("n=3"), b"{}")
+        .await
+        .err()
+        .unwrap();
+    assert_eq!((status, body["code"].as_str()), (504, Some("timeout")));
+    places_are_free(&harness).await;
+    assert_budget_is_free(&harness);
+}
+
+#[tokio::test]
+async fn a_stream_frees_what_it_holds_at_its_time_limit_whether_or_not_its_caller_reads() {
+    use crate::frame;
+    use axum::body::Body;
+    use axum::extract::Request;
+    use hyper::service::Service;
+    use hyper_util::service::TowerToHyperService;
+
+    // More bytes than the node keeps ready for a caller that does not read.
+    let body = vec![b'z'; 8 * 1024 * 1024];
+    let provider = provider_with_log_store(move |_| Reply::with_body(200, &[], &body)).await;
+    let (harness, app, record) = ready(&provider).await;
+    let mut request = stream_meta(&app, &record, "POST", PROFILE);
+    request["timeout_ms"] = json!(1000);
+    let mut bytes = frame::encode_head(&request);
+    bytes.extend_from_slice(b"{}");
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/forward")
+        .header("content-length", bytes.len())
+        .body(Body::from(bytes))
+        .unwrap();
+    let response = TowerToHyperService::new(crate::api::router(harness.node.clone()))
+        .call(request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let taken = harness.node.limits.forward_concurrency - 1;
+    assert_eq!(harness.node.forward_slots.available_permits(), taken);
+
+    // The caller holds the response and reads nothing of its body. At the time limit of the
+    // call the place of the call is free all the same.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    places_are_free(&harness).await;
+
+    // A caller that reads then gets the parts that were ready and the end record of the time
+    // limit.
+    let received = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let streamed = crate::testing::read_stream(&received);
+    assert_eq!(streamed.end["complete"], false);
+    assert_eq!(streamed.end["code"], "timeout");
+    assert!(streamed.body().len() < 8 * 1024 * 1024);
+
+    // A caller that goes away frees the place at once.
+    let mut request = stream_meta(&app, &record, "POST", &format!("{PROFILE}?n=2"));
+    request["timeout_ms"] = json!(30000);
+    let mut bytes = frame::encode_head(&request);
+    bytes.extend_from_slice(b"{}");
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/forward")
+        .header("content-length", bytes.len())
+        .body(Body::from(bytes))
+        .unwrap();
+    let response = TowerToHyperService::new(crate::api::router(harness.node.clone()))
+        .call(request)
+        .await
+        .unwrap();
+    assert_eq!(harness.node.forward_slots.available_permits(), taken);
+    drop(response);
+    places_are_free(&harness).await;
+    assert_budget_is_free(&harness);
+}
+
+#[tokio::test]
+async fn the_stream_key_and_the_time_limit_of_a_stream_are_checked() {
+    let provider = quiet_provider_and_log_store().await;
+    let (harness, app, record) = ready(&provider).await;
+    let invalid = |outcome: Result<crate::testing::Streamed, (u16, Value)>| {
+        let (status, body) = outcome.err().unwrap();
+        (
+            status,
+            body["code"].as_str().unwrap_or_default().to_string(),
+        )
+    };
+    // `stream` is a boolean.
+    for value in [json!("true"), json!(1), json!([])] {
+        let mut request = stream_meta(&app, &record, "GET", PROFILE);
+        request["stream"] = value;
+        let (status, body) = harness.forward_stream(request, b"").await.err().unwrap();
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (400, Some("invalid_request"))
+        );
+        assert_eq!(body["message"], "stream is missing or invalid");
+    }
+    // The time limit of a stream reaches to 600,000 milliseconds, that of a frame to 120,000.
+    let mut request = stream_meta(&app, &record, "GET", PROFILE);
+    request["timeout_ms"] = json!(600_001);
+    assert_eq!(
+        invalid(harness.forward_stream(request, b"").await),
+        (400, "invalid_request".to_string())
+    );
+    let mut request = stream_meta(&app, &record, "GET", PROFILE);
+    request["timeout_ms"] = json!(600_000);
+    assert!(harness.forward_stream(request, b"").await.is_ok());
+    let mut request = meta(&app, &record, "GET", PROFILE, json!([]));
+    request["timeout_ms"] = json!(120_001);
+    assert_eq!(
+        failure(harness.forward(request, b"").await),
+        (400, "invalid_request".to_string())
+    );
+    // `"stream": false` and `"stream": null` are a frame.
+    for value in [json!(false), Value::Null] {
+        let mut request = meta(&app, &record, "GET", PROFILE, json!([]));
+        request["stream"] = value;
+        assert_eq!(harness.forward(request, b"").await.unwrap().status, 200);
+    }
+    places_are_free(&harness).await;
     assert_budget_is_free(&harness);
 }
