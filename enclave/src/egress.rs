@@ -120,8 +120,8 @@ pub enum EgressError {
     /// The response body is above the limit.
     TooLarge,
     /// The response body is under a coding the node does not remove, so it cannot search it:
-    /// a transfer coding other than `chunked`, a content coding other than `identity`, or an
-    /// instance manipulation.
+    /// a transfer coding other than the one coding `chunked` (another coding, or `chunked`
+    /// more than once), a content coding other than `identity`, or an instance manipulation.
     Coded,
 }
 
@@ -1041,20 +1041,25 @@ impl Exchange {
         let (parts, body) = response.into_parts();
 
         // A node sends no `TE` header, so the one transfer coding a provider may apply is
-        // `chunked`, which the HTTP client removes. A body under another transfer coding
-        // (`gzip, chunked`) would reach the caller still coded and without the header that
-        // says so, and the node could not search it.
-        let coded = parts
-            .headers
-            .get_all(TRANSFER_ENCODING)
-            .iter()
-            .any(|value| {
-                value.to_str().map_or(true, |codings| {
-                    codings
-                        .split(',')
-                        .any(|coding| !coding.trim().eq_ignore_ascii_case("chunked"))
-                })
-            });
+        // `chunked`, once, which the HTTP client removes. A body under another transfer
+        // coding (`gzip, chunked`), or under `chunked` more than once (`chunked, chunked`, in
+        // one header or in two), would reach the caller still coded and without the header
+        // that says so, and the node could not search it: the HTTP client removes one layer
+        // of `chunked` and no other coding.
+        let mut codings = 0usize;
+        let mut chunked_alone = true;
+        for value in parts.headers.get_all(TRANSFER_ENCODING) {
+            match value.to_str() {
+                Ok(listed) => {
+                    for coding in listed.split(',') {
+                        codings += 1;
+                        chunked_alone &= coding.trim().eq_ignore_ascii_case("chunked");
+                    }
+                }
+                Err(_) => chunked_alone = false,
+            }
+        }
+        let coded = !chunked_alone || codings > 1;
         // The same holds, for a response that is handed on, for a body under a content
         // coding (the node asks for `identity`) and for a body under an instance manipulation
         // (RFC 3229: the status 226, the header `IM`), which a caller can ask a server for

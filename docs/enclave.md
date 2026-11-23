@@ -843,7 +843,8 @@ which form it holds. The order of the processing:
    places of the node-wide bound of provider requests in flight (section 8). The node follows no
    redirect (a 3xx response is returned as it is). A response with `Transfer-Encoding: chunked`
    is returned decoded. The node sends no `TE` header, and a response under any other transfer
-   coding fails the check of step 10. The hop-by-hop headers of the response (`connection`,
+   coding, or one that names `chunked` more than once, fails the check of step 10. The
+   hop-by-hop headers of the response (`connection`,
    `keep-alive`, `proxy-authenticate`, `proxy-authorization`, `te`, `trailer`,
    `transfer-encoding`, `upgrade`, and the names that its `Connection` header lists),
    `Set-Cookie` and `Set-Cookie2` are left out.
@@ -851,7 +852,9 @@ which form it holds. The order of the processing:
    a response body above 64 MiB is `too_large`.
 10. The response check (rule E4 of egress-policy.md, `enclave/src/provider_response.rs`). A
     response with a `Content-Encoding` other than `identity`, or with a transfer coding other than
-    `chunked`, fails the check: the node does not hand on a body it cannot search. The two
+    `chunked`, fails the check: the node does not hand on a body it cannot search. So does a
+    response that names the coding `chunked` more than once, in one `Transfer-Encoding` header
+    or in several: the node removes that coding once. The two
     headers are read as they arrived, before the headers that the `Connection` header of the
     response lists are left out (step 8), and a response under an instance manipulation (RFC
     3229: the status 226, or a header `IM`) fails the check as well. A response

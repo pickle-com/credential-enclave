@@ -1278,6 +1278,74 @@ async fn a_response_the_node_cannot_search_or_whose_head_holds_the_value_is_not_
     }
 }
 
+/// `body` under one layer of the transfer coding `chunked`, in chunks of `size` bytes.
+fn chunked_once(body: &[u8], size: usize) -> Vec<u8> {
+    let mut coded = Vec::new();
+    for chunk in body.chunks(size) {
+        coded.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+        coded.extend_from_slice(chunk);
+        coded.extend_from_slice(b"\r\n");
+    }
+    coded.extend_from_slice(b"0\r\n\r\n");
+    coded
+}
+
+#[tokio::test]
+async fn a_body_under_the_chunked_coding_more_than_once_is_not_handed_on() {
+    // A site that states the transfer coding `chunked` twice, in one header or in two, and
+    // sends the value back in a body that is chunked twice. The HTTP client of the node
+    // removes one layer of that coding: what it reads is a body that is still chunked, whose
+    // inner chunks part the value, under no header that says so.
+    for stated in [
+        "chunked, chunked",
+        "chunked,chunked",
+        "Chunked , CHUNKED",
+        "chunked\r\ntransfer-encoding: chunked",
+        "chunked, chunked, chunked",
+    ] {
+        let provider = site(move |seen| {
+            let echoed = seen.header("x-api-key").unwrap_or_default();
+            let inner = chunked_once(format!("{{\"echo\":\"{echoed}\"}}").as_bytes(), 13);
+            let mut reply =
+                format!("HTTP/1.1 200 OK\r\ntransfer-encoding: {stated}\r\n\r\n").into_bytes();
+            reply.extend_from_slice(&chunked_once(&inner, 4096));
+            Reply::Raw(reply)
+        })
+        .await;
+        let forward = forward_node(&provider).await;
+        let request = request_of("GET", "/v1/echo", "", "header:x-api-key", b"");
+        let meta = json!({
+            "envelope": envelope(&forward, &request, VALUE, 1),
+            "headers": [["X-Api-Key", PLACEHOLDER]],
+        });
+        let outcome = forward.vault_send(meta, b"").await;
+        assert_eq!(provider.only().header("x-api-key"), Some(VALUE), "{stated}");
+        assert_eq!(
+            code(&outcome),
+            (502, "response_withheld".to_string()),
+            "{stated}"
+        );
+    }
+
+    // The coding once is the coding the node removes: a body under it is handed on as the
+    // site wrote it.
+    let provider = site(|_| {
+        let mut reply = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: Chunked\r\n\r\n".to_vec();
+        reply.extend_from_slice(&chunked_once(b"{\"ok\":true}", 4));
+        Reply::Raw(reply)
+    })
+    .await;
+    let forward = forward_node(&provider).await;
+    let request = request_of("GET", "/v1/echo", "", "header:x-api-key", b"");
+    let meta = json!({
+        "envelope": envelope(&forward, &request, VALUE, 1),
+        "headers": [["X-Api-Key", PLACEHOLDER]],
+    });
+    let sent = forward.vault_send(meta, b"").await.unwrap();
+    assert_eq!(sent.body(), b"{\"ok\":true}");
+    assert_eq!(sent.end, json!({"complete": true}));
+}
+
 #[tokio::test]
 async fn a_value_a_site_sends_back_in_a_header_that_is_not_utf8_is_not_handed_on() {
     // A value with characters outside ASCII. The site sends it back in a header, beside a
