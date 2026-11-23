@@ -18,18 +18,22 @@
 //!    and the log store of a node of the delegation role, the role and the log store of a
 //!    node of the reserve role, or the role of a node of the forward role (`config`);
 //! 5. reports the state of the node, the life of the enclave and the counts of the two relays
-//!    on TCP 9091, `/healthz`, `/livez` and `/metrics` (`health`);
+//!    on TCP 9091, `/healthz`, `/livez` and `/metrics` (`health`), and keeps the ready mark of
+//!    the pod there: the backend sets it with `POST /ready` once the node of a pod of the
+//!    delegation role or of the reserve role holds what it has to hold, the host program
+//!    sets it itself once the node of a pod of the forward role took its role, and the
+//!    readiness probe of the pod reads it with `/readyz` (`ready`);
 //! 6. watches the enclave with `nitro-cli describe-enclaves` every 10 seconds (`watch`): when
 //!    the enclave ended on its own, it asks the backend to collect what is left, ends the
 //!    enclave and exits with a status that is not 0, so that the container runtime starts it
 //!    again with a new enclave;
 //! 7. on SIGTERM logs the enclaves `nitro-cli` describes and lets the node hand on and finish
-//!    what must not end with it, then ends the enclave (`launch`). It closes the node, so that
-//!    the node begins no further use of a credential. In a pod of the delegation role or of
-//!    the reserve role it then asks the backend to collect the state of the node and waits for
-//!    a time that grows with the delegations of the node (`drain`). In a pod of every role it
-//!    waits for the calls the node is in the middle of and for the connections of their
-//!    callers (`calls`).
+//!    what must not end with it, then ends the enclave (`launch`). From the signal on the pod
+//!    is not ready (`ready`). It closes the node, so that the node begins no further use of a
+//!    credential. In a pod of the delegation role or of the reserve role it then asks the
+//!    backend to collect the state of the node and waits for a time that grows with the
+//!    delegations of the node (`drain`). In a pod of each of the three roles it waits for the
+//!    calls the node is in the middle of and for the connections of their callers (`calls`).
 //!
 //! With the argument `drain` it makes the shutdown collection call of step 7 alone, logs its
 //! outcome and ends with the status 0 whatever the outcome: the pre-stop hook of the pod runs
@@ -44,11 +48,12 @@
 //! `CHARACTER_API_BASE_URL` and the client values of `config`,
 //! `CREDENTIAL_ENCLAVE_LOG_BUCKET` and `CREDENTIAL_ENCLAVE_LOG_REGION` of the log store,
 //! `CREDENTIAL_ENCLAVE_MEMORY_MIB` of `launch`, and `CREDENTIAL_ENCLAVE_DRAIN_URL`,
-//! `CREDENTIAL_ENCLAVE_DRAIN_TOKEN` and `CREDENTIAL_ENCLAVE_POD_NAME` of `drain`. A pod of the
-//! reserve role reads neither the base address nor a client value: its node calls no
-//! provider. A pod of the forward role reads the role and the memory, and none of the
-//! others: its node holds no client value, has no log store and holds no delegation a
-//! shutdown could collect.
+//! `CREDENTIAL_ENCLAVE_DRAIN_TOKEN` and `CREDENTIAL_ENCLAVE_POD_NAME` of `drain`
+//! (`CREDENTIAL_ENCLAVE_DRAIN_TOKEN` is the token of the call that sets the ready mark as
+//! well). A pod of the reserve role reads neither the base address nor a client value: its
+//! node calls no provider. A pod of the forward role reads the role and the memory, and none
+//! of the others: its node holds no client value, has no log store and holds no delegation a
+//! shutdown could collect or a ready mark could wait for.
 
 #![forbid(unsafe_code)]
 // The enclave ends with the host program, and a panic ends a connection or the program
@@ -82,6 +87,7 @@ mod health;
 mod http;
 mod launch;
 mod memory;
+mod ready;
 mod relay;
 #[cfg(test)]
 mod testing;
@@ -100,6 +106,7 @@ use config::{ConfigError, Injection, LogStore, Role};
 use drain::Drain;
 use egress::{Allowlist, EgressCounters, Reach, TcpOutbound};
 use faults::vital;
+use ready::Readiness;
 use relay::{InboundCounters, NodeConnector, VsockListener, VsockNode};
 use watch::EnclaveWatch;
 
@@ -372,6 +379,28 @@ fn drain_of_the_pod() -> Option<Drain> {
     }
 }
 
+/// The ready mark of the pod (`ready`), not set, and one line of the log that says who sets
+/// it. The backend sets the mark of a pod whose node holds delegations, with the token of the
+/// shutdown collection call: a pod without that token is never marked. The host program sets
+/// the mark of a pod of the forward role itself, and such a pod takes no call that sets it.
+fn readiness_of_the_pod(role: Role) -> Readiness {
+    let token = match role {
+        Role::Delegation | Role::Reserve => variable(drain::TOKEN_VARIABLE),
+        Role::Forward => None,
+    };
+    match (role, &token) {
+        (Role::Forward, _) => {
+            log("ready mark: set by the host program once the node took the forward role")
+        }
+        (_, Some(_)) => log("ready mark: set by the backend, once the node holds its delegations"),
+        (_, None) => log(&format!(
+            "ready mark: never set, {} is not set",
+            drain::TOKEN_VARIABLE
+        )),
+    }
+    Readiness::new(token)
+}
+
 /// The setup of a pod of the delegation role: the egress relay connects to the hosts of the
 /// provider definitions and of the log store, the configuration carries the client values of
 /// the operator and the log store, and a shutdown asks the backend to collect the state of the
@@ -487,14 +516,18 @@ async fn run() -> Result<(), String> {
     let counters = Arc::new(EgressCounters::default());
     let inbound_counters = Arc::new(InboundCounters::default());
     let watch = EnclaveWatch::new();
+    let readiness = Arc::new(readiness_of_the_pod(role));
     // The tasks that accept connections serve each connection on a task of its own. The
     // program cannot do without the tasks that accept (`faults::vital`).
     tokio::spawn(vital(health::serve(
         status_listener,
-        node.clone(),
-        counters.clone(),
-        inbound_counters.clone(),
-        watch.clone(),
+        Arc::new(health::Surface {
+            node: node.clone(),
+            counters: counters.clone(),
+            inbound: inbound_counters.clone(),
+            watch: watch.clone(),
+            readiness: readiness.clone(),
+        }),
     )));
     tokio::spawn(vital(egress::serve(
         egress_listener,
@@ -548,6 +581,11 @@ async fn run() -> Result<(), String> {
                     ));
                 }
             }
+            // A node of the forward role holds nothing a backend has to fill it with: the pod
+            // is ready once the node took the role.
+            if role == Role::Forward && readiness.mark() {
+                log("ready: the node took the forward role, the ready mark of the pod is set");
+            }
         }
         (Role::Delegation, Ok(body)) => {
             tokio::spawn(vital(configure(node.clone(), body)));
@@ -576,6 +614,8 @@ async fn run() -> Result<(), String> {
             true
         }
     };
+    // From here on the pod is not ready, whatever its mark: no caller is to choose it.
+    readiness.end();
     // Whether the node was alive at that moment: the enclave object `nitro-cli` describes,
     // or `[]`.
     match tokio::task::spawn_blocking(launch::describe_enclaves).await {
