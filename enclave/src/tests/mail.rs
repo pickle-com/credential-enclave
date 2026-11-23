@@ -14,12 +14,12 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 use super::quiet_provider_and_log_store;
-use crate::frame::{self, META_LIMIT_BYTES};
+use crate::frame;
 use crate::mail;
 use crate::state::Limits;
 use crate::testing::{App, Harness};
 
-const PASSWORD: &str = "naver-secret-marker-2e7c06830e6f";
+pub(super) const PASSWORD: &str = "naver-secret-marker-2e7c06830e6f";
 const MESSAGE: &[u8] = b"From: tester@naver.com\r\nTo: friend@example.com\r\nSubject: a test\r\nMessage-ID: <one@pickle.com>\r\n\r\nhello\r\n";
 
 struct MailServer {
@@ -292,37 +292,59 @@ impl MailServer {
     }
 
     async fn harness_with_limits(&self, limits: Limits) -> (Harness, App, Value) {
-        let provider = quiet_provider_and_log_store().await;
-        let harness = Harness::with_mail_roots(&provider, self.roots.clone(), limits);
-        harness.platform.route("imap.naver.com", self.address);
-        harness.platform.route("smtp.naver.com", self.address);
-        harness.use_log_store().await;
-        let app = App::new("mail-user", 33);
-        app.grant(&harness).await;
-        let record = app.record(
-            "app_password",
-            "naver_mail",
-            &json!({"username":"tester@naver.com","password":PASSWORD}),
-        );
-        (harness, app, record)
+        harness_at(self.roots.clone(), self.address, limits).await
     }
 }
 
-async fn request(
-    harness: &Harness,
-    record: &Value,
-    operation: &str,
-    params: Value,
-    body: &[u8],
-) -> (u16, Value, Vec<u8>) {
+/// A node with a log store whose two mail hosts are at `address`, behind certificates of
+/// `roots`; the account `mail-user` with a grant; and a record of that account for the
+/// mailbox `tester@naver.com` with the application password [`PASSWORD`].
+pub(super) async fn harness_at(
+    roots: RootCertStore,
+    address: std::net::SocketAddr,
+    limits: Limits,
+) -> (Harness, App, Value) {
+    let provider = quiet_provider_and_log_store().await;
+    let harness = Harness::with_mail_roots(&provider, roots, limits);
+    harness.platform.route("imap.naver.com", address);
+    harness.platform.route("smtp.naver.com", address);
+    harness.use_log_store().await;
+    let app = App::new("mail-user", 33);
+    app.grant(&harness).await;
+    let record = app.record(
+        "app_password",
+        "naver_mail",
+        &json!({"username":"tester@naver.com","password":PASSWORD}),
+    );
+    (harness, app, record)
+}
+
+/// The request frame of a mail call of the account `mail-user`.
+pub(super) fn frame_of(record: &Value, params: &Value, body: &[u8]) -> Vec<u8> {
     let meta =
         json!({"user_id":"mail-user","record":record,"context":"cli:naver-mail","request":params});
     let metadata = serde_json::to_vec(&meta).unwrap();
     let mut wire = (metadata.len() as u32).to_be_bytes().to_vec();
     wire.extend_from_slice(&metadata);
     wire.extend_from_slice(body);
+    wire
+}
+
+/// One mail call of the account `mail-user`: the status of the answer, the meta of its frame
+/// (the failure body of an answer that is no frame) and the body of the frame.
+pub(super) async fn request(
+    harness: &Harness,
+    record: &Value,
+    operation: &str,
+    params: Value,
+    body: &[u8],
+) -> (u16, Value, Vec<u8>) {
     let response = harness
-        .call(Method::POST, &format!("/v1/mail/{operation}"), wire)
+        .call(
+            Method::POST,
+            &format!("/v1/mail/{operation}"),
+            frame_of(record, &params, body),
+        )
         .await;
     assert!(!String::from_utf8_lossy(&response.body).contains(PASSWORD));
     assert!(!String::from_utf8_lossy(&response.body).contains(&STANDARD.encode(PASSWORD)));
@@ -581,16 +603,21 @@ async fn mixed_admission_scenario() -> Value {
         false,
     )
     .await;
-    // A budget that two folder listings fill: the third mail call is refused while the small
-    // HTTP calls still fit.
-    let listing = mail::LISTING_INPUT_BYTES * 6 + 2 * META_LIMIT_BYTES;
-    let (harness, app, record) = server
-        .harness_with_limits(Limits {
-            body_budget_bytes: 2 * listing + 1024 * 1024,
-            ..Limits::default()
-        })
-        .await;
+    let (harness, app, record) = server.harness().await;
     let harness = Arc::new(harness);
+    // A budget with room for two folder listings that wait for their login and for 16 KiB
+    // more: a third mail call is refused while the small HTTP calls still fit. The rest of
+    // the budget of the node is held here.
+    let listing = frame_of(&record, &json!({"action":"folders"}), b"").len()
+        + mail::CALL_BYTES
+        + mail::SHARE_STEP_BYTES;
+    let free = 2 * listing + 16 * 1024;
+    let _rest = harness
+        .node
+        .body_budget
+        .clone()
+        .try_acquire_many_owned((harness.node.limits.body_budget_bytes - free) as u32)
+        .unwrap();
     let google = app.record(
         "oauth",
         "google_workspace",
@@ -712,8 +739,11 @@ async fn oversized_literal_declaration_is_refused_before_it_is_read() {
     );
 }
 
+/// What a mail call holds of the body budget while its login waits: its request frame, its
+/// fixed share, and for a read one step for the greeting it read. No call holds the largest
+/// mail it could read.
 #[tokio::test]
-async fn mail_reservations_follow_the_operation() {
+async fn the_share_of_a_mail_call_at_its_login_is_its_frame_and_its_fixed_share() {
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let server = MailServer::with_login_delay(
         false,
@@ -728,28 +758,27 @@ async fn mail_reservations_follow_the_operation() {
     let (harness, _app, record) = server.harness().await;
     let harness = Arc::new(harness);
     let budget = harness.node.limits.body_budget_bytes;
-    let frames = 2 * META_LIMIT_BYTES;
-    for (params, expected) in [
+    let read = mail::CALL_BYTES + mail::SHARE_STEP_BYTES;
+    for (operation, params, fixed) in [
+        ("read", json!({"action":"folders"}), read),
+        ("read", json!({"action":"search","uid_validity":0}), read),
         (
-            json!({"action":"folders"}),
-            mail::LISTING_INPUT_BYTES * 6 + frames,
-        ),
-        (
-            json!({"action":"search","uid_validity":0}),
-            mail::LISTING_INPUT_BYTES * 6 + frames,
-        ),
-        (
+            "read",
             json!({"action":"read","uid_validity":0,"uid":7}),
-            mail::message_input_bytes(&harness.node.limits)
-                + harness.node.limits.body_bytes
-                + frames,
+            read,
+        ),
+        (
+            "verify",
+            json!({}),
+            mail::CALL_BYTES + mail::LOGIN_INPUT_BYTES + mail::SMTP_INPUT_BYTES,
         ),
     ] {
+        let expected = frame_of(&record, &params, b"").len() + fixed;
         let seen = server.passwords.lock().unwrap().len();
         let call = {
             let harness = harness.clone();
             let record = record.clone();
-            tokio::spawn(async move { request(&harness, &record, "read", params, b"").await })
+            tokio::spawn(async move { request(&harness, &record, operation, params, b"").await })
         };
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while server.passwords.lock().unwrap().len() == seen {

@@ -8,6 +8,7 @@ use std::{
     collections::BTreeMap,
     fmt, io,
     pin::Pin,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
     time::Duration,
 };
@@ -23,15 +24,16 @@ use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter,
     ReadBuf,
 };
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use zeroize::Zeroizing;
 
 use crate::imap::{self, Code, Condition, Fetched, Response, Status, Step};
 use crate::platform::Stream;
 use crate::provider_response::{self, CheckedResponse};
-use crate::state::{open_for, GrantView, Limits, Node};
+use crate::state::{lock, open_for, GrantView, Limits, Node};
 
-/// Protocol input a verify, folder listing or search connection accepts: 4 MiB. A UID set or
-/// headers above it end the connection; the search must be narrowed.
+/// Protocol input the IMAP connection of a folder listing or of a search accepts: 4 MiB. A
+/// UID set or headers above it end the connection; the search must be narrowed.
 pub(crate) const LISTING_INPUT_BYTES: usize = 4 * 1024 * 1024;
 
 /// The end-to-end time limit of a mail call, its admission included (`api::mail`). It is also
@@ -45,11 +47,136 @@ pub(crate) fn message_input_bytes(limits: &Limits) -> usize {
     limits.body_bytes + 1024 * 1024
 }
 
-/// Protocol input an SMTP connection accepts.
+/// Protocol input the IMAP connection of a verification accepts: the greeting of the server
+/// and its answer to the login. A call that verifies reserves these bytes before it reads its
+/// request frame.
+pub(crate) const LOGIN_INPUT_BYTES: usize = 64 * 1024;
+
+/// Protocol input an SMTP connection accepts. A call that opens one reserves these bytes
+/// before it reads its request frame.
 pub(crate) const SMTP_INPUT_BYTES: usize = 64 * 1024;
+
+/// What a mail call holds besides its request frame and the mail it reads: its parsed
+/// request, the read buffer of its IMAP connection and the head of its response frame.
+/// Reserved with the frame, before the call reads it.
+pub(crate) const CALL_BYTES: usize = 64 * 1024;
+
+/// The step in which the share of a mail call follows its protocol input.
+pub(crate) const SHARE_STEP_BYTES: usize = 64 * 1024;
+
+/// What a folder listing or a search holds at once per byte of its protocol input. The
+/// responses are read one at a time, and what a call keeps of them is the names of the
+/// folders, the UIDs of the search and the header blocks of at most 50 messages. At its peak
+/// a call holds the bytes it keeps (at most one per byte of input, and three for a number of
+/// the search: the digits of the response and the number), the text it makes of them (the
+/// base64 of a header is 4/3 of its bytes; the JSON of a name is at most twice its bytes), and
+/// the copy the check of the response makes of that text. Six covers each of these sums.
+pub(crate) const LISTING_HELD_PER_BYTE: usize = 6;
+
+/// What a raw message read holds at once per byte of its protocol input: the message, and the
+/// copy the check of the response makes of it.
+pub(crate) const MESSAGE_HELD_PER_BYTE: usize = 2;
 
 /// The most bytes a connection to the IMAP server takes from its stream in one read.
 const IMAP_READ_BYTES: usize = 16 * 1024;
+
+/// The share of the body budget of the node that one mail call holds (the budget of
+/// `Limits::body_budget_bytes`, which `forward` reserves its bodies from).
+///
+/// A call takes its share without waiting, in two parts. The first is taken before the call
+/// reads its request frame: the frame, [`CALL_BYTES`], and the input bound of every connection
+/// whose input the call does not follow ([`LOGIN_INPUT_BYTES`], [`SMTP_INPUT_BYTES`]). The
+/// second follows the protocol input of a read ([`Allowance`]): for every byte the call takes
+/// from its IMAP connection, and for every octet of a literal the server declares, the share
+/// grows by what the call holds per byte of input, before the reader of the responses takes
+/// the byte. So the share of a call is what the call read, and the shares of the calls of a
+/// node add up to the mail the node holds, not to the largest mail each call could have read.
+/// When the budget has no room for a step, the input of the call ends there
+/// ([`MailError::Capacity`]).
+pub(crate) struct Share {
+    budget: Arc<Semaphore>,
+    held: Mutex<Held>,
+}
+
+struct Held {
+    /// The bytes of the budget the call holds. `None` once its response frame took them.
+    permit: Option<OwnedSemaphorePermit>,
+    /// The part of the share that does not follow the input.
+    base: usize,
+}
+
+/// Takes `bytes` of the budget without waiting. `None` when they are not free.
+fn take_bytes(budget: &Arc<Semaphore>, bytes: usize) -> Option<OwnedSemaphorePermit> {
+    let permits = u32::try_from(bytes).ok()?;
+    budget.clone().try_acquire_many_owned(permits).ok()
+}
+
+impl Share {
+    /// The share of a call that starts: `bytes` of the budget, taken without waiting. `None`
+    /// when they are not free.
+    pub(crate) fn admit(budget: &Arc<Semaphore>, bytes: usize) -> Option<Arc<Share>> {
+        let permit = take_bytes(budget, bytes)?;
+        Some(Arc::new(Share {
+            budget: budget.clone(),
+            held: Mutex::new(Held {
+                permit: Some(permit),
+                base: bytes,
+            }),
+        }))
+    }
+
+    /// Makes the share `bytes`: more is taken without waiting, less is given back. False
+    /// when the budget has no room for more, and for a share its response frame took.
+    fn resize(&self, held: &mut Held, bytes: usize) -> bool {
+        let Some(permit) = held.permit.as_mut() else {
+            return false;
+        };
+        let now = permit.num_permits();
+        if bytes > now {
+            match take_bytes(&self.budget, bytes.saturating_sub(now)) {
+                Some(more) => permit.merge(more),
+                None => return false,
+            }
+        } else if let Some(freed) = permit.split(now.saturating_sub(bytes)) {
+            drop(freed);
+        }
+        true
+    }
+
+    /// Makes `bytes` the part of the share that does not follow the input, and the share
+    /// that size: the call knows the length of its request frame now.
+    pub(crate) fn rebase(&self, bytes: usize) -> bool {
+        let mut held = lock(&self.held);
+        held.base = bytes;
+        self.resize(&mut held, bytes)
+    }
+
+    /// Raises the share to its base plus `input_share` bytes, in whole steps of
+    /// [`SHARE_STEP_BYTES`]. A share that is that large already stays as it is. False when
+    /// the budget has no room.
+    fn cover(&self, input_share: usize) -> bool {
+        let mut held = lock(&self.held);
+        let steps = input_share.div_ceil(SHARE_STEP_BYTES);
+        let needed = held
+            .base
+            .saturating_add(steps.saturating_mul(SHARE_STEP_BYTES));
+        let covered = held
+            .permit
+            .as_ref()
+            .is_some_and(|permit| permit.num_permits() >= needed);
+        covered || self.resize(&mut held, needed)
+    }
+
+    /// Ends the share at what the response frame of the call holds, `bytes` at the most,
+    /// and hands the permit to that frame: a share is never raised here. `None` for a share
+    /// that was handed over before.
+    pub(crate) fn settle(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
+        let mut held = lock(&self.held);
+        let now = held.permit.as_ref()?.num_permits();
+        self.resize(&mut held, bytes.min(now));
+        held.permit.take()
+    }
+}
 
 /// Whether a `NO` reply to `LOGIN` says that the server refused the credentials. Two forms
 /// count: the RFC 5530 response code `AUTHENTICATIONFAILED`, and the information
@@ -74,6 +201,9 @@ pub enum MailError {
     TooLarge,
     MailboxChanged,
     Missing,
+    /// The body budget of the node has no room for the input of the call: the input ended
+    /// there.
+    Capacity,
 }
 
 impl AppPassword {
@@ -131,14 +261,14 @@ impl AppPassword {
     }
 
     /// Opens a connection to imap.naver.com and authenticates: sink K6 of the egress policy.
-    /// The connection delivers at most `input_bytes` of protocol input.
-    async fn imap(&self, node: &Node, input_bytes: usize) -> Result<ImapSession, MailError> {
+    /// The connection delivers its protocol input within `allowance`.
+    async fn imap(&self, node: &Node, allowance: Allowance) -> Result<ImapSession, MailError> {
         let stream = node
             .egress
             .open_mail(node.platform.as_ref(), "imap.naver.com", 993, CALL_TIMEOUT)
             .await
             .map_err(|_| MailError::Unavailable)?;
-        let mut connection = ImapConnection::new(stream, input_bytes);
+        let mut connection = ImapConnection::new(stream, allowance);
         // The greeting of the server: a connection it refuses, or ends, carries no login.
         match connection.response().await? {
             Response::Untagged(status)
@@ -209,21 +339,34 @@ impl AppPassword {
     }
 
     pub async fn verify(&self, node: &Node) -> Result<(), MailError> {
-        drop(self.imap(node, LISTING_INPUT_BYTES).await?);
+        drop(
+            self.imap(node, Allowance::reserved(LOGIN_INPUT_BYTES))
+                .await?,
+        );
         drop(self.smtp(node).await?);
         Ok(())
     }
 
-    pub async fn read(&self, node: &Node, request: &ReadMail) -> Result<MailData, MailError> {
+    /// Reads mail for one call. The share of the call follows the input of its connection
+    /// (`share`).
+    pub async fn read(
+        &self,
+        node: &Node,
+        request: &ReadMail,
+        share: &Arc<Share>,
+    ) -> Result<MailData, MailError> {
         request.validate()?;
         // A UID search can expand into a large set before pagination. Bound listing and
         // header input separately from a raw message, whose content has the frame limit.
-        let input_bytes = if request.action == "read" {
-            message_input_bytes(&node.limits)
-        } else {
-            LISTING_INPUT_BYTES
+        let allowance = match request.action.as_str() {
+            "read" => Allowance::charged(
+                message_input_bytes(&node.limits),
+                MESSAGE_HELD_PER_BYTE,
+                share,
+            ),
+            _ => Allowance::charged(LISTING_INPUT_BYTES, LISTING_HELD_PER_BYTE, share),
         };
-        let mut session = self.imap(node, input_bytes).await?;
+        let mut session = self.imap(node, allowance).await?;
         session.read(request, &node.limits).await
     }
 
@@ -485,6 +628,8 @@ impl ImapSession {
             uids.dedup();
             let more = uids.len() > request.limit;
             uids.truncate(request.limit);
+            // The numbers of the page stay: the room of the others is given back.
+            uids.shrink_to_fit();
             page.next_uid = if more { uids.last().copied() } else { None };
             if !uids.is_empty() {
                 let set = uids
@@ -793,34 +938,117 @@ impl Smtp {
     }
 }
 
-/// A connection to the IMAP server: the byte pipe with TLS that ends inside the node, the
-/// reader of its responses ([`crate::imap`]) and the bound of its protocol input.
+/// What one call may take from an IMAP connection, and what that costs the call.
 ///
-/// The connection takes at most `left` further bytes from its stream. A literal the server
-/// declares is held against that bound when it is declared: a declaration above what is left
-/// of the bound ends the input before the buffer of the literal is made, because its octets
-/// could not arrive under the bound. So what a connection holds of its input never exceeds
-/// its input bound, whatever length a server declares.
+/// `left` bounds the protocol input: the connection delivers no byte above it. `accounted` is
+/// what the call holds of its input: the bytes it took, and the octets still to come of a
+/// literal the server declared. The buffer of a literal has the length of the literal from
+/// the moment the literal is admitted, so a declaration alone commits that memory. Two rules
+/// keep it inside the share of the call. A declaration above what is left of the input bound
+/// ends the input: its octets could not arrive under the bound. And the share of the call is
+/// raised to `accounted` times what the call holds per byte ([`Share`]) before the buffer of
+/// a literal is made and before a byte that was taken is read. So what a connection holds of
+/// its input never exceeds its input bound, whatever length a server declares, and the call
+/// holds a share of the body budget for all of it.
+pub(crate) struct Allowance {
+    /// Bytes the call may still take from the connection.
+    left: usize,
+    /// Bytes the call took, and the octets still to come of a declared literal.
+    accounted: usize,
+    /// The octets of declared literals that are accounted and were not taken yet.
+    outstanding: usize,
+    /// What the call holds at once per byte of `accounted`, and the share that covers it.
+    /// `None` for a connection whose whole input bound the call reserved before it opened
+    /// the connection.
+    charge: Option<(usize, Arc<Share>)>,
+}
+
+impl Allowance {
+    /// `bound` bytes of input, for each of which the call holds `held_per_byte` bytes at once
+    /// and takes them into its share as the input arrives.
+    pub(crate) fn charged(bound: usize, held_per_byte: usize, share: &Arc<Share>) -> Allowance {
+        Allowance {
+            left: bound,
+            accounted: 0,
+            outstanding: 0,
+            charge: Some((held_per_byte, share.clone())),
+        }
+    }
+
+    /// `bound` bytes of input that the call reserved before it opened the connection.
+    pub(crate) fn reserved(bound: usize) -> Allowance {
+        Allowance {
+            left: bound,
+            accounted: 0,
+            outstanding: 0,
+            charge: None,
+        }
+    }
+
+    /// Raises the share of the call to what it holds of its input now.
+    fn cover(&self) -> Result<(), MailError> {
+        match &self.charge {
+            Some((held_per_byte, share))
+                if !share.cover(self.accounted.saturating_mul(*held_per_byte)) =>
+            {
+                Err(MailError::Capacity)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Counts `bytes` bytes the connection just delivered. The octets of a declared literal
+    /// among them were accounted when they were declared.
+    fn take(&mut self, bytes: usize) -> Result<(), MailError> {
+        self.left = self.left.saturating_sub(bytes);
+        let declared = bytes.min(self.outstanding);
+        self.outstanding = self.outstanding.saturating_sub(declared);
+        self.accounted = self
+            .accounted
+            .saturating_add(bytes.saturating_sub(declared));
+        self.cover()
+    }
+
+    /// Accounts the `missing` octets of a literal the server declared that the connection
+    /// has not delivered yet. They arrive within what is left of the bound, or not at all:
+    /// a declaration above it is [`MailError::Unavailable`].
+    fn declare(&mut self, missing: u64) -> Result<(), MailError> {
+        let missing = usize::try_from(missing)
+            .ok()
+            .filter(|missing| *missing <= self.left)
+            .ok_or(MailError::Unavailable)?;
+        self.outstanding = self.outstanding.saturating_add(missing);
+        self.accounted = self.accounted.saturating_add(missing);
+        self.cover()
+    }
+}
+
+/// A connection to the IMAP server: the byte pipe with TLS that ends inside the node, the
+/// reader of its responses ([`crate::imap`]) and the input its call may take from it. Every
+/// byte the server sends passes the [`Allowance`] of the call before the reader takes it: the
+/// input bound, and the share of the body budget. The reader is the one place that says where
+/// the octets of a literal are, so the octets the allowance counts are the octets a response
+/// holds.
 pub(crate) struct ImapConnection {
     stream: Stream,
     reader: imap::Reader,
     /// Bytes the stream delivered. The reader took the first `taken` of them.
     buffer: Vec<u8>,
     taken: usize,
-    /// Bytes the connection may still take from its stream.
-    left: usize,
+    /// What the call of the connection may take from it.
+    allowance: Allowance,
     /// The number of the last tag.
     tags: u64,
 }
 
 impl ImapConnection {
-    fn new(stream: Stream, input_bytes: usize) -> ImapConnection {
+    fn new(stream: Stream, allowance: Allowance) -> ImapConnection {
         ImapConnection {
             stream,
             reader: imap::Reader::default(),
             buffer: Vec::new(),
             taken: 0,
-            left: input_bytes,
+            allowance,
             tags: 0,
         }
     }
@@ -900,7 +1128,8 @@ impl ImapConnection {
     }
 
     /// The next response of the server. The end of the connection, the end of the input the
-    /// connection may take, and bytes that are no response are [`MailError::Unavailable`].
+    /// call may take, and bytes that are no response are [`MailError::Unavailable`]; a body
+    /// budget without room for the input is [`MailError::Capacity`].
     async fn response(&mut self) -> Result<Response, MailError> {
         loop {
             let ahead = self.buffer.get(self.taken..).unwrap_or_default();
@@ -914,12 +1143,10 @@ impl ImapConnection {
                 Step::Response(raw) => return imap::parse(raw).ok_or(MailError::Unavailable),
                 Step::Malformed => return Err(MailError::Unavailable),
                 Step::Literal(octets) => {
-                    // The octets the stream has not delivered yet arrive within what is
-                    // left of the bound, or the input ends here.
+                    // The octets the stream has not delivered yet are accounted, and held
+                    // against the input bound, before the buffer of the literal is made.
                     let ahead = self.buffer.len().saturating_sub(self.taken) as u64;
-                    if octets.saturating_sub(ahead) > self.left as u64 {
-                        return Err(MailError::Unavailable);
-                    }
+                    self.allowance.declare(octets.saturating_sub(ahead))?;
                     self.reader.admit();
                 }
                 Step::More => self.fill().await?,
@@ -927,10 +1154,10 @@ impl ImapConnection {
         }
     }
 
-    /// Takes the next bytes from the stream, within the bound of the connection. The reader
+    /// Takes the next bytes from the stream, within the allowance of the call. The reader
     /// took every byte the buffer held: the buffer is empty.
     async fn fill(&mut self) -> Result<(), MailError> {
-        let window = IMAP_READ_BYTES.min(self.left);
+        let window = IMAP_READ_BYTES.min(self.allowance.left);
         if window == 0 {
             return Err(MailError::Unavailable);
         }
@@ -943,8 +1170,7 @@ impl ImapConnection {
         if read == 0 {
             return Err(MailError::Unavailable);
         }
-        self.left = self.left.saturating_sub(read);
-        Ok(())
+        self.allowance.take(read)
     }
 }
 

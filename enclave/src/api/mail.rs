@@ -11,14 +11,13 @@ use credential_enclave_protocol::{purpose, ProtocolError};
 use hyper::body::Bytes;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tokio::sync::OwnedSemaphorePermit;
 
 use super::responses::forward_frame;
 use super::{invalid, read_body, record_of, respond, ApiError, JsonBody};
 use crate::frame::{self, META_LIMIT_BYTES};
 use crate::log_store;
-use crate::mail::{self, AppPassword, MailData, MailError, ReadMail};
-use crate::state::{events, lock, Limits, Node};
+use crate::mail::{self, AppPassword, MailData, MailError, ReadMail, Share};
+use crate::state::{events, lock, Node};
 
 pub async fn verify(State(node): State<Arc<Node>>, request: Request) -> Response {
     call(node, request, "verify").await
@@ -46,53 +45,37 @@ fn admission_error(error: tokio::sync::TryAcquireError) -> ApiError {
     }
 }
 
-/// Resizes the reservation to `keep` bytes without waiting: more is taken from the budget
-/// (`capacity_unavailable` when it is not free), less is given back.
-fn resize(node: &Node, budget: &mut OwnedSemaphorePermit, keep: usize) -> Result<(), ApiError> {
-    let held = budget.num_permits();
-    if keep > held {
-        let extra =
-            u32::try_from(keep - held).map_err(|_| ApiError::from(ProtocolError::TooLarge))?;
-        budget.merge(
-            node.body_budget
-                .clone()
-                .try_acquire_many_owned(extra)
-                .map_err(admission_error)?,
-        );
-    } else {
-        drop(budget.split(held - keep));
+/// The part of the share of the body budget of a mail call that does not follow its protocol
+/// input, without its request frame (`mail::Share`). The share of a call is what the call
+/// holds in memory at once:
+///
+/// | operation | taken before the request frame is read | taken as the protocol input arrives |
+/// | --- | --- | --- |
+/// | verify | the frame, `CALL_BYTES`, the input bounds of its IMAP connection and of its SMTP connection | nothing |
+/// | read: folders, search | the frame, `CALL_BYTES` | 6 bytes per byte of IMAP input (bound: 4 MiB) |
+/// | read: read | the frame, `CALL_BYTES` | 2 bytes per byte of IMAP input (bound: the body limit + 1 MiB) |
+/// | submit | the frame (the payload is part of it), `CALL_BYTES`, the input bound of its SMTP connection | nothing |
+///
+/// The frame is taken by its declared length (the frame limit when none is declared) and by
+/// its length once it was read. A verification and a submission take the whole of their share
+/// here, before a credential is opened: such a call never ends with `capacity_unavailable`
+/// after its entry was created. A read takes the second part while it reads, after its entry.
+fn fixed_share(operation: &str) -> usize {
+    match operation {
+        "verify" => mail::CALL_BYTES + mail::LOGIN_INPUT_BYTES + mail::SMTP_INPUT_BYTES,
+        "submit" => mail::CALL_BYTES + mail::SMTP_INPUT_BYTES,
+        _ => mail::CALL_BYTES,
     }
-    Ok(())
 }
 
-/// What a mail call holds in memory at once, by operation. The protocol input of a mail
-/// connection has a bound, and a literal the server declares above what is left of the bound
-/// ends the input before a buffer is made for it (`mail::ImapConnection`), so what a
-/// connection holds of its input is bounded by its bound and not by a length a server names.
-///
-/// | operation | input cap | held at once | reserve |
-/// | --- | --- | --- | --- |
-/// | verify, folders, search | 4 MiB | the responses as they were read, the names or the headers taken from them, the base64 text of the headers, the JSON, the copy the check of the response makes | cap × 6 + 2 × META |
-/// | read | body limit + 1 MiB | the response as it was read (≤ cap), whose literal becomes the message (≤ body limit), and the copy the check of the response makes | cap + body limit + 2 × META |
-/// | submit | the request frame | the payload | payload + 2 × META |
-///
-/// The request frame is read under a reservation of its declared length (the frame limit
-/// when none is declared); once the action and the payload are known, and before a
-/// credential is opened, the reservation is resized to the operation's amount.
-fn reservation(
-    limits: &Limits,
-    operation: &str,
-    action: Option<&str>,
-    payload_bytes: usize,
-) -> usize {
-    let frames = 2 * META_LIMIT_BYTES;
-    match (operation, action) {
-        ("submit", _) => payload_bytes + frames,
-        ("read", None | Some("read")) => {
-            mail::message_input_bytes(limits) + limits.body_bytes + frames
-        }
-        _ => mail::LISTING_INPUT_BYTES * 6 + frames,
-    }
+/// The failure of a read whose input the body budget of the node had no room for. The entry
+/// of the call is on the chain, the call read from the mailbox and changed nothing in it, and
+/// nothing of what it read leaves.
+fn no_room_for_the_input() -> ApiError {
+    ApiError::with_message(
+        ProtocolError::CapacityUnavailable,
+        "the node has no room for the mail the call reads; the call changed nothing",
+    )
 }
 
 async fn run(node: &Node, request: Request, operation: &str) -> Result<Response, ApiError> {
@@ -107,14 +90,18 @@ async fn run(node: &Node, request: Request, operation: &str) -> Result<Response,
         return Err(ProtocolError::TooLarge.into());
     }
     // The same budget also admits HTTP forwarding; no separate unbounded mail pool exists.
-    let reserve = u32::try_from(declared.unwrap_or(frame_limit))
-        .map_err(|_| ApiError::from(ProtocolError::TooLarge))?;
-    let mut budget = node
-        .body_budget
-        .clone()
-        .try_acquire_many_owned(reserve)
-        .map_err(admission_error)?;
+    // The call takes the share of its frame and its fixed share without waiting.
+    let fixed = fixed_share(operation);
+    let share = Share::admit(
+        &node.body_budget,
+        declared.unwrap_or(frame_limit).saturating_add(fixed),
+    )
+    .ok_or(ProtocolError::CapacityUnavailable)?;
     let frame_bytes = Bytes::from(read_body(request, frame_limit).await?);
+    // The frame is in memory: its share is its length.
+    if !share.rebase(frame_bytes.len().saturating_add(fixed)) {
+        return Err(ProtocolError::CapacityUnavailable.into());
+    }
     let (meta_value, payload) = frame::decode(&frame_bytes)?;
     drop(frame_bytes);
     if payload.len() > node.limits.body_bytes {
@@ -160,16 +147,6 @@ async fn run(node: &Node, request: Request, operation: &str) -> Result<Response,
     if operation != "submit" && !payload.is_empty() {
         return Err(invalid("mail payload"));
     }
-    resize(
-        node,
-        &mut budget,
-        reservation(
-            &node.limits,
-            operation,
-            read_request.as_ref().map(|read| read.action.as_str()),
-            payload.len(),
-        ),
-    )?;
 
     node.ensure_open()?;
     if node.log_store.id().is_none() {
@@ -226,6 +203,7 @@ async fn run(node: &Node, request: Request, operation: &str) -> Result<Response,
                 .read(
                     node,
                     read_request.as_ref().ok_or_else(|| invalid("request"))?,
+                    &share,
                 )
                 .await
         }
@@ -256,19 +234,22 @@ async fn run(node: &Node, request: Request, operation: &str) -> Result<Response,
             to_json(&json!({"code": "invalid_mail_request"})),
         ),
         Err(MailError::TooLarge) => return Err(ProtocolError::TooLarge.into()),
+        Err(MailError::Capacity) => return Err(no_room_for_the_input()),
         Err(MailError::Unavailable) => return Err(ProtocolError::ProviderUnreachable.into()),
     };
     if body.len() > node.limits.body_bytes {
         return Err(ProtocolError::TooLarge.into());
     }
-    let retained = body.len() + META_LIMIT_BYTES;
     drop(payload);
-    let unused = budget.num_permits().saturating_sub(retained);
-    drop(budget.split(unused));
+    // The check holds at most one more copy of the body: it runs under the share the input
+    // of the call took. The response frame then keeps the share of what it holds.
     let response = credentials.check(
         status,
         vec![("content-type".into(), content_type.into())],
         body,
     )?;
+    let budget = share
+        .settle(response.body_len().saturating_add(mail::CALL_BYTES))
+        .ok_or_else(ApiError::internal)?;
     Ok(forward_frame(response, Some(log), budget))
 }
