@@ -965,10 +965,18 @@ which form it holds. The order of the processing:
    call takes one of the 512 places of the forward calls and the share of the body budget its
    request frame occupies before it reads the frame, and waits for the two together for at most
    30 seconds (`ADMISSION_WAIT`, section 8): a call that has not got them by then ends with
-   `capacity_unavailable`, having read nothing, created no entry and sent nothing. A call that
-   asks for a stream takes one share more within the same 30 seconds, after it read its frame:
-   the share of the body budget the search of its response can hold (step 11). Without it the
-   call ends with `capacity_unavailable` as well, having created no entry and sent nothing.
+   `capacity_unavailable`, having read nothing, created no entry and sent nothing. The call
+   takes one share more within the same 30 seconds, after it read its frame: the share of the
+   body budget for what it holds of the credential of the record beside its bodies. For a
+   call that answers with a frame that is what the search of the response can hold (step 10:
+   the forms of the credential, twice, and the last bytes and one step of every reading) and
+   the copies of the token its request carries (the token, the header value, and that value
+   twice more while the request is sent): about 32 KiB for a token of 200 bytes and 206 KiB
+   for one of 2,000 bytes. Such a call holds the share until the search of its response has
+   ended. For a call that asks for a stream it is what the search of step 11 can hold. The
+   share is taken for the longest token a record of that size can hold and narrowed once the
+   record is open (step 11). Without the share the call ends with `capacity_unavailable` as
+   well, having created no entry and sent nothing.
 1. The common front. The kind of the record is `oauth` or `oauth_imported` (any other kind is
    `not_allowed`).
 2. The address check (section 7). A violation is `not_allowed`.
@@ -1856,10 +1864,16 @@ The rules:
   requests, so the places are not the bound of the throughput of a node: the provider requests
   in flight and the body budget are). A `forward`, `forward/batch` or `vault/send` call waits
   for its place and for the shares of the body budget it takes before its request leaves (the
-  share its request frame occupies, and for `vault/send` and for a `forward` call that asks
-  for a stream the share the search of its response can hold with the forms of the
-  credential: about 31 KiB for a credential of 30 bytes, 62 KiB for one of 200 bytes and 2.7
-  MiB for a vault value of 12,000 bytes) for at
+  share its request frame occupies, and the share of what it holds of its credential beside
+  its bodies. For `vault/send` and for a `forward` call that asks for a stream that is what
+  the search of its response can hold with the forms of the credential: about 31 KiB for a
+  credential of 30 bytes, 62 KiB for one of 200 bytes and 2.7 MiB for a vault value of 12,000
+  bytes. For a `forward` call that answers with a frame and for a `forward/batch` call it is
+  what the search of one response can hold, which keeps no received bytes, and the copies of
+  the token its requests carry: the token and the header value of every request, and that
+  header value twice more for every request that is being sent. That is about 32 KiB for a
+  `forward` call with a token of 200 bytes and 206 KiB with one of 2,000 bytes. The searches
+  of the responses of one call run one at a time) for at
   most 30 seconds together (`ADMISSION_WAIT`)
   and ends with `capacity_unavailable` when it has not got them by then: the node reads
   nothing from the connection of a call that waits, so it does not learn that the caller of
@@ -1946,7 +1960,7 @@ The limits, as the source states them:
 | Body of a provider request and of a provider response (`forward`); the bodies of the results of a `forward/batch` call together | 64 MiB each |
 | Sum of the bodies in memory | 2 GiB |
 | Concurrent `forward` and `forward/batch` calls | 512 |
-| Wait of a `forward` or `forward/batch` call for its place, for the share of the body budget of its request frame and, when it asks for a stream, for the share of the search of its response (`ADMISSION_WAIT`) | 30 seconds |
+| Wait of a `forward` or `forward/batch` call for its place, for the share of the body budget of its request frame and for the share of what it holds of its credential (`ADMISSION_WAIT`) | 30 seconds |
 | Connections from the backend held open at once (`inbound_limit` of health) | One eighth of the memory of the kernel divided by 344,064 bytes, 64 to 16,384: 1,502 in an enclave of 4,096 MiB |
 | Longest wait for the peer of a connection from the backend: for the head of a request, for the next bytes of a request body, for the peer to take bytes of a response (`inbound_idle`) | 60 seconds |
 | Read buffer of the HTTP connection of a caller, and the longest request head | 32 KiB |

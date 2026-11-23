@@ -154,8 +154,31 @@ fn overwrite(headers: &mut [(String, String)]) {
     }
 }
 
+/// A bound of the memory [`check`] holds while it searches a whole response, for a credential
+/// of `credential_bytes` bytes. The body and the headers are the caller's, and the check makes
+/// no copy of the body. It holds the forms of the credential, and those forms a second time,
+/// in lower case, while it searches the header names; the readings of one search at a time;
+/// and the copy in lower case of what one step of the search of a header name reads (the last
+/// bytes of a reading with the first of the step, or what the step adds: less than two steps).
+/// The longest form of a credential is its hexadecimal form, two bytes for one.
+///
+/// The value of a header whose text is not ASCII is read once more as the bytes its
+/// characters stand for. That copy is as long as the value, which the head of a response
+/// bounds, whatever the credential: it is not counted here.
+pub const fn check_memory_bound(credential_bytes: usize) -> usize {
+    let longest = credential_bytes.saturating_mul(2);
+    let lowered = slice_of(longest)
+        .saturating_mul(2)
+        .saturating_add(OPEN_ESCAPE_BYTES.saturating_mul(4));
+    Forms::room_of(credential_bytes)
+        .saturating_mul(2)
+        .saturating_add(Readings::room_of(longest))
+        .saturating_add(lowered)
+}
+
 /// Checks the response of a request that carried `credential` (the token without the prefix of
-/// the definition).
+/// the definition). What the check holds while it searches is bounded by the length of the
+/// credential ([`check_memory_bound`]).
 pub fn check(
     credential: &Secret<String>,
     status: u16,
@@ -237,6 +260,16 @@ impl Forms {
             }
         }
         Forms(kept)
+    }
+
+    /// A bound of the room of the forms of one credential of `credential_bytes` bytes: the
+    /// credential as it is, six base64 texts (four characters for three bytes), two
+    /// hexadecimal texts (two for one), the text with `+` for its spaces, and the text a
+    /// reader of ISO 8859-1 makes of it (at most two bytes for one). That is sixteen bytes
+    /// for each byte of the credential, and the few characters the base64 texts have more for
+    /// the bytes in front of the credential.
+    const fn room_of(credential_bytes: usize) -> usize {
+        credential_bytes.saturating_mul(16).saturating_add(64)
     }
 
     /// The length of the longest form in bytes, 0 when there is none.
@@ -858,6 +891,23 @@ impl Readings {
     /// kinds of escapes.
     const COUNT: usize = 1 + PERCENT_LAYERS + JSON_LAYERS + REFERENCE_LAYERS;
 
+    /// A bound of the room of the readings of a search whose longest form has `longest`
+    /// bytes: for every reading its last bytes, the escape that waits, and what one step of
+    /// the search adds to it.
+    const fn room_of(longest: usize) -> usize {
+        // What one step adds to a reading, and the escape that waits, are written into
+        // buffers that grow by doubling: the room of each is at most twice what it holds.
+        let step = slice_of(longest)
+            .saturating_add(OPEN_ESCAPE_BYTES)
+            .saturating_mul(2);
+        let waits = OPEN_ESCAPE_BYTES.saturating_mul(4);
+        let reading = longest
+            .saturating_mul(2)
+            .saturating_add(step)
+            .saturating_add(waits);
+        reading.saturating_mul(Readings::COUNT)
+    }
+
     /// The readings of a search whose longest form has `longest` bytes.
     fn new(longest: usize) -> Readings {
         let mut received = Reading::of(None);
@@ -1066,31 +1116,20 @@ impl StreamCheck {
     }
 
     /// A bound of the memory the check of the response of a request holds while the body
-    /// arrives, for a credential of `credential_bytes` bytes: the forms of the credential,
-    /// the buffer of the received bytes, and for every reading its last bytes, the escape
-    /// that waits, and what one step of a search adds to it. The longest form of a credential
-    /// is its hexadecimal form, two bytes for one.
+    /// arrives, for a credential of `credential_bytes` bytes: the forms of the credential
+    /// ([`Forms::room_of`]), the buffer of the received bytes, and the readings
+    /// ([`Readings::room_of`]). The longest form of a credential is its hexadecimal form, two
+    /// bytes for one.
+    ///
+    /// The check of the head, before the body arrives ([`StreamCheck::begin`]), holds what
+    /// the check of a whole response holds ([`check_memory_bound`]), which is less: the
+    /// buffer of the received bytes, which is made after that check, is more than the second
+    /// copy of the forms and the copy of a step that check holds.
     pub const fn memory_bound(credential_bytes: usize) -> usize {
         let longest = credential_bytes.saturating_mul(2);
-        // The forms: the credential as it is, six base64 texts (four characters for three
-        // bytes), two hexadecimal texts (two for one), the text with `+` for its spaces, and
-        // the text a reader of ISO 8859-1 makes of it (at most two bytes for one). That is
-        // sixteen bytes for each byte of the credential, and the few characters the base64
-        // texts have more for the bytes in front of the credential.
-        let forms = credential_bytes.saturating_mul(16).saturating_add(64);
-        // What one step adds to a reading, and the escape that waits, are written into
-        // buffers that grow by doubling: the room of each is at most twice what it holds.
-        let step = slice_of(longest)
-            .saturating_add(OPEN_ESCAPE_BYTES)
-            .saturating_mul(2);
-        let waits = OPEN_ESCAPE_BYTES.saturating_mul(4);
-        let reading = longest
-            .saturating_mul(2)
-            .saturating_add(step)
-            .saturating_add(waits);
         Self::buffer_of(longest)
-            .saturating_add(forms)
-            .saturating_add(reading.saturating_mul(Readings::COUNT))
+            .saturating_add(Forms::room_of(credential_bytes))
+            .saturating_add(Readings::room_of(longest))
     }
 
     /// Takes the next bytes of the body and returns the bytes that are handed on now: none
@@ -2373,6 +2412,88 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_check_of_a_whole_response_holds_no_more_memory_than_its_bound() {
+        // The room of everything `check` holds at once while it searches a response: the
+        // forms of the credential, the same forms in lower case for the header names, the
+        // readings of one search, and the copy in lower case of what one step of the search
+        // of a header name reads. The search below is the search of a header name over a
+        // long text, the one that holds all four. The text holds escapes of every layer of
+        // every kind, so each reading comes to be searched for itself.
+        let credentials = [
+            "x".repeat(8),
+            TOKEN.to_string(),
+            "p\u{e4}ss phrase \u{d55c}\u{ae00} 0123456789".to_string(),
+            format!("{}!", "\u{d55c} ".repeat(700)),
+            "k".repeat(12_000),
+        ];
+        let room = |forms: &Forms| -> usize {
+            forms
+                .0
+                .iter()
+                .map(|form| form.expose_secret().capacity())
+                .sum()
+        };
+        let mut noise = Noise(0x510e_527f_ade6_82d1);
+        for text in credentials {
+            let bound = check_memory_bound(text.len());
+            let forms = Forms::of(&[Secret::new(text.clone())]);
+            let folded = forms.folded();
+            let names = Search {
+                folds: true,
+                ..folded.search()
+            };
+            let mut readings = Readings::new(names.longest);
+            let mut received = Vec::new();
+            while received.len() < 600_000 {
+                received.extend_from_slice(b"%252541 \\\\n &#38;#65; ");
+                received.extend(noise.some(900));
+            }
+            for (step, slice) in received.chunks(slice_of(names.longest)).enumerate() {
+                assert!(!readings.add(&names, slice, false));
+                let of_the_readings: usize = readings
+                    .readings
+                    .iter()
+                    .map(|reading| reading.tail.capacity() + reading.open.capacity())
+                    .chain(readings.added.iter().map(Vec::capacity))
+                    .sum();
+                // The copy in lower case is as long as what it is made of: the last bytes of
+                // a reading with the first bytes of a step, which have room in the buffer of
+                // those last bytes, or what the step adds to a reading.
+                let lowered = readings
+                    .readings
+                    .iter()
+                    .map(|reading| reading.tail.capacity())
+                    .chain(readings.added.iter().map(Vec::len))
+                    .chain([slice.len()])
+                    .max()
+                    .unwrap();
+                let in_use = room(&forms) + room(&folded) + of_the_readings + lowered;
+                assert!(
+                    in_use <= bound,
+                    "{} bytes, step {step}: {in_use} in use, bound {bound}",
+                    text.len()
+                );
+            }
+            assert_eq!(readings.readings.len(), Readings::COUNT);
+            // Every reading was searched for itself in this text: the room counted above is
+            // the room of all of them.
+            assert!(readings
+                .readings
+                .iter()
+                .all(|reading| reading.tail.capacity() >= names.longest));
+        }
+        // The check of a stream holds what the check of a whole response holds while it
+        // reads the head, before it makes its buffer of received bytes: the bound of a stream
+        // is the larger one for every credential.
+        for bytes in [0, 1, 8, 200, 511, 512, 513, 2_000, 12_000, 1 << 20] {
+            assert!(check_memory_bound(bytes) <= StreamCheck::memory_bound(bytes));
+        }
+        // The bound for a token of a common length and for a long one.
+        assert_eq!(check_memory_bound(200), 32_192);
+        assert_eq!(check_memory_bound(2_000), 200_960);
     }
 
     #[test]
