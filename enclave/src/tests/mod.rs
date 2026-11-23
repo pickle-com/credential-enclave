@@ -22,6 +22,7 @@ mod oauth;
 mod peer;
 mod records;
 mod roles;
+mod search_reference;
 mod surface;
 mod vault;
 mod vault_handoff;
