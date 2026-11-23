@@ -5,10 +5,11 @@
 //! its caller back, and a token response holds its tokens at the places the definition names.
 //! This module is the defense for a response that breaks that assumption.
 //!
-//! [`Forms`] is the search. Bytes are read in six readings: as they were received, with their
-//! percent escapes decoded once, twice and three times ([`PERCENT_LAYERS`], for a value that
-//! was encoded more than once), and with their JSON string escapes decoded once and twice
-//! ([`JSON_LAYERS`], for a JSON text inside a JSON string). Each reading is searched for these
+//! [`Forms`] is the search. Bytes are read in six readings ([`Readings`]): as they were
+//! received, with their percent escapes decoded once, twice and three times
+//! ([`PERCENT_LAYERS`], for a value that was encoded more than once), and with their JSON
+//! string escapes decoded once and twice ([`JSON_LAYERS`], for a JSON text inside a JSON
+//! string). Each reading is searched for these
 //! forms of the credential: as it is, base64 or base64url in each of the three byte alignments
 //! and without padding, hexadecimal in lower or upper case. Decoding the escapes finds the
 //! credential under every percent-encoding of it and under every way a writer of JSON escapes
@@ -30,9 +31,10 @@
 //!
 //! [`check`] reads a whole response and hands on all of it or nothing. [`StreamCheck`] reads a
 //! body while it arrives and hands on the bytes in front of the last ones it holds back, so a
-//! body of any length is searched in a bounded memory. Its verdict on a body is the verdict of
-//! [`check`] on the same bytes, and no byte of a form it finds is handed on: the body is cut
-//! in front of it.
+//! body of any length is searched in a bounded memory. The two read a body through the same
+//! readings, step by step from its first byte, so the verdict of the one on a body is the
+//! verdict of the other on the same bytes, and no byte of a form a [`StreamCheck`] finds is
+//! handed on: the body is cut in front of it.
 
 use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use base64::Engine;
@@ -62,10 +64,15 @@ const _: () = assert!(
         && ESCAPED_BYTE_SPAN >= 3usize.pow(PERCENT_LAYERS as u32)
 );
 
-/// The most bytes of a body a [`StreamCheck`] reads in one search. A longer part is read in
-/// slices of this length (of the length of the longest form, when that is longer), so what
-/// the check holds does not grow with the parts a body arrives in.
-const STREAM_SLICE_BYTES: usize = 16 * 1024;
+/// The most bytes one step of a search adds to the readings (the length of the longest form,
+/// when that is longer). A reading that decodes escapes is searched for itself only in the
+/// steps around an escape, so a step is short: the bytes between two escapes that lie far
+/// apart are searched once, in the reading they were received in.
+const SEARCH_SLICE_BYTES: usize = 1024;
+
+/// The fewest new bytes a [`StreamCheck`] waits for before it searches them (four times the
+/// length of the longest form, when that is more).
+const STREAM_GATHER_BYTES: usize = 4 * 1024;
 
 /// More bytes than an escape that waits for the bytes that follow can have: the longest one
 /// is two escapes of a JSON string, the two halves of a character outside the basic plane,
@@ -117,7 +124,8 @@ pub fn check(
     mut body: Vec<u8>,
 ) -> Result<CheckedResponse, Withheld> {
     let forms = Forms::of(std::slice::from_ref(credential));
-    if coded(&headers) || forms.found_in(&body) || forms.found_in_head(&headers) {
+    let search = forms.search();
+    if coded(&headers) || search.found_in(&body) || search.found_in_head(&headers) {
         // What is withheld may hold the credential: the copy this check was given is
         // overwritten before it is dropped.
         body.zeroize();
@@ -172,55 +180,71 @@ impl Forms {
             .unwrap_or(0)
     }
 
-    /// True when `bytes` hold one of the forms as they are: one reading, no escape decoded.
-    fn in_reading(&self, bytes: &[u8]) -> bool {
-        self.0
-            .iter()
-            .any(|form| memmem::find(bytes, form.expose_secret()).is_some())
+    /// The search for these forms, made ready once for the bytes it is to read.
+    fn search(&self) -> Search<'_> {
+        Search {
+            finders: self
+                .0
+                .iter()
+                .map(|form| memmem::Finder::new(form.expose_secret().as_slice()))
+                .collect(),
+            longest: self.longest(),
+        }
     }
 
     /// True when `received` hold one of the forms: as received, under percent escapes, or
     /// under the escapes of a JSON string.
     pub fn found_in(&self, received: &[u8]) -> bool {
-        if self.in_reading(received) {
-            return true;
-        }
-        // Each layer of escapes is decoded and searched. There is one decoded copy at a time,
-        // and each further layer is decoded inside it. The copy may hold the credential: it
-        // is overwritten before it is dropped.
-        for escapes in [Escapes::Percent, Escapes::Json] {
-            if !escapes.begin_in(received, true) {
-                continue;
-            }
-            let mut decoded = received.to_vec();
-            let mut reflected = false;
-            for _ in 0..escapes.layers() {
-                if !decode_in_place(escapes, &mut decoded) {
-                    break;
-                }
-                if self.in_reading(&decoded) {
-                    reflected = true;
-                    break;
-                }
-            }
-            decoded.zeroize();
-            if reflected {
-                return true;
-            }
-        }
-        false
+        self.search().found_in(received)
     }
 
     /// True when the name or the value of a response header holds one of the forms
     /// ([`Forms::found_in`]): in the text the node hands on, or in the bytes the sender wrote
     /// when that text is their reading as ISO 8859-1.
+    #[cfg(test)]
+    pub fn found_in_header(&self, text: &str) -> bool {
+        self.search().found_in_header(text)
+    }
+}
+
+/// The search for the forms of a credential ([`Forms::search`]): a searcher for each form,
+/// which borrows the form, and the length of the longest one.
+struct Search<'a> {
+    finders: Vec<memmem::Finder<'a>>,
+    longest: usize,
+}
+
+impl Search<'_> {
+    /// True when `bytes` hold one of the forms as they are: one reading, no escape decoded.
+    fn in_reading(&self, bytes: &[u8]) -> bool {
+        self.finders
+            .iter()
+            .any(|finder| finder.find(bytes).is_some())
+    }
+
+    /// True when `received` hold one of the forms, in one of the readings of [`Readings`].
+    /// The bytes are read slice by slice: no copy of the whole of them is made.
+    fn found_in(&self, received: &[u8]) -> bool {
+        if self.finders.is_empty() {
+            return false;
+        }
+        let mut readings = Readings::new(self.longest);
+        received
+            .chunks(slice_of(self.longest))
+            .any(|slice| readings.add(self, slice, false))
+            || readings.add(self, &[], true)
+    }
+
+    /// True when the name or the value of a response header holds one of the forms: in the
+    /// text the node hands on, or in the bytes the sender wrote when that text is their
+    /// reading as ISO 8859-1.
     ///
     /// A header whose bytes are not UTF-8 is handed on with one character per byte
     /// (`crate::egress::Exchange`). A credential with a character outside ASCII stands in
     /// such a text as other characters than its own, and whoever receives the text reads the
     /// bytes back from it. So a text whose characters all lie below U+0100 is searched as the
     /// bytes those characters stand for as well.
-    pub fn found_in_header(&self, text: &str) -> bool {
+    fn found_in_header(&self, text: &str) -> bool {
         if self.found_in(text.as_bytes()) {
             return true;
         }
@@ -243,6 +267,16 @@ impl Forms {
         headers
             .iter()
             .any(|(name, value)| self.found_in_header(name) || self.found_in_header(value))
+    }
+}
+
+/// The most bytes one step of a search adds to the readings, for a longest form of `longest`
+/// bytes: [`SEARCH_SLICE_BYTES`], or the length of that form when it is longer.
+const fn slice_of(longest: usize) -> usize {
+    if longest > SEARCH_SLICE_BYTES {
+        longest
+    } else {
+        SEARCH_SLICE_BYTES
     }
 }
 
@@ -414,71 +448,31 @@ fn json_step(rest: &[u8], end: bool) -> Step {
     }
 }
 
-/// Replaces every escape of `bytes` by the bytes it stands for, in place. False when `bytes`
-/// hold no such escape. What an escape stands for is never longer than the escape, so the
-/// result is written over the source, and the bytes behind the result are overwritten before
-/// the length is cut.
-fn decode_in_place(escapes: Escapes, bytes: &mut Vec<u8>) -> bool {
-    // The bytes in front of the first byte that can begin an escape stay where they are.
-    let Some(first) = memchr::memchr(escapes.first_byte(), bytes) else {
-        return false;
-    };
-    let (mut read, mut write, mut any) = (first, first, false);
-    while let Some(rest) = bytes.get(read..).filter(|rest| !rest.is_empty()) {
-        // The bytes the step stands for, at most four, and the bytes of `bytes` it consumed.
-        let (stands_for, length, consumed) = match escapes.step(rest, true) {
-            Step::Decoded {
-                consumed,
-                decoded,
-                length,
-            } => {
-                any = true;
-                (decoded, length, consumed.max(1))
-            }
-            Step::Literal | Step::Open => {
-                let literal = rest.first().copied().unwrap_or_default();
-                ([literal, 0, 0, 0], 1, 1)
-            }
-        };
-        // The result is not longer than what was read, so it is written at or in front of
-        // the place of the read.
-        for (target, byte) in bytes
-            .iter_mut()
-            .skip(write)
-            .zip(stands_for.iter().take(length))
-        {
-            *target = *byte;
-        }
-        read += consumed;
-        write += length;
-    }
-    if let Some(behind) = bytes.get_mut(write..) {
-        behind.zeroize();
-    }
-    bytes.truncate(write);
-    any
-}
-
-/// One reading of a body that arrives in parts.
+/// One reading of bytes that arrive in parts.
 ///
 /// A reading that decodes escapes decodes them part by part: an escape that the bytes so far
 /// begin and do not end waits for the bytes that follow. So the bytes of the reading are, at
-/// every moment, the bytes [`Forms::found_in`] reads when it decodes the whole body, up to
-/// the escape that waits.
+/// every moment, the bytes of that reading of the whole body, up to the escape that waits.
+///
+/// A reading is searched only while it differs from the reading it is decoded from. Before
+/// that reading held an escape of its kind the two are the same bytes, and they are the same
+/// bytes again once as many bytes as a form can have followed the last escape: a form that
+/// ends in the bytes still to come then lies in bytes the two readings share, and the search
+/// of the one reading is the search of the other.
 struct Reading {
-    /// The reading this one is decoded from (its place among the readings of the check) and
-    /// the escapes that are decoded. `None` for the body as it was received.
+    /// The reading this one is decoded from (its place among the readings) and the escapes
+    /// that are decoded. `None` for the bytes as they were received.
     origin: Option<(usize, Escapes)>,
-    /// False until the reading this one is decoded from held an escape of its kind. Up to
-    /// there the two are the same bytes, and the search of that reading is the search of
-    /// this one.
+    /// True while the reading is searched for itself.
     begun: bool,
     /// The escape that waits for the bytes that follow.
     open: Vec<u8>,
     /// The last bytes of the reading, one fewer than the longest form has: a form that ends
-    /// in the bytes still to come begins in them. A reading that has begun has room for
-    /// these bytes and for what one search adds to them, so they stay at one place of memory.
+    /// in the bytes still to come begins in them.
     tail: Vec<u8>,
+    /// The bytes at the end of the reading that stand for themselves: the bytes since the
+    /// last escape that was decoded.
+    plain: usize,
 }
 
 impl Reading {
@@ -488,31 +482,64 @@ impl Reading {
             begun: false,
             open: Vec::new(),
             tail: Vec::new(),
+            plain: 0,
         }
     }
 
     /// Begins the reading with the last bytes `before` of the reading it was the same bytes
-    /// as, and with `room` bytes for its last bytes.
-    fn begin(&mut self, before: &[u8], room: usize) {
-        let mut tail = Vec::with_capacity(room.max(before.len()));
-        tail.extend_from_slice(before);
-        self.tail = tail;
+    /// as. It has room for the bytes it comes to hold: its last bytes and as many of what a
+    /// step adds, both one fewer than `longest`.
+    fn begin(&mut self, before: &[u8], longest: usize) {
+        self.tail.clear();
+        self.tail
+            .reserve_exact(longest.saturating_mul(2).max(before.len()));
+        self.tail.extend_from_slice(before);
         self.begun = true;
+        self.plain = 0;
     }
 
-    /// The bytes `source` adds to this reading, where `source` is what the reading it is
-    /// decoded from received: every escape becomes the bytes it stands for. With `end`,
-    /// nothing follows `source`: an escape that did not end is the bytes it is.
-    fn decode(&mut self, escapes: Escapes, source: &[u8], end: bool) -> Vec<u8> {
-        let mut bytes = std::mem::take(&mut self.open);
-        bytes.extend_from_slice(source);
-        // What an escape stands for is never longer than the escape.
-        let mut decoded = Vec::with_capacity(bytes.len());
+    /// Adds to `decoded` the bytes `source` adds to this reading, where `source` is what the
+    /// reading it is decoded from received: every escape becomes the bytes it stands for.
+    /// With `end`, nothing follows `source`: an escape that did not end is the bytes it is.
+    fn decode(&mut self, escapes: Escapes, source: &[u8], end: bool, decoded: &mut Vec<u8>) {
         let mut at = 0;
-        while let Some(rest) = bytes.get(at..).filter(|rest| !rest.is_empty()) {
+        // An escape that waited ends within the first bytes of `source`, or it is none: its
+        // first byte then stands for itself, and the bytes that waited behind it are read
+        // anew.
+        while !self.open.is_empty() {
+            let waited = self.open.len();
+            let rest = source.get(at..).unwrap_or_default();
+            let joined = rest.len().min(OPEN_ESCAPE_BYTES);
+            self.open
+                .extend_from_slice(rest.get(..joined).unwrap_or_default());
+            let nothing_follows = end && joined == rest.len();
+            match escapes.step(&self.open, nothing_follows) {
+                // The escape holds every byte that waited for its end.
+                Step::Decoded {
+                    consumed,
+                    decoded: stands_for,
+                    length,
+                } if consumed >= waited => {
+                    decoded.extend(stands_for.iter().take(length));
+                    self.plain = 0;
+                    at += consumed - waited;
+                    self.open.zeroize();
+                }
+                // The bytes still begin an escape, and every byte of `source` is among them.
+                Step::Open if joined == rest.len() => return,
+                _ => {
+                    decoded.extend(self.open.first());
+                    self.plain = self.plain.saturating_add(1);
+                    self.open.truncate(waited);
+                    self.open.drain(..1);
+                }
+            }
+        }
+        while let Some(rest) = source.get(at..).filter(|rest| !rest.is_empty()) {
             // The bytes up to the next one that can begin an escape stand for themselves.
             let plain = memchr::memchr(escapes.first_byte(), rest).unwrap_or(rest.len());
             decoded.extend_from_slice(rest.get(..plain).unwrap_or_default());
+            self.plain = self.plain.saturating_add(plain);
             at += plain;
             let Some(rest) = rest.get(plain..).filter(|rest| !rest.is_empty()) else {
                 break;
@@ -524,35 +551,63 @@ impl Reading {
                     length,
                 } => {
                     decoded.extend(stands_for.iter().take(length));
+                    self.plain = 0;
                     at += consumed.max(1);
                 }
                 Step::Literal => {
                     decoded.extend(rest.first());
+                    self.plain = self.plain.saturating_add(1);
                     at += 1;
                 }
                 // The escape may end in the bytes that follow: it waits.
                 Step::Open => {
                     self.open.extend_from_slice(rest);
-                    break;
+                    return;
                 }
             }
         }
-        bytes.zeroize();
-        decoded
     }
 
     /// Adds `fresh` to the reading and searches it. True when the reading holds a form that
-    /// ends in `fresh`. Afterwards the reading keeps its last bytes, one fewer than
-    /// `longest`.
-    fn search(&mut self, forms: &Forms, longest: usize, fresh: &[u8]) -> bool {
-        self.tail.extend_from_slice(fresh);
-        if forms.in_reading(&self.tail) {
+    /// ends in `fresh`. Afterwards the reading keeps its last bytes, one fewer than the
+    /// longest form has.
+    fn search(&mut self, search: &Search<'_>, fresh: &[u8]) -> bool {
+        let overlap = search.longest.saturating_sub(1);
+        // A form that begins in the last bytes of the reading ends within as many bytes of
+        // `fresh`. Every other form that ends in `fresh` lies in it whole.
+        let kept = self.tail.len();
+        let front = fresh.get(..overlap.min(fresh.len())).unwrap_or_default();
+        self.tail.extend_from_slice(front);
+        if (kept > 0 && search.in_reading(&self.tail)) || search.in_reading(fresh) {
             return true;
         }
-        let kept = longest.saturating_sub(1).min(self.tail.len());
-        let dropped = self.tail.len() - kept;
-        self.tail.drain(..dropped);
+        match fresh
+            .len()
+            .checked_sub(overlap)
+            .and_then(|at| fresh.get(at..))
+        {
+            Some(last) => {
+                self.tail.clear();
+                self.tail.extend_from_slice(last);
+            }
+            // `fresh` is shorter than that: the reading keeps the end of what it has now.
+            None => {
+                let dropped = self.tail.len().saturating_sub(overlap);
+                self.tail.drain(..dropped);
+            }
+        }
         false
+    }
+
+    /// Ends the search of the reading for itself when it is the same bytes as the reading it
+    /// is decoded from again: no escape waits, and as many bytes as it keeps followed the
+    /// last escape.
+    fn rest(&mut self, longest: usize) {
+        if self.origin.is_some() && self.open.is_empty() && self.plain >= longest.saturating_sub(1)
+        {
+            self.begun = false;
+            self.tail.clear();
+        }
     }
 }
 
@@ -560,6 +615,109 @@ impl Drop for Reading {
     fn drop(&mut self) {
         self.open.zeroize();
         self.tail.zeroize();
+    }
+}
+
+/// The readings of bytes a provider sent, as the search reads them step by step: the bytes
+/// as they were received first, and behind them each reading that decodes the escapes of a
+/// reading in front of it (the layers of each kind of escapes, each decoded from the layer
+/// before it, the first from the bytes as received).
+struct Readings {
+    longest: usize,
+    readings: Vec<Reading>,
+    /// What one step adds to each reading. The buffers are kept between the steps.
+    added: Vec<Vec<u8>>,
+    /// For every reading, the reading whose bytes it is in this step: itself while it is
+    /// searched for itself.
+    same_as: Vec<usize>,
+}
+
+impl Readings {
+    /// The readings of a search whose longest form has `longest` bytes.
+    fn new(longest: usize) -> Readings {
+        let mut received = Reading::of(None);
+        received.begin(&[], longest);
+        let mut readings = vec![received];
+        for escapes in [Escapes::Percent, Escapes::Json] {
+            let mut from = 0;
+            for _ in 0..escapes.layers() {
+                readings.push(Reading::of(Some((from, escapes))));
+                from = readings.len() - 1;
+            }
+        }
+        Readings {
+            longest,
+            added: readings.iter().map(|_| Vec::new()).collect(),
+            same_as: Vec::with_capacity(readings.len()),
+            readings,
+        }
+    }
+
+    /// Adds `received`, at most one slice of the bytes, to every reading and searches each.
+    /// True when a reading holds a form. With `end`, nothing follows `received`.
+    fn add(&mut self, search: &Search<'_>, received: &[u8], end: bool) -> bool {
+        self.same_as.clear();
+        for index in 0..self.readings.len() {
+            // A reading stands behind the reading it is decoded from, so what this step adds
+            // to that one is known when its turn comes.
+            let (Some((before, at)), Some((added_before, added_at))) = (
+                self.readings.split_at_mut_checked(index),
+                self.added.split_at_mut_checked(index),
+            ) else {
+                return true;
+            };
+            let (Some(reading), Some(added)) = (at.first_mut(), added_at.first_mut()) else {
+                return true;
+            };
+            added.zeroize();
+            let Some((from, escapes)) = reading.origin else {
+                self.same_as.push(index);
+                continue;
+            };
+            let source_of = self.same_as.get(from).copied().unwrap_or(0);
+            let source = match source_of {
+                0 => received,
+                other => added_before
+                    .get(other)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+            };
+            if !reading.begun {
+                if !escapes.begin_in(source, end) {
+                    self.same_as.push(source_of);
+                    continue;
+                }
+                // The reading begins as the end of the reading it was the same bytes as, as
+                // that one stood in front of these bytes.
+                let last = before.get(source_of).map(|reading| reading.tail.as_slice());
+                reading.begin(last.unwrap_or_default(), self.longest);
+            }
+            reading.decode(escapes, source, end, added);
+            self.same_as.push(index);
+        }
+        for (index, reading) in self.readings.iter_mut().enumerate() {
+            if self.same_as.get(index) != Some(&index) {
+                continue;
+            }
+            let fresh = match index {
+                0 => received,
+                other => self.added.get(other).map(Vec::as_slice).unwrap_or_default(),
+            };
+            if reading.search(search, fresh) {
+                return true;
+            }
+            reading.rest(self.longest);
+        }
+        false
+    }
+}
+
+impl Drop for Readings {
+    fn drop(&mut self) {
+        // Decoded bytes may hold the credential: they are overwritten before they are dropped.
+        for bytes in &mut self.added {
+            bytes.zeroize();
+        }
     }
 }
 
@@ -594,8 +752,7 @@ impl Drop for Reading {
 /// credential.
 pub struct StreamCheck {
     forms: Forms,
-    /// The length of the longest form.
-    longest: usize,
+    readings: Readings,
     /// The received bytes that were not handed on yet: the bytes of `held` from `front` on.
     /// The bytes in front of `front` were handed on and are dropped once they are the larger
     /// part of the buffer.
@@ -605,9 +762,8 @@ pub struct StreamCheck {
     unsearched: usize,
     /// The bytes held back behind what is handed on.
     hold: usize,
-    /// The readings: the body as received first, and behind it each reading that decodes
-    /// the escapes of a reading in front of it.
-    readings: Vec<Reading>,
+    /// The bytes a search waits for.
+    gather: usize,
     /// True once a search found a form: nothing more is handed on.
     withheld: bool,
 }
@@ -623,36 +779,22 @@ impl StreamCheck {
         headers: &mut Vec<(String, String)>,
     ) -> Result<StreamCheck, Withheld> {
         let forms = Forms::of(std::slice::from_ref(credential));
-        if coded(headers) || forms.found_in_head(headers) {
+        if coded(headers) || forms.search().found_in_head(headers) {
             overwrite(headers);
             headers.clear();
             return Err(Withheld);
         }
-        // The readings stand behind the reading they are decoded from: the layers of each
-        // kind of escapes, each decoded from the layer before it, the first from the body as
-        // it was received.
         let longest = forms.longest();
-        let mut received = Reading::of(None);
-        received.begin(&[], Self::room_of(longest));
-        let mut readings = vec![received];
-        for escapes in [Escapes::Percent, Escapes::Json] {
-            let mut from = 0;
-            for _ in 0..escapes.layers() {
-                readings.push(Reading::of(Some((from, escapes))));
-                from = readings.len() - 1;
-            }
-        }
-        let hold = Self::hold_of(longest);
         Ok(StreamCheck {
             forms,
-            longest,
+            readings: Readings::new(longest),
             // The buffer has room for the most bytes it comes to hold, so its bytes stay at
             // one place of memory.
             held: Vec::with_capacity(Self::buffer_of(longest)),
             front: 0,
             unsearched: 0,
-            hold,
-            readings,
+            hold: Self::hold_of(longest),
+            gather: Self::gather_of(longest),
             withheld: false,
         })
     }
@@ -662,50 +804,41 @@ impl StreamCheck {
         longest.saturating_add(1).saturating_mul(ESCAPED_BYTE_SPAN)
     }
 
-    /// The most bytes of a body one search reads, for a longest form of `longest` bytes.
-    const fn slice_of(longest: usize) -> usize {
-        if longest > STREAM_SLICE_BYTES {
-            longest
+    /// The new bytes a search waits for, for a longest form of `longest` bytes:
+    /// [`STREAM_GATHER_BYTES`], or four times the length of that form when that is more. A
+    /// search makes its searchers ready, a work that grows with the forms, and reads the
+    /// last bytes of a reading again: it waits for enough bytes to be the smaller part of
+    /// both.
+    const fn gather_of(longest: usize) -> usize {
+        let forms = longest.saturating_mul(4);
+        if forms > STREAM_GATHER_BYTES {
+            forms
         } else {
-            STREAM_SLICE_BYTES
+            STREAM_GATHER_BYTES
         }
-    }
-
-    /// The most bytes one search adds to a reading, for a longest form of `longest` bytes:
-    /// the bytes that waited for a search (fewer than the longest form has), one slice, and
-    /// an escape that waited for the bytes that follow.
-    const fn added_of(longest: usize) -> usize {
-        longest
-            .saturating_add(Self::slice_of(longest))
-            .saturating_add(OPEN_ESCAPE_BYTES)
     }
 
     /// The room of the buffer of the received bytes, for a longest form of `longest` bytes:
     /// twice what is held back (the bytes that were handed on leave the buffer when they are
-    /// its larger part) and what one search adds.
+    /// its larger part), the bytes that wait for a search and the bytes that start one.
     const fn buffer_of(longest: usize) -> usize {
         Self::hold_of(longest)
             .saturating_mul(2)
-            .saturating_add(Self::added_of(longest))
-    }
-
-    /// The room of the last bytes of one reading, for a longest form of `longest` bytes: the
-    /// bytes it keeps and what one search adds to them.
-    const fn room_of(longest: usize) -> usize {
-        longest.saturating_add(Self::added_of(longest))
+            .saturating_add(Self::gather_of(longest).saturating_mul(2))
     }
 
     /// A bound of the memory the check of the response of a request holds while the body
     /// arrives, for a credential of `credential_bytes` bytes: the buffer of the received
-    /// bytes, and for every reading its last bytes and the two copies a search decodes what
-    /// it adds through. The longest form of a credential is its hexadecimal form, two bytes
-    /// for one.
+    /// bytes, and for every reading its last bytes and what one step of a search adds to it.
+    /// The longest form of a credential is its hexadecimal form, two bytes for one.
     pub const fn memory_bound(credential_bytes: usize) -> usize {
         let longest = credential_bytes.saturating_mul(2);
-        // The body as received, and the layers of the two kinds of escapes.
+        // The bytes as received, and the layers of the two kinds of escapes.
         let readings = 1 + PERCENT_LAYERS + JSON_LAYERS;
-        let reading =
-            Self::room_of(longest).saturating_add(Self::added_of(longest).saturating_mul(2));
+        let reading = longest
+            .saturating_mul(2)
+            .saturating_add(slice_of(longest))
+            .saturating_add(OPEN_ESCAPE_BYTES);
         Self::buffer_of(longest).saturating_add(reading.saturating_mul(readings))
     }
 
@@ -713,138 +846,100 @@ impl StreamCheck {
     /// until enough bytes for a search have arrived. `Err` when the body holds the
     /// credential: the bytes the check held are overwritten, and every later call fails too.
     pub fn take(&mut self, received: &[u8]) -> Result<Vec<u8>, Withheld> {
-        if self.withheld {
-            return Err(Withheld);
-        }
-        let mut handed_on = Vec::new();
-        for slice in received.chunks(Self::slice_of(self.longest)) {
-            self.held.extend_from_slice(slice);
-            self.unsearched = self.unsearched.saturating_add(slice.len());
-            // A search reads the last bytes of every reading again, as many as the longest
-            // form has. It waits for as many new bytes, so the bytes the searches of a body
-            // read stay below twice the bytes of the readings of that body.
-            if self.unsearched >= self.longest.max(1) {
-                if let Err(withheld) = self.search(false) {
-                    handed_on.zeroize();
-                    return Err(withheld);
-                }
-                self.hand_on(self.hold, &mut handed_on);
-            }
-        }
-        Ok(handed_on)
+        self.advance(received, false)
     }
 
     /// The end of the body: returns the bytes that were still held back, after a last search.
     /// An escape that began and did not end is the bytes it is, in every reading.
     pub fn end(&mut self) -> Result<Vec<u8>, Withheld> {
+        self.advance(&[], true)
+    }
+
+    /// Adds `received` to the body, searches the bytes that wait for a search once enough of
+    /// them have arrived (with `end`, all of them: nothing follows), and returns the bytes
+    /// that are handed on: those in front of the bytes held back (with `end`, all of them).
+    fn advance(&mut self, received: &[u8], end: bool) -> Result<Vec<u8>, Withheld> {
         if self.withheld {
             return Err(Withheld);
         }
-        self.search(true)?;
+        // The searchers are made ready once for the searches of this call, when it comes to
+        // one: a call that only adds bytes to the ones that wait makes none.
+        let mut searchers: Option<Search<'_>> = None;
         let mut handed_on = Vec::new();
-        self.hand_on(0, &mut handed_on);
-        Ok(handed_on)
-    }
-
-    /// Moves the bytes that are not handed on yet, but the last `kept` of them, to
-    /// `handed_on`.
-    fn hand_on(&mut self, kept: usize, handed_on: &mut Vec<u8>) {
-        let until = self.held.len().saturating_sub(kept).max(self.front);
-        handed_on.extend_from_slice(self.held.get(self.front..until).unwrap_or_default());
-        self.front = until;
-        // The bytes that were handed on leave the buffer once they are the larger part of
-        // it: a buffer is moved as often as it halves, not with every part.
-        if self.front >= self.held.len() - self.front {
-            self.held.drain(..self.front);
-            self.front = 0;
+        let mut found = false;
+        for bytes in received.chunks(self.gather) {
+            self.held.extend_from_slice(bytes);
+            self.unsearched = self.unsearched.saturating_add(bytes.len());
+            if self.unsearched < self.gather {
+                continue;
+            }
+            let search = searchers.get_or_insert_with(|| self.forms.search());
+            found = Self::search(
+                search,
+                &mut self.readings,
+                &self.held,
+                self.unsearched,
+                false,
+            );
+            if found {
+                break;
+            }
+            self.unsearched = 0;
+            Self::hand_on(&mut self.held, &mut self.front, self.hold, &mut handed_on);
         }
-    }
-
-    /// Searches the bytes no search has read yet, in every reading. With `end`, nothing
-    /// follows them.
-    fn search(&mut self, end: bool) -> Result<(), Withheld> {
-        let fresh_at = self.held.len().saturating_sub(self.unsearched);
-        self.unsearched = 0;
-        let received = self.held.get(fresh_at..).unwrap_or_default();
-        if Self::found(&self.forms, self.longest, &mut self.readings, received, end) {
+        if end && !found {
+            let search = searchers.get_or_insert_with(|| self.forms.search());
+            found = Self::search(
+                search,
+                &mut self.readings,
+                &self.held,
+                self.unsearched,
+                true,
+            );
+            self.unsearched = 0;
+            Self::hand_on(&mut self.held, &mut self.front, 0, &mut handed_on);
+        }
+        if found {
+            // What the check held, and what this call was about to hand on, may hold the
+            // credential: it is overwritten, and nothing more is handed on.
             self.withheld = true;
             self.held.zeroize();
             self.front = 0;
-            self.readings.clear();
+            handed_on.zeroize();
             return Err(Withheld);
         }
-        Ok(())
+        Ok(handed_on)
     }
 
-    /// Adds `received` to every reading and searches each. True when a reading holds a form.
-    fn found(
-        forms: &Forms,
-        longest: usize,
-        readings: &mut [Reading],
-        received: &[u8],
+    /// Moves the bytes of `held` from `front` on, but the last `kept` of them, to
+    /// `handed_on`.
+    fn hand_on(held: &mut Vec<u8>, front: &mut usize, kept: usize, handed_on: &mut Vec<u8>) {
+        let until = held.len().saturating_sub(kept).max(*front);
+        handed_on.extend_from_slice(held.get(*front..until).unwrap_or_default());
+        *front = until;
+        // The bytes that were handed on leave the buffer once they are the larger part of
+        // it: a buffer is moved as often as it halves, not with every part.
+        if *front >= held.len() - *front {
+            held.drain(..*front);
+            *front = 0;
+        }
+    }
+
+    /// Searches the last `unsearched` bytes of `held`, which no search has read yet, in every
+    /// reading. With `end`, nothing follows them. True when a reading holds a form.
+    fn search(
+        search: &Search<'_>,
+        readings: &mut Readings,
+        held: &[u8],
+        unsearched: usize,
         end: bool,
     ) -> bool {
-        // What `received` adds to each reading. A reading that has not begun is the same
-        // bytes as the reading it is decoded from: `same_as` names, for every reading, the
-        // reading whose bytes it is (itself, once it has begun).
-        let mut added: Vec<Vec<u8>> = Vec::with_capacity(readings.len());
-        let mut same_as: Vec<usize> = Vec::with_capacity(readings.len());
-        for index in 0..readings.len() {
-            let origin = readings.get(index).and_then(|reading| reading.origin);
-            let Some((from, escapes)) = origin else {
-                added.push(Vec::new());
-                same_as.push(index);
-                continue;
-            };
-            let source_of = same_as.get(from).copied().unwrap_or(0);
-            let source = match source_of {
-                0 => received,
-                other => added.get(other).map(Vec::as_slice).unwrap_or_default(),
-            };
-            let begun = readings.get(index).is_some_and(|reading| reading.begun);
-            if !begun && !escapes.begin_in(source, end) {
-                added.push(Vec::new());
-                same_as.push(source_of);
-                continue;
-            }
-            // A reading begins as the end of the reading it was the same bytes as, as that
-            // one stood in front of these bytes.
-            let mut before = match begun {
-                true => None,
-                false => readings.get(source_of).map(|reading| reading.tail.clone()),
-            };
-            let decoded = match readings.get_mut(index) {
-                Some(reading) => {
-                    if let Some(before) = &before {
-                        reading.begin(before, Self::room_of(longest));
-                    }
-                    reading.decode(escapes, source, end)
-                }
-                None => Vec::new(),
-            };
-            before.zeroize();
-            added.push(decoded);
-            same_as.push(index);
-        }
-        let mut found = false;
-        for (index, reading) in readings.iter_mut().enumerate() {
-            if same_as.get(index) != Some(&index) {
-                continue;
-            }
-            let fresh = match index {
-                0 => received,
-                other => added.get(other).map(Vec::as_slice).unwrap_or_default(),
-            };
-            if reading.search(forms, longest, fresh) {
-                found = true;
-                break;
-            }
-        }
-        // Decoded bytes may hold the credential: they are overwritten before they are dropped.
-        for bytes in &mut added {
-            bytes.zeroize();
-        }
-        found
+        let fresh_at = held.len().saturating_sub(unsearched);
+        let received = held.get(fresh_at..).unwrap_or_default();
+        received
+            .chunks(slice_of(search.longest))
+            .any(|slice| readings.add(search, slice, false))
+            || (end && readings.add(search, &[], true))
     }
 }
 
@@ -1201,25 +1296,22 @@ mod tests {
         // The longest form of the token is its hexadecimal form.
         let longest = 2 * TOKEN.len();
         let hold = (longest + 1) * ESCAPED_BYTE_SPAN;
-        // Nothing leaves before enough bytes for a search have arrived, and nothing while
-        // the check has no more bytes than it holds back.
+        let gather = STREAM_GATHER_BYTES;
+        assert!(4 * longest < gather && hold < gather);
+        // Nothing leaves before enough bytes for a search have arrived.
         assert_eq!(
-            check.take(&vec![b'a'; longest - 1]).unwrap(),
+            check.take(&vec![b'a'; gather - 1]).unwrap(),
             Vec::<u8>::new()
         );
-        let more = vec![b'a'; hold - (longest - 1)];
-        assert_eq!(check.take(&more).unwrap(), Vec::<u8>::new());
-        // From there on, the bytes of a search push as many bytes out.
-        assert_eq!(
-            check.take(&vec![b'b'; longest]).unwrap(),
-            vec![b'a'; longest]
-        );
+        // With the next byte the search runs, and everything in front of the bytes held back
+        // is handed on.
+        assert_eq!(check.take(b"a").unwrap(), vec![b'a'; gather - hold]);
         // The bytes are held back whatever they are: the beginning of the credential leaves
         // as late as any other bytes.
         let begun = &TOKEN.as_bytes()[..TOKEN.len() - 1];
-        let mut likeness = vec![b'c'; 3 * longest];
+        let mut likeness = vec![b'c'; gather - begun.len()];
         likeness.extend_from_slice(begun);
-        assert_eq!(check.take(&likeness).unwrap().len(), likeness.len());
+        assert_eq!(check.take(&likeness).unwrap().len(), gather);
         // The end hands on the rest.
         assert_eq!(check.end().unwrap().len(), hold);
     }
@@ -1306,8 +1398,20 @@ mod tests {
 
     /// `bytes` with one layer of escapes decoded, `None` when they hold no escape.
     fn decoded(escapes: Escapes, bytes: &[u8]) -> Option<Vec<u8>> {
-        let mut decoded = bytes.to_vec();
-        decode_in_place(escapes, &mut decoded).then_some(decoded)
+        let mut decoded = Vec::new();
+        Reading::of(Some((0, escapes))).decode(escapes, bytes, true, &mut decoded);
+        escapes.begin_in(bytes, true).then_some(decoded)
+    }
+
+    /// Decodes one layer of escapes of `bytes`. False when they hold no escape.
+    fn decode_in_place(escapes: Escapes, bytes: &mut Vec<u8>) -> bool {
+        match decoded(escapes, bytes) {
+            Some(layer) => {
+                *bytes = layer;
+                true
+            }
+            None => false,
+        }
     }
 
     /// The escape of a JSON string for one code unit: a backslash, `u` and four hexadecimal
@@ -1509,30 +1613,39 @@ mod tests {
         let room = check.held.capacity();
         assert_eq!(room, StreamCheck::buffer_of(longest));
         let mut held = 0;
-        for round in 0..60 {
-            // Parts of a few bytes and parts far above one slice of a search.
-            let part = match round % 3 {
+        let mut rested = false;
+        for round in 0..90 {
+            // Parts of a few bytes, parts far above what one search waits for, and parts
+            // without an escape, behind which every reading is the bytes as received again.
+            let part = match round % 4 {
                 0 => noise.some(40),
                 1 => noise.some(3_000),
-                _ => noise.some(300_000),
+                2 => noise.some(300_000),
+                _ => vec![b'x'; 2 * STREAM_GATHER_BYTES],
             };
             let handed_on = check.take(&part).unwrap();
             held = held + part.len() - handed_on.len();
             // What is not handed on is what the check holds back and what waits for a
             // search, and the buffers stay where they are.
-            assert!(held < StreamCheck::hold_of(longest) + longest);
+            assert!(held < StreamCheck::hold_of(longest) + StreamCheck::gather_of(longest));
             assert_eq!(check.held.capacity(), room);
-            for reading in check.readings.iter().filter(|reading| reading.begun) {
+            let readings = &check.readings.readings;
+            rested |= round % 4 == 3 && readings.iter().skip(1).all(|reading| !reading.begun);
+            for reading in readings.iter().filter(|reading| reading.begun) {
                 assert!(reading.tail.len() < longest);
+                assert!(reading.tail.capacity() <= 2 * longest);
                 assert!(reading.open.len() < OPEN_ESCAPE_BYTES);
-                assert_eq!(reading.tail.capacity(), StreamCheck::room_of(longest));
+            }
+            for added in &check.readings.added {
+                assert!(added.capacity() <= 2 * (slice_of(longest) + OPEN_ESCAPE_BYTES));
             }
         }
+        assert!(rested);
         assert_eq!(check.end().unwrap().len(), held);
         // The bound a call reserves for the check of a vault value of the longest length and
-        // of a token of a common length.
-        assert!(StreamCheck::memory_bound(12_000) < 4 * 1024 * 1024);
-        assert!(StreamCheck::memory_bound(200) < 512 * 1024);
+        // of a value of a common length.
+        assert!(StreamCheck::memory_bound(12_000) < 3 * 1024 * 1024);
+        assert!(StreamCheck::memory_bound(200) < 64 * 1024);
     }
 
     #[test]

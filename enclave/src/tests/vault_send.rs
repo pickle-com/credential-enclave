@@ -1161,8 +1161,9 @@ async fn a_streamed_response_that_reflects_the_value_is_cut_in_front_of_the_refl
     let forms = Forms::of(&[Secret::new(VALUE.to_string())]);
     for (name, form) in reflections(VALUE) {
         // The lead is longer than what the search holds back.
-        let lead = format!("{{\"lead\":\"{}\",\"echo\":\"", "0123456789".repeat(400)).into_bytes();
-        assert!(lead.len() > HELD_BACK + LONGEST);
+        let lead =
+            format!("{{\"lead\":\"{}\",\"echo\":\"", "0123456789".repeat(1_000)).into_bytes();
+        assert!(lead.len() > HELD_BACK + GATHER);
         let whole = [lead.as_slice(), &form, b"\",\"tail\":true}"].concat();
         // The body arrives in pieces that end inside the reflection: after its first byte, in
         // its middle, and one byte before its end.
@@ -1310,9 +1311,11 @@ async fn a_value_a_site_sends_back_in_a_header_that_is_not_utf8_is_not_handed_on
     }
 }
 
-/// The length of the longest form of `VALUE`, the hexadecimal one. A search of a streamed
-/// body waits for as many bytes.
+/// The length of the longest form of `VALUE`, the hexadecimal one.
 const LONGEST: usize = 2 * VALUE.len();
+
+/// The new bytes a search of a streamed body waits for, for a value of this length.
+const GATHER: usize = 4 * 1024;
 
 /// How many of its last bytes the search of a streamed body holds back for `VALUE`: the bytes
 /// that one byte more than its longest form can take.
@@ -1345,7 +1348,7 @@ fn body_bytes_so_far(stream: &[u8]) -> usize {
 fn assert_cut_behind(handed_on: &[u8], part: &[u8]) {
     let most = part.len() - HELD_BACK;
     assert!(
-        handed_on.len() <= most && handed_on.len() + LONGEST > most,
+        handed_on.len() <= most && handed_on.len() + GATHER > most,
         "{} of {}",
         handed_on.len(),
         part.len()
@@ -1357,8 +1360,8 @@ fn assert_cut_behind(handed_on: &[u8], part: &[u8]) {
 async fn a_response_is_handed_on_while_it_arrives() {
     // The site sends the head and the first events at once and the last event 600 ms later.
     // The first events are more bytes than the search holds back.
-    let first = b"data: 0123456789\n\n".repeat(400);
-    assert!(first.len() > 2 * HELD_BACK);
+    let first = b"data: 0123456789\n\n".repeat(1_000);
+    assert!(first.len() > HELD_BACK + 2 * GATHER);
     let last = b"data: done\n\n".to_vec();
     let chunks = [first.clone(), last.clone()];
     let provider = site(move |_| {
@@ -1401,7 +1404,7 @@ async fn a_response_is_handed_on_while_it_arrives() {
             // The bytes the search holds back did not leave before the site went on.
             assert!(so_far <= early, "{so_far}");
         }
-        if early_after.is_none() && so_far + LONGEST > early {
+        if early_after.is_none() && so_far + GATHER > early {
             early_after = Some(started.elapsed());
         }
     }
@@ -1425,12 +1428,12 @@ async fn a_body_that_ends_early_or_not_in_time_is_cut_with_its_reason() {
             "timeout_ms": 1000,
         })
     };
-    // A response that announces 10,000 bytes and sends 4,000 of them: more than the search
+    // A response that announces 100,000 bytes and sends 40,000 of them: more than the search
     // holds back.
-    let part = b"0123456789".repeat(400);
-    assert!(part.len() > HELD_BACK + LONGEST);
+    let part = b"0123456789".repeat(4_000);
+    assert!(part.len() > HELD_BACK + GATHER);
     let partial = [
-        b"HTTP/1.1 200 OK\r\ncontent-length: 10000\r\n\r\n".as_slice(),
+        b"HTTP/1.1 200 OK\r\ncontent-length: 100000\r\n\r\n".as_slice(),
         &part,
     ]
     .concat();
