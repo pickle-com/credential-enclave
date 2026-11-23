@@ -161,9 +161,19 @@ binding = UTF-8(JSON {"v":1,"sign":b64u(node signing public key),"seal":b64u(nod
 
 - `binding` is at most 512 bytes long.
 - `role` names the role of a node, and a binding states it by its value. A node of the delegation
-  role holds the delegations of accounts, and its binding has no `role` key. The value `reserve`
-  names the role of a node that holds delegations as well, and that gives and takes delegation
-  transfers: its binding carries the key behind its `log`. The value `forward` names the forward
+  role holds the delegations of accounts and uses their credentials, and its binding has no
+  `role` key. The value `reserve` names the reserve role. A node of that role holds delegations
+  as well: it takes the commands of the apps (section 5) and gives and takes delegation transfers
+  (10.1). It uses no credential: it answers no call that opens or creates a record or calls a
+  provider (enclave.md section 4), so the entries it writes are control entries (7.1), and it
+  connects to its log store alone. Its binding carries the key behind its `log`:
+
+  ```text
+  binding = UTF-8(JSON {"v":1,"sign":b64u(node signing public key),"seal":b64u(node sealing public key),"release":"v1.0.0",
+                        "log":{"bucket":"...","region":"..."},"role":"reserve"})
+  ```
+
+  The value `forward` names the forward
   role (enclave.md section 4): such a node holds no delegation, opens no record, writes no log entry
   and has no node document (7.7). It sends the one request of a use of a vault secret that a node of
   the delegation role sealed to it (10.5). Its binding is the two keys and the release with
@@ -175,7 +185,11 @@ binding = UTF-8(JSON {"v":1,"sign":b64u(node signing public key),"seal":b64u(nod
 
   A `role` of any other value names no role: a document with such a binding is no binding, and
   so is one with the role `forward` and a `log`. A node takes its role once and does not change
-  it, so the `role` of a binding a verifier read holds for as long as that node lives. Whoever
+  it, so the `role` of a binding a verifier read holds for as long as that node lives. A binding
+  without the key is that of a node of the delegation role, or of a node that has taken no role
+  yet and can still take each of the three (enclave.md section 4). Whatever role such a node
+  takes, a user key that is handed to it afterwards is in a node that holds delegations: a node
+  of the forward role answers neither the grant command nor the delegation transfer. Whoever
   hands a user key to a node reads the role by its value: an app before it sends the command
   grant (5.3), and a node before it seals a delegation transfer (10.1), hand a user key to a
   node whose binding has no `role` key or the `role` `reserve`, and to no node whose binding
@@ -1523,43 +1537,107 @@ any other form is not a release tag and has no place in the order.
 
 ### 10.4 The delegation subset
 
-Purpose: the operator runs `pods` nodes and gives the delegation of every account to `copies` of
-them, so that the state of a node and the work of a transfer grow with the accounts of its share
-and not with every account. The nodes are numbered by their ordinal, 0 to `pods - 1`, and the
-operator's backend lists for an account the nodes of its share. The nodes of an account are a
-function of the account and the two integers alone:
+Purpose: a delegation is in the memory of nodes and nowhere else, so the delegation of an account
+is lost when every node that holds it ends at the same time (10.1). The operator gives the
+delegation of every account to a fixed number of its nodes, so that the state of a node and the
+work of a transfer grow with the accounts of its share and not with every account, and it places
+those nodes where they do not end together: in different groups (a group is the place a node runs
+in, for the nodes of the operator its availability zone), and one of them among nodes of the
+reserve role, which no call that uses a credential reaches (4.1).
+
+The operator runs its nodes in pools: the nodes of one role that are numbered together. The nodes
+of a pool are numbered by their ordinal, 0 to `pods - 1`, and every account has its delegation on
+`copies` of them. The placement of a pool is `pods`, `copies` and, for a pool with groups, the
+name of the group of every ordinal (`groups`) and the number of groups an account passes over
+(`skip`). The operator's backend lists for an account the nodes of its share. The nodes of an
+account in a pool are a function of the account and the placement alone:
 
 ```text
-rank(user_id, ordinal) = SHA-256(UTF-8(user_id) || "\n" || UTF-8(ordinal as decimal digits))
+rank(user_id, ordinal)     = SHA-256(UTF-8(user_id) || "\n" || UTF-8(ordinal as decimal digits))
+group_rank(user_id, group) = SHA-256(UTF-8(user_id) || "\n" || "zone" || "\n" || the bytes of the name)
+
+without groups:
 assign(user_id, pods, copies) = the first min(copies, pods) ordinals of 0..pods in the ascending
                                 order of (rank(user_id, ordinal), ordinal)
+
+with groups:
+group_order(user_id)   = the different names of groups in the ascending order of
+                         (group_rank(user_id, name), the bytes of the name)
+first(user_id, group)  = the ordinal whose group is that name and that is first in the ascending
+                         order of (rank(user_id, ordinal), ordinal)
+assign(user_id, pods, copies, groups, skip)
+                       = first(user_id, group) of each of the copies groups at the positions
+                         skip to skip + copies - 1 of group_order(user_id), in that order
 ```
 
-The order of two ranks is the order of their 32 bytes. A node that restarts keeps its ordinal
-and its share. When `pods` grows by one, the accounts whose first `copies` ordinals gain the new
-ordinal hand one ordinal over to it and every other account keeps its ordinals; when `pods`
-shrinks by one, the accounts that held the removed ordinal gain the ordinal that ranks next for
-them and every other account keeps its ordinals.
+The order of two hashes is the order of their 32 bytes. A `user_id` holds no line feed (section
+1) and a group name none either, so no ordinal and no group of any account share the input of
+their hash.
 
-The `subset` object of a request names the nodes the operator runs, the ordinal of the node the
-request is about and the nodes per account:
+- Without groups the assignment is that of the releases before v2.4.0, and `skip` is not read: it
+  counts groups, and such a pool has none. A node that restarts keeps its ordinal and its share.
+  When `pods` grows by one, the accounts whose first `copies` ordinals gain the new ordinal hand
+  one ordinal over to it and every other account keeps its ordinals; when `pods` shrinks by one,
+  the accounts that held the removed ordinal gain the ordinal that ranks next for them and every
+  other account keeps its ordinals.
+- With groups an account has one node in each of `copies` different groups, so the loss of one
+  group takes one node of an account at the most. A node more in a group takes, from a node of
+  that group, the accounts that rank it first there and whose groups of this pool include that
+  group, and every other account keeps its nodes; a node less, in a group that keeps another
+  node, hands its accounts to the node of its group that ranks next for each of them.
+- The order of the groups of an account depends on the account and on the names alone, not on
+  the ordinals. Two pools whose `groups` hold the same names therefore agree on it. With a pool
+  of nodes of the delegation role that takes the first two groups of an account (`copies` 2,
+  `skip` 0) and a pool of nodes of the reserve role that takes its third group (`copies` 1,
+  `skip` 2), an account has its delegation on two nodes that use it and on one node that does
+  not, in three different groups. This rests on the two pools naming the same groups: a pool
+  whose `groups` hold a name the other pool lacks ranks that name among the others, and the
+  positions of the two pools then no longer name different groups.
+
+The `subset` object of a request names the placement of a pool and the ordinal of the node of
+that pool the request is about:
 
 ```text
 subset = {"pods": 3, "pod": 1, "copies": 2}
+subset = {"pods": 6, "pod": 4, "copies": 2, "skip": 0,
+          "groups": ["us-west-2a", "us-west-2b", "us-west-2c", "us-west-2a", "us-west-2b", "us-west-2c"]}
 ```
 
-`pods` is 1 to 1,024, `pod` is below `pods` and `copies` is at least 1; a `copies` at or above
-`pods` names every node. Another value is `invalid_request`. A node does not know its own
-ordinal: the caller names it. A false value from the caller makes a node hold fewer grants, never
-more: the receiving node of a transfer and the node that prunes still verify every other rule.
+| Key | Value |
+| --- | --- |
+| `pods` | An integer of 1 to 1,024 |
+| `pod` | An integer below `pods` |
+| `copies` | An integer of at least 1. Without `groups`, a `copies` at or above `pods` names every node |
+| `groups` | Optional: an array of exactly `pods` strings, the name of the group of every ordinal. A name is 1 to 63 bytes, each an ASCII letter, a digit, `-`, `_` or `.`, and two names are the same group when their bytes are equal. Absent or `null`: a pool without groups |
+| `skip` | Optional: an integer below 4,294,967,296, absent or `null` for 0. With `groups`, the different names are at least `skip + copies`. Without `groups` its value changes nothing |
+
+Another value is `invalid_request`, also `groups` with fewer different names than
+`skip + copies`: an account would have fewer nodes than its copies there, or two of them in one
+group. The caller gives such a pool a placement without groups. Keys the object does not define
+are not read. A node does not know its own ordinal or its group: the caller names them. A false
+value from the caller makes a node hold fewer grants, never more: the receiving node of a
+transfer and the node that prunes still verify every other rule.
+
+A node of a release before v2.4.0 reads the three integers and no other key: for an object with
+`groups` it computes the assignment without groups. A caller therefore sends `groups`, and a
+`skip` that it means, only in calls to nodes of release v2.4.0 or later. An object without
+`groups` selects the same accounts on a node of every release that reads the key `subset`.
 
 | Call | What `subset` does |
 | --- | --- |
-| `peer/export` (`pod` is the ordinal of the receiving node) | The page selects the accounts whose `assign(user_id, pods, copies)` contains `pod` alone, and `limit` counts those. Without the key the page selects every account with a grant, as 10.1 states |
-| `peer/import` (`pod` is the ordinal of this node) | A grant of the envelope whose account's `assign(user_id, pods, copies)` does not contain `pod` is left out: not put in place, no entry, not counted in `imported`. Without the key every grant of the envelope is taken. A giving node of a release without this rule hands every account over, and the receiving node keeps its share all the same |
-| `grants/prune` (`pod` is the ordinal of this node; the key is required) | The node walks its accounts in `user_id` order after `after` and drops the grant, within its time or expired, of every account whose `assign(user_id, pods, copies)` does not contain `pod`: the user key is overwritten with zeros and the account has no grant, as at the end of a grant. No entry is created (nothing is used: the operator chose which nodes hold a key). A revocation marker and the chain of the account stay. The response lists the `user_id` of every pruned account and the `user_id` the walk continues after, the empty string when it reached the end (enclave.md 5.15) |
+| `peer/export` (`pod` is the ordinal of the receiving node, and the placement that of its pool) | The page selects the accounts whose assignment contains `pod` alone, and `limit` counts those. Without the key the page selects every account with a grant, as 10.1 states. The giving node can be a node of another pool than the receiving node: it selects by the placement the call names |
+| `peer/import` (`pod` is the ordinal of this node) | A grant of the envelope whose account's assignment does not contain `pod` is left out: not put in place, no entry, not counted in `imported`. Without the key every grant of the envelope is taken. A giving node of a release without this rule hands every account over, and the receiving node keeps its share all the same |
+| `grants/prune` (`pod` is the ordinal of this node; the key is required) | The node walks its accounts in `user_id` order after `after` and drops the grant, within its time or expired, of every account whose assignment does not contain `pod`: the user key is overwritten with zeros and the account has no grant, as at the end of a grant. No entry is created (nothing is used: the operator chose which nodes hold a key). A revocation marker and the chain of the account stay. The response lists the `user_id` of every pruned account and the `user_id` the walk continues after, the empty string when it reached the end (enclave.md 5.15) |
 
-Test vectors of the assignment; the backend of the operator computes the same function:
+A change of the placement of a pool (a node more or less, a group for every node, another
+`copies`) moves delegations in two steps that the caller orders. First every node whose share
+grows is filled with the subset of the new placement, from the nodes that hold its accounts
+(`peer/export` and `peer/import`): a giving node drops nothing. Then the nodes are pruned with
+the subset of the new placement. Between the two steps an account is on its nodes of both
+placements, so no account has fewer nodes than before at any moment.
+
+Test vectors of the assignment without groups, each as the set of its ordinals; the backend of
+the operator computes the same function:
 
 | `user_id` | `pods` | `copies` | `assign` |
 | --- | --- | --- | --- |
@@ -1569,6 +1647,21 @@ Test vectors of the assignment; the backend of the operator computes the same fu
 | `bob` | 4 | 1 | {1} |
 | `사용자 1` | 6 | 2 | {0, 4} |
 | `carol` | 2 | 5 | {0, 1} |
+
+With groups, each with the order of its groups and the ordinals in the order the account takes
+them (`a`, `b` and `c` stand for `us-west-2a`, `us-west-2b` and `us-west-2c`):
+
+| `user_id` | `groups` | `copies` | `skip` | `group_order` | `assign` |
+| --- | --- | --- | --- | --- | --- |
+| `user-1` | a, b, c, a, b, c | 2 | 0 | c, a, b | 2, 0 |
+| `user-1` | a, b, c | 1 | 2 | c, a, b | 1 |
+| `사용자 1` | c, c, b, b, a, a | 3 | 0 | a, c, b | 4, 0, 2 |
+| `bob` | `zone_1.a`, `Zone-2`, `zone_1.a`, `Zone-2` | 1 | 1 | `Zone-2`, `zone_1.a` | 0 |
+
+The first two rows are the two pools of one fleet: the account `user-1` has the ordinals 2 and 0
+of the first pool, in the groups c and a, and the ordinal 1 of the second pool, in the group b.
+The key `subset` of `protocol/vectors.json` holds these cases and further ones, with the rank
+order of every group, and `subset` objects with the verdict of their form (section 13).
 
 ### 10.5 The use of a vault secret in a request
 
@@ -1744,7 +1837,8 @@ redirect. The response passes rule E4 of the egress policy before any part of it
 | Most accounts in one delegation transfer | 1,000 |
 | Most nodes of a later release that a node hands one grant to (10.1) | 64 |
 | Nodes a delegation subset names (`pods`, 10.4) | 1 to 1,024 |
-| Nodes per account of a delegation subset (`copies`, 10.4) | 1 to `pods` (a larger value names every node) |
+| Nodes per account of a delegation subset (`copies`, 10.4) | Without `groups`: 1 to `pods` (a larger value names every node). With `groups`: at least 1, and `skip + copies` at most the number of different group names |
+| Longest name of a group of a delegation subset (10.4) | 63 bytes |
 | Most pruned accounts in one page of `grants/prune` (10.4, enclave.md 5.15) | 1,000 |
 | Most accounts one `grants/prune` call looks at (`SCAN_LIMIT`) | 10,000 |
 | Longest release statement (10.3) | 16,384 bytes |
@@ -1816,6 +1910,7 @@ name ends with `_text` holds the same value again as UTF-8 text.
 | `sealed_release` | A `release` call that named a key to seal to: `receiver_private` and `seal_to` (the key pair of the caller), `hpke_seed`, `user_id`, `record_id`, `field`, `origin`, `info_text`, `aad_text`, `value_text` and `sealed` | `sealed` opens with `receiver_private` to `value_text`, and does not open under another `aad` |
 | `basic_credentials` | `placeholder_text`, `value_text` and `cases`: values of an `Authorization` header (`authorization_text`) with the `slot` of the half the placeholder is (`basic:user`, `basic:password`, or null for a header a node sends under neither), and `written_text`, the header a node of the forward role writes for the value | The caller of a node tells from a header which of the two slots it is |
 | `header_values` | `placeholder_text`, `refused_schemes` and `cases`: values of the header of a slot `header:<name>` with `valid`, whether a node of the forward role puts the value in the place of the placeholder (10.5) | The same |
+| `subset` | `cases`: a pool of `pods` nodes with `copies` nodes per account, `skip`, and with or without `groups`, each with `assign`, the ordinals that hold the delegation of `user_id` in the order the account takes them; without `groups` also `ranked`, every ordinal in the order of its rank; with `groups` also `group_order`, the groups in the order of the account, and `group_ranked`, the ordinals of each of those groups by their rank. `pools`: the placements of two pools with the same groups (`calls`: `copies` 2, `skip` 0; `reserve`: `copies` 1, `skip` 2) and, for six accounts, the nodes of the account in both and the three groups of those nodes. `objects`: `subset` objects of a request, each with `valid` | A node and the backend of the operator compute `assign` for every case (10.4): the node to select the share of a node, the backend to list the nodes of an account. The nodes of an account in the two pools lie in three different groups. A node reads an object with `valid` true and answers `invalid_request` to one with `valid` false |
 | `transfer` | The keys of the giving node and of the receiving node, `payload_text`, `signed`, `envelope`, `hpke_seed`, the result that the receiving node opened (`grants`), and `cases`: an envelope with a changed ciphertext (`opens: false`), a transfer signed by another key (`signature_valid: false`), an envelope for another node | A receiving node implementation opens the envelope and obtains the same list of grants (10.1) |
 
 Of these, the tests of the app use `key_derivation`, `record`, `signed`, `log` and

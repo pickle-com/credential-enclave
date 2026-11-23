@@ -61,9 +61,15 @@ operator domain (not trusted by the node)        node (AWS Nitro Enclave, memory
 | TOTP seed | When the user enters it | In memory, while `release` computes a code | Ciphertext only. `release` hands out the 6-digit code |
 | Log entry | Opens it with the log decryption key | Creates it, writes it to the log store before the act, keeps it until its storage is acknowledged | Stores it sealed. Cannot delete the copy in the log store for 365 days |
 
-A node of this program takes one of two roles, once. A node of the delegation role
+A node of this program takes one of three roles, once. A node of the delegation role
 is the node of the picture: it holds the delegations of accounts, and it connects to the addresses
-of its provider definitions and to its log store only. A node of the forward role holds no user
+of its provider definitions and to its log store only. A node of the reserve role holds
+delegations as well and uses none of them: it takes the grant and the revoke of an app and hands
+delegations to other nodes and takes them from other nodes, it refuses every call that uses a
+credential, and it connects to its log store only. The operator keeps one copy of the delegation
+of an account on such a node, in another availability zone than the nodes that use it, so that
+what ends the nodes that read provider responses does not end every node that holds the
+delegation (protocol.md 10.4). A node of the forward role holds no user
 key, opens no record and writes no log entry. It receives one value of a vault secret at a time,
 sealed to it by a node of the delegation role of the same measurement together with the one
 request the value is for, and sends that request to the host of that request: a host the account
@@ -114,7 +120,7 @@ Each row holds for a node that runs this source inside a Nitro Enclave (see "How
 | A vault secret says where its value may go, and nobody without the user key can change that. `release` hands the value of a record with the slot `field` out for an origin of the hosts of the record, and the value of a record with slots of a request is handed out by no call | The hosts and the slots of a record of kind `vault_secret` are part of its plaintext, which is encrypted under the user key. The two calls that use the value hold their caller to them, and no record lists the slot `field` beside a slot of a request | [protocol.md](docs/protocol.md) section 6, enclave.md 5.9 and 5.9c, `protocol/src/vault_secret.rs` |
 | A vault secret that goes into a request leaves the node that opened its record only under a seal to a node of the forward role of the same measurement, for one request to a host of the record, with the value at a slot of the record, after the log entry of that request. The node of the forward role sends that request once, and hands on no response that holds the value in a form its search knows | The seal takes the log entry of the use and a node whose attestation was verified. The request that leaves is built from the opened envelope alone: its host, its address and the hash of its body are those of the entry. The response passes the reflection check of the egress policy while it arrives | protocol.md 10.5, enclave.md 5.9c and 5.16, `enclave/src/bound.rs`, `enclave/src/provider_response.rs` |
 | A value the operator domain stored in the vault says so, and its storing has a log entry | `vault/store` writes the plaintext itself, with the source `operator`, under an `id` and a nonce the node draws, and hands the record out after the log store confirmed the entry | enclave.md 5.9b |
-| The node that holds user keys connects to no host an account chose, and the node that does holds no user key | A node takes one role. A node of the forward role refuses every call that takes a command, a delegation transfer or a record, and a node of the delegation role has no call that sends a request outside the addresses of its definitions | protocol.md 4.1, enclave.md section 4, `enclave/src/role.rs` |
+| The node that holds user keys connects to no host an account chose, and the node that does holds no user key | A node takes one role. A node of the forward role refuses every call that takes a command, a delegation transfer or a record, a node of the delegation role has no call that sends a request outside the addresses of its definitions, and a node of the reserve role refuses every call that opens a record or sends a request to a provider | protocol.md 4.1, enclave.md section 4, `enclave/src/role.rs` |
 | The code a node runs is this source, and anyone can check that with the measurements | The build is reproducible: one commit gives the same PCR0, PCR1 and PCR2 on every build. The attestation document of a node, signed under the AWS Nitro Enclaves root certificate, states the three values of the running enclave and binds the public keys of the node. A node does not start in a debug-mode enclave | enclave.md section 11, `build/build.sh`, `protocol/src/attestation.rs`, `verify/` |
 
 A vault value that is typed into a page is protected by the node up to `release`. `release` hands
