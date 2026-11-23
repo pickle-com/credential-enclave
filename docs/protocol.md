@@ -1133,14 +1133,16 @@ entry as a pending entry (a call that waited writes it once more, 7.1):
   confirmation of the entry of that act. An account whose pending entries reached 64 gets no further
   entry from a call that uses a credential (enclave.md 5.14). A pending entry is gone with its node:
   a node that ends, with or without its orderly shutdown, leaves in the store what the store
-  confirmed and nothing else.
+  confirmed and nothing else. A node that halted an account after a fault gives up the pending
+  entries of that account the same way, and performs no act for the account afterwards
+  (enclave.md 3.1).
 - What a missing object means. An object version of the log store cannot be deleted before its
   retention ends. So for an entry that is not in the store, the act that entry describes did not
   take place: the node did not call the provider, did not hand the value out, did not hand the
   record of a stored value out, did not seal the value of a vault secret for a request, did not take
   the user key, did not hand the grant to a later release. This holds for an entry the store never
   confirmed, whose `seq` no key of the store carries, and for whatever a node held in memory when it
-  ended. The two exceptions are the rows without an act that waits: a revoke erased the key, and an
+  ended or when it halted the account. The two exceptions are the rows without an act that waits: a revoke erased the key, and an
   import from an earlier release put the grant in place (the giving node's `grant_transferred_out`
   of that grant is in the store). The store can hold more entries than there were acts, and not
   fewer: an entry whose act failed afterwards or never started (the provider refused, the call
@@ -1708,7 +1710,7 @@ redirect. The response passes rule E4 of the egress policy before any part of it
 | `wrong_node`, `open_failed`, `bad_signature`, `bad_challenge`, `bad_expiry`, `unsupported_policy`, `custody_mismatch` | Failures of command processing (5.3). `custody_mismatch` means that the `custody` of the grant is not the custody of the platform of that node |
 | `peer_unverified` | The attestation response of a peer does not verify, or its platform, its measurement or its log store is not one this node accepts (10.1). The endorsement of a later release fails a check of 10.3. The node a use of a vault secret is to be sealed to is not a node of the forward role of the measurement of this node (10.5) |
 | `user_mismatch` | The `user_id` of a command is not the account of the call (5.3). The `user_id` of a record is not the account of the call (section 6). The account of a pending authorization is not the account of the call |
-| `internal` | A failure of the platform (the attestation device, the random source). The call ends without changing anything |
+| `internal` | A failure of the platform (the attestation device, the random source), or a call that needs the state of an account the node halted after a fault (enclave.md 3.1). The call performed no act, and another node that holds the delegation of the account can take it |
 | `not_configured` | The operator configuration has not arrived yet |
 | `closing` | The orderly shutdown has started |
 | `grant_required` | The account has no grant |

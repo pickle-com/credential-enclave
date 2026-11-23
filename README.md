@@ -78,6 +78,13 @@ that the operator's release key signed the measurements of the later release and
 transparency log recorded the signature, and when the later release lists the earlier one as a
 predecessor.
 
+A node that ends takes the user keys it holds with it, so a fault of the node program (a panic,
+in its own code or in a library it is built with) ends as little of a node as it can have left in
+doubt: the one call it happened in, the state of one account on that node, or, for a fault under
+state every account depends on, the node. A call that ended this way gets no response, and no
+fault makes a node act without the confirmed entry of the act ([enclave.md](docs/enclave.md)
+3.1).
+
 The log store is a set of Amazon S3 buckets with Object Lock. A node writes every log entry there
 itself, over TLS that ends inside the node, with a retention in compliance mode of 365 days, and
 performs the act the entry describes only after the store confirmed the entry. The binding of the
@@ -343,7 +350,7 @@ curl http://127.0.0.1:8080/v1/health
 | Document | Content |
 | --- | --- |
 | [docs/protocol.md](docs/protocol.md) | The keys, the attestation, the commands of the app, the record, the log and the log store, the node statements, the delegation transfer, the failure codes, the test vectors |
-| [docs/enclave.md](docs/enclave.md) | The node program and the host program: the state of a node, every call, the write to the log store, the provider definitions, the address check, the build and the release |
+| [docs/enclave.md](docs/enclave.md) | The node program and the host program: the state of a node, what a fault of the program ends, every call, the write to the log store, the provider definitions, the address check, the build and the release |
 | [docs/egress-policy.md](docs/egress-policy.md) | What can leave a node, the rules E1 to E6, the class of every response field, the limits |
 | [secure-program/README.md](secure-program/README.md) | The secure program of the apps: what it is, what it never does, how a release is made and verified, its limits |
 

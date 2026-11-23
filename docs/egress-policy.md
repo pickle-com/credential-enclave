@@ -291,10 +291,18 @@ the tests of the stream form in `enclave/src/tests/forward.rs`, the tests of
   The last element is one string with a space.
 - The crates of the node deny the lints `print_stdout`, `print_stderr` and `dbg_macro`. The one
   exception is the function `diagnostic` of `enclave/src/main.rs`, which takes a fixed string
-  and reports a failed start. A panic message cannot hold a secret (E1: `Debug`).
+  and reports a failed start.
+- A panic of the node writes nothing of a call. The message of a panic cannot hold a secret
+  (E1: `Debug`), and it can hold another value of the call it happened in, so the panic hook
+  of the node counts the panic and has no output (`faults::silence`, enclave.md 3.1). What
+  leaves of a panic is that count, in `health`, and the end of the connection of its call.
+  When a second panic ends the process while a first one unwinds, the standard library writes
+  one line of its own to the standard error: a fixed string, without the message or the place
+  of either panic.
 
 Fixed by: the type of `ApiError` and `ProviderError`, the lint attributes at the crate roots,
-and the tests of `enclave/src/oauth.rs`.
+the tests of `enclave/src/oauth.rs`, and the two tests of the output of a panic in
+`enclave/src/faults.rs`.
 
 ### E6. No plaintext of the caller becomes a credential, and the kind says where a value came from
 
@@ -384,7 +392,7 @@ calls, and `egress/sink-callers.tsv` (the two callers of K1).
 
 | Call | The fields of a successful response and their classes |
 | --- | --- |
-| `GET /v1/health` | `node` P, `release` P, `platform` P, `custody` P, `role` P, `started_ms` P, `time_ms` P, `configured` P, `closing` P, `accounts` P, `grants` P, `mail_providers` P, `log_store` E and P (`bucket`, `region` and `credentials_expires_ms` E, `shards`, `node_document_ms`, `pending` and `pending_oldest_ms` P), `log` P (seven counts, six counts of failed write attempts under constant cause names, the count of repeated attempts, eight cumulative counts of the time to confirmation under constant bounds, their sum and their count), `load` P (two counts of the calls, two counts of the connections from the backend and their bound, three CPU times and two sizes of the kernel, two counts of the descriptors of the process, and two counts of the connections that wait for the end of their peer; the five of the kernel are null when it exposes none, so is each count of the descriptors when the kernel or the platform gives none, and so are the two counts of the waiting connections on the local platform), `egress` P (the count of opened connections, four counts of failed opens under constant cause names, the counts of repeated opens and of opens in progress, two counts of reused idle connections), `refresh` P (four counts of late token address calls under constant outcome names, the count of those in progress), `state` P (three counts of kept `refresh` responses, merge keys and unconfirmed entries, two counts of idle connections under constant peer names) |
+| `GET /v1/health` | `node` P, `release` P, `platform` P, `custody` P, `role` P, `started_ms` P, `time_ms` P, `configured` P, `closing` P, `accounts` P, `grants` P, `mail_providers` P, `log_store` E and P (`bucket`, `region` and `credentials_expires_ms` E, `shards`, `node_document_ms`, `pending` and `pending_oldest_ms` P), `log` P (seven counts, six counts of failed write attempts under constant cause names, the count of repeated attempts, eight cumulative counts of the time to confirmation under constant bounds, their sum and their count), `load` P (two counts of the calls, two counts of the connections from the backend and their bound, three CPU times and two sizes of the kernel, two counts of the descriptors of the process, two counts of the connections that wait for the end of their peer, and two counts of the faults the node contained: the panics of the program and the accounts it halted; the five of the kernel are null when it exposes none, so is each count of the descriptors when the kernel or the platform gives none, and so are the two counts of the waiting connections on the local platform), `egress` P (the count of opened connections, four counts of failed opens under constant cause names, the counts of repeated opens and of opens in progress, two counts of reused idle connections), `refresh` P (four counts of late token address calls under constant outcome names, the count of those in progress), `state` P (three counts of kept `refresh` responses, merge keys and unconfirmed entries, two counts of idle connections under constant peer names) |
 | `POST /v1/config` | `configured` P, `node_document_ms` P |
 | `POST /v1/attestation` | `v` P, `platform` P, `document` S (the platform signs the two public keys of the node, the release and the nonce of the caller), `node` P, `challenge` P, `release` P, `challenge_statement` S (its body: `type`, `node`, `challenge`, `time_ms` P, the nonce of the caller E) |
 | `POST /v1/messages` | `reply` S (its body: `type`, `ok`, `code`, `node`, `time_ms` P, `user_id`, `challenge`, `key_id`, `not_after_ms` D), `log` P, `grant` D |
