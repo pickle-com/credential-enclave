@@ -1010,6 +1010,52 @@ test("A3: a key of a node id the backend hands out no document for is a read hel
   assert.deepEqual(world.securityStatuses.slice(-1)[0].reasons, ["conflicting_signatures"]);
 });
 
+test("an address of the store that gives a query key twice, or carries a fragment, is not called: the listing of format 3 and the listing of a chain of format 2", async () => {
+  // The listing of the entries of format 3: the prefix of the account stands last, another first.
+  const twice = S.fixture(source);
+  await S.start(twice);
+  const own = (world, letter) => "prefix=" + encodeURIComponent("a3/" + world.userId + "/" + letter + "/");
+  const reread = (fx, rewrite) => fx.world.fault("POST /api/secure/log/read", (request) => ({
+    status: 200, body: {
+      pages: JSON.parse(request.body).pages.map((page) => ({
+        prefix: page.prefix, url: rewrite(fx.world.readUrl(page), page.prefix),
+      })),
+    },
+  }));
+  reread(twice, (url, letter) => url.replace(own(twice.world, letter), "prefix=a3%2Fnone%2F&" + own(twice.world, letter)));
+  let calls = twice.world.sent("S3 ").length;
+  await nextDay(twice);
+  assert.equal(twice.world.state.log.store, "blocked");
+  assert.equal(twice.world.state.log.store_failure, "read:url");
+  assert.equal(twice.world.sent("S3 ").length, calls);
+  for (const rewrite of [(url) => url.replace("/?", "/#?"), (url) => url + "#", (url) => url.replace("&max-keys=1000", "&max-keys=1000&max-keys=1000")]) {
+    const fx = S.fixture(source);
+    await S.start(fx);
+    reread(fx, rewrite);
+    calls = fx.world.sent("S3 ").length;
+    await nextDay(fx);
+    assert.equal(fx.world.state.log.store_failure, "read:url");
+    assert.equal(fx.world.sent("S3 ").length, calls);
+  }
+  // The listing of a chain of format 2.
+  const chain = S.fixture(source, { nodes: 0, legacy: 1 });
+  chain.world.routes.log = "disabled";
+  await S.start(chain);
+  assert.equal(chain.world.state.log.status, "verified");
+  chain.world.fault("POST /api/secure/log/store/listings", (request) => {
+    const answer = JSON.parse(chain.world.api("POST", "/api/secure/log/store/listings", null, request.body).body);
+    for (const item of answer.nodes) {
+      item.list_url = item.list_url.replace("versions&prefix=", "versions&prefix=v1%2Faccounts%2Fnone%2F&prefix=");
+    }
+    return { status: 200, body: answer };
+  });
+  calls = chain.world.sent("S3 ").length;
+  await nextDay(chain);
+  assert.equal(chain.world.state.log.store, "blocked");
+  assert.equal(chain.world.state.log.store_failure, "listings:url");
+  assert.equal(chain.world.sent("S3 ").length, calls);
+});
+
 test("what does not mark the log: an empty seq, a node that ended without a shutdown, an entry of another key", async () => {
   const fx = S.fixture(source);
   await S.start(fx);

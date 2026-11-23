@@ -2322,8 +2322,9 @@
     return "a3/" + userId() + "/" + letter + "/";
   }
 
-  /** Reads the query string of a URL as a table from name to value. */
-  function parseQuery(url) {
+  /** Reads the query string of a URL as a table from name to value. With once true, a query that
+   *  gives a name twice has no table (null). */
+  function parseQuery(url, once) {
     const out = Object.create(null);
     const start = url.indexOf("?");
     if (start < 0) return out;
@@ -2339,16 +2340,22 @@
     for (const pair of query.split("&")) {
       if (pair === "") continue;
       const at = pair.indexOf("=");
-      out[component(at < 0 ? pair : pair.slice(0, at))] = at < 0 ? "" : component(pair.slice(at + 1));
+      const name = component(at < 0 ? pair : pair.slice(0, at));
+      if (once === true && name in out) return null;
+      out[name] = at < 0 ? "" : component(pair.slice(at + 1));
     }
     return out;
   }
 
-  /** The parts of an address: the host (lower case, with its port when one is given), the path
-   *  (percent-decoded) and the query table. The scheme is https, or http as well when plain is
-   *  true. null when the value is not such an address with a host or the path does not decode. */
+  /** The parts of an address of the log store: the host (lower case, with its port when one is
+   *  given), the path (percent-decoded) and the query table. The scheme is https, or http as well
+   *  when plain is true. null when the value is not such an address with a host, the path does
+   *  not decode, the query gives a name twice, or the address carries a fragment: the program
+   *  judges an address by the one value it reads for a name, so an address the store could read
+   *  another way is not called (the store answers a name that is given twice by its first value,
+   *  and a fragment is not part of the request the device sends). */
   function splitUrl(url, plain) {
-    if (typeof url !== "string") return null;
+    if (typeof url !== "string" || url.indexOf("#") >= 0) return null;
     const scheme = url.slice(0, 8) === "https://" ? "https://"
       : plain === true && url.slice(0, 7) === "http://" ? "http://" : null;
     if (scheme === null) return null;
@@ -2369,7 +2376,8 @@
     } catch (error) {
       return null;
     }
-    return { host: host, path: path, query: parseQuery(tail) };
+    const query = parseQuery(tail, true);
+    return query === null ? null : { host: host, path: path, query: query };
   }
 
   /** Whether the query of a presigned address carries only the keys allowed and the signature keys
