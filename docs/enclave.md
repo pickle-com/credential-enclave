@@ -2291,7 +2291,8 @@ host program of a pod of every role lets the calls in progress end before it end
   last part of a response and the end record of its stream may still be on their way to the
   caller, a call that holds no place (`refresh`, `oauth/complete`, `release`, a command of an
   app) ends within the time of this wait, and a call that reached the closed node last gets
-  its answer `closing`.
+  its answer `closing`. It looks at the connections every 20 milliseconds, so the enclave
+  ends as soon as the last of them has ended.
 - The two waits have limits, and the enclave ends after them whatever the node said. The wait
   for the places of the node is 660 seconds at the most, counted from the signal: 600 seconds,
   the longest time limit of a call that holds a place (a `forward` call that asked for its

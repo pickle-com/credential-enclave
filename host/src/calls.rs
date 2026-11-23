@@ -75,8 +75,12 @@ pub const CALLERS_WAIT: Duration = Duration::from_secs(60);
 pub const WAIT_LONGEST: Duration = Duration::from_secs(720);
 const _: () = assert!(WAIT_LONGEST.as_secs() == CALLS_WAIT.as_secs() + CALLERS_WAIT.as_secs());
 
-/// Pause between two looks at the node and at the connections of the callers.
+/// Pause between two looks at the node.
 const POLL_PAUSE: Duration = Duration::from_millis(500);
+/// Pause between two looks at the connections of the callers. The relay takes no further
+/// connection then, and the connections it holds end within milliseconds when nothing but
+/// answers `closing` is on its way: the enclave ends as soon as they have ended.
+const CALLERS_POLL_PAUSE: Duration = Duration::from_millis(20);
 /// Longest round trip of the `close` call.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Longest response body of the `close` call the host program reads.
@@ -274,7 +278,7 @@ impl<'a> Wait<'a> {
                     if now >= limit {
                         return Outcome::CallersLeft { callers: left };
                     }
-                    tokio::time::sleep_until((now + POLL_PAUSE).min(limit)).await;
+                    tokio::time::sleep_until((now + CALLERS_POLL_PAUSE).min(limit)).await;
                 }
                 None => {
                     if now >= limit {
@@ -433,12 +437,19 @@ mod tests {
         assert!(!waiting.is_finished());
 
         // Every connection the relay holds is waited for: the one of the call that was in
-        // progress, and the one that reached the closed node last.
+        // progress, and the one that reached the closed node last. The wait ends within one
+        // look at the connections after the last of them ended.
         drop(caller);
         tokio::time::sleep(Duration::from_secs(5)).await;
         assert!(!waiting.is_finished());
+        let ended = Instant::now();
         drop(refused);
         assert_eq!(waiting.await.unwrap(), Outcome::Finished);
+        assert!(
+            ended.elapsed() <= CALLERS_POLL_PAUSE,
+            "{:?}",
+            ended.elapsed()
+        );
         assert_eq!(callers.held(), 0);
     }
 
