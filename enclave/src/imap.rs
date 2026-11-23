@@ -106,6 +106,13 @@ impl Reader {
             && self.response.marks.is_empty()
     }
 
+    /// The bytes of text the reader holds of the response it stands in: its lines so far,
+    /// without the octets of its literals. Whoever feeds the reader holds this against a
+    /// bound: the reader takes the bytes of a line until the line ends.
+    pub(crate) fn text_bytes(&self) -> usize {
+        self.response.text.len()
+    }
+
     /// Admits the literal the reader reported ([`Step::Literal`]): its octets are taken from
     /// the bytes that follow. The buffer of the literal is made here, with the length that
     /// was declared, so it is not moved while it fills. A length no buffer can have gets a
@@ -585,8 +592,22 @@ fn list(cursor: &mut Cursor<'_>, literals: &mut [Vec<u8>]) -> Option<Response> {
 
 /// `SEARCH number ...`: the numbers. What follows the numbers (the modification sequence of
 /// an extension) is passed over.
+///
+/// The list of the numbers is made with room for every word of the rest of the response, so
+/// it does not grow while it fills: a response of numbers holds its text and four bytes for
+/// each of its words, and a word with the blank in front of it is two bytes of the text at
+/// the least.
 fn search(cursor: &mut Cursor<'_>) -> Vec<u32> {
+    let words = cursor
+        .text
+        .get(cursor.at..)
+        .unwrap_or_default()
+        .split(|byte| *byte == b' ')
+        .filter(|word| !word.is_empty())
+        .count();
     let mut found = Vec::new();
+    // Without the room, the list grows with the numbers it takes.
+    let _ = found.try_reserve_exact(words);
     while let Some(Token::Atom(atom)) = cursor.next(false) {
         match number(atom) {
             Some(value) => found.push(value),

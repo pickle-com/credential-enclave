@@ -315,7 +315,19 @@ async fn harness_and_store_at(
     limits: Limits,
 ) -> (Harness, App, Value, Provider) {
     let provider = quiet_provider_and_log_store().await;
-    let harness = Harness::with_mail_roots(&provider, roots, limits);
+    let (harness, app, record) = harness_over(&provider, roots, address, limits).await;
+    (harness, app, record, provider)
+}
+
+/// [`harness_at`] for a node whose log store is the stand-in `store`: a test that writes the
+/// answers of the store gives its own.
+pub(super) async fn harness_over(
+    store: &Provider,
+    roots: RootCertStore,
+    address: std::net::SocketAddr,
+    limits: Limits,
+) -> (Harness, App, Value) {
+    let harness = Harness::with_mail_roots(store, roots, limits);
     harness.platform.route("imap.naver.com", address);
     harness.platform.route("smtp.naver.com", address);
     harness.use_log_store().await;
@@ -326,7 +338,7 @@ async fn harness_and_store_at(
         "naver_mail",
         &json!({"username":"tester@naver.com","password":PASSWORD}),
     );
-    (harness, app, record, provider)
+    (harness, app, record)
 }
 
 /// The events of the last entry of the chain of the account in the log store.

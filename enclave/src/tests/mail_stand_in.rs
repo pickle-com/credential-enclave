@@ -15,9 +15,9 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 
-use super::mail::{harness_at, request};
+use super::mail::{harness_at, harness_over, request};
 use crate::state::Limits;
-use crate::testing::{App, Harness};
+use crate::testing::{App, Harness, Provider};
 
 /// The message of the mailbox of [`mailbox`].
 pub(super) const MESSAGE: &[u8] = b"From: friend@example.com\r\nTo: tester@naver.com\r\nSubject: a test\r\nMessage-ID: <one@pickle.com>\r\n\r\nhello\r\n";
@@ -282,6 +282,15 @@ impl ImapServer {
     /// record of the mailbox `tester@naver.com`.
     pub(super) async fn harness(&self, limits: Limits) -> (Harness, App, Value) {
         harness_at(self.roots.clone(), self.address, limits).await
+    }
+
+    /// [`ImapServer::harness`] for a node whose log store is the stand-in `store`.
+    pub(super) async fn harness_over(
+        &self,
+        store: &Provider,
+        limits: Limits,
+    ) -> (Harness, App, Value) {
+        harness_over(store, self.roots.clone(), self.address, limits).await
     }
 
     /// The commands the stand-in received, without the numbers of their connections.

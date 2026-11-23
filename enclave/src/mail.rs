@@ -66,12 +66,21 @@ pub(crate) const CALL_BYTES: usize = 64 * 1024;
 pub(crate) const SHARE_STEP_BYTES: usize = 64 * 1024;
 
 /// What a folder listing or a search holds at once per byte of its protocol input. The
-/// responses are read one at a time, and what a call keeps of them is the names of the
-/// folders, the UIDs of the search and the header blocks of at most 50 messages. At its peak
-/// a call holds the bytes it keeps (at most one per byte of input, and three for a number of
-/// the search: the digits of the response and the number), the text it makes of them (the
-/// base64 of a header is 4/3 of its bytes; the JSON of a name is at most twice its bytes), and
-/// the copy the check of the response makes of that text. Six covers each of these sums.
+/// responses are read one at a time, and a response is held as its text while it is read:
+/// the buffer of a text grows by doubling, so a text holds up to three times its bytes at
+/// the moment it grows. What a call keeps of its responses:
+///
+/// - A folder listing keeps the JSON document it answers with, written as the names arrive:
+///   no more than the bytes of the lines the names came in, in a buffer that grows by
+///   doubling. The check of the response makes one copy of the document.
+/// - A search keeps the numbers of its `SEARCH` responses: four bytes for a number, which
+///   is two bytes of text at the least, in a list that has the room for the numbers of one
+///   response when that response is read, and grows by doubling over several responses.
+/// - A search then keeps the header blocks of at most 50 messages, each once (the octets of
+///   its literal, or its base64, which is 4/3 of them), the JSON document it makes of them,
+///   and the copy the check of the response makes of that document.
+///
+/// Six covers the sum of each kind at its peak.
 pub(crate) const LISTING_HELD_PER_BYTE: usize = 6;
 
 /// What a raw message read holds at once per byte of its protocol input: the message, and the
@@ -80,6 +89,24 @@ pub(crate) const MESSAGE_HELD_PER_BYTE: usize = 2;
 
 /// The most bytes a connection to the IMAP server takes from its stream in one read.
 const IMAP_READ_BYTES: usize = 16 * 1024;
+
+/// The longest text of one response of the IMAP server a connection reads: its lines without
+/// the octets of its literals. It is the input bound of a folder listing or of a search,
+/// whose longest response is the line of a search with its numbers. The connection of the
+/// read of one message has a larger input bound, for the literal of the message: the lines
+/// around that literal are short, and a text above this bound ends the connection. The buffer
+/// of a text grows as its bytes arrive, so a text holds more than its bytes while it grows;
+/// the buffer of a literal has the length of the literal from its declaration on.
+pub(crate) const RESPONSE_TEXT_BYTES: usize = LISTING_INPUT_BYTES;
+
+/// What the declaration of a literal counts as, in bytes of protocol input, beside the octets
+/// of the literal. The reader of the responses keeps 32 bytes for every literal of the
+/// response it stands in (the place of the literal in the text, and the head of its buffer),
+/// in two lists that grow by doubling: while one of them grows, the reader holds three times
+/// those bytes. A server can declare a literal without an octet in 4 bytes of a line, so
+/// without this count a response of such declarations would hold many times the bytes it was
+/// counted as.
+pub(crate) const LITERAL_INPUT_BYTES: usize = 96;
 
 /// The share of the body budget of the node that one mail call holds (the budget of
 /// `Limits::body_budget_bytes`, which `forward` reserves its bodies from).
@@ -583,12 +610,8 @@ impl ReadMail {
     }
 }
 
-/// The folders of an account, as a folder listing answers.
-#[derive(Serialize)]
-struct Folders<'a> {
-    folders: Vec<Folder<'a>>,
-}
-
+/// One folder of an account, as a folder listing answers: the listing is the JSON document
+/// `{"folders":[...]}` of these.
 #[derive(Serialize)]
 struct Folder<'a> {
     name: &'a str,
@@ -698,14 +721,7 @@ impl ImapSession {
     /// The commands of one read, and what the read answers with.
     async fn read(&mut self, request: &ReadMail, limits: &Limits) -> Result<MailData, MailError> {
         if request.action == "folders" {
-            let names = self.list_folders().await?;
-            let folders = names
-                .iter()
-                .map(|name| Folder {
-                    name: name.as_str(),
-                })
-                .collect();
-            return Ok(MailData::Json(to_json(&Folders { folders })));
+            return Ok(MailData::Json(self.list_folders().await?));
         }
         let (validity, uid_next) = self.examine(&request.mailbox).await?;
         if request
@@ -781,18 +797,28 @@ impl ImapSession {
         Ok(MailData::Raw(body))
     }
 
-    /// `LIST "" "*"`: the names of the folders of the account.
-    async fn list_folders(&mut self) -> Result<Vec<String>, MailError> {
+    /// `LIST "" "*"`: the folders of the account, as the JSON document a folder listing
+    /// answers with (`{"folders":[{"name":"INBOX"},...]}`). The document is written as the
+    /// names arrive: a listing holds the text it answers with, and no list of the names
+    /// beside it.
+    async fn list_folders(&mut self) -> Result<Vec<u8>, MailError> {
         let tag = self.send("LIST \"\" \"*\"".to_string()).await?;
-        let mut folders = Vec::new();
+        let mut document = b"{\"folders\":[".to_vec();
+        let mut first = true;
         loop {
             let response = self.connection.response().await?;
             match turn(&response, &tag) {
-                Turn::Completed(ok) => return self.completed(ok, folders),
+                Turn::Completed(ok) => {
+                    document.extend_from_slice(b"]}");
+                    return self.completed(ok, document);
+                }
                 Turn::Ended => return Err(MailError::Unavailable),
                 Turn::Data => {
                     if let Response::List(name) = response {
-                        folders.push(name);
+                        if !std::mem::take(&mut first) {
+                            document.push(b',');
+                        }
+                        document.extend_from_slice(&to_json(&Folder { name: &name }));
                     }
                 }
             }
@@ -895,7 +921,12 @@ impl ImapSession {
                 Turn::Ended => return Err(MailError::Unavailable),
                 Turn::Data => {
                     if let Response::Search(values) = response {
-                        uids.extend(values);
+                        // The numbers of the first response are the list: no copy of them
+                        // is made.
+                        match uids.is_empty() {
+                            true => uids = values,
+                            false => uids.extend(values),
+                        }
                     }
                 }
             }
@@ -1056,19 +1087,24 @@ impl Smtp {
 /// What one call may take from an IMAP connection, and what that costs the call.
 ///
 /// `left` bounds the protocol input: the connection delivers no byte above it. `accounted` is
-/// what the call holds of its input: the bytes it took, and the octets still to come of a
-/// literal the server declared. The buffer of a literal has the length of the literal from
-/// the moment the literal is admitted, so a declaration alone commits that memory. Two rules
-/// keep it inside the share of the call. A declaration above what is left of the input bound
-/// ends the input: its octets could not arrive under the bound. And the share of the call is
+/// what the call holds of its input: the bytes it took, the octets still to come of a
+/// literal the server declared, and [`LITERAL_INPUT_BYTES`] for every declaration. The buffer
+/// of a literal has the length of the literal from the moment the literal is admitted, so a
+/// declaration alone commits that memory, and the reader keeps a place for every literal it
+/// admitted, whatever its length. Three rules keep both inside the share of the call. A
+/// declaration above what is left of the input bound ends the input: its octets could not
+/// arrive under the bound. Every declaration takes [`LITERAL_INPUT_BYTES`] of the input bound,
+/// so the literals of a connection are bounded like its bytes. And the share of the call is
 /// raised to `accounted` times what the call holds per byte ([`Share`]) before the buffer of
 /// a literal is made and before a byte that was taken is read. So what a connection holds of
-/// its input never exceeds its input bound, whatever length a server declares, and the call
-/// holds a share of the body budget for all of it.
+/// its input never exceeds its input bound, whatever a server declares, and the call holds a
+/// share of the body budget for all of it.
 pub(crate) struct Allowance {
-    /// Bytes the call may still take from the connection.
+    /// Bytes the call may still take from the connection, and bytes its declarations may
+    /// still count as.
     left: usize,
-    /// Bytes the call took, and the octets still to come of a declared literal.
+    /// Bytes the call took, the octets still to come of a declared literal, and what its
+    /// declarations counted as.
     accounted: usize,
     /// The octets of declared literals that are accounted and were not taken yet.
     outstanding: usize,
@@ -1124,16 +1160,25 @@ impl Allowance {
         self.cover()
     }
 
-    /// Accounts the `missing` octets of a literal the server declared that the connection
-    /// has not delivered yet. They arrive within what is left of the bound, or not at all:
-    /// a declaration above it is [`MailError::Unavailable`].
+    /// Accounts the declaration of a literal: [`LITERAL_INPUT_BYTES`] of the input bound for
+    /// the declaration itself, and the `missing` octets of the literal that the connection
+    /// has not delivered yet. The octets arrive within what is left of the bound, or not at
+    /// all: a declaration the bound has no room for is [`MailError::Unavailable`].
     fn declare(&mut self, missing: u64) -> Result<(), MailError> {
+        let left = self
+            .left
+            .checked_sub(LITERAL_INPUT_BYTES)
+            .ok_or(MailError::Unavailable)?;
         let missing = usize::try_from(missing)
             .ok()
-            .filter(|missing| *missing <= self.left)
+            .filter(|missing| *missing <= left)
             .ok_or(MailError::Unavailable)?;
+        self.left = left;
         self.outstanding = self.outstanding.saturating_add(missing);
-        self.accounted = self.accounted.saturating_add(missing);
+        self.accounted = self
+            .accounted
+            .saturating_add(LITERAL_INPUT_BYTES)
+            .saturating_add(missing);
         self.cover()
     }
 }
@@ -1274,8 +1319,9 @@ impl ImapConnection {
     }
 
     /// The next response of the server. The end of the connection, the end of the input the
-    /// call may take, and bytes that are no response are [`MailError::Unavailable`]; a body
-    /// budget without room for the input is [`MailError::Capacity`].
+    /// call may take, a text above [`RESPONSE_TEXT_BYTES`] and bytes that are no response are
+    /// [`MailError::Unavailable`]; a body budget without room for the input is
+    /// [`MailError::Capacity`].
     async fn response(&mut self) -> Result<Response, MailError> {
         loop {
             let ahead = self.buffer.get(self.taken..).unwrap_or_default();
@@ -1305,7 +1351,13 @@ impl ImapConnection {
                         .declare(octets.saturating_sub(ahead))?;
                     self.reader.admit();
                 }
-                Step::More => self.fill().await?,
+                Step::More => {
+                    // The reader took every byte of the buffer and stands inside a response.
+                    if self.reader.text_bytes() > RESPONSE_TEXT_BYTES {
+                        return Err(MailError::Unavailable);
+                    }
+                    self.fill().await?;
+                }
             }
         }
     }
@@ -1419,23 +1471,64 @@ mod tests {
 
     #[test]
     fn the_input_of_a_connection_ends_at_a_literal_that_cannot_arrive_within_its_bound() {
-        // The bound leaves room for the 40 octets of a declared literal: they are accounted
-        // when they are declared, and not again when they arrive.
-        let mut allowance = Allowance::reserved(64);
+        let declaration = LITERAL_INPUT_BYTES;
+        // The bound leaves room for a declaration and for the 40 octets it declares: both
+        // are accounted when the literal is declared, and the octets not again when they
+        // arrive.
+        let mut allowance = Allowance::reserved(64 + declaration);
         assert!(allowance.take(24).is_ok());
         assert!(allowance.declare(40).is_ok());
-        assert_eq!((allowance.accounted, allowance.left), (64, 40));
+        assert_eq!(
+            (allowance.accounted, allowance.left),
+            (64 + declaration, 40)
+        );
         assert!(allowance.take(40).is_ok());
-        assert_eq!((allowance.accounted, allowance.left), (64, 0));
+        assert_eq!((allowance.accounted, allowance.left), (64 + declaration, 0));
         // One byte less of the bound, and the literal cannot arrive: the input ends at the
         // declaration.
-        let mut allowance = Allowance::reserved(63);
+        let mut allowance = Allowance::reserved(63 + declaration);
         assert!(allowance.take(24).is_ok());
         assert!(matches!(allowance.declare(40), Err(MailError::Unavailable)));
         assert!(matches!(
             allowance.declare(u64::MAX),
             Err(MailError::Unavailable)
         ));
+    }
+
+    /// A declaration counts as input whatever length it declares: a server that declares
+    /// literals without an octet reaches the input bound by their number, and the share of
+    /// the call covers what the reader keeps for each of them.
+    #[test]
+    fn the_declarations_of_a_connection_are_bounded_by_its_input_bound() {
+        let declaration = LITERAL_INPUT_BYTES;
+        // Each declaration here is 4 bytes of a line: `{0}` and its line feed.
+        let mut allowance = Allowance::reserved(10 * (4 + declaration));
+        for _ in 0..10 {
+            assert!(allowance.take(4).is_ok());
+            assert!(allowance.declare(0).is_ok());
+        }
+        assert_eq!(
+            (allowance.accounted, allowance.left),
+            (10 * (4 + declaration), 0)
+        );
+        assert!(matches!(allowance.declare(0), Err(MailError::Unavailable)));
+
+        // The share of a call follows its declarations as it follows its bytes: two bytes of
+        // share per byte the declarations were counted as. The declarations that are counted
+        // as one step of input take two steps of the budget, and one more takes the third.
+        let step = SHARE_STEP_BYTES;
+        let budget = Arc::new(Semaphore::new(8 * step));
+        let held = |budget: &Arc<Semaphore>| 8 * step - budget.available_permits();
+        let share = Share::admit(&budget, 0).unwrap();
+        let mut allowance = Allowance::charged(1 << 20, 2, &share);
+        for _ in 0..step / (4 + declaration) {
+            assert!(allowance.take(4).is_ok());
+            assert!(allowance.declare(0).is_ok());
+        }
+        assert_eq!(held(&budget), 2 * step);
+        assert!(allowance.take(4).is_ok());
+        assert!(allowance.declare(0).is_ok());
+        assert_eq!(held(&budget), 3 * step);
     }
 
     #[test]

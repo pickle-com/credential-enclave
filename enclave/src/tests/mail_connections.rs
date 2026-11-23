@@ -1,8 +1,10 @@
 //! The connections of the mail reads: what a read holds of the body budget of the node while
-//! it reads, and the responses of a server that a read reads.
+//! it reads, the bounds of what it takes from its connection, the responses of a server that a
+//! read reads, and the sessions a node keeps between the reads of a record.
 
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
@@ -10,9 +12,11 @@ use tokio::sync::Semaphore;
 
 use super::mail::{frame_of, request, PASSWORD};
 use super::mail_stand_in::{fetch_literal, mailbox, until, Act, Answer, ImapServer, MESSAGE};
+use super::provider_and_log_store;
 use crate::mail;
-use crate::state::Limits;
-use crate::testing::Harness;
+use crate::state::{lock, Limits};
+use crate::subset::assign;
+use crate::testing::{Harness, Provider, Reply};
 
 /// A message of `bytes` bytes.
 fn message_of(bytes: usize) -> Vec<u8> {
@@ -237,6 +241,126 @@ async fn a_read_ends_where_the_body_budget_has_no_room_for_its_input() {
     }
     assert_eq!(harness.last_seq("mail-user"), entries);
     assert_eq!(server.connections.load(Ordering::SeqCst), connections);
+}
+
+/// A read takes no more from its connection than the bounds of the connection: the bytes of
+/// its input, the text of one response, and the declarations of literals, each of which
+/// counts as input whatever length it declares. A server that sends more ends the read with
+/// `provider_unreachable`; the same responses below the bounds are read, so it is the bound
+/// that ends the read and not the form of the response.
+#[tokio::test]
+async fn the_input_of_a_read_ends_at_the_bounds_of_its_connection() {
+    /// `bytes` bytes of `SEARCH` responses that name the message 7, in lines of 1,000 bytes.
+    fn search_lines(bytes: usize) -> Vec<u8> {
+        let line = format!("* SEARCH{}\r\n", " 7".repeat(495));
+        line.as_bytes().repeat(bytes / line.len())
+    }
+    /// A `FETCH` response of the message 7 whose text holds a quoted string of `bytes` bytes.
+    fn long_text(bytes: usize) -> Vec<u8> {
+        format!(
+            "* 1 FETCH (X \"{}\" UID 7 RFC822.SIZE {})\r\n",
+            "a".repeat(bytes),
+            MESSAGE.len()
+        )
+        .into_bytes()
+    }
+    /// A `FETCH` response of the message 7 with a list of `count` literals without an octet.
+    fn empty_literals(count: usize) -> Vec<u8> {
+        let mut response = b"* 1 FETCH (X (".to_vec();
+        response.extend_from_slice(&b"{0}\r\n".repeat(count));
+        response
+            .extend_from_slice(format!(") UID 7 RFC822.SIZE {})\r\n", MESSAGE.len()).as_bytes());
+        response
+    }
+
+    const MIB: usize = 1024 * 1024;
+    // The folder a read names says what the stand-in sends: the folder of the last `EXAMINE`.
+    let examined: Arc<Mutex<String>> = Arc::default();
+    let server = {
+        let examined = examined.clone();
+        ImapServer::start(move |command| {
+            let text = command.text;
+            if let Some(folder) = text.strip_prefix("EXAMINE ") {
+                *lock(&examined) = folder.trim_matches('"').to_string();
+                return Answer::ok("* 1 EXISTS\r\n* OK [UIDVALIDITY 42] valid\r\n");
+            }
+            let examined = lock(&examined).clone();
+            let (kind, size) = examined.split_once(' ').unwrap_or_default();
+            let size: usize = size.parse().unwrap_or_default();
+            match kind {
+                "numbers" if text.starts_with("UID SEARCH ") => Answer::ok(search_lines(size)),
+                "text" if text.ends_with(" (UID RFC822.SIZE)") => Answer::ok(long_text(size)),
+                "literals" if text.ends_with(" (UID RFC822.SIZE)") => {
+                    Answer::ok(empty_literals(size))
+                }
+                _ => mailbox(command),
+            }
+        })
+        .await
+    };
+    let (harness, _app, record) = server.harness(Limits::default()).await;
+    // The input bound of the connection of a message read: the body limit and 1 MiB.
+    let message_input = harness.node.limits.body_bytes + MIB;
+    assert!(message_input > 16 * MIB);
+    // The declarations that connection has room for: each counts as 96 bytes of input beside
+    // the 5 bytes of its line. On the line they are a twentieth of the bound.
+    let declarations = message_input / (96 + 5);
+
+    for (action, folder, read) in [
+        // The input bound of a search: 4 MiB.
+        ("search", format!("numbers {}", 3 * MIB), true),
+        ("search", format!("numbers {}", 5 * MIB), false),
+        // The text of one response, 4 MiB, on a connection whose input bound is far above it.
+        ("read", format!("text {}", 3 * MIB), true),
+        ("read", format!("text {}", 4 * MIB + 64 * 1024), false),
+        // The declarations of a connection.
+        ("read", format!("literals {}", declarations / 8), true),
+        ("read", format!("literals {}", declarations + 1), false),
+    ] {
+        let connections = server.ended.load(Ordering::SeqCst);
+        let (status, meta, body) = request(
+            &harness,
+            &record,
+            "read",
+            json!({"action":action,"mailbox":folder,"uid":7,"uid_validity":42}),
+            b"",
+        )
+        .await;
+        match read {
+            true => {
+                assert_eq!(
+                    (status, meta["status"].as_u64()),
+                    (200, Some(200)),
+                    "{folder}: {meta}"
+                );
+                match action {
+                    "search" => assert_eq!(
+                        serde_json::from_slice::<Value>(&body).unwrap()["messages"][0]["uid"],
+                        7,
+                        "{folder}"
+                    ),
+                    _ => assert_eq!(body, MESSAGE, "{folder}"),
+                }
+            }
+            false => {
+                assert_eq!(
+                    (status, meta["code"].as_str()),
+                    (502, Some("provider_unreachable")),
+                    "{folder}: {meta}"
+                );
+                // The connection ended inside a response: it carries no further read.
+                until("the connection of the read ended", || {
+                    server.ended.load(Ordering::SeqCst) == connections + 1
+                })
+                .await;
+            }
+        }
+        assert_eq!(
+            harness.node.body_budget.available_permits(),
+            harness.node.limits.body_budget_bytes,
+            "{folder}"
+        );
+    }
 }
 
 /// Three responses a server can send that end the parser of the crate imap-proto 0.17.0 with
@@ -902,4 +1026,175 @@ async fn a_refused_login_ends_the_kept_session_of_its_record() {
         request(&harness, &record, "read", json!({"action":"folders"}), b"").await;
     assert_eq!((status, meta["status"].as_u64()), (200, Some(401)));
     assert_eq!(server.logins.load(Ordering::SeqCst), 3);
+}
+
+/// What the stand-in of the log store of [`scripted_store`] does with the write of an entry.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EntryWrite {
+    /// Confirms it.
+    Confirm,
+    /// Confirms it after this pause.
+    ConfirmAfter(Duration),
+    /// Refuses it.
+    Refuse,
+}
+
+/// A stand-in for the log store that answers the write of an entry by what the first value
+/// says at that moment, and the moment it received the first write of an entry whose
+/// confirmation it held back. It confirms the write of a node document.
+async fn scripted_store() -> (
+    Provider,
+    Arc<Mutex<EntryWrite>>,
+    Arc<Mutex<Option<Instant>>>,
+) {
+    let entries = Arc::new(Mutex::new(EntryWrite::Confirm));
+    let held_at: Arc<Mutex<Option<Instant>>> = Arc::default();
+    let store = {
+        let (entries, held_at) = (entries.clone(), held_at.clone());
+        provider_and_log_store(
+            |_| Reply::json(200, &json!({"ok": true})),
+            move |seen| {
+                let confirmed = Reply::with_body(
+                    200,
+                    &[("etag", "\"0\""), ("x-amz-version-id", "version")],
+                    b"",
+                )
+                .keep_alive();
+                if !seen.target.contains("/a3/") {
+                    return confirmed;
+                }
+                match *lock(&entries) {
+                    EntryWrite::Confirm => confirmed,
+                    EntryWrite::ConfirmAfter(pause) => {
+                        lock(&held_at).get_or_insert_with(Instant::now);
+                        confirmed.after(pause)
+                    }
+                    EntryWrite::Refuse => {
+                        Reply::with_body(500, &[], b"<Error></Error>").keep_alive()
+                    }
+                }
+            },
+        )
+        .await
+    };
+    (store, entries, held_at)
+}
+
+/// A read reaches the session the node keeps for its record only after the log store
+/// confirmed the entry of the read: while the store holds back its confirmation, the server
+/// receives no command of the read.
+#[tokio::test]
+async fn a_read_sends_no_command_over_a_kept_session_before_the_store_confirmed_its_entry() {
+    const HELD: Duration = Duration::from_millis(300);
+    let (store, entries, held_at) = scripted_store().await;
+    // The moment each command arrived at the server.
+    let arrivals: Arc<Mutex<Vec<Instant>>> = Arc::default();
+    let server = {
+        let arrivals = arrivals.clone();
+        ImapServer::start(move |command| {
+            lock(&arrivals).push(Instant::now());
+            mailbox(command)
+        })
+        .await
+    };
+    let (harness, _app, record) = server.harness_over(&store, Limits::default()).await;
+    list_folders(&harness, &record).await;
+    assert_eq!(sessions_of(&harness).await, (0, 1));
+    let commands = server.texts().len();
+
+    *lock(&entries) = EntryWrite::ConfirmAfter(HELD);
+    list_folders(&harness, &record).await;
+    // The read went over the kept session: one command more, and no login.
+    assert_eq!(server.texts().len(), commands + 1);
+    assert_eq!(server.logins.load(Ordering::SeqCst), 1);
+    assert_eq!(sessions_of(&harness).await, (1, 1));
+    // Its command arrived after the store answered the write of its entry, which the store
+    // did no earlier than `HELD` after it received that write.
+    let held_at = lock(&held_at).expect("the store received the write of the entry");
+    let arrived = *lock(&arrivals).last().unwrap();
+    assert!(
+        arrived.duration_since(held_at) >= HELD,
+        "{:?}",
+        arrived.duration_since(held_at)
+    );
+}
+
+/// A read whose entry the log store does not confirm ends with `log_store_unavailable`: it
+/// sends nothing to the server, and the session the node keeps for its record stays where it
+/// was, for the next read.
+#[tokio::test]
+async fn a_read_whose_entry_the_store_refuses_reaches_no_kept_session() {
+    let (store, entries, _) = scripted_store().await;
+    let server = ImapServer::start(mailbox).await;
+    // A node that writes every entry once: a refusal ends the write of an entry at once.
+    let limits = Limits {
+        log_write: Duration::from_millis(450),
+        ..Limits::default()
+    };
+    let (harness, _app, record) = server.harness_over(&store, limits).await;
+    list_folders(&harness, &record).await;
+    assert_eq!(sessions_of(&harness).await, (0, 1));
+    let (commands, seq) = (server.texts().len(), harness.last_seq("mail-user"));
+
+    *lock(&entries) = EntryWrite::Refuse;
+    let (status, meta, _) =
+        request(&harness, &record, "read", json!({"action":"folders"}), b"").await;
+    assert_eq!(
+        (status, meta["code"].as_str()),
+        (503, Some("log_store_unavailable"))
+    );
+    // The node created the entry of the read, the store did not confirm it, and the read
+    // did not take place: the server received nothing, and the session was not taken.
+    assert_eq!(harness.last_seq("mail-user"), seq + 1);
+    assert_eq!(server.texts().len(), commands);
+    assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+    assert_eq!(sessions_of(&harness).await, (0, 1));
+
+    // The store confirms again: the next read goes over the session.
+    *lock(&entries) = EntryWrite::Confirm;
+    list_folders(&harness, &record).await;
+    assert_eq!(server.texts().len(), commands + 1);
+    assert_eq!(server.logins.load(Ordering::SeqCst), 1);
+    assert_eq!(sessions_of(&harness).await, (1, 1));
+}
+
+/// A grant the node dropped (`grants/prune`) leaves no session a read reaches: a read of the
+/// account is refused before it comes to a session, and the session the node kept under that
+/// grant ends at its idle time without a call.
+#[tokio::test]
+async fn no_read_goes_over_a_session_after_its_grant_was_pruned() {
+    let server = ImapServer::start(mailbox).await;
+    let (harness, app, record) = server.harness(Limits::default()).await;
+    harness.node.egress.mail_sessions.set_limits(300, 300_000);
+    list_folders(&harness, &record).await;
+    assert_eq!(sessions_of(&harness).await, (0, 1));
+
+    // The node of the two that does not hold the account under a subset of one copy.
+    let holders = assign("mail-user", 2, 1);
+    let other = (0..2).find(|pod| !holders.contains(pod)).unwrap();
+    let (status, pruned) = harness
+        .post(
+            "/v1/grants/prune",
+            json!({"subset": {"pods": 2, "pod": other, "copies": 1}, "limit": 10}),
+        )
+        .await;
+    assert_eq!((status, &pruned["pruned"]), (200, &json!(["mail-user"])));
+    let commands = server.texts().len();
+    let (status, meta, _) =
+        request(&harness, &record, "read", json!({"action":"folders"}), b"").await;
+    assert_eq!(
+        (status, meta["code"].as_str()),
+        (409, Some("grant_required"))
+    );
+    assert_eq!(server.texts().len(), commands);
+    until("the session of the pruned grant ended", || {
+        server.ended.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert_eq!(sessions_of(&harness).await, (0, 0));
+
+    // The grant of the account on this node again: its first read logs in.
+    app.grant(&harness).await;
+    list_folders(&harness, &record).await;
+    assert_eq!(server.logins.load(Ordering::SeqCst), 2);
 }
