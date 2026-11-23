@@ -1505,7 +1505,7 @@ Test vectors of the assignment; the backend of the operator computes the same fu
 | `response_withheld` | A provider response failed a check of rule E4 of the egress policy (egress-policy.md) and was not handed on. A repeated call does not change the outcome |
 | `too_large` | A body above the limit (64 MiB each for a request and a response; for `forward/batch`, the bodies of the results together). An event that no entry can hold (7.1) |
 | `log_store_unavailable` | The log store did not confirm the entry of the call, or the node cannot write to it: it has no log store in its configuration, no credentials within their time, or no node document in the store (7.6, 7.7). The act of the call did not take place. A repeated call can succeed |
-| `capacity_unavailable` | The mail call could not immediately reserve its slot or body budget. No credential was opened and no provider request was sent. A later call can succeed |
+| `capacity_unavailable` | The node has no room for the call. A `forward` or `forward/batch` call was not admitted within its wait, or a mail call could not take its place or the first part of its share of the body budget at once: no credential was opened and no provider request was sent. A `mail/read` also ends with this code while it reads, when the body budget has no room for its input (the message `the node has no room for the mail the call reads; the call changed nothing`): that call has its entry, read from the mailbox and changed nothing in it (enclave.md, "Mail call surface"). A later call can succeed |
 
 ## 12. Constants
 
@@ -1537,6 +1537,7 @@ Test vectors of the assignment; the backend of the operator computes the same fu
 | Provider requests of a node in flight at once (`PROVIDER_INFLIGHT`) | 512 |
 | Idle connections of a node to its log store (`LOG_STORE_IDLE_CONNECTIONS`) | 32 |
 | Idle connections of a node to one provider host for one account, and their idle time (`PROVIDER_IDLE_CONNECTIONS`, `PROVIDER_IDLE_MS`) | 8, 30 seconds |
+| Authenticated IMAP sessions a node keeps between the reads of a record: per record and per node, the time one is kept after its last read, and the longest time after its login at which one is handed to a read (`KEPT_SESSIONS`, `SESSION_IDLE_MS`, `SESSION_LOGIN_MS`, enclave.md, "Mail call surface") | 1 and 1,024, 30 seconds, 300 seconds |
 | Pending entries of an account at which a call that uses a credential creates no entry (`PENDING_ENTRIES`) | 64 |
 | Interval of the sweep of a node, which writes the pending entries of every account again (`SWEEP_INTERVAL`) | 30 seconds |
 | Retention of an object of the log store (Object Lock), expiry of the bucket lifecycle (`LOG_RETENTION_DAYS`, `LOG_EXPIRY_DAYS`) | 365 days from the node time of the write, 400 days |
@@ -1604,6 +1605,23 @@ against its attested grant ledger and every binding against the record it create
 `record_id`, `provider`, `operation`, typed `request`, `body_bytes`, `body_sha256` and `context`.
 The act starts only after the log store confirmed it. This is an attempted act, not a delivery
 receipt. Message content and application passwords are not in the event.
+
+Every mail call has its own event. A node keeps the authenticated IMAP session of a read for
+the next read of the same record, for at most 30 seconds between two reads and 300 seconds
+after its login, so a read does not always log in. A read that goes over a kept session
+creates its event and waits for the confirmation of its entry like a read that logs in, and
+takes the session only then: the reads of an account that reached its mailbox are the
+`mail_request` events of operation `read` on its chain, whether or not each of them logged in.
+
+A node reads the plaintext of a mail record after that confirmation, and not before. What it
+judges before it creates the event is the same for every value the record can hold: the grant,
+the AEAD verification, the kind and the provider of the record, and the form of the request. A
+plaintext that is no JSON object, a `username` that is no NAVER account name, and a `password`
+shorter than 8 bytes, longer than 256 bytes or with a control character are `record_invalid`
+after the entry; a submission whose `From` field is not the account of the record is refused
+after the entry as well (enclave.md, "Mail call surface"). In both cases nothing goes to the
+provider, and the entry stays on the chain as the entry of a mail call that did not take place.
+So no answer of a mail call depends on the content of a record unless an entry records the call.
 
 ## The secure program release
 
