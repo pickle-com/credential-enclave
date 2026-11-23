@@ -280,6 +280,9 @@ pub struct Load {
     /// P: a count, the connections from the backend closed at accept because the bound of
     /// open connections was reached, since the node started.
     pub inbound_refused: u64,
+    /// P: a count, the bound of open connections from the backend in force: the node computed
+    /// it at its start from the memory of the kernel it runs in.
+    pub inbound_limit: usize,
     /// P: the CPU time in user mode of the kernel the node runs in since it booted, in
     /// milliseconds. Null when the kernel exposes no procfs value.
     pub cpu_user_ms: Option<u64>,
@@ -298,6 +301,13 @@ pub struct Load {
     /// P: a count, the soft limit of open file descriptors of the node process in force. Null
     /// when the platform has no such limit.
     pub descriptors_limit: Option<u64>,
+    /// P: a count, the connections the node is done with and keeps open until their peer
+    /// reported the end of its bytes, at this moment. Null on a platform that closes a
+    /// connection when the node is done with it.
+    pub lingering_connections: Option<usize>,
+    /// P: a count, the connections the node closed before their peer had reported its end,
+    /// since the node started. Null in the same way.
+    pub lingering_cut: Option<u64>,
 }
 
 /// `GET /v1/health`.
@@ -613,12 +623,32 @@ pub(super) fn json_error(status: StatusCode, body: &ErrorBody<'_>) -> Response {
     json_bytes(status, to_json(body))
 }
 
-/// A response frame of `forward`: the meta, then the provider body. The share of the body
-/// budget that the provider body occupies is held until the frame was written out.
+/// A response frame of `forward`: the meta, then the provider body. Every part keeps the
+/// share of the body budget that the provider body occupies ([`BudgetedPart`]), so the share
+/// is held until the frame was written out.
 struct FrameBody {
     parts: VecDeque<Bytes>,
     remaining: u64,
-    _budget: OwnedSemaphorePermit,
+}
+
+/// A part of a response frame together with the share of the body budget of the node the
+/// frame occupies. The share is free when the last part of the frame is dropped.
+///
+/// The body of a response is handed to the HTTP connection of the caller, which drops the
+/// body object as soon as it has taken every part, before a byte is written. What it keeps
+/// until its stream took the bytes is the parts themselves (a stream that writes several
+/// buffers in one write: `crate::platform::Attempted`, and a TCP stream). So the share
+/// travels with the bytes, and a peer that takes a response slowly, or not at all, holds
+/// memory the budget counts: for as long as the node waits for it (`inbound_idle`).
+struct BudgetedPart {
+    bytes: Bytes,
+    _budget: std::sync::Arc<OwnedSemaphorePermit>,
+}
+
+impl AsRef<[u8]> for BudgetedPart {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 impl HttpBody for FrameBody {
@@ -697,11 +727,17 @@ pub fn forward_batch_frame(results: Vec<BatchResult>, budget: OwnedSemaphorePerm
 
 fn frame_response(parts: Vec<Bytes>, budget: OwnedSemaphorePermit) -> Response {
     let remaining = parts.iter().map(|part| part.len() as u64).sum();
-    let frame_body = FrameBody {
-        parts: VecDeque::from(parts),
-        remaining,
-        _budget: budget,
-    };
+    let budget = std::sync::Arc::new(budget);
+    let parts = parts
+        .into_iter()
+        .map(|bytes| {
+            Bytes::from_owner(BudgetedPart {
+                bytes,
+                _budget: budget.clone(),
+            })
+        })
+        .collect();
+    let frame_body = FrameBody { parts, remaining };
     let mut response = Response::new(Body::new(frame_body));
     *response.status_mut() = StatusCode::OK;
     response

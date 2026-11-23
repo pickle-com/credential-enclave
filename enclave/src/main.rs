@@ -19,6 +19,7 @@ mod clock;
 mod descriptors;
 mod egress;
 mod frame;
+mod inbound;
 mod lineage;
 mod load;
 mod log_store;
@@ -102,7 +103,14 @@ async fn run(platform_name: &str) -> Result<(), PlatformError> {
     let _ = descriptors::raise_limit();
     let platform = platform::select(platform_name)?;
     let clock = Arc::new(Clock::start(platform.as_ref())?);
-    let limits = Limits::default();
+    // The connections from the backend the node holds at once are a share of the memory of
+    // the kernel it runs in (enclave.md section 8). `health` reports the bound in force.
+    let limits = Limits {
+        inbound_connections: inbound::connections_for(
+            load::read_memory().map(|memory| memory.total),
+        ),
+        ..Limits::default()
+    };
     let node = Arc::new(Node::start(
         platform.clone(),
         clock.clone(),
@@ -112,7 +120,7 @@ async fn run(platform_name: &str) -> Result<(), PlatformError> {
         Lineage::embedded(RELEASE)?,
         limits,
     )?);
-    let listener = platform.listen().await?;
+    let listener = platform.listen(node.limits.inbound_connections).await?;
     tokio::spawn(keep_calibrating(platform, clock));
     tokio::spawn(log_store::keep_sweeping(node.clone()));
     tokio::select! {

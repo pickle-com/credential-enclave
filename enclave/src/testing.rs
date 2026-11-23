@@ -159,7 +159,7 @@ impl Platform for TestPlatform {
         system_time_ms()
     }
 
-    async fn listen(&self) -> Result<Listener, PlatformError> {
+    async fn listen(&self, _connections: usize) -> Result<Listener, PlatformError> {
         TcpListener::bind("127.0.0.1:0")
             .await
             .map(Listener::Tcp)
