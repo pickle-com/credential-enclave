@@ -2578,6 +2578,71 @@ for each p of hashes, in order:
 pass when sn == 0 and r == root_hash
 ```
 
+### The attestation of the source
+
+The GitHub release of a tag `secure-program-v{N}` carries two attestations that GitHub made for
+runs the push of the tag started. Each is a Sigstore bundle: an in-toto statement whose subject is
+`secure-program.js` with the SHA-256 of the file, signed under a certificate of the public
+Sigstore instance that states the workflow run, and recorded in Rekor.
+
+| Bundle | What made it | What its certificate states as the signer |
+| --- | --- | --- |
+| `secure-program-provenance.sigstore.json` | The job of `secure-program-release.yml` (enclave.md 11.2), a file of the commit of the tag | That workflow at the tag |
+| `secure-program-source.sigstore.json` | The job of `secure-program-source.yml` at one fixed commit, which `secure-program-source-release.yml` calls | `secure-program-source.yml` at that fixed commit |
+
+The first is made by a workflow of the commit of the tag, so that commit decides what its job
+attests. The second is the attestation of the source: it is made by a workflow whose file a
+verifier fixes by its commit, and the commit of the tag decides nothing of it but the bytes of the
+program file. The rules of that workflow:
+
+- It is started only by the call of another workflow and takes no input and no secret.
+- Its job runs on a runner GitHub hosts. It reads the bytes of `secure-program/secure-program.js`
+  as the commit that started the run holds them: the blob of that commit, a regular file, read
+  from the object and not from a file of a working tree (the conversions a working tree applies
+  do not reach it). It attests the SHA-256 of those bytes.
+- It runs no script and no action of that commit. The actions it uses are fixed by their commits
+  in its own file.
+
+GitHub writes the identity of the run into the token the job signs with, and Fulcio copies it
+into the certificate (the extensions `1.3.6.1.4.1.57264.1.{n}`). For a job of a workflow that
+another workflow called, the certificate states the called workflow as what signed and the caller
+as what started the run:
+
+| Extension | Name | What it states for the attestation of the source |
+| --- | --- | --- |
+| 8 | Issuer | `https://token.actions.githubusercontent.com` |
+| 9 | Build Signer URI | The workflow of the job: `.github/workflows/secure-program-source.yml` of this repository |
+| 10 | Build Signer Digest | The commit of that workflow file: the fixed commit the caller names |
+| 11 | Runner Environment | `github-hosted` |
+| 12, 15, 17 | Source Repository URI, its identifier, the identifier of its owner | The repository in which the run took place: `https://github.com/pickle-com/credential-enclave`, `1400118248`, `151645824` |
+| 13 | Source Repository Digest | The commit that started the run: the commit of the tag |
+| 14 | Source Repository Ref | `refs/tags/secure-program-v{N}` |
+| 18 | Build Config URI | The workflow that started the run, at the tag |
+| 20 | Build Trigger | `push` |
+| 22 | Source Repository Visibility At Signing | `public` |
+
+A verifier that requires the extensions 8, 9, 10, 11, 12, 14, 15, 17, 20 and 22 of a certificate
+that chains to the certificate authority of the public Sigstore instance, verifies the signature
+of the bundle and its entry of the log, and compares the SHA-256 of the subject with the SHA-256
+of a program, has verified this: the bytes of that program are the bytes of
+`secure-program/secure-program.js` of the commit the certificate states (extension 13), and that
+commit was pushed to this repository under the tag `secure-program-v{N}` while the repository was
+public. Anyone can read that commit by its hash and compare:
+
+```bash
+git show {commit}:secure-program/secure-program.js | sha256sum
+```
+
+What the attestation does not show: that the commit is on a branch of this repository, or that
+the tag still names it (a tag can be moved or removed after the run; the certificate and the entry
+of the log keep the hash of the commit), and what the program of that commit does, which is for
+the reader of the file. It rests on GitHub writing the true identity of the run into the token, on
+the certificate authority and on the log. Another repository can call the same workflow: the
+certificate of such a run states that repository (extensions 12, 15 and 17), and a run on a runner
+of a repository owner states `self-hosted` (extension 11).
+
+The ten checks of "The verification" read neither attestation.
+
 ### What the app requires
 
 An app runs the verification for a program that the backend served, in a release build. The

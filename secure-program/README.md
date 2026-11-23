@@ -137,7 +137,12 @@ store), `presentSecret` and `promptSecret` (where a vault value passes the app),
 2. The workflow writes the release statement of the tag with [`statement.py`](statement.py) (it
    stops when the N of the tag is not the `VERSION` of the file), creates the GitHub release of the
    tag, and uploads `secure-program.js`, `statement.json` and a build provenance attestation of
-   the file (`secure-program-provenance.sigstore.json`).
+   the file (`secure-program-provenance.sigstore.json`). The same push starts
+   [`.github/workflows/secure-program-source-release.yml`](../.github/workflows/secure-program-source-release.yml),
+   which calls [`secure-program-source.yml`](../.github/workflows/secure-program-source.yml) at a
+   fixed commit: that workflow attests the SHA-256 of the file as the commit of the tag holds it,
+   and the bundle is uploaded to the same release as `secure-program-source.sigstore.json`
+   (docs/protocol.md, "The attestation of the source").
 3. The operator, on the machine that holds the release key, rebuilds the statement from the tag,
    compares it byte for byte with the `statement.json` of the GitHub release, signs it with the
    release key (ECDSA P-256 with SHA-256) and records the signature in Rekor as a `hashedrekord`
@@ -184,6 +189,22 @@ The bytes of the statement, the entry and the release proof are specified in
 4. The app runs that release: the encryption key screen of the app shows "Security program v{N}"
    and the SHA-256 of the program it loaded, and they equal `version` and `sha256` of the
    statement.
+
+5. The file is the file of the commit of the tag, attested by the workflow at its fixed commit
+   (the commit after the `@` in `secure-program-source-release.yml`):
+
+   ```bash
+   gh attestation verify secure-program.js --repo pickle-com/credential-enclave \
+     --bundle secure-program-source.sigstore.json \
+     --signer-workflow pickle-com/credential-enclave/.github/workflows/secure-program-source.yml \
+     --signer-digest {the fixed commit} \
+     --source-ref refs/tags/secure-program-v{N} --deny-self-hosted-runners
+   ```
+
+   The certificate of the bundle states the commit of the tag as the Source Repository Digest
+   (the extension `1.3.6.1.4.1.57264.1.13`), and
+   `git show {that commit}:secure-program/secure-program.js | sha256sum` equals the SHA-256 of
+   the subject.
 
 ## The tests
 
