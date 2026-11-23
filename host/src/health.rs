@@ -1038,7 +1038,7 @@ mod tests {
     use tokio::net::TcpStream;
 
     use super::*;
-    use crate::egress::{Allowlist, Outcome, TcpOutbound};
+    use crate::egress::{Allowlist, Outcome, Reach, TcpOutbound};
     use crate::testing::{
         health_body, health_body_with_descriptors, health_body_with_egress_and_refresh,
         health_body_with_limit, health_body_with_load, Behavior, FakeNode,
@@ -1833,9 +1833,9 @@ mod tests {
         // both, whatever the node answers.
         let (mut node_side, inbound) = tokio::io::duplex(64);
         node_side.write_all(b"\n").await.unwrap();
-        let allowlist = Allowlist::from_definitions(crate::DEFINITIONS).unwrap();
+        let reach = Reach::Listed(Allowlist::from_definitions(crate::DEFINITIONS).unwrap());
         assert_eq!(
-            crate::egress::relay(inbound, &allowlist, &TcpOutbound, &counters).await,
+            crate::egress::relay(inbound, &reach, &TcpOutbound, &counters).await,
             Outcome::Malformed
         );
         let relay_listener = relay::listen_tcp(

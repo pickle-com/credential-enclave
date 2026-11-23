@@ -11,9 +11,11 @@
 //!    the environment gives it (`launch`);
 //! 2. relays TCP 8080 to the listener of the node, vsock 16:8080 (`relay`);
 //! 3. relays the outbound connections of the node, vsock port 8443, to port 443 of the hosts of
-//!    the provider definitions and of the log store (`egress`);
-//! 4. sends the operator configuration, with the log store of the node, to the node once the
-//!    node answers (`config`);
+//!    the provider definitions and of the log store or, for a node of the forward role, to
+//!    port 443 of any host at a public address (`egress`);
+//! 4. sends the operator configuration to the node once the node answers: the client values
+//!    and the log store of a node of the delegation role, or the role of a node of the
+//!    forward role (`config`);
 //! 5. reports the state of the node, the life of the enclave and the counts of the two relays
 //!    on TCP 9091, `/healthz`, `/livez` and `/metrics` (`health`);
 //! 6. watches the enclave with `nitro-cli describe-enclaves` every 10 seconds (`watch`): when
@@ -32,10 +34,14 @@
 //! the calls to the node and the TLS ciphertext between the node and the providers. It holds
 //! the OAuth client values of the operator and never writes them to its output.
 //!
-//! Environment: `CHARACTER_API_BASE_URL` and the client values of `config`,
-//! `CREDENTIAL_ENCLAVE_LOG_BUCKET` and `CREDENTIAL_ENCLAVE_LOG_REGION` of the log store,
-//! `CREDENTIAL_ENCLAVE_MEMORY_MIB` of `launch`, and `CREDENTIAL_ENCLAVE_DRAIN_URL`,
-//! `CREDENTIAL_ENCLAVE_DRAIN_TOKEN` and `CREDENTIAL_ENCLAVE_POD_NAME` of `drain`.
+//! Environment: `CREDENTIAL_ENCLAVE_ROLE` (the role of the node of the pod: not set for the
+//! delegation role, `forward` for the forward role), `CHARACTER_API_BASE_URL` and the client
+//! values of `config`, `CREDENTIAL_ENCLAVE_LOG_BUCKET` and `CREDENTIAL_ENCLAVE_LOG_REGION` of
+//! the log store, `CREDENTIAL_ENCLAVE_MEMORY_MIB` of `launch`, and
+//! `CREDENTIAL_ENCLAVE_DRAIN_URL`, `CREDENTIAL_ENCLAVE_DRAIN_TOKEN` and
+//! `CREDENTIAL_ENCLAVE_POD_NAME` of `drain`. A pod of the forward role reads the first and the
+//! memory, and none of the others: its node holds no client value, has no log store and
+//! holds nothing a shutdown could collect.
 
 #![forbid(unsafe_code)]
 // The host program is built to abort on a panic, and the enclave ends with it. So:
@@ -80,9 +86,9 @@ use std::time::Duration;
 
 use tokio::signal::unix::{signal, Signal, SignalKind};
 
-use config::{ConfigError, Injection, LogStore};
+use config::{ConfigError, Injection, LogStore, Role};
 use drain::Drain;
-use egress::{Allowlist, EgressCounters, TcpOutbound};
+use egress::{Allowlist, EgressCounters, Reach, TcpOutbound};
 use relay::{InboundCounters, NodeConnector, VsockListener, VsockNode};
 use watch::EnclaveWatch;
 
@@ -235,6 +241,10 @@ const DRAIN_SUBCOMMAND_MARGIN: Duration = Duration::from_secs(10);
 /// signal that follows makes the same call again (the backend takes a repeated call for the
 /// same pod as the same collection).
 async fn run_drain() {
+    if Role::from_variables(&variable) == Ok(Role::Forward) {
+        log("drain: skipped, a node of the forward role holds nothing to collect");
+        return;
+    }
     let drain = match Drain::from_variables(&variable) {
         Ok(Some(drain)) => drain,
         Ok(None) => {
@@ -267,16 +277,15 @@ async fn run_drain() {
     }
 }
 
-async fn run() -> Result<(), String> {
-    log(&format!("version {}", env!("CARGO_PKG_VERSION")));
-    log(&launch::release_line(Path::new(launch::MEASUREMENTS_PATH)));
-    match descriptors::raise_limit() {
-        Some((soft, hard)) => log(&format!("descriptors: limit {soft}, hard limit {hard}")),
-        None => log("descriptors: the platform has no limit of open descriptors"),
-    }
-    let memory_mib = launch::memory_mib(&variable)?;
-    log(&format!("enclave: memory {memory_mib} MiB, 2 vCPUs"));
+/// What the role of the node of the pod decides before the enclave starts: what the egress
+/// relay connects to, the operator configuration, and the shutdown collection call.
+type Setup = (Reach, Result<Vec<u8>, ConfigError>, Option<Drain>);
 
+/// The setup of a pod of the delegation role: the egress relay connects to the hosts of the
+/// provider definitions and of the log store, the configuration carries the client values of
+/// the operator and the log store, and a shutdown asks the backend to collect the state of the
+/// node.
+fn delegation_setup() -> Result<Setup, String> {
     let allowlist = Allowlist::from_definitions(DEFINITIONS)?;
     let providers = config::provider_names(DEFINITIONS)?;
     log(&format!(
@@ -309,10 +318,10 @@ async fn run() -> Result<(), String> {
             None
         }
     };
-    let allowlist = Arc::new(match &log_store {
+    let allowlist = match &log_store {
         Some(log_store) => allowlist.with_log_store(log_store.host()),
         None => allowlist,
-    });
+    };
     log(&config::summary(&providers, &variable));
     let operator_config = config::operator_config(&providers, &variable, log_store.as_ref());
     let drain = match Drain::from_variables(&variable) {
@@ -324,6 +333,37 @@ async fn run() -> Result<(), String> {
             ));
             None
         }
+    };
+    Ok((Reach::Listed(allowlist), operator_config, drain))
+}
+
+/// The setup of a pod of the forward role: the egress relay connects to port 443 of any host
+/// at a public address, the configuration names the role and nothing else, and there is no
+/// shutdown collection call. A node of the forward role holds no client value, has no log
+/// store and holds no delegation: the variables of those are not read.
+fn forward_setup() -> Setup {
+    log("role: forward, the node sends the requests of secret uses");
+    log("egress: port 443 of any host at a public address");
+    log("log store: none, a node of the forward role writes no entry");
+    log("operator configuration: the forward role, no client value");
+    log("shutdown collection: none, a node of the forward role holds nothing to collect");
+    (Reach::PublicHosts, Ok(config::forward_config()), None)
+}
+
+async fn run() -> Result<(), String> {
+    log(&format!("version {}", env!("CARGO_PKG_VERSION")));
+    log(&launch::release_line(Path::new(launch::MEASUREMENTS_PATH)));
+    match descriptors::raise_limit() {
+        Some((soft, hard)) => log(&format!("descriptors: limit {soft}, hard limit {hard}")),
+        None => log("descriptors: the platform has no limit of open descriptors"),
+    }
+    let memory_mib = launch::memory_mib(&variable)?;
+    log(&format!("enclave: memory {memory_mib} MiB, 2 vCPUs"));
+
+    let role = Role::from_variables(&variable)?;
+    let (reach, operator_config, drain) = match role {
+        Role::Delegation => delegation_setup()?,
+        Role::Forward => forward_setup(),
     };
 
     // The handlers exist before the enclave starts: from here on a termination signal is
@@ -369,7 +409,7 @@ async fn run() -> Result<(), String> {
     ));
     tokio::spawn(egress::serve(
         egress_listener,
-        allowlist,
+        Arc::new(reach),
         Arc::new(TcpOutbound),
         counters,
     ));
@@ -388,26 +428,48 @@ async fn run() -> Result<(), String> {
     }
     log("enclave: started");
 
-    tokio::spawn(relay::serve(
-        inbound_listener,
-        node.clone(),
-        inbound_counters.clone(),
-    ));
-    tokio::spawn(report_first_answer(node.clone(), inbound_counters));
+    tokio::spawn(report_first_answer(node.clone(), inbound_counters.clone()));
     tokio::spawn(watch::keep_watching(
         watch.clone(),
         launch::describe_enclaves,
         node.clone(),
     ));
-    match operator_config {
-        Ok(body) => {
+    match (role, operator_config) {
+        // A node takes its role once, and a call of the delegation role gives a node without
+        // a role that role. So the node of this pod takes the forward role before the inbound
+        // relay lets a caller reach it, and a node that refuses the role ends the program:
+        // the container starts again with a new enclave.
+        (Role::Forward, Ok(body)) => {
+            let injection = tokio::select! {
+                injection = config::inject(node.as_ref(), &body) => injection,
+                signal_name = termination(&mut terminate, &mut interrupt) => {
+                    return Err(format!("{signal_name} before the node took its role"));
+                }
+            };
+            match injection {
+                Injection::Accepted => {
+                    log("operator configuration: the node took the forward role")
+                }
+                Injection::Rejected { status, code } => {
+                    return Err(format!(
+                        "the node refused the forward role with status {status} {code}"
+                    ));
+                }
+            }
+        }
+        (Role::Delegation, Ok(body)) => {
             tokio::spawn(configure(node.clone(), body));
         }
-        Err(ConfigError::NoBaseUrl) => log(&format!(
+        (_, Err(ConfigError::NoBaseUrl)) => log(&format!(
             "operator configuration: not sent, {} is not set",
             config::BASE_URL_VARIABLE
         )),
     }
+    tokio::spawn(relay::serve(
+        inbound_listener,
+        node.clone(),
+        inbound_counters,
+    ));
 
     // The host program ends on a termination signal, or when the watch confirmed that the
     // enclave ended on its own: the state of the node is gone then, and the one recovery is
@@ -429,7 +491,9 @@ async fn run() -> Result<(), String> {
         Ok(Err(reason)) => log(&format!("enclave: describe-enclaves failed, {reason}")),
         Err(_) => log("enclave: describe-enclaves did not complete"),
     }
-    collect(drain, node.as_ref()).await;
+    if role == Role::Delegation {
+        collect(drain, node.as_ref()).await;
+    }
     log("enclave: ending");
     match tokio::task::spawn_blocking(launch::terminate_enclave).await {
         Ok(Ok(())) => log("enclave: ended"),

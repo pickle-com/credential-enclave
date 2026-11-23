@@ -8,6 +8,11 @@
 //! The configuration also names the log store of the node, when the environment names one:
 //! the bucket the node writes its log entries to, and the region of that bucket.
 //!
+//! That is the configuration of a node of the delegation role. The environment of a pod can
+//! name the forward role instead ([`Role`]): the configuration of such a node is
+//! `{"role":"forward"}` and nothing else, because a node of the forward role holds no client
+//! value and has no log store.
+//!
 //! The client values are secrets of the operator. They are never part of a log line.
 
 use std::time::Duration;
@@ -28,6 +33,39 @@ pub const BASE_URL_VARIABLE: &str = "CHARACTER_API_BASE_URL";
 pub const LOG_BUCKET_VARIABLE: &str = "CREDENTIAL_ENCLAVE_LOG_BUCKET";
 /// The variable with the region of that bucket.
 pub const LOG_REGION_VARIABLE: &str = "CREDENTIAL_ENCLAVE_LOG_REGION";
+
+/// The variable that names the role of the node of the pod.
+pub const ROLE_VARIABLE: &str = "CREDENTIAL_ENCLAVE_ROLE";
+
+/// The role of the node of a pod (enclave.md section 9), as the environment of the pod names
+/// it. The host program gives its node the role with the operator configuration, and its
+/// egress relay connects to what a node of that role connects to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// The node holds the delegations of accounts: `CREDENTIAL_ENCLAVE_ROLE` is not set.
+    Delegation,
+    /// The node sends the requests of secret uses: `CREDENTIAL_ENCLAVE_ROLE` is `forward`.
+    Forward,
+}
+
+impl Role {
+    /// Reads the role from the environment. A value other than `forward` is an error: the
+    /// host program starts no enclave whose role it cannot tell.
+    pub fn from_variables(variable: &dyn Fn(&str) -> Option<String>) -> Result<Role, String> {
+        match variable(ROLE_VARIABLE).as_deref() {
+            None => Ok(Role::Delegation),
+            Some("forward") => Ok(Role::Forward),
+            Some(other) => Err(format!(
+                "{ROLE_VARIABLE} is {other:?}: the one role it names is forward, and a pod of the delegation role does not set it"
+            )),
+        }
+    }
+}
+
+/// The body of `POST /v1/config` of a node of the forward role (enclave.md 5.1).
+pub fn forward_config() -> Vec<u8> {
+    json!({"role": "forward"}).to_string().into_bytes()
+}
 
 /// The log store the environment names (enclave.md 5.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -550,6 +588,26 @@ mod tests {
                 "{region}"
             );
         }
+    }
+
+    #[test]
+    fn the_role_of_a_pod_is_the_delegation_role_unless_its_environment_names_forward() {
+        assert_eq!(
+            Role::from_variables(&environment(&[])),
+            Ok(Role::Delegation)
+        );
+        // An empty value is a missing value.
+        let empty = environment(&[("CREDENTIAL_ENCLAVE_ROLE", "")]);
+        assert_eq!(Role::from_variables(&empty), Ok(Role::Delegation));
+        let forward = environment(&[("CREDENTIAL_ENCLAVE_ROLE", "forward")]);
+        assert_eq!(Role::from_variables(&forward), Ok(Role::Forward));
+        for other in ["Forward", "FORWARD", "delegation", "forward ", "1", "true"] {
+            let named = environment(&[("CREDENTIAL_ENCLAVE_ROLE", other)]);
+            let refused = Role::from_variables(&named).unwrap_err();
+            assert!(refused.contains("CREDENTIAL_ENCLAVE_ROLE"), "{refused}");
+        }
+        // The configuration of a node of the forward role names its role and nothing else.
+        assert_eq!(forward_config(), b"{\"role\":\"forward\"}");
     }
 
     #[test]
