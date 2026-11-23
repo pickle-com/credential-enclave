@@ -865,7 +865,8 @@ which form it holds. The order of the processing:
     text inside a JSON string), and each reading is searched for the credential as it is, in
     base64 or base64url (each of the three byte alignments, without padding) and in hexadecimal
     (lower or upper case). A header whose bytes are not UTF-8 is searched as those bytes as well.
-    The credential is searched for without the white space at its ends. A form shorter than 8
+    A header name, which the node hands on in lower case, is searched without regard to the case
+    of its letters. The credential is searched for without the white space at its ends. A form shorter than 8
     bytes is not searched for. A failed check is
     `response_withheld`: no part of the response leaves. The event `provider_request` is already
     on the chain, because the request went to the provider.

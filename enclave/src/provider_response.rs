@@ -124,8 +124,7 @@ pub fn check(
     mut body: Vec<u8>,
 ) -> Result<CheckedResponse, Withheld> {
     let forms = Forms::of(std::slice::from_ref(credential));
-    let search = forms.search();
-    if coded(&headers) || search.found_in(&body) || search.found_in_head(&headers) {
+    if coded(&headers) || forms.found_in(&body) || forms.found_in_head(&headers) {
         // What is withheld may hold the credential: the copy this check was given is
         // overwritten before it is dropped.
         body.zeroize();
@@ -196,7 +195,25 @@ impl Forms {
                 .map(|form| memmem::Finder::new(form.expose_secret().as_slice()))
                 .collect(),
             longest: self.longest(),
+            folds: false,
         }
+    }
+
+    /// The forms with every ASCII letter in lower case: what a header name is searched for
+    /// ([`Forms::found_in_head`]). Two forms that differ in the case of their letters alone
+    /// are one form here.
+    fn folded(&self) -> Forms {
+        let mut kept: Vec<Secret<Vec<u8>>> = Vec::new();
+        for form in &self.0 {
+            let folded = Secret::new(form.expose_secret().to_ascii_lowercase());
+            let known = kept
+                .iter()
+                .any(|other| other.expose_secret() == folded.expose_secret());
+            if !known {
+                kept.push(folded);
+            }
+        }
+        Forms(kept)
     }
 
     /// True when `received` hold one of the forms: as received, under percent escapes, or
@@ -205,9 +222,29 @@ impl Forms {
         self.search().found_in(received)
     }
 
-    /// True when the name or the value of a response header holds one of the forms
-    /// ([`Forms::found_in`]): in the text the node hands on, or in the bytes the sender wrote
-    /// when that text is their reading as ISO 8859-1.
+    /// True when a header name or a header value of `headers` holds one of the forms.
+    ///
+    /// A header value is searched as it is handed on ([`Search::found_in_header`]). A header
+    /// name is searched without regard to the case of its ASCII letters: the HTTP client of
+    /// a node hands a header name on in lower case, whatever its sender wrote. A credential
+    /// with an upper case letter stands in such a name as other bytes than its own, and
+    /// whoever receives the name holds the credential but for the case of its letters. So
+    /// each reading of a name is compared in lower case with the forms in lower case.
+    fn found_in_head(&self, headers: &[(String, String)]) -> bool {
+        let values = self.search();
+        let folded = self.folded();
+        let names = Search {
+            folds: true,
+            ..folded.search()
+        };
+        headers
+            .iter()
+            .any(|(name, value)| names.found_in(name.as_bytes()) || values.found_in_header(value))
+    }
+
+    /// True when the value of a response header holds one of the forms ([`Forms::found_in`]):
+    /// in the text the node hands on, or in the bytes the sender wrote when that text is their
+    /// reading as ISO 8859-1.
     #[cfg(test)]
     pub fn found_in_header(&self, text: &str) -> bool {
         self.search().found_in_header(text)
@@ -219,14 +256,30 @@ impl Forms {
 struct Search<'a> {
     finders: Vec<memmem::Finder<'a>>,
     longest: usize,
+    /// True for the search of a header name ([`Forms::found_in_head`]): the forms are in
+    /// lower case, and a reading is compared in lower case.
+    folds: bool,
 }
 
 impl Search<'_> {
     /// True when `bytes` hold one of the forms as they are: one reading, no escape decoded.
+    /// The search of a header name reads the ASCII letters of `bytes` in lower case.
     fn in_reading(&self, bytes: &[u8]) -> bool {
-        self.finders
+        if !self.folds {
+            return self
+                .finders
+                .iter()
+                .any(|finder| finder.find(bytes).is_some());
+        }
+        // A reading of a header name may hold the credential: the copy in lower case is
+        // overwritten before it is dropped.
+        let mut folded = bytes.to_ascii_lowercase();
+        let found = self
+            .finders
             .iter()
-            .any(|finder| finder.find(bytes).is_some())
+            .any(|finder| finder.find(&folded).is_some());
+        folded.zeroize();
+        found
     }
 
     /// True when `received` hold one of the forms, in one of the readings of [`Readings`].
@@ -242,9 +295,9 @@ impl Search<'_> {
             || readings.add(self, &[], true)
     }
 
-    /// True when the name or the value of a response header holds one of the forms: in the
-    /// text the node hands on, or in the bytes the sender wrote when that text is their
-    /// reading as ISO 8859-1.
+    /// True when the value of a response header holds one of the forms: in the text the node
+    /// hands on, or in the bytes the sender wrote when that text is their reading as ISO
+    /// 8859-1.
     ///
     /// A header whose bytes are not UTF-8 is handed on with one character per byte
     /// (`crate::egress::Exchange`). A credential with a character outside ASCII stands in
@@ -267,13 +320,6 @@ impl Search<'_> {
             bytes.zeroize();
             found
         })
-    }
-
-    /// True when a header name or a header value of `headers` holds one of the forms.
-    fn found_in_head(&self, headers: &[(String, String)]) -> bool {
-        headers
-            .iter()
-            .any(|(name, value)| self.found_in_header(name) || self.found_in_header(value))
     }
 }
 
@@ -786,7 +832,7 @@ impl StreamCheck {
         headers: &mut Vec<(String, String)>,
     ) -> Result<StreamCheck, Withheld> {
         let forms = Forms::of(std::slice::from_ref(credential));
-        if coded(headers) || forms.search().found_in_head(headers) {
+        if coded(headers) || forms.found_in_head(headers) {
             overwrite(headers);
             headers.clear();
             return Err(Withheld);
@@ -1355,6 +1401,38 @@ mod tests {
         let encoded = STANDARD_NO_PAD.encode(format!("Bearer {TOKEN}"));
         assert_eq!(outcome(&[("x-debug", &encoded)], b"{}"), Err(Withheld));
         assert_eq!(outcome(&[("x-request-id", "abc")], b"{}"), Ok(()));
+    }
+
+    #[test]
+    fn a_credential_in_a_header_name_is_found_whatever_the_case_of_its_letters() {
+        // The HTTP client of a node hands a header name on in lower case: a name a site wrote
+        // with the credential in it reaches the search with the letters of the credential in
+        // lower case. A credential of characters a header name can hold.
+        let token = "Sk-Live_4f9A.bCd~0123456789";
+        let outcome = |name: &str, value: &str| {
+            let headers = vec![(name.to_string(), value.to_string())];
+            check(&Secret::new(token.to_string()), 200, headers, Vec::new()).map(|_| ())
+        };
+        let lower = token.to_ascii_lowercase();
+        assert_eq!(outcome(&lower, "1"), Err(Withheld));
+        assert_eq!(outcome(&format!("x-echo-{lower}"), "1"), Err(Withheld));
+        // The forms of the credential, as a name in lower case holds them.
+        let hexadecimal = hex(token.as_bytes(), b"0123456789ABCDEF").to_ascii_lowercase();
+        let hexadecimal = String::from_utf8(hexadecimal).unwrap();
+        assert_eq!(outcome(&format!("x-{hexadecimal}"), "1"), Err(Withheld));
+        let encoded = URL_SAFE_NO_PAD
+            .encode(format!("ab{token}"))
+            .to_ascii_lowercase();
+        assert_eq!(outcome(&format!("x-{encoded}"), "1"), Err(Withheld));
+        // A letter of the credential that stands in the name as a percent escape keeps its
+        // case, and the letters around it have lost theirs.
+        let escaped = lower.replacen('s', "%53", 1).replacen("a.b", "%41.b", 1);
+        assert_eq!(outcome(&format!("x-{escaped}"), "1"), Err(Withheld));
+        // A header value is handed on as it was received, and is searched as it is: a text
+        // that differs from the credential in the case of a letter is another text.
+        assert_eq!(outcome("x-echo", token), Err(Withheld));
+        assert_eq!(outcome("x-echo", &lower), Ok(()));
+        assert_eq!(outcome("x-echo-sk-live", "1"), Ok(()));
     }
 
     #[test]

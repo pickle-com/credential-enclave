@@ -1451,6 +1451,38 @@ async fn a_value_a_site_sends_back_in_a_header_that_is_not_utf8_is_not_handed_on
     }
 }
 
+#[tokio::test]
+async fn a_value_a_site_sends_back_as_a_header_name_is_not_handed_on() {
+    // A value of characters a header name can hold, with upper case letters. The site names
+    // a header of its response after it. The HTTP client of the node hands a header name on
+    // in lower case, so the name the caller would receive is the value but for the case of
+    // its letters.
+    let value = "Sk-Live_4f9A.bCd~0123456789";
+    for front in ["", "X-Unknown-Key-"] {
+        let provider = site(move |seen| {
+            let echoed = seen.header("x-api-key").unwrap_or_default();
+            let reply = format!(
+                "HTTP/1.1 401 Unauthorized\r\n{front}{echoed}: 1\r\ncontent-length: 2\r\n\r\n{{}}"
+            );
+            Reply::Raw(reply.into_bytes())
+        })
+        .await;
+        let forward = forward_node(&provider).await;
+        let request = request_of("GET", "/v1/me", "", "header:x-api-key", b"");
+        let meta = json!({
+            "envelope": envelope(&forward, &request, value, 1),
+            "headers": [["X-Api-Key", PLACEHOLDER]],
+        });
+        let outcome = forward.vault_send(meta, b"").await;
+        assert_eq!(provider.only().header("x-api-key"), Some(value));
+        assert_eq!(
+            code(&outcome),
+            (502, "response_withheld".to_string()),
+            "{front:?}"
+        );
+    }
+}
+
 /// The length of the longest form of `VALUE`, the hexadecimal one.
 const LONGEST: usize = 2 * VALUE.len();
 
