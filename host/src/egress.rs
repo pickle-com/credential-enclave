@@ -10,6 +10,10 @@
 //! This list is a second
 //! line: the node itself sends credentials only to the addresses of its definitions, which are
 //! part of the measured binary, and log entries only to its log store.
+//!
+//! The relay holds at most [`relay::EGRESS_PIPES`] connections of the node at once: a
+//! connection above that is answered `ERR\n` without a provider connection. A connection it
+//! holds ends within the limits of a pipe ([`relay::pipe`]).
 
 use std::collections::BTreeSet;
 use std::io;
@@ -21,7 +25,7 @@ use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpSocket;
 
-use crate::relay::{self, AcceptFailure, BoxFuture, Stream, VsockListener};
+use crate::relay::{self, AcceptFailure, BoxFuture, Pipes, Stream, VsockListener};
 
 /// The vsock port of the egress relay.
 pub const EGRESS_PORT: u32 = 8443;
@@ -173,10 +177,7 @@ impl Outbound for TcpOutbound {
                     TcpSocket::new_v6()
                 };
                 let connected = match socket {
-                    Ok(socket) => match socket.set_keepalive(true) {
-                        Ok(()) => socket.connect(address).await,
-                        Err(error) => Err(error),
-                    },
+                    Ok(socket) => socket.connect(address).await,
                     Err(error) => Err(error),
                 };
                 match connected {
@@ -204,12 +205,21 @@ pub enum Outcome {
     /// The provider could not be reached: the host and the failure of the name lookup or of the
     /// connection.
     Unreachable(String, String),
+    /// The relay held [`relay::EGRESS_PIPES`] connections of the node: the target is on the
+    /// list and was not dialed.
+    OverLimit,
 }
 
 impl Outcome {
     /// The values of the `outcome` label of `credential_enclave_host_egress_relays_total`, in
     /// the order of the variants.
-    pub const LABELS: [&'static str; 4] = ["relayed", "malformed", "not_allowed", "unreachable"];
+    pub const LABELS: [&'static str; 5] = [
+        "relayed",
+        "malformed",
+        "not_allowed",
+        "unreachable",
+        "over_limit",
+    ];
 
     /// The position of the outcome in [`Outcome::LABELS`].
     fn index(&self) -> usize {
@@ -218,23 +228,41 @@ impl Outcome {
             Outcome::Malformed => 1,
             Outcome::NotAllowed(_) => 2,
             Outcome::Unreachable(..) => 3,
+            Outcome::OverLimit => 4,
         }
     }
 }
 
-/// The counts of the egress relay since the host program started. The relay writes them and
-/// the status surface reads them for `/metrics` (enclave.md section 9).
-#[derive(Debug, Default)]
+/// The counts of the egress relay since the host program started, and the connections it
+/// holds. The relay writes them and the status surface reads them for `/metrics` (enclave.md
+/// section 9).
+#[derive(Debug)]
 pub struct EgressCounters {
     /// Failed accepts by class, in the order of [`AcceptFailure::ALL`].
     accept_errors: [AtomicU64; 3],
     /// Served connections of the node by outcome, in the order of [`Outcome::LABELS`].
-    relays: [AtomicU64; 4],
-    /// Connections whose bytes the relay moves at this moment.
-    relays_inflight: AtomicU64,
+    relays: [AtomicU64; 5],
+    /// The connections of the node the relay holds, at most [`relay::EGRESS_PIPES`]: those it
+    /// opens a provider connection for and those whose bytes it moves.
+    pipes: Arc<Pipes>,
+}
+
+impl Default for EgressCounters {
+    fn default() -> EgressCounters {
+        EgressCounters::holding(relay::EGRESS_PIPES)
+    }
 }
 
 impl EgressCounters {
+    /// The counts of a relay that holds at most `limit` connections of the node at once.
+    pub fn holding(limit: usize) -> EgressCounters {
+        EgressCounters {
+            accept_errors: Default::default(),
+            relays: Default::default(),
+            pipes: Pipes::new(limit),
+        }
+    }
+
     fn count_accept_error(&self, failure: AcceptFailure) {
         self.accept_errors[failure as usize].fetch_add(1, Ordering::Relaxed);
     }
@@ -252,32 +280,16 @@ impl EgressCounters {
     }
 
     /// The served connections by outcome: the value of the `outcome` label and the count.
-    pub fn relays(&self) -> [(&'static str, u64); 4] {
+    pub fn relays(&self) -> [(&'static str, u64); 5] {
         std::array::from_fn(|index| {
             let count = self.relays[index].load(Ordering::Relaxed);
             (Outcome::LABELS[index], count)
         })
     }
 
-    /// The connections whose bytes the relay moves at this moment.
-    pub fn relays_inflight(&self) -> u64 {
-        self.relays_inflight.load(Ordering::Relaxed)
-    }
-}
-
-/// Holds one unit of `relays_inflight` while a pipe moves bytes.
-struct Inflight<'a>(&'a AtomicU64);
-
-impl<'a> Inflight<'a> {
-    fn new(gauge: &'a AtomicU64) -> Inflight<'a> {
-        gauge.fetch_add(1, Ordering::Relaxed);
-        Inflight(gauge)
-    }
-}
-
-impl Drop for Inflight<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+    /// The connections of the node the relay holds, and how its pipes ended.
+    pub fn pipes(&self) -> &Pipes {
+        &self.pipes
     }
 }
 
@@ -310,8 +322,9 @@ where
 }
 
 /// Serves one connection of the node: reads the `CONNECT` line, checks the target against the
-/// list, opens the provider connection, answers and relays. The outcome is counted, and the
-/// connection holds one unit of the inflight gauge while its bytes move.
+/// list, takes a place among the connections the relay holds, opens the provider connection,
+/// answers and relays. The outcome is counted, and the connection holds its place from the
+/// check of its target until its pipe has ended.
 pub async fn relay<S>(
     inbound: S,
     allowlist: &Allowlist,
@@ -345,6 +358,9 @@ where
     if !allowlist.allows(host, port) {
         return refuse(inbound, Outcome::NotAllowed(format!("{host}:{port}"))).await;
     }
+    let Some(place) = counters.pipes.admit() else {
+        return refuse(inbound, Outcome::OverLimit).await;
+    };
     let provider =
         tokio::time::timeout(PROVIDER_CONNECT_TIMEOUT, outbound.connect(host, port)).await;
     let provider = match provider {
@@ -361,14 +377,17 @@ where
     if inbound.write_all(REPLY_OK).await.is_err() || inbound.flush().await.is_err() {
         return Outcome::Relayed;
     }
-    let _inflight = Inflight::new(&counters.relays_inflight);
-    relay::pipe(inbound, provider).await;
+    // What the node still sends to a provider that closed stays unread: the node learns of
+    // the close from the end of the connection, and nobody waits for a reply to those bytes.
+    relay::pipe(inbound, provider, &place, relay::Relay::Egress).await;
     Outcome::Relayed
 }
 
-/// The egress relay: serves every connection of `listener`. A refused connection leaves one
-/// line in the output of the host program. A failed accept is counted by its class, and the
-/// next accept follows at once or after a pause as the class asks (`relay::AcceptFailure`).
+/// The egress relay: serves every connection of `listener`. A connection refused for its
+/// line, its target or its provider leaves one line in the output of the host program; a
+/// connection refused because the relay holds its limit is counted only. A failed accept is
+/// counted by its class, and the next accept follows at once or after a pause as the class
+/// asks (`relay::AcceptFailure`).
 pub async fn serve(
     listener: VsockListener,
     allowlist: Arc<Allowlist>,
@@ -390,7 +409,7 @@ pub async fn serve(
         let counters = counters.clone();
         tokio::spawn(async move {
             match relay(inbound, &allowlist, outbound.as_ref(), &counters).await {
-                Outcome::Relayed => {}
+                Outcome::Relayed | Outcome::OverLimit => {}
                 Outcome::Malformed => {
                     crate::log("egress: refused a connection without a valid CONNECT line");
                 }
@@ -645,10 +664,10 @@ mod tests {
         let mut buffer = [0u8; 12];
         provider.read_exact(&mut buffer).await.unwrap();
         assert_eq!(&buffer, b"client hello");
-        // The bytes move: the connection holds one unit of the inflight gauge, and the outcome
-        // is not counted yet.
-        assert_eq!(counters.relays_inflight(), 1);
-        assert_eq!(counters.relays().map(|(_, count)| count), [0, 0, 0, 0]);
+        // The bytes move: the connection holds one place of the relay, and the outcome is not
+        // counted yet.
+        assert_eq!(counters.pipes().held(), 1);
+        assert_eq!(counters.relays().map(|(_, count)| count), [0, 0, 0, 0, 0]);
 
         provider.write_all(b"server hello").await.unwrap();
         node.read_exact(&mut buffer).await.unwrap();
@@ -660,14 +679,89 @@ mod tests {
         node.shutdown().await.unwrap();
         assert_eq!(read_all(&mut provider).await, b"");
         assert_eq!(relayed.await.unwrap(), Outcome::Relayed);
-        assert_eq!(counters.relays_inflight(), 0);
+        assert_eq!(counters.pipes().held(), 0);
         assert_eq!(
             counters.relays(),
             [
                 ("relayed", 1),
                 ("malformed", 0),
                 ("not_allowed", 0),
-                ("unreachable", 0)
+                ("unreachable", 0),
+                ("over_limit", 0)
+            ]
+        );
+        assert_eq!(
+            counters.pipes().ended(),
+            [
+                ("closed", 1),
+                ("failed", 0),
+                ("idle", 0),
+                ("half_closed", 0)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connection_above_the_limit_of_the_relay_is_answered_err_and_never_dialed() {
+        let providers = Arc::new(Providers::reachable());
+        let counters = Arc::new(EgressCounters::holding(1));
+        let (mut node, inbound) = tokio::io::duplex(1024);
+        let relayed = {
+            let (providers, counters) = (providers.clone(), counters.clone());
+            tokio::spawn(async move {
+                relay(inbound, &allowlist(), providers.as_ref(), &counters).await
+            })
+        };
+        node.write_all(b"CONNECT api.first.example:443\n")
+            .await
+            .unwrap();
+        let mut reply = [0u8; 3];
+        node.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"OK\n");
+        assert_eq!(counters.pipes().held(), 1);
+
+        // The relay holds its one connection: the next one is refused with the answer of a
+        // target the relay does not connect to, and no provider is dialed for it.
+        let (mut second, inbound) = tokio::io::duplex(1024);
+        second
+            .write_all(b"CONNECT api.second.example:443\n")
+            .await
+            .unwrap();
+        let outcome = relay(inbound, &allowlist(), providers.as_ref(), &counters).await;
+        assert_eq!(outcome, Outcome::OverLimit);
+        assert_eq!(read_all(&mut second).await, b"ERR\n");
+        assert_eq!(providers.dialed(), [("api.first.example".to_string(), 443)]);
+        assert_eq!(counters.pipes().held(), 1);
+
+        // The first connection ends: its place is free.
+        let mut provider = providers.take_far_end();
+        provider.shutdown().await.unwrap();
+        node.shutdown().await.unwrap();
+        assert_eq!(relayed.await.unwrap(), Outcome::Relayed);
+        assert_eq!(counters.pipes().held(), 0);
+        let (mut third, inbound) = tokio::io::duplex(1024);
+        third
+            .write_all(b"CONNECT api.second.example:443\n")
+            .await
+            .unwrap();
+        let relayed = {
+            let (providers, counters) = (providers.clone(), counters.clone());
+            tokio::spawn(async move {
+                relay(inbound, &allowlist(), providers.as_ref(), &counters).await
+            })
+        };
+        third.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"OK\n");
+        drop((third, providers.take_far_end()));
+        assert_eq!(relayed.await.unwrap(), Outcome::Relayed);
+        assert_eq!(
+            counters.relays(),
+            [
+                ("relayed", 2),
+                ("malformed", 0),
+                ("not_allowed", 0),
+                ("unreachable", 0),
+                ("over_limit", 1)
             ]
         );
     }
@@ -695,10 +789,11 @@ mod tests {
                 ("relayed", 0),
                 ("malformed", 1),
                 ("not_allowed", 2),
-                ("unreachable", 3)
+                ("unreachable", 3),
+                ("over_limit", 0)
             ]
         );
-        assert_eq!(counters.relays_inflight(), 0);
+        assert_eq!(counters.pipes().held(), 0);
         assert_eq!(
             counters.accept_errors(),
             [("aborted", 0), ("resources", 0), ("other", 0)]
