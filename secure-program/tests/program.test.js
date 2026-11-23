@@ -2733,7 +2733,7 @@ test("A1: objects someone else wrote under the seq of a transfer in a chain of f
   assert.deepEqual(other.securityStatuses.slice(-1)[0].reasons, ["verification_blocked"]);
 });
 
-test("A3: a chain of format 2 whose listing goes on over pages that name few seqs keeps the rounds from its end and marks the log, and a long chain a node wrote is read on round after round without a count", async () => {
+test("A3: a chain of format 2 whose listing goes on over pages that hold many objects under one seq keeps the rounds from its end and marks the log, and a long chain a node wrote is read on round after round without a count", async () => {
   // A use entry and then a transfer to a node of a measurement no list has. Under the seq of
   // the use entry, more objects than the listing pages of a round hold (pages of ten object
   // versions): the rounds do not reach the transfer.
