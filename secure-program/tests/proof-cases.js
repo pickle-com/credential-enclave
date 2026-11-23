@@ -23,13 +23,14 @@ function otherPcr(pcr) {
 
 /** The cases for a release tag that is later than every release the program lists. listed is
  *  the latest release the program lists and version the version of the program. Returns
- *  [{name, reason, proofs, measurement, release, target, constants, logs, later}]: reason is
- *  null for proofs that hold, and the text the program logs for the check that refuses the
+ *  [{name, reason, proofs, measurement, release, target, constants, logs, later, debug}]: reason
+ *  is null for proofs that hold, and the text the program logs for the check that refuses the
  *  others; measurement and release are those of the node that presents the proofs; target is
  *  the server target of the build; constants are the parties whose keys and certificates the
  *  program holds; logs are the keys of the logs the program holds (null: the key of the log of
  *  the constants); later is true for proofs that hold and whose statement states a program
- *  later than version (the release is none the program accepts). */
+ *  later than version (the release is none the program accepts); debug is true for the proofs
+ *  of a measurement no node presents (a PCR of it is all zero). */
 function proofCases(release, listed, version) {
   const parties = model.makeParties();
   const measurement = randomMeasurement();
@@ -112,6 +113,17 @@ function proofCases(release, listed, version) {
   for (const field of ["pcr0", "pcr1", "pcr2"]) {
     const other = Object.assign({}, measurement, { [field]: otherPcr(measurement[field]) });
     add("the proofs of another measurement: one character of " + field, "p1: measurement", proofsOf({}, release, other));
+  }
+  // A PCR whose value is all zero is the value of an enclave in debug mode. The document of such
+  // an enclave fails the attestation, so no node presents these proofs: they reach the program
+  // for the digest of a measurement that an entry names (debug).
+  const zero = "0".repeat(96);
+  for (const [name, debug] of [
+    ["pcr0", Object.assign({}, measurement, { pcr0: zero })], ["pcr1", Object.assign({}, measurement, { pcr1: zero })],
+    ["pcr2", Object.assign({}, measurement, { pcr2: zero })], ["every PCR", { pcr0: zero, pcr1: zero, pcr2: zero }],
+  ]) {
+    add("the proofs of a measurement whose " + name + " is all zero", "p1: statement", proofsOf({}, release, debug),
+      { measurement: debug, debug: true });
   }
 
   // ---- P1: the program_min of the statement ----

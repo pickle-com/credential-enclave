@@ -193,6 +193,31 @@ test("release proofs that hold hand the node its grant, and proofs that differ f
   const cases = proofCases("v2.5.0", listed[listed.length - 1].release, VERSION);
   const seen = new Map();
   for (const item of cases) {
+    if (item.debug === true) {
+      // A measurement with a PCR that is all zero is that of no node whose attestation verifies,
+      // so no node presents these proofs: the listed node writes a transfer of the key that
+      // names the measurement, and the backend hands the proofs out for its digest. The
+      // statement is refused, and the measurement is one no list has and no proofs showed: it
+      // marks the log a day later.
+      const debug = S.fixture(source, { target: item.target });
+      await S.start(debug, model.withParties(debug.source, item.constants, item.logs));
+      const receiver = debug.world.addNode({ release: item.release, measurement: bridge.randomMeasurement(), offered: false });
+      debug.nodes[0].record("c", [{
+        t: "grant_transferred_out", time_ms: debug.world.now, to: receiver.id, release: item.release,
+        pcr0: item.measurement.pcr0, pcr1: item.measurement.pcr1, pcr2: item.measurement.pcr2,
+      }]);
+      debug.world.measureProofs.set(digestOf(item.measurement), item.proofs);
+      await nextDay(debug);
+      seen.set(item.reason, (seen.get(item.reason) || 0) + 1);
+      assert.deepEqual(refusals(debug.world), [item.reason], item.name);
+      assert.deepEqual(keptProven(debug.world), [], item.name);
+      assert.equal(debug.world.state.log.status, "pending", item.name);
+      await nextDay(debug);
+      assert.equal(debug.world.state.log.status, "attention", item.name);
+      assert.equal(debug.world.state.log.unknown_nodes, 1, item.name);
+      assert.deepEqual(refusals(debug.world), [item.reason], item.name);
+      continue;
+    }
     const fx = S.fixture(source, { target: item.target });
     const world = fx.world;
     const later = world.addNode({ release: item.release, measurement: item.measurement });
@@ -501,7 +526,7 @@ test("the release of the binding of a node is the release its proofs name: a nod
   assert.ok(world.logs.some((line) => line.indexOf("attestation rejected: release of the binding") === 0));
 });
 
-test("a runtime verifies no further release proofs once eight failed within an hour", async () => {
+test("a runtime verifies no further release proofs that nodes present once eight failed within an hour, and verifies whatever failed the proofs the backend hands out for a measurement a round asked it for", async () => {
   const fx = S.fixture(source, { nodes: 1 });
   const world = fx.world;
   const parties = model.makeParties();
@@ -521,6 +546,21 @@ test("a runtime verifies no further release proofs once eight failed within an h
   }
   assert.equal(refusals(world).length, 8);
   assert.ok(refusals(world).every((reason) => reason === "p1: measurement"));
+  // Within that hour the listed node hands the key to a node of release v2.6.0 that the device
+  // is not offered, and the backend holds the proofs of that release. The round that reads the
+  // transfer asks the backend for the proofs of the measurement and verifies them: the answer
+  // to that request is what a measurement marks the log on, so it is never taken for proofs
+  // that fail without the verdict.
+  const measurement = bridge.randomMeasurement();
+  const receiver = world.addNode({ release: "v2.6.0", measurement: measurement, offered: false });
+  world.releaseProofs.set("v2.6.0", model.proofsOf(parties, "v2.6.0", measurement));
+  moveKey(world, fx.nodes[0], "v2.4.0", receiver, measurement, "v2.6.0");
+  world.advance(2 * 60000);
+  await S.event(fx, "foreground");
+  assert.equal(refusals(world).length, 8);
+  assert.deepEqual(keptProven(world).map((item) => item.release), ["v2.6.0"]);
+  assert.equal(world.stored("log.unaccepted")[digestOf(measurement)], undefined);
+  assert.equal(world.securityStatuses.filter((item) => item.status === "attention").length, 0);
 });
 
 // ---- program_min ----

@@ -239,7 +239,10 @@ program reads a release statement and the entry of its record as a node does.
 PROGRAM_JS]`): the verdict of the program of this checkout, or of the source `--program` names,
 with its constants as they are and for a build of the server target named. Release proofs are
 public values, so whoever makes or carries them can ask a version of the program for its verdict
-before a node of the release takes a key.
+before a node of the release takes a key. The verdict is that of the five checks on the proofs
+alone: the measurement a node presents and the binding of that node (its `release`, which must be
+the release of the statement, its `log`, `role` and `program_min`) are read from the attestation of
+the node, which this file does not read.
 
 `SECURE_PROGRAM_VECTORS` names the vector files to read instead of `protocol/vectors.json` (paths
 separated by commas). A test of vectors that the files do not hold is skipped.

@@ -11,6 +11,11 @@
 // are verified by the model of the bridge (bridge.js). The file prints what the program makes of
 // the proofs for a build of the server target (prod unless --target names another) and ends
 // with the status 0 when the proofs make the release one that program accepts, and 1 otherwise.
+//
+// The verdict is that of the five checks on the proofs alone. Whether a node presents the
+// measurement the statement states, and what the binding of that node states (the program
+// requires its release to be the release of the statement, and reads its log, role and
+// program_min), is the attestation of the node: this file reads no node.
 "use strict";
 
 const fs = require("node:fs");

@@ -1885,11 +1885,12 @@
   /** Reads a release statement (docs/protocol.md 10.3, check 1): the bytes of the file
    *  measurements.json of a release. They are at most PROOF_STATEMENT_BYTES long and a JSON
    *  object that states release, pcr0, pcr1 and pcr2 once each: release a text, each PCR 96
-   *  lower-case hexadecimal characters. The statement may state program_min, once: the lowest
-   *  version of the program that reads what the nodes of the release write, written as decimal
-   *  digits without a leading zero (a lone 0 is one) and a number the program holds exactly.
-   *  The other members are not read. Returns {release, pcr0, pcr1, pcr2, program_min}
-   *  (program_min undefined for a statement that states none), or null. */
+   *  lower-case hexadecimal characters that are not all zero. The statement may state
+   *  program_min, once: the lowest version of the program that reads what the nodes of the
+   *  release write, written as decimal digits without a leading zero (a lone 0 is one) and a
+   *  number the program holds exactly. The other members are not read. Returns {release, pcr0,
+   *  pcr1, pcr2, program_min} (program_min undefined for a statement that states none), or
+   *  null. */
   function readReleaseStatement(bytes) {
     if (bytes.length > PROOF_STATEMENT_BYTES) return null;
     const value = parseJson(bytes);
@@ -1905,6 +1906,11 @@
       read[name] = member(value, name);
     }
     if (typeof read.release !== "string" || !hex96(read.pcr0) || !hex96(read.pcr1) || !hex96(read.pcr2)) return null;
+    // A PCR whose value is all zero is the value of an enclave in debug mode, whatever that
+    // enclave runs: a statement that states one states the measurement of no release. (The
+    // document of such an enclave is refused by verifyNitro; the proofs of a measurement that
+    // an entry names are read without a document.)
+    if (/^0+$/.test(read.pcr0) || /^0+$/.test(read.pcr1) || /^0+$/.test(read.pcr2)) return null;
     read.program_min = undefined;
     if (times("program_min") > 0) {
       const stands = countOf(member(value, "program_min"), false);
@@ -2336,17 +2342,21 @@
    *    refused  the proofs fail a check, which is logged
    *    spent    nothing was verified: PROOF_FAILURES proofs failed in this runtime within
    *             PROOF_FAILURE_SPAN_MS
+   *  The proofs the backend handed out for a measurement a round asked it for (asked true) are
+   *  verified whatever failed before: that answer is what a measurement marks the log on
+   *  (proofsDenied), so it is never taken for the answer of proofs that fail without the
+   *  verdict, and a round asks for a measurement once in PROOF_SEEK_RETRY_MS.
    *  A verdict is kept with the release and the program_min of the statement. Of two statements
    *  that held for one measurement, the release of the one verified last and the higher
    *  program_min stand. */
-  function proveBuild(proofs, measurement, measure) {
+  function proveBuild(proofs, measurement, measure, asked) {
     const now = native.nowMs();
     // The proofs this runtime refused last for the measurement are refused without a second
     // verification: the same value comes from a node, from a node document and from the backend.
     const presented = JSON.stringify(proofs);
     if (typeof presented === "string" && proofRefused.get(measure) === presented) return "refused";
     proofFailures = proofFailures.filter(function (time) { return time <= now && now - time < PROOF_FAILURE_SPAN_MS; });
-    if (proofFailures.length >= PROOF_FAILURES) return "spent";
+    if (asked !== true && proofFailures.length >= PROOF_FAILURES) return "spent";
     let shown = null;
     try {
       shown = proveRelease(proofs, measurement, releaseTrust(), native.deviceInfo().server_target);
@@ -2454,7 +2464,8 @@
    *  call sends one request, for PROOF_REQUEST_MEASURES measurements at most, and a round
    *  (run) sends PROOF_ROUND_REQUESTS of them at most. Of the answer, an element counts when it
    *  names a measurement of the request for the first time and carries proofs whose statement
-   *  states that measurement. An answer without proofs that hold, and a backend without the
+   *  states that measurement; its proofs are verified whatever proofs failed in this runtime
+   *  before (proveBuild). An answer without proofs that hold, and a backend without the
    *  route, leave the measurements what they were and are noted as the answer that the backend
    *  hands out no such proofs (proofAnswered: proofsDenied). A request that fails otherwise is
    *  noted with what its failure means for a round (proofFailed), and its measurements are
@@ -2523,7 +2534,7 @@
       // verdict at the measurement.
       const stated = statedMeasurement(proofs);
       const measurement = stated !== null && measureOf(stated) === digest ? stated : { pcr0: "", pcr1: "", pcr2: "" };
-      if (proveBuild(proofs, measurement, digest) === "shown") shown += 1;
+      if (proveBuild(proofs, measurement, digest, true) === "shown") shown += 1;
     }
     return { shown: shown, left: left };
   }

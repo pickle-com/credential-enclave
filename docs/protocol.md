@@ -1339,7 +1339,7 @@ Test vectors of the assignment; the backend of the operator computes the same fu
 | `LOG_DOUBT_ROUNDS` (the app) | 2: the rounds whose answers carried no signature that verifies for a key before the signatures of its node contradict each other (A2) |
 | `PROOF_STATEMENT_BYTES`, `PROOF_ATTESTATION_BYTES`, `PROOF_PATH_HASHES`, `PROOF_DEPLOY_SIGNATURES`, `PROOF_JSON_DEPTH` (the app) | 16,384, 65,536, 64, 8 and 32: the bytes of a release statement, the bytes of the attestation of release proofs as JSON without white space, the hashes of its audit path, the elements of `deploy_signatures`, and the arrays and objects inside one another of a JSON value of release proofs ("The release proofs") |
 | `PROOF_REQUEST_NODES`, `PROOF_RETRY_MS`, `PROOF_REQUEST_MEASURES`, `PROOF_ROUND_REQUESTS`, `PROOF_SEEK_RETRY_MS` (the app) | 4 and 1 hour: the nodes one grant step asks for the release proofs of their release, one of each measurement, and the time after which a node of a measurement is asked again. 8, 4 and 5 minutes: the measurements one request to the backend for release proofs names, such requests per round, and the time after which a round asks for a measurement again |
-| `PROOF_FAILURES`, `PROOF_FAILURE_SPAN_MS`, `PROOF_REFUSED_KEPT` (the app) | 8 and 1 hour: a runtime verifies no further release proofs while this many failed within this time. 8: the measurements for which a runtime remembers the proofs it refused last, which it does not verify again |
+| `PROOF_FAILURES`, `PROOF_FAILURE_SPAN_MS`, `PROOF_REFUSED_KEPT` (the app) | 8 and 1 hour: a runtime verifies no further release proofs that a node or a node document presents while this many proofs failed within this time. 8: the measurements for which a runtime remembers the proofs it refused last, which it does not verify again |
 | `PROOF_KEPT_VERDICTS`, `PROOF_KEPT_PROOFS`, `PROOF_KEPT_CHARS` (the app) | 256: the measurements whose verdicts of release proofs the device keeps (beyond them the verdict of the earliest release leaves). 4 and 65,536: the releases whose proofs are kept with the verdict, the latest ones the program accepts, and the characters of the JSON of proofs that are kept |
 | `LOG_BLOCKED_ROUNDS`, `LOG_BLOCKED_MS`, `LOG_REACH_MS`, `LOG_URL_FRESH_MS` (the app) | 3 and 3 days: the rounds in a row whose reads were held back (or the reads of one kind the log screen notes as held back from it), and the age of the first of them, at which the log is marked (A3). 60,000: a request that was not answered counts as held back when the backend answered another request of the runtime within this time. 240,000: the age of a signed address from which a refusal of the store is the age of the address |
 | `LOG_RETENTION_DAYS` (the app) | 365: a key older than this is expected by no reader (the retention of its lock), and a key is expected in the listing while it is a day younger (A4) |
@@ -1605,11 +1605,11 @@ the bundle the release workflow of this repository attaches to the GitHub releas
 `release-statement.sigstore.json` (enclave.md 11.2). The program does not read other members.
 
 Every check must hold, for a measurement M (PCR0, PCR1 and PCR2 of a document that verified by
-4.3):
+4.3, or of a measurement that an entry of an accepted node names):
 
 | Check | Rule |
 | --- | --- |
-| P1 | The statement is at most 16,384 bytes long and a JSON object that states `release`, `pcr0`, `pcr1` and `pcr2` once each: `release` a release tag (10.3), each PCR 96 lower-case hexadecimal characters. The three PCRs equal those of M. The statement may state `program_min`, once: a non-negative integer below 2^53, written as decimal digits without a leading zero (a lone `0` is one) and with neither a fraction nor an exponent. Other members of the statement are not read |
+| P1 | The statement is at most 16,384 bytes long and a JSON object that states `release`, `pcr0`, `pcr1` and `pcr2` once each: `release` a release tag (10.3), each PCR 96 lower-case hexadecimal characters that are not all zero (a PCR that is all zero is the value of an enclave in debug mode, whatever it runs). The three PCRs equal those of M. The statement may state `program_min`, once: a non-negative integer below 2^53, written as decimal digits without a leading zero (a lone `0` is one) and with neither a fraction nor an exponent. Other members of the statement are not read |
 | P2 | The release key signed the statement and a transparency log of the program recorded that signature: checks 2, 3 and 4 of 10.3 for a log of the form Rekor v1, with the release key and the log key the program holds. The time of the entry is compared with no clock (check 5 of 10.3 asks the clock of a node, and the notice period is 0 seconds) |
 | P3 | `deploy_signatures` has at most 8 elements, each with the texts `key_id` and `signature`. Exactly one element names the key id of the server target of the build (`prod` for the server target `prod`, `dev` for every other), and its signature is the Ed25519 signature of that deploy key over the UTF-8 bytes of `pickle-enclave-release-statement-v1`, a line feed, the lower-case hexadecimal SHA-256 of the statement and a line feed. The deploy keys are the keys with which the apps verify the deploy signature of a served program, by the same rule of the key id. The deploy signature of a program covers `pickle-secure-program-v1`, a line feed and the program, so neither signature is one of the other kind |
 | P4 | GitHub attested the statement: the attestation verifies by the rules below, under the identity of the release workflow at the tag `release` of the statement, and its in-toto statement has the predicate type `https://pickle.com/credential-enclave/release/v1` and a predicate whose `release`, `pcr0`, `pcr1`, `pcr2` and `program_min` equal those of the statement (a predicate states no `program_min` where the statement states none) |
@@ -1733,8 +1733,8 @@ Where the proofs come from. Whoever hands them over, the checks above decide.
   that knows that the backend hands out no release proofs that show it: the backend answered a
   request for the proofs of that measurement, the answer is not earlier than the time the device
   first saw the measurement and not older than one hour, and no proofs of it showed the
-  measurement (it carried none, or proofs that fail a check, or proofs the runtime did not
-  verify because eight had failed within the hour). A backend without the route (the status 404
+  measurement (it carried none, or proofs that fail a check: the proofs of such an answer are
+  verified whatever proofs failed in the runtime before). A backend without the route (the status 404
   and no code of its own) answers so. A request that fails any other way is no answer: the
   measurement waits, the round is pending, and the next round asks again without waiting for
   the five minutes. Past the 24 hours of A1, a round whose request for the proofs failed on the
@@ -1751,9 +1751,11 @@ Where the proofs come from. Whoever hands them over, the checks above decide.
 A node kept as one of a later release is asked for the proofs of its measurement again when the
 last request for them is an hour old: the proofs of a release may reach the backend after its
 nodes. A request to a node for proofs that failed is none the measurement was asked with: the
-next step asks again. A runtime verifies no further proofs while 8 of them failed within an hour, and it does
-not verify again the proofs it refused last for a measurement: the same value reaches it from a
-node, from a node document and from the backend. Proofs that fail are logged with the check that
+next step asks again. A runtime verifies no further proofs that a node or a node document presents
+while 8 proofs failed within an hour, and it does not verify again the proofs it refused last for a
+measurement: the same value reaches it from a node, from a node document and from the backend. The
+proofs the backend hands out for a measurement a round asked it for are verified whatever failed
+before: that answer is what A1 waits for, and a round asks for a measurement once in five minutes. Proofs that fail are logged with the check that
 failed (`release proofs refused: p4: identity 11`).
 
 Proofs that reach the device after it read the entries of a node. A control key is remembered as
