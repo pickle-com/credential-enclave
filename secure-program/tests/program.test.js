@@ -542,9 +542,10 @@ test("a node of format 3 receives the grant after one request for its attestatio
   assert.deepEqual(Object.keys(grants), [fx.nodes[0].id]);
   assert.equal(grants[fx.nodes[0].id].release, "v2.4.0");
   assert.ok(grants[fx.nodes[0].id].granted_ms > 0);
-  // A node of format 3 is not written into the ledger of the earlier programs, and nothing of the
-  // ledger is exchanged with the backend.
-  assert.equal(world.sent("GET /api/secure/ledger").length, 0);
+  // The sealed ledger of the backend is read once, before the grant goes out (another device of
+  // the account may have turned the delegation off). A node of format 3 is not written into
+  // the ledger of the earlier programs, and a device with no setting to share uploads nothing.
+  assert.equal(world.sent("GET /api/secure/ledger").length, 1);
   assert.equal(world.sent("PUT /api/secure/ledger").length, 0);
   assert.equal(world.sent("S3 " + world.storeHost).length, 0);
 });
@@ -766,12 +767,16 @@ test("a grant to a node of a release before v2.4.0 is written into the ledger an
   assert.ok(kept.granted_ms > 0 && kept.not_after_ms > kept.granted_ms);
   assert.equal(kept.checkpoint.seq, 0);
   assert.equal(kept.unknown_ms, 0);
-  assert.equal(world.sent("GET /api/secure/ledger").length, 1);
+  // (The sealed ledger is read before the grants go out, and once more by the exchange that
+  // uploads the node the grant wrote into the ledger.)
+  assert.equal(world.sent("GET /api/secure/ledger").length, 2);
   assert.equal(world.ledgerUploads, 1);
-  // The same grant a day later changes no node of the ledger: nothing is shared again.
+  // The same grant a day later changes no node of the ledger: nothing is shared again. The
+  // renewal reads the sealed ledger once, as every step that hands a grant does.
   await nextDay(fx);
   await world.settle(1000);
   assert.equal(world.ledgerUploads, 1);
+  assert.equal(world.sent("GET /api/secure/ledger").length, 3);
 });
 
 // ---- The round: the four conditions that mark the log ----
@@ -6043,4 +6048,394 @@ test("control entries that arrive on a chain faster than the device reads them, 
   assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
   assert.equal(world.stored("log.round").unfinished, 0);
   assert.equal(world.securityStatuses.slice(-1)[0].status, "ok");
+});
+
+// ---- The last list before the tag: the settings of the delegation between the devices of an account ----
+
+/** Two devices of the account of a fixture on one backend. The second device holds the master
+ *  key of the account and has a keychain, a program store and a published state of its own: the
+ *  keychain item of the ledger does not travel between the two (as between two Android devices,
+ *  or an iOS device without iCloud Keychain). on(name) makes the world the one of that device
+ *  ("a": the device of the fixture, "b": the second) and starts a new runtime on it. */
+function twoDevices(fx) {
+  const world = fx.world;
+  const master = "com.pickle.client.secure.master-key\n" + world.userId;
+  const kept = {
+    a: { keychain: world.keychain, store: world.store, state: world.state, runtime: world.runtime },
+    b: { keychain: new Map([[master, world.keychain.get(master)]]), store: new Map(), state: {}, runtime: {} },
+  };
+  let current = "a";
+  return {
+    on: async (name) => {
+      for (const field of ["keychain", "store", "state", "runtime"]) kept[current][field] = world[field];
+      current = name;
+      for (const field of ["keychain", "store", "state", "runtime"]) world[field] = kept[name][field];
+      await S.start(fx);
+      await world.settle(1000);
+    },
+  };
+}
+
+test("what one device sets of the delegation reaches the other devices of the account before they hand a grant: a step that is about to send a grant reads the sealed ledger of the backend first, so a delegation turned off on one device is not handed again by another, and a shorter lifetime is the one the other renews with", async () => {
+  const grantsOf = (node) => node.commands.filter((command) => command.type === "grant").length;
+  const fx = S.fixture(source);
+  const world = fx.world;
+  const node = fx.nodes[0];
+  const both = twoDevices(fx);
+  await both.on("a");
+  await both.on("b");
+  assert.equal(world.state.grant.state, "active");
+  assert.equal(grantsOf(node), 2);
+  // The user turns the delegation off on device A: the node drops the key.
+  await both.on("a");
+  assert.deepEqual(await S.call(fx, "set_delegation", { enabled: false }), { ok: true, value: { grant: { state: "off", not_after_ms: 0 } } });
+  await world.settle(1000);
+  assert.equal(node.grants.has(world.userId), false);
+  const handed = grantsOf(node);
+  // Device B: a new runtime, a push that says a grant is required, and the synchronization of
+  // the next day. A step that is about to hand the grant again reads the sealed ledger first,
+  // and hands none: the delegation is off on B as well. (The new runtime, minutes after the
+  // grant B handed, has no grant to hand and sends nothing.)
+  world.advance(2 * 60000);
+  await both.on("b");
+  assert.equal(grantsOf(node), handed);
+  await S.event(fx, "push", { reason: "grant_required" });
+  assert.equal(world.state.grant.state, "off");
+  assert.equal(grantsOf(node), handed);
+  world.advance(25 * HOUR_MS);
+  await S.event(fx, "foreground");
+  assert.equal(grantsOf(node), handed);
+  assert.equal(node.grants.has(world.userId), false);
+  assert.deepEqual(await S.call(fx, "connect", { target: "github" }), { ok: false, code: "delegation_off" });
+  // A week of the two devices, each with a synchronization a day: the node holds the key on no
+  // day.
+  for (let day = 0; day < 7; day += 1) {
+    world.advance(25 * HOUR_MS);
+    await both.on(day % 2 === 0 ? "a" : "b");
+    await S.event(fx, "push", { reason: "grant_required" });
+    assert.equal(node.grants.has(world.userId), false, "day " + day);
+  }
+  assert.equal(grantsOf(node), handed);
+  // The user turns it on again on device B: the next synchronization of A reads that before it
+  // sends its revokes, and hands its grant.
+  await both.on("b");
+  assert.equal((await S.call(fx, "set_delegation", { enabled: true })).ok, true);
+  await world.settle(1000);
+  assert.equal(node.grants.has(world.userId), true);
+  const revoked = node.commands.filter((command) => command.type === "revoke").length;
+  world.advance(2 * 60000);
+  await both.on("a");
+  assert.equal(world.state.grant.state, "active");
+  assert.equal(node.commands.filter((command) => command.type === "revoke").length, revoked);
+  assert.equal(node.grants.has(world.userId), true);
+
+  // A shorter lifetime set on A is the lifetime B renews with.
+  assert.equal((await S.call(fx, "set_grant_days", { days: 3 })).value.days, 3);
+  await world.settle(1000);
+  world.advance(25 * HOUR_MS);
+  await both.on("b");
+  assert.equal(world.state.grant_days, 3);
+  assert.ok(node.grants.get(world.userId).not_after_ms <= world.now + 3 * DAY_MS);
+  assert.ok(node.grants.get(world.userId).not_after_ms > world.now + 2 * DAY_MS);
+});
+
+test("a step whose reading of the sealed ledger fails hands no grant, and the next step asks again: a backend that fails for a moment does not have one device hand a delegation another device turned off; a sealed ledger this program does not read is left as it is, and the procedures say program_stale", async () => {
+  const grantsOf = (node) => node.commands.filter((command) => command.type === "grant").length;
+  const refused = { status: 503, body: { detail: "postgresql_unavailable" } };
+  const fx = S.fixture(source);
+  const world = fx.world;
+  const node = fx.nodes[0];
+  const both = twoDevices(fx);
+  await both.on("a");
+  await both.on("b");
+  await both.on("a");
+  assert.equal((await S.call(fx, "set_delegation", { enabled: false })).ok, true);
+  await world.settle(1000);
+  const handed = grantsOf(node);
+  // The route of the sealed ledger fails. Device B hands no grant in any of its steps, and a
+  // procedure that needs the grant ends with that failure.
+  world.fault("GET /api/secure/ledger", refused);
+  await both.on("b");
+  for (let day = 0; day < 3; day += 1) {
+    world.advance(25 * HOUR_MS);
+    await S.event(fx, "foreground");
+    await S.event(fx, "push", { reason: "grant_required" });
+  }
+  assert.equal(grantsOf(node), handed);
+  assert.equal(node.grants.has(world.userId), false);
+  assert.deepEqual(await S.call(fx, "connect", { target: "github" }), { ok: false, code: "postgresql_unavailable" });
+  assert.deepEqual(await S.call(fx, "set_grant_days", { days: 7 }), { ok: false, code: "postgresql_unavailable" });
+  // (One answer that fails is asked again, and the step goes on.)
+  // Device A, whose delegation is off, sends its revokes all the same.
+  const revokes = node.commands.filter((command) => command.type === "revoke").length;
+  world.advance(25 * HOUR_MS);
+  await both.on("a");
+  assert.ok(node.commands.filter((command) => command.type === "revoke").length > revokes);
+  // The route answers again: B reads that the delegation is off.
+  world.clearFaults();
+  world.advance(25 * HOUR_MS);
+  await both.on("b");
+  assert.equal(world.state.grant.state, "off");
+  assert.equal(grantsOf(node), handed);
+
+  // One answer of that route that fails for a moment: asked once more, and the grant is handed.
+  const once = S.fixture(source);
+  once.world.fault("GET /api/secure/ledger", refused, 1);
+  await S.start(once);
+  assert.equal(once.world.state.grant.state, "active");
+  assert.equal(once.world.sent("GET /api/secure/ledger").length, 2);
+  // A backend without the route has nothing to merge.
+  const none = S.fixture(source);
+  none.world.fault("GET /api/secure/ledger", { status: 404, body: { detail: "Not Found" } });
+  await S.start(none);
+  assert.equal(none.world.state.grant.state, "active");
+
+  // A sealed ledger of this key that this program does not read (a later program sealed it): no
+  // grant, no upload over it, and program_stale.
+  for (const shape of ["sealed otherwise", "another shape"]) {
+    const later = S.fixture(source);
+    const sealed = shape === "another shape" ? { key_id: later.keys.keyId, v: 2, payload: "AAAA" }
+      : { key_id: later.keys.keyId, nonce: b64u(crypto.randomBytes(12)), ct: b64u(crypto.randomBytes(80)) };
+    later.world.sharedLedger = sealed;
+    await S.start(later);
+    assert.equal(later.world.runtime.program_stale, true, shape);
+    assert.deepEqual(later.nodes[0].commands, [], shape);
+    assert.deepEqual(await S.call(later, "connect", { target: "github" }), { ok: false, code: "program_stale" }, shape);
+    assert.deepEqual(await S.call(later, "set_delegation", { enabled: true }), { ok: false, code: "program_stale" }, shape);
+    await nextDay(later);
+    await later.world.settle(1000);
+    assert.deepEqual(later.nodes[0].commands, [], shape);
+    assert.equal(later.world.ledgerUploads, 0, shape);
+    assert.deepEqual(later.world.sharedLedger, sealed, shape);
+  }
+  // A sealed ledger of another key (the key the account had before) is nothing to merge.
+  const old = S.fixture(source);
+  old.world.sharedLedger = { key_id: "0123456789abcdef", nonce: b64u(crypto.randomBytes(12)), ct: b64u(crypto.randomBytes(80)) };
+  await S.start(old);
+  assert.equal(old.world.state.grant.state, "active");
+  assert.equal(old.world.runtime.program_stale, false);
+});
+
+test("a setting of the delegation whose upload failed is uploaded by the next step of that device, and a device without a setting uploads nothing", async () => {
+  const fx = S.fixture(source);
+  const world = fx.world;
+  const node = fx.nodes[0];
+  const both = twoDevices(fx);
+  await both.on("a");
+  await both.on("b");
+  await both.on("a");
+  // (A device that set nothing uploaded nothing.)
+  assert.equal(world.ledgerUploads, 0);
+  // The upload of the switch fails.
+  world.fault("PUT /api/secure/ledger", { status: 503, body: {} }, 1);
+  assert.equal((await S.call(fx, "set_delegation", { enabled: false })).ok, true);
+  await world.settle(1000);
+  assert.equal(world.ledgerUploads, 0);
+  // The next synchronization of that device uploads it, and the other device then hands none.
+  world.advance(2 * 60000);
+  await S.event(fx, "foreground");
+  await world.settle(1000);
+  assert.equal(world.ledgerUploads, 1);
+  const handed = node.commands.filter((command) => command.type === "grant").length;
+  world.advance(25 * HOUR_MS);
+  await both.on("b");
+  await S.event(fx, "push", { reason: "grant_required" });
+  assert.equal(node.commands.filter((command) => command.type === "grant").length, handed);
+  assert.equal(world.state.grant.state, "off");
+
+  // The same when the read of that exchange fails (twice: it is asked once more): the next
+  // synchronization of the device, whose delegation is off, reads the sealed ledger before its
+  // revokes and uploads what it does not hold.
+  const other = S.fixture(source);
+  const pair = twoDevices(other);
+  await pair.on("a");
+  await pair.on("b");
+  await pair.on("a");
+  other.world.fault("GET /api/secure/ledger", { status: 503, body: {} }, 2);
+  assert.equal((await S.call(other, "set_delegation", { enabled: false })).ok, true);
+  await other.world.settle(1000);
+  assert.equal(other.world.ledgerUploads, 0);
+  other.world.advance(2 * 60000);
+  await S.event(other, "foreground");
+  await other.world.settle(1000);
+  assert.equal(other.world.ledgerUploads, 1);
+  other.world.advance(25 * HOUR_MS);
+  await pair.on("b");
+  await S.event(other, "push", { reason: "grant_required" });
+  assert.equal(other.world.state.grant.state, "off");
+  assert.equal(other.nodes[0].grants.has(other.world.userId), false);
+});
+
+// ---- The last list before the tag: two steps that write the same judgement ----
+
+test("A1: a measurement a round noted as one that held the key stays one when the step of the grants of a synchronization, which read the same values before it waited for an attestation, writes after that round: the log is marked a day later as it is without that wait", async () => {
+  for (const raced of [false, true]) {
+    const label = raced ? "raced" : "plain";
+    const fx = S.fixture(source, { device: { securityStatus: true } });
+    await S.start(fx);
+    const world = fx.world;
+    // An accepted node hands the key of the account to a node of a measurement no list has (the
+    // entry of the transfer names the measurement), and the backend lists that node.
+    world.advance(2 * HOUR_MS);
+    const other = bridge.randomMeasurement();
+    const later = world.addNode({ release: "v9.0.0", measurement: other });
+    fx.nodes[0].record("c", [{
+      t: "grant_transferred_out", time_ms: world.now, to: later.id, release: "v9.0.0",
+      pcr0: other.pcr0, pcr1: other.pcr1, pcr2: other.pcr2,
+    }]);
+    // The app comes to the foreground and the log screen is read at once: the synchronization
+    // asks for the attestation of the listed node, and the round of the screen reads the
+    // transfer. In the raced run the attestation is answered twenty seconds late, after that
+    // round has ended and written.
+    if (raced) world.fault("GET /api/secure/nodes", { delay_ms: 20000 }, 1);
+    await world.run(Promise.all([
+      Promise.resolve(fx.program.onEvent("foreground", {})).then(() => {}, () => {}),
+      fx.program.procedures.read_log({}).then(() => {}, () => {}),
+    ]));
+    await world.settle(30000);
+    const kept = Object.values(world.stored("log.unaccepted"));
+    assert.equal(kept.length, 1, label);
+    assert.equal(kept[0].held, true, label);
+    // (The step of the grants met that node: the device keeps its judgement of it.)
+    assert.equal(world.stored("log.nodes")[later.id] !== undefined, true, label);
+    assert.equal(world.state.log.status, "pending", label);
+    // A day later the log is marked, and stays marked.
+    for (let day = 0; day < 2; day += 1) {
+      world.advance(26 * HOUR_MS);
+      await S.event(fx, "foreground");
+      await world.settle(5000);
+      assert.equal(world.state.log.status, "attention", label + " day " + day);
+      assert.equal(world.state.log.unknown_nodes, 1, label + " day " + day);
+    }
+    assert.deepEqual(world.securityStatuses.slice(-1)[0].reasons, ["unlisted_release"], label);
+  }
+});
+
+test("a round that ends keeps what the step of the grants wrote while it read: the node of a later release that step met, and the time the device first saw its measurement", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  world.advance(2 * HOUR_MS);
+  // A listed node of a measurement no list has, which holds no key of the account. The round
+  // of the screen starts first and waits for its listing; the synchronization meets the node
+  // and writes it while that round reads.
+  const later = world.addNode({ release: "v9.0.0", measurement: bridge.randomMeasurement() });
+  world.fault("POST /api/secure/log/read", { delay_ms: 8000 }, 1);
+  const reading = fx.program.procedures.read_log({}).then(() => {}, () => {});
+  await world.settle(1000);
+  await world.run(Promise.all([Promise.resolve(fx.program.onEvent("foreground", {})).then(() => {}, () => {}), reading]));
+  await world.settle(30000);
+  assert.equal(world.stored("log.nodes")[later.id] !== undefined, true);
+  const kept = Object.values(world.stored("log.unaccepted"));
+  assert.equal(kept.length, 1);
+  assert.equal(kept[0].held, false);
+  assert.equal(kept[0].node, later.id);
+  // (That node is not asked for its attestation again by the next synchronization.)
+  const asked = world.sent("GET /api/secure/nodes").length;
+  world.advance(2 * 60000);
+  await S.event(fx, "foreground");
+  assert.equal(world.sent("GET /api/secure/nodes").length, asked);
+});
+
+test("a mark an event of the app told while a round read is not covered by that round: the round reads what the app was told last when it ends, tells no pending over an attention, and a measurement that marked the log marks it on for a round that cannot say now what is served", async () => {
+  // A build that knows the delivery of the program itself. A measurement no list has held the
+  // key for longer than a day.
+  const delivery = { verified: 0, settled_ms: 0, failed_ms: 0, failed_status: 0 };
+  const fx = S.fixture(source, { device: { securityStatus: true, delivery: () => delivery } });
+  const world = fx.world;
+  delivery.verified = fx.version;
+  delivery.settled_ms = world.now;
+  await S.start(fx);
+  moveKeyToUnlisted(fx);
+  world.advance(25 * HOUR_MS);
+  delivery.settled_ms = world.now;
+  await S.event(fx, "foreground");
+  await world.settle(3000);
+  assert.equal(world.state.log.status, "pending");
+  assert.equal(world.state.log.newer_release_nodes, 1);
+  // 26 hours later the last check of the app is two hours old. The user opens the log screen:
+  // a round starts, and its listing is answered eight seconds late.
+  world.advance(26 * HOUR_MS);
+  delivery.settled_ms = world.now - 2 * HOUR_MS;
+  const before = world.securityStatuses.length;
+  world.fault("POST /api/secure/log/read", { delay_ms: 8000 }, 1);
+  const reading = fx.program.procedures.read_log({}).then(() => {}, () => {});
+  await world.settle(5000);
+  // The app checks for a new program (there is none) and a push arrives: the event marks the
+  // log, 59 minutes and 58 seconds after that check.
+  delivery.settled_ms = world.now - (HOUR_MS - 2000);
+  const push = Promise.resolve(fx.program.onEvent("push", { reason: "refresh" })).then(() => {}, () => {});
+  await world.settle(1000);
+  assert.equal(world.state.log.status, "attention");
+  assert.deepEqual(world.securityStatuses.slice(before).map((told) => told.status), ["attention"]);
+  // The round ends when that check is older than an hour. It tells nothing over the attention,
+  // and the mark stays.
+  await world.run(Promise.all([reading, push]));
+  await world.settle(20000);
+  assert.ok(world.securityStatuses.slice(before).every((told) => told.status === "attention"));
+  assert.equal(world.stored("log.round").told, "attention");
+  assert.equal(world.state.log.status, "attention");
+  assert.equal(world.state.log.unknown_nodes, 1);
+  // A round two hours after the last check, in the same runtime: the mark stays.
+  world.advance(2 * HOUR_MS);
+  assert.equal((await S.call(fx, "read_log", { limit: 5 })).value.status, "attention");
+  assert.equal(world.state.log.status, "attention");
+});
+
+test("a round that began before the end of the account erased what the device keeps of the log writes nothing back and publishes nothing", async () => {
+  const fx = S.fixture(source, { device: { securityStatus: true } });
+  await S.start(fx);
+  const world = fx.world;
+  for (let i = 0; i < 3; i += 1) {
+    world.advance(HOUR_MS);
+    fx.nodes[0].record("c", [{ t: "connection_created", time_ms: world.now, record_id: "r" + i, provider: "slack", scope: "" }]);
+  }
+  // A round of the screen waits for its listing while the account ends.
+  world.fault("POST /api/secure/log/read", { delay_ms: 8000 }, 1);
+  const reading = fx.program.procedures.read_log({}).then(() => {}, () => {});
+  await world.settle(2000);
+  const reports = world.reports.length;
+  const told = world.securityStatuses.length;
+  await S.event(fx, "account_end", { reason: "account_deleted" });
+  assert.deepEqual(Array.from(world.store.keys()).filter((key) => key.startsWith("log.")), []);
+  await world.run(reading);
+  await world.settle(30000);
+  assert.deepEqual(Array.from(world.store.keys()).filter((key) => key.startsWith("log.") || key === "ledger"), []);
+  assert.equal(world.reports.length, reports);
+  assert.equal(world.securityStatuses.length, told);
+});
+
+test("a setting of the delegation that is made while an exchange of the ledger is under way reaches the other devices all the same", async () => {
+  const fx = S.fixture(source);
+  const world = fx.world;
+  const node = fx.nodes[0];
+  const both = twoDevices(fx);
+  await both.on("a");
+  await both.on("b");
+  await both.on("a");
+  // Device A sets a lifetime, and the exchange that uploads it is answered five seconds late:
+  // the second request for the sealed ledger of that call (the first is the reading before the
+  // setting). While that exchange is under way the user turns the delegation off.
+  let reads = 0;
+  world.fault("GET /api/secure/ledger", () => {
+    reads += 1;
+    return reads === 2 ? { delay_ms: 5000 } : undefined;
+  });
+  assert.equal((await S.call(fx, "set_grant_days", { days: 7 })).ok, true);
+  assert.equal((await S.call(fx, "set_delegation", { enabled: false })).ok, true);
+  await world.settle(30000);
+  world.clearFaults();
+  // The next synchronization of A makes up for an upload the exchange in flight left out.
+  world.advance(2 * 60000);
+  await S.event(fx, "foreground");
+  await world.settle(5000);
+  const handed = node.commands.filter((command) => command.type === "grant").length;
+  // Device B, about to hand its grant, reads that the delegation is off.
+  world.advance(25 * HOUR_MS);
+  await both.on("b");
+  await S.event(fx, "push", { reason: "grant_required" });
+  assert.equal(world.state.grant.state, "off");
+  assert.equal(world.state.grant_days, 7);
+  assert.equal(node.commands.filter((command) => command.type === "grant").length, handed);
+  assert.equal(node.grants.has(world.userId), false);
 });
