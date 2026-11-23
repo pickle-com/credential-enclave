@@ -120,7 +120,8 @@ response that sends it back is cut. The limits of that are in the next section.
 
 ## What it does not guarantee
 
-The first twelve rows are the limits that section 5 of egress-policy.md states.
+The first eighteen rows, but for the row "The entry of a value on the device", are the limits that
+section 5 of egress-policy.md states.
 
 | Limit | What it means |
 | --- | --- |
@@ -136,6 +137,7 @@ The first twelve rows are the limits that section 5 of egress-policy.md states.
 | Side channels | The size and the time of a response, and the sizes of the parts of a response that is handed on as a stream |
 | The entry of a value on the device | A value a user enters reaches the secure program through a screen of the app. An app build that draws the input field of a value, and the text that says where the value may go, from a screen definition the backend of the operator serves leaves both to the operator domain: it can show other hosts than the record names. Only a build that draws that sheet itself removes this |
 | The rest of a request that carries a vault secret | A record binds the host and the slot of a value. The path of that host a request goes to, its body and its other headers are chosen by the caller, the operator domain. A host with an address that stores what it receives and returns it to another request, or that returns a value in a form the reflection check does not know (encrypted, compressed, split), lets the operator domain read the value there. Every such request is on the log of the account |
+| A value that can be guessed | The node withholds the response to a request that carried a vault secret, or cuts it, exactly when the response holds the value, and the operator domain, which calls the node, sees that verdict. So the verdict on a response whose content the caller chose says whether that content holds the value, and a value of a small set of candidates (a word of a dictionary, a short number) can be told from the others that way. A value that cannot be guessed, as a key a provider issued, is not found this way. Every such request is on the log of the account |
 | An earlier record | After a user narrowed the reach of a vault secret or deleted it, the operator domain can still hold the earlier record, and a node opens it while a grant is in force. Its use is on the log like any other |
 | A value a page receives | The origin of a `release` call is what the caller stated: the node holds it to the hosts of a vault secret and writes it into the entry, and it does not know where a browser is |
 | A value the operator domain gave | The operator domain knew a value it stored through `vault/store`. The record says so. What the source shows for such a value begins with the record |
