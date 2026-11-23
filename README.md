@@ -111,7 +111,7 @@ The first twelve rows are the limits that section 5 of egress-policy.md states.
 | `previous` of `oauth/merge` | Any record of kind `oauth` of the same account and provider is taken. The operator domain can choose to move the refresh token of one connection of a user into another connection of the same user and provider. That is a limit of integrity, not of confidentiality |
 | The freshness of a record | A node keeps no state about records. The operator domain stores them and can present an older record of an account, for example the one from before a refresh. That decides which token is used. It does not let anyone read one |
 | The honesty of the app | The app holds the master key and verifies the attestation. The app binary is not open source yet. The secure program that the app runs for this protocol is in this repository (`secure-program/`) and bound to the public record: a release build loads a served program only with the release proof of a release of this repository ([secure-program/README.md](secure-program/README.md)). What that does not show is that the binary runs the program unchanged: until the app is open source, "the app is honest" is an assumption, and an app that is not the published one can leak the master key. Verifying the app binary is outside this repository |
-| Side channels | The size and the time of a response |
+| Side channels | The size and the time of a response, and the sizes of the parts of a response that is handed on as a stream |
 | The log store | The guarantee of the log store rests on AWS: on S3 Object Lock in compliance mode, and on the AWS account of the operator, which holds the bucket. When that account is closed, the bucket goes with it. An object can be deleted when its retention ended, 365 days after the write. The operator domain carries the bytes between a node and the store and can stop them: the node then uses no credential (the calls end with `log_store_unavailable`), so stopping the store stops the service and hides no use. The store can hold more entries than there were acts: an entry whose act failed afterwards or never started is in the store like any other. The operator domain holds the credentials for the bucket and can add objects to it: an object is an entry of a node when its body verifies under the signing key of that node (protocol.md 7.6) |
 | The transfer to a later release | The operator can move the delegations of a node to a node of a later release: a release whose measurements it signs with its release key and publishes in the public transparency log (protocol.md 10.3). The later release is another program, and the user keys are then under the rules of its source. The notice period between the entry of the log and the transfer is zero: an account does not learn of a release before its delegation can move there. What stays is the record: every release that received delegations is permanently in the public log, with the hash of its measurements under the signature of the release key |
 | The transparency log | The honesty of the log rests on the operation of Sigstore Rekor. A node checks the signed entry timestamp of the log: the signature of the log key over the entry. It checks no inclusion proof and no checkpoint, so it does not show that the log kept the entry |
@@ -262,8 +262,9 @@ that read the bytes of a secret are a closed list, checked on every push
 under the user key, sealed to a verified peer node, inside a TLS request to an address of the
 provider definitions, as one vault value from `release`, and, for the credentials of the
 operator for the log store, inside the TLS request that writes a log entry there. Every field of every response is
-classified, a provider response is checked before any part of it is returned, and a test plants a
-marker in every secret and searches every response for it.
+classified, a provider response is checked before any part of it is returned (a response that is
+handed on as a stream is checked while it arrives, and is cut in front of a credential it holds),
+and a test plants a marker in every secret and searches every response for it.
 
 ## Repository
 

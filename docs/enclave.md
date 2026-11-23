@@ -45,6 +45,7 @@ credential-enclave/
 │   ├── src/main.rs               # the argument, the choice of the platform, the start of the server
 │   ├── src/platform/mod.rs       # trait Platform (section 2)
 │   ├── src/platform/nitro.rs     # NSM attestation, vsock listener, vsock egress
+│   ├── src/platform/lingering.rs # a vsock connection is closed only after its peer reported its end (section 8)
 │   ├── src/platform/local.rs     # unsigned document, TCP listener, direct egress
 │   ├── src/state.rs              # the state of a node (section 3), the counts of health, the events of the log
 │   ├── src/subset.rs             # the delegation subset: which accounts a node holds (protocol.md 10.4)
@@ -56,6 +57,7 @@ credential-enclave/
 │   ├── src/lineage.rs            # the release key, the log key and the list of predecessors of the program (5.13)
 │   ├── src/load.rs               # the CPU time and the memory of the kernel, from procfs, for `load` of health (5.1)
 │   ├── src/descriptors.rs        # the limit of open descriptors the node raises at its start, and the two descriptor values of `load` of health (section 8)
+│   ├── src/inbound.rs            # the connections from the backend: their number from the memory of the kernel, and the time limits of a body and of a response (section 8)
 │   ├── src/providers/mod.rs      # the provider definitions: parsing, validation, the address check
 │   ├── src/providers/definitions.json
 │   ├── src/oauth.rs              # the authorization address, the token address call, the merge rules, the public fields
@@ -63,11 +65,11 @@ credential-enclave/
 │   ├── src/provider_response.rs  # the check of a provider response before `forward` returns it
 │   ├── src/egress.rs             # the TLS client (rustls), the idle connections per (account, host), the node-wide bound of provider requests
 │   ├── src/log_store.rs          # the log store: the group commit, the write of an entry, its signature, the pending entries, the idle connections (5.14)
-│   ├── src/frame.rs              # the frame of `forward` (5.8) and of `forward/batch` (5.8b)
+│   ├── src/frame.rs              # the frame of `forward` (5.8) and of `forward/batch` (5.8b), and the stream of `forward`
 │   ├── src/testing.rs            # tests only: the provider stand-in, the test platform and clock
 │   └── src/tests/                # tests only: the tests of the whole node (section 12)
 ├── host/                         # crate credential-enclave-host (binary credential-enclave-host)
-│   └── src/{main,launch,relay,egress,config,health,watch,descriptors,drain,http,testing}.rs
+│   └── src/{main,launch,relay,egress,config,health,watch,descriptors,memory,drain,http,testing}.rs
 ├── verify/                       # crate credential-enclave-verify (binary credential-enclave-verify)
 │   ├── src/{main,arguments,evaluate,fetch,render}.rs   # the attestation check
 │   ├── src/program.rs            # the subcommand program: the release proof of the secure program
@@ -123,6 +125,15 @@ The crates and what they depend on, as their `Cargo.toml` files state it:
   attestation documents that tests build), and the feature `test-util` of `tokio`.
 - Every crate has `#![forbid(unsafe_code)]`: the source of this repository has no `unsafe` block
   (its dependencies are outside this rule).
+- The node program and the host program abort on a panic (the release profile below), and a
+  node that ends takes the delegations it holds with it. The crates of the node program, of
+  the host program and of the protocol deny, outside the code of their tests, the lints
+  `clippy::unwrap_used`, `expect_used`, `panic`, `unreachable`, `todo`, `unimplemented`,
+  `indexing_slicing`, `string_slice` and `get_unwrap`. A place that keeps an `expect` carries
+  `#[expect(clippy::expect_used, reason = "...")]` with the reason why no input reaches its
+  failure. The rule is not in force in four modules, which a `cfg_attr` at their `mod` line
+  says: `enclave/src/state.rs`, `enclave/src/log_store.rs`, `protocol/src/log.rs` and
+  `protocol/src/keys.rs`. The rule reads the code of these crates and not their dependencies.
 - The release profile is a build input of the measured binary: `opt-level = 3`, `lto = "fat"`,
   `codegen-units = 1`, `panic = "abort"`, `strip = true`.
 
@@ -158,8 +169,9 @@ pub trait Platform: Send + Sync + 'static {
     fn attestation(&self, user_data: &[u8], nonce: &[u8]) -> Result<Vec<u8>, PlatformError>;
     fn fill_random(&self, out: &mut [u8]) -> Result<(), PlatformError>;
     fn trusted_time_ms(&self) -> Result<u64, PlatformError>;          // the time the hypervisor gives
-    fn listen(&self) -> impl Future<Output = Result<Listener, PlatformError>> + Send;   // where the calls of the backend arrive
+    fn listen(&self, connections: usize) -> impl Future<Output = Result<Listener, PlatformError>> + Send;   // where the calls of the backend arrive; `connections` is the bound of section 8
     fn connect(&self, host: &str, port: u16) -> impl Future<Output = Result<Stream, PlatformError>> + Send;  // the outbound byte pipe to a provider or to the log store
+    fn lingering(&self) -> Option<(usize, u64)>;                      // the connections that wait for the end of their peer, and those closed before it (section 8). None on local
 }
 ```
 
@@ -171,8 +183,8 @@ pub trait Platform: Send + Sync + 'static {
 | `attestation` | NSM `Attestation { user_data, nonce, public_key: None }` | The local document of protocol.md 4.2 |
 | `fill_random` | Kernel randomness (`getrandom`). At boot the node checks that `/sys/class/misc/hw_random/rng_current` is `nsm-hwrng`, and the start stops when it is not | `getrandom` |
 | `trusted_time_ms` | The node requests one NSM attestation document and reads its `timestamp` (the signature is not verified: the document comes from the node's own `/dev/nsm`) | The system time |
-| `listen` | vsock, port 8080, any CID (`VMADDR_CID_ANY`) | TCP `0.0.0.0:8080` |
-| `connect` | The node connects to vsock port 8443 of the parent (CID 3), sends `CONNECT {host}:{port}\n` as the first line, receives `OK\n`, and uses the connection as the byte pipe from then on. The host is a DNS name: lower-case letters, digits, `.` and `-`. The hosts a node asks for are those of its provider definitions and the host of its log store | A direct TCP connection |
+| `listen` | vsock, port 8080, any CID (`VMADDR_CID_ANY`), with a queue of `connections` connections that wait for accept (section 8). An accepted connection is closed only after its peer reported the end of its bytes, and a write to it is attempted each time it is asked for (section 8) | TCP `0.0.0.0:8080` |
+| `connect` | The node connects to vsock port 8443 of the parent (CID 3), sends `CONNECT {host}:{port}\n` as the first line, receives `OK\n`, and uses the connection as the byte pipe from then on. The host is a DNS name: lower-case letters, digits, `.` and `-`. The hosts a node asks for are those of its provider definitions and the host of its log store. The connection is closed only after the egress relay reported the end of its bytes (section 8) | A direct TCP connection |
 
 The program argument: `credential-enclave --platform {nitro|local}`. There is no other
 configuration (the operator configuration arrives through the call of 5.1). A wrong argument ends
@@ -354,8 +366,12 @@ struct Credentials { access_key_id: String, secret_access_key: Secret<String>, s
 
 A path that is not defined is 404, and a method that a path does not accept is 405. Both have the
 code `invalid_request`. `user_mismatch` is 400 also when the account of a record does not match
-(protocol.md section 6). A JSON body is accepted up to 1 MiB, and a longer one is `too_large`. The
-responses of a node carry no `Date` header (it would be a value of the system clock).
+(protocol.md section 6). A JSON body is accepted up to 1 MiB, and a longer one is `too_large`. A
+body whose bytes stop arriving for 60 seconds (`inbound_idle`, section 8) is `invalid_request`
+with the message `the request body did not arrive within the time limit`, and the connection
+ends after that response. A request head above 32 KiB is answered with the status 431 by the
+HTTP connection, before a call sees it. The responses of a node carry no `Date` header (it
+would be a value of the system clock).
 
 - The common front of the calls that use a credential (`forward`, `forward/batch`, `refresh`,
   `revoke-token`, `release`, `oauth/complete`, the mail calls): (1) the node is not `closing`. (2)
@@ -398,7 +414,7 @@ GET /v1/health -> {"node":"...","release":"v2.1.0","platform":"nitro","custody":
                    "log":{"entries":0,"events":0,"writes":0,"write_failures":0,"open_batches":0,"batch_calls":0,"batch_requests":0,
                           "write_attempt_failures":{"connect":0,"tls":0,"closed":0,"timeout":0,"status_4xx":0,"status_5xx":0},"write_retries":0,
                           "write_ms_buckets":{"25":0,"50":0,"100":0,"250":0,"500":0,"1000":0,"2500":0,"5000":0},"write_ms_sum":0,"write_count":0},
-                   "load":{"provider_inflight":0,"forward_calls":0,"inbound_connections":0,"inbound_refused":0,"cpu_user_ms":0|null,"cpu_system_ms":0|null,"cpu_idle_ms":0|null,"memory_total_bytes":0|null,"memory_available_bytes":0|null,"descriptors_open":0|null,"descriptors_limit":0|null},
+                   "load":{"provider_inflight":0,"forward_calls":0,"inbound_connections":0,"inbound_refused":0,"inbound_limit":0,"cpu_user_ms":0|null,"cpu_system_ms":0|null,"cpu_idle_ms":0|null,"memory_total_bytes":0|null,"memory_available_bytes":0|null,"descriptors_open":0|null,"descriptors_limit":0|null,"lingering_connections":0|null,"lingering_cut":0|null},
                    "egress":{"opens":0,"open_failures":{"transport":0,"relay_refused":0,"tls":0,"http":0},"open_retries":0,"open_inflight":0,"idle_reuses":{"provider":0,"log_store":0}},
                    "refresh":{"late":{"kept":0,"dropped":0,"failed":0,"abandoned":0},"late_inflight":0},
                    "state":{"kept_refreshes":0,"merge_keys":0,"pending_entries":0,"idle_connections":{"provider":0,"log_store":0}}}
@@ -477,13 +493,19 @@ POST /v1/config {"providers":{"google_workspace":{"client_id":"...","client_secr
   every call. Each of the five values of the kernel is null when the kernel exposes no procfs
   value (a kernel without procfs, or a development machine that is not Linux); the two counts
   are always numbers. `inbound_connections` is the number of connections from the backend the
-  node holds open at this moment, and `inbound_refused` the number of connections it closed at
-  accept because its bound of open connections was reached, since it started (section 8).
+  node holds open at this moment, `inbound_refused` the number of connections it closed at
+  accept because its bound of open connections was reached, since it started, and
+  `inbound_limit` that bound: the node computed it at its start from the memory of its kernel
+  (section 8).
   `descriptors_open` is the number of open file descriptors of the node process (the entries of
   `/proc/self/fd`, null when the kernel exposes none) and `descriptors_limit` the soft limit of
   open file descriptors in force (null when the platform has no such limit): the limit the
   node raised at its start (section 8), or the limit the kernel gave it when the kernel refused
   the raise. The operator domain reads the two to see a node that approaches its limit.
+  `lingering_connections` is the number of connections the node is done with and keeps open
+  until their peer reported the end of its bytes, at this moment, and `lingering_cut` the
+  number of connections it closed before that end, since it started (section 8). Both are
+  null on the local platform, which closes a connection when the node is done with it.
 - `log_store` of `config` names the log store of the node (protocol.md 4.1 gives the form of the
   two names. Another form is `invalid_request`). The key is optional. A node takes a log store
   once: a later configuration that names the same log store, or none, leaves it in place, and a
@@ -698,27 +720,69 @@ response meta: {"status":200,"headers":[["name","value"],...],"log":{"seq":1,"in
 
 The payload of the request is the body to send to the provider. The payload of the response is the
 body that the provider returned, as the provider sent it: the node asks for the encoding
-`identity`, decodes nothing, and does not return a body of another encoding (step 10). The order
-of the processing:
+`identity`, decodes nothing, and does not return a body of another encoding (step 10).
+
+The response has one of two forms, and the caller chooses with `stream` of the request meta.
+Without the key, and with `false` or `null`, the response is the frame above: the node reads
+the whole body of the provider into memory, at most 64 MiB of it, checks the response as a
+whole and answers with the meta and the body. With `"stream": true` the response is a stream:
+the head of the provider response first, and its body in parts while it arrives (step 11). A
+body that is handed on as a stream has no limit.
+
+```text
+stream = meta_len (unsigned 32 bit, big-endian) || meta (UTF-8 JSON, meta_len bytes) || part* || end
+part   = part_len (unsigned 32 bit, big-endian, 1 to 1,048,576) || part_len bytes of the body of the provider
+end    = 0 (unsigned 32 bit) || end record (UTF-8 JSON, all the rest)
+Content-Type: application/vnd.pickle.stream
+```
+
+```json
+stream meta: {"status":200,"headers":[["name","value"],...],"log":{"seq":1,"index":0,"created":true}}
+end record:  {"complete":true} | {"complete":false,"code":"response_withheld","message":"..."}
+```
+
+A node of a release before v2.4.0 does not know the key: it passes over it and answers with a
+frame. So a caller that asks for a stream reads the `Content-Type` of a 200 response to learn
+which form it holds. The order of the processing:
 
 0. The frame: meta is a JSON object of at most 1 MiB (a longer meta, and a meta that is no object,
-   is `invalid_request`). A payload above 64 MiB is `too_large`. A `timeout_ms` that is not an
-   integer from 1,000 to 120,000 is `invalid_request` (when it is omitted, it is 30,000).
+   is `invalid_request`). A payload above 64 MiB is `too_large`. `stream` is a boolean (another
+   value is `invalid_request`). A `timeout_ms` that is not an integer from 1,000 to 120,000 is
+   `invalid_request` (when it is omitted, it is 30,000). For a call that asks for a stream the
+   range is 1,000 to 600,000: the time limit of such a call reaches to the end of the body. The
+   call takes one of the 512 places of the forward calls and the share of the body budget its
+   request frame occupies before it reads the frame, and waits for the two together for at most
+   30 seconds (`ADMISSION_WAIT`, section 8): a call that has not got them by then ends with
+   `capacity_unavailable`, having read nothing, created no entry and sent nothing.
 1. The common front. The kind of the record is `oauth` or `oauth_imported` (any other kind is
    `not_allowed`).
 2. The address check (section 7). A violation is `not_allowed`.
 3. The method is one of `GET`, `POST`, `PUT`, `PATCH`, `DELETE` (any other is `not_allowed`).
 4. The header check: a name holds token characters only, and a value holds no control character
    (CR and LF included). A violation is `invalid_request`. A value can hold characters outside
-   ASCII and is sent as UTF-8. A call with a header named `x-http-method-override`,
-   `x-http-method` or `x-method-override` (ASCII letters compared without regard to case) is
+   ASCII and is sent as UTF-8. A header name is compared in lower case and with `-` for every
+   `_` (some servers read the two as one character). A call with a header named
+   `x-http-method-override`, `x-http-method` or `x-method-override` is
    refused with `not_allowed`: such a header asks a provider to treat the request as one of
    another method than the method the request is sent with, which is the method the entry of
    step 6 names. The node refuses the call. It does not drop the header and send the rest. The
    node drops the names below and the name that equals `inject.header` of the definition:
    `authorization`, `proxy-authorization`, `cookie`, `host`, `content-length`,
    `transfer-encoding`, `connection`, `keep-alive`, `upgrade`, `te`, `trailer`, `expect`,
-   `accept-encoding`.
+   `accept-encoding`, `range`, `if-range`, `accept-charset`. Without `Range` and `If-Range` the
+   node asks for the whole of a response: the response check of step 10 reads what one
+   response holds. Of a response that held the injected credential, two parts that a caller
+   asked for one by one would each pass that check, and a response of several ranges
+   (`multipart/byteranges`) holds its parts with other bytes between them. A provider that
+   honours a range answers the request without one with the whole representation, so a
+   caller that names a range receives the status 200 and the whole body, and a body of any
+   length is handed on as a stream (step 11). Without `Accept-Charset` the node asks for no
+   character encoding of a response: the check of step 10 reads bytes, and in UTF-16 the
+   bytes of a credential are not the bytes it looks for. An `Accept` header can ask for the
+   same with a `charset` parameter, so a call with an `Accept` header in which the word
+   `charset` (in any case of its letters) is followed by anything but `=` and `utf-8` or
+   `utf8` (with or without quotes and blanks) is refused with `not_allowed`, before an entry
+   is created.
 5. The merge decision (protocol.md 7.2): a GET request without a body that matches an event of
    the open batch or of an entry created less than 300 seconds before shares that event. In case
    of a merge the call continues at step 8 without an event of its own, once the log store
@@ -764,6 +828,31 @@ of the processing:
     or upper case). A form shorter than 8 bytes is not searched for. A failed check is
     `response_withheld`: no part of the response leaves. The event `provider_request` is already
     on the chain, because the request went to the provider.
+11. A call that asked for a stream. Steps 8 and 9 run up to the head of the provider response:
+    a failure before it (`timeout`, `provider_unreachable`) is the failure of the call, a
+    JSON failure as for a frame. The head passes the checks of step 10 before the status 200
+    leaves: a response under a `Content-Encoding` other than `identity` or a transfer coding
+    other than `chunked`, and a response whose header names or header values hold the
+    injected credential, is `response_withheld`, and no stream begins. Then the node answers
+    200 with the stream meta, and a task hands the body on: every part of the body goes
+    through the search of step 10 (`provider_response::StreamCheck`) before it leaves. The
+    search holds back as many bytes as the longest form of the credential can take under
+    three layers of percent escapes (27 bytes for each of its bytes) and 32 more, and hands
+    on the bytes in front of them once a search of everything it holds found no form of the
+    credential (it searches when 65,536 new bytes have arrived, or as many as it holds back
+    when that is more, and at the end of the body). Its verdict on a body is the verdict of
+    step 10 on the same bytes, and a body that holds the credential is cut in front of it: no
+    byte of the form leaves. The end record says how the body ended: `{"complete":true}`, or
+    `complete` false with the `code` `response_withheld`, `provider_unreachable` (the
+    connection of the provider failed or ended inside the body) or `timeout`, and the fixed
+    `message` of that code. A stream that ends without an end record was cut on its way and
+    is a failure for its caller. The response body of a stream takes no share of the body
+    budget: the node holds the bytes held back, the bytes of one search and four elements of
+    the stream. At the time limit of the call the task frees the connection to the provider
+    and the place of the call among the forward calls whether or not the caller reads the
+    response; it frees them as well when the connection of the caller ends. The sizes of the
+    parts of a stream depend on the length of the credential (the bytes held back), which
+    the size of the request to the provider shows the operator domain as well.
 
 The value of the credential header: `inject.prefix` followed by the value at the first path of
 `inject.paths` that holds a non-empty string in the token object. When there is no such value, the
@@ -1322,29 +1411,73 @@ The rules:
 - Concurrency: at most 512 `forward` and `forward/batch` calls run at the same time (a semaphore; a
   batch call takes one place, and holds it for the round trips of its requests, so the places
   are not the bound of the throughput of a node: the provider requests in flight and the body
-  budget are). At most 512 provider requests of the node are in flight at once,
+  budget are). A `forward` or `forward/batch` call waits for its place and for the share of the
+  body budget its request frame occupies for at most 30 seconds together (`ADMISSION_WAIT`)
+  and ends with `capacity_unavailable` when it has not got them by then: the node reads
+  nothing from the connection of a call that waits, so it does not learn that the caller of
+  such a call is gone, and the wait is what bounds the time such a call holds its connection.
+  At most 512 provider requests of the node are in flight at once,
   and a batch sends at most 6 of its requests at a time. The bodies of a request and of a
   response are held in memory, and each of them is `too_large` above 64 MiB (for a batch, the
   bodies of its results together). A call that would raise the sum of the bodies in memory above
-  2 GiB waits until there is room.
-- Connections from the backend: the node holds at most 16,384 of them open at the same time
-  (`inbound_connections`). A connection accepted while that many are open is closed without a
-  byte and counted in `inbound_refused` of `load` of health; the caller sees a connection that
-  ended without a response, as it does for a node that is gone, and what it does next follows
-  its own retry rules (the backend of the operator tries another node for a call it may
-  repeat). A
-  connection that waits longer than 60 seconds (`inbound_idle`) for the head of its next
-  request, before its first request or idle between two requests, is closed. The queue of the
-  listener (the connections that wait for accept) holds 1,024 connections on the nitro platform.
+  2 GiB waits until there is room. The share of the budget a response body occupies travels
+  with the bytes of the response and is free when the connection wrote them: a caller that
+  takes a response slowly, or not at all, holds memory the budget counts. The body of a
+  response that is handed on as a stream (5.8 step 11) is not held in memory and takes no
+  share.
+- Connections from the backend: the node holds a bounded number of them open at the same time
+  (`inbound_limit` of `load` of health). It computes the bound at its start from the memory of
+  its kernel: one eighth of `MemTotal` divided by what one connection can hold that no other
+  bound covers (344,064 bytes: the 262,144 bytes the kernel takes into the receive queue of a
+  vsock socket before the peer has to wait, two read buffers of 32 KiB of the HTTP
+  connection, and 16 KiB for the socket, the task and the state), at least 64 and at most
+  16,384. An enclave of 4,096 MiB has 3,943 MiB and holds 1,502 connections; a kernel that
+  exposes no memory size (a development machine that is not Linux) gives 16,384. A connection
+  accepted while that many are open is closed without a byte and counted in `inbound_refused`
+  of `load` of health; the caller sees a connection that ended without a response, as it does
+  for a node that is gone, and what it does next follows its own retry rules (the backend of
+  the operator tries another node for a call it may repeat).
+- A connection from the backend ends within a fixed time whatever its peer does. The node waits
+  for the peer of a connection at three places, and at each of them for 60 seconds
+  (`inbound_idle`) at the longest: for the head of the next request (before the first request
+  and between two requests), for the next bytes of a request body (the call ends with
+  `invalid_request`, and the connection after its response), and for the peer to take bytes of
+  a response (the connection ends). A write the peer does not take is attempted again every
+  second: the kernel of an enclave gives a writer that waits no event when the peer of its
+  vsock connection closes, so a write that waited for such an event would wait without an end.
+  The HTTP connection reads at most 32 KiB ahead of what it has parsed, and a request head
+  above that is answered with the status 431.
+- The queue of the listener (the connections that wait for accept) holds as many connections as
+  the node holds on the nitro platform. The kernel of an enclave caps the queue of every
+  listener at `net.core.somaxconn`, whose default there is 128, whatever a `listen` call asks
+  for: the node, the first process of the enclave, writes the bound to
+  `/proc/sys/net/core/somaxconn` before it asks for the queue. A kernel that refuses one of
+  the two leaves the queue shorter, and the listener works as before.
+- A vsock connection the node is done with is closed only after its peer reported the end of
+  its bytes. The kernel of an enclave (Linux 4.14.256, the kernel `nitro-cli` 1.5.0 puts into
+  an enclave image file) keeps the bytes that reach a vsock socket after the node closed it,
+  for as long as the enclave runs. A node is done with a connection while its peer is still
+  sending in several places: a call it answered before the end of the request body, a
+  connection above its bound, a response of a provider it gave up on. So the node does not
+  close such a connection: it closes the write side, which tells the peer that the node is
+  done, and a task reads and drops what the peer still sends until the peer reports the end
+  of its bytes (`platform::Lingering`). The two relays of the host program end their side at
+  once when the node closes its write side (9.1), so the wait is a round trip. At most 1,024
+  connections wait at once, each for 10 seconds at the longest; a connection that finds no
+  place, and one whose peer has not ended after the 10 seconds, is closed and counted in
+  `lingering_cut` of `load` of health. The connections the node accepts and the connections
+  it opens to the egress relay are both of this kind. The local platform closes a connection
+  when the node is done with it.
 - Descriptors: every connection the node accepts and every connection it opens holds one file
   descriptor. The kernel of the enclave starts the node with the default limit of its first
   process, 1,024 open descriptors; at its start the node raises the limit to 65,536
   (`DESCRIPTOR_LIMIT` of `descriptors.rs`: the soft limit, and the hard limit when it is below
   the target), or to its hard limit when the kernel refuses the target. `load` of health reports
   the limit in force and the open descriptors. The bounds of this section keep the descriptors
-  of a node below the target: 16,384 connections from the backend, 1,024 idle connections to the
-  providers, 32 idle connections to the log store, 512 provider requests in flight, 256
-  connections being opened, and the writes to the log store of the calls in progress.
+  of a node below the target: at most 16,384 connections from the backend, 1,024 idle
+  connections to the providers, 32 idle connections to the log store, 512 provider requests in
+  flight, 256 connections being opened, 1,024 connections that wait for the end of their peer,
+  and the writes to the log store of the calls in progress.
 - The size of the enclave: 2 vCPUs (a constant of the host program) and the memory that the
   environment variable `CREDENTIAL_ENCLAVE_MEMORY_MIB` of the host program gives in MiB, 4,096
   when the variable is not set (section 9).
@@ -1363,9 +1496,12 @@ The limits, as the source states them:
 | Body of a provider request and of a provider response (`forward`); the bodies of the results of a `forward/batch` call together | 64 MiB each |
 | Sum of the bodies in memory | 2 GiB |
 | Concurrent `forward` and `forward/batch` calls | 512 |
-| Connections from the backend held open at once (`inbound_connections`) | 16,384 |
-| Idle time after which a connection from the backend is closed (`inbound_idle`) | 60 seconds |
-| Queue of the listener of the node (nitro platform) | 1,024 connections |
+| Wait of a `forward` or `forward/batch` call for its place and for the share of the body budget of its request frame (`ADMISSION_WAIT`) | 30 seconds |
+| Connections from the backend held open at once (`inbound_limit` of health) | One eighth of the memory of the kernel divided by 344,064 bytes, 64 to 16,384: 1,502 in an enclave of 4,096 MiB |
+| Longest wait for the peer of a connection from the backend: for the head of a request, for the next bytes of a request body, for the peer to take bytes of a response (`inbound_idle`) | 60 seconds |
+| Read buffer of the HTTP connection of a caller, and the longest request head | 32 KiB |
+| Queue of the listener of the node (nitro platform) | The connections the node holds at once |
+| Connections that wait for the end of their peer at once, and the longest wait of one (`LINGERING_CONNECTIONS`, `LINGER_LIMIT`) | 1,024, 10 seconds |
 | Open descriptors the node asks the kernel for at its start (`DESCRIPTOR_LIMIT`) | 65,536 |
 | Requests in one `forward/batch` call | 100 |
 | Requests of one `forward/batch` call in flight at once | 6 |
@@ -1376,6 +1512,9 @@ The limits, as the source states them:
 | Events in one entry | 128 |
 | Plaintext of one entry | 1,048,576 bytes |
 | `timeout_ms` of `forward` and `forward/batch` | 1,000 to 120,000, default 30,000 |
+| `timeout_ms` of a `forward` call that asks for a stream | 1,000 to 600,000, default 30,000 |
+| One part of a stream | 1,048,576 bytes |
+| Bytes the search of a stream holds back | 27 bytes for each byte of the longest form of the credential, and 32 |
 | Address of `forward` | 8,192 bytes |
 | Response of a token address | 1 MiB, time limit 15 seconds (`token_timeout`) |
 | Late response of a token address call of `refresh` (`token_late_limit`) | 120 seconds from the start of the call |
@@ -1411,10 +1550,10 @@ configuration from environment variables.
 | Function | What it does |
 | --- | --- |
 | Start | Before the enclave, the host program raises its own limit of open descriptors to 65,536 (`descriptors.rs`), or to its hard limit when the target is above it (the container does not hold `CAP_SYS_RESOURCE`), and logs the limits in force. Then `nitro-cli run-enclave --eif-path /opt/credential-enclave/enclave.eif --cpu-count 2 --memory {memory} --enclave-cid 16`, where `{memory}` is the value of the environment variable `CREDENTIAL_ENCLAVE_MEMORY_MIB` in MiB and 4,096 when the variable is not set or empty. A value that is not a positive decimal integer (a sign, a leading zero, a fraction, letters, a value above 4,294,967,295) ends the host program before the start of the enclave with one line on the standard error that names the variable and the value, and a status that is not 0. The host program logs the memory and the vCPUs it starts the enclave with. When the start fails, the host program prints the ends of the `nitro-cli` log files and ends with a status that is not 0 |
-| Inbound relay | For every connection on TCP `0.0.0.0:8080` it opens a connection to vsock `16:8080` and moves the bytes in both directions. It does not read the bytes: the call surface of the node ends inside the enclave. It counts the connections for which the vsock connection to the node failed or did not open within its time limit of 5 seconds (the Status row): a caller whose connection the relay closes without a byte |
-| Egress relay | It listens on vsock port 8443. It reads the first line `CONNECT {host}:{port}\n`. When the host is on the allow list and the port is 443, it connects by TCP, answers `OK\n` and moves the bytes. Otherwise it sends `ERR\n` and closes. The allow list is the hosts of section 7, the hosts of the token addresses and the revocation addresses of 6.2 (the host program is built from the same definitions file), and the host of the log store, `{bucket}.s3.{region}.amazonaws.com`, when the two variables of the next row name one. TLS ends inside the node, so the relay sees ciphertext only. This list is a second line: the node itself sends a credential only to the addresses of its definitions, and log entries only to its log store. Its listener has a backlog of 1,024 connections (the queue of connections that wait for accept; the kernel of the parent instance resets a connection request that finds the queue full); when the kernel refuses to set it the host program logs one line and keeps the default. A failed accept, on this listener and on the two TCP listeners, is classified by its error: `ECONNABORTED`, `EPROTO`, `EINTR` and `EAGAIN` (the connection was gone before accept returned it, or the call was interrupted) are followed by the next accept at once; `EMFILE`, `ENFILE`, `ENOBUFS` and `ENOMEM` (the process or the kernel is out of descriptors or memory) and every other error are followed by a pause of 50 milliseconds. The egress relay counts its failed accepts by class (`aborted`, `resources`, `other`), its connections by outcome and the connections whose bytes it moves at this moment (the Status row) |
+| Inbound relay | For every connection on TCP `0.0.0.0:8080` it opens a connection to vsock `16:8080` and moves the bytes in both directions (the pipe of 9.1). It does not read the bytes: the call surface of the node ends inside the enclave. It holds a bounded number of connections of callers at once: 16,384 until the node answers its first `health` call, and from then on the bound the node reports (`inbound_limit`) less 8 places, which stay free for the calls the host program itself makes to the node (the probes of the pod, the metrics, the watch). A connection above the bound is closed without a byte and counted. It counts the connections for which the vsock connection to the node failed or did not open within its time limit of 5 seconds (the Status row): a caller whose connection the relay closes without a byte. The queue of its TCP listener is asked for 16,384 connections (the kernel caps it at `net.core.somaxconn` of the network namespace of the pod) |
+| Egress relay | It listens on vsock port 8443. It reads the first line `CONNECT {host}:{port}\n`. When the host is on the allow list and the port is 443, it connects by TCP, answers `OK\n` and moves the bytes. Otherwise it sends `ERR\n` and closes. The allow list is the hosts of section 7, the hosts of the token addresses and the revocation addresses of 6.2 (the host program is built from the same definitions file), and the host of the log store, `{bucket}.s3.{region}.amazonaws.com`, when the two variables of the next row name one. TLS ends inside the node, so the relay sees ciphertext only. This list is a second line: the node itself sends a credential only to the addresses of its definitions, and log entries only to its log store. It holds at most 8,192 connections of the node at once: a connection above the bound is answered `ERR` and no provider is connected (the outcome `over_limit`). The bytes move through the pipe of 9.1. Its listener has a backlog of 1,024 connections (the queue of connections that wait for accept; the kernel of the parent instance resets a connection request that finds the queue full); when the kernel refuses to set it the host program logs one line and keeps the default. A failed accept, on this listener and on the two TCP listeners, is classified by its error: `ECONNABORTED`, `EPROTO`, `EINTR` and `EAGAIN` (the connection was gone before accept returned it, or the call was interrupted) are followed by the next accept at once; `EMFILE`, `ENFILE`, `ENOBUFS` and `ENOMEM` (the process or the kernel is out of descriptors or memory) and every other error are followed by a pause of 50 milliseconds. The egress relay counts its failed accepts by class (`aborted`, `resources`, `other`), its connections by outcome and the connections whose bytes it moves at this moment (the Status row) |
 | Operator configuration | It reads the values of every provider from environment variables and calls `POST /v1/config` once the `health` call of the node answers. The variables: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `OUTLOOK_CLIENT_ID`, `OUTLOOK_CLIENT_SECRET`, `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `NOTION_CLIENT_ID`, `NOTION_CLIENT_SECRET`, `X_CLIENT_ID`, `X_CLIENT_SECRET`, `LINK_CLIENT_ID`, `LINK_CLIENT_SECRET`, `STRIPE_PUBLISHABLE_KEY`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, and `CHARACTER_API_BASE_URL` (the front of the callback address `{value}/api/integrations/{provider}/oauth/callback`). The configuration names every provider of the definitions: `redirect_uri` is always set, and a value without a variable is the empty string. `CREDENTIAL_ENCLAVE_LOG_BUCKET` and `CREDENTIAL_ENCLAVE_LOG_REGION` name the log store: when both are set and have the forms of protocol.md 4.1, the configuration carries them as `log_store`. When one is missing or has another form, the configuration carries no `log_store` and one line of the log says why. Without `CHARACTER_API_BASE_URL` no configuration is sent. A configuration that the node refuses is not sent again. The host program does not send the credentials for the log store: the backend sends them (5.14) |
-| Status | TCP 9091: `GET /healthz` (200 when the round trip of the `health` call of the node succeeds within 8 seconds, 503 otherwise: the responsiveness of the node, read by the startup and readiness probes of the pod), `GET /livez` (200 while the enclave runs, 503 once the watch of the enclave (the Watch row) confirmed that it ended: the life of the enclave, read by the liveness probe of the pod. It makes no call to the node: a node that does not answer is not a dead enclave, and a pod replaced for that reason would lose the delegations of a living node) and `GET /metrics` (the Prometheus text format). Four gauges: `credential_enclave_up` (1 when the `health` round trip succeeds, 0 when it fails), `credential_enclave_configured` (1 when `configured` of `health` is true), `credential_enclave_accounts` (`accounts` of `health`), `credential_enclave_started_timestamp_seconds` (`started_ms` of `health` in seconds). From the `log` object of `health`, when the node answers with one: the counters `credential_enclave_log_entries_total` (`entries`), `credential_enclave_log_events_total` (`events`), `credential_enclave_log_store_writes_total` (`writes`), `credential_enclave_log_store_write_failures_total` (`write_failures`), `credential_enclave_forward_batch_calls_total` (`batch_calls`), `credential_enclave_forward_batch_requests_total` (`batch_requests`), and the gauge `credential_enclave_log_open_batches` (`open_batches`); and, when the object holds the write counts of 5.1: the counter `credential_enclave_log_store_write_attempt_failures_total{cause}` (`write_attempt_failures`; `cause` is `connect`, `tls`, `closed`, `timeout`, `status_4xx` or `status_5xx`), the counter `credential_enclave_log_store_write_retries_total` (`write_retries`), and the histogram `credential_enclave_log_store_write_seconds`: `_bucket{le}` for `le` `0.025`, `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5` and `5` from the cumulative counts of `write_ms_buckets`, `_bucket{le="+Inf"}` and `_count` from `write_count`, `_sum` from `write_ms_sum` as seconds with three decimals. From the `log_store` object of `health`, when it is not null: the gauge `credential_enclave_log_store_pending_accounts` (`pending`) and, when the object holds `pending_oldest_ms`, the gauge `credential_enclave_log_store_pending_oldest_seconds` (its milliseconds as seconds with three decimals). From the `load` object of `health`, when the node answers with one: the gauges `credential_enclave_provider_inflight` (`provider_inflight`) and `credential_enclave_forward_calls` (`forward_calls`); when its three CPU values are not null, the counters `credential_enclave_cpu_user_seconds_total`, `credential_enclave_cpu_system_seconds_total` and `credential_enclave_cpu_idle_seconds_total` (the milliseconds of `health` as seconds with three decimals); when its two memory values are not null, the gauges `credential_enclave_memory_total_bytes` and `credential_enclave_memory_available_bytes`; when the object holds the two counts of the connections from the backend (a node of release v2.2.0 or later), the gauge `credential_enclave_inbound_connections` (`inbound_connections`) and the counter `credential_enclave_inbound_refused_total` (`inbound_refused`); when it holds the value, the gauge `credential_enclave_descriptors_open` (`descriptors_open`) and the gauge `credential_enclave_descriptors_limit` (`descriptors_limit`). From the `egress` object of `health`, when the node answers with one: the counter `credential_enclave_egress_opens_total` (`opens`), the counter `credential_enclave_egress_open_failures_total{cause}` (`open_failures`; `cause` is `transport`, `relay_refused`, `tls` or `http`), the counter `credential_enclave_egress_open_retries_total` (`open_retries`), the gauge `credential_enclave_egress_open_inflight` (`open_inflight`) and the counter `credential_enclave_egress_idle_reuses_total{peer}` (`idle_reuses`; `peer` is `provider` or `log_store`). From the `refresh` object of `health`, when the node answers with one: the counter `credential_enclave_refresh_late_total{outcome}` (`late`; `outcome` is `kept`, `dropped`, `failed` or `abandoned`) and the gauge `credential_enclave_refresh_late_inflight` (`late_inflight`). After the series of the objects, when the answer holds the value: the gauge `credential_enclave_grants` (`grants` of `health`, the accounts with a grant within its time; every release answers it). From the `state` object of `health`, when the node answers with one: the gauges `credential_enclave_kept_refreshes` (`kept_refreshes`), `credential_enclave_merge_keys` (`merge_keys`), `credential_enclave_pending_entries` (`pending_entries`) and `credential_enclave_idle_connections{peer}` (`idle_connections`; `peer` is `provider` or `log_store`). From the host program itself, with every answer, after the series of `health`: the gauge `credential_enclave_host_enclave_running` (1 while the last `describe-enclaves` of the watch listed a running enclave or none ran yet, 0 when it listed none), the gauges `credential_enclave_host_descriptors_open` and `credential_enclave_host_descriptors_limit` (the open descriptors of the host program and its limit in force, when the kernel gives both), the counter `credential_enclave_host_egress_accept_errors_total{cause}` (the failed accepts of the egress relay; `cause` is `aborted`, `resources` or `other`), the counter `credential_enclave_host_egress_relays_total{outcome}` (the connections of the node the egress relay served; `outcome` is `relayed`, `malformed`, `not_allowed` or `unreachable`), the gauge `credential_enclave_host_egress_relays_inflight` (the connections whose bytes the egress relay moves at this moment) and the counter `credential_enclave_host_inbound_node_connect_failures_total` (the connections of callers for which the inbound relay could not open its connection to the node). When the `health` call fails, the answer is `credential_enclave_up 0` and the series of the host program. A counter of the node restarts at 0 when the node restarts (the started timestamp changes), a CPU counter when the kernel of the node boots, and a counter of the host program when the host program starts |
+| Status | TCP 9091: `GET /healthz` (200 when the round trip of the `health` call of the node succeeds within 8 seconds, 503 otherwise: the responsiveness of the node, read by the startup and readiness probes of the pod), `GET /livez` (200 while the enclave runs, 503 once the watch of the enclave (the Watch row) confirmed that it ended: the life of the enclave, read by the liveness probe of the pod. It makes no call to the node: a node that does not answer is not a dead enclave, and a pod replaced for that reason would lose the delegations of a living node) and `GET /metrics` (the Prometheus text format). Four gauges: `credential_enclave_up` (1 when the `health` round trip succeeds, 0 when it fails), `credential_enclave_configured` (1 when `configured` of `health` is true), `credential_enclave_accounts` (`accounts` of `health`), `credential_enclave_started_timestamp_seconds` (`started_ms` of `health` in seconds). From the `log` object of `health`, when the node answers with one: the counters `credential_enclave_log_entries_total` (`entries`), `credential_enclave_log_events_total` (`events`), `credential_enclave_log_store_writes_total` (`writes`), `credential_enclave_log_store_write_failures_total` (`write_failures`), `credential_enclave_forward_batch_calls_total` (`batch_calls`), `credential_enclave_forward_batch_requests_total` (`batch_requests`), and the gauge `credential_enclave_log_open_batches` (`open_batches`); and, when the object holds the write counts of 5.1: the counter `credential_enclave_log_store_write_attempt_failures_total{cause}` (`write_attempt_failures`; `cause` is `connect`, `tls`, `closed`, `timeout`, `status_4xx` or `status_5xx`), the counter `credential_enclave_log_store_write_retries_total` (`write_retries`), and the histogram `credential_enclave_log_store_write_seconds`: `_bucket{le}` for `le` `0.025`, `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5` and `5` from the cumulative counts of `write_ms_buckets`, `_bucket{le="+Inf"}` and `_count` from `write_count`, `_sum` from `write_ms_sum` as seconds with three decimals. From the `log_store` object of `health`, when it is not null: the gauge `credential_enclave_log_store_pending_accounts` (`pending`) and, when the object holds `pending_oldest_ms`, the gauge `credential_enclave_log_store_pending_oldest_seconds` (its milliseconds as seconds with three decimals). From the `load` object of `health`, when the node answers with one: the gauges `credential_enclave_provider_inflight` (`provider_inflight`) and `credential_enclave_forward_calls` (`forward_calls`); when its three CPU values are not null, the counters `credential_enclave_cpu_user_seconds_total`, `credential_enclave_cpu_system_seconds_total` and `credential_enclave_cpu_idle_seconds_total` (the milliseconds of `health` as seconds with three decimals); when its two memory values are not null, the gauges `credential_enclave_memory_total_bytes` and `credential_enclave_memory_available_bytes`; when the object holds the two counts of the connections from the backend (a node of release v2.2.0 or later), the gauge `credential_enclave_inbound_connections` (`inbound_connections`) and the counter `credential_enclave_inbound_refused_total` (`inbound_refused`); when it holds the bound (a node of release v2.4.0 or later), the gauge `credential_enclave_inbound_limit` (`inbound_limit`); when it holds the value, the gauge `credential_enclave_descriptors_open` (`descriptors_open`) and the gauge `credential_enclave_descriptors_limit` (`descriptors_limit`); when it holds the two counts of the connections that wait for the end of their peer (a node of release v2.4.0 or later on the nitro platform), the gauge `credential_enclave_lingering_connections` (`lingering_connections`) and the counter `credential_enclave_lingering_cut_total` (`lingering_cut`). From the `egress` object of `health`, when the node answers with one: the counter `credential_enclave_egress_opens_total` (`opens`), the counter `credential_enclave_egress_open_failures_total{cause}` (`open_failures`; `cause` is `transport`, `relay_refused`, `tls` or `http`), the counter `credential_enclave_egress_open_retries_total` (`open_retries`), the gauge `credential_enclave_egress_open_inflight` (`open_inflight`) and the counter `credential_enclave_egress_idle_reuses_total{peer}` (`idle_reuses`; `peer` is `provider` or `log_store`). From the `refresh` object of `health`, when the node answers with one: the counter `credential_enclave_refresh_late_total{outcome}` (`late`; `outcome` is `kept`, `dropped`, `failed` or `abandoned`) and the gauge `credential_enclave_refresh_late_inflight` (`late_inflight`). After the series of the objects, when the answer holds the value: the gauge `credential_enclave_grants` (`grants` of `health`, the accounts with a grant within its time; every release answers it). From the `state` object of `health`, when the node answers with one: the gauges `credential_enclave_kept_refreshes` (`kept_refreshes`), `credential_enclave_merge_keys` (`merge_keys`), `credential_enclave_pending_entries` (`pending_entries`) and `credential_enclave_idle_connections{peer}` (`idle_connections`; `peer` is `provider` or `log_store`). From the host program itself, with every answer, after the series of `health`: the gauge `credential_enclave_host_enclave_running` (1 while the last `describe-enclaves` of the watch listed a running enclave or none ran yet, 0 when it listed none), the gauges `credential_enclave_host_descriptors_open` and `credential_enclave_host_descriptors_limit` (the open descriptors of the host program and its limit in force, when the kernel gives both), the counter `credential_enclave_host_egress_accept_errors_total{cause}` (the failed accepts of the egress relay; `cause` is `aborted`, `resources` or `other`), the gauge `credential_enclave_host_socket_memory_bytes` (the memory of socket buffers charged to the container of the host program: the line `sock` of `memory.stat` of its cgroup, when the kernel gives it), the counter `credential_enclave_host_egress_relays_total{outcome}` (the connections of the node the egress relay served; `outcome` is `relayed`, `malformed`, `not_allowed`, `unreachable` or `over_limit`), the counter `credential_enclave_host_inbound_node_connect_failures_total` (the connections of callers for which the inbound relay could not open its connection to the node), the counter `credential_enclave_host_inbound_refused_total` (the connections of callers the inbound relay closed without a byte because it held its bound), and for each of the two relays (`{relay}` is `egress` or `inbound`) the series of its pipes (9.1): the gauge `credential_enclave_host_{relay}_relays_inflight` (the connections it holds at this moment), the gauge `credential_enclave_host_{relay}_relays_limit` (its bound), the gauges `credential_enclave_host_{relay}_relays_oldest_seconds` and `credential_enclave_host_{relay}_relays_idle_seconds` (the age of the connection it has held longest, and the longest time one of its connections has moved no byte), the gauge `credential_enclave_host_{relay}_relays_large_buffers` (the buffers of 64 KiB its pipes hold) and the counter `credential_enclave_host_{relay}_relays_ended_total{cause}` (the pipes that ended; `cause` is `closed`, `failed`, `idle` or `half_closed`). A pipe that does not end shows as `_relays_idle_seconds` above 900 and as a growing count of the causes `idle` and `half_closed`; the cause `failed` counts a provider that reset its connection as well and is no sign of a fault. When the `health` call fails, the answer is `credential_enclave_up 0` and the series of the host program. A counter of the node restarts at 0 when the node restarts (the started timestamp changes), a CPU counter when the kernel of the node boots, and a counter of the host program when the host program starts |
 | Sending the operator configuration again | Does not happen. The configuration is sent once at the start. To change a value, the pod is replaced |
 | Watch | Every 10 seconds the host program runs `nitro-cli describe-enclaves` (in a blocking task; an answer is waited for 5 seconds, a run that takes longer is waited for at the next poll and no second run starts beside it) and reads its JSON list: an element whose `State` is `RUNNING` is a running enclave. Before the third consecutive answer without a running enclave counts, the host program makes one `health` call to the node: a node that answers is alive whatever the list said, the answer counts as a running enclave and the count starts over (a node that does not answer is judged by the list alone). Three consecutive answers without a running enclave confirm that the enclave ended on its own (the node program aborted, the enclave ran out of memory, the hypervisor ended it): the host program logs it, makes the shutdown collection call of the Shutdown row (the backend records the node as closed; the collection fails at its first stage, as the node is gone), calls `nitro-cli terminate-enclave --all` and ends with a status that is not 0, so that the container runtime starts it again with a new enclave, which takes its delegations from the living nodes. One answer without a running enclave does not confirm the end (one line of the log says that the list was empty), and a run that failed or passed its 5 seconds changes nothing: a host program that ended on a reading failure would end a living node and lose its delegations. `GET /livez` and the gauge `credential_enclave_host_enclave_running` of the Status row read the same observations |
 | Shutdown | On SIGTERM (or SIGINT) the host program logs one line with the output of `nitro-cli describe-enclaves` on one line (the JSON list of the running enclaves: the enclave object while the node is alive, `[]` when the enclave ended before the signal; the line says whether the node was alive when the signal came), then calls `POST {CREDENTIAL_ENCLAVE_DRAIN_URL}` (the shutdown collection route of the backend): the body `{"pod": "<the value of CREDENTIAL_ENCLAVE_POD_NAME>"}`, the headers `Authorization: Bearer {CREDENTIAL_ENCLAVE_DRAIN_TOKEN}` and `Content-Type: application/json`. Inside that request the backend makes the calls of the orderly shutdown to the node (5.11, 5.13), through the inbound relay. Before the call the host program reads `accounts` of the `health` call of the node and waits for the response for 100 seconds plus 4 seconds for every started page of 1,000 accounts, at most 600 seconds (`drain::response_timeout`: the backend hands the delegations over and collects the final heads page by page, 1,000 accounts a page, measured at about 2 seconds and about 1 second a page; a node that does not answer its `health` call gets the 100 seconds). The log names the wait and the accounts. Then it calls `nitro-cli terminate-enclave --all` and ends. The `terminationGracePeriodSeconds` of the pod must cover the longest wait of the `drain` subcommand, the longest wait of this call and a margin: 610 + 600 + 30 = 1,240 seconds. When one of the three variables (`CREDENTIAL_ENCLAVE_DRAIN_URL`, `CREDENTIAL_ENCLAVE_DRAIN_TOKEN`, `CREDENTIAL_ENCLAVE_POD_NAME`) is missing, it ends the enclave without the collection. The call of the signal path repeats the call of the `drain` subcommand when the pre-stop hook made one: the backend takes a repeated call for the same pod as the same collection |
@@ -1423,6 +1562,50 @@ configuration from environment variables.
 
 The output of the host program is its log: lines on the standard output, and the output of
 `nitro-cli`. The client values of the operator are never part of a line.
+
+### 9.1 The pipe of the two relays
+
+A pipe moves the bytes between the two connections of a relay (`host/src/relay.rs`). It has a
+side that asks and a side that answers: a caller and the node for the inbound relay, the node
+and a provider (or the log store) for the egress relay.
+
+- A pipe ends within a fixed time whatever its two ends do. It ends when no byte moved in
+  either direction for 900 seconds while both directions are open (the cause `idle`: 900
+  seconds are above every silence of a connection in use, the longest of which is the time
+  limit of a call), and when no byte moved for 60 seconds after one of its streams reported
+  the end of its bytes (the cause `half_closed`). A byte the pipe drops is not a byte that
+  moved.
+- A pipe does not wait for the kernel to say that a write can go on. The kernel of the parent
+  instance gives a writer that waits no event when the peer of its vsock connection closes
+  while the socket holds unread bytes: a write that waited for such an event would wait
+  without an end, and the pipe would keep its TCP socket with the bytes its peer sent. So a
+  write a stream did not take is asked of it again every second and at once when the other
+  direction ends, and a write to a vsock connection is attempted each time it is asked for.
+- The end of the bytes of the node says that the node is done with the connection: the node
+  closes its write side when it is done and keeps the connection open only until its peer
+  ended too (section 8). So a pipe that read the end of the bytes of the node closes the
+  write side of its connection to the node at once and moves nothing more to it. The inbound
+  relay moves the answer of the node to the caller and reads and drops what the caller still
+  sends, until the caller reports its end: a caller that was sending the body of its request
+  when the node answered reads the whole answer and closes its connection itself. The egress
+  relay moves the last bytes of the node to the provider and ends: nobody waits for what the
+  provider still sends.
+- When the side that asks is gone (a write to it fails), nobody waits for an answer, and the
+  pipe ends at once. When the side that answers closed, the pipe stays open for what it sent
+  last.
+- A direction of a pipe holds a buffer of 4 KiB. While it moves many bytes it takes one of
+  the 2,048 buffers of 64 KiB of its relay and gives it back when it has not held 4 KiB at
+  once for one second; while the relay has none to give, the direction goes on with the small
+  buffer.
+- The connections of the relays set no TCP keepalive: the first probe of the kernel comes
+  after 7,200 seconds, past both limits of a pipe.
+
+The memory of the parent container: the host program holds at most 16,384 + 8,192
+connections with two buffers of 4 KiB each and 2 x 2,048 buffers of 64 KiB (about 450 MiB
+when every bound is reached). The receive queues of its TCP sockets are memory of the kernel
+of the parent instance that is charged to the container (`sock` of `memory.stat`): the kernel
+grows the receive queue of one socket up to `tcp_rmem` (32 MiB on the parent instances of
+this service) and bounds all of them together at the third value of `net.ipv4.tcp_mem`.
 
 ## 10. Stages 2 and 3
 
@@ -1531,13 +1714,14 @@ place of every provider (`enclave/src/testing.rs`).
 | Log store | `enclave/src/tests/log_store.rs`, the unit tests of `enclave/src/log_store.rs` | Against a stand-in for Amazon S3 on the TLS server of the provider stand-in: the write of an entry arrives before the request to the provider, under the key of format 2 whose seven parts the test computes again from the body, with the headers and a signature that the test computes again from the request. A write the store does not confirm (a status other than 200, a 412 included, no connection, no answer within the time limit) stops the act of every call, the writer and the calls that waited for it. A pending entry is written again with the next write of its account, and a request that shares an event waits for its entry. The signed refusal of a grant, a revoke that erases the key whatever the store answers, the failure and the repetition of `peer/export`, the refusal of a peer of another log store, a node of the nitro platform without a log store or credentials, the limit of pending entries, calls that end before their write (the account has no writer afterwards), calls that run at the same time form one entry and write each entry once. The idle connections: one connection for writes in a row, a connection the store closed, a write whose idle connection ends without a response, the current credentials over an idle connection. The attempts of a write: a 5xx status and 429 are repeated over a new connection with the same body within the budget, a 4xx status is not, an idle connection that stalls or that closes without a response is left for a new connection, a new connection that closes without a response is repeated as well, a store that cannot be reached is asked for three connections, and the causes and the counts of health. The sweep: its rate, its random order, and the jitter before it writes the entries of an account. The local endpoint: a path-style write over plain HTTP with the host of the endpoint, refused on the nitro platform and for a value that is not an origin. The signature against the examples of the AWS documentation |
 | Address check | The unit tests of `enclave/src/providers/mod.rs` | The refusals of section 7 (another host, a path outside the lists, a denied path in its spellings, dot segments, dot segments in front of a path parameter, encoded separators and separators that are encoded twice, a port, user information), and the validation of the definitions, including the rules for public fields |
 | OAuth | `enclave/src/tests/oauth.rs`, the unit tests of `enclave/src/oauth.rs` | Against the provider stand-in: exchange, refresh, the merge of a reconnect, the nested token place of slack and its `ok: false`, the public fields and the containment check, the closed vocabulary of `provider_error`, the kept response of a repeated refresh, a token address call of `refresh` whose response arrives after the time limit of the call (kept for the next call with the same record; dropped after a revoke or after `close`; a late refusal and the late limit; the bound of the late calls and their counts in health), a record of kind `oauth_imported` |
-| forward | `enclave/src/tests/forward.rs`, the unit tests of `enclave/src/provider_response.rs` and `enclave/src/egress.rs` | Header removal, the refusal of a header that overrides the method and of the batch address of Microsoft Graph, the injected credential, the event of a GET request with a body, the whole path and the whole query in the event of the longest address, redirects that are not followed, chunked responses, the body limit, the time limit, a response that reflects the credential (as it is, under percent escapes of up to three layers, in base64 and in hexadecimal), the idle connections per (account, host): two accounts never share one, a connection is dropped after 30 seconds idle, a GET over an idle connection that ends without a response is sent once more and a POST is not; an open that fails before a request byte left is repeated within half the time limit of the call (two refusals and then a success, three refusals, a refusal that arrives after half the time limit), the bound of connections being opened at once, and the counts of `egress` of health |
+| forward | `enclave/src/tests/forward.rs`, the unit tests of `enclave/src/provider_response.rs` and `enclave/src/egress.rs` | Header removal, the refusal of a header that overrides the method and of the batch address of Microsoft Graph, the injected credential, the event of a GET request with a body, the whole path and the whole query in the event of the longest address, redirects that are not followed, chunked responses, the body limit, the time limit, a response that reflects the credential (as it is, under percent escapes of up to three layers, in base64 and in hexadecimal), the idle connections per (account, host): two accounts never share one, a connection is dropped after 30 seconds idle, a GET over an idle connection that ends without a response is sent once more and a POST is not; an open that fails before a request byte left is repeated within half the time limit of the call (two refusals and then a success, three refusals, a refusal that arrives after half the time limit), the bound of connections being opened at once, and the counts of `egress` of health; a call that is not admitted within its wait ends with `capacity_unavailable` and holds nothing; the headers the node drops (`Range`, `If-Range`, `Accept-Charset`, names written with `_`), the refusal of an `Accept` header that names another character encoding than UTF-8. The stream form: a body above the body limit is handed on in parts, with a declared length and chunked; a body that holds the credential is cut in front of it; a head that holds it, or a coded body, begins no stream; the end record of a body that does not arrive and of the time limit; the place of the call is free at the time limit whether or not the caller reads, and at once when the caller is gone; `stream` and the time limit of a stream are checked. The search of a stream (`provider_response.rs`): bodies in parts of any length are handed on whole without the credential, are cut in front of every form of it at every place (as it is, base64, hexadecimal, under one to three layers of escapes, each byte escaped), and get the verdict of the check of a whole response |
 | forward/batch | `enclave/src/tests/forward_batch.rs` | One entry names every request before any leaves; a batch of 100 with 6 in flight; a request that fails the address check refuses the whole call with its index and creates no event; a merged request inside a batch shares the event; two entries when the open batch reaches its cap inside a batch; one failed request leaves the other results intact and keeps its `log` object; the bodies of the results together under the body limit; the results in the order of the requests; the bodies split by `body_bytes`; a batch of 0 or 101 requests is invalid |
 | Delegation transfer | `enclave/src/tests/peer.rs` | The round trip of export and import between two nodes of the local platform, paging, the exclusion of expired grants and of accounts that revoked, a grant of another `sign_pk` is not replaced, the refusal of a changed envelope and of an envelope for another node, the entries `grant_transferred_out` and `grant_transferred_in` (the `logs` of the responses and the objects of the store), a repeated export to the same peer without a new entry, the limit of 64 peers per grant, an export with an endorsement that does not hold (it hands nothing over and leaves no entry, also for a peer the call without an endorsement accepts), the `subset` of export (the share of the peer alone, with entries for it alone, and pages that count the selected grants) and of import (the share of the receiving node alone out of a transfer of every account, `copies` at or above `pods` names every account, `null` is a call without a subset, a subset outside its bounds is refused by both calls) |
 | Delegation subset and pruning | `enclave/src/tests/grants.rs`, the unit tests of `enclave/src/subset.rs` | The assignment vectors of protocol.md 10.4 and the agreement of `contains` with `assign`; `grants/prune` drops the grants within their time and the expired grants outside the share page by page in `user_id` order, leaves the chains, the revocation markers and the grants of the share, prunes nothing more on a repeated walk, works in the state `closing`, and refuses a missing subset, a subset outside its bounds and a `limit` of 0; after grants, a refresh, merged GET requests, refused writes, an expiry, a revoke, an import, a prune, two sweeps and the shutdown, every count of health (`accounts`, `grants`, `pending`, `pending_entries`, `kept_refreshes`, `merge_keys`, `open_batches`) equals a scan of the accounts |
+| Connections from the backend | `enclave/src/tests/inbound.rs`, the unit tests of `enclave/src/inbound.rs` and `enclave/src/platform/lingering.rs` | The bound of the connections from the memory of the kernel. A request body whose bytes stop arriving ends its call with `invalid_request` after the time limit and frees its share of the body budget; a caller that takes no byte of a response is cut after the time limit and frees the share of the response body, which is held until then; a write that is not taken is attempted again without an event; a request head above the read buffer is answered with 431. A connection that is dropped closes its write side and is closed after the end of its peer, within the time limit and the bound of waiting connections, and a connection whose peer had ended is closed at once |
 | Call surface | `enclave/src/tests/surface.rs`, the unit tests of `enclave/src/load.rs` and `enclave/src/descriptors.rs` | `health` with the counts of its `log`, `egress`, `refresh` and `state` objects and the values of its `load` object (the readers of `/proc/stat`, `/proc/meminfo` and the auxiliary vector on sample text: the columns of each mode, a line with fewer columns, malformed text; the limit of open descriptors is raised or kept and never lowered, and the count of open descriptors follows the descriptors the process holds), the bound of the connections from the backend (a connection above the bound is closed without a byte and counted, an idle connection is closed after the idle time and frees its place), the operator configuration, attestation and its challenge statement, the failure bodies, HTTP/1.1 over a real connection, that `log/entries` and `log/ack` do not exist, and that the calls of the router are the calls of the table in section 4 of egress-policy.md |
 | Egress policy | `enclave/src/tests/canary.rs` | The canary test of egress-policy.md: every secret carries a distinct marker, the provider stand-in breaks its contract on purpose (reflected credentials, tokens in public fields, content and transfer codings, cookies, redirects), every call of the router is made in a success and in a failure, no marker appears in a response in any of the searched encodings, and a credential reaches only the addresses of its own provider. The one exception is the requested field of a successful `release`. Both nodes of the walk have a log store: no write to it carries a secret of the account, and of the credentials for it the session token reaches the log store alone and the secret access key no request |
-| Host program | The unit tests of `host/src/` | The relays (the inbound relay counts the connections for which the node could not be reached), the allow list of the egress relay with the host of the log store, the operator configuration with the log store of the environment, the memory of the enclave from its variable (the default, a value, the refused values), the description line of the enclaves, the one argument `drain`, the status surface (the four gauges, the seven series of the `log` object of `health`, which the answer of a node of a release before v2.0.0 does not have, the seven series of its `load` object, which the answer of a node of a release before v2.0.1 does not have and whose CPU and memory series are absent when the values are null, the series of its `egress`, `refresh` and `state` objects, the gauge of its `grants` value, and the four series of the two relays) the shutdown call and its wait (the base, the pages of the accounts of the node, the longest wait), the watch of the enclave (the reading of the answer of `describe-enclaves`, three consecutive answers without a running enclave confirm the end and one does not, a failed run does not count, a node that answers its health call keeps the end from being confirmed), `/livez` from the watch and not from the node, the series of a node of release v2.2.0 (the connections from the backend, the descriptors of the node and of the host program, the gauge of the watch), and the limit of open descriptors of the host program, against a stand-in for the node over in-memory pipes |
+| Host program | The unit tests of `host/src/` | The pipe of the relays (9.1): the two limits, a transfer that lasts longer than both, a write that is not taken and is attempted again every second without an event, the end of the node (the write side of the node is closed at once, the answer reaches a caller that is still sending, the provider is cut off), a side that asks and is gone, the buffers of the two sizes, the bound of a relay and the ages of its connections, the bound the inbound relay takes from the node. The relays (the inbound relay counts the connections for which the node could not be reached, and closes a connection above its bound without a byte), the allow list of the egress relay with the host of the log store, the operator configuration with the log store of the environment, the memory of the enclave from its variable (the default, a value, the refused values), the description line of the enclaves, the one argument `drain`, the status surface (the four gauges, the seven series of the `log` object of `health`, which the answer of a node of a release before v2.0.0 does not have, the seven series of its `load` object, which the answer of a node of a release before v2.0.1 does not have and whose CPU and memory series are absent when the values are null, the series of its `egress`, `refresh` and `state` objects, the gauge of its `grants` value, and the four series of the two relays) the shutdown call and its wait (the base, the pages of the accounts of the node, the longest wait), the watch of the enclave (the reading of the answer of `describe-enclaves`, three consecutive answers without a running enclave confirm the end and one does not, a failed run does not count, a node that answers its health call keeps the end from being confirmed), `/livez` from the watch and not from the node, the series of a node of release v2.2.0 (the connections from the backend, the descriptors of the node and of the host program, the gauge of the watch), and the limit of open descriptors of the host program, against a stand-in for the node over in-memory pipes |
 | Verification tool | The unit tests of `verify/src/`, `verify/tests/offline.rs`, with the files of `verify/tests/fixtures/` | The checks on a stored attestation document of a node of release v1.0.0 against the `measurements.json` of that release, the refusals, the report with the log store of a binding, and the exit status of the built tool |
 
 
