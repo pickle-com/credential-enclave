@@ -606,6 +606,90 @@
   // refuses local nodes unless it is a debug build or a build made for the local stack
   // (localAccepted).
   const OPERATOR_CUSTODY_TARGETS = ["alpha", "dev"];
+
+  // ---- The release proofs (docs/protocol.md, "The release proofs") ----
+  // A measurement that ACCEPTED_RELEASES does not have is the measurement of an accepted release
+  // when release proofs pass every check of proveRelease for it: a release statement names the
+  // measurement, the release key of the operator signed the statement and a public transparency
+  // log recorded that signature, the deploy key of this server target signed the statement,
+  // GitHub attested the statement for a run of the release workflow of the public repository at
+  // the tag of the release, and the release is later than every release of ACCEPTED_RELEASES.
+  // The values below are what those checks are made with.
+  //
+  // The release key of the operator: ECDSA P-256, the DER of its SubjectPublicKeyInfo. It is
+  // enclave/release/release-key.pem of this repository, the key whose signature a node asks for
+  // before it hands delegations to a later release (docs/protocol.md 10.3). The SHA-256 of the
+  // DER is c49cd263f635f55405c20a88480296010619fd3bc585711822283df302931cec.
+  const RELEASE_KEY =
+    "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEmQyIqafm8BeN8nVSry5034Txoqs9Dt_mbEFCS68YqOSsmAepo6U3--y0" +
+    "eKUNMUSQAaGeV9uH6wBGx1dWLZqkJQ";
+  // The transparency logs an entry of a release proof is of: the key of each (ECDSA P-256, the
+  // DER of its SubjectPublicKeyInfo). The identifier of a log is the lower-case hexadecimal
+  // SHA-256 of that DER. The one log is rekor.sigstore.dev (the form Rekor v1 of
+  // docs/protocol.md 10.3), with the identifier
+  // c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d.
+  const PROOF_LOG_KEYS = [
+    "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE2G2Y-2tabdTV5BcGiBIx0a9fAFwrkBbmLSGtks4L3qX6yYY0zufBnhC8" +
+    "Ur_iy55GhWP_9A_bY2LhC30M9-RYtw",
+  ];
+  // The certificate authority of the public instance of Sigstore (Fulcio), as its trusted root
+  // names it: the DER of the root certificate (SHA-256
+  // 3ba7b6cc4e95469d4d334b49cb257ad8537076fa84b0ca87ff4ecfe6a54680c1) and of the intermediate
+  // certificate (SHA-256 15d795348226b4649f750f5802592c393bee7cc53c3b86982175b7ad087efe47). Both
+  // end on 2031-10-05.
+  const FULCIO_ROOT =
+    "MIIB9zCCAXygAwIBAgIUALZNAPFdxHPwjeDloDwyYChAO_4wCgYIKoZIzj0EAwMwKjEVMBMGA1UEChMMc2lnc3RvcmUu" +
+    "ZGV2MREwDwYDVQQDEwhzaWdzdG9yZTAeFw0yMTEwMDcxMzU2NTlaFw0zMTEwMDUxMzU2NThaMCoxFTATBgNVBAoTDHNp" +
+    "Z3N0b3JlLmRldjERMA8GA1UEAxMIc2lnc3RvcmUwdjAQBgcqhkjOPQIBBgUrgQQAIgNiAAT7XeFT4rb3PQGwS4IajtLk" +
+    "3_OlnpgangaBclYpsYBr5i-4ynB07ceb3LP0OIOZdxexX69c5iVuyJRQ-Hz05yi-UF3uBWAlHpiS5sh0-H2GHE7SXrk1" +
+    "EC5m1Tr19L9gg92jYzBhMA4GA1UdDwEB_wQEAwIBBjAPBgNVHRMBAf8EBTADAQH_MB0GA1UdDgQWBBRYwB5fkUWlZql6" +
+    "zJChkyLQKsXF-jAfBgNVHSMEGDAWgBRYwB5fkUWlZql6zJChkyLQKsXF-jAKBggqhkjOPQQDAwNpADBmAjEAj1nHeXZp" +
+    "-13NWBNa-EDsDP8G1WWg1tCMWP_WHPqpaVo0jhsweNFZgSs0eE7wYI4qAjEA2WB9ot98sIkoF3vZYdd3_VtWB5b9TNMe" +
+    "a7Ix_stJ5TfcLLeABLE4BNJOsQ4vnBHJ";
+  const FULCIO_INTERMEDIATE =
+    "MIICGjCCAaGgAwIBAgIUALnViVfnU0brJasmRkHrn_UnfaQwCgYIKoZIzj0EAwMwKjEVMBMGA1UEChMMc2lnc3RvcmUu" +
+    "ZGV2MREwDwYDVQQDEwhzaWdzdG9yZTAeFw0yMjA0MTMyMDA2MTVaFw0zMTEwMDUxMzU2NThaMDcxFTATBgNVBAoTDHNp" +
+    "Z3N0b3JlLmRldjEeMBwGA1UEAxMVc2lnc3RvcmUtaW50ZXJtZWRpYXRlMHYwEAYHKoZIzj0CAQYFK4EEACIDYgAE8RVS" +
+    "_ysH-NOvuDZyPIZtilgUF9NlarYpAd9HP1vBBH1U5CV77LSS7s0ZiH4nE7Hv7ptS6LvvR_STk798LVgMzLlJ4HeIfF3t" +
+    "HSaexLcYpSASr1kS0N_RgBJz_9jWCiXno3sweTAOBgNVHQ8BAf8EBAMCAQYwEwYDVR0lBAwwCgYIKwYBBQUHAwMwEgYD" +
+    "VR0TAQH_BAgwBgEB_wIBADAdBgNVHQ4EFgQU39Ppz1YkEZb5qNjpKFWixi4YZD8wHwYDVR0jBBgwFoAUWMAeX5FFpWap" +
+    "esyQoZMi0CrFxfowCgYIKoZIzj0EAwMDZwAwZAIwPCsQK4DYiZYDPIaDi5HFKnfxXx6ASSVmERfsynYBiX2X6SJRnZU8" +
+    "4_9DZdnFvvxmAjBOt6QpBlc4J_0DxvkTCqpclvziL6BCCPnjdlIB3Pu3BxsPmygUY7Ii2zbdCdliiow";
+  // The deploy keys of the operator (Ed25519 public keys), by key id: the keys the apps verify
+  // the deploy signature of a served program with. A build whose server target is prod asks for
+  // the signature of the key prod, every other build for that of the key dev (the rule of the
+  // apps for the program).
+  const DEPLOY_KEYS = {
+    prod: "Kz9GBEBjv19Fkw5pNl8SMz3a1yIYzXePIIG42dGRAEs",
+    dev: "CkEZLhRl2AhgdcuG3xZuESRhENMxfHJ_jQotJ6yA6ZM",
+  };
+  // What a deploy key signs of a release statement: the UTF-8 bytes of this text, of the
+  // lower-case hexadecimal SHA-256 of the statement and of one line feed. The deploy signature of
+  // a program is over the text "pickle-secure-program-v1\n" and the program, so neither signature
+  // is one of the other kind.
+  const DEPLOY_STATEMENT_CONTEXT = "pickle-enclave-release-statement-v1\n";
+  // The identity GitHub attests a release statement under: the certificate of the attestation
+  // states these values in its extensions 1.3.6.1.4.1.57264.1.{number} (attestedIdentity). The
+  // repository and its owner are named by their address and by their identifiers, which do not
+  // change and are not given to another repository.
+  const PROOF_TOKEN_ISSUER = "https://token.actions.githubusercontent.com";
+  const PROOF_REPOSITORY = "https://github.com/pickle-com/credential-enclave";
+  const PROOF_REPOSITORY_ID = "1400118248";
+  const PROOF_OWNER_ID = "151645824";
+  const PROOF_WORKFLOW = ".github/workflows/release.yml";
+  // The payload type of the envelope of an attestation and the predicate type of the in-toto
+  // statement in it, as the release workflow of this repository writes them.
+  const PROOF_PAYLOAD_TYPE = "application/vnd.in-toto+json";
+  const PROOF_PREDICATE_TYPE = "https://pickle.com/credential-enclave/release/v1";
+  // The limits of release proofs: the bytes of a release statement, the bytes of an attestation
+  // as JSON without white space, the hashes of an audit path, the elements of deploy_signatures,
+  // and the arrays and objects inside one another of a JSON value of the proofs.
+  const PROOF_STATEMENT_BYTES = 16384;
+  const PROOF_ATTESTATION_BYTES = 65536;
+  const PROOF_PATH_HASHES = 64;
+  const PROOF_DEPLOY_SIGNATURES = 8;
+  const PROOF_JSON_DEPTH = 32;
+
   // The record kinds this program makes in the migration (the device-side sealing of what was
   // stored before the switch), and the most rounds of fetching and uploading one sync runs (one
   // fetch carries up to 100 items).
@@ -1153,6 +1237,839 @@
       if (error && error.code === "attestation_failed") throw error;
       throw attestationFailure(String((error && error.message) || error));
     }
+  }
+
+  // ---- The release proofs: the formats ----
+  //
+  // The readers below take a value in one form only and return null for every other: the proofs
+  // are public values that anyone may hand to the program, and a value that two readers could
+  // read differently is refused.
+
+  /** Base64 -> bytes; null for a text that is not base64 in the one form asked for. With url
+   *  false the form is the standard alphabet with its padding: the length is a multiple of four
+   *  and one or two "=" stand at the end only. With url true it is the URL-safe alphabet without
+   *  padding. A text whose last character carries bits that belong to no byte is refused. */
+  function decodeStrict(encoded, url) {
+    if (typeof encoded !== "string") return null;
+    if (!(url ? /^[A-Za-z0-9_-]*$/ : /^[A-Za-z0-9+/]*={0,2}$/).test(encoded)) return null;
+    if (!url && encoded.length % 4 !== 0) return null;
+    let length = encoded.length;
+    while (length > 0 && encoded[length - 1] === "=") length -= 1;
+    if (length % 4 === 1) return null;
+    const out = new Uint8Array(Math.floor((length * 3) / 4));
+    let bits = 0;
+    let acc = 0;
+    let at = 0;
+    for (let i = 0; i < length; i += 1) {
+      const code = encoded.charCodeAt(i);
+      const value = code >= 65 && code <= 90 ? code - 65 : code >= 97 && code <= 122 ? code - 71
+        : code >= 48 && code <= 57 ? code + 4 : code === 43 || code === 45 ? 62 : 63;
+      acc = ((acc << 6) | value) & 0xfff;
+      bits += 6;
+      if (bits >= 8) {
+        bits -= 8;
+        out[at] = (acc >> bits) & 255;
+        at += 1;
+      }
+    }
+    return (acc & ((1 << bits) - 1)) === 0 ? out : null;
+  }
+
+  /** UTF-8 bytes -> a string; null for bytes that are not UTF-8 (text puts U+FFFD in the place of
+   *  such a byte, which encodes to other bytes than the ones read). */
+  function utf8Text(bytes) {
+    const decoded = text(bytes);
+    return equal(utf8(decoded), bytes) ? decoded : null;
+  }
+
+  /** Whether a value is a JSON object (an array is none). */
+  function isObject(value) {
+    return value !== null && typeof value === "object" && !Array.isArray(value);
+  }
+
+  /** The member key of a JSON object; undefined when value is no object or has no such member. */
+  function member(value, key) {
+    return isObject(value) && Object.prototype.hasOwnProperty.call(value, key) ? value[key] : undefined;
+  }
+
+  // Half of a surrogate pair in a string: a high surrogate that no low one follows, or a low
+  // surrogate that no high one precedes.
+  const HALF_PAIR = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?:[^\uD800-\uDBFF]|^)[\uDC00-\uDFFF]/;
+
+  /** Whether a JSON value holds only what every reader of JSON reads the same way: finite
+   *  numbers, strings and keys without half of a surrogate pair, and not more than
+   *  PROOF_JSON_DEPTH arrays and objects inside one another. */
+  function soundJson(value, depth) {
+    if (typeof value === "number") return Number.isFinite(value);
+    if (typeof value === "string") return !HALF_PAIR.test(value);
+    if (value === null || typeof value !== "object") return true;
+    if (depth >= PROOF_JSON_DEPTH) return false;
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (!soundJson(item, depth + 1)) return false;
+      }
+      return true;
+    }
+    for (const key of Object.keys(value)) {
+      if (HALF_PAIR.test(key) || !soundJson(value[key], depth + 1)) return false;
+    }
+    return true;
+  }
+
+  /** The JSON value of UTF-8 bytes; undefined for bytes that are not UTF-8, that are not one JSON
+   *  value, and for a value soundJson refuses. */
+  function parseJson(bytes) {
+    const decoded = utf8Text(bytes);
+    if (decoded === null) return undefined;
+    let value = undefined;
+    try {
+      value = JSON.parse(decoded);
+    } catch (error) {
+      return undefined;
+    }
+    return soundJson(value, 0) ? value : undefined;
+  }
+
+  /** The keys of the outermost object of a JSON text, in their order, a key as often as the
+   *  text states it; null when the text does not begin with an object. The text is one that
+   *  JSON.parse read. JSON.parse keeps the last value of a key an object states twice, so what
+   *  an object states once is read from here. */
+  function statedKeys(json) {
+    const end = json.length;
+    let at = 0;
+    const skipSpace = function () {
+      while (at < end && " \t\n\r".indexOf(json[at]) >= 0) at += 1;
+    };
+    // The string that begins with the quotation mark at the present place, as it is written.
+    const readString = function () {
+      const from = at;
+      at += 1;
+      while (at < end && json[at] !== "\"") at += json[at] === "\\" ? 2 : 1;
+      at += 1;
+      return json.slice(from, at);
+    };
+    skipSpace();
+    if (json[at] !== "{") return null;
+    at += 1;
+    const keys = [];
+    skipSpace();
+    if (json[at] === "}") return keys;
+    while (at < end) {
+      skipSpace();
+      if (json[at] !== "\"") return null;
+      try {
+        keys.push(JSON.parse(readString()));
+      } catch (error) {
+        return null;
+      }
+      skipSpace();
+      if (json[at] !== ":") return null;
+      at += 1;
+      // The value of the key: up to the comma or the closing brace of the outermost object.
+      let depth = 0;
+      while (at < end) {
+        const symbol = json[at];
+        if (symbol === "\"") {
+          readString();
+          continue;
+        }
+        if (symbol === "{" || symbol === "[") {
+          depth += 1;
+        } else if (symbol === "}" || symbol === "]") {
+          if (depth === 0) break;
+          depth -= 1;
+        } else if (symbol === "," && depth === 0) {
+          break;
+        }
+        at += 1;
+      }
+      if (at >= end || json[at] === "]") return null;
+      if (json[at] === "}") return keys;
+      at += 1;
+    }
+    return null;
+  }
+
+  /** A count of a JSON value: the value when it is a non-negative integer the program holds
+   *  exactly, otherwise null. With digits true a string of decimal digits without a leading zero
+   *  is a count as well (a lone 0 is one): the form in which an attestation carries its counts. */
+  function countOf(value, digits) {
+    const number = digits && typeof value === "string" && /^(0|[1-9][0-9]{0,15})$/.test(value)
+      ? Number(value) : value;
+    return typeof number === "number" && Number.isSafeInteger(number) && number >= 0 && !Object.is(number, -0)
+      ? number : null;
+  }
+
+  /** The position of a release tag in the order of releases (docs/protocol.md 10.3): [major,
+   *  minor, patch, 1, 0] for v{major}.{minor}.{patch} and [major, minor, patch, 0, n] for
+   *  v{major}.{minor}.{patch}-rc.{n}, each number decimal without a leading zero and below 2^32.
+   *  null for a text of any other form: it is no release tag and has no place in the order. */
+  function releasePosition(tag) {
+    const number = "(0|[1-9][0-9]{0,9})";
+    const match = new RegExp("^v" + number + "\\." + number + "\\." + number + "(?:-rc\\." + number + ")?$")
+      .exec(String(tag));
+    if (match === null) return null;
+    const position = [Number(match[1]), Number(match[2]), Number(match[3]), match[4] === undefined ? 1 : 0,
+      match[4] === undefined ? 0 : Number(match[4])];
+    return position.some(function (part) { return part > 4294967295; }) ? null : position;
+  }
+
+  /** Whether the release at position a is later than the one at position b. */
+  function releaseLater(a, b) {
+    for (let at = 0; at < a.length; at += 1) {
+      if (a[at] !== b[at]) return a[at] > b[at];
+    }
+    return false;
+  }
+
+  /** One element of DER in bytes at the offset at, before limit: {tag, at, content, end} (its
+   *  tag byte, where it begins, where its content begins, where it ends). null for bytes that
+   *  are not one element of DER: a tag of more than one byte, a length that is not in its
+   *  shortest form or takes more than four bytes, an element that runs past limit. */
+  function derElement(bytes, at, limit) {
+    if (at + 2 > limit) return null;
+    const tag = bytes[at];
+    if ((tag & 0x1f) === 0x1f) return null;
+    let length = bytes[at + 1];
+    let content = at + 2;
+    if (length >= 0x80) {
+      const count = length & 0x7f;
+      if (count < 1 || count > 4 || content + count > limit || bytes[content] === 0) return null;
+      length = 0;
+      for (let i = 0; i < count; i += 1) length = length * 256 + bytes[content + i];
+      if (length < 0x80) return null;
+      content += count;
+    }
+    if (content + length > limit) return null;
+    return { tag: tag, at: at, content: content, end: content + length };
+  }
+
+  /** The elements of DER that fill bytes from the offset from to the offset to, in order; null
+   *  when the bytes between the two are not such elements. */
+  function derElements(bytes, from, to) {
+    const found = [];
+    let at = from;
+    while (at < to) {
+      const next = derElement(bytes, at, to);
+      if (next === null) return null;
+      found.push(next);
+      at = next.end;
+    }
+    return found;
+  }
+
+  /** The seconds since 1970-01-01T00:00:00Z a UTCTime or a GeneralizedTime of a certificate
+   *  states (YYMMDDHHMMSSZ or YYYYMMDDHHMMSSZ: a two-digit year below 50 is of the century
+   *  2000, the others of 1900); null for an element of another form and for a day no calendar
+   *  has. */
+  function derTime(bytes, element) {
+    const digits = element.tag === 0x17 ? 12 : element.tag === 0x18 ? 14 : 0;
+    if (digits === 0 || element.end - element.content !== digits + 1 || bytes[element.end - 1] !== 0x5a) {
+      return null;
+    }
+    const number = function (start, count) {
+      let value = 0;
+      for (let i = 0; i < count; i += 1) {
+        const digit = bytes[element.content + start + i] - 0x30;
+        if (!(digit >= 0 && digit <= 9)) return NaN;
+        value = value * 10 + digit;
+      }
+      return value;
+    };
+    const wide = digits - 10;
+    let year = number(0, wide);
+    if (wide === 2) year += year < 50 ? 2000 : 1900;
+    const parts = [year, number(wide, 2), number(wide + 2, 2), number(wide + 4, 2), number(wide + 6, 2),
+      number(wide + 8, 2)];
+    if (parts.some(Number.isNaN) || year < 1950 || parts[1] < 1 || parts[1] > 12 || parts[2] < 1 ||
+        parts[3] > 23 || parts[4] > 59 || parts[5] > 59) {
+      return null;
+    }
+    const moment = new Date(Date.UTC(year, parts[1] - 1, parts[2], parts[3], parts[4], parts[5]));
+    return moment.getUTCDate() === parts[2] ? moment.getTime() / 1000 : null;
+  }
+
+  // The object identifiers the reading of a certificate looks for, as the hexadecimal of their
+  // content bytes: the basic constraints (2.5.29.19), the arc of the extensions of Fulcio
+  // (1.3.6.1.4.1.57264.1) and the ECDSA signatures with SHA-256, SHA-384 and SHA-512.
+  const OID_BASIC_CONSTRAINTS = "551d13";
+  const OID_FULCIO = "2b0601040183bf3001";
+  const OID_ECDSA_HASHES = {
+    "2a8648ce3d040302": "sha256", "2a8648ce3d040303": "sha384", "2a8648ce3d040304": "sha512",
+  };
+
+  /** Reads an X.509 certificate from its DER: {tbs, algorithm, signature, issuer, subject,
+   *  notBefore, notAfter, key, extensions}. tbs is the signed part as it is encoded, algorithm
+   *  the hexadecimal of the identifier of the signature algorithm, signature the signature
+   *  value, issuer and subject the two names as they are encoded, notBefore and notAfter the
+   *  validity in seconds since 1970, key the SubjectPublicKeyInfo as it is encoded, and
+   *  extensions a Map from the hexadecimal of the identifier of an extension to its value.
+   *  null for bytes that are not such a certificate, for a signed part whose signature algorithm
+   *  is not the one of the certificate, and for a certificate that holds an extension twice. */
+  function readCertificate(der) {
+    const outer = derElement(der, 0, der.length);
+    if (outer === null || outer.tag !== 0x30 || outer.end !== der.length) return null;
+    const parts = derElements(der, outer.content, outer.end);
+    if (parts === null || parts.length !== 3 || parts[0].tag !== 0x30 || parts[1].tag !== 0x30 ||
+        parts[2].tag !== 0x03 || parts[2].end - parts[2].content < 1 || der[parts[2].content] !== 0) {
+      return null;
+    }
+    const fields = derElements(der, parts[0].content, parts[0].end);
+    const names = derElements(der, parts[1].content, parts[1].end);
+    if (fields === null || names === null || names.length < 1 || names[0].tag !== 0x06) return null;
+    const first = fields.length > 0 && fields[0].tag === 0xa0 ? 1 : 0;
+    const tags = [0x02, 0x30, 0x30, 0x30, 0x30, 0x30];
+    if (fields.length < first + 6) return null;
+    for (let i = 0; i < 6; i += 1) {
+      if (fields[first + i].tag !== tags[i]) return null;
+    }
+    const piece = function (element) { return der.subarray(element.at, element.end); };
+    if (!equal(piece(fields[first + 1]), piece(parts[1]))) return null;
+    const validity = derElements(der, fields[first + 3].content, fields[first + 3].end);
+    if (validity === null || validity.length !== 2) return null;
+    const notBefore = derTime(der, validity[0]);
+    const notAfter = derTime(der, validity[1]);
+    if (notBefore === null || notAfter === null) return null;
+    const extensions = new Map();
+    for (let i = first + 6; i < fields.length; i += 1) {
+      const field = fields[i];
+      if (field.tag === 0x81 || field.tag === 0x82) continue;
+      const list = field.tag === 0xa3 ? derElements(der, field.content, field.end) : null;
+      const items = list !== null && list.length === 1 && list[0].tag === 0x30
+        ? derElements(der, list[0].content, list[0].end) : null;
+      if (items === null) return null;
+      for (const item of items) {
+        const inner = item.tag === 0x30 ? derElements(der, item.content, item.end) : null;
+        if (inner === null || (inner.length !== 2 && inner.length !== 3) || inner[0].tag !== 0x06 ||
+            inner[inner.length - 1].tag !== 0x04 || (inner.length === 3 && inner[1].tag !== 0x01)) {
+          return null;
+        }
+        const identifier = hex(der.subarray(inner[0].content, inner[0].end));
+        if (extensions.has(identifier)) return null;
+        const value = inner[inner.length - 1];
+        extensions.set(identifier, der.subarray(value.content, value.end));
+      }
+    }
+    return {
+      tbs: piece(parts[0]), algorithm: hex(der.subarray(names[0].content, names[0].end)),
+      signature: der.subarray(parts[2].content + 1, parts[2].end),
+      issuer: piece(fields[first + 2]), subject: piece(fields[first + 4]),
+      notBefore: notBefore, notAfter: notAfter, key: piece(fields[first + 5]), extensions: extensions,
+    };
+  }
+
+  /** Whether a certificate is one of a certificate authority: its basic constraints state it. */
+  function certificateAuthority(certificate) {
+    const value = certificate.extensions.get(OID_BASIC_CONSTRAINTS);
+    const sequence = value === undefined ? null : derElement(value, 0, value.length);
+    if (sequence === null || sequence.tag !== 0x30 || sequence.end !== value.length) return false;
+    const inner = derElements(value, sequence.content, sequence.end);
+    return inner !== null && inner.length > 0 && inner[0].tag === 0x01 &&
+      inner[0].end - inner[0].content === 1 && value[inner[0].content] !== 0;
+  }
+
+  /** The text of the extension 1.3.6.1.4.1.57264.1.{number} of a certificate, whose value is the
+   *  DER of one UTF8String; undefined when the certificate has no such extension or its value is
+   *  not such a string. */
+  function fulcioText(certificate, number) {
+    const value = certificate.extensions.get(OID_FULCIO + (number < 16 ? "0" : "") + number.toString(16));
+    const string = value === undefined ? null : derElement(value, 0, value.length);
+    if (string === null || string.tag !== 0x0c || string.end !== value.length) return undefined;
+    const decoded = utf8Text(value.subarray(string.content, string.end));
+    return decoded === null ? undefined : decoded;
+  }
+
+  // The first bytes of the SubjectPublicKeyInfo (DER) of an ECDSA public key with an uncompressed
+  // point, by curve: the algorithm id-ecPublicKey with the curve and the head of the bit string.
+  // The point follows them (0x04 and two coordinates of size bytes).
+  const EC_KEY_FORMS = [
+    { curve: "p256", size: 32, head: "3059301306072a8648ce3d020106082a8648ce3d030107034200" },
+    { curve: "p384", size: 48, head: "3076301006072a8648ce3d020106052b81040022036200" },
+  ];
+
+  /** The ECDSA public key of a SubjectPublicKeyInfo (DER) on P-256 or P-384 with an uncompressed
+   *  point: {curve, size, point}; null for any other bytes. */
+  function ecKey(spki) {
+    for (const form of EC_KEY_FORMS) {
+      const head = form.head.length / 2;
+      if (spki.length === head + 1 + 2 * form.size && hex(spki.subarray(0, head)) === form.head &&
+          spki[head] === 0x04) {
+        return { curve: form.curve, size: form.size, point: spki.subarray(head) };
+      }
+    }
+    return null;
+  }
+
+  /** The r and the s of an ECDSA signature in ASN.1 DER as size bytes each, r first; null for
+   *  bytes that are not the DER of two non-negative integers of at most size bytes. */
+  function ecdsaRaw(signature, size) {
+    const outer = derElement(signature, 0, signature.length);
+    if (outer === null || outer.tag !== 0x30 || outer.end !== signature.length) return null;
+    const parts = derElements(signature, outer.content, outer.end);
+    if (parts === null || parts.length !== 2) return null;
+    const raw = new Uint8Array(2 * size);
+    for (let i = 0; i < 2; i += 1) {
+      const part = parts[i];
+      let from = part.content;
+      const length = part.end - from;
+      // An integer in DER: at least one byte, not negative, and without a leading zero byte
+      // that the sign does not need.
+      if (part.tag !== 0x02 || length < 1 || signature[from] >= 0x80 ||
+          (length > 1 && signature[from] === 0 && signature[from + 1] < 0x80)) {
+        return null;
+      }
+      if (signature[from] === 0) from += 1;
+      if (part.end - from > size) return null;
+      raw.set(signature.subarray(from, part.end), (i + 1) * size - (part.end - from));
+    }
+    return raw;
+  }
+
+  /** Whether signature (ASN.1 DER) is the ECDSA signature of key (ecKey) over message with the
+   *  hash named (sha256, sha384, sha512). */
+  function ecdsaSigned(key, hash, message, signature) {
+    const raw = key === null ? null : ecdsaRaw(signature, key.size);
+    if (raw === null) return false;
+    try {
+      return native.ecdsaVerify({
+        curve: key.curve, hash: hash, format: "raw", publicKey: encode(key.point),
+        message: encode(message), signature: encode(raw),
+      }) === true;
+    } catch (error) {
+      if (failureCode(error) === "cancelled") throw error;
+      return false;
+    }
+  }
+
+  /** Whether issuer issued certificate: the issuer name of the certificate is the subject name of
+   *  issuer as it is encoded, and the signature of the certificate is the ECDSA signature of the
+   *  key of issuer over the signed part, with the hash the signature algorithm names. */
+  function issuedBy(certificate, issuer) {
+    const key = ecKey(issuer.key);
+    const hash = OID_ECDSA_HASHES[certificate.algorithm];
+    return key !== null && hash !== undefined && equal(certificate.issuer, issuer.subject) &&
+      ecdsaSigned(key, hash, certificate.tbs, certificate.signature);
+  }
+
+  // The white space a node takes from both ends of a PEM text (the characters of the Unicode
+  // property White_Space), and the white space it takes out of the base64 between the two lines
+  // (space, tab, line feed, form feed, carriage return).
+  const PEM_ENDS = "[\\t-\\r \\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]+";
+  const PEM_INNER = /[ \t\n\f\r]/g;
+
+  /** The bytes of a PEM text of the kind label (PUBLIC KEY, CERTIFICATE): the standard base64
+   *  between the line -----BEGIN label----- and the line -----END label-----, without its white
+   *  space; null for any other text. The reading is the one of a node (docs/protocol.md 10.3,
+   *  check 4). */
+  function pemBytes(pem, label) {
+    const begin = "-----BEGIN " + label + "-----";
+    const end = "-----END " + label + "-----";
+    const trimmed = pem.replace(new RegExp("^" + PEM_ENDS), "").replace(new RegExp(PEM_ENDS + "$"), "");
+    if (trimmed.length < begin.length + end.length || trimmed.slice(0, begin.length) !== begin ||
+        trimmed.slice(trimmed.length - end.length) !== end) {
+      return null;
+    }
+    return decodeStrict(trimmed.slice(begin.length, trimmed.length - end.length).replace(PEM_INNER, ""), false);
+  }
+
+  /** The SHA-256 of bytes, as bytes. */
+  function sha256(bytes) {
+    return decode(native.sha256(encode(bytes)));
+  }
+
+  /** The bytes a log of the form Rekor v1 signs for an entry (its signed entry timestamp): the
+   *  JSON object of body, integratedTime, logID and logIndex with its keys in this order and
+   *  without white space. body is a text of characters of the base64 alphabet. */
+  function signedEntry(body, integratedTime, logId, logIndex) {
+    return utf8("{\"body\":\"" + body + "\",\"integratedTime\":" + String(integratedTime) + ",\"logID\":\"" +
+      logId + "\",\"logIndex\":" + String(logIndex) + "}");
+  }
+
+  /** The root of the Merkle tree of size leaves (RFC 6962 section 2.1) in which the leaf index
+   *  has the hash leaf, by the audit path from that leaf upwards (the steps of RFC 9162 section
+   *  2.1.3.2); null when the index is not below the size and when the path is shorter or longer
+   *  than the way from that leaf to the root. The indexes are halved as numbers: an index of a
+   *  log is above 2^31. */
+  function auditRoot(leaf, index, size, path) {
+    if (!(index < size)) return null;
+    const inner = new Uint8Array([0x01]);
+    let node = index;
+    let last = size - 1;
+    let root = leaf;
+    for (const sibling of path) {
+      if (last === 0) return null;
+      if (node % 2 === 1 || node === last) {
+        root = sha256(concat(inner, sibling, root));
+        while (node % 2 === 0 && node !== 0) {
+          node = Math.floor(node / 2);
+          last = Math.floor(last / 2);
+        }
+      } else {
+        root = sha256(concat(inner, root, sibling));
+      }
+      node = Math.floor(node / 2);
+      last = Math.floor(last / 2);
+    }
+    return last === 0 ? root : null;
+  }
+
+  /** Whether checkpoint is the note of the head of the tree of treeSize leaves with the root
+   *  rootHash that log signed (c2sp.org/tlog-checkpoint). The part before the first empty line,
+   *  with the line feed that ends it, is the note: its first line is not empty, its second line
+   *  the size in decimal and its third line the standard base64 of the root. A line after the
+   *  empty line is a line of the log when it is U+2014, a space, a name, a space and the
+   *  standard base64 of bytes that begin with the first four bytes of the identifier of the log.
+   *  The checkpoint holds at least one line of the log, and the bytes after the first four of
+   *  every line of the log are an ECDSA signature of the log key over the note. */
+  function checkpointSigned(checkpoint, treeSize, rootHash, log) {
+    if (typeof checkpoint !== "string") return false;
+    const cut = checkpoint.indexOf("\n\n");
+    if (cut < 0) return false;
+    const lines = checkpoint.slice(0, cut).split("\n");
+    const stated = lines.length >= 3 ? decodeStrict(lines[2], false) : null;
+    if (lines[0] === "" || lines[1] !== String(treeSize) || stated === null || !equal(stated, rootHash)) {
+      return false;
+    }
+    const note = utf8(checkpoint.slice(0, cut) + "\n");
+    // U+2014 and a space: what a signature line of a signed note begins with.
+    const head = String.fromCharCode(0x2014) + " ";
+    let signed = false;
+    for (const line of checkpoint.slice(cut + 2).split("\n")) {
+      const space = line.indexOf(" ", 2);
+      const named = line.slice(0, 2) === head && space > 2 ? decodeStrict(line.slice(space + 1), false) : null;
+      if (named === null || named.length <= 4 || !equal(named.subarray(0, 4), log.hint)) continue;
+      if (!ecdsaSigned(log.key, "sha256", note, named.subarray(4))) return false;
+      signed = true;
+    }
+    return signed;
+  }
+
+  // ---- The release proofs: the verdict ----
+
+  /** The refusal of release proofs. reason names the check that failed. */
+  function unproven(reason) {
+    return native.error("release_unproven", reason);
+  }
+
+  /** Reads a release statement (docs/protocol.md 10.3, check 1): the bytes of the file
+   *  measurements.json of a release. They are at most PROOF_STATEMENT_BYTES long and a JSON
+   *  object that states release, pcr0, pcr1 and pcr2 once each: release a text, each PCR 96
+   *  lower-case hexadecimal characters. The other members are not read. Returns {release, pcr0,
+   *  pcr1, pcr2}, or null. */
+  function readReleaseStatement(bytes) {
+    if (bytes.length > PROOF_STATEMENT_BYTES) return null;
+    const value = parseJson(bytes);
+    const stated = isObject(value) ? statedKeys(text(bytes)) : null;
+    if (stated === null) return null;
+    const read = {};
+    for (const name of ["release", "pcr0", "pcr1", "pcr2"]) {
+      if (stated.filter(function (key) { return key === name; }).length !== 1) return null;
+      read[name] = member(value, name);
+    }
+    if (typeof read.release !== "string" || !hex96(read.pcr0) || !hex96(read.pcr1) || !hex96(read.pcr2)) return null;
+    return read;
+  }
+
+  /** P2: a transparency log of trust recorded the signature of the release key over statement
+   *  (checks 2, 3 and 4 of docs/protocol.md 10.3 for a log of the form Rekor v1; digest is the
+   *  lower-case hexadecimal SHA-256 of statement). entry is {log_id, body, integrated_time,
+   *  log_index, signed_entry_timestamp}: what the log returned for the entry. The time of the
+   *  entry is compared with no clock (check 5 is the clock of a node; the notice period is 0
+   *  seconds). Throws unproven. */
+  function releaseRecorded(statement, digest, entry, trust) {
+    const logId = member(entry, "log_id");
+    const body = member(entry, "body");
+    if (typeof logId !== "string" || typeof body !== "string") throw unproven("p2: entry");
+    const log = trust.logs.find(function (item) { return item.id === logId; });
+    if (log === undefined) throw unproven("p2: log");
+    // The signed entry timestamp: the signature of the log over the body it returned with the
+    // time and the index it gave the entry. A body with a character outside the base64 alphabet
+    // could end the string of the body in the signed bytes.
+    const integratedTime = countOf(member(entry, "integrated_time"), false);
+    const logIndex = countOf(member(entry, "log_index"), false);
+    const timestamp = decodeStrict(member(entry, "signed_entry_timestamp"), false);
+    if (integratedTime === null || logIndex === null || timestamp === null || !/^[A-Za-z0-9+/=]*$/.test(body)) {
+      throw unproven("p2: promise");
+    }
+    if (!ecdsaSigned(log.key, "sha256", signedEntry(body, integratedTime, log.id, logIndex), timestamp)) {
+      throw unproven("p2: signed entry timestamp");
+    }
+    // The body: the record of this statement under the release key.
+    const bodyBytes = decodeStrict(body, false);
+    const record = bodyBytes === null ? undefined : parseJson(bodyBytes);
+    const spec = member(record, "spec");
+    const hash = member(member(spec, "data"), "hash");
+    if (member(record, "apiVersion") !== "0.0.1" || member(record, "kind") !== "hashedrekord" ||
+        member(hash, "algorithm") !== "sha256") {
+      throw unproven("p2: body");
+    }
+    if (member(hash, "value") !== digest) throw unproven("p2: statement hash");
+    const signature = member(spec, "signature");
+    const keyPem = decodeStrict(member(member(signature, "publicKey"), "content"), false);
+    const keyText = keyPem === null ? null : utf8Text(keyPem);
+    const keyDer = keyText === null ? null : pemBytes(keyText, "PUBLIC KEY");
+    if (keyDer === null || !equal(keyDer, trust.releaseKey)) throw unproven("p2: release key");
+    const releaseKey = ecKey(trust.releaseKey);
+    const signed = decodeStrict(member(signature, "content"), false);
+    if (releaseKey === null || releaseKey.curve !== "p256" || signed === null ||
+        !ecdsaSigned(releaseKey, "sha256", statement, signed)) {
+      throw unproven("p2: release signature");
+    }
+  }
+
+  /** P3: the deploy key of the server target target signed the statement with the digest digest
+   *  (lower-case hexadecimal SHA-256). signatures is [{key_id, signature}]: at most
+   *  PROOF_DEPLOY_SIGNATURES elements, each with a key id and the standard base64 of an Ed25519
+   *  signature over DEPLOY_STATEMENT_CONTEXT, the digest and a line feed. Exactly one element
+   *  names the key id of the target (prod for the server target prod, dev for every other), and
+   *  its signature verifies under that key of keys. Throws unproven. */
+  function deploySigned(digest, signatures, keys, target) {
+    const keyId = target === "prod" ? "prod" : "dev";
+    if (!Array.isArray(signatures) || signatures.length > PROOF_DEPLOY_SIGNATURES ||
+        signatures.some(function (item) {
+          return typeof member(item, "key_id") !== "string" || typeof member(item, "signature") !== "string";
+        })) {
+      throw unproven("p3: shape");
+    }
+    const own = signatures.filter(function (item) { return item.key_id === keyId; });
+    const signature = own.length === 1 && typeof keys[keyId] === "string"
+      ? decodeStrict(own[0].signature, false) : null;
+    let signed = false;
+    if (signature !== null && signature.length === 64) {
+      try {
+        signed = native.ed25519Verify(
+          keys[keyId], encode(utf8(DEPLOY_STATEMENT_CONTEXT + digest + "\n")), encode(signature)) === true;
+      } catch (error) {
+        if (failureCode(error) === "cancelled") throw error;
+      }
+    }
+    if (!signed) throw unproven("p3: signature");
+  }
+
+  /** The values the certificate of the attestation of the release statement of release states,
+   *  by the number of its extension 1.3.6.1.4.1.57264.1.{number}: the issuer of the token
+   *  (GitHub Actions), the workflow that signed (9) and the workflow that started the run (18:
+   *  the release workflow at the tag, started as itself and not called by another workflow), a
+   *  runner GitHub hosts (11: a runner of the owner of a repository signs what that owner hands
+   *  it), the repository by its address and by its identifier and that of its owner (12, 15,
+   *  17), the tag of the release as the ref (14), the push of that tag as what started the run
+   *  (20: a run started otherwise takes inputs that are not public), and a repository that was
+   *  public (22). */
+  function attestedIdentity(release) {
+    const workflow = PROOF_REPOSITORY + "/" + PROOF_WORKFLOW + "@refs/tags/" + release;
+    return [
+      [8, PROOF_TOKEN_ISSUER], [9, workflow], [11, "github-hosted"], [12, PROOF_REPOSITORY],
+      [14, "refs/tags/" + release], [15, PROOF_REPOSITORY_ID], [17, PROOF_OWNER_ID], [18, workflow],
+      [20, "push"], [22, "public"],
+    ];
+  }
+
+  /** The bytes the signature of a DSSE envelope covers (its pre-authentication encoding). */
+  function preAuthentication(payloadType, payload) {
+    const type = utf8(payloadType);
+    return concat(utf8("DSSEv1 " + type.length + " "), type, utf8(" " + payload.length + " "), payload);
+  }
+
+  /** P4, the attestation: verifies a Sigstore bundle (the attestation GitHub writes for a
+   *  workflow run) and returns the in-toto statement of its envelope. identity is the list of
+   *  attestedIdentity. Every check must hold:
+   *    the bundle, as JSON without white space, is at most PROOF_ATTESTATION_BYTES long and
+   *    holds a certificate, one log entry and an envelope with one signature;
+   *    the payload type of the envelope is PROOF_PAYLOAD_TYPE and its payload a JSON object;
+   *    the certificate, the intermediate and the root of trust are valid at the time the log
+   *    took the entry (the certificate is valid for ten minutes, so no clock of a device is
+   *    asked), the two certificates of trust are those of certificate authorities and the
+   *    certificate is not, the intermediate issued the certificate and the root the
+   *    intermediate. No trust store of the device and no network is asked;
+   *    the certificate states every value of identity;
+   *    the signature of the envelope is the ECDSA P-256 signature of the key of the certificate
+   *    over the pre-authentication encoding of the payload;
+   *    the log entry is of a log of trust and is the dsse entry (version 0.0.1) of this payload,
+   *    this signature and this certificate, and the signed entry timestamp, the audit path and
+   *    the checkpoint of the entry verify under the key of that log.
+   *  The signed certificate timestamps of the certificate are not read: that the certificate was
+   *  issued is on the log this function verifies, which holds the certificate. Throws unproven. */
+  function attestedStatement(attestation, identity, trust) {
+    const material = member(attestation, "verificationMaterial");
+    const certificateText = member(member(material, "certificate"), "rawBytes");
+    const entries = member(material, "tlogEntries");
+    const envelope = member(attestation, "dsseEnvelope");
+    const payloadText = member(envelope, "payload");
+    const payloadType = member(envelope, "payloadType");
+    const signatures = member(envelope, "signatures");
+    if (typeof certificateText !== "string" || !Array.isArray(entries) || entries.length !== 1 ||
+        !isObject(entries[0]) || typeof payloadText !== "string" || typeof payloadType !== "string" ||
+        !Array.isArray(signatures) || signatures.length !== 1 || typeof member(signatures[0], "sig") !== "string") {
+      throw unproven("p4: shape");
+    }
+    if (utf8(JSON.stringify(attestation)).length > PROOF_ATTESTATION_BYTES) throw unproven("p4: size");
+    const entry = entries[0];
+
+    const payload = decodeStrict(payloadText, false);
+    const statement = payload === null ? undefined : parseJson(payload);
+    if (payloadType !== PROOF_PAYLOAD_TYPE || !isObject(statement)) throw unproven("p4: payload");
+
+    const integratedTime = countOf(member(entry, "integratedTime"), true);
+    const leafDer = decodeStrict(certificateText, false);
+    const leaf = leafDer === null ? null : readCertificate(leafDer);
+    if (integratedTime === null || leaf === null || trust.intermediate === null || trust.root === null) {
+      throw unproven("p4: certificate");
+    }
+    for (const certificate of [leaf, trust.intermediate, trust.root]) {
+      if (!(certificate.notBefore <= integratedTime && integratedTime <= certificate.notAfter)) {
+        throw unproven("p4: certificate validity");
+      }
+    }
+    if (!certificateAuthority(trust.intermediate) || !certificateAuthority(trust.root) || certificateAuthority(leaf)) {
+      throw unproven("p4: certificate authority");
+    }
+    if (!issuedBy(leaf, trust.intermediate)) throw unproven("p4: certificate issuer");
+    if (!issuedBy(trust.intermediate, trust.root)) throw unproven("p4: certificate root");
+
+    for (const item of identity) {
+      if (fulcioText(leaf, item[0]) !== item[1]) throw unproven("p4: identity " + item[0]);
+    }
+
+    const signature = decodeStrict(member(signatures[0], "sig"), false);
+    const leafKey = ecKey(leaf.key);
+    if (signature === null || leafKey === null || leafKey.curve !== "p256" ||
+        !ecdsaSigned(leafKey, "sha256", preAuthentication(payloadType, payload), signature)) {
+      throw unproven("p4: signature");
+    }
+
+    const keyId = decodeStrict(member(member(entry, "logId"), "keyId"), false);
+    const logId = keyId === null ? "" : hex(keyId);
+    const log = trust.logs.find(function (item) { return item.id === logId; });
+    if (log === undefined) throw unproven("p4: log");
+    const bodyText = member(entry, "canonicalizedBody");
+    const body = decodeStrict(bodyText, false);
+    const record = body === null ? undefined : parseJson(body);
+    const spec = member(record, "spec");
+    if (member(record, "kind") !== "dsse" || member(record, "apiVersion") !== "0.0.1") {
+      throw unproven("p4: log entry kind");
+    }
+    const payloadHash = member(spec, "payloadHash");
+    if (member(payloadHash, "algorithm") !== "sha256" || member(payloadHash, "value") !== hex(sha256(payload))) {
+      throw unproven("p4: log entry payload");
+    }
+    const logged = member(spec, "signatures");
+    const first = Array.isArray(logged) && logged.length === 1 ? logged[0] : undefined;
+    const loggedSignature = decodeStrict(member(first, "signature"), false);
+    if (loggedSignature === null || !equal(loggedSignature, signature)) throw unproven("p4: log entry signature");
+    const verifier = decodeStrict(member(first, "verifier"), false);
+    const verifierText = verifier === null ? null : utf8Text(verifier);
+    const loggedCertificate = verifierText === null ? null : pemBytes(verifierText, "CERTIFICATE");
+    if (loggedCertificate === null || !equal(loggedCertificate, leafDer)) {
+      throw unproven("p4: log entry certificate");
+    }
+    const logIndex = countOf(member(entry, "logIndex"), true);
+    const timestamp = decodeStrict(member(member(entry, "inclusionPromise"), "signedEntryTimestamp"), false);
+    if (logIndex === null || timestamp === null ||
+        !ecdsaSigned(log.key, "sha256", signedEntry(bodyText, integratedTime, log.id, logIndex), timestamp)) {
+      throw unproven("p4: signed entry timestamp");
+    }
+    const proof = member(entry, "inclusionProof");
+    const leafIndex = countOf(member(proof, "logIndex"), true);
+    const treeSize = countOf(member(proof, "treeSize"), true);
+    const rootHash = decodeStrict(member(proof, "rootHash"), false);
+    const hashes = member(proof, "hashes");
+    let path = Array.isArray(hashes) && hashes.length <= PROOF_PATH_HASHES ? [] : null;
+    for (const item of path === null ? [] : hashes) {
+      const hash = decodeStrict(item, false);
+      if (hash === null || hash.length !== 32) {
+        path = null;
+        break;
+      }
+      path.push(hash);
+    }
+    const root = path === null || leafIndex === null || treeSize === null || treeSize < 1 ||
+      rootHash === null || rootHash.length !== 32
+      ? null : auditRoot(sha256(concat(new Uint8Array([0x00]), body)), leafIndex, treeSize, path);
+    if (root === null || !equal(root, rootHash)) throw unproven("p4: inclusion proof");
+    if (!checkpointSigned(member(member(proof, "checkpoint"), "envelope"), treeSize, rootHash, log)) {
+      throw unproven("p4: checkpoint");
+    }
+    return statement;
+  }
+
+  /** The verdict of release proofs for a measurement {pcr0, pcr1, pcr2} (96 lower-case
+   *  hexadecimal characters each), by a build of the server target target. proofs is {statement,
+   *  entry, deploy_signatures, attestation}: the base64url of the bytes of a release statement,
+   *  the entry of a transparency log, the signatures of the deploy keys and the attestation of
+   *  GitHub. trust is what the proofs are verified with (releaseTrust). Every check must hold:
+   *    P1  the statement is a release statement (readReleaseStatement) whose release is a
+   *        release tag and whose pcr0, pcr1 and pcr2 are those of the measurement;
+   *    P5  the release is later than every release of trust.releases (ACCEPTED_RELEASES), in
+   *        the order of releases;
+   *    P3  the deploy key of the server target signed the statement (deploySigned);
+   *    P2  the release key signed the statement and a transparency log recorded that signature
+   *        (releaseRecorded);
+   *    P4  GitHub attested the statement: the attestation verifies (attestedStatement) under
+   *        the identity of the release workflow at the tag of the release (trust.identity), and
+   *        the predicate of its in-toto statement, of the type PROOF_PREDICATE_TYPE, states the
+   *        release and the three PCRs of the statement.
+   *  Returns the release the statement names. Throws unproven for proofs that fail a check:
+   *  the measurement is then one no list has and no proof showed, as before. */
+  function proveRelease(proofs, measurement, trust, target) {
+    const statementText = member(proofs, "statement");
+    if (typeof statementText !== "string" || statementText.length > 2 * PROOF_STATEMENT_BYTES ||
+        !isObject(member(proofs, "entry")) || !Array.isArray(member(proofs, "deploy_signatures")) ||
+        !isObject(member(proofs, "attestation")) || !soundJson(proofs, 0)) {
+      throw unproven("shape");
+    }
+    const statement = decodeStrict(statementText, true);
+    const stated = statement === null ? null : readReleaseStatement(statement);
+    if (stated === null) throw unproven("p1: statement");
+    const position = releasePosition(stated.release);
+    if (position === null) throw unproven("p1: release tag");
+    if (stated.pcr0 !== measurement.pcr0 || stated.pcr1 !== measurement.pcr1 || stated.pcr2 !== measurement.pcr2) {
+      throw unproven("p1: measurement");
+    }
+    for (const name of trust.releases) {
+      const listed = releasePosition(name);
+      if (listed === null || !releaseLater(position, listed)) throw unproven("p5: release order");
+    }
+    const digest = hex(sha256(statement));
+    deploySigned(digest, proofs.deploy_signatures, trust.deployKeys, target);
+    releaseRecorded(statement, digest, proofs.entry, trust);
+    const attested = attestedStatement(proofs.attestation, trust.identity(stated.release), trust);
+    const predicate = member(attested, "predicate");
+    if (member(attested, "predicateType") !== PROOF_PREDICATE_TYPE) throw unproven("p4: predicate type");
+    for (const name of ["release", "pcr0", "pcr1", "pcr2"]) {
+      if (member(predicate, name) !== stated[name]) throw unproven("p4: predicate " + name);
+    }
+    return stated.release;
+  }
+
+  /** A transparency log of the form Rekor v1 with the key spki (the DER of the
+   *  SubjectPublicKeyInfo of an ECDSA P-256 key): {id, hint, key}, the identifier of the log (the
+   *  lower-case hexadecimal SHA-256 of the DER), its first four bytes (what names the key on a
+   *  checkpoint) and the key. */
+  function proofLog(spki) {
+    const id = sha256(spki);
+    return { id: hex(id), hint: id.subarray(0, 4), key: ecKey(spki) };
+  }
+
+  // What release proofs are verified with in this runtime (releaseTrust): made at the first use
+  // (the top level calls nothing).
+  let proofTrust = null;
+
+  /** What release proofs are verified with: the release key, the transparency logs, the root and
+   *  the intermediate certificate of Fulcio, the deploy keys, the releases of ACCEPTED_RELEASES
+   *  and the identity of an attestation, all from the constants of this program. */
+  function releaseTrust() {
+    if (proofTrust === null) {
+      proofTrust = {
+        releaseKey: decode(RELEASE_KEY),
+        logs: PROOF_LOG_KEYS.map(function (key) { return proofLog(decode(key)); }),
+        root: readCertificate(decode(FULCIO_ROOT)),
+        intermediate: readCertificate(decode(FULCIO_INTERMEDIATE)),
+        deployKeys: DEPLOY_KEYS,
+        releases: ACCEPTED_RELEASES.map(function (build) { return build.release; }),
+        identity: attestedIdentity,
+      };
+    }
+    return proofTrust;
   }
 
   // ---- Keys ----
