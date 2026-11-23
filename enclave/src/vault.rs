@@ -33,7 +33,9 @@ use credential_enclave_protocol::keys::NodeKeys;
 use credential_enclave_protocol::record::{self, Kind, Record};
 use credential_enclave_protocol::released::{seal_released, SealTo, SealedValue};
 use credential_enclave_protocol::secret::Secret;
-use credential_enclave_protocol::secret_use::{fits_header, BoundRequest, SecretUseEnvelope, Slot};
+use credential_enclave_protocol::secret_use::{
+    fits_header, is_used_in_requests, BoundRequest, SecretUseEnvelope, Slot,
+};
 use credential_enclave_protocol::totp::totp;
 use credential_enclave_protocol::vault_secret::{self, Reach, Source};
 use credential_enclave_protocol::{limits, ProtocolError};
@@ -371,8 +373,10 @@ impl ForRequest {
     /// time the envelope is made at: it ends 30 seconds later.
     ///
     /// What depends on the value is judged here, after the entry. A plaintext that is no JSON
-    /// object or holds no string `value`, a value of fewer than 8 bytes or of more than 12,000
-    /// (of a shorter one no reflection could be found in a response), for a slot
+    /// object or holds no string `value`, a value of more than 12,000 bytes or with fewer than
+    /// 8 bytes without the characters a server strips at its ends (`is_used_in_requests` of
+    /// the protocol crate: of a shorter text no reflection could be found in a response), for
+    /// a slot
     /// `header:<name>`, `basic:user` and `basic:password` a value with a control character
     /// (it would end the line of its header, and the credentials of HTTP Basic hold none),
     /// and for the slot `basic:user` a value with a colon (the first colon of the credentials
@@ -393,8 +397,7 @@ impl ForRequest {
     ) -> Result<SecretUseEnvelope, ProtocolError> {
         let value = member_of(&self.plaintext, "value")?;
         let stored = value.expose_secret().as_str();
-        let sized = (limits::SECRET_USE_VALUE_BYTES_MIN..=limits::SECRET_USE_VALUE_BYTES_MAX)
-            .contains(&stored.len());
+        let sized = is_used_in_requests(stored);
         let fits = match request.slot() {
             Slot::Header(_) => fits_header(stored),
             // The slot names the half of the credentials the value stands for: neither half

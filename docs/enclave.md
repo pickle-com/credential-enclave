@@ -940,7 +940,10 @@ which form it holds. The order of the processing:
    call takes one of the 512 places of the forward calls and the share of the body budget its
    request frame occupies before it reads the frame, and waits for the two together for at most
    30 seconds (`ADMISSION_WAIT`, section 8): a call that has not got them by then ends with
-   `capacity_unavailable`, having read nothing, created no entry and sent nothing.
+   `capacity_unavailable`, having read nothing, created no entry and sent nothing. A call that
+   asks for a stream takes one share more within the same 30 seconds, after it read its frame:
+   the share of the body budget the search of its response can hold (step 11). Without it the
+   call ends with `capacity_unavailable` as well, having created no entry and sent nothing.
 1. The common front. The kind of the record is `oauth` or `oauth_imported` (any other kind is
    `not_allowed`).
 2. The address check (section 7). A violation is `not_allowed`.
@@ -998,7 +1001,8 @@ which form it holds. The order of the processing:
    places of the node-wide bound of provider requests in flight (section 8). The node follows no
    redirect (a 3xx response is returned as it is). A response with `Transfer-Encoding: chunked`
    is returned decoded. The node sends no `TE` header, and a response under any other transfer
-   coding fails the check of step 10. The hop-by-hop headers of the response (`connection`,
+   coding, or one that names `chunked` more than once, fails the check of step 10. The
+   hop-by-hop headers of the response (`connection`,
    `keep-alive`, `proxy-authenticate`, `proxy-authorization`, `te`, `trailer`,
    `transfer-encoding`, `upgrade`, and the names that its `Connection` header lists),
    `Set-Cookie` and `Set-Cookie2` are left out.
@@ -1006,17 +1010,28 @@ which form it holds. The order of the processing:
    a response body above 64 MiB is `too_large`.
 10. The response check (rule E4 of egress-policy.md, `enclave/src/provider_response.rs`). A
     response with a `Content-Encoding` other than `identity`, or with a transfer coding other than
-    `chunked`, fails the check: the node does not hand on a body it cannot search. The two
+    `chunked`, fails the check: the node does not hand on a body it cannot search. So does a
+    response that names the coding `chunked` more than once, in one `Transfer-Encoding` header
+    or in several: the node removes that coding once. The two
     headers are read as they arrived, before the headers that the `Connection` header of the
     response lists are left out (step 8), and a response under an instance manipulation (RFC
     3229: the status 226, or a header `IM`) fails the check as well. A response
     fails the check when a header name, a header value or the body holds the injected credential
     (the token without the prefix of the definition). Each of the three is read as it was
     received, with its percent escapes decoded (up to three times, for a value that was
-    encoded more than once) and with its JSON string escapes decoded (up to twice, for a JSON
-    text inside a JSON string), and each reading is searched for the credential as it is, in
-    base64 or base64url (each of the three byte alignments, without padding) and in hexadecimal
-    (lower or upper case). A header whose bytes are not UTF-8 is searched as those bytes as well. A form shorter than 8 bytes is not searched for. A failed check is
+    encoded more than once), with its JSON string escapes decoded (up to twice, for a JSON
+    text inside a JSON string) and with its character references of HTML and XML decoded (up
+    to twice, for a text that was escaped again: the names `&amp;`, `&lt;`, `&gt;`, `&quot;`
+    and `&apos;`, and the number of a character in decimal or in hexadecimal, of at most six
+    bytes for each byte of that character), and each reading is searched for the credential as it is, in
+    base64 or base64url (each of the three byte alignments, without padding), in hexadecimal
+    (lower or upper case), when it holds a space with `+` in the place of every space, and when
+    it holds a character outside ASCII as the text a reader of ISO 8859-1 makes of its bytes. A
+    header whose bytes are not UTF-8 is searched as those bytes as well.
+    A header name, which the node hands on in lower case, is searched without regard to the case
+    of its letters. The credential is searched for without the characters a server strips at its
+    ends (white space, control characters and U+FEFF: protocol.md 10.5). A form shorter than 8
+    bytes is not searched for. A failed check is
     `response_withheld`: no part of the response leaves. The event `provider_request` is already
     on the chain, because the request went to the provider.
 11. A call that asked for a stream. Steps 8 and 9 run up to the head of the provider response:
@@ -1043,11 +1058,20 @@ which form it holds. The order of the processing:
     `complete` false with the `code` `response_withheld`, `provider_unreachable` (the
     connection of the provider failed or ended inside the body) or `timeout`, and the fixed
     `message` of that code. A stream that ends without an end record was cut on its way and
-    is a failure for its caller. The response body of a stream takes no share of the body
-    budget: the node holds the bytes held back, the bytes of one search and four elements of
-    the stream. At the time limit of the call the task frees the connection to the provider
-    and the place of the call among the forward calls whether or not the caller reads the
-    response; it frees them as well when the connection of the caller ends. The sizes of the
+    is a failure for its caller. The response body of a stream is not held in memory and
+    takes no share of the body budget. What the node holds for it is the search (the bytes
+    held back, the bytes that wait for a search, the last bytes of every reading and the
+    forms of the credential) and four elements of the stream. What the search can hold is
+    bounded by the length of the credential (`StreamCheck::memory_bound`: about 62 KiB for a
+    token of 200 bytes and 470 KiB for one of 2,000 bytes), and the call holds that share of
+    the body budget from step 0 to the end of the stream. The token is known once the record
+    is open, under the lock of the account, where a call does not wait: so the call takes
+    the share for the longest token a record of that size can hold (the plaintext of a
+    record is shorter than its ciphertext) and gives back what the token does not need once
+    the record is open. At the time limit of the call the task frees the connection to the
+    provider, that share and the place of the call among the forward calls whether or not
+    the caller reads the response; it frees them as well when the connection of the caller
+    ends. The sizes of the
     parts of a stream depend on the length of the credential (the bytes held back), which
     the size of the request to the provider shows the operator domain as well.
 
@@ -1217,7 +1241,8 @@ without the operator configuration.
    path, the query, the size and the hash of the body as the request object states them,
    `context`, `name`, `slot` and `to` (protocol.md 7.2). It is merged with no other event. A call
    that is refused up to here creates no event.
-6. After the log store confirmed the entry: the value is 8 to 12,000 bytes, and for a slot of a
+6. After the log store confirmed the entry: the value has at most 12,000 bytes, of which 8 or
+   more are left without the characters a server strips at its ends (protocol.md 10.5), and for a slot of a
    header and for the two slots of HTTP Basic it holds no control character (for `basic:user`, no
    colon either). A value that fails is `record_invalid`: no envelope leaves, and the entry stays.
 7. The node seals the value and the request object to the sealing key of the receiving node
@@ -1800,8 +1825,10 @@ The rules:
   requests, so the places are not the bound of the throughput of a node: the provider requests
   in flight and the body budget are). A `forward`, `forward/batch` or `vault/send` call waits
   for its place and for the shares of the body budget it takes before its request leaves (the
-  share its request frame occupies, and for `vault/send` the share the search of its response
-  can hold: about 20 KiB for a value of 30 bytes and 2.3 MiB for one of 12,000 bytes) for at
+  share its request frame occupies, and for `vault/send` and for a `forward` call that asks
+  for a stream the share the search of its response can hold with the forms of the
+  credential: about 31 KiB for a credential of 30 bytes, 62 KiB for one of 200 bytes and 2.7
+  MiB for a vault value of 12,000 bytes) for at
   most 30 seconds together (`ADMISSION_WAIT`)
   and ends with `capacity_unavailable` when it has not got them by then: the node reads
   nothing from the connection of a call that waits, so it does not learn that the caller of
@@ -1814,7 +1841,7 @@ The rules:
   with the bytes of the response and is free when the connection wrote them: a caller that
   takes a response slowly, or not at all, holds memory the budget counts. The body of a
   response that is handed on as a stream (5.8 step 11) is not held in memory and takes no
-  share.
+  share: its call holds the share of its search instead.
 - Connections from the backend: the node holds a bounded number of them open at the same time
   (`inbound_limit` of `load` of health). It computes the bound at its start from the memory of
   its kernel: one eighth of `MemTotal` divided by what one connection can hold that no other
@@ -1888,7 +1915,7 @@ The limits, as the source states them:
 | Body of a provider request and of a provider response (`forward`); the bodies of the results of a `forward/batch` call together | 64 MiB each |
 | Sum of the bodies in memory | 2 GiB |
 | Concurrent `forward` and `forward/batch` calls | 512 |
-| Wait of a `forward` or `forward/batch` call for its place and for the share of the body budget of its request frame (`ADMISSION_WAIT`) | 30 seconds |
+| Wait of a `forward` or `forward/batch` call for its place, for the share of the body budget of its request frame and, when it asks for a stream, for the share of the search of its response (`ADMISSION_WAIT`) | 30 seconds |
 | Connections from the backend held open at once (`inbound_limit` of health) | One eighth of the memory of the kernel divided by 344,064 bytes, 64 to 16,384: 1,502 in an enclave of 4,096 MiB |
 | Longest wait for the peer of a connection from the backend: for the head of a request, for the next bytes of a request body, for the peer to take bytes of a response (`inbound_idle`) | 60 seconds |
 | Read buffer of the HTTP connection of a caller, and the longest request head | 32 KiB |
@@ -1906,7 +1933,7 @@ The limits, as the source states them:
 | `timeout_ms` of `forward` and `forward/batch` | 1,000 to 120,000, default 30,000 |
 | `timeout_ms` of a `forward` call that asks for a stream | 1,000 to 600,000, default 30,000 |
 | One part of a stream | 1,048,576 bytes |
-| Bytes the search of a stream holds back | 27 bytes for each byte of the longest form of the credential, and 32 |
+| Bytes the search of a stream holds back | 36 bytes for each byte of the longest form of the credential, and 36 more |
 | Address of `forward` | 8,192 bytes |
 | Response of a token address | 1 MiB, time limit 15 seconds (`token_timeout`) |
 | Late response of a token address call of `refresh` (`token_late_limit`) | 120 seconds from the start of the call |

@@ -248,11 +248,12 @@ fn caller_headers(
 }
 
 /// A request that passed steps 2 to 4 of enclave.md 5.8: the outbound request with the
-/// credential injected, the token to search the response for (rule E4), the merge key of a GET
-/// without a body, and the event `provider_request` of the request.
+/// credential injected, the token to search the response for (rule E4) and its length, the
+/// merge key of a GET without a body, and the event `provider_request` of the request.
 pub(super) struct Prepared {
     pub outbound: OutboundRequest,
     pub token: Secret<String>,
+    pub token_bytes: usize,
     pub merge_key: Option<[u8; 32]>,
     pub event: Value,
 }
@@ -290,10 +291,11 @@ pub(super) fn prepare(
     let rule = definition
         .inject_rule(target.host())
         .ok_or(ProtocolError::NotAllowed)?;
-    let (header_value, token) = parsed
+    let credential = parsed
         .credential(rule)
-        .ok_or(ProtocolError::RecordInvalid)?
-        .into_parts();
+        .ok_or(ProtocolError::RecordInvalid)?;
+    let token_bytes = credential.token_bytes();
+    let (header_value, token) = credential.into_parts();
     let mut headers = vec![
         OutboundHeader::secret(&rule.header, header_value),
         OutboundHeader::plain("accept-encoding", "identity"),
@@ -336,6 +338,7 @@ pub(super) fn prepare(
     Ok(Prepared {
         outbound,
         token,
+        token_bytes,
         merge_key,
         event,
     })
@@ -423,10 +426,13 @@ pub(super) fn cut(error: ProtocolError) -> StreamEnd {
 /// status 200 has left, and a body that is cut says so in the end record of its stream.
 ///
 /// `request_budget` is the share of the body budget the request frame occupies: it is free
-/// once the request is on the wire. The body of the provider takes no share: the node holds
-/// the bytes it has not handed on yet, a bounded number (`StreamCheck`). `place` is the place
-/// of the call among the forward calls of the node: it is free when the body has ended, was
-/// cut, the time limit passed or the caller is gone, whichever comes first.
+/// once the request is on the wire. The body of the provider is not held in memory. What the
+/// node holds of it is what the search holds: the bytes it has not handed on yet, its
+/// readings and the forms of the credential, as many bytes as the length of the credential
+/// bounds (`StreamCheck::memory_bound`). `held` is the place of the call among the forward
+/// calls of the node and the share of the body budget of that bound: the two are free when
+/// the body has ended, was cut, the time limit passed or the caller is gone, whichever comes
+/// first.
 async fn stream(
     node: &Arc<Node>,
     user_id: &str,
@@ -434,7 +440,7 @@ async fn stream(
     timeout: Duration,
     log: LogRef,
     request_budget: OwnedSemaphorePermit,
-    place: OwnedSemaphorePermit,
+    held: (OwnedSemaphorePermit, OwnedSemaphorePermit),
 ) -> Result<Response, ApiError> {
     let Prepared {
         outbound, token, ..
@@ -463,8 +469,22 @@ async fn stream(
     // under a content coding, is not handed on. Nothing of it has left.
     let check = StreamCheck::begin(&token, &mut headers).map_err(ProtocolError::from)?;
     drop(token);
-    let (body, late) = hand_on_body(exchange, check, deadline, place);
+    let (body, late) = hand_on_body(exchange, check, deadline, held);
     Ok(forward_stream(status, headers, Some(log), body, late))
+}
+
+/// More bytes than the credential of `record` has: the credential is a part of the plaintext
+/// of the record, and that plaintext is shorter than the ciphertext, which `ct` writes with
+/// four characters for three bytes.
+fn credential_bytes_at_most(record: &Record) -> usize {
+    record.ct.len().div_ceil(4).saturating_mul(3)
+}
+
+/// `budget` without what it holds above `needed` bytes of the body budget: those are free.
+fn narrowed(mut budget: OwnedSemaphorePermit, needed: usize) -> OwnedSemaphorePermit {
+    let above = budget.num_permits().saturating_sub(needed);
+    drop(budget.split(above));
+    budget
 }
 
 /// Starts the task of a stream (the stream form of `forward`, `vault/send`), which hands the
@@ -598,6 +618,20 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
         true => timeout_within(&meta, STREAM_TIMEOUT_MAX_MS)?,
         false => timeout_of(&meta)?,
     };
+    // The search of a response that is handed on as a stream lasts as long as the stream, and
+    // what it holds grows with the length of the credential. The call takes the share of the
+    // body budget that search can hold before anything of it is recorded or sent, within the
+    // time of its admission. The credential is known once the record is open, under the
+    // account lock, where a call does not wait. So the share is taken for the longest
+    // credential a record of this size can hold, and what the credential does not need is
+    // given back when it is known.
+    let check_budget = match streamed {
+        true => {
+            let bound = StreamCheck::memory_bound(credential_bytes_at_most(&record));
+            Some(admission.budget(node, bound).await?)
+        }
+        false => None,
+    };
 
     // 1: the common front. Everything up to the event happens under the account lock, so a
     // revoke that is answered before this point leaves no request behind it.
@@ -641,6 +675,9 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
         (prepared, place)
     };
     drop(payload);
+    // The search of a stream holds no more than the bound of this credential.
+    let check_budget = check_budget
+        .map(|budget| narrowed(budget, StreamCheck::memory_bound(prepared.token_bytes)));
 
     // 5, 6: the request leaves only after the log store confirmed the entry that holds its
     // event (the group commit of protocol.md 7.1).
@@ -654,8 +691,9 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
     // reservation of the request frame goes with it and is free once the request is on the
     // wire (`execute`).
     let timeout = Duration::from_millis(timeout_ms);
-    if streamed {
-        return stream(node, user_id, prepared, timeout, log, request_budget, slot).await;
+    if let Some(check_budget) = check_budget {
+        let held = (slot, check_budget);
+        return stream(node, user_id, prepared, timeout, log, request_budget, held).await;
     }
     let Prepared {
         outbound, token, ..

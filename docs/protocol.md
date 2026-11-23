@@ -574,8 +574,8 @@ them. A node reads the keys of this table and passes over every other key of the
 | --- | --- |
 | `field` | An input field of a web page, typed there by whoever fills the page. `release` hands the value out |
 | `header:<name>` | Inside the value of the request header `<name>`. The name is 1 to 64 characters of `[a-z0-9-]`, and it is none of the headers a node of the forward role drops or refuses (10.5) |
-| `query:<name>` | The whole value of the query parameter `<name>`. The name is 1 to 64 of the characters a query writes without a percent escape: ASCII letters, digits, `-`, `.`, `_` and `~` |
-| `form:<name>` | The whole value of the field `<name>` of a body of the type `application/x-www-form-urlencoded`. The name has the form of the name of `query` |
+| `query:<name>` | The whole value of a query parameter `<name>`. The name is 1 to 64 of the characters a query writes without a percent escape: ASCII letters, digits, `-`, `.`, `_` and `~` |
+| `form:<name>` | The whole value of a field `<name>` of a body of the type `application/x-www-form-urlencoded`. The name has the form of the name of `query` |
 | `json:<name>` | A string member of a JSON body. The name is the keys of the objects on the way to the member joined by `.` (`auth.token` is the member `token` of the member `auth` of the top-level object): no key is empty, no key holds a control character or a space character, and the name is at most 64 bytes of UTF-8 |
 | `path` | Inside the path of the request |
 | `basic:user`, `basic:password` | The whole user-id, or the whole password, of the credentials of HTTP Basic in the `Authorization` header (RFC 7617) |
@@ -1820,9 +1820,11 @@ request = {"method":"POST","host":"api.openai.com","path":"/v1/chat/completions"
 The placeholder and the address agree with the slot. For the slot `path` the placeholder occurs
 once in the path and not in the query, and the path in front of it does not end with the
 beginning of a percent escape, neither as it stands nor with its percent escapes decoded up to
-three times. For a slot `query:<name>` it is the whole value of the one parameter of that name and
-occurs nowhere else in the address. For every other slot it occurs neither in the path nor in the
-query.
+three times. For a slot `query:<name>` exactly one pair of the query (its pairs are the texts that
+`&` separates) is the name, `=` and the placeholder, with nothing else, and the placeholder occurs
+nowhere else in the address. A query may hold further pairs of the same name beside that one: a
+request with them is sent. For every other slot the placeholder occurs neither in the path nor in
+the query.
 
 **The envelope.** After the log store confirmed the entry that holds the event `provider_request`
 of the use (7.2), the node of the delegation role signs and seals:
@@ -1838,8 +1840,13 @@ enc, ct  = single-shot HPKE to the sealing key of the receiving node,
 
 - `not_after_ms` is `time_ms` plus 30,000: an envelope can be used for 30 seconds of the time of
   the giving node. `nonce` is 16 fresh random bytes, the number of the use.
-- `value` is the value of the record: 8 to 12,000 bytes. A shorter value is not searched for in
-  the response to its request (egress-policy.md, rule E4), so no node seals or sends one.
+- `value` is the value of the record: at most 12,000 bytes, of which 8 or more are left without
+  the characters a server strips at its ends. Those are the white space characters (the Unicode
+  property White_Space), the control characters (U+0000 to U+001F and U+007F to U+009F) and
+  U+FEFF, the byte order mark: what the function that strips a text removes in one runtime or
+  another. The search of the response to its request looks for the value without those
+  characters at its ends, and a text of fewer than 8 bytes is not searched for
+  (egress-policy.md, rule E4), so no node seals or sends a value with fewer.
 - The purpose strings are those of this envelope alone. A node opens a delegation transfer (10.1)
   under other ones, so a node of the forward role has no operation that opens a transfer, and a
   node of the delegation role has none that opens this envelope.
@@ -1860,7 +1867,7 @@ enc, ct  = single-shot HPKE to the sealing key of the receiving node,
 | `sig` verifies under the signing key that `envelope.from` names | `bad_signature` |
 | `payload` is a JSON object with `v` 1 and `type` `secret_use` | `unsupported_version`, `invalid_request` |
 | `payload.from` and `payload.to` equal those of the envelope | `wrong_node` |
-| The form of the fields: the two times, a `nonce` of 16 bytes, a `user_id`, a `record_id` of 16 bytes, a `value` of 8 to 12,000 bytes, a request object | `invalid_request`, `too_large` for a body above 64 MiB |
+| The form of the fields: the two times, a `nonce` of 16 bytes, a `user_id`, a `record_id` of 16 bytes, a `value` of at most 12,000 bytes with 8 or more of them without the characters a server strips at its ends, a request object | `invalid_request`, `too_large` for a body above 64 MiB |
 | The time of the node is before `not_after_ms`, and `not_after_ms` is at most 60 seconds ahead of it | `bad_expiry` |
 | The body of the call has the length and the SHA-256 the request object states, and the request of the call is the request of the envelope (below) | `invalid_request`, `not_allowed` |
 | The `nonce` was not marked before | `bad_challenge` |
@@ -1899,9 +1906,11 @@ envelope. The node puts the value at the slot and nowhere else:
 - `form:<name>`, `json:<name>`: the one `Content-Type` header of the caller is
   `application/x-www-form-urlencoded` for a form slot and a JSON type (`application/json`, or a
   type whose subtype ends with `+json`) for a JSON slot, it states no `charset` but UTF-8, and the
-  caller states no `Content-Encoding`. For a form slot the placeholder is the whole value of the
-  one field of that name. For a JSON slot it is the whole content of the string member the name
-  leads to, written without an escape.
+  caller states no `Content-Encoding`. For a form slot exactly one pair of the body is the name,
+  `=` and the placeholder, with nothing else, as in a query for its slot: a body may hold further
+  fields of the same name beside that one. For a JSON slot the placeholder is the whole content of
+  the string member the name leads to, written without an escape; a body in which one object
+  names that member, or an object on the way to it, twice is not sent.
 - The node drops these headers of the caller: `host`, `content-length`, `transfer-encoding`,
   `connection`, `keep-alive`, `proxy-connection`, `upgrade`, `te`, `trailer`, `expect`,
   `accept-encoding`, `proxy-authorization`, `range`, `if-range` and `accept-charset`. It writes
@@ -2006,7 +2015,7 @@ redirect. The response passes rule E4 of the egress policy before any part of it
 | Longest name of such a record, longest name inside a slot | 64 characters, 64 bytes |
 | Longest `value` that `vault/store` takes, longest plaintext of a record it makes | 12,000 bytes, 12,272 bytes |
 | Lengths a device pads the plaintext of a record of kind `vault_secret` to | 256, 512, 1,024, 2,048, 4,096, 8,192 and 12,272 bytes |
-| Value of a vault secret that is used in a request (10.5) | 8 to 12,000 bytes |
+| Value of a vault secret that is used in a request (10.5) | At most 12,000 bytes, 8 or more of them without the characters a server strips at its ends (white space, control characters, U+FEFF) |
 | Time an envelope of a use of a vault secret can be used, time a node keeps the mark of a used one | 30 seconds, 60 seconds |
 | Marks of used envelopes a node of the forward role keeps at once | 1,048,576 |
 | Placeholder of a request (10.5) | 16 to 128 characters |

@@ -27,6 +27,7 @@ mod peer;
 mod pools;
 mod records;
 mod roles;
+mod search_reference;
 mod surface;
 mod vault;
 mod vault_handoff;

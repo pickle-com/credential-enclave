@@ -1278,6 +1278,364 @@ async fn a_response_the_node_cannot_search_or_whose_head_holds_the_value_is_not_
     }
 }
 
+/// `body` under one layer of the transfer coding `chunked`, in chunks of `size` bytes.
+fn chunked_once(body: &[u8], size: usize) -> Vec<u8> {
+    let mut coded = Vec::new();
+    for chunk in body.chunks(size) {
+        coded.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+        coded.extend_from_slice(chunk);
+        coded.extend_from_slice(b"\r\n");
+    }
+    coded.extend_from_slice(b"0\r\n\r\n");
+    coded
+}
+
+#[tokio::test]
+async fn a_body_under_the_chunked_coding_more_than_once_is_not_handed_on() {
+    // A site that states the transfer coding `chunked` twice, in one header or in two, and
+    // sends the value back in a body that is chunked twice. The HTTP client of the node
+    // removes one layer of that coding: what it reads is a body that is still chunked, whose
+    // inner chunks part the value, under no header that says so.
+    for stated in [
+        "chunked, chunked",
+        "chunked,chunked",
+        "Chunked , CHUNKED",
+        "chunked\r\ntransfer-encoding: chunked",
+        "chunked, chunked, chunked",
+    ] {
+        let provider = site(move |seen| {
+            let echoed = seen.header("x-api-key").unwrap_or_default();
+            let inner = chunked_once(format!("{{\"echo\":\"{echoed}\"}}").as_bytes(), 13);
+            let mut reply =
+                format!("HTTP/1.1 200 OK\r\ntransfer-encoding: {stated}\r\n\r\n").into_bytes();
+            reply.extend_from_slice(&chunked_once(&inner, 4096));
+            Reply::Raw(reply)
+        })
+        .await;
+        let forward = forward_node(&provider).await;
+        let request = request_of("GET", "/v1/echo", "", "header:x-api-key", b"");
+        let meta = json!({
+            "envelope": envelope(&forward, &request, VALUE, 1),
+            "headers": [["X-Api-Key", PLACEHOLDER]],
+        });
+        let outcome = forward.vault_send(meta, b"").await;
+        assert_eq!(provider.only().header("x-api-key"), Some(VALUE), "{stated}");
+        assert_eq!(
+            code(&outcome),
+            (502, "response_withheld".to_string()),
+            "{stated}"
+        );
+    }
+
+    // The coding once is the coding the node removes: a body under it is handed on as the
+    // site wrote it.
+    let provider = site(|_| {
+        let mut reply = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: Chunked\r\n\r\n".to_vec();
+        reply.extend_from_slice(&chunked_once(b"{\"ok\":true}", 4));
+        Reply::Raw(reply)
+    })
+    .await;
+    let forward = forward_node(&provider).await;
+    let request = request_of("GET", "/v1/echo", "", "header:x-api-key", b"");
+    let meta = json!({
+        "envelope": envelope(&forward, &request, VALUE, 1),
+        "headers": [["X-Api-Key", PLACEHOLDER]],
+    });
+    let sent = forward.vault_send(meta, b"").await.unwrap();
+    assert_eq!(sent.body(), b"{\"ok\":true}");
+    assert_eq!(sent.end, json!({"complete": true}));
+}
+
+#[tokio::test]
+async fn a_value_with_white_space_at_its_ends_is_found_without_it() {
+    // A value that was stored with white space at its ends, as one that was copied with a
+    // space or a line end behind it. A server reads the value of a header without the white
+    // space around it, and a server that reads a parameter often strips it: what such a site
+    // sends back is the value without that white space, which is the value a server takes.
+    let spaced = [
+        format!("{VALUE} "),
+        format!(" {VALUE}"),
+        format!("  {VALUE}  "),
+        format!("{VALUE}\n"),
+        format!("\u{a0}{VALUE}\u{3000}"),
+    ];
+    for (index, value) in spaced.iter().enumerate() {
+        let in_a_line = !value.contains('\n');
+        for echo in ["body", "header"] {
+            // The site sends back what it read of the header, or of the query parameter.
+            let provider = site(move |seen| {
+                let read = match in_a_line {
+                    true => seen.header("x-api-key").unwrap_or_default().to_string(),
+                    false => url::form_urlencoded::parse(
+                        seen.target
+                            .split_once('?')
+                            .map_or("", |(_, query)| query)
+                            .as_bytes(),
+                    )
+                    .find(|(name, _)| name == "key")
+                    .map(|(_, value)| value.into_owned())
+                    .unwrap_or_default(),
+                };
+                let read = read.trim().to_string();
+                let lead = "0123456789".repeat(1_000);
+                match echo {
+                    "body" => Reply::json(400, &json!({"lead": lead, "unknown key": read})),
+                    _ => Reply::with_body(400, &[("x-unknown-key", read.as_str())], b"{}"),
+                }
+            })
+            .await;
+            let forward = forward_node(&provider).await;
+            let query = format!("key={PLACEHOLDER}");
+            let (request, headers) = match in_a_line {
+                true => (
+                    request_of("GET", "/v1/me", "", "header:x-api-key", b""),
+                    json!([["X-Api-Key", PLACEHOLDER]]),
+                ),
+                false => (
+                    request_of("GET", "/v1/me", &query, "query:key", b""),
+                    json!([]),
+                ),
+            };
+            let meta = json!({
+                "envelope": envelope(&forward, &request, value, index as u8),
+                "headers": headers,
+            });
+            let outcome = forward.vault_send(meta, b"").await;
+            assert_eq!(provider.seen().len(), 1, "{value:?} {echo}");
+            match (echo, outcome) {
+                ("body", Ok(sent)) => {
+                    assert_eq!(sent.end["code"], "response_withheld", "{value:?}");
+                    let body = String::from_utf8(sent.body()).unwrap();
+                    assert!(!body.contains(VALUE), "{value:?}");
+                }
+                (_, outcome) => assert_eq!(
+                    code(&outcome),
+                    (502, "response_withheld".to_string()),
+                    "{value:?} {echo}"
+                ),
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_value_is_found_without_what_a_server_strips_at_its_ends() {
+    // A value that was stored with a byte order mark in front of it, as one that was read
+    // from a file, or with a control character at one of its ends. The functions that strip
+    // a text do not remove the same characters in every runtime: the site of this test
+    // removes every character up to U+0020, U+007F and U+FEFF, and sends back what is left.
+    let stored = [
+        format!("\u{feff}{VALUE}"),
+        format!("{VALUE}\u{1f}"),
+        format!("\u{1}\u{feff} {VALUE}\u{7f}"),
+    ];
+    for (index, value) in stored.iter().enumerate() {
+        let provider = site(|seen| {
+            let query = seen.target.split_once('?').map_or("", |(_, query)| query);
+            let read = url::form_urlencoded::parse(query.as_bytes())
+                .find(|(name, _)| name == "key")
+                .map(|(_, value)| value.into_owned())
+                .unwrap_or_default();
+            let read = read.trim_matches(|character: char| {
+                character <= ' ' || character == '\u{7f}' || character == '\u{feff}'
+            });
+            Reply::json(400, &json!({"unknown key": read}))
+        })
+        .await;
+        let forward = forward_node(&provider).await;
+        let query = format!("key={PLACEHOLDER}");
+        let request = request_of("GET", "/v1/me", &query, "query:key", b"");
+        let meta = json!({
+            "envelope": envelope(&forward, &request, value, index as u8),
+            "headers": [],
+        });
+        let sent = forward.vault_send(meta, b"").await.unwrap();
+        // The site received the value as it was stored, and sent it back without its ends.
+        let target = format!("/v1/me?key={}", percent(value));
+        assert_eq!(provider.only().target, target);
+        assert_eq!(sent.end["code"], "response_withheld", "{value:?}");
+        assert_eq!(sent.body(), b"", "{value:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_value_with_a_space_that_a_site_sends_back_in_an_address_is_not_handed_on() {
+    // A value with spaces. The site answers with a redirect whose address holds the value as
+    // a writer of a form body writes it: `+` for a space, a percent escape for every other
+    // byte it does not write as it is.
+    let value = "correct horse/battery staple=42";
+    for echo in ["location", "body"] {
+        let provider = site(move |seen| {
+            let echoed = seen.header("x-passphrase").unwrap_or_default();
+            let written: String = url::form_urlencoded::byte_serialize(echoed.as_bytes()).collect();
+            let address = format!("/login?reason=unknown&passphrase={written}");
+            match echo {
+                "location" => Reply::with_body(302, &[("location", address.as_str())], b""),
+                _ => Reply::json(401, &json!({"login": address})),
+            }
+        })
+        .await;
+        let forward = forward_node(&provider).await;
+        let request = request_of("GET", "/v1/me", "", "header:x-passphrase", b"");
+        let meta = json!({
+            "envelope": envelope(&forward, &request, value, 1),
+            "headers": [["X-Passphrase", PLACEHOLDER]],
+        });
+        let outcome = forward.vault_send(meta, b"").await;
+        assert_eq!(provider.only().header("x-passphrase"), Some(value));
+        match (echo, outcome) {
+            ("body", Ok(sent)) => {
+                assert_eq!(sent.end["code"], "response_withheld");
+                assert_eq!(sent.body(), b"");
+            }
+            (_, outcome) => assert_eq!(code(&outcome), (502, "response_withheld".to_string())),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_value_outside_ascii_that_a_site_reads_as_iso_8859_1_is_not_handed_on() {
+    // A value with characters outside ASCII in a header. HTTP gives the bytes of a header
+    // value outside ASCII no character encoding, and the site of this test reads every byte
+    // as one character of ISO 8859-1, as many servers do. It sends that text back in a JSON
+    // body: in UTF-8, and with every character outside ASCII as an escape.
+    let value = "\u{be44}\u{bc00}-p\u{e4}ss-0123456789";
+    for escaped in [false, true] {
+        let provider = site(move |seen| {
+            let read: String = seen
+                .header("x-api-key")
+                .unwrap_or_default()
+                .bytes()
+                .map(char::from)
+                .collect();
+            let text: String = read
+                .chars()
+                .map(|character| match escaped && !character.is_ascii() {
+                    true => format!("\\u{:04x}", u32::from(character)),
+                    false => character.to_string(),
+                })
+                .collect();
+            let body = format!("{{\"unknown key\":\"{text}\"}}");
+            Reply::with_body(
+                401,
+                &[("content-type", "application/json")],
+                body.as_bytes(),
+            )
+        })
+        .await;
+        let forward = forward_node(&provider).await;
+        let request = request_of("GET", "/v1/me", "", "header:x-api-key", b"");
+        let meta = json!({
+            "envelope": envelope(&forward, &request, value, 1),
+            "headers": [["X-Api-Key", PLACEHOLDER]],
+        });
+        let sent = forward.vault_send(meta, b"").await.unwrap();
+        // The site received the bytes of the value, and no part of what it made of them is
+        // handed on.
+        assert_eq!(provider.only().header("x-api-key"), Some(value));
+        assert_eq!(sent.end["code"], "response_withheld", "escaped: {escaped}");
+        assert_eq!(sent.body(), b"", "escaped: {escaped}");
+    }
+}
+
+#[tokio::test]
+async fn a_value_a_site_sends_back_under_character_references_is_not_handed_on() {
+    // A value with the characters a writer of HTML or XML writes as character references.
+    // The site answers with a page that shows the value, written as one of several writers
+    // write it: they differ in the characters they escape and in how they write a number.
+    let value = "p&ss<w>or\"d'42/x=y+z";
+    let writers: [&[(char, &str)]; 5] = [
+        // The five characters, the apostrophe as a hexadecimal number.
+        &[
+            ('&', "&amp;"),
+            ('<', "&lt;"),
+            ('>', "&gt;"),
+            ('"', "&quot;"),
+            ('\'', "&#x27;"),
+        ],
+        // The apostrophe as a decimal number with a leading zero.
+        &[
+            ('&', "&amp;"),
+            ('<', "&lt;"),
+            ('>', "&gt;"),
+            ('"', "&quot;"),
+            ('\'', "&#039;"),
+        ],
+        // `/` and `=` as numbers as well.
+        &[
+            ('&', "&amp;"),
+            ('<', "&lt;"),
+            ('>', "&gt;"),
+            ('"', "&quot;"),
+            ('\'', "&#39;"),
+            ('/', "&#x2F;"),
+            ('=', "&#x3D;"),
+        ],
+        // The names of XML, and `+` as a number.
+        &[
+            ('&', "&amp;"),
+            ('<', "&lt;"),
+            ('>', "&gt;"),
+            ('"', "&quot;"),
+            ('\'', "&apos;"),
+            ('+', "&#43;"),
+        ],
+        // Numbers alone.
+        &[
+            ('&', "&#38;"),
+            ('<', "&#60;"),
+            ('>', "&#62;"),
+            ('"', "&#34;"),
+            ('\'', "&#39;"),
+        ],
+    ];
+    fn written(text: &str, writer: &[(char, &str)]) -> String {
+        text.chars()
+            .map(|character| {
+                let reference = writer.iter().find(|(escaped, _)| *escaped == character);
+                reference.map_or(character.to_string(), |(_, reference)| {
+                    reference.to_string()
+                })
+            })
+            .collect()
+    }
+    for writer in writers {
+        // The page as it is, and the page inside a page that shows its source: escaped twice.
+        for twice in [false, true] {
+            let provider = site(move |seen| {
+                let echoed = seen.header("x-passphrase").unwrap_or_default();
+                let mut shown = written(echoed, writer);
+                if twice {
+                    shown = written(&shown, writer);
+                }
+                let page = format!(
+                    "<html><body><p>No account has the passphrase \
+                     <input name=\"passphrase\" value=\"{shown}\"></p></body></html>"
+                );
+                Reply::with_body(
+                    401,
+                    &[("content-type", "text/html; charset=utf-8")],
+                    page.as_bytes(),
+                )
+            })
+            .await;
+            let forward = forward_node(&provider).await;
+            let request = request_of("GET", "/v1/me", "", "header:x-passphrase", b"");
+            let meta = json!({
+                "envelope": envelope(&forward, &request, value, 1),
+                "headers": [["X-Passphrase", PLACEHOLDER]],
+            });
+            let sent = forward.vault_send(meta, b"").await.unwrap();
+            // The site received the value, and no part of the page that shows it is handed
+            // on.
+            assert_eq!(provider.only().header("x-passphrase"), Some(value));
+            let case = format!("{} twice: {twice}", written(value, writer));
+            assert_eq!(sent.end["code"], "response_withheld", "{case}");
+            assert_eq!(sent.body(), b"", "{case}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_value_a_site_sends_back_in_a_header_that_is_not_utf8_is_not_handed_on() {
     // A value with characters outside ASCII. The site sends it back in a header, beside a
@@ -1307,6 +1665,38 @@ async fn a_value_a_site_sends_back_in_a_header_that_is_not_utf8_is_not_handed_on
             code(&outcome),
             (502, "response_withheld".to_string()),
             "{beside:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_value_a_site_sends_back_as_a_header_name_is_not_handed_on() {
+    // A value of characters a header name can hold, with upper case letters. The site names
+    // a header of its response after it. The HTTP client of the node hands a header name on
+    // in lower case, so the name the caller would receive is the value but for the case of
+    // its letters.
+    let value = "Sk-Live_4f9A.bCd~0123456789";
+    for front in ["", "X-Unknown-Key-"] {
+        let provider = site(move |seen| {
+            let echoed = seen.header("x-api-key").unwrap_or_default();
+            let reply = format!(
+                "HTTP/1.1 401 Unauthorized\r\n{front}{echoed}: 1\r\ncontent-length: 2\r\n\r\n{{}}"
+            );
+            Reply::Raw(reply.into_bytes())
+        })
+        .await;
+        let forward = forward_node(&provider).await;
+        let request = request_of("GET", "/v1/me", "", "header:x-api-key", b"");
+        let meta = json!({
+            "envelope": envelope(&forward, &request, value, 1),
+            "headers": [["X-Api-Key", PLACEHOLDER]],
+        });
+        let outcome = forward.vault_send(meta, b"").await;
+        assert_eq!(provider.only().header("x-api-key"), Some(value));
+        assert_eq!(
+            code(&outcome),
+            (502, "response_withheld".to_string()),
+            "{front:?}"
         );
     }
 }
@@ -1638,6 +2028,54 @@ async fn every_request_goes_over_a_connection_of_its_own() {
     assert_eq!(health["egress"]["idle_reuses"]["provider"], 0);
     assert_eq!(health["state"]["idle_connections"]["provider"], 0);
     assert_eq!(forward.node.egress.provider_idle.idle_total(), 0);
+}
+
+#[tokio::test]
+async fn a_value_reaches_no_server_without_a_certificate_for_the_host_of_its_envelope() {
+    // The bytes of a node are carried by the host program, which belongs to the operator
+    // domain: whoever carries them can lead the connection for the site of a value to
+    // another server. The node asks for the host of the envelope by its name and verifies
+    // the certificate of the server for that name, so such a server receives no request.
+    let request = request_of("GET", "/v1/me", "", "header:authorization", b"");
+    let headers = json!([["authorization", format!("Bearer {PLACEHOLDER}")]]);
+
+    // A server with a certificate for the host of the envelope from an authority the node
+    // does not trust.
+    let trusted = quiet_site().await;
+    let stranger = quiet_site().await;
+    let forward = forward_node(&trusted).await;
+    forward.platform.route(SITE, stranger.address);
+    let meta = json!({
+        "envelope": envelope(&forward, &request, VALUE, 1),
+        "headers": headers,
+    });
+    let outcome = forward.vault_send(meta, b"").await;
+    assert_eq!(code(&outcome), (502, "provider_unreachable".to_string()));
+    assert_eq!(stranger.seen().len(), 0);
+    assert_eq!(trusted.seen().len(), 0);
+
+    // A server with a certificate of the authority the node trusts, for another host than
+    // the host of the envelope.
+    let other = Provider::start(&["files.site.example"], |_| {
+        Reply::json(200, &json!({"ok": true}))
+    })
+    .await;
+    let forward = forward_node(&other).await;
+    forward.platform.route(SITE, other.address);
+    let meta = json!({
+        "envelope": envelope(&forward, &request, VALUE, 2),
+        "headers": headers,
+    });
+    let outcome = forward.vault_send(meta, b"").await;
+    assert_eq!(code(&outcome), (502, "provider_unreachable".to_string()));
+    assert_eq!(other.seen().len(), 0);
+    // The node asked for the host of the envelope, and for no other one.
+    assert!(forward
+        .platform
+        .connections()
+        .iter()
+        .all(|(host, port)| host == SITE && *port == 443));
+    assert!(!forward.platform.connections().is_empty());
 }
 
 #[tokio::test]

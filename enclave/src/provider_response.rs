@@ -5,15 +5,21 @@
 //! its caller back, and a token response holds its tokens at the places the definition names.
 //! This module is the defense for a response that breaks that assumption.
 //!
-//! [`Forms`] is the search. Bytes are read in six readings ([`Readings`]): as they were
+//! [`Forms`] is the search. Bytes are read in eight readings ([`Readings`]): as they were
 //! received, with their percent escapes decoded once, twice and three times
-//! ([`PERCENT_LAYERS`], for a value that was encoded more than once), and with their JSON
+//! ([`PERCENT_LAYERS`], for a value that was encoded more than once), with their JSON
 //! string escapes decoded once and twice ([`JSON_LAYERS`], for a JSON text inside a JSON
-//! string). Each reading is searched for these
+//! string), and with their character references of HTML and XML decoded once and twice
+//! ([`REFERENCE_LAYERS`], for a text that was escaped again). Each reading is searched for these
 //! forms of the credential: as it is, base64 or base64url in each of the three byte alignments
-//! and without padding, hexadecimal in lower or upper case. Decoding the escapes finds the
-//! credential under every percent-encoding of it and under every way a writer of JSON escapes
-//! it: encoders do not agree on the bytes they escape or on the case of the digits (one writes
+//! and without padding, hexadecimal in lower or upper case, for a credential with a space the
+//! credential with `+` in the place of every space, and for a credential with a character
+//! outside ASCII the text a reader of ISO 8859-1 makes of its bytes. Decoding the escapes
+//! finds the credential under every percent-encoding of it, under every way a writer of JSON
+//! escapes it and under the character references a writer of HTML or XML puts in the place
+//! of its characters: encoders do not agree on the bytes they escape, on the case of the
+//! digits or on the form of a reference (one writes `'` as `&#39;`, another as `&#x27;`, a
+//! third as `&apos;`; one writes
 //! `/` as `\/`, another `=` as `\u003d`), and all of their outputs decode to the same bytes. A
 //! form shorter than [`SHORTEST_FORM_BYTES`] is not searched for: it would match unrelated
 //! data. The tokens of the defined providers are longer than that in every form.
@@ -39,6 +45,7 @@
 use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use credential_enclave_protocol::secret::Secret;
+use credential_enclave_protocol::secret_use::searched_text;
 use memchr::memmem;
 use zeroize::Zeroize;
 
@@ -53,15 +60,42 @@ pub const PERCENT_LAYERS: usize = 3;
 /// How many times the check decodes the JSON string escapes of what it reads.
 pub const JSON_LAYERS: usize = 2;
 
+/// How many times the check decodes the character references of what it reads.
+pub const REFERENCE_LAYERS: usize = 2;
+
+/// The most digits of a numeric character reference the check decodes, in decimal and in
+/// hexadecimal: as many as the largest code point has (1114111, 10FFFF). A reference with
+/// more digits is left as it is. So a reference is at most ten bytes, and a reading knows
+/// within as many bytes whether a `&` begins one.
+const REFERENCE_DECIMAL_DIGITS: usize = 7;
+const REFERENCE_HEXADECIMAL_DIGITS: usize = 6;
+
+/// The most bytes a character reference the check decodes has for each byte it stands for:
+/// `&quot;` and `&#x27;` are six bytes for one. A numeric reference that is longer than that
+/// for the bytes of its character is left as it is: a reference of an ASCII character with
+/// more than three decimal or two hexadecimal digits (`&#0039;`). A reference of a character
+/// outside ASCII stands for two bytes or more and is at most ten bytes, so its digits are
+/// bounded by the two numbers above alone. With this bound a byte under character references
+/// takes no more received bytes than a byte under the escapes of a JSON string, and a stream
+/// holds back no more for the one than for the other ([`ESCAPED_BYTE_SPAN`]).
+const REFERENCE_BYTE_SPAN: usize = 6;
+
+const _: () = assert!(
+    "&#;".len() + REFERENCE_DECIMAL_DIGITS <= 2 * REFERENCE_BYTE_SPAN
+        && "&#x;".len() + REFERENCE_HEXADECIMAL_DIGITS <= 2 * REFERENCE_BYTE_SPAN
+);
+
 /// The most bytes one byte of a reading can take in what a provider sent. An escape of a JSON
 /// string is six bytes for one (`\u0041`), and each of the six can be such an escape of the
-/// layer above it, for [`JSON_LAYERS`] layers. A percent escape is three bytes for one, for
-/// [`PERCENT_LAYERS`] layers, which is less.
+/// layer above it, for [`JSON_LAYERS`] layers. A character reference is at most
+/// [`REFERENCE_BYTE_SPAN`] bytes for one, for [`REFERENCE_LAYERS`] layers, which is as much.
+/// A percent escape is three bytes for one, for [`PERCENT_LAYERS`] layers, which is less.
 pub const ESCAPED_BYTE_SPAN: usize = 36;
 
 const _: () = assert!(
     ESCAPED_BYTE_SPAN >= 6usize.pow(JSON_LAYERS as u32)
         && ESCAPED_BYTE_SPAN >= 3usize.pow(PERCENT_LAYERS as u32)
+        && ESCAPED_BYTE_SPAN >= REFERENCE_BYTE_SPAN.pow(REFERENCE_LAYERS as u32)
 );
 
 /// The most bytes one step of a search adds to the readings (the length of the longest form,
@@ -76,8 +110,13 @@ const STREAM_GATHER_BYTES: usize = 4 * 1024;
 
 /// More bytes than an escape that waits for the bytes that follow can have: the longest one
 /// is two escapes of a JSON string, the two halves of a character outside the basic plane,
-/// less one byte.
+/// less one byte. A character reference that waits is shorter: it lacks its `;`.
 const OPEN_ESCAPE_BYTES: usize = 16;
+
+const _: () = assert!(
+    OPEN_ESCAPE_BYTES > "&#".len() + REFERENCE_DECIMAL_DIGITS
+        && OPEN_ESCAPE_BYTES > "&#x".len() + REFERENCE_HEXADECIMAL_DIGITS
+);
 
 /// A provider response that passed the check: the status, the headers and the body, as the
 /// provider sent them.
@@ -124,8 +163,7 @@ pub fn check(
     mut body: Vec<u8>,
 ) -> Result<CheckedResponse, Withheld> {
     let forms = Forms::of(std::slice::from_ref(credential));
-    let search = forms.search();
-    if coded(&headers) || search.found_in(&body) || search.found_in_head(&headers) {
+    if coded(&headers) || forms.found_in(&body) || forms.found_in_head(&headers) {
         // What is withheld may hold the credential: the copy this check was given is
         // overwritten before it is dropped.
         body.zeroize();
@@ -145,12 +183,36 @@ pub struct Forms(Vec<Secret<Vec<u8>>>);
 
 impl Forms {
     /// The forms of every credential of `credentials`: as it is, base64 and base64url at each
-    /// byte alignment, hexadecimal in both cases. A form shorter than [`SHORTEST_FORM_BYTES`]
-    /// is left out.
+    /// byte alignment, hexadecimal in both cases, for a credential with a space the
+    /// credential with `+` in the place of every space, and for a credential with a character
+    /// outside ASCII the text a reader of ISO 8859-1 makes of its bytes. A form shorter than
+    /// [`SHORTEST_FORM_BYTES`] is left out.
+    ///
+    /// HTTP gives the bytes of a header value outside ASCII no character encoding, and a
+    /// server reads them in one of its own: many read every byte as one character of ISO
+    /// 8859-1, and some read the bytes of a parameter or of the credentials of HTTP Basic
+    /// that way. What such a server sends back of a credential with a character outside
+    /// ASCII is the text of that reading, in UTF-8 or under the escapes of a JSON string:
+    /// other bytes than the credential, from which the bytes of the credential are read
+    /// back. That text is a form of its own ([`read_as_latin1`]).
+    ///
+    /// A query and a form body (`application/x-www-form-urlencoded`) write a space as `+` and
+    /// every other byte they do not write as it is as a percent escape. The readings that
+    /// decode percent escapes leave a `+` as it is, because a `+` of another text is no
+    /// space. So a credential with a space that a site sends back in an address or in a form
+    /// body stands in those readings with `+` for its spaces: that text is a form of its own.
+    ///
+    /// A credential is searched for without the characters at its ends that a server strips
+    /// from a text (`searched_text` of the protocol crate: white space, control characters
+    /// and U+FEFF). A server reads the value of a header without the white space around it,
+    /// and often strips a parameter, so what it sends back of a credential that was stored
+    /// with a space, a line end or a byte order mark at one of its ends may be the credential
+    /// without it. Bytes that hold the credential with those characters hold it without them
+    /// as well, in each of these forms: the search finds both.
     pub fn of(credentials: &[Secret<String>]) -> Forms {
         let mut kept: Vec<Secret<Vec<u8>>> = Vec::new();
         for credential in credentials {
-            let token = credential.expose_secret().as_bytes();
+            let token = searched_text(credential.expose_secret()).as_bytes();
             let mut forms: Vec<Vec<u8>> = vec![token.to_vec()];
             for alignment in 0..3 {
                 forms.push(base64_inside(&STANDARD_NO_PAD, token, alignment));
@@ -158,6 +220,12 @@ impl Forms {
             }
             forms.push(hex(token, b"0123456789abcdef"));
             forms.push(hex(token, b"0123456789ABCDEF"));
+            if token.contains(&b' ') {
+                forms.push(plus_for_space(token));
+            }
+            if !token.is_ascii() {
+                forms.push(read_as_latin1(token));
+            }
             for form in forms {
                 let form = Secret::new(form);
                 let known = kept
@@ -189,18 +257,56 @@ impl Forms {
                 .map(|form| memmem::Finder::new(form.expose_secret().as_slice()))
                 .collect(),
             longest: self.longest(),
+            folds: false,
         }
     }
 
-    /// True when `received` hold one of the forms: as received, under percent escapes, or
-    /// under the escapes of a JSON string.
+    /// The forms with every ASCII letter in lower case: what a header name is searched for
+    /// ([`Forms::found_in_head`]). Two forms that differ in the case of their letters alone
+    /// are one form here.
+    fn folded(&self) -> Forms {
+        let mut kept: Vec<Secret<Vec<u8>>> = Vec::new();
+        for form in &self.0 {
+            let folded = Secret::new(form.expose_secret().to_ascii_lowercase());
+            let known = kept
+                .iter()
+                .any(|other| other.expose_secret() == folded.expose_secret());
+            if !known {
+                kept.push(folded);
+            }
+        }
+        Forms(kept)
+    }
+
+    /// True when `received` hold one of the forms: as received, under percent escapes, under
+    /// the escapes of a JSON string, or under character references.
     pub fn found_in(&self, received: &[u8]) -> bool {
         self.search().found_in(received)
     }
 
-    /// True when the name or the value of a response header holds one of the forms
-    /// ([`Forms::found_in`]): in the text the node hands on, or in the bytes the sender wrote
-    /// when that text is their reading as ISO 8859-1.
+    /// True when a header name or a header value of `headers` holds one of the forms.
+    ///
+    /// A header value is searched as it is handed on ([`Search::found_in_header`]). A header
+    /// name is searched without regard to the case of its ASCII letters: the HTTP client of
+    /// a node hands a header name on in lower case, whatever its sender wrote. A credential
+    /// with an upper case letter stands in such a name as other bytes than its own, and
+    /// whoever receives the name holds the credential but for the case of its letters. So
+    /// each reading of a name is compared in lower case with the forms in lower case.
+    fn found_in_head(&self, headers: &[(String, String)]) -> bool {
+        let values = self.search();
+        let folded = self.folded();
+        let names = Search {
+            folds: true,
+            ..folded.search()
+        };
+        headers
+            .iter()
+            .any(|(name, value)| names.found_in(name.as_bytes()) || values.found_in_header(value))
+    }
+
+    /// True when the value of a response header holds one of the forms ([`Forms::found_in`]):
+    /// in the text the node hands on, or in the bytes the sender wrote when that text is their
+    /// reading as ISO 8859-1.
     #[cfg(test)]
     pub fn found_in_header(&self, text: &str) -> bool {
         self.search().found_in_header(text)
@@ -212,14 +318,30 @@ impl Forms {
 struct Search<'a> {
     finders: Vec<memmem::Finder<'a>>,
     longest: usize,
+    /// True for the search of a header name ([`Forms::found_in_head`]): the forms are in
+    /// lower case, and a reading is compared in lower case.
+    folds: bool,
 }
 
 impl Search<'_> {
     /// True when `bytes` hold one of the forms as they are: one reading, no escape decoded.
+    /// The search of a header name reads the ASCII letters of `bytes` in lower case.
     fn in_reading(&self, bytes: &[u8]) -> bool {
-        self.finders
+        if !self.folds {
+            return self
+                .finders
+                .iter()
+                .any(|finder| finder.find(bytes).is_some());
+        }
+        // A reading of a header name may hold the credential: the copy in lower case is
+        // overwritten before it is dropped.
+        let mut folded = bytes.to_ascii_lowercase();
+        let found = self
+            .finders
             .iter()
-            .any(|finder| finder.find(bytes).is_some())
+            .any(|finder| finder.find(&folded).is_some());
+        folded.zeroize();
+        found
     }
 
     /// True when `received` hold one of the forms, in one of the readings of [`Readings`].
@@ -235,9 +357,9 @@ impl Search<'_> {
             || readings.add(self, &[], true)
     }
 
-    /// True when the name or the value of a response header holds one of the forms: in the
-    /// text the node hands on, or in the bytes the sender wrote when that text is their
-    /// reading as ISO 8859-1.
+    /// True when the value of a response header holds one of the forms: in the text the node
+    /// hands on, or in the bytes the sender wrote when that text is their reading as ISO
+    /// 8859-1.
     ///
     /// A header whose bytes are not UTF-8 is handed on with one character per byte
     /// (`crate::egress::Exchange`). A credential with a character outside ASCII stands in
@@ -261,13 +383,6 @@ impl Search<'_> {
             found
         })
     }
-
-    /// True when a header name or a header value of `headers` holds one of the forms.
-    fn found_in_head(&self, headers: &[(String, String)]) -> bool {
-        headers
-            .iter()
-            .any(|(name, value)| self.found_in_header(name) || self.found_in_header(value))
-    }
 }
 
 /// The most bytes one step of a search adds to the readings, for a longest form of `longest`
@@ -289,6 +404,16 @@ enum Escapes {
     /// `\u` with four hexadecimal digits, as the UTF-8 bytes of its character (two such
     /// escapes for a character outside the basic plane).
     Json,
+    /// The character references of HTML and XML: the five named ones both know (`&amp;`,
+    /// `&lt;`, `&gt;`, `&quot;`, `&apos;`) as the character they name, and a numeric one, in
+    /// decimal (`&#39;`) or in hexadecimal (`&#x27;`, `&#X27;`), as the UTF-8 bytes of the
+    /// character with that code point. A reference ends with `;`. A numeric reference has at
+    /// most [`REFERENCE_DECIMAL_DIGITS`] or [`REFERENCE_HEXADECIMAL_DIGITS`] digits, names a
+    /// character (no half of a surrogate pair, no number above U+10FFFF), and is at most
+    /// [`REFERENCE_BYTE_SPAN`] bytes for each byte of that character. Every other text that
+    /// begins with `&` stands for itself, the other named references of HTML (`&nbsp;`)
+    /// among them.
+    Reference,
 }
 
 impl Escapes {
@@ -297,6 +422,7 @@ impl Escapes {
         match self {
             Escapes::Percent => PERCENT_LAYERS,
             Escapes::Json => JSON_LAYERS,
+            Escapes::Reference => REFERENCE_LAYERS,
         }
     }
 
@@ -305,6 +431,7 @@ impl Escapes {
         match self {
             Escapes::Percent => b'%',
             Escapes::Json => b'\\',
+            Escapes::Reference => b'&',
         }
     }
 
@@ -312,6 +439,15 @@ impl Escapes {
     /// end that the bytes after them may complete: the reading with the escapes decoded then
     /// differs from `bytes`, or may come to differ.
     fn begin_in(self, bytes: &[u8], end: bool) -> bool {
+        // A character reference ends with `;`. Bytes without one hold no reference: they can
+        // begin one, in their last bytes, fewer than an escape that waits can have. So the
+        // many `&` of a text without a `;` (the parameters of an address) are not looked at.
+        let bytes = match self {
+            Escapes::Reference if memchr::memchr(b';', bytes).is_none() => bytes
+                .get(bytes.len().saturating_sub(OPEN_ESCAPE_BYTES)..)
+                .unwrap_or(bytes),
+            _ => bytes,
+        };
         memchr::memchr_iter(self.first_byte(), bytes).any(|index| {
             bytes
                 .get(index..)
@@ -325,6 +461,7 @@ impl Escapes {
         match self {
             Escapes::Percent => percent_step(rest, end),
             Escapes::Json => json_step(rest, end),
+            Escapes::Reference => reference_step(rest, end),
         }
     }
 }
@@ -445,6 +582,90 @@ fn json_step(rest: &[u8], end: bool) -> Step {
             Unit::Value(unit) => character(unit, 6),
         },
         Some(_) => Step::Literal,
+    }
+}
+
+/// The named character references the check decodes, and the byte each stands for: the five
+/// XML defines, which HTML has as well.
+const NAMED_REFERENCES: [(&[u8], u8); 5] = [
+    (b"&amp;", b'&'),
+    (b"&lt;", b'<'),
+    (b"&gt;", b'>'),
+    (b"&quot;", b'"'),
+    (b"&apos;", b'\''),
+];
+
+fn reference_step(rest: &[u8], end: bool) -> Step {
+    if rest.first() != Some(&b'&') {
+        return Step::Literal;
+    }
+    // Bytes that begin a reference and do not end it wait for the bytes that follow, when
+    // some may follow.
+    let open = match end {
+        true => Step::Literal,
+        false => Step::Open,
+    };
+    match rest.get(1) {
+        None => return open,
+        Some(b'#') => return numeric_reference_step(rest, open),
+        // The second byte of a name. Most texts that begin with `&` and are no reference
+        // (the parameters of a query) end here.
+        Some(b'a' | b'l' | b'g' | b'q') => {}
+        Some(_) => return Step::Literal,
+    }
+    for (name, byte) in NAMED_REFERENCES {
+        if rest.starts_with(name) {
+            return one_byte(name.len(), byte);
+        }
+        // All of `rest` is the beginning of the name.
+        if name.starts_with(rest) {
+            return open;
+        }
+    }
+    Step::Literal
+}
+
+/// What stands at the beginning of `rest`, which begins with `&#`: a numeric character
+/// reference, or bytes that stand for themselves. `open` is what `rest` is when all of it is
+/// the beginning of a reference.
+fn numeric_reference_step(rest: &[u8], open: Step) -> Step {
+    let (radix, front, most) = match rest.get(2) {
+        None => return open,
+        Some(b'x' | b'X') => (16, "&#x".len(), REFERENCE_HEXADECIMAL_DIGITS),
+        Some(_) => (10, "&#".len(), REFERENCE_DECIMAL_DIGITS),
+    };
+    // The number has no more digits than the largest code point: it stays far below the
+    // largest number of its type.
+    let mut code: u32 = 0;
+    let mut digits = 0;
+    loop {
+        let digit = match rest.get(front + digits) {
+            None => return open,
+            Some(b';') if digits > 0 => break,
+            Some(byte) => char::from(*byte).to_digit(radix),
+        };
+        match digit {
+            Some(digit) if digits < most => {
+                code = code * radix + digit;
+                digits += 1;
+            }
+            _ => return Step::Literal,
+        }
+    }
+    let consumed = front + digits + ";".len();
+    // Half of a surrogate pair and a number above U+10FFFF name no character.
+    let Some(character) = char::from_u32(code) else {
+        return Step::Literal;
+    };
+    let mut decoded = [0u8; 4];
+    let length = character.encode_utf8(&mut decoded).len();
+    if consumed > REFERENCE_BYTE_SPAN * length {
+        return Step::Literal;
+    }
+    Step::Decoded {
+        consumed,
+        decoded,
+        length,
     }
 }
 
@@ -633,12 +854,16 @@ struct Readings {
 }
 
 impl Readings {
+    /// How many readings a search has: the bytes as received, and the layers of the three
+    /// kinds of escapes.
+    const COUNT: usize = 1 + PERCENT_LAYERS + JSON_LAYERS + REFERENCE_LAYERS;
+
     /// The readings of a search whose longest form has `longest` bytes.
     fn new(longest: usize) -> Readings {
         let mut received = Reading::of(None);
         received.begin(&[], longest);
         let mut readings = vec![received];
-        for escapes in [Escapes::Percent, Escapes::Json] {
+        for escapes in [Escapes::Percent, Escapes::Json, Escapes::Reference] {
             let mut from = 0;
             for _ in 0..escapes.layers() {
                 readings.push(Reading::of(Some((from, escapes))));
@@ -669,7 +894,12 @@ impl Readings {
             let (Some(reading), Some(added)) = (at.first_mut(), added_at.first_mut()) else {
                 return true;
             };
-            added.zeroize();
+            // What the step before added to the reading may hold the credential: it is
+            // overwritten. A buffer that holds no byte was overwritten when it was emptied,
+            // all of its room, and nothing was written to it since.
+            if !added.is_empty() {
+                added.zeroize();
+            }
             let Some((from, escapes)) = reading.origin else {
                 self.same_as.push(index);
                 continue;
@@ -683,7 +913,15 @@ impl Readings {
                     .unwrap_or_default(),
             };
             if !reading.begun {
-                if !escapes.begin_in(source, end) {
+                // A layer above the first one of its kind reads the bytes the layer below it
+                // reads, while that layer is not searched for itself: it has just found that
+                // these bytes begin no escape of their kind.
+                let asked = source_of != from
+                    && before
+                        .get(from)
+                        .and_then(|below| below.origin)
+                        .is_some_and(|(_, below)| below == escapes);
+                if asked || !escapes.begin_in(source, end) {
                     self.same_as.push(source_of);
                     continue;
                 }
@@ -779,7 +1017,7 @@ impl StreamCheck {
         headers: &mut Vec<(String, String)>,
     ) -> Result<StreamCheck, Withheld> {
         let forms = Forms::of(std::slice::from_ref(credential));
-        if coded(headers) || forms.search().found_in_head(headers) {
+        if coded(headers) || forms.found_in_head(headers) {
             overwrite(headers);
             headers.clear();
             return Err(Withheld);
@@ -828,18 +1066,31 @@ impl StreamCheck {
     }
 
     /// A bound of the memory the check of the response of a request holds while the body
-    /// arrives, for a credential of `credential_bytes` bytes: the buffer of the received
-    /// bytes, and for every reading its last bytes and what one step of a search adds to it.
-    /// The longest form of a credential is its hexadecimal form, two bytes for one.
+    /// arrives, for a credential of `credential_bytes` bytes: the forms of the credential,
+    /// the buffer of the received bytes, and for every reading its last bytes, the escape
+    /// that waits, and what one step of a search adds to it. The longest form of a credential
+    /// is its hexadecimal form, two bytes for one.
     pub const fn memory_bound(credential_bytes: usize) -> usize {
         let longest = credential_bytes.saturating_mul(2);
-        // The bytes as received, and the layers of the two kinds of escapes.
-        let readings = 1 + PERCENT_LAYERS + JSON_LAYERS;
+        // The forms: the credential as it is, six base64 texts (four characters for three
+        // bytes), two hexadecimal texts (two for one), the text with `+` for its spaces, and
+        // the text a reader of ISO 8859-1 makes of it (at most two bytes for one). That is
+        // sixteen bytes for each byte of the credential, and the few characters the base64
+        // texts have more for the bytes in front of the credential.
+        let forms = credential_bytes.saturating_mul(16).saturating_add(64);
+        // What one step adds to a reading, and the escape that waits, are written into
+        // buffers that grow by doubling: the room of each is at most twice what it holds.
+        let step = slice_of(longest)
+            .saturating_add(OPEN_ESCAPE_BYTES)
+            .saturating_mul(2);
+        let waits = OPEN_ESCAPE_BYTES.saturating_mul(4);
         let reading = longest
             .saturating_mul(2)
-            .saturating_add(slice_of(longest))
-            .saturating_add(OPEN_ESCAPE_BYTES);
-        Self::buffer_of(longest).saturating_add(reading.saturating_mul(readings))
+            .saturating_add(step)
+            .saturating_add(waits);
+        Self::buffer_of(longest)
+            .saturating_add(forms)
+            .saturating_add(reading.saturating_mul(Readings::COUNT))
     }
 
     /// Takes the next bytes of the body and returns the bytes that are handed on now: none
@@ -947,6 +1198,33 @@ impl Drop for StreamCheck {
     fn drop(&mut self) {
         self.held.zeroize();
     }
+}
+
+/// `bytes` with `+` in the place of every space: how a query and a form body write a text,
+/// but for the bytes they write as percent escapes.
+fn plus_for_space(bytes: &[u8]) -> Vec<u8> {
+    bytes
+        .iter()
+        .map(|byte| match byte {
+            b' ' => b'+',
+            other => *other,
+        })
+        .collect()
+}
+
+/// The UTF-8 text a reader of ISO 8859-1 makes of `bytes`: one character for each byte, so a
+/// byte outside ASCII becomes the two bytes of a character from U+0080 to U+00FF.
+fn read_as_latin1(bytes: &[u8]) -> Vec<u8> {
+    // The longest text: no buffer that holds a part of the credential is left behind by a
+    // growth.
+    let mut text = Vec::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        match byte.is_ascii() {
+            true => text.push(*byte),
+            false => text.extend_from_slice(&[0xc0 | (byte >> 6), 0x80 | (byte & 0x3f)]),
+        }
+    }
+    text
 }
 
 fn hex(bytes: &[u8], digits: &[u8; 16]) -> Vec<u8> {
@@ -1122,11 +1400,11 @@ mod tests {
             self.bytes(length)
         }
 
-        /// Bytes that hold `%`, backslashes, hexadecimal digits and other characters, so
-        /// that parts of them read as escapes.
+        /// Bytes that hold `%`, backslashes, `&`, `#`, `;`, hexadecimal digits and other
+        /// characters, so that parts of them read as escapes.
         fn bytes(&mut self, length: usize) -> Vec<u8> {
             const ALPHABET: &[u8] =
-                b"%%25 2541abcdefABCDEF0123456789{}\":,xyzXYZ_-./=+\\\\uuunrt00d";
+                b"%%25 2541abcdefABCDEF0123456789{}\":,xyzXYZ_-./=+\\\\uuunrt00d&&##;;";
             (0..length)
                 .map(|_| ALPHABET[self.below(ALPHABET.len())])
                 .collect()
@@ -1148,6 +1426,51 @@ mod tests {
             }
         }
         out
+    }
+
+    /// `bytes` (ASCII) under one layer of character references. `&`, `<`, `>`, `"` and `'`
+    /// are written as a reference, as a writer of HTML or XML has to, by name or by number,
+    /// and every other byte as a numeric reference or not as `noise` says. With `every`, each
+    /// byte is a numeric reference of six bytes: the longest way to write it.
+    fn referenced(bytes: &[u8], noise: &mut Noise, every: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        for byte in bytes {
+            let name = match byte {
+                b'&' => Some("&amp;"),
+                b'<' => Some("&lt;"),
+                b'>' => Some("&gt;"),
+                b'"' => Some("&quot;"),
+                b'\'' => Some("&apos;"),
+                _ => None,
+            };
+            let number = match (every, noise.below(4)) {
+                // Six bytes: three decimal digits, or two hexadecimal ones.
+                (true, 0 | 1) => format!("&#{byte:03};"),
+                (true, 2) => format!("&#x{byte:02x};"),
+                (true, _) => format!("&#X{byte:02X};"),
+                (false, 0) => format!("&#{byte};"),
+                (false, 1) => format!("&#x{byte:x};"),
+                (false, 2) => format!("&#x{byte:02X};"),
+                (false, _) => format!("&#{byte:03};"),
+            };
+            match (name, every) {
+                (Some(name), false) if noise.below(2) == 0 => {
+                    out.extend_from_slice(name.as_bytes())
+                }
+                (None, false) if noise.below(3) != 0 => out.push(*byte),
+                _ => out.extend_from_slice(number.as_bytes()),
+            }
+        }
+        out
+    }
+
+    /// `bytes` (ASCII) under one layer of the escapes of one kind.
+    fn written(escapes: Escapes, bytes: &[u8], noise: &mut Noise, every: bool) -> Vec<u8> {
+        match escapes {
+            Escapes::Percent => escaped(bytes, noise, every),
+            Escapes::Json => json_escaped(bytes, noise, every),
+            Escapes::Reference => referenced(bytes, noise, every),
+        }
     }
 
     /// Hands `body` to a stream check in parts whose lengths `noise` chooses, and returns the
@@ -1208,25 +1531,20 @@ mod tests {
         for round in 0..480 {
             let form = &forms[round % forms.len()];
             // The form as it is, under one, two or three layers of percent escapes, or under
-            // one or two layers of the escapes of a JSON string. Some rounds escape every
-            // byte in each of their layers: the longest a form can be written.
-            let json = round % 3 == 0;
-            let layers = match json {
-                true => round % 4 % (JSON_LAYERS + 1),
-                false => round % 4,
-            };
+            // one or two layers of the escapes of a JSON string or of character references.
+            // Some rounds escape every byte in each of their layers: the longest a form can
+            // be written.
+            let escapes = [Escapes::Json, Escapes::Percent, Escapes::Reference][round % 3];
+            let layers = round % 4 % (escapes.layers() + 1);
             let every = round % 8 >= 6;
             let mut reflected = form.clone();
             for _ in 0..layers {
-                reflected = match json {
-                    true => json_escaped(&reflected, &mut noise, every),
-                    false => escaped(&reflected, &mut noise, every),
-                };
+                reflected = written(escapes, &reflected, &mut noise, every);
             }
             if every {
-                let span = match json {
-                    true => 6usize.pow(layers as u32),
-                    false => 3usize.pow(layers as u32),
+                let span = match escapes {
+                    Escapes::Percent => 3usize.pow(layers as u32),
+                    Escapes::Json | Escapes::Reference => 6usize.pow(layers as u32),
                 };
                 assert_eq!(reflected.len(), form.len() * span);
                 assert!(span <= ESCAPED_BYTE_SPAN);
@@ -1271,11 +1589,9 @@ mod tests {
                 }
                 _ => hex(token, b"0123456789abcdef"),
             };
+            let escapes = [Escapes::Json, Escapes::Percent, Escapes::Reference][round % 5 % 3];
             for _ in 0..(round % 3) {
-                piece = match round % 5 < 2 {
-                    true => json_escaped(&piece, &mut noise, false),
-                    false => escaped(&piece, &mut noise, false),
-                };
+                piece = written(escapes, &piece, &mut noise, false);
             }
             body.extend_from_slice(&piece);
             body.extend(noise.some(150_000));
@@ -1348,6 +1664,134 @@ mod tests {
         let encoded = STANDARD_NO_PAD.encode(format!("Bearer {TOKEN}"));
         assert_eq!(outcome(&[("x-debug", &encoded)], b"{}"), Err(Withheld));
         assert_eq!(outcome(&[("x-request-id", "abc")], b"{}"), Ok(()));
+    }
+
+    #[test]
+    fn a_credential_in_a_header_name_is_found_whatever_the_case_of_its_letters() {
+        // The HTTP client of a node hands a header name on in lower case: a name a site wrote
+        // with the credential in it reaches the search with the letters of the credential in
+        // lower case. A credential of characters a header name can hold.
+        let token = "Sk-Live_4f9A.bCd~0123456789";
+        let outcome = |name: &str, value: &str| {
+            let headers = vec![(name.to_string(), value.to_string())];
+            check(&Secret::new(token.to_string()), 200, headers, Vec::new()).map(|_| ())
+        };
+        let lower = token.to_ascii_lowercase();
+        assert_eq!(outcome(&lower, "1"), Err(Withheld));
+        assert_eq!(outcome(&format!("x-echo-{lower}"), "1"), Err(Withheld));
+        // The forms of the credential, as a name in lower case holds them.
+        let hexadecimal = hex(token.as_bytes(), b"0123456789ABCDEF").to_ascii_lowercase();
+        let hexadecimal = String::from_utf8(hexadecimal).unwrap();
+        assert_eq!(outcome(&format!("x-{hexadecimal}"), "1"), Err(Withheld));
+        let encoded = URL_SAFE_NO_PAD
+            .encode(format!("ab{token}"))
+            .to_ascii_lowercase();
+        assert_eq!(outcome(&format!("x-{encoded}"), "1"), Err(Withheld));
+        // A letter of the credential that stands in the name as a percent escape keeps its
+        // case, and the letters around it have lost theirs.
+        let escaped = lower.replacen('s', "%53", 1).replacen("a.b", "%41.b", 1);
+        assert_eq!(outcome(&format!("x-{escaped}"), "1"), Err(Withheld));
+        // A header value is handed on as it was received, and is searched as it is: a text
+        // that differs from the credential in the case of a letter is another text.
+        assert_eq!(outcome("x-echo", token), Err(Withheld));
+        assert_eq!(outcome("x-echo", &lower), Ok(()));
+        assert_eq!(outcome("x-echo-sk-live", "1"), Ok(()));
+    }
+
+    #[test]
+    fn a_credential_is_searched_for_without_what_a_server_strips_at_its_ends() {
+        // A credential that was stored with white space, a byte order mark or a control
+        // character at its ends, and bytes that hold it without them: as it is, and in its
+        // base64 and hexadecimal forms.
+        for stored in [
+            format!("{TOKEN}\n"),
+            format!("  {TOKEN}\t"),
+            format!("\u{feff}{TOKEN}"),
+            format!("{TOKEN}\u{1f}"),
+            format!("\u{1}\u{feff} {TOKEN}\u{7f}\u{3000}"),
+        ] {
+            let forms = Forms::of(&[Secret::new(stored.clone())]);
+            let inside = format!("{{\"unknown key\":\"{TOKEN}\"}}");
+            assert!(forms.found_in(inside.as_bytes()), "{stored:?}");
+            assert!(forms.found_in(STANDARD_NO_PAD.encode(&inside).as_bytes()));
+            assert!(forms.found_in(&hex(inside.as_bytes(), b"0123456789abcdef")));
+            // The credential as it was stored holds the text that is searched for.
+            assert!(forms.found_in(stored.as_bytes()), "{stored:?}");
+            assert!(forms.found_in(STANDARD_NO_PAD.encode(&stored).as_bytes()));
+            // What stands inside a credential is part of it.
+            let parted = TOKEN.replacen('/', "/ ", 1);
+            assert!(!forms.found_in(parted.as_bytes()), "{stored:?}");
+        }
+    }
+
+    #[test]
+    fn a_credential_with_a_space_is_found_with_a_plus_for_each_space() {
+        // A query and a form body write a space as `+`, and every other byte they do not
+        // write as it is as a percent escape.
+        let phrase = "correct horse/battery staple=42";
+        let forms = Forms::of(&[Secret::new(phrase.to_string())]);
+        for sent_back in [
+            // Every space as `+`, the other bytes as they are.
+            "correct+horse/battery+staple=42",
+            // As a writer of a form body writes it.
+            "/next?echo=correct+horse%2Fbattery+staple%3D42&page=2",
+            // That text encoded once more, and again.
+            "/login?next=%2Fnext%3Fecho%3Dcorrect%2Bhorse%252Fbattery%2Bstaple%253D42",
+            "/a?b=%2Flogin%3Fnext%3D%252Fnext%253Fecho%253Dcorrect%252Bhorse%25252Fbattery%252Bstaple%25253D42",
+            // Inside a JSON string, with the escapes of a writer of JSON.
+            "{\"next\":\"\\/next?echo=correct+horse\\/battery+staple\\u003d42\"}",
+            // A space as a percent escape, and as it is.
+            "/next?echo=correct%20horse%2Fbattery%20staple%3D42",
+            "echo: correct horse/battery staple=42",
+        ] {
+            assert!(forms.found_in(sent_back.as_bytes()), "{sent_back}");
+        }
+        // A text with `+` for one space and the other space as it is holds neither form.
+        assert!(!forms.found_in(b"correct+horse/battery staple=42"));
+        // A credential without a space has no such form: its `+` is no space.
+        let forms = Forms::of(&[Secret::new("correct+horse/battery+staple=42".to_string())]);
+        assert!(!forms.found_in(phrase.as_bytes()));
+    }
+
+    #[test]
+    fn a_credential_outside_ascii_is_found_as_a_reader_of_iso_8859_1_sends_it_back() {
+        // A credential with characters outside ASCII, of two and of three bytes each, and
+        // what a server makes of its bytes when it reads every byte as one character of ISO
+        // 8859-1.
+        let wide = "p\u{e4}ssw\u{f6}rd-\u{d0a4}-12345";
+        let forms = Forms::of(&[Secret::new(wide.to_string())]);
+        let misread: String = wide.bytes().map(char::from).collect();
+        assert_ne!(misread, wide);
+        // That text in UTF-8, as a writer of JSON that escapes no character writes it.
+        let written = format!("{{\"unknown key\":\"{misread}\"}}");
+        assert!(forms.found_in(written.as_bytes()));
+        // With every character outside ASCII as an escape of a JSON string.
+        let escaped: String = misread
+            .chars()
+            .map(|character| match character.is_ascii() {
+                true => character.to_string(),
+                false => format!("\\u{:04x}", u32::from(character)),
+            })
+            .collect();
+        assert!(escaped.is_ascii());
+        assert!(forms.found_in(format!("{{\"unknown key\":\"{escaped}\"}}").as_bytes()));
+        // Under percent escapes, as an address holds it.
+        let in_an_address: String = misread
+            .bytes()
+            .map(|byte| match byte.is_ascii_alphanumeric() {
+                true => char::from(byte).to_string(),
+                false => format!("%{byte:02X}"),
+            })
+            .collect();
+        assert!(forms.found_in(format!("/login?unknown={in_an_address}").as_bytes()));
+        // The credential in UTF-8 is found as it is.
+        assert!(forms.found_in(format!("{{\"unknown key\":\"{wide}\"}}").as_bytes()));
+        // The form is no longer than the hexadecimal one, by which a stream holds bytes back.
+        assert_eq!(forms.longest(), 2 * wide.len());
+        // A credential of ASCII is the same text in both readings: it has no form of its own
+        // for the second one.
+        assert_eq!(read_as_latin1(b"p-ssw-rd-12345"), b"p-ssw-rd-12345");
+        assert_eq!(read_as_latin1(wide.as_bytes()), misread.as_bytes());
     }
 
     #[test]
@@ -1536,27 +1980,258 @@ mod tests {
     }
 
     #[test]
+    fn character_references_are_decoded_once_per_layer() {
+        let reference = |text: &str| decoded(Escapes::Reference, text.as_bytes());
+        // A text without `&`, and a `&` that begins no reference the check decodes.
+        assert_eq!(reference("plain text, 100% and %26"), None);
+        for stands_for_itself in [
+            "a & b",
+            "a=1&b=2&c",
+            "&&&",
+            "&;",
+            // Another name of HTML, a name in another case, a name without its `;`.
+            "&nbsp;",
+            "&AMP;",
+            "&Lt;",
+            "&amp",
+            "&ampx;",
+            "&quot",
+            // A number without a digit, with another character in it, without its `;`.
+            "&#;",
+            "&#x;",
+            "&#X;",
+            "&# 39;",
+            "&#3 9;",
+            "&#-39;",
+            "&#+39;",
+            "&#x2g;",
+            "&#39",
+            "&#x27",
+            "&#39:",
+            // More digits than the largest code point has.
+            "&#00000233;",
+            "&#x00000e9;",
+            // An ASCII character in more than six bytes.
+            "&#0039;",
+            "&#x027;",
+            "&#0000039;",
+            "&#x000027;",
+            // Half of a surrogate pair, and a number above U+10FFFF.
+            "&#xD800;",
+            "&#xdfff;",
+            "&#55296;",
+            "&#x110000;",
+            "&#1114112;",
+            "&#9999999;",
+            "&#xFFFFFF;",
+        ] {
+            assert_eq!(reference(stands_for_itself), None, "{stands_for_itself}");
+        }
+        // The five names.
+        assert_eq!(
+            reference("&amp;&lt;&gt;&quot;&apos;"),
+            Some(b"&<>\"'".to_vec())
+        );
+        // A number in decimal, and in hexadecimal with its digits and its `x` in either case.
+        // An ASCII character with as many leading zeros as six bytes hold.
+        assert_eq!(
+            reference("&#39;&#039;&#x27;&#X27;&#x2f;&#x2F;&#61;&#43;&#0;&#x00;&#127;&#x7f;"),
+            Some(b"''''//=+\0\0\x7f\x7f".to_vec())
+        );
+        // A character outside ASCII is its UTF-8 bytes, with leading zeros up to the most
+        // digits a number has.
+        let wide = "&#233;&#xe9;&#x00E9;&#0000233;&#x0000E9;&#128;&#54620;&#xD55C;&#x00d55c;\
+                    &#128512;&#x1F600;&#x01f600;&#1114111;&#x10FFFF;";
+        let expected = "\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{80}\u{d55c}\u{d55c}\u{d55c}\
+                        \u{1f600}\u{1f600}\u{1f600}\u{10ffff}\u{10ffff}";
+        assert_eq!(reference(wide), Some(expected.as_bytes().to_vec()));
+        // A reference between other bytes and behind a `&` that begins none.
+        assert_eq!(reference("a&amp;b&c"), Some(b"a&b&c".to_vec()));
+        assert_eq!(reference("&&amp;&"), Some(b"&&&".to_vec()));
+        // A text that was escaped more than once: one layer at a time.
+        let mut layers = b"&amp;amp;lt; &amp;#38;#39; &#x26;#x26;#x27; &amp;amp;amp;".to_vec();
+        assert!(decode_in_place(Escapes::Reference, &mut layers));
+        assert_eq!(layers, b"&amp;lt; &#38;#39; &#x26;#x27; &amp;amp;");
+        assert!(decode_in_place(Escapes::Reference, &mut layers));
+        assert_eq!(layers, b"&lt; &#39; &#x27; &amp;");
+        assert!(decode_in_place(Escapes::Reference, &mut layers));
+        assert_eq!(layers, b"< ' ' &");
+        assert!(!decode_in_place(Escapes::Reference, &mut layers));
+        // A reference that ends where the bytes end, and bytes that end inside of one.
+        assert_eq!(reference("x&#39;"), Some(b"x'".to_vec()));
+        assert_eq!(reference("x&#3"), None);
+        assert_eq!(reference("x&am"), None);
+        assert_eq!(REFERENCE_LAYERS, 2);
+    }
+
+    #[test]
+    fn a_credential_under_character_references_is_withheld_in_every_form() {
+        let embed = |form: &str| format!("<p class=\"echo\">prefix {form} suffix</p>").into_bytes();
+        // A token with `/`, `+` and `=`. Writers of HTML differ in the characters they write
+        // as a reference and in how they write the number: in decimal or in hexadecimal, with
+        // a leading zero or without, the three characters or every byte.
+        let every_byte = |hexadecimal: bool| -> String {
+            TOKEN
+                .bytes()
+                .map(|byte| match hexadecimal {
+                    true => format!("&#x{byte:X};"),
+                    false => format!("&#{byte};"),
+                })
+                .collect()
+        };
+        for written in [
+            "ya29.a0Af&#x2F;Token+With&#x3D;Symbols_1234567890".to_string(),
+            "ya29.a0Af&#x2f;Token&#x2b;With&#x3d;Symbols_1234567890".to_string(),
+            "ya29.a0Af&#47;Token&#43;With&#61;Symbols_1234567890".to_string(),
+            "ya29.a0Af&#047;Token&#043;With&#061;Symbols_1234567890".to_string(),
+            every_byte(true),
+            every_byte(false),
+            // Escaped twice, as a page that shows the source of a page.
+            "ya29.a0Af&amp;#x2F;Token+With&amp;#x3D;Symbols_1234567890".to_string(),
+            "ya29.a0Af&#38;#47;Token&#38;#43;With&#38;#61;Symbols_1234567890".to_string(),
+        ] {
+            assert_eq!(outcome(&[], &embed(&written)), Err(Withheld), "{written}");
+            assert_eq!(
+                outcome(&[("x-echo", &written)], b""),
+                Err(Withheld),
+                "{written}"
+            );
+        }
+        // Escaped three times: no reading decodes a third layer.
+        let thrice = "ya29.a0Af&amp;amp;#x2F;Token+With&amp;amp;#x3D;Symbols_1234567890";
+        assert_eq!(outcome(&[], &embed(thrice)), Ok(()));
+        // The base64 text of a longer value that holds the token, with its `+`, `/` and `=`
+        // as references.
+        let padded = base64::engine::general_purpose::STANDARD.encode(format!("x{TOKEN}a>cd?e"));
+        assert!(padded.contains('/') && padded.contains('+') && padded.ends_with('='));
+        let escaped = padded
+            .replace('+', "&#43;")
+            .replace('/', "&#x2F;")
+            .replace('=', "&#x3D;");
+        assert_eq!(outcome(&[], &embed(&escaped)), Err(Withheld));
+
+        // A credential with the five characters every writer of HTML or XML escapes.
+        let password = Secret::new("p&ss<w>or\"d'42-xyz".to_string());
+        let outcome = |body: &str| check(&password, 200, Vec::new(), embed(body)).map(|_| ());
+        for written in [
+            "p&amp;ss&lt;w&gt;or&quot;d&#39;42-xyz",
+            "p&amp;ss&lt;w&gt;or&quot;d&#x27;42-xyz",
+            "p&amp;ss&lt;w&gt;or&quot;d&#039;42-xyz",
+            "p&amp;ss&lt;w&gt;or&quot;d&apos;42-xyz",
+            "p&#38;ss&#60;w&#62;or&#34;d&#39;42-xyz",
+            "p&#x26;ss&#x3C;w&#x3e;or&#X22;d&#x27;42-xyz",
+            // A writer that leaves a character as it is where its place allows it.
+            "p&amp;ss&lt;w>or\"d'42-xyz",
+            // Escaped twice.
+            "p&amp;amp;ss&amp;lt;w&amp;gt;or&amp;quot;d&amp;#39;42-xyz",
+            "p&#38;amp;ss&#38;lt;w&#38;gt;or&#38;quot;d&#38;apos;42-xyz",
+        ] {
+            assert_eq!(outcome(written), Err(Withheld), "{written}");
+        }
+        // The credential with one character as a reference the check does not decode, and a
+        // body with references and without the credential, pass.
+        assert_eq!(outcome("p&amp;ss&lt;w&gt;or&quot;d&#0039;42-xyz"), Ok(()));
+        assert_eq!(outcome("p&AMP;ss&lt;w&gt;or&quot;d&#39;42-xyz"), Ok(()));
+        assert_eq!(
+            outcome("Tom &amp; Jerry &lt;b&gt; &#39;x&#39;&nbsp;&copy; a=1&b=2"),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn a_credential_in_a_header_that_is_not_utf8_is_found_in_the_bytes_of_the_header() {
         // A credential with characters outside ASCII, in a header whose bytes are not UTF-8.
         // The node hands such a header on with one character for each byte, and the
         // credential stands in that text as other characters than its own.
-        let credential = Secret::new("p\u{e4}ss-\u{d55c}\u{ae00}-w\u{f6}rd".to_string());
-        let mut sent = b"echo=".to_vec();
-        sent.extend_from_slice(credential.expose_secret().as_bytes());
-        sent.push(0xff);
-        assert!(std::str::from_utf8(&sent).is_err());
-        let handed_on: String = sent.iter().map(|byte| char::from(*byte)).collect();
-        assert!(!handed_on.contains(credential.expose_secret().as_str()));
+        let credential = Secret::new("p\u{e4}ss \u{d55c}\u{ae00} w\u{f6}rd".to_string());
         let forms = Forms::of(std::slice::from_ref(&credential));
-        assert!(!forms.found_in(handed_on.as_bytes()));
-        assert!(forms.found_in_header(&handed_on));
-        let headers = vec![("x-echo".to_string(), handed_on.clone())];
-        assert!(check(&credential, 200, headers.clone(), Vec::new()).is_err());
-        let mut headers = headers;
-        assert!(StreamCheck::begin(&credential, &mut headers).is_err());
+        // The header holds the credential as it is, or as a form body writes it: with `+`
+        // for its spaces.
+        let as_it_is = credential.expose_secret().clone();
+        let in_a_form = as_it_is.replace(' ', "+");
+        let handed_on = |written: &str| -> String {
+            let mut sent = b"echo=".to_vec();
+            sent.extend_from_slice(written.as_bytes());
+            sent.push(0xff);
+            assert!(std::str::from_utf8(&sent).is_err());
+            sent.iter().map(|byte| char::from(*byte)).collect()
+        };
+        for written in [&as_it_is, &in_a_form] {
+            let handed_on = handed_on(written);
+            assert!(!handed_on.contains(written.as_str()));
+            assert!(forms.found_in_header(&handed_on));
+            let headers = vec![("x-echo".to_string(), handed_on.clone())];
+            assert!(check(&credential, 200, headers.clone(), Vec::new()).is_err());
+            let mut headers = headers;
+            assert!(StreamCheck::begin(&credential, &mut headers).is_err());
+        }
+        // The text the node hands on of the credential as it is is the form of the
+        // credential for a reader of ISO 8859-1, which the search finds in any bytes. The
+        // text of the credential with `+` for its spaces is no form: it is found in the
+        // bytes its characters stand for, as the search of a header reads them.
+        assert!(forms.found_in(handed_on(&as_it_is).as_bytes()));
+        assert!(!forms.found_in(handed_on(&in_a_form).as_bytes()));
         // A text with a character above U+00FF is no such reading of bytes.
-        let other = format!("{handed_on}\u{d55c}");
+        let other = format!("{}\u{d55c}", handed_on(&in_a_form));
         assert!(!forms.found_in_header(&other));
+    }
+
+    #[test]
+    fn a_stream_is_cut_in_front_of_a_credential_outside_ascii_under_the_longest_references() {
+        // A credential with characters of one, two, three and four bytes, every character
+        // written as the longest reference the search decodes (six bytes for an ASCII
+        // character, ten for another one), and that text with every byte as a reference of
+        // six bytes again: the most received bytes a form under character references takes.
+        let wide = "p\u{e4}ss-\u{d55c}\u{ae00}-\u{1f600}-0123456789";
+        let credential = Secret::new(wide.to_string());
+        let forms = Forms::of(std::slice::from_ref(&credential));
+        let once: String = wide
+            .chars()
+            .map(|character| match character.is_ascii() {
+                true => format!("&#{:03};", u32::from(character)),
+                false => format!("&#x{:06X};", u32::from(character)),
+            })
+            .collect();
+        let twice: String = once.bytes().map(|byte| format!("&#{byte:03};")).collect();
+        assert_eq!(once.len(), 6 * 16 + 10 * 4);
+        assert_eq!(twice.len(), 6 * once.len());
+        // No byte of the credential takes more than a stream holds back for it.
+        assert!(twice.len() <= ESCAPED_BYTE_SPAN * wide.len());
+        for written in [&once, &twice] {
+            let mut body = vec![b'x'; 300_000];
+            body.push(b' ');
+            let front = body.len();
+            body.extend_from_slice(written.as_bytes());
+            body.extend_from_slice(b" and the rest of the page");
+            assert!(forms.found_in(&body));
+            for part in [1usize, 7, 64, 1_000, 4_096, 100_000] {
+                let mut headers = Vec::new();
+                let mut check = StreamCheck::begin(&credential, &mut headers).unwrap();
+                let mut handed_on = Vec::new();
+                let mut withheld = false;
+                for bytes in body.chunks(part) {
+                    match check.take(bytes) {
+                        Ok(bytes) => handed_on.extend_from_slice(&bytes),
+                        Err(Withheld) => {
+                            withheld = true;
+                            break;
+                        }
+                    }
+                }
+                if !withheld {
+                    withheld = check.end().is_err();
+                }
+                assert!(withheld, "parts of {part}");
+                // The byte in front of the form was not handed on either.
+                assert!(handed_on.len() < front, "parts of {part}");
+                assert_eq!(handed_on, body[..handed_on.len()]);
+            }
+        }
+        // One reference more than six bytes for a byte of its character, and the credential
+        // is not found: that reference is not decoded.
+        let longer = once.replacen("&#112;", "&#0112;", 1);
+        assert_ne!(longer, once);
+        assert!(!forms.found_in(longer.as_bytes()));
     }
 
     #[test]
@@ -1646,6 +2321,58 @@ mod tests {
         // of a value of a common length.
         assert!(StreamCheck::memory_bound(12_000) < 3 * 1024 * 1024);
         assert!(StreamCheck::memory_bound(200) < 64 * 1024);
+    }
+
+    #[test]
+    fn a_check_holds_no_more_memory_than_the_bound_a_call_reserves_for_it() {
+        // The room of everything a check holds while a body arrives: the forms of the
+        // credential, the buffer of the received bytes, and for every reading its last bytes,
+        // the escape that waits and what a step adds to it. A credential with a space and
+        // with characters outside ASCII has every form, and a long one makes a step of the
+        // search as long as its longest form.
+        let credentials = [
+            "x".repeat(8),
+            TOKEN.to_string(),
+            "p\u{e4}ss phrase \u{d55c}\u{ae00} 0123456789".to_string(),
+            format!("{}!", "\u{d55c} ".repeat(700)),
+            "k".repeat(12_000),
+        ];
+        let mut noise = Noise(0x3c6e_f372_fe94_f82b);
+        for text in credentials {
+            let bound = StreamCheck::memory_bound(text.len());
+            let mut headers = Vec::new();
+            let mut check = StreamCheck::begin(&Secret::new(text.clone()), &mut headers).unwrap();
+            for round in 0..12 {
+                let part = match round % 3 {
+                    0 => noise.some(200),
+                    1 => noise.some(70_000),
+                    _ => noise.some(900_000),
+                };
+                check.take(&part).unwrap();
+                // The bound counts as many readings as a search has.
+                assert_eq!(check.readings.readings.len(), Readings::COUNT);
+                assert_eq!(check.readings.added.len(), Readings::COUNT);
+                let forms: usize = check
+                    .forms
+                    .0
+                    .iter()
+                    .map(|form| form.expose_secret().capacity())
+                    .sum();
+                let of_the_readings: usize = check
+                    .readings
+                    .readings
+                    .iter()
+                    .map(|reading| reading.tail.capacity() + reading.open.capacity())
+                    .chain(check.readings.added.iter().map(Vec::capacity))
+                    .sum();
+                let in_use = check.held.capacity() + forms + of_the_readings;
+                assert!(
+                    in_use <= bound,
+                    "{} bytes, round {round}: {in_use} in use, bound {bound}",
+                    text.len()
+                );
+            }
+        }
     }
 
     #[test]
