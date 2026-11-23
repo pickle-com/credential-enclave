@@ -147,10 +147,17 @@ impl Forms {
     /// The forms of every credential of `credentials`: as it is, base64 and base64url at each
     /// byte alignment, hexadecimal in both cases. A form shorter than [`SHORTEST_FORM_BYTES`]
     /// is left out.
+    ///
+    /// A credential is searched for without the white space at its ends (the Unicode property
+    /// White_Space). A server reads the value of a header without the white space around it,
+    /// and often strips it from a parameter, so what it sends back of a credential that was
+    /// stored with a space or a line end behind it may be the credential without it. Bytes
+    /// that hold the credential with its white space hold it without as well, in each of
+    /// these forms: the search finds both.
     pub fn of(credentials: &[Secret<String>]) -> Forms {
         let mut kept: Vec<Secret<Vec<u8>>> = Vec::new();
         for credential in credentials {
-            let token = credential.expose_secret().as_bytes();
+            let token = credential.expose_secret().trim().as_bytes();
             let mut forms: Vec<Vec<u8>> = vec![token.to_vec()];
             for alignment in 0..3 {
                 forms.push(base64_inside(&STANDARD_NO_PAD, token, alignment));

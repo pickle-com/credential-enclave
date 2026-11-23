@@ -1347,6 +1347,78 @@ async fn a_body_under_the_chunked_coding_more_than_once_is_not_handed_on() {
 }
 
 #[tokio::test]
+async fn a_value_with_white_space_at_its_ends_is_found_without_it() {
+    // A value that was stored with white space at its ends, as one that was copied with a
+    // space or a line end behind it. A server reads the value of a header without the white
+    // space around it, and a server that reads a parameter often strips it: what such a site
+    // sends back is the value without that white space, which is the value a server takes.
+    let spaced = [
+        format!("{VALUE} "),
+        format!(" {VALUE}"),
+        format!("  {VALUE}  "),
+        format!("{VALUE}\n"),
+        format!("\u{a0}{VALUE}\u{3000}"),
+    ];
+    for (index, value) in spaced.iter().enumerate() {
+        let in_a_line = !value.contains('\n');
+        for echo in ["body", "header"] {
+            // The site sends back what it read of the header, or of the query parameter.
+            let provider = site(move |seen| {
+                let read = match in_a_line {
+                    true => seen.header("x-api-key").unwrap_or_default().to_string(),
+                    false => url::form_urlencoded::parse(
+                        seen.target
+                            .split_once('?')
+                            .map_or("", |(_, query)| query)
+                            .as_bytes(),
+                    )
+                    .find(|(name, _)| name == "key")
+                    .map(|(_, value)| value.into_owned())
+                    .unwrap_or_default(),
+                };
+                let read = read.trim().to_string();
+                let lead = "0123456789".repeat(1_000);
+                match echo {
+                    "body" => Reply::json(400, &json!({"lead": lead, "unknown key": read})),
+                    _ => Reply::with_body(400, &[("x-unknown-key", read.as_str())], b"{}"),
+                }
+            })
+            .await;
+            let forward = forward_node(&provider).await;
+            let query = format!("key={PLACEHOLDER}");
+            let (request, headers) = match in_a_line {
+                true => (
+                    request_of("GET", "/v1/me", "", "header:x-api-key", b""),
+                    json!([["X-Api-Key", PLACEHOLDER]]),
+                ),
+                false => (
+                    request_of("GET", "/v1/me", &query, "query:key", b""),
+                    json!([]),
+                ),
+            };
+            let meta = json!({
+                "envelope": envelope(&forward, &request, value, index as u8),
+                "headers": headers,
+            });
+            let outcome = forward.vault_send(meta, b"").await;
+            assert_eq!(provider.seen().len(), 1, "{value:?} {echo}");
+            match (echo, outcome) {
+                ("body", Ok(sent)) => {
+                    assert_eq!(sent.end["code"], "response_withheld", "{value:?}");
+                    let body = String::from_utf8(sent.body()).unwrap();
+                    assert!(!body.contains(VALUE), "{value:?}");
+                }
+                (_, outcome) => assert_eq!(
+                    code(&outcome),
+                    (502, "response_withheld".to_string()),
+                    "{value:?} {echo}"
+                ),
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_value_a_site_sends_back_in_a_header_that_is_not_utf8_is_not_handed_on() {
     // A value with characters outside ASCII. The site sends it back in a header, beside a
     // byte that is no UTF-8: the node hands such a header on with one character per byte,

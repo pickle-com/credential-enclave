@@ -55,7 +55,8 @@ pub async fn handoff(State(node): State<Arc<Node>>, request: Request) -> Respons
 ///
 /// The plaintext is read for the value after the log store confirmed the entry that holds the
 /// event, and the value is sealed then (`ForRequest::hand_off`). A value no envelope carries
-/// (no string, fewer than 8 bytes or more than 12,000, a control character for a header slot
+/// (no string, more than 12,000 bytes, fewer than 8 bytes without the white space at its ends,
+/// a control character for a header slot
 /// or for a slot of HTTP Basic, a colon for the slot `basic:user`) is `record_invalid` at
 /// that point: the response carries no envelope and the entry stays.
 async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {

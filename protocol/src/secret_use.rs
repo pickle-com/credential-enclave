@@ -307,6 +307,26 @@ pub fn fits_header(value: &str) -> bool {
     !value.chars().any(char::is_control)
 }
 
+/// The value of a vault secret as the search of a response looks for it (egress-policy.md,
+/// rule E4): without the white space at its ends (the Unicode property White_Space).
+///
+/// A server reads the value of a header without the white space around it, and a server that
+/// reads a parameter or a member of a body often strips it. So what a site sends back of a
+/// value that was stored with a space or a line end at one of its ends may be the value
+/// without it, which is the value that site takes. A response that holds the value with its
+/// white space holds it without as well, in every form the search knows.
+pub fn searched_text(value: &str) -> &str {
+    value.trim()
+}
+
+/// True for a value that is used in a request (10.5): at most 12,000 bytes, of which 8 or
+/// more are left without the white space at its ends ([`searched_text`]). Of a shorter one no
+/// reflection is searched for in the response to its request, so no node seals or sends one.
+pub fn is_used_in_requests(value: &str) -> bool {
+    value.len() <= limits::SECRET_USE_VALUE_BYTES_MAX
+        && searched_text(value).len() >= limits::SECRET_USE_VALUE_BYTES_MIN
+}
+
 /// The authentication schemes whose credentials a value of a header slot does not stand in
 /// ([`states_no_scheme`]): the name of each, in lower case.
 ///
@@ -1015,7 +1035,7 @@ pub fn seal_secret_use(
 /// | `payload.v` is 1 | `unsupported_version` |
 /// | `payload.type` is `secret_use` | `invalid_request` |
 /// | `payload.from` and `payload.to` equal those of the envelope | `wrong_node` |
-/// | the form of the fields: the two times, a `nonce` of 16 bytes, a valid `user_id`, a `record_id` of 16 bytes, a `value` of 8 to 12,000 bytes, a request object ([`BoundRequest::from_value`]) | `invalid_request` (`too_large` for a body above the limit) |
+/// | the form of the fields: the two times, a `nonce` of 16 bytes, a valid `user_id`, a `record_id` of 16 bytes, a `value` that is used in requests ([`is_used_in_requests`]), a request object ([`BoundRequest::from_value`]) | `invalid_request` (`too_large` for a body above the limit) |
 ///
 /// The signature is verified over the payload bytes as carried, before they are parsed. It
 /// shows that the holder of the signing key `from` made the payload. The receiving node does
@@ -1107,8 +1127,7 @@ fn read_secret_use(
     let user_id = text("user_id")?;
     let record_id = text("record_id")?;
     let value = text("value")?;
-    let sized = (limits::SECRET_USE_VALUE_BYTES_MIN..=limits::SECRET_USE_VALUE_BYTES_MAX)
-        .contains(&value.len());
+    let sized = is_used_in_requests(value);
     if !is_valid_name(user_id) || b64u_decode_array::<16>(record_id).is_err() || !sized {
         return Err(INVALID);
     }
@@ -1506,6 +1525,35 @@ mod tests {
         ] {
             assert!(!fits_header(value), "{value:?}");
         }
+    }
+
+    #[test]
+    fn a_value_used_in_a_request_has_eight_bytes_without_the_white_space_at_its_ends() {
+        for (value, searched) in [
+            ("sk-live_0123456789", "sk-live_0123456789"),
+            (" sk-live_0123456789\n", "sk-live_0123456789"),
+            ("\t\r\n12345678 \u{a0}\u{3000}", "12345678"),
+            ("1234 5678", "1234 5678"),
+        ] {
+            assert_eq!(searched_text(value), searched, "{value:?}");
+            assert!(is_used_in_requests(value), "{value:?}");
+        }
+        // Fewer than 8 bytes are left: the search of a response would look for no form of
+        // such a value.
+        for value in [
+            "1234567",
+            " 1234567 ",
+            "1234567\n\n\n",
+            "        ",
+            "\u{3000}123456",
+        ] {
+            assert!(!is_used_in_requests(value), "{value:?}");
+        }
+        // The longest value, and one byte more. White space counts for the length of a value
+        // and not for the text that is searched for.
+        let longest = "v".repeat(limits::SECRET_USE_VALUE_BYTES_MAX);
+        assert!(is_used_in_requests(&longest));
+        assert!(!is_used_in_requests(&format!("{longest} ")));
     }
 
     #[test]

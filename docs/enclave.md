@@ -864,7 +864,9 @@ which form it holds. The order of the processing:
     encoded more than once) and with its JSON string escapes decoded (up to twice, for a JSON
     text inside a JSON string), and each reading is searched for the credential as it is, in
     base64 or base64url (each of the three byte alignments, without padding) and in hexadecimal
-    (lower or upper case). A header whose bytes are not UTF-8 is searched as those bytes as well. A form shorter than 8 bytes is not searched for. A failed check is
+    (lower or upper case). A header whose bytes are not UTF-8 is searched as those bytes as well.
+    The credential is searched for without the white space at its ends. A form shorter than 8
+    bytes is not searched for. A failed check is
     `response_withheld`: no part of the response leaves. The event `provider_request` is already
     on the chain, because the request went to the provider.
 11. A call that asked for a stream. Steps 8 and 9 run up to the head of the provider response:
@@ -1065,7 +1067,8 @@ without the operator configuration.
    path, the query, the size and the hash of the body as the request object states them,
    `context`, `name`, `slot` and `to` (protocol.md 7.2). It is merged with no other event. A call
    that is refused up to here creates no event.
-6. After the log store confirmed the entry: the value is 8 to 12,000 bytes, and for a slot of a
+6. After the log store confirmed the entry: the value has at most 12,000 bytes, of which 8 or
+   more are left without the white space at its ends (protocol.md 10.5), and for a slot of a
    header and for the two slots of HTTP Basic it holds no control character (for `basic:user`, no
    colon either). A value that fails is `record_invalid`: no envelope leaves, and the entry stays.
 7. The node seals the value and the request object to the sealing key of the receiving node
