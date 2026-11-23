@@ -1726,7 +1726,7 @@ The limits, as the source states them:
 | `timeout_ms` of `forward` and `forward/batch` | 1,000 to 120,000, default 30,000 |
 | `timeout_ms` of a `forward` call that asks for a stream | 1,000 to 600,000, default 30,000 |
 | One part of a stream | 1,048,576 bytes |
-| Bytes the search of a stream holds back | 27 bytes for each byte of the longest form of the credential, and 32 |
+| Bytes the search of a stream holds back | 36 bytes for each byte of the longest form of the credential, and 36 more |
 | Address of `forward` | 8,192 bytes |
 | Response of a token address | 1 MiB, time limit 15 seconds (`token_timeout`) |
 | Late response of a token address call of `refresh` (`token_late_limit`) | 120 seconds from the start of the call |
