@@ -301,8 +301,16 @@
   const LOG_SUMMARY_REQUESTS = 5;
   const LOG_SCREEN_WAIT_MS = 3000;
   const LOG_SCREEN_BODIES = 200;
-  // The times the first page of the screen is read on below keys that turned out to be no entries.
+  // The times a page of the screen is read on below keys that turned out to be no entries.
   const LOG_SCREEN_REFILLS = 2;
+  // The listings of the screen: the requests that read them on for one page (a page of the
+  // store names 1,000 keys of each prefix, many more than a page of the screen shows), the
+  // requests that read them on at one opening of the screen down to the later pages noted as
+  // held back from it, and the keys the screen holds of them at most (beyond that a later page
+  // is listed from the marker of its time).
+  const LOG_PAGE_READS = 4;
+  const LOG_CATCHUP_READS = 16;
+  const LOG_SCREEN_KEYS = 20000;
 
   // ---- The chains of format 1 and format 2 (the bucket the binding names) ----
   // The chains one round follows, the nodes one address request names, the passes of listings
@@ -335,6 +343,11 @@
   const LEGACY_TOP_STEPS = 48;
   const LEGACY_DISPLAY_ENTRIES = 1000;
   const LEGACY_DISPLAY_LIST = 1000;
+  // The pages of the listing of the end of a chain that one opening of the screen reads before a
+  // listing without an end counts as held back, and the times one call of the screen walks the
+  // chains because a chain stood on a seq that holds no entry of its node.
+  const LEGACY_HEAD_PAGES = 4;
+  const LEGACY_ANCHOR_WALKS = 3;
   // 2026-11-23T00:00:00Z. A node of a release before LOG_FORMAT_3_FROM names no measurement in
   // the event of a transfer of the delegation (grant_transferred_out), so the document of the
   // receiving node is what says of which release that node is. From this time on the backend
@@ -4386,7 +4399,6 @@
             key: version.key, versionId: version.versionId, isLatest: version.isLatest, parts: parts,
           });
         }
-        rememberKeys(id, entries);
         run.nodes.add(id);
         legacy.nodes[id].read_ms = now;
         const seqs = Array.from(entries.keys()).sort(function (a, b) { return a - b; });
@@ -5574,44 +5586,147 @@
   // from the master key, and answer the next opening before any request.
 
   // The chains of format 1 and format 2 the screen knows keys of (runtime lifetime). displayNodes
-  // maps a node id to {candidates: Map<seq, candidate[]>, floor, exhausted, sorted}: the keys the
-  // screen knows, the smallest seq whose listing was read (0 while none was), whether the listing
-  // reached the start of the chain, and the seqs in descending order (null when the candidates
-  // changed). displayEntries maps "node:seq" to the entry the screen opened {id, time_ms, count,
-  // items}, at most LEGACY_DISPLAY_ENTRIES of them (the oldest read leaves first).
+  // maps a node id to what the screen knows of its chain (displayNode). The screen takes the
+  // keys of a chain from its own listings alone: a range of seqs enters what it knows only from
+  // a listing that was read as far as the range reaches, so an object someone else wrote into
+  // the chain makes a listing longer and hides nothing. displayEntries maps "node:seq" to the
+  // entry the screen opened {id, time_ms, count, items}, at most LEGACY_DISPLAY_ENTRIES of them
+  // (the oldest read leaves first).
   const displayNodes = new Map();
   const displayEntries = new Map();
   // The node documents the reads of later pages learned (runtime lifetime; a round keeps its own
   // in the program store).
   const pageNodes = Object.create(null);
 
+  /** What the screen knows of the chain of node id (displayNodes), made when first asked for:
+   *  {candidates, floor, exhausted, sorted, head, rising, pages, sinking, seeking, latest, facts}.
+   *  candidates maps a seq to the object versions a listing named under it. floor is the seq from
+   *  which on the screen knows every key the store named (0 while no listing was read): a range
+   *  enters it only from a listing that was read to its end, or as far as the range reaches.
+   *  head says that the listing of the end of the chain was read to its end at this opening of
+   *  the screen, rising where that listing goes on while it was not, and pages how many pages of
+   *  it were read at this opening. exhausted says that nothing lies below floor. sinking is the
+   *  listing of the range below floor that is not read to its end yet, and seeking the search
+   *  for the last seq below a seq that goes on with the next call. latest is the latest time a
+   *  key the screen listed of the chain names (0: no key names a time). sorted are the seqs in
+   *  descending order (null when the candidates changed), and facts what the keys under a seq
+   *  name (keyFacts), kept until the candidates of that seq change. */
   function displayNode(id) {
     let node = displayNodes.get(id);
     if (node === undefined) {
-      node = { candidates: new Map(), floor: 0, exhausted: false, sorted: null };
+      node = {
+        candidates: new Map(), floor: 0, exhausted: false, sorted: null, head: false, rising: null, pages: 0,
+        sinking: null, seeking: null, latest: 0, facts: new Map(),
+      };
       displayNodes.set(id, node);
     }
     return node;
   }
 
   /** Puts the candidates of a listing (a table from seq to candidates) into the keys the screen
-   *  knows of node id. The candidates of a seq already known are replaced, and when they are
-   *  other object versions than before, the entry the screen opened under that seq is dropped
-   *  (it is opened again from the object versions the store now names). */
-  function rememberKeys(id, entries) {
+   *  knows of node id. The candidates of a seq already known are replaced, or, with merge (a
+   *  listing page that goes on where the page before it stopped), added to. When the object
+   *  versions under a seq are other ones than before, the entry the screen opened under that seq
+   *  is dropped (it is opened again from the object versions the store now names). */
+  function rememberKeys(id, entries, merge) {
     const node = displayNode(id);
     entries.forEach(function (candidates, seq) {
       const before = node.candidates.get(seq);
+      let next = candidates;
+      if (before !== undefined && merge === true) {
+        next = before.slice();
+        for (const candidate of candidates) {
+          const known = next.some(function (kept) { return kept.key === candidate.key && kept.versionId === candidate.versionId; });
+          if (!known) next.push(candidate);
+        }
+      }
       if (before !== undefined) {
-        const same = before.length === candidates.length && before.every(function (kept, at) {
-          return kept.key === candidates[at].key && kept.versionId === candidates[at].versionId;
+        const same = before.length === next.length && before.every(function (kept, at) {
+          return kept.key === next[at].key && kept.versionId === next[at].versionId;
         });
         if (!same) displayEntries.delete(id + ":" + seq);
       }
-      node.candidates.set(seq, candidates);
-      if (node.floor === 0 || seq < node.floor) node.floor = seq;
+      for (const candidate of next) {
+        if (candidate.parts.format === 2 && candidate.parts.time_ms > node.latest) node.latest = candidate.parts.time_ms;
+      }
+      node.candidates.set(seq, next);
+      node.facts.delete(seq);
     });
     node.sorted = null;
+  }
+
+  /** The lowest seq the screen knows of the chain of node id and what it
+   *  knows of the entry under it: {seq, state, time_ms}. state is "verified" (the screen opened
+   *  the entry, and the node wrote it), "unverified" (no object read under the seq is an entry of
+   *  the node) or "unread". null when the screen knows no key of the chain. A node writes its
+   *  chain seq after seq, each entry no earlier than the one before it. So when the entry under
+   *  the lowest seq the screen knows is one the node wrote, the end of the chain lies among the
+   *  keys the screen knows, and nothing below them is later than that entry. Under a lowest seq
+   *  that holds no entry of the node, anything may lie below: an object someone else wrote names
+   *  any seq and any time. */
+  function chainBottom(id) {
+    const seqs = sortedSeqs(displayNode(id));
+    if (seqs.length === 0) return null;
+    const seq = seqs[seqs.length - 1];
+    const opened = displayEntries.get(id + ":" + seq);
+    if (opened === undefined) return { seq: seq, state: "unread", time_ms: 0 };
+    if (unverifiedEntry(opened)) return { seq: seq, state: "unverified", time_ms: 0 };
+    return { seq: seq, state: "verified", time_ms: opened.time_ms };
+  }
+
+  /** The largest seq of the chain of node id under which the device knows
+   *  an entry the node wrote: the seq up to which the rounds read the chain (it moves only where
+   *  the node wrote), or a seq above it whose entry the screen opened. 0 when it knows none. */
+  function writtenSeq(legacy, id) {
+    const followed = legacy.nodes[id];
+    let written = followed === undefined ? 0 : followed.seq;
+    for (const seq of sortedSeqs(displayNode(id))) {
+      if (seq <= written) break;
+      const opened = displayEntries.get(id + ":" + seq);
+      if (opened !== undefined && !unverifiedEntry(opened)) {
+        written = seq;
+        break;
+      }
+    }
+    return written;
+  }
+
+  /** Where the listing of the end of the chain of node id begins, or goes
+   *  on, at this opening of the screen: a target of loadChainKeys. For a listing that is not read
+   *  to its end, the markers of the store where it stopped. For a chain the screen listed in this
+   *  runtime, one seq below the last seq the device knows the node wrote (writtenSeq), and no
+   *  lower than the keys the screen knows: a node writes its next entry under the seq after its
+   *  last one, so the listing names what the node wrote since, whatever someone else wrote above
+   *  the end of the chain. For a chain the screen has not listed, LEGACY_DISPLAY_LIST seqs under
+   *  the end the device knows of (chainHint). null when the device knows nothing of the end of
+   *  such a chain: it is searched for (findChainTop). */
+  function headStart(cache, legacy, id) {
+    const node = displayNode(id);
+    if (node.rising !== null) {
+      return { id: id, after: node.rising.after, key_marker: node.rising.key_marker, version_id_marker: node.rising.version_id_marker };
+    }
+    if (node.floor > 0) return { id: id, after: Math.max(node.floor, writtenSeq(legacy, id)) - 1 };
+    const hint = chainHint(cache, legacy, id);
+    return hint === null ? null : { id: id, after: Math.max(0, hint.seq - LEGACY_DISPLAY_LIST) };
+  }
+
+  /** Puts one page of the listing of the end of the chain of node id
+   *  (target: as loadChainKeys read it) into the keys the screen knows. Returns whether the
+   *  listing ended with it: the screen then knows every key from floor on (head). Otherwise the
+   *  place where the listing goes on is kept (rising). */
+  function takeHeadPage(id, target) {
+    const node = displayNode(id);
+    node.pages += 1;
+    rememberKeys(id, target.entries, node.rising !== null);
+    if (node.floor === 0 || target.after + 1 < node.floor) node.floor = target.after + 1;
+    if (target.after === 0) node.exhausted = true;
+    if (!target.more) {
+      node.head = true;
+      node.rising = null;
+      return true;
+    }
+    node.rising = { after: target.after, key_marker: target.next.key_marker, version_id_marker: target.next.version_id_marker };
+    return false;
   }
 
   /** The seqs the screen knows of a chain, the largest first. */
@@ -5638,6 +5753,7 @@
    *  it). null when no key of format 2 lies under the seq (a key of format 1 names no time: the
    *  entry carries it). */
   function keyFacts(node, seq) {
+    if (node.facts.has(seq)) return node.facts.get(seq);
     let facts = null;
     let settled = true;
     for (const candidate of node.candidates.get(seq) || []) {
@@ -5654,8 +5770,8 @@
       facts.time_ms = Math.max(facts.time_ms, parts.time_ms);
       facts.count = Math.max(facts.count, parts.count);
     }
-    if (facts === null) return null;
-    facts.settled = settled;
+    if (facts !== null) facts.settled = settled;
+    node.facts.set(seq, facts);
     return facts;
   }
 
@@ -5701,22 +5817,29 @@
     };
   }
 
-  /** Lists chains of format 1 and format 2 in one stage: targets are [{id, after, below, probe}]
-   *  (the keys of node id above the seq after; with below, only the keys under that seq). The keys
-   *  enter the keys the screen knows, unless probe is set (a listing that only looks where a chain
-   *  ends). Each target receives last (the largest seq the listing named, after when none) and
-   *  more (whether the listing goes on); a target whose listing failed receives neither, and
-   *  failure, the failure of its read. With reads (the listings are the ones of a read of the log
-   *  screen: chainReads), a listing that is held back goes to the rounds and is noted
-   *  (denyChain: a request that was not answered counts when the backend answered another
-   *  request of this runtime around it), and a listing that was read ends what was noted when it
-   *  covers what was held back (serveChain). A backend that states it has no such store holds
-   *  the listing of a chain back that the store is known to hold (reads.live). Throws a failure
-   *  that is not one of the store. */
+  /** Reads one listing page of each of several chains of format 1 and format 2, in one stage:
+   *  targets are [{id, after, below, key_marker, version_id_marker, probe}] (the keys of node id
+   *  above the seq after and, with below, under that seq; the markers of the store when the page
+   *  goes on where a page before it stopped). Each target receives entries (a table from seq to
+   *  the object versions named under it, within the range), last (the largest seq of the range
+   *  the page named, after when none), reached (the page named a seq at or above below), more
+   *  (the listing goes on within the range) and next (the markers of the store for the page
+   *  after it). A target whose listing failed receives failure and nothing else. Nothing enters
+   *  the keys the screen knows: the caller puts a range there once it is read as far as it
+   *  reaches. With reads (the listings are the ones of a read of the log screen: chainReads), a
+   *  listing that is held back goes to the rounds, unless it only looks for the end of a chain
+   *  (probe), and is noted (denyChain: a request that was not answered counts when the backend
+   *  answered another request of this runtime around it). A backend that states it has no such
+   *  store holds the listing of a chain back that the store is known to hold (reads.live).
+   *  Throws a failure that is not one of the store. */
   async function loadChainKeys(turn, targets, reads) {
     const started = native.nowMs();
     const listings = await legacyListings(turn, targets.map(function (target) {
-      return { node: target.id, key_marker: listingMarker(target.id, target.after), version_id_marker: null };
+      const goes = typeof target.key_marker === "string";
+      return {
+        node: target.id, key_marker: goes ? target.key_marker : listingMarker(target.id, target.after),
+        version_id_marker: goes && typeof target.version_id_marker === "string" ? target.version_id_marker : null,
+      };
     }));
     for (let at = 0; at < targets.length; at += 1) {
       const target = targets[at];
@@ -5728,74 +5851,175 @@
         target.failure = failure;
         if (reads === undefined || failure.kind === "unreachable" || !(turnLeft(turn) > 0)) continue;
         if (failure.kind === "absent" && !reads.live(target.id)) continue;
-        // A listing that only looks for the end of a chain is not one the rounds make again.
         if (target.probe !== true && reads.chainsHeld.length < LOG_WITHHELD_CHAINS) {
           reads.chainsHeld.push([target.id, target.after, target.below === undefined ? 0 : target.below]);
         }
         if (failure.kind === "silent" && reads.reached === null) reads.reached = await reachJudged(turn, started);
         if (failure.kind !== "silent" || reads.reached === true) {
-          if (denyChain(target.id, target.after, target.below !== undefined)) reads.judge = true;
+          if (denyChain(target.id, target.after)) reads.judge = true;
         }
         continue;
       }
       const prefix = accountPrefix() + target.id + "/";
       const entries = new Map();
       let last = target.after;
+      let reached = false;
       for (const version of outcome.value.versions) {
         const parts = parseStoreKey(version.key, prefix);
         if (parts === null || parts.seq <= target.after) continue;
+        if (target.below !== undefined && parts.seq >= target.below) {
+          reached = true;
+          continue;
+        }
         if (parts.seq > last) last = parts.seq;
-        if (target.below !== undefined && parts.seq >= target.below) continue;
         if (!entries.has(parts.seq)) entries.set(parts.seq, []);
         entries.get(parts.seq).push({
           key: version.key, versionId: version.versionId, isLatest: version.isLatest, parts: parts,
         });
       }
-      target.more = outcome.value.truncated && outcome.value.nextKeyMarker !== null;
+      target.entries = entries;
       target.last = last;
-      if (reads !== undefined) {
-        reads.chainsRead.add(name);
-        if (serveChain(target.id, target)) reads.judge = true;
-      }
-      if (target.probe === true) continue;
-      const node = displayNode(target.id);
-      rememberKeys(target.id, entries);
-      if (node.floor === 0 || target.after + 1 < node.floor) node.floor = target.after + 1;
-      // The listing began at the start of the chain, or named nothing under the keys known
-      // (everything below is gone with its retention): there is nothing further down.
-      if (target.after === 0 || (target.below !== undefined && entries.size === 0)) node.exhausted = true;
+      target.reached = reached;
+      target.more = outcome.value.truncated && outcome.value.nextKeyMarker !== null && !reached;
+      target.next = { key_marker: outcome.value.nextKeyMarker, version_id_marker: outcome.value.nextVersionIdMarker };
+      if (reads !== undefined) reads.chainsRead.add(name);
     }
   }
 
-  /** Finds the end of a chain the device knows no seq of: listings that only look (probe), from
-   *  seq 0, jumping ahead while the chain goes on and halving the range once a jump passed the
-   *  end, LEGACY_TOP_STEPS at most. Returns the largest seq seen (0 for a chain without keys), or
-   *  -1 when a listing failed or the listings of this call are spent. */
-  async function findChainTop(turn, id, budget) {
-    let known = 0;
-    let high = 0;
-    let jump = 4 * LEGACY_DISPLAY_LIST;
-    let probe = 0;
-    for (let step = 0; step < LEGACY_TOP_STEPS; step += 1) {
+  /** Finds the last seq of a chain under the seq ceiling (Infinity: the end of the chain) when
+   *  the device knows none: listings that only look (probe), from seq 0, jumping ahead while the
+   *  chain goes on and halving the range once a jump passed the end, LEGACY_TOP_STEPS at most.
+   *  Returns the largest seq seen (0 for no key in the range), or -1 when a listing failed or
+   *  the listings of this call are spent: the search is kept with the chain (seeking) and goes
+   *  on with the next call. */
+  async function findChainTop(turn, id, budget, ceiling) {
+    const node = displayNode(id);
+    let search = node.seeking;
+    if (search === null || search.ceiling !== ceiling) {
+      search = {
+        ceiling: ceiling, known: 0, high: ceiling === Infinity ? 0 : ceiling, jump: 4 * LEGACY_DISPLAY_LIST, probe: 0, steps: 0,
+      };
+      node.seeking = search;
+    }
+    while (search.steps < LEGACY_TOP_STEPS) {
       if (budget.lists <= 0) return -1;
       budget.lists -= 1;
-      const target = { id: id, after: probe, probe: true };
+      const target = { id: id, after: search.probe, probe: true };
+      if (ceiling !== Infinity) target.below = ceiling;
       await loadChainKeys(turn, [target], budget.reads);
       if (target.last === undefined) return -1;
-      if (target.last > probe) {
-        known = target.last;
-        if (!target.more) return known;
-        if (high !== 0 && high - known <= 1) return known;
-        probe = high === 0 ? known + jump : known + Math.floor((high - known) / 2);
-        if (high === 0) jump *= 4;
+      search.steps += 1;
+      if (target.last > search.probe) {
+        search.known = target.last;
+        if (!target.more || (search.high !== 0 && search.high - search.known <= 1)) break;
+        search.probe = search.high === 0 ? search.known + search.jump : search.known + Math.floor((search.high - search.known) / 2);
+        if (search.high === 0) search.jump *= 4;
       } else {
-        // Nothing above the probe: the end is at or below it.
-        high = probe;
-        if (high - known <= 1) return known;
-        probe = known + Math.floor((high - known) / 2);
+        // Nothing of the range above the probe: its last seq is at or below it.
+        search.high = search.probe;
+        if (search.high - search.known <= 1) break;
+        search.probe = search.known + Math.floor((search.high - search.known) / 2);
       }
     }
-    return known;
+    node.seeking = null;
+    return search.known;
+  }
+
+  /** Reads the listing of the end of the chain of node id to its end, for this opening of the
+   *  screen, from where it begins or goes on (headStart; the end of a chain the device knows
+   *  nothing of is searched for first). The listing is read on page after page with the markers
+   *  of the store (budget.lists pages of this call at most), and every page enters the keys the
+   *  screen knows. Returns "ready" when the listing ended (the screen then knows every key from
+   *  floor on: head), "spent" when the listings of this call are spent (the listing goes on with
+   *  the next call, and the screen shows what was named so far), and "failed" when a listing
+   *  failed. A listing that went on over LEGACY_HEAD_PAGES pages at one opening and has no end
+   *  yet holds more than a node writes: it is noted as a listing held back from the screen
+   *  (denyChain). */
+  async function readChainHead(turn, cache, legacy, id, budget) {
+    const node = displayNode(id);
+    if (node.head) return "ready";
+    let target = headStart(cache, legacy, id);
+    if (target === null) {
+      const top = await findChainTop(turn, id, budget, Infinity);
+      if (top < 0) return budget.lists <= 0 ? "spent" : "failed";
+      target = { id: id, after: Math.max(0, top - LEGACY_DISPLAY_LIST) };
+    }
+    while (budget.lists > 0) {
+      budget.lists -= 1;
+      await loadChainKeys(turn, [target], budget.reads);
+      if (target.entries === undefined) return "failed";
+      if (takeHeadPage(id, target)) return "ready";
+      target = headStart(cache, legacy, id);
+    }
+    if (node.pages >= LEGACY_HEAD_PAGES) {
+      if (denyChain(id, target.after) && budget.reads !== undefined) budget.reads.judge = true;
+    }
+    return "spent";
+  }
+
+  /** Reads the keys of the chain of node id below the ones the screen knows: the
+   *  LEGACY_DISPLAY_LIST seqs under floor, listed from the lowest of them until the listing names
+   *  a seq at or above floor or ends (page after page, with the markers of the store). Only then
+   *  do the keys enter the keys the screen knows, and floor moves down: a listing that stops
+   *  before floor leaves the seqs next to floor unnamed, and the screen walks a chain downward.
+   *  When the range holds no key, the last seq below it is found (findChainTop under floor) and
+   *  the range begins there: a stretch of seqs without keys does not end the chain. Returns
+   *  "ready", "spent" (the listings of this call are spent: what was read is kept, sinking, and
+   *  the next call reads on) or "failed". */
+  async function readChainBelow(turn, id, budget) {
+    const node = displayNode(id);
+    if (node.exhausted || node.floor <= 1) {
+      node.exhausted = true;
+      return "ready";
+    }
+    let work = node.sinking;
+    if (work === null || work.below !== node.floor) {
+      work = {
+        after: Math.max(0, node.floor - LEGACY_DISPLAY_LIST - 1), below: node.floor, key_marker: null, version_id_marker: null,
+        entries: new Map(),
+      };
+    }
+    node.sinking = work;
+    while (budget.lists > 0) {
+      budget.lists -= 1;
+      const target = { id: id, after: work.after, below: work.below };
+      if (work.key_marker !== null) {
+        target.key_marker = work.key_marker;
+        target.version_id_marker = work.version_id_marker;
+      }
+      await loadChainKeys(turn, [target], budget.reads);
+      if (target.entries === undefined) return "failed";
+      target.entries.forEach(function (candidates, seq) {
+        work.entries.set(seq, (work.entries.get(seq) || []).concat(candidates));
+      });
+      if (target.more) {
+        work.key_marker = target.next.key_marker;
+        work.version_id_marker = target.next.version_id_marker;
+        continue;
+      }
+      if (work.entries.size === 0 && work.after > 0) {
+        const top = await findChainTop(turn, id, budget, work.below);
+        if (top < 0) {
+          node.sinking = null;
+          return budget.lists <= 0 ? "spent" : "failed";
+        }
+        if (top > 0) {
+          work = {
+            after: Math.max(0, top - LEGACY_DISPLAY_LIST), below: work.below, key_marker: null, version_id_marker: null,
+            entries: new Map(),
+          };
+          node.sinking = work;
+          continue;
+        }
+        work.after = 0;
+      }
+      rememberKeys(id, work.entries);
+      node.floor = work.after + 1;
+      if (work.after === 0) node.exhausted = true;
+      node.sinking = null;
+      return "ready";
+    }
+    return "spent";
   }
 
   /** The entry of seq of a chain as the screen shows it: {id, time_ms, count, items}, from the
@@ -5849,6 +6073,17 @@
       id: entry.id, time_ms: time, count: entry.count,
       items: entry.items.map(function (item) { return Object.assign({}, item, { time_ms: time }); }),
     };
+  }
+
+  /** The entry the screen holds opened under seq of the chain of node id,
+   *  opened now from the object versions read (objects) when it holds none: legacyEntry, and for
+   *  a seq none of whose candidates was read, a line that is not verified, at time 0. */
+  function openedEntry(keys, id, seq, objects, reads) {
+    const entry = legacyEntry(keys, id, seq, objects, reads);
+    if (entry !== null) return entry;
+    const blank = { id: "2:" + id + ":" + seq, time_ms: 0, count: 1, items: openEntryItems(id, seq, null, 0) };
+    displayEntries.set(id + ":" + seq, blank);
+    return blank;
   }
 
   /** The object versions of the candidates of the seqs given ([{id, seq}]) that the screen has
@@ -5937,8 +6172,11 @@
       }
     }
     if (withheld.chains.length > 0) {
+      // (The listing is read to see whether it is still held back. Its keys do not enter the
+      // keys the screen knows: the screen reads its ranges to their ends itself.)
       const targets = withheld.chains.map(function (chain) {
-        return chain[2] === 0 ? { id: chain[0], after: chain[1] } : { id: chain[0], after: chain[1], below: chain[2] };
+        return chain[2] === 0 ? { id: chain[0], after: chain[1], probe: true }
+          : { id: chain[0], after: chain[1], below: chain[2], probe: true };
       });
       await loadChainKeys(turn, targets);
       for (let at = 0; at < targets.length; at += 1) {
@@ -6073,44 +6311,73 @@
     return ids;
   }
 
-  /** What the device knows of the end of a chain the screen has not listed: {seq, time_ms} from
-   *  the kept screen or from the chains this device follows; null when nothing is known. */
+  /** What the device knows of the end of a chain the screen has not listed: {seq, time_ms}. For a
+   *  chain this device follows, the seq up to which the rounds read it, with the later of the
+   *  time the rounds know of the entry there and the time the kept screen names. For any other
+   *  chain, what the kept screen names. time_ms is 0 when no time is known that nothing of the
+   *  chain is later than. null when nothing is known. */
   function chainHint(cache, legacy, id) {
     const kept = cache.tops[id];
     const followed = legacy.nodes[id];
-    if (kept !== undefined && (followed === undefined || kept.seq >= followed.seq)) return kept;
-    return followed === undefined ? null : { seq: followed.seq, time_ms: followed.time_ms };
+    if (followed !== undefined && followed.seq > 0) {
+      return { seq: followed.seq, time_ms: Math.max(followed.time_ms, kept === undefined ? 0 : kept.time_ms) };
+    }
+    return kept === undefined ? null : kept;
   }
 
-  /** The next step of one chain for a page of entries before beforeMs, below the seq pointer:
+  /** Whether the chain of node id may still be written: this device follows
+   *  it and has not closed it, or the device does not follow it and the last time it knows of it
+   *  is unknown or within the longest lifetime of a grant (a node of a release before
+   *  LOG_FORMAT_3_FROM writes an entry with every grant it takes). The end of such a chain is
+   *  listed again with every opening of the screen. */
+  function chainLive(cache, legacy, id) {
+    const followed = legacy.nodes[id];
+    if (followed !== undefined) return !followed.closed;
+    const kept = cache.tops[id];
+    return kept === undefined || kept.time_ms === 0 || native.nowMs() - kept.time_ms < (GRANT_DAYS_MAX + 1) * DAY_MS;
+  }
+
+  /** The next step of one chain for a page of entries before beforeMs (picked: the seqs of the
+   *  chain the page took already):
    *    {step: "entry", seq, time, count}  its next entry, with the time and the number of events
-   *                                       its key names (for a chain of format 1, whose keys name
-   *                                       no time, of the entry the screen opened)
-   *    {step: "top", hint, time}          the chain is not listed yet: time is the time the
-   *                                       device knows of its end (Infinity when it knows none)
-   *    {step: "below", time}              the keys listed are used up and the chain goes on below
-   *                                       them: time is the time of the lowest key listed
-   *    {step: "open", seqs, time}         a chain of format 1 whose next entries are not opened
+   *                                       its key names (for a seq whose keys name no one time,
+   *                                       of the entry the screen opened)
+   *    {step: "top", time}                the listing of the end of the chain is not read to its
+   *                                       end at this opening (tried: the chains for which this
+   *                                       call tried): at once for a chain the screen knows keys
+   *                                       of or that may still be written (time Infinity), and
+   *                                       otherwise when the time the device knows of its end
+   *                                       comes
+   *    {step: "below", time}              the chain goes on below the keys the screen knows, and
+   *                                       what lies there may be later than its next entry
+   *    {step: "open", seqs, time}         seqs whose keys name no one time, whose entries are not
+   *                                       opened and may be later than its next entry
    *  time is the latest time the next entry of the chain can have. null when the chain has no
-   *  entry left for the page. */
-  function nextOfChain(cache, legacy, id, pointer, beforeMs) {
+   *  entry left for the page. The entries of a chain are taken by their times, the latest first,
+   *  whatever their seqs: an object someone else wrote under a seq of its own names any time, and
+   *  it takes its line at that time without moving an entry of the node. What lies below the
+   *  keys the screen knows is no later than the entry under the lowest seq it knows when the node
+   *  wrote that entry (chainBottom). While that entry is not read, the time its key names stands
+   *  in (chainPage reads it with the page), and under a lowest seq that holds no entry of the
+   *  node the chain is read on below at once. */
+  function nextOfChain(cache, legacy, id, picked, beforeMs, tried) {
     const node = displayNode(id);
-    if (node.candidates.size === 0) {
-      if (node.exhausted) return null;
+    if (!node.head && !tried.has(id)) {
       const hint = chainHint(cache, legacy, id);
-      return { id: id, step: "top", hint: hint, time: hint === null || hint.time_ms === 0 ? Infinity : hint.time_ms };
+      const eager = node.candidates.size > 0 || node.rising !== null || chainLive(cache, legacy, id);
+      return { id: id, step: "top", time: eager || hint === null || hint.time_ms === 0 ? Infinity : hint.time_ms };
     }
-    const seqs = sortedSeqs(node);
-    let lowest = Infinity;
-    // The time the seq above the one looked at was placed at.
+    let best = null;
+    // The seq looked at before this one, and the time it was placed at (or is bound by).
+    let aboveSeq = -1;
     let above = Infinity;
     const unopened = [];
-    for (const seq of seqs) {
+    for (const seq of sortedSeqs(node)) {
       // The time and the number of events the seq is placed with: what its keys name when they
-      // all name one time, otherwise what the entry the screen opened says. An opened line
-      // that is not verified is placed no later than the seq above it, so the time its keys
-      // name moves it neither down the list nor out of the order of its chain. A seq whose
-      // keys name several times, or none, is opened before it is placed.
+      // all name one time, otherwise what the entry the screen opened says. An opened line that
+      // is not verified is placed no later than the seq next above it, so a time someone wrote
+      // into a key under the seq of an entry moves the line of that seq neither up nor down.
+      const near = aboveSeq === seq + 1 ? above : Infinity;
       const facts = keyFacts(node, seq);
       let time = null;
       let count = 1;
@@ -6120,143 +6387,244 @@
       } else {
         const opened = displayEntries.get(id + ":" + seq);
         if (opened !== undefined) {
-          time = unverifiedEntry(opened) ? Math.min(opened.time_ms, above) : opened.time_ms;
+          time = unverifiedEntry(opened) ? Math.min(opened.time_ms, near) : opened.time_ms;
           count = opened.items.length;
         }
       }
-      if (seq >= pointer) {
-        if (time !== null) above = time;
-        continue;
-      }
+      aboveSeq = seq;
       if (time === null) {
-        unopened.push(seq);
-        if (unopened.length >= LOG_SCREEN_EVENTS) break;
+        // Opened before it is placed. Its entry is no later than the latest time its keys name,
+        // or, when they name none, than the seq next above it.
+        above = facts !== null ? facts.time_ms : near;
+        if (!picked.has(seq)) unopened.push({ seq: seq, bound: above });
         continue;
       }
-      if (unopened.length > 0) break;
       above = time;
-      lowest = time;
-      if (time < beforeMs) return { id: id, step: "entry", seq: seq, time: time, count: count };
+      if (picked.has(seq) || !(time < beforeMs)) continue;
+      if (best === null || time > best.time) best = { seq: seq, time: time, count: count };
     }
-    if (unopened.length > 0) {
-      const hint = cache.tops[id];
-      const bound = lowest !== Infinity ? lowest : hint !== undefined && hint.time_ms !== 0 ? hint.time_ms : Infinity;
-      return { id: id, step: "open", seqs: unopened, time: bound };
+    // The seqs to open before the next entry is placed: the ones whose entries may come before it
+    // (a later time, or the same time under a larger seq).
+    const first = unopened.filter(function (item) {
+      return best === null || item.bound > best.time || (item.bound === best.time && item.seq > best.seq);
+    });
+    const openTime = first.reduce(function (latest, item) { return Math.max(latest, item.bound); }, -Infinity);
+    let below = null;
+    if (!node.exhausted && node.floor > 1) {
+      const bottom = chainBottom(id);
+      below = bottom === null || bottom.state === "unverified" ? Infinity : bottom.state === "verified" ? bottom.time_ms : above;
     }
-    if (!node.exhausted && node.floor > 1) return { id: id, step: "below", time: lowest };
-    return null;
+    if (first.length > 0 && (below === null || openTime >= below)) {
+      return {
+        id: id, step: "open", time: openTime,
+        seqs: first.slice(0, LOG_SCREEN_EVENTS).map(function (item) { return item.seq; }),
+      };
+    }
+    if (below !== null && (best === null || below > best.time)) return { id: id, step: "below", time: below };
+    return best === null ? null : { id: id, step: "entry", seq: best.seq, time: best.time, count: best.count };
   }
 
   /** The entries of the chains of format 1 and format 2 before beforeMs, the latest first, until
    *  their events reach limit or the next one is not later than floorMs (0: no such bound; the
    *  entries of the same millisecond as the last one stay on the page). The chains are merged by
-   *  the times their keys name; a chain the screen has not listed takes part with the time the
-   *  device knows of its end and is listed when its turn comes, so a chain older than the page
-   *  costs no request. budget bounds the listings of this call (lists). Returns {entries, more}:
-   *  more says that entries before the last one exist or may exist. Throws a store failure. */
+   *  the times of their entries. With the first page (beforeMs Infinity: an opening of the
+   *  screen), the end of every chain that may still be written is listed again, so an entry a
+   *  node just wrote is on the page, and a chain with listings noted as held back from the
+   *  screen (log.denied) is read from its end down to below the lowest of them, as a user who
+   *  scrolls that far would have it read. A chain that ended takes part with the time the device
+   *  knows of its end and is listed when its turn comes, so a chain older than the page costs no
+   *  request. budget bounds the listings of this call (lists).
+   *
+   *  With the entries of the page, the entry under the lowest seq the screen knows of every
+   *  chain that goes on below is read (chainBottom). When it is no entry of the node, the page
+   *  was made on a time someone else wrote into a key: the chains are walked again, and that
+   *  chain is read on below at once (LEGACY_ANCHOR_WALKS walks at most). A chain that still
+   *  stands on such a seq when the call ends may hold entries the page does not show: that is
+   *  noted as a listing held back from the screen (denyChain). The listings noted of a chain end
+   *  when the screen read the chain from its end down to the place noted and stands on an entry
+   *  the node wrote (serveChain). Returns {entries, more}: more says that entries before the
+   *  last one exist or may exist. Throws a store failure. */
   async function chainPage(turn, keys, cache, beforeMs, limit, floorMs, budget) {
     const legacy = loadLegacy();
     const ids = chainNodes(cache);
-    const pointers = new Map();
-    const done = new Set();
-    const chosen = [];
-    let count = 0;
-    let lastMs = 0;
+    const tried = new Set();
+    // The chains a listing of this call failed for: they are left out of the page.
+    const out = new Set();
     let more = false;
     let opens = 2;
-    const turns = limit + 4 * ids.length + 3 * LEGACY_SCREEN_LISTS + 16;
-    let round = 0;
-    for (; round < turns; round += 1) {
-      let best = null;
+    if (beforeMs === Infinity) {
+      const denied = loadDenied();
+      const fresh = [];
       for (const id of ids) {
-        if (done.has(id)) continue;
-        const next = nextOfChain(cache, legacy, id, pointers.has(id) ? pointers.get(id) : Infinity, beforeMs);
-        if (next === null) {
-          done.add(id);
-          continue;
-        }
-        if (best === null || next.time > best.time || (next.time === best.time && next.id < best.id)) best = next;
+        if (!chainLive(cache, legacy, id) && denied.chains[id] === undefined) continue;
+        const node = displayNode(id);
+        node.head = false;
+        node.rising = null;
+        node.pages = 0;
+        const target = headStart(cache, legacy, id);
+        if (target !== null) fresh.push(target);
       }
-      if (best === null) break;
-      const under = floorMs > 0 && best.time <= floorMs;
-      if (best.step === "entry") {
-        if (under || (count >= limit && best.time !== lastMs)) {
-          more = true;
-          break;
-        }
-        chosen.push(best);
-        count += best.count;
-        lastMs = best.time;
-        pointers.set(best.id, best.seq);
-        continue;
-      }
-      // The chain is listed or opened before its next entry is known; best.time bounds the time of
-      // that entry from above. A chain that lies before this page is left for a later page.
-      if (under || (count >= limit && best.time < lastMs)) {
-        more = true;
-        done.add(best.id);
-        continue;
-      }
-      const node = displayNode(best.id);
-      if (best.step === "open") {
-        if (opens <= 0) {
-          more = true;
-          break;
-        }
-        opens -= 1;
-        const objects = await readChainObjects(
-          turn, best.seqs.map(function (seq) { return { id: best.id, seq: seq }; }), budget.reads);
-        for (const seq of best.seqs) {
-          if (legacyEntry(keys, best.id, seq, objects, budget.reads) === null) {
-            displayEntries.set(best.id + ":" + seq, {
-              id: "2:" + best.id + ":" + seq, time_ms: 0, count: 1, items: openEntryItems(best.id, seq, null, 0),
-            });
+      // The first pages of those listings are asked for together, LEGACY_LISTING_NODES chains
+      // with one request for their addresses.
+      for (let at = 0; at < fresh.length && budget.lists > 0; at += LEGACY_LISTING_NODES) {
+        const batch = fresh.slice(at, at + Math.min(LEGACY_LISTING_NODES, budget.lists));
+        budget.lists -= batch.length;
+        await loadChainKeys(turn, batch, budget.reads);
+        for (const target of batch) {
+          if (target.entries !== undefined) {
+            takeHeadPage(target.id, target);
+            continue;
           }
-        }
-        const top = displayEntries.get(best.id + ":" + sortedSeqs(node)[0]);
-        if (top !== undefined) cache.tops[best.id] = { seq: sortedSeqs(node)[0], time_ms: top.time_ms };
-        continue;
-      }
-      if (budget.lists <= 0) {
-        more = true;
-        break;
-      }
-      if (best.step === "top") {
-        const top = best.hint === null ? await findChainTop(turn, best.id, budget) : best.hint.seq;
-        const target = { id: best.id, after: Math.max(0, top - LEGACY_DISPLAY_LIST) };
-        if (top >= 0 && budget.lists > 0) {
-          budget.lists -= 1;
-          await loadChainKeys(turn, [target], budget.reads);
-        }
-        if (target.last === undefined) {
+          tried.add(target.id);
+          out.add(target.id);
           more = true;
-          done.add(best.id);
-          continue;
-        }
-        if (node.candidates.size === 0) node.exhausted = true;
-      } else {
-        budget.lists -= 1;
-        const below = node.floor;
-        const target = { id: best.id, after: Math.max(0, below - LEGACY_DISPLAY_LIST - 1), below: below };
-        await loadChainKeys(turn, [target], budget.reads);
-        if (target.last === undefined) {
-          more = true;
-          done.add(best.id);
-          continue;
         }
       }
-      const seqs = sortedSeqs(node);
-      if (seqs.length > 0) {
-        const latest = topTime(node);
-        if (latest > 0) cache.tops[best.id] = { seq: seqs[0], time_ms: latest };
+      for (const id of ids) {
+        const noted = denied.chains[id];
+        if (noted === undefined) continue;
+        const lowest = noted.reduce(function (least, read) { return Math.min(least, read.after); }, Infinity);
+        tried.add(id);
+        let state = await readChainHead(turn, cache, legacy, id, budget);
+        const node = displayNode(id);
+        while (state === "ready" && !node.exhausted && node.floor > lowest + 1) state = await readChainBelow(turn, id, budget);
+        if (state !== "ready") {
+          more = true;
+          if (state === "failed") out.add(id);
+        }
       }
     }
-    if (round >= turns) more = true;
-    const objects = await readChainObjects(turn, chosen, budget.reads);
+    const turns = limit + 4 * ids.length + 3 * LEGACY_SCREEN_LISTS + 16;
+    let chosen = [];
+    let objects = new Map();
+    let partial = false;
+    for (let walk = 0; walk < LEGACY_ANCHOR_WALKS; walk += 1) {
+      const picked = new Map();
+      for (const id of ids) picked.set(id, new Set());
+      const done = new Set(out);
+      let count = 0;
+      let lastMs = 0;
+      let round = 0;
+      chosen = [];
+      partial = false;
+      for (; round < turns; round += 1) {
+        let best = null;
+        for (const id of ids) {
+          if (done.has(id)) continue;
+          const next = nextOfChain(cache, legacy, id, picked.get(id), beforeMs, tried);
+          if (next === null) {
+            done.add(id);
+            continue;
+          }
+          if (best === null || next.time > best.time || (next.time === best.time && next.id < best.id)) best = next;
+        }
+        if (best === null) break;
+        const under = floorMs > 0 && best.time <= floorMs;
+        if (best.step === "entry") {
+          if (under || (count >= limit && best.time !== lastMs)) {
+            partial = true;
+            break;
+          }
+          chosen.push(best);
+          count += best.count;
+          lastMs = best.time;
+          picked.get(best.id).add(best.seq);
+          continue;
+        }
+        // The chain is listed or opened before its next entry is known; best.time bounds the time
+        // of that entry from above. A chain that lies before this page is left for a later page.
+        if (under || (count >= limit && best.time < lastMs)) {
+          partial = true;
+          done.add(best.id);
+          continue;
+        }
+        if (best.step === "open") {
+          if (opens <= 0) {
+            partial = true;
+            break;
+          }
+          opens -= 1;
+          const read = await readChainObjects(
+            turn, best.seqs.map(function (seq) { return { id: best.id, seq: seq }; }), budget.reads);
+          for (const seq of best.seqs) openedEntry(keys, best.id, seq, read, budget.reads);
+          continue;
+        }
+        if (budget.lists <= 0) {
+          partial = true;
+          break;
+        }
+        let state = "ready";
+        if (best.step === "top") {
+          tried.add(best.id);
+          state = await readChainHead(turn, cache, legacy, best.id, budget);
+        } else {
+          state = await readChainBelow(turn, best.id, budget);
+        }
+        if (state !== "ready") {
+          // A listing that failed leaves the chain out of this page. One that the listings of
+          // this call did not reach the end of shows what was named so far when it is the
+          // listing of the end of the chain, and nothing further down when it is a range below.
+          partial = true;
+          if (state === "failed") out.add(best.id);
+          if (state === "failed" || best.step === "below") done.add(best.id);
+        }
+      }
+      if (round >= turns) partial = true;
+      // The entries of the page are read, and with them the entry under the lowest seq the
+      // screen knows of every chain that goes on below.
+      const bottoms = [];
+      for (const id of ids) {
+        const node = displayNode(id);
+        if (out.has(id) || node.exhausted || node.floor <= 1) continue;
+        const bottom = chainBottom(id);
+        if (bottom !== null && bottom.state === "unread") bottoms.push({ id: id, seq: bottom.seq });
+      }
+      const taken = new Set(chosen.map(function (item) { return item.id + ":" + item.seq; }));
+      objects = await readChainObjects(
+        turn, chosen.concat(bottoms.filter(function (item) { return !taken.has(item.id + ":" + item.seq); })), budget.reads);
+      for (const item of chosen) legacyEntry(keys, item.id, item.seq, objects, budget.reads);
+      let loose = false;
+      for (const item of bottoms) {
+        if (unverifiedEntry(openedEntry(keys, item.id, item.seq, objects, budget.reads))) loose = true;
+      }
+      // A chain that stands on a seq that holds no entry of its node: the walk is made again,
+      // and reads that chain on below at once.
+      if (!loose || budget.lists <= 0) break;
+    }
+    if (partial) more = true;
     const entries = [];
     for (const item of chosen) {
       const entry = legacyEntry(keys, item.id, item.seq, objects, budget.reads);
       if (entry !== null) entries.push(placedEntry(entry, item.time));
+    }
+    // What the screen knows of the end of each chain it listed is kept for the next runtime: the
+    // last seq the device knows the node wrote (the last seq the screen knows when it knows of
+    // none), and the latest time a key of the chain names. That time is kept only for a chain
+    // whose end lies among the keys the screen knows (it stands on an entry the node wrote, or
+    // was read down to its first seq, and its end was listed): a later runtime leaves such a
+    // chain unlisted until a page reaches that time.
+    const noted = loadDenied().chains;
+    for (const id of ids) {
+      const node = displayNode(id);
+      if (node.floor === 0) continue;
+      const seqs = sortedSeqs(node);
+      const bottom = chainBottom(id);
+      const sound = node.exhausted || node.floor <= 1 || (bottom !== null && bottom.state === "verified");
+      if (seqs.length > 0) {
+        let latest = node.latest;
+        for (let at = 0; latest === 0 && at < seqs.length && at < LEGACY_SEQ_READS; at += 1) {
+          const opened = displayEntries.get(id + ":" + seqs[at]);
+          if (opened !== undefined && !unverifiedEntry(opened)) latest = opened.time_ms;
+        }
+        const written = writtenSeq(legacy, id);
+        cache.tops[id] = { seq: written > 0 ? written : seqs[0], time_ms: sound && node.head ? latest : 0, anchored: true };
+      }
+      if (!sound && !out.has(id) && bottom !== null && bottom.state === "unverified") {
+        more = true;
+        if (denyChain(id, node.floor - 1) && budget.reads !== undefined) budget.reads.judge = true;
+      } else if (noted[id] !== undefined && serveChain(id) && budget.reads !== undefined) {
+        budget.reads.judge = true;
+      }
     }
     return { entries: entries, more: more };
   }
@@ -6319,7 +6687,12 @@
     const tops = kept.tops !== null && typeof kept.tops === "object" ? kept.tops : {};
     for (const id of Object.keys(tops)) {
       if (NODE_ID.test(id) && tops[id] !== null && typeof tops[id] === "object") {
-        cache.tops[id] = { seq: whole(tops[id].seq), time_ms: whole(tops[id].time_ms) };
+        // The time counts when the value says it was kept by the rule of chainPage (anchored).
+        // A time kept without that is the time the last keys of a listing named, and a key
+        // someone else wrote names any time: such a chain is listed at the next opening.
+        cache.tops[id] = {
+          seq: whole(tops[id].seq), time_ms: tops[id].anchored === true ? whole(tops[id].time_ms) : 0, anchored: true,
+        };
       }
     }
     for (const id of Array.isArray(kept.found) ? kept.found : []) {
@@ -6613,12 +6986,13 @@
   // reads what was held back, or until the last of them is LOG_DENIED_KEPT_MS old: the screen
   // then made no such read for that long, and a mark that nothing confirms any more ends.
 
-  /** The reads held back from the screen that the screen has not read since: {pages, chains}.
-   *  pages are the later pages, the earliest first: [{t, before_ms, limit}] (the time the read
-   *  was noted, the lowest time a page held back on its day begins below, the most events such
-   *  a page was asked for). chains maps a node id to the listings of its chain, the earliest
-   *  first: [{t, after, deep}] (the lowest seq a listing held back on its day began after, and
-   *  whether one of them was a listing below the keys the screen knew). A read noted that is
+  /** The reads held back from the screen that the screen has not read since: {pages, chains,
+   *  filled}. pages are the later pages, the earliest first: [{t, before_ms, limit}] (the time
+   *  the read was noted, the lowest time a page held back on its day begins below, the most
+   *  events such a page was asked for). chains maps a node id to the listings of its chain, the
+   *  earliest first: [{t, after}] (the lowest seq a listing held back on its day began after).
+   *  filled are the days on which a page of the screen held no entry of format 3 because every
+   *  key it took was no entry, with keys left below: [{t}]. A read noted that is
    *  LOG_DENIED_KEPT_MS old is left out, unless it is among reads that mark the log and the
    *  last of those is younger than that. A time that lies after now is the clock of the device
    *  having run backwards: it counts as now. */
@@ -6647,13 +7021,12 @@
           ? { t: 0, before_ms: whole(item.before_ms), limit: Math.max(1, whole(item.limit)) } : null;
       }),
       chains: Object.create(null),
+      filled: reads(kept.filled, function () { return { t: 0 }; }),
     };
     const chains = kept.chains !== null && typeof kept.chains === "object" ? kept.chains : {};
     for (const id of Object.keys(chains).slice(0, LOG_DENIED_CHAINS)) {
       if (!NODE_ID.test(id)) continue;
-      const list = reads(chains[id], function (item) {
-        return { t: 0, after: whole(item.after), deep: item.deep === true };
-      });
+      const list = reads(chains[id], function (item) { return { t: 0, after: whole(item.after) }; });
       if (list.length > 0) denied.chains[id] = list;
     }
     return denied;
@@ -6675,8 +7048,10 @@
       return a[0] !== b[0] ? a[0] - b[0] : a[1] - b[1];
     });
     for (const id of ids.slice(0, Math.max(0, ids.length - LOG_DENIED_CHAINS))) delete denied.chains[id];
-    const empty = denied.pages.length === 0 && Object.keys(denied.chains).length === 0;
-    storeJson(STORE_DENIED, empty ? null : denied);
+    const empty = denied.pages.length === 0 && Object.keys(denied.chains).length === 0 && denied.filled.length === 0;
+    const stored = { pages: denied.pages, chains: denied.chains };
+    if (denied.filled.length > 0) stored.filled = denied.filled;
+    storeJson(STORE_DENIED, empty ? null : stored);
   }
 
   /** Whether a list of reads held back ([{t}], the earliest first) marks the log at the time
@@ -6691,6 +7066,7 @@
     let first = 0;
     const lists = Object.keys(denied.chains).map(function (id) { return denied.chains[id]; });
     lists.push(denied.pages);
+    lists.push(denied.filled);
     for (const reads of lists) {
       if (heldLong(reads, now) && (first === 0 || reads[0].t < first)) first = Math.max(1, reads[0].t);
     }
@@ -6724,18 +7100,17 @@
   }
 
   /** Ends the later pages held back that the screen has read itself since: the listings it
-   *  holds in this runtime name the keys of the page (ownPage), or the page it read now begins
-   *  at or below the time of that page (beforeMs; Infinity for the page that begins the two
-   *  listings) for as many events or more (limit). Returns whether the later pages held back
+   *  holds in this runtime name the keys of the page (ownPage). The screen reads those listings
+   *  on from the start of the two listings, each page from the last key of the page before it,
+   *  so a note ends only when the screen was given the listings from the first page down to that
+   *  page (below the keys the screen keeps, where a page is listed from the marker of its time:
+   *  when it was given the listing of that very page). Returns whether the later pages held back
    *  marked the log and no longer do. */
-  function servePage(beforeMs, limit) {
+  function servePage() {
     const denied = loadDenied();
     if (denied.pages.length === 0) return false;
     const now = native.nowMs();
-    const left = denied.pages.filter(function (kept) {
-      const below = beforeMs <= kept.before_ms && limit >= kept.limit;
-      return !below && ownPage(kept.before_ms, kept.limit) === null;
-    });
+    const left = denied.pages.filter(function (kept) { return ownPage(kept.before_ms, kept.limit) === null; });
     if (left.length === denied.pages.length) return false;
     const marked = heldLong(denied.pages, now);
     denied.pages = left;
@@ -6744,44 +7119,59 @@
   }
 
   /** Notes a listing of the chain of node id that was held back from the screen (after: the
-   *  seq the listing began after; below: whether it was a listing below the keys the screen
-   *  knows). Returns whether the listings of that chain held back mark the log now. */
-  function denyChain(id, after, below) {
+   *  seq the listing began after). Returns whether the listings of that chain held back mark
+   *  the log now. */
+  function denyChain(id, after) {
     const now = native.nowMs();
     const denied = loadDenied();
     const reads = denied.chains[id] === undefined ? [] : denied.chains[id];
-    noteDenied(reads, now, { t: now, after: after, deep: below }, function (last) {
+    noteDenied(reads, now, { t: now, after: after }, function (last) {
       last.after = Math.min(last.after, after);
-      if (below) last.deep = true;
     });
     denied.chains[id] = reads;
     saveDenied(denied);
     return heldLong(reads, now);
   }
 
-  /** Ends the listings of the chain of node id held back that a listing the screen read itself
-   *  covers (target: {after, below, probe, more}): a listing below the keys the screen knows
-   *  that begins at or below the seq the one held back began after; or a listing that reaches
-   *  the end of the chain, when it begins at or below that seq or when every listing held back
-   *  with it was one of the end of the chain (what such a listing would have named and this one
-   *  does not name lies below it now, where a listing below the keys the screen knows is what
-   *  names it). A listing that only looks for the end of a chain ends nothing. Returns whether
-   *  the listings of that chain held back marked the log and no longer do. */
-  function serveChain(id, target) {
-    if (target.probe === true || (target.below === undefined && target.more === true)) return false;
+  /** Ends the listings of the chain of node id held back that the screen has read itself since:
+   *  at this opening it read the listing of the end of the chain to its end (head), it knows
+   *  every key from the seq after the one such a listing began after (floor), and the lowest seq
+   *  it knows holds an entry the node wrote (chainBottom), or it read the chain down to its
+   *  first seq. The screen then read the chain from its end down to that place, and what it
+   *  shows of the chain is what the node wrote. Returns whether the listings of that chain held
+   *  back marked the log and no longer do. */
+  function serveChain(id) {
+    const node = displayNode(id);
+    if (!node.head) return false;
     const denied = loadDenied();
     const reads = denied.chains[id];
     if (reads === undefined) return false;
+    const entire = node.exhausted || node.floor <= 1;
+    const bottom = chainBottom(id);
+    if (!entire && (bottom === null || bottom.state !== "verified")) return false;
     const now = native.nowMs();
-    const left = reads.filter(function (kept) {
-      return target.after > kept.after && (target.below !== undefined || kept.deep);
-    });
+    const left = reads.filter(function (kept) { return !entire && node.floor > kept.after + 1; });
     if (left.length === reads.length) return false;
     const marked = heldLong(reads, now);
     if (left.length === 0) delete denied.chains[id];
     else denied.chains[id] = left;
     saveDenied(denied);
     return marked && !heldLong(left, now);
+  }
+
+  /** Notes that a page of the screen held no entry of format 3 because
+   *  every key it took was no entry (an object under a node id the store holds no node document
+   *  of), with keys left below: objects that are no entries take the places of entries on the
+   *  screen. One note for a day (noteDenied); three of them, the first three days old, mark the
+   *  log as reads held back do. Nothing the screen reads ends such a note: while the objects
+   *  keep the pages, every opening notes it again, and a note ends by its age. Returns whether
+   *  such pages mark the log now. */
+  function denyFilled() {
+    const now = native.nowMs();
+    const denied = loadDenied();
+    noteDenied(denied.filled, now, { t: now }, noop);
+    saveDenied(denied);
+    return heldLong(denied.filled, now);
   }
 
   // ---- The summary of the last LOG_SUMMARY_DAYS days ----
@@ -7029,9 +7419,105 @@
     return full ? page : null;
   }
 
+  /** Reads the listings the screen holds on where they stopped: one request
+   *  for the next page of each of the two listings that goes on, from the markers of the store,
+   *  and the keys join the ones the screen holds. The request is the same whoever has the
+   *  listings read on (a page the user scrolls to, or the reading down to a page noted as held
+   *  back): each begins at the last key of the page before it. Returns whether a listing was read
+   *  on (false: neither goes on, or the screen holds LOG_SCREEN_KEYS keys). Throws a store
+   *  failure. */
+  async function readOnListings(turn) {
+    const wanted = [];
+    let held = 0;
+    for (const letter of ["c", "u"]) {
+      const listing = screenListings[letter];
+      held += listing.keys.length;
+      if (listing.truncated) {
+        wanted.push({ prefix: letter, key_marker: listing.next_key_marker, version_id_marker: listing.next_version_id_marker });
+      }
+    }
+    if (wanted.length === 0 || held >= LOG_SCREEN_KEYS) return false;
+    const pages = await readListings(turn, wanted);
+    for (let at = 0; at < wanted.length; at += 1) {
+      const listing = screenListings[wanted[at].prefix];
+      for (const parsed of pages[at].keys) {
+        if (listing.tails.has(parsed.tail)) continue;
+        listing.tails.add(parsed.tail);
+        listing.keys.push(parsed);
+      }
+      listing.truncated = pages[at].truncated;
+      listing.next_key_marker = pages[at].next_key_marker;
+      listing.next_version_id_marker = pages[at].next_version_id_marker;
+    }
+    return true;
+  }
+
+  /** Joins the keys the screen held below the first listing pages it
+   *  read now (held: the listings of the opening before, when they began at the start of the two
+   *  listings): where a new first page goes on and its last key is one the screen held, the keys
+   *  it held after that key follow it, with the place where that listing stopped. An opening so
+   *  reads on from where the one before it stopped, and not from the first page again. */
+  function keepListed(held) {
+    for (const letter of ["c", "u"]) {
+      const fresh = screenListings[letter];
+      const old = held[letter];
+      if (old === fresh || !fresh.truncated || fresh.keys.length === 0) continue;
+      const last = fresh.keys[fresh.keys.length - 1].tail;
+      const at = old.keys.findIndex(function (parsed) { return parsed.tail === last; });
+      if (at < 0) continue;
+      for (const parsed of old.keys.slice(at + 1)) {
+        if (fresh.tails.has(parsed.tail)) continue;
+        fresh.tails.add(parsed.tail);
+        fresh.keys.push(parsed);
+      }
+      fresh.truncated = old.truncated;
+      fresh.next_key_marker = old.next_key_marker;
+      fresh.next_version_id_marker = old.next_version_id_marker;
+    }
+  }
+
+  /** Reads the listings of the screen down to the later pages noted as
+   *  held back from it (log.denied), at an opening of the screen: while such a page is noted and
+   *  the listings the screen holds, from the start of the two listings, do not name its keys,
+   *  they are read on (LOG_CATCHUP_READS requests at most for one opening; within a runtime the
+   *  next opening reads on from where this one stopped). The requests are the ones a user who
+   *  scrolls that far has the screen send, each from the last key of the page before it, and
+   *  the screen makes its later pages from what they name. So a note ends at the next opening
+   *  the backend answers, whether or not the user scrolls down again, and the operator domain
+   *  ends it only by giving this screen the listings from the first page down to that page
+   *  (servePage). A request that is held back is noted for its day, at the time the listings
+   *  reach down to. */
+  async function readDownToDenied(turn, keys) {
+    const started = native.nowMs();
+    for (let step = 0; step < LOG_CATCHUP_READS; step += 1) {
+      if (screenListings === null || screenListings.top !== Infinity) return;
+      const open = loadDenied().pages.filter(function (kept) { return ownPage(kept.before_ms, kept.limit) === null; });
+      if (open.length === 0) break;
+      let read = false;
+      try {
+        read = await readOnListings(turn);
+      } catch (failure) {
+        if (!isStoreFailure(failure) || !(turnLeft(turn) > 0)) throw failure;
+        const refused = failure.kind === "absent" || failure.kind === "blocked";
+        if (refused || (failure.kind === "silent" && await reachJudged(turn, started))) {
+          let reached = 0;
+          for (const letter of ["c", "u"]) {
+            const listing = screenListings[letter];
+            if (listing.truncated && listing.keys.length > 0) reached = Math.max(reached, listing.keys[listing.keys.length - 1].time_ms);
+          }
+          if (reached > 0 && denyPage(reached, LOG_SCREEN_EVENTS)) requestRound(freeTurn(), keys, "sync").then(noop, noop);
+        }
+        return;
+      }
+      if (!read) break;
+    }
+    if (screenListings !== null && servePage()) requestRound(freeTurn(), keys, "sync").then(noop, noop);
+  }
+
   /** One later page of the screen: the entries before beforeMs, read without a round. The keys
-   *  of the page are taken from the listings of format 3 the screen read in this runtime, or,
-   *  below them, from the two listings read from the marker of that time. The entries of the
+   *  of the page are taken from the listings of format 3 the screen holds in this runtime, read
+   *  on from the start of the two listings as far as the page, or, below the keys the screen
+   *  keeps, from the two listings read from the marker of that time. The entries of the
    *  page come from the backend, each verified as a round verifies it; what the page finds
    *  changes no kept judgement (the rounds judge). An entry the rounds read for the screen
    *  (log.recovered) is taken from there and not asked for. A read the page finds held back (its
@@ -7040,9 +7526,8 @@
    *  When the listings of the page are held back and the rounds kept a listing page that covers
    *  that time, the page is made from it; when they kept none, the read is noted among the later
    *  pages held back from the screen (log.denied), and listings the screen then reads itself
-   *  that name the keys of that page, or that begin at or below its time, end it (servePage).
-   *  The entries of the chains of format 1 and format 2 are merged in. Returns the page of
-   *  mergePage. */
+   *  that name the keys of that page end it (servePage). The entries of the chains of format 1
+   *  and format 2 are merged in. Returns the page of mergePage. */
   async function readPage(turn, keys, cache, beforeMs, limit) {
     const started = native.nowMs();
     let chosen = { chosen: [], more: false, count: 0 };
@@ -7060,9 +7545,24 @@
     let unread = false;
     let listings = null;
     // The listings the screen read in this runtime name the keys of the page when they reach
-    // that far: no listing is asked for then.
-    const own = ownPage(beforeMs, limit);
+    // that far: no listing is asked for then. When they do not reach it, they are read on where
+    // they stopped (LOG_PAGE_READS requests at most), and a screen that holds none that begin
+    // at or above the page reads the first pages of the two listings before that. So a later
+    // page is made from listings that go on from the start of the two listings, each from the
+    // last key of the one before it. The listings from the marker of the time of the page are
+    // asked for only when those reads do not reach it: the screen holds as many keys as it
+    // keeps, or the page lies further below than they read on.
+    let own = ownPage(beforeMs, limit);
     try {
+      if (own === null && (screenListings === null || beforeMs > screenListings.top)) {
+        const top = await readListings(turn, screenPages(0));
+        screenListings = { c: top[0], u: top[1], top: Infinity };
+        own = ownPage(beforeMs, limit);
+      }
+      for (let step = 0; own === null && step < LOG_PAGE_READS; step += 1) {
+        if (!(await readOnListings(turn))) break;
+        own = ownPage(beforeMs, limit);
+      }
       if (own === null) listings = await readListings(turn, screenPages(beforeMs));
     } catch (failure) {
       if (!isStoreFailure(failure) || !(turnLeft(turn) > 0)) throw failure;
@@ -7095,9 +7595,9 @@
     }
     if (listings !== null || own !== null) {
       run.pagesRead.add(beforeMs);
-      // The later pages held back that this read covers end here; when they marked the log and
-      // no longer do, a round judges and publishes that now.
-      if (servePage(beforeMs, limit)) requestRound(freeTurn(), keys, "sync").then(noop, noop);
+      // The later pages held back whose keys the listings of the screen now name end here; when
+      // they marked the log and no longer do, a round judges and publishes that now.
+      if (servePage()) requestRound(freeTurn(), keys, "sync").then(noop, noop);
       dropRecoveredPage(keys, recovered, beforeMs);
     }
     if (chosen.chosen.length > 0) {
@@ -7119,12 +7619,17 @@
     saveWithheld(run);
     if (unread && chosen.chosen.length === 0) throw native.error("log_store_unreachable", "log screen");
     const first = [];
+    // The keys taken for the page that are no entries.
+    let passed = 0;
     for (const parsed of chosen.chosen) {
       const kept = recovered.entries.get("3:" + parsed.tail);
       if (kept !== undefined) {
         if (kept.e !== null) first.push(kept.e);
+        else passed += 1;
       } else if (!junk.has(parsed.key)) {
         first.push(entryOfRecord(parsed, records.get(parsed.key)));
+      } else {
+        passed += 1;
       }
     }
     const floorMs = pageFloor(chosen, first, limit);
@@ -7144,7 +7649,40 @@
     if (failed !== null && failed.kind !== "absent" && first.length === 0) {
       throw native.error("log_store_unreachable", "log screen");
     }
-    return mergePage(first, chains.entries, limit, chosen.more || chains.more, floorMs);
+    const page = mergePage(first, chains.entries, limit, chosen.more || chains.more, floorMs);
+    page.taken = chosen.chosen.length;
+    page.passed = passed;
+    return page;
+  }
+
+  /** Reads a page of the screen on below the keys it passed: a key taken for a page that turned
+   *  out to be no entry (an object under a node id the store holds no node document of) left its
+   *  place on the page empty, and the page is read on below it as a later page is read,
+   *  LOG_SCREEN_REFILLS times at most (page: what readPage returns, with taken and passed, the
+   *  keys of format 3 the last read took and how many of them were no entries). When every key
+   *  the last read took was no entry and keys are left below, objects that are no entries keep
+   *  entries off the screen: that is noted for its day (denyFilled), and a round judges at once
+   *  when such notes mark the log. Returns the page. */
+  async function fillPage(turn, keys, cache, page, limit) {
+    let full = page;
+    let last = page;
+    for (let refill = 0; refill < LOG_SCREEN_REFILLS && last.passed > 0 && full.has_more && full.last_ms > 0 &&
+        full.items.length < limit; refill += 1) {
+      try {
+        last = await readPage(turn, keys, cache, full.last_ms, limit - full.items.length);
+      } catch (failure) {
+        if (failureCode(failure) !== "log_store_unreachable") throw failure;
+        return full;
+      }
+      full = {
+        entries: full.entries.concat(last.entries), items: full.items.concat(last.items), last_ms: last.last_ms,
+        has_more: last.has_more,
+      };
+    }
+    if (last.taken > 0 && last.passed === last.taken && full.has_more) {
+      if (denyFilled()) requestRound(freeTurn(), keys, "sync").then(noop, noop);
+    }
+    return full;
   }
 
   /** The first page of the screen and the summary, read from the store: one round started by the
@@ -7198,11 +7736,12 @@
     let passed = 0;
     // The listings this read gave the screen name the keys of its later pages as far as they
     // reach.
+    const held = screenListings;
     screenListings = round.pages.c !== null && round.pages.u !== null
       ? { c: round.pages.c, u: round.pages.u, top: Infinity } : null;
     // The later pages held back from the screen whose keys those listings name end here; when
     // they marked the log and no longer do, a round judges and publishes that now.
-    if (screenListings !== null && servePage(Infinity, 0)) requestRound(freeTurn(), keys, "sync").then(noop, noop);
+    if (screenListings !== null && servePage()) requestRound(freeTurn(), keys, "sync").then(noop, noop);
     if (plan !== null) {
       cache.listed_ms = began;
       for (const parsed of plan.chosen.chosen) {
@@ -7313,23 +7852,12 @@
     }
     saveChainReads(keys, reads, nodesHeld, nodesRead);
     timing.summary = Math.max(0, native.nowMs() - began);
-    let page = mergePage(first, chains.entries, limit, more || chains.more, floorMs);
-    // Keys chosen for the page that turned out to be no entries (objects under a node id the
-    // store holds no node document of) left their places on the page empty: the page is read on
-    // below them, as a later page is read, LOG_SCREEN_REFILLS times at most.
-    for (let refill = 0; refill < LOG_SCREEN_REFILLS && passed > 0 && page.has_more && page.last_ms > 0 && page.items.length < limit; refill += 1) {
-      let rest = null;
-      try {
-        rest = await readPage(turn, keys, cache, page.last_ms, limit - page.items.length);
-      } catch (failure) {
-        if (failureCode(failure) !== "log_store_unreachable") throw failure;
-        break;
-      }
-      page = {
-        entries: page.entries.concat(rest.entries), items: page.items.concat(rest.items), last_ms: rest.last_ms,
-        has_more: rest.has_more,
-      };
-    }
+    const merged = mergePage(first, chains.entries, limit, more || chains.more, floorMs);
+    merged.taken = plan === null ? 0 : plan.chosen.chosen.length;
+    merged.passed = passed;
+    // Keys taken for the page that turned out to be no entries left their places on the page
+    // empty: the page is read on below them (fillPage).
+    const page = await fillPage(turn, keys, cache, merged, limit);
     // What the device keeps: the entries of the page up to LOG_KEEP_EVENTS events, and the tally.
     const kept = [];
     let keptEvents = 0;
@@ -7345,6 +7873,17 @@
     saveCache(keys, cache);
     timing.total = Math.max(0, native.nowMs() - began);
     round.report(timing);
+    // The keys the screen held below the first pages it read now stay with it, and while later
+    // pages are noted as held back from it, the listings are read on down to them: on the line
+    // of the screen, after this read, which does not wait for it.
+    if (screenListings !== null) {
+      if (held !== null && held.top === Infinity) keepListed(held);
+      if (loadDenied().pages.length > 0) {
+        screenLine.run(freeTurn(), function () {
+          return readDownToDenied(newTurn(PROCEDURE_LIMIT_MS, ""), keys);
+        }).then(noop, noop);
+      }
+    }
     return { page: page, summary: summaryResult(tally, since, truncated), log: round.log };
   }
 
@@ -7362,37 +7901,41 @@
    *  counted range (the one nearest to it first) and the entries below it (the one nearest to it
    *  first), read in one batch (LOG_SUMMARY_ENTRIES entries at most in the window). The counted
    *  range of a chain stays one range: the count of a chain stops at the first entry that was not
-   *  read. A chain whose known end lies in the window and whose keys of the window the screen has
-   *  not listed is listed once per call. A key of format 1 names no time and ends the descent of
-   *  its chain (the releases that wrote format 1 ended before any window this program counts).
-   *  Returns whether entries of the window remain uncounted. */
+   *  read. A seq whose keys name a time before the window is passed over, wherever it lies in the
+   *  chain. The keys below the ones the screen knows of a chain are read once per call while
+   *  what lies there may lie in the window: the entry under the lowest seq the screen knows lies
+   *  in it, or is no entry of the node (chainBottom; while that entry is not read, the time its
+   *  key names stands in). A chain whose end the page did not list to its end at this opening
+   *  leaves the count open. A key of format 1 names no time and ends the descent of its chain
+   *  (the releases that wrote format 1 ended before any window this program counts). Returns
+   *  whether entries of the window remain uncounted. */
   async function countChains(turn, keys, cache, tally, since, budget) {
     const legacy = loadLegacy();
     const ids = chainNodes(cache);
-    const targets = [];
+    let uncounted = false;
+    const reaches = function (id) {
+      const node = displayNode(id);
+      if (node.exhausted || node.floor <= 1) return false;
+      const bottom = chainBottom(id);
+      if (bottom === null) return node.head;
+      if (bottom.state === "verified") return bottom.time_ms >= since;
+      if (bottom.state === "unverified") return true;
+      const facts = keyFacts(node, bottom.seq);
+      return facts !== null && facts.time_ms >= since;
+    };
     for (const id of ids) {
       const node = displayNode(id);
-      const seqs = sortedSeqs(node);
-      if (node.exhausted || targets.length >= budget.lists) continue;
-      if (seqs.length === 0) {
+      if (!node.head) {
         const hint = chainHint(cache, legacy, id);
-        if (hint !== null && hint.time_ms >= since) {
-          targets.push({ id: id, after: Math.max(0, hint.seq - LEGACY_DISPLAY_LIST) });
-        }
-        continue;
+        if (node.candidates.size > 0 || hint === null || hint.time_ms === 0 || hint.time_ms >= since) uncounted = true;
+        if (node.candidates.size === 0) continue;
       }
-      const lowest = keyFacts(node, seqs[seqs.length - 1]);
-      if (lowest !== null && lowest.time_ms >= since && node.floor > 1) {
-        targets.push({ id: id, after: Math.max(0, node.floor - LEGACY_DISPLAY_LIST - 1), below: node.floor });
+      if (reaches(id)) {
+        if (budget.lists <= 0 || (await readChainBelow(turn, id, budget)) !== "ready") uncounted = true;
       }
-    }
-    if (targets.length > 0) {
-      budget.lists -= targets.length;
-      await loadChainKeys(turn, targets, budget.reads);
     }
     const plans = [];
     const wanted = [];
-    let uncounted = false;
     let room = Math.max(0, LOG_SUMMARY_ENTRIES - summaryEntries(tally, since));
     for (const id of ids) {
       const node = displayNode(id);
@@ -7405,12 +7948,7 @@
       };
       // Above the counted range from the seq nearest to it, below it from the seq nearest to it.
       const above = range === null ? [] : seqs.filter(function (seq) { return seq > range.hi; }).reverse();
-      const below = [];
-      for (const seq of seqs) {
-        if (range !== null && seq >= range.lo) continue;
-        if (!inWindow(seq)) break;
-        below.push(seq);
-      }
+      const below = seqs.filter(function (seq) { return (range === null || seq < range.lo) && inWindow(seq); });
       const plan = { id: id, above: [], below: [] };
       for (const seq of above) {
         if (!inWindow(seq)) continue;
@@ -7429,8 +7967,7 @@
         room -= 1;
         plan.below.push(seq);
       }
-      const lowest = keyFacts(node, seqs[seqs.length - 1]);
-      if (lowest !== null && lowest.time_ms >= since && !node.exhausted && node.floor > 1) uncounted = true;
+      if (reaches(id)) uncounted = true;
       if (plan.above.length + plan.below.length === 0) continue;
       plans.push(plan);
       for (const seq of plan.above.concat(plan.below)) wanted.push({ id: id, seq: seq });
@@ -9439,7 +9976,7 @@
     if (before === null) throw native.error("invalid_input", "before_ms");
     const keys = heldKeys();
     const cache = loadCache(keys);
-    const page = await readPage(turn, keys, cache, before, LOG_SCREEN_EVENTS);
+    const page = await fillPage(turn, keys, cache, await readPage(turn, keys, cache, before, LOG_SCREEN_EVENTS), LOG_SCREEN_EVENTS);
     const groups = displayGroups(page.items);
     const last = logPagePlaces.length === 0 ? null : logPagePlaces[logPagePlaces.length - 1];
     const next = last !== null && last.before_ms === before ? logPageAfter(page, last.rows, groups.length) : null;
@@ -9497,9 +10034,10 @@
     if (before === null && args.before_ms !== undefined && args.before_ms !== null) {
       throw native.error("invalid_input", "before_ms");
     }
+    const cache = before === null ? null : loadCache(keys);
     const page = before === null
       ? (await readScreen(turn, keys, limit)).page
-      : await readPage(turn, keys, loadCache(keys), before, limit);
+      : await fillPage(turn, keys, cache, await readPage(turn, keys, cache, before, limit), limit);
     const items = displayGroups(page.items).map(recordItem);
     return { items: items, next_before_ms: page.has_more && page.last_ms >= 1 ? page.last_ms : null };
   }
