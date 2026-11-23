@@ -11,11 +11,12 @@
 //!    the environment gives it (`launch`);
 //! 2. relays TCP 8080 to the listener of the node, vsock 16:8080 (`relay`);
 //! 3. relays the outbound connections of the node, vsock port 8443, to port 443 of the hosts of
-//!    the provider definitions and of the log store or, for a node of the forward role, to
-//!    port 443 of any host at a public address (`egress`);
+//!    the provider definitions and of the log store, for a node of the reserve role to port
+//!    443 of the host of the log store alone, and for a node of the forward role to port 443
+//!    of any host at a public address (`egress`);
 //! 4. sends the operator configuration to the node once the node answers: the client values
-//!    and the log store of a node of the delegation role, or the role of a node of the
-//!    forward role (`config`);
+//!    and the log store of a node of the delegation role, the role and the log store of a
+//!    node of the reserve role, or the role of a node of the forward role (`config`);
 //! 5. reports the state of the node, the life of the enclave and the counts of the two relays
 //!    on TCP 9091, `/healthz`, `/livez` and `/metrics` (`health`);
 //! 6. watches the enclave with `nitro-cli describe-enclaves` every 10 seconds (`watch`): when
@@ -24,10 +25,11 @@
 //!    again with a new enclave;
 //! 7. on SIGTERM logs the enclaves `nitro-cli` describes and lets the node hand on and finish
 //!    what must not end with it, then ends the enclave (`launch`). It closes the node, so that
-//!    the node begins no further use of a credential. In a pod of the delegation role it then
-//!    asks the backend to collect the state of the node and waits for a time that grows with
-//!    the delegations of the node (`drain`). In a pod of either role it waits for the calls
-//!    the node is in the middle of and for the connections of their callers (`calls`).
+//!    the node begins no further use of a credential. In a pod of the delegation role or of
+//!    the reserve role it then asks the backend to collect the state of the node and waits for
+//!    a time that grows with the delegations of the node (`drain`). In a pod of every role it
+//!    waits for the calls the node is in the middle of and for the connections of their
+//!    callers (`calls`).
 //!
 //! With the argument `drain` it makes the shutdown collection call of step 7 alone, logs its
 //! outcome and ends with the status 0 whatever the outcome: the pre-stop hook of the pod runs
@@ -38,13 +40,15 @@
 //! the OAuth client values of the operator and never writes them to its output.
 //!
 //! Environment: `CREDENTIAL_ENCLAVE_ROLE` (the role of the node of the pod: not set for the
-//! delegation role, `forward` for the forward role), `CHARACTER_API_BASE_URL` and the client
-//! values of `config`, `CREDENTIAL_ENCLAVE_LOG_BUCKET` and `CREDENTIAL_ENCLAVE_LOG_REGION` of
-//! the log store, `CREDENTIAL_ENCLAVE_MEMORY_MIB` of `launch`, and
-//! `CREDENTIAL_ENCLAVE_DRAIN_URL`, `CREDENTIAL_ENCLAVE_DRAIN_TOKEN` and
-//! `CREDENTIAL_ENCLAVE_POD_NAME` of `drain`. A pod of the forward role reads the first and the
-//! memory, and none of the others: its node holds no client value, has no log store and
-//! holds no delegation a shutdown could collect.
+//! delegation role, `reserve` for the reserve role, `forward` for the forward role),
+//! `CHARACTER_API_BASE_URL` and the client values of `config`,
+//! `CREDENTIAL_ENCLAVE_LOG_BUCKET` and `CREDENTIAL_ENCLAVE_LOG_REGION` of the log store,
+//! `CREDENTIAL_ENCLAVE_MEMORY_MIB` of `launch`, and `CREDENTIAL_ENCLAVE_DRAIN_URL`,
+//! `CREDENTIAL_ENCLAVE_DRAIN_TOKEN` and `CREDENTIAL_ENCLAVE_POD_NAME` of `drain`. A pod of the
+//! reserve role reads neither the base address nor a client value: its node calls no
+//! provider. A pod of the forward role reads the role and the memory, and none of the
+//! others: its node holds no client value, has no log store and holds no delegation a
+//! shutdown could collect.
 
 #![forbid(unsafe_code)]
 // The enclave ends with the host program, and a panic ends a connection or the program
@@ -244,9 +248,10 @@ async fn collect(drain: Option<Drain>, node: &dyn NodeConnector) {
 ///
 /// The node is closed first (`calls`), so that it begins no further use of a credential and
 /// its calls in progress end within a time that counts from here. In a pod of the delegation
-/// role the backend then collects the state of the node, and moves its delegations while its
-/// calls in progress end. A node of the forward role holds nothing to collect. Then the calls
-/// the node is in the middle of, and the connections of their callers, are waited for.
+/// role or of the reserve role the backend then collects the state of the node, and moves its
+/// delegations while its calls in progress end. A node of the forward role holds nothing to
+/// collect. Then the calls the node is in the middle of, and the connections of their
+/// callers, are waited for.
 ///
 /// With `enclave_ended` the watch confirmed that the enclave ended on its own: the node is
 /// gone and holds no call, so it is not closed and not waited for, and the collection tells
@@ -264,7 +269,7 @@ async fn hand_on_and_finish(
         false => Some(calls::Wait::begin(node, callers).await),
     };
     match role {
-        Role::Delegation => collect(drain, node).await,
+        Role::Delegation | Role::Reserve => collect(drain, node).await,
         Role::Forward => {}
     }
     if let Some(wait) = wait {
@@ -323,21 +328,11 @@ async fn run_drain() {
 /// relay connects to, the operator configuration, and the shutdown collection call.
 type Setup = (Reach, Result<Vec<u8>, ConfigError>, Option<Drain>);
 
-/// The setup of a pod of the delegation role: the egress relay connects to the hosts of the
-/// provider definitions and of the log store, the configuration carries the client values of
-/// the operator and the log store, and a shutdown asks the backend to collect the state of the
-/// node.
-fn delegation_setup() -> Result<Setup, String> {
-    let allowlist = Allowlist::from_definitions(DEFINITIONS)?;
-    let providers = config::provider_names(DEFINITIONS)?;
-    log(&format!(
-        "egress: port 443 of {} provider hosts",
-        allowlist.len()
-    ));
-    // The log store of the node: the configuration names it, and the egress relay lets the
-    // node reach it. Without it a node of the nitro platform refuses every use of a
-    // credential.
-    let log_store = match LogStore::from_variables(&variable) {
+/// The log store of the node of the pod, as the environment names it: the configuration
+/// names it, and the egress relay lets the node reach it. Without it a node of the nitro
+/// platform takes no grant and refuses every use of a credential.
+fn log_store_of_the_pod() -> Option<LogStore> {
+    match LogStore::from_variables(&variable) {
         Ok(Some(log_store)) => {
             log(&format!(
                 "log store: {} in {}, egress to port 443 of {}",
@@ -359,14 +354,13 @@ fn delegation_setup() -> Result<Setup, String> {
             log(&format!("log store: none, {reason}"));
             None
         }
-    };
-    let allowlist = match &log_store {
-        Some(log_store) => allowlist.with_log_store(log_store.host()),
-        None => allowlist,
-    };
-    log(&config::summary(&providers, &variable));
-    let operator_config = config::operator_config(&providers, &variable, log_store.as_ref());
-    let drain = match Drain::from_variables(&variable) {
+    }
+}
+
+/// The shutdown collection call of a pod whose node holds delegations, as the environment
+/// configures it.
+fn drain_of_the_pod() -> Option<Drain> {
+    match Drain::from_variables(&variable) {
         Ok(drain) => drain,
         Err(reason) => {
             log(&format!(
@@ -375,8 +369,53 @@ fn delegation_setup() -> Result<Setup, String> {
             ));
             None
         }
+    }
+}
+
+/// The setup of a pod of the delegation role: the egress relay connects to the hosts of the
+/// provider definitions and of the log store, the configuration carries the client values of
+/// the operator and the log store, and a shutdown asks the backend to collect the state of the
+/// node.
+fn delegation_setup() -> Result<Setup, String> {
+    let allowlist = Allowlist::from_definitions(DEFINITIONS)?;
+    let providers = config::provider_names(DEFINITIONS)?;
+    log(&format!(
+        "egress: port 443 of {} provider hosts",
+        allowlist.len()
+    ));
+    let log_store = log_store_of_the_pod();
+    let allowlist = match &log_store {
+        Some(log_store) => allowlist.with_log_store(log_store.host()),
+        None => allowlist,
     };
-    Ok((Reach::Listed(allowlist), operator_config, drain))
+    log(&config::summary(&providers, &variable));
+    let operator_config = config::operator_config(&providers, &variable, log_store.as_ref());
+    Ok((
+        Reach::Listed(allowlist),
+        operator_config,
+        drain_of_the_pod(),
+    ))
+}
+
+/// The setup of a pod of the reserve role: the egress relay connects to the host of the log
+/// store and to nothing else, the configuration names the role and the log store and carries
+/// no client value, and a shutdown asks the backend to collect the state of the node, as in a
+/// pod of the delegation role. A node of the reserve role holds delegations and uses no
+/// credential: the base address and the client values of the operator are not read.
+fn reserve_setup() -> Setup {
+    log("role: reserve, the node holds delegations and uses no credential");
+    log("egress: no provider host and no mail endpoint");
+    let log_store = log_store_of_the_pod();
+    let allowlist = match &log_store {
+        Some(log_store) => Allowlist::without_providers().with_log_store(log_store.host()),
+        None => Allowlist::without_providers(),
+    };
+    log("operator configuration: the reserve role, no client value");
+    (
+        Reach::Listed(allowlist),
+        Ok(config::reserve_config(log_store.as_ref())),
+        drain_of_the_pod(),
+    )
 }
 
 /// The setup of a pod of the forward role: the egress relay connects to port 443 of any host
@@ -410,6 +449,7 @@ async fn run() -> Result<(), String> {
     let role = Role::from_variables(&variable)?;
     let (reach, operator_config, drain) = match role {
         Role::Delegation => delegation_setup()?,
+        Role::Reserve => reserve_setup(),
         Role::Forward => forward_setup(),
     };
 
@@ -484,11 +524,12 @@ async fn run() -> Result<(), String> {
         node.clone(),
     )));
     match (role, operator_config) {
-        // A node takes its role once, and a call of the delegation role gives a node without
-        // a role that role. So the node of this pod takes the forward role before the inbound
-        // relay lets a caller reach it, and a node that refuses the role ends the program:
-        // the container starts again with a new enclave.
-        (Role::Forward, Ok(body)) => {
+        // A node takes its role once, and the first call that only a node that holds
+        // delegations answers gives a node without a role the delegation role. So the node of
+        // this pod takes the reserve role or the forward role before the inbound relay lets a
+        // caller reach it, and a node that refuses the role ends the program: the container
+        // starts again with a new enclave.
+        (Role::Reserve | Role::Forward, Ok(body)) => {
             let injection = tokio::select! {
                 injection = config::inject(node.as_ref(), &body) => injection,
                 signal_name = termination(&mut terminate, &mut interrupt) => {
@@ -496,12 +537,14 @@ async fn run() -> Result<(), String> {
                 }
             };
             match injection {
-                Injection::Accepted => {
-                    log("operator configuration: the node took the forward role")
-                }
+                Injection::Accepted => log(&format!(
+                    "operator configuration: the node took the {} role",
+                    role.name()
+                )),
                 Injection::Rejected { status, code } => {
                     return Err(format!(
-                        "the node refused the forward role with status {status} {code}"
+                        "the node refused the {} role with status {status} {code}",
+                        role.name()
                     ));
                 }
             }

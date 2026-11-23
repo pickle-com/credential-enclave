@@ -66,9 +66,12 @@ log store and is part of none, and neither appears in a response.
 | C5 | The site of a vault secret | A TLS connection that ends inside a node of the forward role (protocol.md 4.1), to port 443 of the host the envelope of one use of a vault secret names (protocol.md 10.5). It carries the one request of that use, with the value at its slot, and ends with the response to it. The operator domain sees TLS records only |
 
 There is no other channel: the node writes no file and opens no other socket. A node of the
-delegation role has the channels C1 to C4, and a node of the forward role C1, C3 and C5: the
-node that holds user keys opens no connection to a host an account chose, and the node that
-opens such a connection holds no user key and no record.
+delegation role has the channels C1 to C4, a node of the reserve role C1, C3 and C4, and a node
+of the forward role C1, C3 and C5: the node that holds user keys opens no connection to a host
+an account chose, and the node that opens such a connection holds no user key and no record. A
+node of the reserve role holds user keys and opens no record: it answers no call that uses a
+credential (enclave.md section 4), so it has no connection to a provider, and what it writes on
+C4 is its node document and control entries.
 
 ### 2.3 What a response can carry
 
@@ -378,6 +381,12 @@ calls, and `egress/sink-callers.tsv` (the two callers of K1).
   secret of one provider appears in no request to another provider. Both nodes of the walk have
   a log store. Of all markers, a write to the log store carries the session token for the log
   store and no other: no secret of the account, and not the secret access key.
+- The node of the reserve role of the fixture takes the delegation of the account from a node
+  of the delegation role, so it holds the marked user key. It refuses every call that uses a
+  credential, with the marked records of the account in the body of the call, and hands the
+  delegation on to a node that uses it. Its responses are part of the verdict on C1, and the
+  verdict on C2 and C4 holds that it asked its platform for connections to the host of its log
+  store and to no other host.
 - The verdict on C5: a node of the forward role asks its platform for connections to the site of
   the vault secret whose use it was handed, and to no other host. The marked value of a vault
   secret appears in the one request to that site, and in no response of the node of the forward

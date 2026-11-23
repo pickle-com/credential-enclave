@@ -1,10 +1,13 @@
 //! The role of a node (protocol.md 4.1, enclave.md section 4), and what a node of the forward
 //! role keeps of the uses it sent (protocol.md 10.5).
 //!
-//! One node program runs in two roles. A node of the delegation role holds the delegations of
-//! accounts and connects to the addresses of its provider definitions and to its log store. A
-//! node of the forward role holds no delegation and opens no record: it sends the one request
-//! of a secret use that a node of the delegation role sealed to it (`vault/send`).
+//! One node program runs in three roles. A node of the delegation role holds the delegations
+//! of accounts, uses their credentials, and connects to the addresses of its provider
+//! definitions and to its log store. A node of the reserve role holds delegations as well and
+//! uses no credential: it takes the commands of the apps, gives and takes delegation
+//! transfers, and connects to its log store alone. A node of the forward role holds no
+//! delegation and opens no record: it sends the one request of a secret use that a node of
+//! the delegation role sealed to it (`vault/send`).
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -12,11 +15,13 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use credential_enclave_protocol::keys::Role;
 use credential_enclave_protocol::limits;
 
-/// The role of a node. A node starts without a role and takes one once: the forward role from
-/// the operator configuration that names it, the delegation role from an operator
-/// configuration without a role or from the first call of the delegation role that reaches it.
-/// A role that was taken does not change, so a node that ever held a user key never has the
-/// forward role, and a node of the forward role never takes a user key.
+/// The role of a node. A node starts without a role and takes one once: the reserve role or
+/// the forward role from the operator configuration that names it, the delegation role from
+/// an operator configuration without a role or from the first call that reaches it and that
+/// only a node that holds delegations answers. A role that was taken does not change. So a
+/// node that ever held a user key never has the forward role, a node of the forward role
+/// never takes a user key, and a node of the reserve role never used a credential and never
+/// uses one.
 #[derive(Debug, Default)]
 pub struct RoleCell(AtomicU8);
 
@@ -34,9 +39,8 @@ impl RoleCell {
         }
     }
 
-    /// The role of the node, `None` while it has not taken one.
-    pub fn get(&self) -> Option<Role> {
-        match self.0.load(Ordering::SeqCst) {
+    fn role(code: u8) -> Option<Role> {
+        match code {
             RoleCell::DELEGATION => Some(Role::Delegation),
             RoleCell::RESERVE => Some(Role::Reserve),
             RoleCell::FORWARD => Some(Role::Forward),
@@ -44,17 +48,28 @@ impl RoleCell {
         }
     }
 
-    /// Takes `role` when the node has none. True when the node has `role` afterwards, false
-    /// when it has the other one.
-    pub fn take(&self, role: Role) -> bool {
+    /// The role of the node, `None` while it has not taken one.
+    pub fn get(&self) -> Option<Role> {
+        RoleCell::role(self.0.load(Ordering::SeqCst))
+    }
+
+    /// Takes `role` when the node has none, and returns the role the node has afterwards:
+    /// `role`, or the role it took before.
+    pub fn settle(&self, role: Role) -> Role {
         let wanted = RoleCell::code(role);
         match self
             .0
             .compare_exchange(RoleCell::NONE, wanted, Ordering::SeqCst, Ordering::SeqCst)
         {
-            Ok(_) => true,
-            Err(held) => held == wanted,
+            Ok(_) => role,
+            Err(held) => RoleCell::role(held).unwrap_or(role),
         }
+    }
+
+    /// Takes `role` when the node has none. True when the node has `role` afterwards, false
+    /// when it has another one.
+    pub fn take(&self, role: Role) -> bool {
+        self.settle(role) == role
     }
 }
 
@@ -145,16 +160,28 @@ mod tests {
         assert_eq!(role.get(), None);
         assert!(role.take(Role::Forward));
         assert_eq!(role.get(), Some(Role::Forward));
-        // The same role again is the role the node has. The other one is not taken.
+        // The same role again is the role the node has. Another one is not taken.
         assert!(role.take(Role::Forward));
         assert!(!role.take(Role::Delegation));
+        assert!(!role.take(Role::Reserve));
+        assert_eq!(role.settle(Role::Delegation), Role::Forward);
         assert_eq!(role.get(), Some(Role::Forward));
 
         let role = RoleCell::default();
         assert!(role.take(Role::Delegation));
         assert!(!role.take(Role::Forward));
+        assert!(!role.take(Role::Reserve));
         assert!(role.take(Role::Delegation));
         assert_eq!(role.get(), Some(Role::Delegation));
+
+        // The reserve role is taken the same way, and it is neither of the other two.
+        let role = RoleCell::default();
+        assert_eq!(role.settle(Role::Reserve), Role::Reserve);
+        assert!(role.take(Role::Reserve));
+        assert!(!role.take(Role::Delegation));
+        assert!(!role.take(Role::Forward));
+        assert_eq!(role.settle(Role::Delegation), Role::Reserve);
+        assert_eq!(role.get(), Some(Role::Reserve));
     }
 
     #[test]

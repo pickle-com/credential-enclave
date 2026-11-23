@@ -8,9 +8,8 @@ use std::time::Duration;
 use credential_enclave_protocol::encoding::b64u;
 use serde_json::{json, Value};
 
-use super::{provider_and_log_store, quiet_provider};
+use super::{assign, provider_and_log_store, quiet_provider};
 use crate::state::{lock, GrantState, Limits, Node};
-use crate::subset::assign;
 use crate::testing::{App, Harness, Provider, Reply};
 
 const MESSAGES: &str = "https://gmail.googleapis.com/gmail/v1/users/me/messages";

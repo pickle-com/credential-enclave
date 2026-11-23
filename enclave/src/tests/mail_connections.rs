@@ -10,13 +10,13 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 
+use super::assign;
 use super::faults;
 use super::mail::{frame_of, request, PASSWORD};
 use super::mail_stand_in::{fetch_literal, mailbox, until, Act, Answer, ImapServer, MESSAGE};
 use super::provider_and_log_store;
 use crate::mail;
 use crate::state::{lock, Limits};
-use crate::subset::assign;
 use crate::testing::{quiet_panics, Harness, Provider, Reply};
 
 /// A message of `bytes` bytes.

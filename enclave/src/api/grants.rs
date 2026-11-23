@@ -1,5 +1,6 @@
 //! `POST /v1/grants/prune` (enclave.md 5.15): the operator reduces which nodes hold the key of
-//! an account to the nodes of the delegation subset (`crate::subset`).
+//! an account to the nodes of the delegation subset (protocol.md 10.4: the module `subset`
+//! of the protocol crate).
 //!
 //! A node that held the delegations of every account before the subset rule drops the grants
 //! of the accounts outside its share, one page at a time. The user key of a dropped grant is

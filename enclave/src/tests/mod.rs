@@ -24,6 +24,7 @@ mod mail_probe;
 mod mail_stand_in;
 mod oauth;
 mod peer;
+mod pools;
 mod records;
 mod roles;
 mod surface;
@@ -49,6 +50,13 @@ fn seven_counts(log: &Value) -> Value {
         counts.insert(key.to_string(), log[key].clone());
     }
     Value::Object(counts)
+}
+
+/// The ordinals that hold the delegation of `user_id` in a pool of `pods` nodes without
+/// groups, `copies` of them (protocol.md 10.4).
+fn assign(user_id: &str, pods: u32, copies: u32) -> Vec<u32> {
+    credential_enclave_protocol::subset::assign(user_id, pods, copies, None, 0)
+        .expect("a pool of 1 to 1,024 nodes with at least one copy")
 }
 
 /// Every host a node can connect to with the embedded definitions: the token addresses, the

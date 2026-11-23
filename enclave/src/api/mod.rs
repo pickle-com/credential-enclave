@@ -28,8 +28,8 @@ use crate::oauth::{ProviderError, Withheld};
 use crate::platform::{Listener, PlatformError};
 use crate::providers::{ClientKind, Definition};
 use crate::state::{Node, OperatorConfig, ProviderCredentials};
-use crate::subset::Subset;
 use credential_enclave_protocol::record::Record;
+use credential_enclave_protocol::subset::Subset;
 
 mod attestation;
 mod close;
@@ -125,58 +125,82 @@ pub fn route_list() -> Vec<(Method, &'static str)> {
         .collect()
 }
 
-/// The role a call belongs to (enclave.md section 4). One node program runs in two roles, and
-/// a node answers the calls of its own role.
+/// Which nodes answer a call (enclave.md section 4). One node program runs in three roles,
+/// and a node answers the calls of its role.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Of {
-    /// A call a node of either role answers, also before it took a role: `health`, `config`,
+    /// A call a node of every role answers, also before it took a role: `health`, `config`,
     /// `attestation` and `close`. None of them reads or changes a delegation, a record or the
     /// log of an account.
-    EitherRole,
-    /// A call of the delegation role: a call that reads or changes a delegation, a record or
-    /// the log of an account. A node without a role takes the delegation role with the first
-    /// such call, and a node of the forward role refuses it.
-    Delegation,
-    /// A call of the forward role: `vault/send`. Only a node that took the forward role from
-    /// its operator configuration answers it.
+    EveryRole,
+    /// A call a node that holds delegations answers, of the delegation role and of the
+    /// reserve role: a call that puts a delegation in place, reads its state, hands it on or
+    /// ends it (`messages`, `status`, `peer/export`, `peer/import`, `grants/prune`), and the
+    /// call that gives the node the credentials of its log store. None of them opens a record
+    /// or calls a provider. A node of the forward role refuses it.
+    Holding,
+    /// A call that uses a credential: a call that opens or creates a record or calls a
+    /// provider. A node of the delegation role answers it, and no other node: a node of the
+    /// reserve role and a node of the forward role refuse it.
+    Use,
+    /// The call of the forward role: `vault/send`. Only a node that took the forward role
+    /// from its operator configuration answers it.
     Forward,
 }
 
-/// The role the call of `path` belongs to. The calls of either role and the call of the
-/// forward role are named here. Every other call is a call of the delegation role, so a call
-/// that is added to the table of [`routes`] is one a node of the forward role refuses until
-/// this function says otherwise.
+/// Which nodes answer the call of `path`. The calls of every role, the calls of a node that
+/// holds delegations and the call of the forward role are named here. Every other call is a
+/// call that uses a credential, so a call that is added to the table of [`routes`] is one a
+/// node of the reserve role and a node of the forward role refuse until this function says
+/// otherwise.
 fn role_of(path: &str) -> Of {
     match path {
-        "/v1/health" | "/v1/config" | "/v1/attestation" | "/v1/close" => Of::EitherRole,
+        "/v1/health" | "/v1/config" | "/v1/attestation" | "/v1/close" => Of::EveryRole,
+        "/v1/messages"
+        | "/v1/status"
+        | "/v1/peer/export"
+        | "/v1/peer/import"
+        | "/v1/grants/prune"
+        | "/v1/log-store/credentials" => Of::Holding,
         "/v1/vault/send" => Of::Forward,
-        _ => Of::Delegation,
+        _ => Of::Use,
     }
 }
+
+/// What a node of the forward role says to a call it does not answer.
+const FORWARD_ROLE_REFUSAL: &str =
+    "the node has the forward role: it holds no delegation and uses no credential";
+/// What a node of the reserve role says to a call that uses a credential.
+const RESERVE_ROLE_REFUSAL: &str =
+    "the node has the reserve role: it holds delegations and uses no credential";
 
 /// The role rule of a call (enclave.md section 4), checked before the handler of the call
 /// reads anything of the request.
 ///
-/// A call of the delegation role gives a node without a role the delegation role, and a node
-/// of the forward role refuses it with `not_allowed`: the calls that put a user key into a
-/// node (`messages`, `peer/import`) and the calls that open a record are all calls of the
-/// delegation role, so no call can make a node of the forward role hold a user key.
+/// A call of a node that holds delegations, and a call that uses a credential, give a node
+/// without a role the delegation role. A node of the forward role refuses both with
+/// `not_allowed`: the calls that put a user key into a node (`messages`, `peer/import`) and
+/// the calls that open a record are among them, so no call can make a node of the forward
+/// role hold a user key. A node of the reserve role refuses a call that uses a credential
+/// with `not_allowed`: no call makes such a node open a record, call a provider or create
+/// the event of a use, whatever its caller sends.
 fn admit(node: &Node, of: Of) -> Result<(), ApiError> {
+    let refused =
+        |message: &'static str| Err(ApiError::with_message(ProtocolError::NotAllowed, message));
     match of {
-        Of::EitherRole => Ok(()),
-        Of::Delegation => match node.role.take(Role::Delegation) {
-            true => Ok(()),
-            false => Err(ApiError::with_message(
-                ProtocolError::NotAllowed,
-                "the node has the forward role and takes no call of the delegation role",
-            )),
+        Of::EveryRole => Ok(()),
+        Of::Holding => match node.role.settle(Role::Delegation) {
+            Role::Delegation | Role::Reserve => Ok(()),
+            Role::Forward => refused(FORWARD_ROLE_REFUSAL),
+        },
+        Of::Use => match node.role.settle(Role::Delegation) {
+            Role::Delegation => Ok(()),
+            Role::Reserve => refused(RESERVE_ROLE_REFUSAL),
+            Role::Forward => refused(FORWARD_ROLE_REFUSAL),
         },
         Of::Forward => match node.role.get() {
             Some(Role::Forward) => Ok(()),
-            _ => Err(ApiError::with_message(
-                ProtocolError::NotAllowed,
-                "the call is a call of the forward role, and the node has not that role",
-            )),
+            _ => refused("the call is a call of the forward role, and the node has not that role"),
         },
     }
 }
@@ -626,11 +650,13 @@ fn missing(key: &str) -> ApiError {
         "requests" => "requests is missing or invalid: 1 to 100 request objects",
         "body_bytes" => "body_bytes of the requests do not add up to the payload",
         "endpoint" => "endpoint is missing or invalid",
-        "role" => "role is invalid: the one role a configuration names is forward",
+        "role" => "role is invalid: a configuration names the role reserve or the role forward",
         "cursor" => "cursor is missing or invalid",
         "limit" => "limit is missing or invalid",
         "subset" => {
-            "subset is missing or invalid: pods 1 to 1024, pod below pods, copies at least 1"
+            "subset is missing or invalid: pods 1 to 1024, pod below pods, copies at least 1, \
+             and groups, when present, one name per ordinal with at least skip plus copies \
+             different names"
         }
         _ => "a field is missing or invalid",
     };
@@ -642,8 +668,9 @@ pub fn record_of(body: &JsonBody, key: &str) -> Result<Record, ApiError> {
     Ok(Record::from_value(body.object(key)?)?)
 }
 
-/// The optional `subset` of a call (enclave.md 5.13 and 5.15): `None` when the key is absent
-/// or null, `invalid_request` when its value is not a subset object within its bounds.
+/// The optional `subset` of a call (enclave.md 5.13 and 5.15, protocol.md 10.4): `None` when
+/// the key is absent or null, `invalid_request` when its value is not a subset object within
+/// its bounds.
 pub fn subset_of(body: &JsonBody) -> Result<Option<Subset>, ApiError> {
     match body.get("subset") {
         None => Ok(None),

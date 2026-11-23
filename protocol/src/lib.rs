@@ -44,6 +44,7 @@ pub mod released;
 pub mod secret;
 pub mod secret_use;
 pub mod statement;
+pub mod subset;
 pub mod totp;
 pub mod vault_secret;
 

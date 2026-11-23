@@ -18,8 +18,9 @@ use crate::faults;
 use crate::load;
 use crate::state::Node;
 
-/// The diagnostic values of a node. `role` is `forward` on a node of the forward role and null
-/// on every other node. `accounts` counts the accounts that have a chain on this
+/// The diagnostic values of a node. `role` is `reserve` on a node of the reserve role,
+/// `forward` on a node of the forward role and null on every other node. `accounts` counts
+/// the accounts that have a chain on this
 /// node and `grants` the accounts that have a grant within its time (the operator domain reads
 /// it to see that a delegation transfer arrived). `log_store` is null on a node without a log
 /// store. Otherwise it names the bucket and its region, the end of the credentials the node

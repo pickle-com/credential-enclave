@@ -23,9 +23,11 @@
 //!    `release`, a command of an app) ends within the time of this wait. A connection the
 //!    relay takes later is not waited for.
 //!
-//! In a pod of the delegation role the shutdown collection call (`drain`) runs between step 1
-//! and step 2: the backend moves the delegations of the node while its calls in progress end.
-//! The wait of step 2 counts from the termination signal in both roles.
+//! In a pod of the delegation role or of the reserve role the shutdown collection call
+//! (`drain`) runs between step 1 and step 2: the backend moves the delegations of the node
+//! while its calls in progress end. A node of the reserve role answers none of the calls of
+//! step 2 and holds no place. The wait of step 2 counts from the termination signal in
+//! every role.
 //!
 //! Each of the two waits has a limit ([`CALLS_WAIT`], [`CALLERS_WAIT`]), and the enclave ends
 //! after them whatever the node said. A node that does not answer is asked again until the

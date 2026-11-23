@@ -24,8 +24,8 @@ use crate::faults;
 use crate::log_store::{self, SWEEP_INTERVAL};
 use crate::platform::Platform;
 use crate::state::{lock, GrantState};
-use crate::subset::Subset;
 use crate::testing::{quiet_panics, App, Harness, Provider, Reply};
+use credential_enclave_protocol::subset::Subset;
 
 /// What the log store stand-in does with the write of an entry: it answers it after `pause`,
 /// with `status` when `status` is not 0 and with a confirmation otherwise. The script is read
