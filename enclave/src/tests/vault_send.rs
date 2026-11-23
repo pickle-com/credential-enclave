@@ -1723,7 +1723,7 @@ async fn a_closing_node_begins_no_request_and_ends_the_one_it_had_begun() {
         (&json!(false), &json!(1))
     );
 
-    // `close` is a call of either role: the node of the forward role takes it, and says so.
+    // `close` is a call of every role: the node of the forward role takes it, and says so.
     let (status, closed) = forward.post("/v1/close", json!({})).await;
     assert_eq!((status, closed), (200, json!({"accounts": 0})));
     let health = forward.health().await;

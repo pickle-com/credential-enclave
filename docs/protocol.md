@@ -1091,8 +1091,10 @@ Authorization: AWS4-HMAC-SHA256 Credential=..., SignedHeaders=..., Signature=...
   moves no object to another bucket and to no other key. The key of an entry of one account never
   has the shape of a key of another account: the 13 digits of `rtime` follow the prefix of the
   account at once, and a reader checks the shape of a key and the `user_id` of the body (7.4).
-- The node keeps up to 32 idle HTTP/1.1 connections to the store and sends the first attempt of a
-  write over the most recently used one. An attempt the store does not confirm because the
+- The node keeps up to 32 idle HTTP/1.1 connections to the store, each for at most 30 seconds,
+  and sends the first attempt of a write over the most recently used one. A connection whose 30
+  seconds passed carries no write, and the node closes it at its next sweep at the latest
+  (enclave.md 5.14). An attempt the store does not confirm because the
   connection failed, the connection closed without a response, the attempt passed its time limit, or
   the status was 5xx or 429 is repeated over a new connection, with a full jitter backoff between
   the attempts, within a budget of twice the time limit of a write per entry; a 4xx status other
@@ -1650,7 +1652,13 @@ any other form is not a release tag and has no place in the order.
   entries, and whose monitor reads that log, is built and endorsed while a log of the tables in
   service still takes entries. When no log of the table of a node takes entries any more, that
   node hands no delegation to a release that is endorsed after that, and the nodes of that
-  release receive their delegations from the apps (10.1).
+  release receive their delegations from the apps (10.1). A workflow of this repository
+  compares, every hour, the transparency logs of the trusted root that the TUF repository of
+  Sigstore distributes with the ones of the copy of that trusted root in this repository, to
+  which a test ties the table of this release: a log the copy does not name, a log of the copy
+  that the trusted root no longer names, and an end of the validity of a log open an issue
+  (enclave.md 11.2). The workflow tells people that the table may have to follow. It checks no
+  signature of the TUF repository, and no node depends on it.
 - An endorsement is a public value and has no end: a node of an earlier release accepts it for as
   long as that node runs. The age of the entry is looked at in check 5 only.
 - The account sees the transfer on its log: the entry `grant_transferred_out` of the giving node
@@ -1940,7 +1948,7 @@ redirect. The response passes rule E4 of the egress policy before any part of it
 | `key_mismatch` | The `key_id` or the `custody` of a record is not that of the grant. The `sign_pk` of a pending authorization is not the `sign_pk` of the grant |
 | `record_invalid` | The form of a record is wrong, or its AEAD verification failed. The plaintext lacks the field that the call uses (no token to inject, no `refresh_token` to refresh with) |
 | `provider_unknown` | The provider has no definition |
-| `not_allowed` | An address, a method, an authorization parameter or a field that the provider definition does not allow. A record of a kind that the call does not take. A use of a vault secret outside the reach of its record: an origin, a host or a slot the record does not list (section 6, 10.5). A call of the other role than the role of the node (enclave.md section 4) |
+| `not_allowed` | An address, a method, an authorization parameter or a field that the provider definition does not allow. A record of a kind that the call does not take. A use of a vault secret outside the reach of its record: an origin, a host or a slot the record does not list (section 6, 10.5). A call that the role of the node does not answer (enclave.md section 4: a node has one of three roles) |
 | `state_unknown` | There is no pending authorization, or its time (600 seconds) has passed |
 | `exchange_failed`, `refresh_failed` | The provider refused the exchange or the refresh. The failure carries the HTTP status of the provider and one word of a closed vocabulary for the error of its response (enclave.md 5.7) |
 | `provider_unreachable`, `timeout` | A transport failure, a time limit that passed |
@@ -1980,7 +1988,7 @@ redirect. The response passes rule E4 of the egress policy before any part of it
 | Most requests in one forward batch (`FORWARD_BATCH_REQUESTS`) | 100 |
 | Requests of one forward batch in flight at once (`FORWARD_BATCH_CONCURRENCY`) | 6 |
 | Provider requests of a node in flight at once (`PROVIDER_INFLIGHT`) | 512 |
-| Idle connections of a node to its log store (`LOG_STORE_IDLE_CONNECTIONS`) | 32 |
+| Idle connections of a node to its log store, and their idle time (`LOG_STORE_IDLE_CONNECTIONS`, `LOG_STORE_IDLE_MS`) | 32, 30 seconds |
 | Idle connections of a node to one provider host for one account, and their idle time (`PROVIDER_IDLE_CONNECTIONS`, `PROVIDER_IDLE_MS`) | 8, 30 seconds |
 | Authenticated IMAP sessions a node keeps between the reads of a record: per record and per node, the time one is kept after its last read, and the longest time after its login at which one is handed to a read (`KEPT_SESSIONS`, `SESSION_IDLE_MS`, `SESSION_LOGIN_MS`, enclave.md, "Mail call surface") | 1 and 1,024, 30 seconds, 300 seconds |
 | Pending entries of an account at which a call that uses a credential creates no entry (`PENDING_ENTRIES`) | 64 |
