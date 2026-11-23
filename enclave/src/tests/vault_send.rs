@@ -1494,6 +1494,51 @@ async fn a_value_with_a_space_that_a_site_sends_back_in_an_address_is_not_handed
 }
 
 #[tokio::test]
+async fn a_value_outside_ascii_that_a_site_reads_as_iso_8859_1_is_not_handed_on() {
+    // A value with characters outside ASCII in a header. HTTP gives the bytes of a header
+    // value outside ASCII no character encoding, and the site of this test reads every byte
+    // as one character of ISO 8859-1, as many servers do. It sends that text back in a JSON
+    // body: in UTF-8, and with every character outside ASCII as an escape.
+    let value = "\u{be44}\u{bc00}-p\u{e4}ss-0123456789";
+    for escaped in [false, true] {
+        let provider = site(move |seen| {
+            let read: String = seen
+                .header("x-api-key")
+                .unwrap_or_default()
+                .bytes()
+                .map(char::from)
+                .collect();
+            let text: String = read
+                .chars()
+                .map(|character| match escaped && !character.is_ascii() {
+                    true => format!("\\u{:04x}", u32::from(character)),
+                    false => character.to_string(),
+                })
+                .collect();
+            let body = format!("{{\"unknown key\":\"{text}\"}}");
+            Reply::with_body(
+                401,
+                &[("content-type", "application/json")],
+                body.as_bytes(),
+            )
+        })
+        .await;
+        let forward = forward_node(&provider).await;
+        let request = request_of("GET", "/v1/me", "", "header:x-api-key", b"");
+        let meta = json!({
+            "envelope": envelope(&forward, &request, value, 1),
+            "headers": [["X-Api-Key", PLACEHOLDER]],
+        });
+        let sent = forward.vault_send(meta, b"").await.unwrap();
+        // The site received the bytes of the value, and no part of what it made of them is
+        // handed on.
+        assert_eq!(provider.only().header("x-api-key"), Some(value));
+        assert_eq!(sent.end["code"], "response_withheld", "escaped: {escaped}");
+        assert_eq!(sent.body(), b"", "escaped: {escaped}");
+    }
+}
+
+#[tokio::test]
 async fn a_value_a_site_sends_back_in_a_header_that_is_not_utf8_is_not_handed_on() {
     // A value with characters outside ASCII. The site sends it back in a header, beside a
     // byte that is no UTF-8: the node hands such a header on with one character per byte,

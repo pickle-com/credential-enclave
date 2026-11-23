@@ -864,7 +864,8 @@ which form it holds. The order of the processing:
     encoded more than once) and with its JSON string escapes decoded (up to twice, for a JSON
     text inside a JSON string), and each reading is searched for the credential as it is, in
     base64 or base64url (each of the three byte alignments, without padding), in hexadecimal
-    (lower or upper case), and, when it holds a space, with `+` in the place of every space. A
+    (lower or upper case), when it holds a space with `+` in the place of every space, and when
+    it holds a character outside ASCII as the text a reader of ISO 8859-1 makes of its bytes. A
     header whose bytes are not UTF-8 is searched as those bytes as well.
     A header name, which the node hands on in lower case, is searched without regard to the case
     of its letters. The credential is searched for without the characters a server strips at its

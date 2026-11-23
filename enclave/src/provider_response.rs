@@ -11,8 +11,10 @@
 //! string escapes decoded once and twice ([`JSON_LAYERS`], for a JSON text inside a JSON
 //! string). Each reading is searched for these
 //! forms of the credential: as it is, base64 or base64url in each of the three byte alignments
-//! and without padding, hexadecimal in lower or upper case, and for a credential with a space
-//! the credential with `+` in the place of every space. Decoding the escapes finds the
+//! and without padding, hexadecimal in lower or upper case, for a credential with a space the
+//! credential with `+` in the place of every space, and for a credential with a character
+//! outside ASCII the text a reader of ISO 8859-1 makes of its bytes. Decoding the escapes
+//! finds the
 //! credential under every percent-encoding of it and under every way a writer of JSON escapes
 //! it: encoders do not agree on the bytes they escape or on the case of the digits (one writes
 //! `/` as `\/`, another `=` as `\u003d`), and all of their outputs decode to the same bytes. A
@@ -146,9 +148,18 @@ pub struct Forms(Vec<Secret<Vec<u8>>>);
 
 impl Forms {
     /// The forms of every credential of `credentials`: as it is, base64 and base64url at each
-    /// byte alignment, hexadecimal in both cases, and for a credential with a space the
-    /// credential with `+` in the place of every space. A form shorter than
+    /// byte alignment, hexadecimal in both cases, for a credential with a space the
+    /// credential with `+` in the place of every space, and for a credential with a character
+    /// outside ASCII the text a reader of ISO 8859-1 makes of its bytes. A form shorter than
     /// [`SHORTEST_FORM_BYTES`] is left out.
+    ///
+    /// HTTP gives the bytes of a header value outside ASCII no character encoding, and a
+    /// server reads them in one of its own: many read every byte as one character of ISO
+    /// 8859-1, and some read the bytes of a parameter or of the credentials of HTTP Basic
+    /// that way. What such a server sends back of a credential with a character outside
+    /// ASCII is the text of that reading, in UTF-8 or under the escapes of a JSON string:
+    /// other bytes than the credential, from which the bytes of the credential are read
+    /// back. That text is a form of its own ([`read_as_latin1`]).
     ///
     /// A query and a form body (`application/x-www-form-urlencoded`) write a space as `+` and
     /// every other byte they do not write as it is as a percent escape. The readings that
@@ -176,6 +187,9 @@ impl Forms {
             forms.push(hex(token, b"0123456789ABCDEF"));
             if token.contains(&b' ') {
                 forms.push(plus_for_space(token));
+            }
+            if !token.is_ascii() {
+                forms.push(read_as_latin1(token));
             }
             for form in forms {
                 let form = Secret::new(form);
@@ -1027,6 +1041,21 @@ fn plus_for_space(bytes: &[u8]) -> Vec<u8> {
         .collect()
 }
 
+/// The UTF-8 text a reader of ISO 8859-1 makes of `bytes`: one character for each byte, so a
+/// byte outside ASCII becomes the two bytes of a character from U+0080 to U+00FF.
+fn read_as_latin1(bytes: &[u8]) -> Vec<u8> {
+    // The longest text: no buffer that holds a part of the credential is left behind by a
+    // growth.
+    let mut text = Vec::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        match byte.is_ascii() {
+            true => text.push(*byte),
+            false => text.extend_from_slice(&[0xc0 | (byte >> 6), 0x80 | (byte & 0x3f)]),
+        }
+    }
+    text
+}
+
 fn hex(bytes: &[u8], digits: &[u8; 16]) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -1516,6 +1545,47 @@ mod tests {
     }
 
     #[test]
+    fn a_credential_outside_ascii_is_found_as_a_reader_of_iso_8859_1_sends_it_back() {
+        // A credential with characters outside ASCII, of two and of three bytes each, and
+        // what a server makes of its bytes when it reads every byte as one character of ISO
+        // 8859-1.
+        let wide = "p\u{e4}ssw\u{f6}rd-\u{d0a4}-12345";
+        let forms = Forms::of(&[Secret::new(wide.to_string())]);
+        let misread: String = wide.bytes().map(char::from).collect();
+        assert_ne!(misread, wide);
+        // That text in UTF-8, as a writer of JSON that escapes no character writes it.
+        let written = format!("{{\"unknown key\":\"{misread}\"}}");
+        assert!(forms.found_in(written.as_bytes()));
+        // With every character outside ASCII as an escape of a JSON string.
+        let escaped: String = misread
+            .chars()
+            .map(|character| match character.is_ascii() {
+                true => character.to_string(),
+                false => format!("\\u{:04x}", u32::from(character)),
+            })
+            .collect();
+        assert!(escaped.is_ascii());
+        assert!(forms.found_in(format!("{{\"unknown key\":\"{escaped}\"}}").as_bytes()));
+        // Under percent escapes, as an address holds it.
+        let in_an_address: String = misread
+            .bytes()
+            .map(|byte| match byte.is_ascii_alphanumeric() {
+                true => char::from(byte).to_string(),
+                false => format!("%{byte:02X}"),
+            })
+            .collect();
+        assert!(forms.found_in(format!("/login?unknown={in_an_address}").as_bytes()));
+        // The credential in UTF-8 is found as it is.
+        assert!(forms.found_in(format!("{{\"unknown key\":\"{wide}\"}}").as_bytes()));
+        // The form is no longer than the hexadecimal one, by which a stream holds bytes back.
+        assert_eq!(forms.longest(), 2 * wide.len());
+        // A credential of ASCII is the same text in both readings: it has no form of its own
+        // for the second one.
+        assert_eq!(read_as_latin1(b"p-ssw-rd-12345"), b"p-ssw-rd-12345");
+        assert_eq!(read_as_latin1(wide.as_bytes()), misread.as_bytes());
+    }
+
+    #[test]
     fn a_content_encoding_other_than_identity_is_withheld() {
         for value in ["gzip", "br", "deflate", "GZIP", "gzip, identity", ""] {
             assert_eq!(
@@ -1705,22 +1775,36 @@ mod tests {
         // A credential with characters outside ASCII, in a header whose bytes are not UTF-8.
         // The node hands such a header on with one character for each byte, and the
         // credential stands in that text as other characters than its own.
-        let credential = Secret::new("p\u{e4}ss-\u{d55c}\u{ae00}-w\u{f6}rd".to_string());
-        let mut sent = b"echo=".to_vec();
-        sent.extend_from_slice(credential.expose_secret().as_bytes());
-        sent.push(0xff);
-        assert!(std::str::from_utf8(&sent).is_err());
-        let handed_on: String = sent.iter().map(|byte| char::from(*byte)).collect();
-        assert!(!handed_on.contains(credential.expose_secret().as_str()));
+        let credential = Secret::new("p\u{e4}ss \u{d55c}\u{ae00} w\u{f6}rd".to_string());
         let forms = Forms::of(std::slice::from_ref(&credential));
-        assert!(!forms.found_in(handed_on.as_bytes()));
-        assert!(forms.found_in_header(&handed_on));
-        let headers = vec![("x-echo".to_string(), handed_on.clone())];
-        assert!(check(&credential, 200, headers.clone(), Vec::new()).is_err());
-        let mut headers = headers;
-        assert!(StreamCheck::begin(&credential, &mut headers).is_err());
+        // The header holds the credential as it is, or as a form body writes it: with `+`
+        // for its spaces.
+        let as_it_is = credential.expose_secret().clone();
+        let in_a_form = as_it_is.replace(' ', "+");
+        let handed_on = |written: &str| -> String {
+            let mut sent = b"echo=".to_vec();
+            sent.extend_from_slice(written.as_bytes());
+            sent.push(0xff);
+            assert!(std::str::from_utf8(&sent).is_err());
+            sent.iter().map(|byte| char::from(*byte)).collect()
+        };
+        for written in [&as_it_is, &in_a_form] {
+            let handed_on = handed_on(written);
+            assert!(!handed_on.contains(written.as_str()));
+            assert!(forms.found_in_header(&handed_on));
+            let headers = vec![("x-echo".to_string(), handed_on.clone())];
+            assert!(check(&credential, 200, headers.clone(), Vec::new()).is_err());
+            let mut headers = headers;
+            assert!(StreamCheck::begin(&credential, &mut headers).is_err());
+        }
+        // The text the node hands on of the credential as it is is the form of the
+        // credential for a reader of ISO 8859-1, which the search finds in any bytes. The
+        // text of the credential with `+` for its spaces is no form: it is found in the
+        // bytes its characters stand for, as the search of a header reads them.
+        assert!(forms.found_in(handed_on(&as_it_is).as_bytes()));
+        assert!(!forms.found_in(handed_on(&in_a_form).as_bytes()));
         // A text with a character above U+00FF is no such reading of bytes.
-        let other = format!("{handed_on}\u{d55c}");
+        let other = format!("{}\u{d55c}", handed_on(&in_a_form));
         assert!(!forms.found_in_header(&other));
     }
 

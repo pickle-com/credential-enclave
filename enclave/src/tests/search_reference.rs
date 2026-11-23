@@ -70,8 +70,9 @@ fn hex(bytes: &[u8], upper: bool) -> Vec<u8> {
 }
 
 /// The forms of a credential the search looks for: as it is, base64 and base64url at each
-/// byte alignment, hexadecimal in both cases, and for a credential with a space the
-/// credential with `+` for every space.
+/// byte alignment, hexadecimal in both cases, for a credential with a space the credential
+/// with `+` for every space, and for a credential with a character outside ASCII the text a
+/// reader of ISO 8859-1 makes of its bytes.
 fn forms_of(credential: &[u8]) -> Vec<Vec<u8>> {
     let mut forms = vec![credential.to_vec()];
     for front in 0..3 {
@@ -83,6 +84,10 @@ fn forms_of(credential: &[u8]) -> Vec<Vec<u8>> {
     if credential.contains(&b' ') {
         let text = String::from_utf8(credential.to_vec()).unwrap();
         forms.push(text.replace(' ', "+").into_bytes());
+    }
+    if !credential.is_ascii() {
+        let misread: String = credential.iter().map(|byte| char::from(*byte)).collect();
+        forms.push(misread.into_bytes());
     }
     forms.retain(|form| form.len() >= 8);
     forms
