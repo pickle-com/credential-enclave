@@ -9,7 +9,9 @@ use credential_enclave_protocol::limits;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use super::mail_stand_in::until;
 use super::{provider_with_log_store, quiet_provider, quiet_provider_and_log_store};
+use crate::log_store;
 use crate::providers::Definitions;
 use crate::state::Limits;
 use crate::testing::{App, Harness, Reply};
@@ -1386,6 +1388,80 @@ async fn requests_of_one_account_to_one_host_share_a_connection_and_accounts_do_
         egress["opens"].as_u64().unwrap() as usize,
         harness.platform.connections().len()
     );
+    assert_budget_is_free(&harness);
+}
+
+#[tokio::test]
+async fn an_idle_connection_ends_at_the_sweep_after_its_idle_time_without_a_further_call() {
+    // The stand-in keeps the connection of a provider request open, and closes the
+    // connection of a write to the log store after its answer.
+    let provider =
+        provider_with_log_store(|_| Reply::json(200, &json!({"ok": true})).keep_alive()).await;
+    let (harness, app, record) = ready(&provider).await;
+    let request = |query: &str| {
+        meta(
+            &app,
+            &record,
+            "GET",
+            &format!("{PROFILE}?{query}"),
+            json!([]),
+        )
+    };
+    let idle = || async {
+        harness.health().await["state"]["idle_connections"]["provider"]
+            .as_u64()
+            .unwrap()
+    };
+
+    // One request: its connection is idle afterwards, in the node and at the provider.
+    assert_eq!(
+        harness.forward(request("n=1"), b"").await.unwrap().status,
+        200
+    );
+    until("the connections of the writes ended", || {
+        provider.open_connections() == 1
+    })
+    .await;
+    assert_eq!(idle().await, 1);
+
+    // The account makes no further call. A sweep before the idle time passed leaves the
+    // connection, and the sweep after it ends the connection: the provider reads its end.
+    harness.node.clock.advance(limits::PROVIDER_IDLE_MS / 2);
+    log_store::sweep(&harness.node).await;
+    assert_eq!((idle().await, provider.open_connections()), (1, 1));
+    harness.node.clock.advance(limits::PROVIDER_IDLE_MS / 2);
+    log_store::sweep(&harness.node).await;
+    assert_eq!(idle().await, 0);
+    until("the idle connection ended", || {
+        provider.open_connections() == 0
+    })
+    .await;
+    assert_eq!(gmail_connections(&harness), 1);
+
+    // A connection its provider closed is no idle connection of the node, also before a
+    // call or a sweep looks at it.
+    assert_eq!(
+        harness.forward(request("n=2"), b"").await.unwrap().status,
+        200
+    );
+    until("the connections of the writes ended", || {
+        provider.open_connections() == 1
+    })
+    .await;
+    assert_eq!(idle().await, 1);
+    provider.close_idle_connections();
+    until("the node read the end of the connection", || {
+        harness.node.egress.provider_idle.idle_total() == 0
+    })
+    .await;
+    assert_eq!(idle().await, 0);
+    assert_eq!(provider.open_connections(), 0);
+    // The request after it opens a connection.
+    assert_eq!(
+        harness.forward(request("n=3"), b"").await.unwrap().status,
+        200
+    );
+    assert_eq!(gmail_connections(&harness), 3);
     assert_budget_is_free(&harness);
 }
 

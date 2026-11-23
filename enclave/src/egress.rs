@@ -583,6 +583,11 @@ impl Exchange {
 /// 5.8 step 8): at most [`limits::PROVIDER_IDLE_CONNECTIONS`] per account and host, each kept
 /// for at most [`limits::PROVIDER_IDLE_MS`], and at most [`IDLE_PROVIDER_CONNECTIONS_TOTAL`] in
 /// all. No connection carries the requests of two accounts.
+///
+/// A connection whose idle time passed carries no further request. The node closes it when
+/// the next request of its account and host asks for a connection, when the next response of
+/// any account ends, and in its sweep ([`ProviderConnections::end_idle`]): a node that
+/// receives no further call closes it at its next sweep at the latest.
 #[derive(Default)]
 pub struct ProviderConnections(NodeLock<HashMap<(String, String), IdleSenders>>);
 
@@ -652,6 +657,28 @@ impl ProviderConnections {
         idle.push((sender, now_ms));
     }
 
+    /// Ends every idle connection whose idle time passed at `now_ms`, and drops every
+    /// connection its provider closed: the step of the sweep of the node for the connections
+    /// of the accounts that make no further call (`crate::log_store::sweep`). The connections
+    /// leave the table inside its lock and end after the lock is free.
+    pub fn end_idle(&self, now_ms: u64) {
+        let mut ended: IdleSenders = Vec::new();
+        let mut pools = lock(&self.0);
+        pools.retain(|_, idle| {
+            let (kept, gone): (IdleSenders, IdleSenders) = std::mem::take(idle)
+                .into_iter()
+                .partition(|(sender, since_ms)| {
+                    !sender.is_closed()
+                        && now_ms < since_ms.saturating_add(limits::PROVIDER_IDLE_MS)
+                });
+            ended.extend(gone);
+            *idle = kept;
+            !idle.is_empty()
+        });
+        drop(pools);
+        drop(ended);
+    }
+
     /// The number of idle connections of `user_id` to `host`.
     #[cfg(test)]
     pub fn idle_count(&self, user_id: &str, host: &str) -> usize {
@@ -660,10 +687,15 @@ impl ProviderConnections {
             .map_or(0, Vec::len)
     }
 
-    /// The number of idle connections over every account and host, as they are kept at this
-    /// moment (`provider` of `idle_connections` of health).
+    /// The number of idle connections over every account and host that are open at this
+    /// moment (`provider` of `idle_connections` of health). A connection its provider closed
+    /// is not one of them, also while it waits in the table for the sweep to drop it.
     pub fn idle_total(&self) -> usize {
-        lock(&self.0).values().map(Vec::len).sum()
+        lock(&self.0)
+            .values()
+            .flatten()
+            .filter(|(sender, _)| !sender.is_closed())
+            .count()
     }
 }
 

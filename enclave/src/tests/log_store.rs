@@ -25,6 +25,7 @@ use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use super::mail_stand_in::until;
 use super::provider_and_log_store;
 use crate::api::peer::{export_to, import_from};
 use crate::attest::{Peer, Program};
@@ -724,7 +725,8 @@ async fn a_write_the_store_refuses_with_a_server_error_is_repeated_within_its_bu
     assert!(log["write_ms_sum"].as_u64().unwrap() < 5000);
     assert_eq!(harness.health().await["log_store"]["pending"], 0);
 
-    // 429 is repeated like a 5xx status.
+    // 429 is repeated like a 5xx status, and counted under the cause of the statuses that
+    // are repeated.
     *lock(&store) = Script {
         refusals: 1,
         refusal_status: 429,
@@ -733,9 +735,11 @@ async fn a_write_the_store_refuses_with_a_server_error_is_repeated_within_its_bu
     assert_eq!(release(&harness, &app, &password(&app)).await.0, 200);
     let log = harness.health().await["log"].clone();
     assert_eq!(log["write_retries"], 3);
-    assert_eq!(log["write_attempt_failures"]["status_4xx"], 1);
+    assert_eq!(log["write_attempt_failures"]["status_5xx"], 3);
+    assert_eq!(log["write_attempt_failures"]["status_4xx"], 0);
 
-    // A 4xx status other than 429 is not repeated: the write fails at once.
+    // A 4xx status other than 429 is not repeated: the write fails at once, under the cause
+    // of the statuses that are not repeated.
     *lock(&store) = Script {
         refusals: 1,
         refusal_status: 403,
@@ -747,7 +751,8 @@ async fn a_write_the_store_refuses_with_a_server_error_is_repeated_within_its_bu
     let log = harness.health().await["log"].clone();
     assert_eq!(log["write_retries"], 3);
     assert_eq!(log["write_failures"], 1);
-    assert_eq!(log["write_attempt_failures"]["status_4xx"], 2);
+    assert_eq!(log["write_attempt_failures"]["status_4xx"], 1);
+    assert_eq!(log["write_attempt_failures"]["status_5xx"], 3);
     assert_eq!(harness.health().await["log_store"]["pending"], 1);
 }
 
@@ -1355,9 +1360,14 @@ async fn a_node_of_the_nitro_platform_does_not_act_without_its_log_store() {
     refused(&app.send(&harness, envelope.clone()).await);
     assert!(writes(&provider).is_empty());
     assert_eq!(harness.last_seq("user-1"), 0);
+    // A node whose clock is at or past the end of its credentials holds none: its health
+    // says so, as before it received any.
+    let held = || async { harness.health().await["log_store"]["credentials_expires_ms"].clone() };
+    assert_eq!(held().await, 0);
 
     // With credentials within their time the same command passes.
     credentials(now_ms + 60_000).await;
+    assert_eq!(held().await, now_ms + 60_000);
     let response = app.send(&harness, envelope).await;
     let reply = harness.verified(purpose::REPLY, &response["reply"]);
     assert_eq!(reply["ok"], true, "{reply}");
@@ -1372,8 +1382,9 @@ async fn a_node_of_the_nitro_platform_does_not_act_without_its_log_store() {
     assert_eq!(release(&harness, &app, &vault).await.0, 200);
 
     // When the credentials end, every act of the node ends with them, before an entry is
-    // created and before a provider is called.
+    // created and before a provider is called, and the node holds no credentials.
     harness.node.clock.advance(60_000);
+    assert_eq!(held().await, 0);
     let seq = harness.last_seq("user-1");
     let outcome = harness.forward(get(&app, &record, MESSAGES), b"").await;
     unavailable(&outcome.err().unwrap());
@@ -2106,6 +2117,67 @@ async fn a_reused_connection_carries_the_current_credentials() {
         writes[1].header("authorization")
     );
     assert_eq!(harness.platform.connections().len(), 1);
+}
+
+#[tokio::test]
+async fn an_idle_connection_to_the_store_ends_at_its_idle_time_without_a_further_write() {
+    let (provider, _store) = stand_in().await;
+    let (harness, app) = node_with_log_store(&provider).await;
+    let idle = || async {
+        harness.health().await["state"]["idle_connections"]["log_store"]
+            .as_u64()
+            .unwrap()
+    };
+    let opened = || harness.platform.connections().len();
+
+    // The node document and the entry of the grant went over one connection, which is idle
+    // now, in the node and at the store.
+    assert_eq!(
+        (idle().await, opened(), provider.open_connections()),
+        (1, 1, 1)
+    );
+
+    // A write within the idle time goes over it. The node writes no further entry: a sweep
+    // before the idle time passed leaves the connection, and the sweep after it ends the
+    // connection, and the store reads its end.
+    let half = limits::LOG_STORE_IDLE_MS / 2;
+    harness.node.clock.advance(half);
+    assert_eq!(release(&harness, &app, &password(&app)).await.0, 200);
+    assert_eq!((idle().await, opened()), (1, 1));
+    harness.node.clock.advance(half);
+    log_store::sweep(&harness.node).await;
+    assert_eq!((idle().await, provider.open_connections()), (1, 1));
+    harness.node.clock.advance(half);
+    log_store::sweep(&harness.node).await;
+    assert_eq!(idle().await, 0);
+    until("the idle connection ended", || {
+        provider.open_connections() == 0
+    })
+    .await;
+
+    // The next write opens a connection. A connection whose idle time passed carries no
+    // write, also before a sweep ended it.
+    assert_eq!(release(&harness, &app, &password(&app)).await.0, 200);
+    assert_eq!((idle().await, opened()), (1, 2));
+    harness.node.clock.advance(limits::LOG_STORE_IDLE_MS);
+    assert_eq!(release(&harness, &app, &password(&app)).await.0, 200);
+    assert_eq!((idle().await, opened()), (1, 3));
+    until("the connection that was passed over ended", || {
+        provider.open_connections() == 1
+    })
+    .await;
+
+    // A connection the store closed is no idle connection of the node, also before a write
+    // or a sweep looks at it.
+    provider.close_idle_connections();
+    until("the node read the end of the connection", || {
+        harness.node.log_store.idle_connections() == 0
+    })
+    .await;
+    assert_eq!(idle().await, 0);
+    assert_eq!(release(&harness, &app, &password(&app)).await.0, 200);
+    assert_eq!(opened(), 4);
+    assert_eq!(harness.health().await["log_store"]["pending"], 0);
 }
 
 /// One day in milliseconds.

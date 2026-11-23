@@ -7,6 +7,9 @@
 //!   confirmed that it ended. The life of the enclave, without a call to the node: the
 //!   liveness probe of the pod reads it. A node that does not answer is not a dead enclave,
 //!   and a pod replaced for that reason would lose the delegations of a living node.
+//! - `POST /ready`: sets the ready mark of the pod, and `GET /readyz`: 200 when the pod is
+//!   ready, 503 otherwise (`ready.rs`). The readiness probe of a pod that waits for the mark
+//!   reads `/readyz`.
 //! - `GET /metrics`: the Prometheus text format. Four gauges from the `health` call; the
 //!   series of the `log` object of the call (six counters and one gauge, and the write counts
 //!   of a node of release v2.1.0 or later), of its `log_store` object, of its `load` object
@@ -16,10 +19,12 @@
 //!   the gauge of its `grants` value and the four gauges of its `state` object, each when the
 //!   node answers with it; and, with every answer, the series of the host program itself: the
 //!   gauge of the watch of the enclave, the two gauges of its own descriptors, the gauge of
-//!   the socket memory of its container, and the series of the two relays.
+//!   the socket memory of its container, the series of the two relays, the count of its
+//!   contained panics and the gauge of the ready mark.
 //!
 //! Every request of `/healthz` and `/metrics` makes one `health` call over a new connection to
-//! the node. Nothing is cached: an answer says what the node answered just now.
+//! the node, and so does a request of `/readyz` of a pod whose mark is set. Nothing is cached:
+//! an answer says what the node answered just now.
 
 use std::convert::Infallible;
 use std::fmt::Write;
@@ -27,7 +32,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use http_body_util::Full;
-use hyper::body::{Bytes, Incoming};
+use hyper::body::{Body, Bytes, Incoming};
 use hyper::header::CONTENT_TYPE;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -39,6 +44,7 @@ use crate::descriptors;
 use crate::egress::EgressCounters;
 use crate::http;
 use crate::memory;
+use crate::ready::{self, Readiness};
 use crate::relay::{self, AcceptFailure, InboundCounters, NodeConnector, Pipes};
 use crate::watch::EnclaveWatch;
 
@@ -51,15 +57,22 @@ const REQUEST_HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 
 const TEXT: &str = "text/plain; charset=utf-8";
 const PROMETHEUS_TEXT: &str = "text/plain; version=0.0.4; charset=utf-8";
+pub const JSON: &str = "application/json";
 
 /// The values of the `health` call the host program reads (enclave.md 5.1). The response has
 /// more fields: they are not read. `log` is absent in the response of a node of a release
 /// before v2.0.0, `load` in the response of a node of a release before v2.0.1, and `egress`,
 /// `refresh` and `state` in the response of a node of a release before v2.1.0. `log_store` is
 /// null in the response of a node without a log store. `grants` is read when the response has
-/// it.
+/// it. `node` is the identifier of the node, the empty string when the response has none, and
+/// `closing` says that its orderly shutdown has started: the ready mark of the pod reads the
+/// two (`ready.rs`).
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct NodeHealth {
+    #[serde(default)]
+    pub node: String,
+    #[serde(default)]
+    pub closing: bool,
     pub configured: bool,
     pub accounts: u64,
     pub started_ms: u64,
@@ -972,7 +985,21 @@ fn host_series(
     );
 }
 
-fn respond(status: StatusCode, content_type: &'static str, body: String) -> Response<Full<Bytes>> {
+/// The gauge of the ready mark of the pod (`ready.rs`): the last series of `/metrics`.
+fn ready_series(text: &mut String, marked: bool) {
+    gauge(
+        text,
+        "credential_enclave_host_ready_marked",
+        "1 when the ready mark of the pod is set, 0 when it is not.",
+        format_args!("{}", u8::from(marked)),
+    );
+}
+
+pub fn respond(
+    status: StatusCode,
+    content_type: &'static str,
+    body: String,
+) -> Response<Full<Bytes>> {
     let mut response = Response::new(Full::new(Bytes::from(body)));
     *response.status_mut() = status;
     response.headers_mut().insert(
@@ -982,23 +1009,55 @@ fn respond(status: StatusCode, content_type: &'static str, body: String) -> Resp
     response
 }
 
-async fn answer(
-    method: &Method,
-    path: &str,
-    node: &dyn NodeConnector,
-    counters: &EgressCounters,
-    inbound: &InboundCounters,
-    watch: &EnclaveWatch,
-) -> Response<Full<Bytes>> {
-    if method != Method::GET {
+/// What the status surface reads: the way to the node, the counts of the egress relay and of
+/// the inbound relay (for `/metrics`), the watch of the enclave (for `/livez` and `/metrics`)
+/// and the ready mark of the pod (for `/ready`, `/readyz` and `/metrics`).
+pub struct Surface {
+    pub node: Arc<dyn NodeConnector>,
+    pub counters: Arc<EgressCounters>,
+    pub inbound: Arc<InboundCounters>,
+    pub watch: Arc<EnclaveWatch>,
+    pub readiness: Arc<Readiness>,
+}
+
+/// The routes of the status surface.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Route {
+    Healthz,
+    Livez,
+    Readyz,
+    Ready,
+    Metrics,
+}
+
+async fn answer<B>(request: Request<B>, surface: &Surface) -> Response<Full<Bytes>>
+where
+    B: Body,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let node = surface.node.as_ref();
+    let route = match request.uri().path() {
+        "/healthz" => Route::Healthz,
+        "/livez" => Route::Livez,
+        "/readyz" => Route::Readyz,
+        "/ready" => Route::Ready,
+        "/metrics" => Route::Metrics,
+        _ => return respond(StatusCode::NOT_FOUND, TEXT, "not found\n".into()),
+    };
+    // The one route that takes a body is the call that sets the ready mark.
+    let method = match route {
+        Route::Ready => Method::POST,
+        _ => Method::GET,
+    };
+    if request.method() != method {
         return respond(
             StatusCode::METHOD_NOT_ALLOWED,
             TEXT,
             "method not allowed\n".into(),
         );
     }
-    match path {
-        "/healthz" => match node_health(node).await {
+    match route {
+        Route::Healthz => match node_health(node).await {
             Some(_) => respond(StatusCode::OK, TEXT, "ok\n".into()),
             None => respond(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1006,8 +1065,8 @@ async fn answer(
                 "the enclave node does not answer\n".into(),
             ),
         },
-        "/livez" => {
-            if watch.ended() {
+        Route::Livez => {
+            if surface.watch.ended() {
                 respond(
                     StatusCode::SERVICE_UNAVAILABLE,
                     TEXT,
@@ -1017,35 +1076,26 @@ async fn answer(
                 respond(StatusCode::OK, TEXT, "ok\n".into())
             }
         }
-        "/metrics" => {
+        Route::Readyz => ready::answer(node, &surface.readiness).await,
+        Route::Ready => ready::set(request, node, &surface.readiness).await,
+        Route::Metrics => {
             let health = node_health(node).await;
-            respond(
-                StatusCode::OK,
-                PROMETHEUS_TEXT,
-                metrics(
-                    health.as_ref(),
-                    counters,
-                    inbound,
-                    watch.running(),
-                    host_descriptors(),
-                    memory::socket_bytes(),
-                ),
-            )
+            let mut text = metrics(
+                health.as_ref(),
+                &surface.counters,
+                &surface.inbound,
+                surface.watch.running(),
+                host_descriptors(),
+                memory::socket_bytes(),
+            );
+            ready_series(&mut text, surface.readiness.marked());
+            respond(StatusCode::OK, PROMETHEUS_TEXT, text)
         }
-        _ => respond(StatusCode::NOT_FOUND, TEXT, "not found\n".into()),
     }
 }
 
-/// Serves the status surface on every connection of `listener`. `counters` are the counts of
-/// the egress relay and `inbound` those of the inbound relay, read for `/metrics`; `watch` is
-/// the watch of the enclave, read for `/livez` and `/metrics`.
-pub async fn serve(
-    listener: TcpListener,
-    node: Arc<dyn NodeConnector>,
-    counters: Arc<EgressCounters>,
-    inbound: Arc<InboundCounters>,
-    watch: Arc<EnclaveWatch>,
-) {
+/// Serves the status surface on every connection of `listener`.
+pub async fn serve(listener: TcpListener, surface: Arc<Surface>) {
     loop {
         let (stream, _) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -1054,28 +1104,11 @@ pub async fn serve(
                 continue;
             }
         };
-        let node = node.clone();
-        let counters = counters.clone();
-        let inbound = inbound.clone();
-        let watch = watch.clone();
+        let surface = surface.clone();
         tokio::spawn(async move {
             let service = service_fn(move |request: Request<Incoming>| {
-                let node = node.clone();
-                let counters = counters.clone();
-                let inbound = inbound.clone();
-                let watch = watch.clone();
-                async move {
-                    let response = answer(
-                        request.method(),
-                        request.uri().path(),
-                        node.as_ref(),
-                        counters.as_ref(),
-                        inbound.as_ref(),
-                        watch.as_ref(),
-                    )
-                    .await;
-                    Ok::<_, Infallible>(response)
-                }
+                let surface = surface.clone();
+                async move { Ok::<_, Infallible>(answer(request, &surface).await) }
             });
             let _ = hyper::server::conn::http1::Builder::new()
                 .timer(TokioTimer::new())
@@ -1226,10 +1259,32 @@ mod tests {
         }
     }
 
+    /// The token of the ready mark of the pods of these tests.
+    const TOKEN: &str = "status-token";
+
+    /// The status surface of a pod whose watch saw nothing yet and whose ready mark the
+    /// backend sets with [`TOKEN`].
     async fn status_surface(
         node: Arc<FakeNode>,
         counters: Arc<EgressCounters>,
         inbound: Arc<InboundCounters>,
+    ) -> SocketAddr {
+        surface_with(
+            node,
+            counters,
+            inbound,
+            EnclaveWatch::new(),
+            Arc::new(Readiness::new(Some(TOKEN.to_string()))),
+        )
+        .await
+    }
+
+    async fn surface_with(
+        node: Arc<FakeNode>,
+        counters: Arc<EgressCounters>,
+        inbound: Arc<InboundCounters>,
+        watch: Arc<EnclaveWatch>,
+        readiness: Arc<Readiness>,
     ) -> SocketAddr {
         let listener = relay::listen_tcp(
             SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
@@ -1239,10 +1294,13 @@ mod tests {
         let address = listener.local_addr().unwrap();
         tokio::spawn(serve(
             listener,
-            node,
-            counters,
-            inbound,
-            EnclaveWatch::new(),
+            Arc::new(Surface {
+                node,
+                counters,
+                inbound,
+                watch,
+                readiness,
+            }),
         ));
         address
     }
@@ -1271,6 +1329,8 @@ mod tests {
         assert_eq!(
             node_health(node.as_ref()).await,
             Some(NodeHealth {
+                node: "n".to_string(),
+                closing: false,
                 configured: true,
                 accounts: 7,
                 started_ms: 1_790_000_000_123,
@@ -1296,6 +1356,8 @@ mod tests {
         assert_eq!(
             node_health(node.as_ref()).await,
             Some(NodeHealth {
+                node: "n".to_string(),
+                closing: false,
                 configured: true,
                 accounts: 7,
                 started_ms: 1_790_000_000_123,
@@ -1320,6 +1382,8 @@ mod tests {
         assert_eq!(
             node_health(node.as_ref()).await,
             Some(NodeHealth {
+                node: "n".to_string(),
+                closing: false,
                 configured: true,
                 accounts: 7,
                 started_ms: 1_790_000_000_123,
@@ -1423,7 +1487,8 @@ mod tests {
         );
 
         // Fields a later node adds do not change the reading, and a node of a release before
-        // v2.0.0 answers without `log`. `grants` is read from every release that answers it.
+        // v2.0.0 answers without `log`. `grants` is read from every release that answers it,
+        // and so are the identifier of the node and whether it is closing.
         let node = FakeNode::answering(|_| {
             let body = r#"{"node":"n","custody":"enclave","grants":3,"configured":false,"accounts":0,"started_ms":5,"closing":true}"#;
             (200, body.to_string())
@@ -1431,6 +1496,8 @@ mod tests {
         assert_eq!(
             node_health(node.as_ref()).await,
             Some(NodeHealth {
+                node: "n".to_string(),
+                closing: true,
                 configured: false,
                 accounts: 0,
                 started_ms: 5,
@@ -1479,6 +1546,8 @@ mod tests {
         let no_counts = EgressCounters::default();
         let no_inbound = no_inbound();
         let health = NodeHealth {
+            node: "n".to_string(),
+            closing: false,
             configured: true,
             accounts: 12,
             started_ms: 1_790_000_000_042,
@@ -1510,6 +1579,8 @@ mod tests {
             .concat()
         );
         let unconfigured = NodeHealth {
+            node: "n".to_string(),
+            closing: false,
             configured: false,
             accounts: 0,
             started_ms: 1000,
@@ -1977,15 +2048,18 @@ mod tests {
         ] {
             assert!(host_text.contains(line), "{line}: {text}");
         }
-        // The series of the inbound relay and the count of the panics of the host program
-        // come last.
+        // The series of the inbound relay, the count of the panics of the host program and
+        // the gauge of the ready mark of the pod come last.
         assert!(
             text.ends_with(
                 "\ncredential_enclave_host_inbound_relays_ended_total{cause=\"idle\"} 0\n\
                  credential_enclave_host_inbound_relays_ended_total{cause=\"half_closed\"} 0\n\
                  # HELP credential_enclave_host_contained_panics_total Panics of the host program that ended one connection and did not end the program, since it started.\n\
                  # TYPE credential_enclave_host_contained_panics_total counter\n\
-                 credential_enclave_host_contained_panics_total 0\n"
+                 credential_enclave_host_contained_panics_total 0\n\
+                 # HELP credential_enclave_host_ready_marked 1 when the ready mark of the pod is set, 0 when it is not.\n\
+                 # TYPE credential_enclave_host_ready_marked gauge\n\
+                 credential_enclave_host_ready_marked 0\n"
             ),
             "{text}"
         );
@@ -2012,11 +2086,11 @@ mod tests {
             "{text}"
         );
         // The gauge of the node, the gauge of the watch, the eight series of the egress relay,
-        // the eight series of the inbound relay and the count of the panics of the host
-        // program.
+        // the eight series of the inbound relay, the count of the panics of the host program
+        // and the gauge of the ready mark.
         assert_eq!(
             text.matches("# TYPE ").count(),
-            1 + 1 + 8 + 8 + 1 + host_descriptor_series
+            1 + 1 + 8 + 8 + 1 + 1 + host_descriptor_series
         );
     }
 
@@ -2031,11 +2105,132 @@ mod tests {
         .await;
         assert_eq!(call(address, Method::GET, "/").await.0, 404);
         assert_eq!(call(address, Method::GET, "/v1/health").await.0, 404);
+        assert_eq!(call(address, Method::POST, "/v1/ready").await.0, 404);
         assert_eq!(call(address, Method::POST, "/healthz").await.0, 405);
         assert_eq!(call(address, Method::POST, "/metrics").await.0, 405);
         assert_eq!(call(address, Method::POST, "/livez").await.0, 405);
+        // The two routes of the ready mark take one method each.
+        assert_eq!(call(address, Method::GET, "/ready").await.0, 405);
+        assert_eq!(call(address, Method::POST, "/readyz").await.0, 405);
         // None of them reached the node.
         assert!(node.calls().is_empty());
+    }
+
+    /// `POST /ready` with the bearer token `token` and `body`: the status and the body of
+    /// the answer.
+    async fn mark(address: SocketAddr, token: Option<&str>, body: &[u8]) -> (u16, String) {
+        let stream = TcpStream::connect(address).await.unwrap();
+        let bearer = token.map(|token| format!("Bearer {token}"));
+        let mut headers = vec![(CONTENT_TYPE, "application/json")];
+        if let Some(bearer) = &bearer {
+            headers.push((hyper::header::AUTHORIZATION, bearer.as_str()));
+        }
+        let request = http::request(
+            Method::POST,
+            "status.test",
+            "/ready",
+            &headers,
+            body.to_vec(),
+        )
+        .unwrap();
+        let reply = http::exchange(stream, request, 64 * 1024).await.unwrap();
+        (reply.status, String::from_utf8(reply.body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn the_status_surface_takes_the_ready_mark_and_reports_the_readiness_of_the_pod() {
+        // The node of the pod has the id `n`.
+        let node = FakeNode::answering(|_| (200, health_body(true, 0, 1)));
+        let readiness = Arc::new(Readiness::new(Some(TOKEN.to_string())));
+        let address = surface_with(
+            node.clone(),
+            Arc::new(EgressCounters::default()),
+            Arc::new(no_inbound()),
+            EnclaveWatch::new(),
+            readiness.clone(),
+        )
+        .await;
+        let gauge = |text: &str| {
+            text.rsplit_once("\ncredential_enclave_host_ready_marked ")
+                .map(|(_, value)| value.to_string())
+        };
+
+        // No mark: the pod is not ready although its node answers.
+        assert_eq!(call(address, Method::GET, "/healthz").await.0, 200);
+        assert_eq!(
+            call(address, Method::GET, "/readyz").await,
+            (503, r#"{"ready":false,"marked":false}"#.to_string())
+        );
+        let (_, text) = call(address, Method::GET, "/metrics").await;
+        assert_eq!(gauge(&text).as_deref(), Some("0\n"), "{text}");
+
+        // The call of the backend: without the token of the pod it sets nothing, and with it
+        // the pod is ready.
+        assert_eq!(
+            mark(address, Some("another-token"), br#"{"node":"n"}"#).await,
+            (401, r#"{"code":"unauthenticated"}"#.to_string())
+        );
+        assert_eq!(
+            mark(address, Some(TOKEN), br#"{"node":"n"}"#).await,
+            (200, r#"{"ready":true,"node":"n"}"#.to_string())
+        );
+        assert_eq!(
+            call(address, Method::GET, "/readyz").await,
+            (200, r#"{"ready":true,"marked":true}"#.to_string())
+        );
+        let (_, text) = call(address, Method::GET, "/metrics").await;
+        assert_eq!(gauge(&text).as_deref(), Some("1\n"), "{text}");
+
+        // The host program begins to end: the pod is not ready, and its mark stays.
+        readiness.end();
+        assert_eq!(
+            call(address, Method::GET, "/readyz").await,
+            (503, r#"{"ready":false,"marked":true}"#.to_string())
+        );
+        let (_, text) = call(address, Method::GET, "/metrics").await;
+        assert_eq!(gauge(&text).as_deref(), Some("1\n"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_ready_call_is_answered_when_its_whole_body_has_arrived() {
+        let node = FakeNode::answering(|_| (200, health_body(true, 0, 1)));
+        let address = status_surface(
+            node.clone(),
+            Arc::new(EgressCounters::default()),
+            Arc::new(no_inbound()),
+        )
+        .await;
+
+        // The head of a call without a token, and the first half of its body. The refusal
+        // does not depend on the body, and still it does not leave before the body ended: an
+        // answer in front of a body that is on its way can be lost with the connection.
+        let body = br#"{"node":"n"}"#;
+        let (first, second) = body.split_at(body.len() / 2);
+        let mut caller = TcpStream::connect(address).await.unwrap();
+        let head = format!(
+            "POST /ready HTTP/1.1\r\nHost: status.test\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        caller.write_all(head.as_bytes()).await.unwrap();
+        caller.write_all(first).await.unwrap();
+        let mut buffer = [0u8; 1024];
+        let early = tokio::time::timeout(
+            Duration::from_millis(200),
+            tokio::io::AsyncReadExt::read(&mut caller, &mut buffer),
+        )
+        .await;
+        assert!(early.is_err(), "an answer left before the end of the body");
+
+        caller.write_all(second).await.unwrap();
+        let count = tokio::io::AsyncReadExt::read(&mut caller, &mut buffer)
+            .await
+            .unwrap();
+        let answer = String::from_utf8_lossy(&buffer[..count]).to_string();
+        assert!(answer.starts_with("HTTP/1.1 401 "), "{answer}");
+        assert!(
+            answer.ends_with(r#"{"code":"unauthenticated"}"#),
+            "{answer}"
+        );
     }
 
     #[tokio::test]
@@ -2238,19 +2433,14 @@ mod tests {
         // The node does not answer: /healthz is 503 and /livez is 200, the enclave runs.
         let node = FakeNode::new(Behavior::Unreachable);
         let watch = EnclaveWatch::new();
-        let listener = relay::listen_tcp(
-            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-            relay::LISTEN_BACKLOG,
-        )
-        .unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(serve(
-            listener,
+        let address = surface_with(
             node.clone(),
             Arc::new(EgressCounters::default()),
             Arc::new(no_inbound()),
             watch.clone(),
-        ));
+            Arc::new(Readiness::new(None)),
+        )
+        .await;
         assert_eq!(call(address, Method::GET, "/healthz").await.0, 503);
         assert_eq!(
             call(address, Method::GET, "/livez").await,

@@ -127,9 +127,12 @@ document states, not at the time of the machine.
   (ECDSA P-256, valid from 2021-01-12) and log2025-1.rekor.sigstore.dev (Ed25519, valid from
   2025-09-23). The test of `enclave/src/lineage.rs` compares the table of transparency logs of
   the node program with it: every log of the file has a row with its key, and the log
-  identifier of that row is the one the file states. The other parts of the file (the
-  certificate authorities, the certificate transparency logs, the timestamp authority) are not
-  read.
+  identifier of that row is the one the file states. The workflow `trusted-root-monitor.yml`
+  compares the `tlogs` of the trusted root that the TUF repository of Sigstore distributes with
+  the `tlogs` of this file every hour (`secure-program/monitor.py --trusted-root`, enclave.md
+  11.2): when they differ, this file is replaced by the trusted root as it is distributed then,
+  and the table and the test follow. The other parts of the file (the certificate authorities,
+  the certificate transparency logs, the timestamp authority) are not read.
 - Origin: `targets/trusted_root.json` of the repository
   <https://github.com/sigstore/root-signing>, as of its commit
   `c09d62f9397fcff8b98b5bcd2dc9044a4f853cd4` (2026-11-23), without a change. The TUF
