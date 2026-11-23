@@ -436,5 +436,5 @@ function withDeployKeys(source, deploy) {
 module.exports = {
   b64, b64u, sha256, der, pem, ecKeyPair, ecdsaSign, certificate, makeAuthority, makeLog, treeHash, auditPath,
   ed25519KeyPair, makeParties, statementOf, deploySignature, recordedEntry, identityOf, attestationOf, proofsOf,
-  withParties, withDeployKeys, DEPLOY_CONTEXT, REPOSITORY, PREDICATE_TYPE, PAYLOAD_TYPE,
+  withParties, withConstant, withDeployKeys, DEPLOY_CONTEXT, REPOSITORY, PREDICATE_TYPE, PAYLOAD_TYPE,
 };

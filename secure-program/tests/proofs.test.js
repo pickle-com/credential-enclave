@@ -1281,3 +1281,94 @@ test("the grant step that asks a node the device knows for the release proofs of
   await nextDay(fx);
   assert.equal(told(world), "attention told attention:unlisted_release grant active");
 });
+
+// ---- The file prove.js ----
+
+test("prove.js states what the program makes of release proofs and of the attestation response of a node: the measurement of the document beside that of the statement, the binding, and whether the node receives a grant", () => {
+  const { spawnSync } = require("node:child_process");
+  const os = require("node:os");
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), "prove-"));
+  try {
+    const parties = model.makeParties();
+    // The documents of the nodes are signed under certificates of X.509: a root in the place of
+    // the root the program holds, an intermediate and a leaf on P-384, which the file verifies
+    // as it verifies the chain of a document of the platform.
+    const authority = model.makeAuthority();
+    const leafKey = model.ecKeyPair("secp384r1");
+    const world = new bridge.World({ serverTarget: "prod" });
+    const seconds = Math.floor(world.now / 1000);
+    world.nitro = {
+      privateKey: leafKey.privateKey, publicKey: null, root: authority.root, intermediate: authority.intermediate,
+      leaf: authority.issue(leafKey, {}, { notBefore: seconds - 60, notAfter: seconds + 10800 }),
+    };
+    const program = path.join(folder, "program.js");
+    fs.writeFileSync(program, model.withConstant(model.withParties(source, parties), "NITRO_ROOT",
+      JSON.stringify(bridge.b64u(authority.root))));
+    const measurement = bridge.randomMeasurement();
+    const write = (name, value) => {
+      const file = path.join(folder, name);
+      fs.writeFileSync(file, JSON.stringify(value));
+      return file;
+    };
+    /** What a node of the options answers a request for its attestation. */
+    const response = (options) => world.addNode(Object.assign({ release: "v2.5.0", measurement: measurement }, options))
+      .attestation(bridge.b64u(crypto.randomBytes(32)));
+    const run = (proofs, nodes) => {
+      const args = [path.join(__dirname, "prove.js"), proofs, "--program", program];
+      for (const node of nodes) args.push("--node", node);
+      const ended = spawnSync(process.execPath, args, { encoding: "utf8" });
+      return { status: ended.status, out: ended.stdout + ended.stderr };
+    };
+    const proofs = write("proofs.json", model.proofsOf(parties, "v2.5.0", measurement));
+
+    // A node of the measurement and the release of the statement, whose binding names the log
+    // store of the server target.
+    const fits = run(proofs, [write("node.json", response({}))]);
+    assert.equal(fits.status, 0, fits.out);
+    assert.equal(fits.out.split("\n").filter((line) => line.endsWith(": that of the statement")).length, 3, fits.out);
+    assert.ok(fits.out.indexOf("binding: release \"v2.5.0\", log {\"bucket\":\"character-credential-log-prod-1\",\"region\":\"us-west-2\"}, " +
+      "role none, program_min none") >= 0, fits.out);
+    assert.ok(fits.out.indexOf("the program hands this node a grant: release v2.5.0, log format 3") >= 0, fits.out);
+    // Without a node the verdict is that of the proofs alone.
+    const alone = run(proofs, []);
+    assert.equal(alone.status, 0, alone.out);
+    assert.equal(alone.out.trim(), "program version " + VERSION + ", server target prod: the proofs show release v2.5.0 (program_min 0)");
+
+    // A node of another measurement: the proofs hold, and they are not the proofs of that node.
+    const other = Object.assign({}, measurement, { pcr1: bridge.randomMeasurement().pcr1 });
+    const differs = run(proofs, [write("other.json", response({ measurement: other }))]);
+    assert.equal(differs.status, 1, differs.out);
+    assert.ok(differs.out.indexOf("pcr1 " + other.pcr1 + ": NOT that of the statement (" + measurement.pcr1 + ")") >= 0, differs.out);
+    assert.ok(differs.out.indexOf("the program hands this node no grant: its measurement is one no list of the program has and no " +
+      "release proofs showed (release proofs refused: p1: measurement)") >= 0, differs.out);
+
+    // A node of the measurement whose binding the program refuses, or whose grant command this
+    // program does not send.
+    for (const [options, refusal] of [
+      [{ release: "v2.5.1" }, "attestation rejected: release of the binding"],
+      [{ log: { bucket: "another-log-store", region: "us-west-2" } }, "attestation rejected: log store"],
+      [{ role: "forward" }, "attestation rejected: binding role"],
+      [{ programMin: VERSION + 1 }, "its binding states program_min " + (VERSION + 1)],
+    ]) {
+      const refused = run(proofs, [write("refused.json", response(options))]);
+      assert.equal(refused.status, 1, refused.out);
+      assert.ok(refused.out.indexOf("the program hands this node no grant: " + refusal) >= 0, refused.out);
+    }
+
+    // An answer that carries the responses of several nodes: each is judged.
+    const answer = run(proofs, [write("nodes.json", { nodes: [response({}), response({ release: "v2.5.1" })] })]);
+    assert.equal(answer.status, 1, answer.out);
+    assert.ok(answer.out.indexOf("response 1") >= 0 && answer.out.indexOf("response 2") >= 0, answer.out);
+    assert.ok(answer.out.indexOf("the program hands this node a grant") >= 0, answer.out);
+
+    // A statement in a form a node reads and the program refuses (half of a surrogate pair,
+    // written as an escape, in a member the program does not read): the same run states it.
+    const escaped = Buffer.from(model.statementOf("v2.5.0", measurement).toString().replace("{", "{\n  \"note\": \"\\ud83d\","), "utf8");
+    const unread = run(write("unread.json", model.proofsOf(parties, "v2.5.0", measurement, { statement: escaped })), [write("node.json", response({}))]);
+    assert.equal(unread.status, 1, unread.out);
+    assert.ok(unread.out.indexOf("refused: p1: statement") >= 0, unread.out);
+    assert.ok(unread.out.indexOf("the program hands this node no grant") >= 0, unread.out);
+  } finally {
+    fs.rmSync(folder, { recursive: true, force: true });
+  }
+});

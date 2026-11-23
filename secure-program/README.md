@@ -235,14 +235,26 @@ in the list. The endorsement cases of `protocol/vectors.json` run through the pr
 program reads a release statement and the entry of its record as a node does.
 
 `tests/prove.js` prints what the program makes of release proofs read from a file
-(`node secure-program/tests/prove.js RELEASE_PROOFS_JSON [--target prod|dev|alpha] [--program
-PROGRAM_JS]`): the verdict of the program of this checkout, or of the source `--program` names,
-with its constants as they are and for a build of the server target named. Release proofs are
-public values, so whoever makes or carries them can ask a version of the program for its verdict
-before a node of the release takes a key. The verdict is that of the five checks on the proofs
-alone: the measurement a node presents and the binding of that node (its `release`, which must be
-the release of the statement, its `log`, `role` and `program_min`) are read from the attestation of
-the node, which this file does not read.
+(`node secure-program/tests/prove.js RELEASE_PROOFS_JSON [--node ATTESTATION_RESPONSE_JSON]...
+[--target prod|dev|alpha] [--program PROGRAM_JS]`): the verdict of the program of this checkout,
+or of the source `--program` names, with its constants as they are and for a build of the server
+target named. Release proofs are public values, so whoever makes or carries them can ask a version
+of the program for its verdict before a node of the release takes a key.
+
+The verdict on the proofs is that of the five checks on the proofs alone. The measurement a node
+presents and the binding of that node are read from the attestation of the node: `--node` names a
+file with what a node answered a request for its attestation (protocol.md 4.2), or with an answer
+that carries such responses (`{nodes: [...]}`). For each response the file prints the three PCRs
+of the document beside those of the statement and what the binding states (`release`, `log`,
+`role`, `program_min`), and states whether the program hands that node a grant when the response
+carries these proofs, or the check of the program that refuses it: a measurement that is not the
+one of the statement, a binding whose `release` is not the release of the statement, a `log` that
+is not the log store of the server target, a role that receives no grant, a `program_min` above
+the version of the program. The certificate chain of the document is verified with the X.509
+implementation of Node, against the root the program holds and at the time the document states,
+and the nonce is taken from the document: the file judges an answer that was saved, not its
+freshness. The status is 0 when the proofs make the release one the program accepts and every
+node named presents the measurement of the statement and receives a grant.
 
 `SECURE_PROGRAM_VECTORS` names the vector files to read instead of `protocol/vectors.json` (paths
 separated by commas). A test of vectors that the files do not hold is skipped.
