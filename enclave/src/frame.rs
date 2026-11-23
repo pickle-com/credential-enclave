@@ -13,6 +13,11 @@ use serde::Serialize;
 /// The content type of a frame.
 pub const CONTENT_TYPE: &str = "application/vnd.pickle.frame";
 
+/// The content type of a response that is a stream: of `POST /v1/vault/send` (enclave.md
+/// 5.16). The meta of a frame, then the body in parts, each behind its length, then an end
+/// record.
+pub const STREAM_CONTENT_TYPE: &str = "application/vnd.pickle.stream";
+
 /// Longest `meta` a node reads: 1 MiB. A request meta holds one record, one address and the
 /// request headers.
 pub const META_LIMIT_BYTES: usize = 1024 * 1024;

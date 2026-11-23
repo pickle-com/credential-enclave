@@ -2,8 +2,8 @@
 //! `docs/egress-policy.md`).
 //!
 //! A response body is a value of a type that implements [`OperatorResponse`], and the functions
-//! that turn a value into a response ([`json_ok`], [`forward_frame`], the failure body of
-//! [`super::ApiError`]) take nothing else. The trait is implemented in this file only: its
+//! that turn a value into a response ([`json_ok`], [`forward_frame`], [`send_stream`], the
+//! failure body of [`super::ApiError`]) take nothing else. The trait is implemented in this file only: its
 //! supertrait is private to it. So this file lists everything the operator domain can receive
 //! from a node. Adding a response type means changing this file.
 //!
@@ -24,7 +24,9 @@
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::future::Future;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use axum::body::Body;
@@ -34,15 +36,19 @@ use axum::response::Response;
 use credential_enclave_protocol::encoding::{to_json, Signed};
 use credential_enclave_protocol::envelope::TransferEnvelope;
 use credential_enclave_protocol::record::Record;
+use credential_enclave_protocol::secret_use::SecretUseEnvelope;
+use credential_enclave_protocol::ProtocolError;
 use hyper::body::{Body as HttpBody, Bytes, Frame, SizeHint};
 use serde::Serialize;
 use tokio::sync::OwnedSemaphorePermit;
 
+use super::ApiError;
+use crate::egress::Exchange;
 use crate::frame;
 use crate::oauth::PublicFields;
-use crate::provider_response::CheckedResponse;
-use crate::state::GrantStatus;
-use crate::vault::ReleasedValue;
+use crate::provider_response::{CheckedHead, CheckedResponse, StreamCheck};
+use crate::state::{lock, GrantStatus};
+use crate::vault::HandedOut;
 
 mod sealed {
     pub trait Sealed {}
@@ -75,6 +81,10 @@ operator_response!(
     ForwardMeta,
     ForwardBatchMeta,
     Released,
+    Stored,
+    HandedOff,
+    SendMeta,
+    StreamEnd,
     Closed,
     Heads,
     Exported,
@@ -311,6 +321,9 @@ pub struct Health<'a> {
     pub platform: &'a str,
     /// P
     pub custody: &'a str,
+    /// P: `forward` on a node of the forward role, null on every other node. The role came
+    /// with the operator configuration (E) and is a constant of the source.
+    pub role: Option<&'a str>,
     /// P: node clock.
     pub started_ms: u64,
     /// P: node clock.
@@ -520,8 +533,33 @@ pub enum BatchResult {
 /// `POST /v1/release`.
 #[derive(Serialize)]
 pub struct Released {
-    /// V
-    pub value: ReleasedValue,
+    /// V: the value under the key `value`, or, for a call that named a key to seal it to,
+    /// the value under the seal of that key under the key `sealed`. The caller chose the key:
+    /// a sealed value is a value the operator domain reads.
+    #[serde(flatten)]
+    pub handed_out: HandedOut,
+    /// P
+    pub log: LogRef,
+}
+
+/// `POST /v1/vault/store`.
+#[derive(Serialize)]
+pub struct Stored {
+    /// C: encrypted under the user key. Its plaintext holds the value and, for a record of
+    /// kind `vault_secret`, the name, the sites and the slots the call gave (E), and the
+    /// source `operator` (P). Its `id` and its nonce are node randomness (P).
+    pub record: Record,
+    /// P
+    pub log: LogRef,
+}
+
+/// `POST /v1/vault/handoff`.
+#[derive(Serialize)]
+pub struct HandedOff {
+    /// C: one use of a vault secret, the value and the request it is for, sealed to the
+    /// sealing key of the verified node of the forward role (sink K8). `from` and `to` are the
+    /// identifiers of the two nodes (P).
+    pub envelope: SecretUseEnvelope,
     /// P
     pub log: LogRef,
 }
@@ -693,6 +731,264 @@ pub fn forward_batch_frame(results: Vec<BatchResult>, budget: OwnedSemaphorePerm
     parts.push(Bytes::from(head));
     parts.extend(bodies);
     frame_response(parts, budget)
+}
+
+/// The meta of a `POST /v1/vault/send` response: the head of the response of the host.
+#[derive(Serialize)]
+pub struct SendMeta {
+    /// R
+    status: u16,
+    /// R
+    headers: Vec<(String, String)>,
+}
+
+/// The end record of the response of `vault/send`: how the body ended.
+#[derive(Serialize)]
+pub struct StreamEnd {
+    /// P: true when the body ended as the host ended it, and every byte of it was handed on.
+    complete: bool,
+    /// P: a code of the closed list of protocol.md section 11, when the body was cut.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'static str>,
+    /// P: a fixed string of the source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<&'static str>,
+}
+
+/// The body of the response of `POST /v1/vault/send` (enclave.md 5.16): the meta, then the
+/// body of the response of the host in parts as it arrives, then the end record.
+///
+/// ```text
+/// stream = meta_len (unsigned 32 bit, big-endian) || meta (UTF-8 JSON) || part* || end
+/// part   = part_len (unsigned 32 bit, big-endian, at least 1) || part_len bytes of the body
+/// end    = 0 (unsigned 32 bit) || UTF-8 JSON {"complete":true}
+///                               | {"complete":false,"code":"...","message":"..."}
+/// ```
+///
+/// Every piece of the body passes the search of rule E4 before a byte of it is queued
+/// (`StreamCheck`), and what is queued lags behind what arrived by the bytes that search
+/// keeps back. When the body ends as the host ended it, the kept bytes follow and the end
+/// record says `complete`. When the search finds the value, when the host or the connection
+/// fails, or when the time limit of the call passes, the body is cut there: the connection to
+/// the host is dropped, the kept bytes are overwritten and not handed on, and the end record
+/// names the reason. A stream that ends without an end record was cut by something else, and
+/// a reader takes it for a failure.
+///
+/// The stream reads a piece of the body when its caller took what was queued before, and it
+/// queues no more than what one piece gives: the node holds of a body the piece it reads and
+/// the bytes the search keeps back, whatever the length of the body.
+///
+/// The time limit of the call holds whatever its caller does. A stream is read only while
+/// its caller takes what it hands on, so a caller that stops reading would keep the response
+/// of the host, and the places of the call, for as long as its connection to the node lasts.
+/// The watch of the time limit ([`BodyStream::watch`]) runs apart from the reading: at the
+/// time limit it drops what the call holds, read or not.
+struct BodyStream {
+    /// What is ready to be written: the meta first, then the parts, then the end record.
+    queue: VecDeque<Bytes>,
+    /// What the call holds while its body goes on. `None` once the body ended or was cut:
+    /// by this stream, or by the watch of the time limit.
+    held: Arc<Mutex<Option<Held>>>,
+    /// True once the end record is queued.
+    ended: bool,
+    /// The time limit of the call, for a stream whose caller reads: the body is cut when it
+    /// passes while the stream waits for the host.
+    deadline: Pin<Box<tokio::time::Sleep>>,
+    /// The watch of the time limit, ended with the stream.
+    watch: tokio::task::AbortHandle,
+}
+
+/// What a call whose response is a stream holds until the body of that response ended or
+/// was cut.
+struct Held {
+    /// The response of the host, with the connection to it and the place of the call among
+    /// the provider requests in flight.
+    exchange: Exchange,
+    check: StreamCheck,
+    /// The place among the forward calls of the node and the share of the body budget the
+    /// request body occupies.
+    _places: (OwnedSemaphorePermit, OwnedSemaphorePermit),
+}
+
+/// The four bytes in front of a part that its length is written into.
+const PART_LENGTH_BYTES: usize = 4;
+
+impl BodyStream {
+    /// The stream of `exchange`, behind `meta`. The watch of the time limit starts with it.
+    fn new(
+        meta: Vec<u8>,
+        check: StreamCheck,
+        exchange: Exchange,
+        deadline: tokio::time::Instant,
+        places: (OwnedSemaphorePermit, OwnedSemaphorePermit),
+    ) -> BodyStream {
+        let held = Arc::new(Mutex::new(Some(Held {
+            exchange,
+            check,
+            _places: places,
+        })));
+        BodyStream {
+            queue: VecDeque::from([Bytes::from(meta)]),
+            watch: BodyStream::watch(held.clone(), deadline),
+            held,
+            ended: false,
+            deadline: Box::pin(tokio::time::sleep_until(deadline)),
+        }
+    }
+
+    /// Drops what a call holds at its time limit, whether or not its stream is read: the
+    /// response of the host with its connection, the search with the bytes it kept, and the
+    /// places of the call. A stream that is read afterwards finds nothing held and ends with
+    /// `timeout`.
+    fn watch(
+        held: Arc<Mutex<Option<Held>>>,
+        deadline: tokio::time::Instant,
+    ) -> tokio::task::AbortHandle {
+        tokio::spawn(async move {
+            tokio::time::sleep_until(deadline).await;
+            let dropped = lock(&held).take();
+            drop(dropped);
+        })
+        .abort_handle()
+    }
+
+    /// A part without a byte of the body yet: the place of its length.
+    fn open_part() -> Vec<u8> {
+        vec![0; PART_LENGTH_BYTES]
+    }
+
+    /// Queues a part, when it holds a byte of the body.
+    fn queue_part(&mut self, mut part: Vec<u8>) {
+        // A part begins with the room for its length. One without that room, and one whose
+        // length the four bytes cannot state, is not queued.
+        let length = part
+            .len()
+            .checked_sub(PART_LENGTH_BYTES)
+            .and_then(|length| u32::try_from(length).ok());
+        if let (Some(length @ 1..), Some(prefix)) = (length, part.get_mut(..PART_LENGTH_BYTES)) {
+            prefix.copy_from_slice(&length.to_be_bytes());
+            self.queue.push_back(Bytes::from(part));
+        }
+    }
+
+    /// Ends the body: drops what the call still holds (the response of the host, the search
+    /// with the bytes it kept, the places of the call) and queues the end record.
+    fn end(&mut self, cut: Option<ProtocolError>) {
+        let dropped = lock(&self.held).take();
+        drop(dropped);
+        self.watch.abort();
+        self.ended = true;
+        let record = StreamEnd {
+            complete: cut.is_none(),
+            code: cut.map(|error| error.code()),
+            message: cut.map(|error| ApiError::from(error).message),
+        };
+        let mut bytes = 0u32.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&to_json(&record));
+        self.queue.push_back(Bytes::from(bytes));
+    }
+
+    /// Reads the next piece of the body and queues what the search hands on of it. `Ready`
+    /// with how the body ended once it ended or was cut (`None` in it for a body that ended
+    /// as the host ended it), and `Ready(None)` for a body that goes on.
+    fn read(&mut self, context: &mut Context<'_>) -> Poll<Option<Option<ProtocolError>>> {
+        let mut held = lock(&self.held);
+        // The watch took what the call held: the time limit passed.
+        let Some(state) = held.as_mut() else {
+            return Poll::Ready(Some(Some(ProtocolError::Timeout)));
+        };
+        let piece = match state.exchange.poll_piece(context) {
+            Poll::Ready(piece) => piece,
+            Poll::Pending => return Poll::Pending,
+        };
+        let mut part = BodyStream::open_part();
+        let ended = match piece {
+            // A piece: what the search hands on of it and of the pieces before it.
+            Some(Ok(piece)) => match state.check.push(&piece, &mut part) {
+                Ok(()) => None,
+                Err(_) => Some(Some(ProtocolError::ResponseWithheld)),
+            },
+            // The end of the body as the host ended it: the bytes the search kept.
+            None => match held.take().map(|state| state.check.finish(&mut part)) {
+                Some(Ok(())) => Some(None),
+                _ => Some(Some(ProtocolError::ResponseWithheld)),
+            },
+            // The connection failed inside the body.
+            Some(Err(_)) => Some(Some(ProtocolError::ProviderUnreachable)),
+        };
+        drop(held);
+        // A part of a body that was cut is not handed on: the cut is in front of it.
+        if !matches!(ended, Some(Some(_))) {
+            self.queue_part(part);
+        }
+        Poll::Ready(ended)
+    }
+}
+
+/// A stream whose caller went away: what the call still holds is dropped with it, here and
+/// not when the watch of the time limit ends.
+impl Drop for BodyStream {
+    fn drop(&mut self) {
+        let dropped = lock(&self.held).take();
+        drop(dropped);
+        self.watch.abort();
+    }
+}
+
+impl HttpBody for BodyStream {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+        loop {
+            if let Some(next) = self.queue.pop_front() {
+                return Poll::Ready(Some(Ok(Frame::data(next))));
+            }
+            if self.ended {
+                return Poll::Ready(None);
+            }
+            if self.deadline.as_mut().poll(context).is_ready() {
+                self.end(Some(ProtocolError::Timeout));
+                continue;
+            }
+            match self.read(context) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => {}
+                Poll::Ready(Some(cut)) => self.end(cut),
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.queue.is_empty() && self.ended
+    }
+}
+
+/// The 200 response of `vault/send`: the head of a response that passed the checks of rule E4
+/// on its status and its headers, and its body as it arrives, each piece after the search of
+/// that rule. `deadline` is the end of the time limit of the call, and `held` the place of the
+/// call among the forward calls of the node with the share of the body budget of its request
+/// body.
+pub fn send_stream(
+    head: CheckedHead,
+    check: StreamCheck,
+    exchange: Exchange,
+    deadline: tokio::time::Instant,
+    held: (OwnedSemaphorePermit, OwnedSemaphorePermit),
+) -> Response {
+    let (status, headers) = head.into_parts();
+    let meta = frame::encode_head(&SendMeta { status, headers });
+    let stream = BodyStream::new(meta, check, exchange, deadline, held);
+    let mut response = Response::new(Body::new(stream));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static(frame::STREAM_CONTENT_TYPE),
+    );
+    response
 }
 
 fn frame_response(parts: Vec<Bytes>, budget: OwnedSemaphorePermit) -> Response {

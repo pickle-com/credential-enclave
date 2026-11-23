@@ -21,7 +21,7 @@ use webpki::{
 
 use crate::encoding::{b64u_decode, b64u_decode_array};
 use crate::envelope::is_usable_seal_key;
-use crate::keys::LogStoreId;
+use crate::keys::{LogStoreId, Role};
 use crate::limits;
 
 /// The AWS Nitro Enclaves Root-G1 certificate (DER): the trust anchor of Nitro attestation
@@ -178,14 +178,20 @@ pub struct NodeBinding {
     pub release: String,
     /// The log store the node writes its entries to before it acts, when it has one.
     pub log: Option<LogStoreId>,
+    /// The role of the node: the forward role when the binding says so, the delegation role
+    /// otherwise.
+    pub role: Role,
 }
 
 /// Reads a binding document (protocol.md 4.1):
 /// `{"v":1,"sign":b64u(32 bytes),"seal":b64u(32 bytes),"release":"..."}` of at most 512 bytes,
-/// with the key `"log":{"bucket":"...","region":"..."}` when the node has a log store.
+/// with the key `"log":{"bucket":"...","region":"..."}` when the node has a log store, or the
+/// key `"role":"forward"` when the node has the forward role.
 /// A sealing key HPKE cannot seal to (a small-order point) is refused, so whatever is sealed
 /// for the keys of a binding this function returned can be sealed. A `log` that is not a bucket
-/// name and a region name is refused: a binding states its log store or none.
+/// name and a region name is refused: a binding states its log store or none. A `role` that is
+/// not the string `forward` is refused, and so is a binding with both a `role` and a `log`: a
+/// node of the forward role has no log store.
 pub fn read_binding(binding: &[u8]) -> Result<NodeBinding, AttestationError> {
     binding_of(binding).ok_or(AttestationError::Malformed)
 }
@@ -210,11 +216,19 @@ fn binding_of(binding: &[u8]) -> Option<NodeBinding> {
             log.get("region")?.as_str()?,
         )?),
     };
+    let role = match value.get("role") {
+        None => Role::of_binding(None)?,
+        Some(role) => Role::of_binding(Some(role.as_str()?))?,
+    };
+    if role == Role::Forward && log.is_some() {
+        return None;
+    }
     Some(NodeBinding {
         sign_public,
         seal_public,
         release: value.get("release")?.as_str()?.to_string(),
         log,
+        role,
     })
 }
 
@@ -704,7 +718,7 @@ impl<'a> NitroPayload<'a> {
 mod tests {
     use super::*;
     use crate::encoding::{b64u, to_json};
-    use crate::keys::{binding, NodeKeys};
+    use crate::keys::{binding, forward_binding, NodeKeys};
     use ring::rand::SystemRandom;
     use ring::signature::{EcdsaKeyPair, ECDSA_P384_SHA384_FIXED_SIGNING};
     use serde_json::json;
@@ -1308,6 +1322,7 @@ mod tests {
                 seal_public: keys.seal_public(),
                 release: "v1.0.0".to_string(),
                 log: None,
+                role: Role::Delegation,
             })
         );
         assert_eq!(verify(&document, None), Ok(verified.clone()));
@@ -1809,8 +1824,32 @@ mod tests {
             |binding| binding["log"] = json!({"bucket": "character-credential-log-prod-1", "region": "us-west-2", "future": 1}),
         ));
         assert_eq!(stated.unwrap().log, Some(log));
+        // A binding states the forward role, or it is the binding of a node of the delegation
+        // role.
+        assert_eq!(read_binding(&value(|_| {})).unwrap().role, Role::Delegation);
+        let forward = read_binding(&forward_binding(&keys, "v1.0.0")).unwrap();
+        assert_eq!((forward.role, forward.log), (Role::Forward, None));
+        assert_eq!(forward.seal_public, keys.seal_public());
+        assert_eq!(
+            read_binding(&value(|binding| binding["role"] = json!("forward")))
+                .unwrap()
+                .role,
+            Role::Forward
+        );
 
-        let changes: [fn(&mut serde_json::Value); 16] = [
+        let changes: [fn(&mut serde_json::Value); 22] = [
+            // A role this release does not know, and a role that is no string.
+            |binding| binding["role"] = json!("delegation"),
+            |binding| binding["role"] = json!("Forward"),
+            |binding| binding["role"] = json!(""),
+            |binding| binding["role"] = json!(null),
+            |binding| binding["role"] = json!(["forward"]),
+            // A node of the forward role has no log store.
+            |binding| {
+                binding["role"] = json!("forward");
+                binding["log"] =
+                    json!({"bucket": "character-credential-log-prod-1", "region": "us-west-2"});
+            },
             // A log store that is not a bucket name and a region name.
             |binding| binding["log"] = json!(null),
             |binding| binding["log"] = json!("character-credential-log-prod-1"),

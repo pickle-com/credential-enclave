@@ -15,6 +15,12 @@
 //! a provider. A request is addressed to a [`Destination`], which only the provider
 //! definitions create: the host of a request is one that passed the address check of
 //! `forward`, or the host of the token address or of the revocation address of a definition.
+//!
+//! It is sink K9 as well: [`BoundRequest::build`] is the one place where the value of a vault
+//! secret is written into a request, on a node of the forward role. The host and the method
+//! of that request are those of an opened envelope of one use of the secret (protocol.md
+//! 10.5): the host the record of the secret names, as the node of the delegation role checked
+//! it before it sealed the value. Such a request goes over a connection of its own.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -27,9 +33,12 @@ use std::time::{Duration, Instant};
 
 use credential_enclave_protocol::limits;
 use credential_enclave_protocol::secret::Secret;
+use credential_enclave_protocol::secret_use::SecretUse;
 use hyper::body::{Body, Bytes, Frame, Incoming, SizeHint};
 use hyper::client::conn::http1::SendRequest;
-use hyper::header::{HeaderName, HeaderValue, CONNECTION, CONTENT_LENGTH, HOST, TRANSFER_ENCODING};
+use hyper::header::{
+    HeaderName, HeaderValue, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, HOST, TRANSFER_ENCODING,
+};
 use hyper::{Method, Request, Uri};
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
@@ -110,8 +119,9 @@ pub enum EgressError {
     Unreachable,
     /// The response body is above the limit.
     TooLarge,
-    /// The response body is under a transfer coding other than `chunked`: the node cannot read
-    /// it.
+    /// The response body is under a coding the node does not remove, so it cannot search it:
+    /// a transfer coding other than `chunked`, a content coding other than `identity`, or an
+    /// instance manipulation.
     Coded,
 }
 
@@ -313,13 +323,131 @@ impl OutboundHeader {
     }
 }
 
-/// A request body that is sent as one chunk.
-pub(crate) struct OnceBody(Option<Bytes>);
+/// The body of the request of one use of a vault secret.
+pub enum BoundBody {
+    /// The body of the caller as it is: the value goes to another place of the request.
+    Plain(Bytes),
+    /// The body of the caller with the value in the place of the placeholder: the bytes in
+    /// front of the placeholder, the value in the form of its place, the bytes behind the
+    /// placeholder. The two runs of the caller are parts of the body the caller sent: a body
+    /// is not copied to put a value into it.
+    Spliced {
+        before: Bytes,
+        written: Secret<Vec<u8>>,
+        after: Bytes,
+    },
+}
+
+impl BoundBody {
+    /// The length of the body in bytes.
+    fn len(&self) -> usize {
+        match self {
+            BoundBody::Plain(bytes) => bytes.len(),
+            BoundBody::Spliced {
+                before,
+                written,
+                after,
+            } => before.len() + written.expose_secret().len() + after.len(),
+        }
+    }
+}
+
+/// The request of one use of a vault secret (protocol.md 10.5), with the value at its place,
+/// ready to be sent. Only [`BoundRequest::build`] creates one.
+///
+/// The host and the method are those of an opened envelope: `build` reads them from a
+/// [`SecretUse`], which only the opening of an envelope creates. So the host a vault value is
+/// sent to is the host that the node of the delegation role wrote into the entry of that use
+/// and sealed with the value, and no other code of the node can name it.
+pub struct BoundRequest {
+    host: String,
+    request: Request<OnceBody>,
+}
+
+impl BoundRequest {
+    /// Writes the request of `secret_use`: the one place where a vault value is written into
+    /// a request (sink K9 of the egress policy). `target` is the request target in origin
+    /// form, `headers` the headers after `Host` and `Content-Length`, and each of the three
+    /// may hold the value. The request carries `Connection: close` as its last header.
+    ///
+    /// A target or a header that cannot be expressed in HTTP/1.1 is [`EgressError::Invalid`].
+    pub fn build(
+        secret_use: &SecretUse,
+        target: &Secret<String>,
+        headers: &[OutboundHeader],
+        body: &BoundBody,
+    ) -> Result<BoundRequest, EgressError> {
+        let host = secret_use.request().host();
+        let method = Method::from_bytes(secret_use.request().method().as_bytes())
+            .map_err(|_| EgressError::Invalid)?;
+        let target: Uri = target
+            .expose_secret()
+            .parse()
+            .map_err(|_| EgressError::Invalid)?;
+        if target.scheme().is_some() || target.authority().is_some() || target.path().is_empty() {
+            return Err(EgressError::Invalid);
+        }
+        let body_length = body.len();
+        let sends_length =
+            body_length > 0 || matches!(method, Method::POST | Method::PUT | Method::PATCH);
+        let mut builder = Request::builder().method(method).uri(target).header(
+            HOST,
+            HeaderValue::from_str(host).map_err(|_| EgressError::Invalid)?,
+        );
+        if sends_length {
+            builder = builder.header(CONTENT_LENGTH, body_length);
+        }
+        for header in headers {
+            let name =
+                HeaderName::from_bytes(header.name.as_bytes()).map_err(|_| EgressError::Invalid)?;
+            let value = match &header.value {
+                HeaderText::Plain(text) => {
+                    HeaderValue::from_bytes(text.as_bytes()).map_err(|_| EgressError::Invalid)?
+                }
+                HeaderText::Secret(text) => {
+                    let mut value = HeaderValue::from_bytes(text.expose_secret().as_bytes())
+                        .map_err(|_| EgressError::Invalid)?;
+                    value.set_sensitive(true);
+                    value
+                }
+            };
+            builder = builder.header(name, value);
+        }
+        builder = builder.header(CONNECTION, HeaderValue::from_static("close"));
+        let body = match body {
+            BoundBody::Plain(bytes) => OnceBody::new(bytes.clone()),
+            BoundBody::Spliced {
+                before,
+                written,
+                after,
+            } => OnceBody::of([
+                before.clone(),
+                Bytes::copy_from_slice(written.expose_secret()),
+                after.clone(),
+            ]),
+        };
+        let request = builder.body(body).map_err(|_| EgressError::Invalid)?;
+        Ok(BoundRequest {
+            host: host.to_string(),
+            request,
+        })
+    }
+}
+
+/// A request body the node holds whole. It is sent in the runs of bytes it is made of: one
+/// run for a body of the caller or a body the node assembled, three for a body of the caller
+/// that a vault value was written into.
+pub(crate) struct OnceBody([Option<Bytes>; 3]);
 
 impl OnceBody {
     /// A body of these bytes. No bytes are no body.
     pub(crate) fn new(bytes: Bytes) -> OnceBody {
-        OnceBody((!bytes.is_empty()).then_some(bytes))
+        OnceBody::of([bytes, Bytes::new(), Bytes::new()])
+    }
+
+    /// A body of these runs of bytes, one after another. An empty run is left out.
+    fn of(runs: [Bytes; 3]) -> OnceBody {
+        OnceBody(runs.map(|run| (!run.is_empty()).then_some(run)))
     }
 }
 
@@ -331,15 +459,17 @@ impl Body for OnceBody {
         mut self: Pin<&mut Self>,
         _: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
-        Poll::Ready(self.0.take().map(|bytes| Ok(Frame::data(bytes))))
+        let next = self.0.iter_mut().find_map(Option::take);
+        Poll::Ready(next.map(|bytes| Ok(Frame::data(bytes))))
     }
 
     fn is_end_stream(&self) -> bool {
-        self.0.is_none()
+        self.0.iter().all(Option::is_none)
     }
 
     fn size_hint(&self) -> SizeHint {
-        SizeHint::with_exact(self.0.as_ref().map_or(0, |bytes| bytes.len() as u64))
+        let length: usize = self.0.iter().flatten().map(Bytes::len).sum();
+        SizeHint::with_exact(length as u64)
     }
 }
 
@@ -400,6 +530,33 @@ impl Exchange {
                             return Err(EgressError::TooLarge);
                         }
                         collected.extend_from_slice(&data);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The next piece of the response body, for a body that is handed on while it arrives.
+    /// `Ready(None)` at the end of the body: the connection then goes back to the idle
+    /// connections of its account and host. `Transfer-Encoding: chunked` is already decoded,
+    /// and the trailers of a body are left out.
+    pub fn poll_piece(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Bytes, EgressError>>> {
+        loop {
+            match Pin::new(&mut self.body).poll_frame(context) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => {
+                    self.keep_connection();
+                    return Poll::Ready(None);
+                }
+                Poll::Ready(Some(Err(_))) => {
+                    return Poll::Ready(Some(Err(EgressError::Unreachable)))
+                }
+                Poll::Ready(Some(Ok(frame))) => {
+                    if let Ok(data) = frame.into_data() {
+                        return Poll::Ready(Some(Ok(data)));
                     }
                 }
             }
@@ -761,6 +918,11 @@ impl Egress {
     /// holds it until the exchange is dropped. `budget` is the time limit of the call: the
     /// opening of a new connection repeats a failed attempt within half of it
     /// ([`Egress::open_at`]).
+    ///
+    /// The response of a request with `account` is handed on to the caller of `forward`: a
+    /// response under a content coding or an instance manipulation is
+    /// [`EgressError::Coded`], like one under a transfer coding the node does not remove.
+    /// The response of a request without `account` is read by the node alone.
     pub async fn send_to_provider(
         &self,
         platform: &dyn DynPlatform,
@@ -809,6 +971,68 @@ impl Egress {
                 (fresh, response)
             }
         };
+        // A connection of an account goes back to the idle connections of that account and
+        // host when the response has ended, unless the provider closes it.
+        let keep = account.map(|user_id| Keep {
+            pool: self.provider_idle.clone(),
+            user_id: user_id.to_string(),
+            host: host.clone(),
+            now_ms,
+        });
+        // A request of an account is a request of `forward`: its response is handed on.
+        Exchange::of(response, sender, keep, inflight, account.is_some())
+    }
+
+    /// Sends the request of one use of a vault secret to the host its envelope names and
+    /// returns the response head (sink K9 of the egress policy).
+    ///
+    /// The request goes over a connection of its own, which carries no other request: the
+    /// node opens it for this request, says `Connection: close` in it, and drops it when the
+    /// response has ended or was cut. On a connection that carried a request before, a server
+    /// that read that request to another end than the node wrote it would take the bytes in
+    /// between for the beginning of the next request, and the request that follows carries a
+    /// value.
+    ///
+    /// The request is sent once: one envelope stands for one request. A failed attempt to
+    /// open the connection is repeated within half of `budget`, the time limit of the call
+    /// ([`Egress::open_at`]): no byte of the request is written before the connection is
+    /// open. The request takes a share of the node-wide bound of provider requests in flight
+    /// and holds it until the exchange is dropped.
+    pub async fn send_to_bound_host(
+        &self,
+        platform: &dyn DynPlatform,
+        request: BoundRequest,
+        budget: Duration,
+    ) -> Result<Exchange, EgressError> {
+        let inflight = self
+            .inflight
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| EgressError::Unreachable)?;
+        let mut sender = self.open(platform, &request.host, budget).await?;
+        let response = sender
+            .send_request(request.request)
+            .await
+            .map_err(|_| EgressError::Unreachable)?;
+        Exchange::of(response, sender, None, inflight, true)
+    }
+}
+
+impl Exchange {
+    /// The exchange of a response whose head arrived: the status and the headers that are
+    /// passed on, and the body still to be read. `keep` says where the connection goes when
+    /// the response has ended. It goes nowhere when the response says `Connection: close`.
+    /// `handed_on` says that the response goes to the caller of the node after the checks
+    /// of rule E4 (`forward`, `vault/send`): such a response is one whose body the node can
+    /// search, under no coding it does not remove.
+    fn of(
+        response: hyper::Response<Incoming>,
+        sender: SendRequest<OnceBody>,
+        keep: Option<Keep>,
+        inflight: OwnedSemaphorePermit,
+        handed_on: bool,
+    ) -> Result<Exchange, EgressError> {
         let (parts, body) = response.into_parts();
 
         // A node sends no `TE` header, so the one transfer coding a provider may apply is
@@ -826,7 +1050,21 @@ impl Egress {
                         .any(|coding| !coding.trim().eq_ignore_ascii_case("chunked"))
                 })
             });
-        if coded {
+        // The same holds, for a response that is handed on, for a body under a content
+        // coding (the node asks for `identity`) and for a body under an instance manipulation
+        // (RFC 3229: the status 226, the header `IM`), which a caller can ask a server for
+        // with a header of its own. Both are read here, from the headers as they arrived: a
+        // response that lists `Content-Encoding` in its `Connection` header would lose that
+        // header below, and reach the check of the response as a body that says no coding.
+        // A response the node reads itself (of a token address, of a revocation address) is
+        // not handed on: the node parses its body as it stands.
+        let encoded = parts.headers.get_all(CONTENT_ENCODING).iter().any(|value| {
+            value.to_str().map_or(true, |coding| {
+                !coding.trim().eq_ignore_ascii_case("identity")
+            })
+        });
+        let manipulated = parts.status.as_u16() == 226 || parts.headers.contains_key("im");
+        if coded || (handed_on && (encoded || manipulated)) {
             return Err(EgressError::Coded);
         }
 
@@ -847,15 +1085,7 @@ impl Egress {
         }
         // A connection the provider closes after this response is not kept: the sender is
         // dropped with the exchange and the connection ends.
-        let keep = match account {
-            Some(user_id) if !provider_closes => Some(Keep {
-                pool: self.provider_idle.clone(),
-                user_id: user_id.to_string(),
-                host: host.clone(),
-                now_ms,
-            }),
-            _ => None,
-        };
+        let keep = keep.filter(|_| !provider_closes);
         let mut content_length = None;
         let mut headers = Vec::with_capacity(parts.headers.len());
         for (name, value) in &parts.headers {
@@ -934,11 +1164,8 @@ fn build_request(outbound: &OutboundRequest) -> Result<Request<OnceBody>, Egress
     }
     builder = builder.header(CONNECTION, HeaderValue::from_static("keep-alive"));
     let body = match &outbound.body {
-        _ if body_length == 0 => OnceBody(None),
-        OutboundBody::Plain(bytes) => OnceBody(Some(bytes.clone())),
-        OutboundBody::Secret(bytes) => {
-            OnceBody(Some(Bytes::copy_from_slice(bytes.expose_secret())))
-        }
+        OutboundBody::Plain(bytes) => OnceBody::new(bytes.clone()),
+        OutboundBody::Secret(bytes) => OnceBody::new(Bytes::copy_from_slice(bytes.expose_secret())),
     };
     builder.body(body).map_err(|_| EgressError::Invalid)
 }

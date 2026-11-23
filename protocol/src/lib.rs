@@ -21,9 +21,12 @@ pub mod keys;
 pub mod log;
 pub mod record;
 pub mod release;
+pub mod released;
 pub mod secret;
+pub mod secret_use;
 pub mod statement;
 pub mod totp;
+pub mod vault_secret;
 
 use std::fmt;
 
@@ -70,6 +73,13 @@ pub mod purpose {
     pub const PEER_SEAL: &str = "pickle.secure.v1.peer";
     /// Signature context of a message between nodes.
     pub const PEER: &str = "pickle.secure.v1.peer\n";
+    /// HPKE info of the envelope of one use of a vault secret (10.5).
+    pub const SECRET_USE_SEAL: &str = "pickle.secure.v3.secret-use";
+    /// Signature context of one use of a vault secret (10.5).
+    pub const SECRET_USE: &str = "pickle.secure.v3.secret-use\n";
+    /// HPKE info of a vault value that `release` seals to a key its caller named (enclave.md
+    /// 5.9).
+    pub const RELEASE_SEAL: &str = "pickle.secure.v3.release";
 }
 
 /// The constants of protocol.md section 12 and the length limits of section 1.
@@ -135,6 +145,39 @@ pub mod limits {
     /// How far the time of an entry of the transparency log may lie after the clock of the
     /// giving node: 300 seconds (10.3).
     pub const RELEASE_ENTRY_AHEAD_SECONDS: u64 = 300;
+    /// Longest `name` of a record of kind `vault_secret`, in characters (section 6).
+    pub const VAULT_SECRET_NAME_CHARS: usize = 64;
+    /// Most hosts in `sites` of a record of kind `vault_secret` (section 6).
+    pub const VAULT_SECRET_SITES: usize = 8;
+    /// Most slots in `slots` of a record of kind `vault_secret` (section 6).
+    pub const VAULT_SECRET_SLOTS: usize = 4;
+    /// Longest name inside a slot of a vault secret (the part after `header:`, `query:`,
+    /// `form:` or `json:`), in bytes (section 6).
+    pub const SLOT_NAME_BYTES: usize = 64;
+    /// Longest host of a site, in bytes (section 6).
+    pub const HOST_BYTES: usize = 253;
+    /// Longest label of the host of a site, in bytes (section 6).
+    pub const HOST_LABEL_BYTES: usize = 63;
+    /// Longest `value` that `vault/store` takes, in bytes (enclave.md 5.9b).
+    pub const VAULT_SECRET_VALUE_BYTES: usize = 12_000;
+    /// Longest plaintext of a record that `vault/store` creates, in bytes (section 6). The
+    /// `ct` of such a record is at most 16,384 characters long.
+    pub const VAULT_SECRET_PLAINTEXT_BYTES: usize = 12_272;
+    /// The lengths the device of an account pads the plaintext of a record of kind
+    /// `vault_secret` to, in bytes (section 6): the shortest of them the plaintext fits.
+    pub const VAULT_SECRET_PADDED_BYTES: [usize; 7] = [256, 512, 1_024, 2_048, 4_096, 8_192, 12_272];
+    /// How long the envelope of one use of a vault secret can be used, from the node time of
+    /// the giving node at which it was made: 30 seconds (10.5).
+    pub const SECRET_USE_MS: u64 = 30_000;
+    /// Shortest value of a vault secret that is used in a request, in bytes (10.5). A shorter
+    /// value is not searched for in the response to the request, so no node sends one.
+    pub const SECRET_USE_VALUE_BYTES_MIN: usize = 8;
+    /// Longest value of a vault secret that is used in a request, in bytes (10.5).
+    pub const SECRET_USE_VALUE_BYTES_MAX: usize = 12_000;
+    /// Shortest placeholder of a request a vault secret is used in, in characters (10.5).
+    pub const PLACEHOLDER_CHARS_MIN: usize = 16;
+    /// Longest placeholder, in characters.
+    pub const PLACEHOLDER_CHARS_MAX: usize = 128;
 }
 
 /// The failure codes of protocol.md section 11. The variants and the codes correspond one to

@@ -15,6 +15,7 @@
 
 mod api;
 mod attest;
+mod bound;
 mod clock;
 mod descriptors;
 mod egress;
@@ -27,6 +28,7 @@ mod oauth;
 mod platform;
 mod provider_response;
 mod providers;
+mod role;
 mod state;
 mod subset;
 #[cfg(test)]

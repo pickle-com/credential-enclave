@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::http::{Method, Request, StatusCode};
+use axum::http::{Method, Request, Response, StatusCode};
 use axum::Router;
 use credential_enclave_protocol::app::{self, AccountKeys};
 use credential_enclave_protocol::encoding::{b64u, b64u_decode, to_json, verify, Signed};
@@ -262,6 +262,13 @@ pub enum Reply {
     KeepAlive(Duration, Vec<u8>),
     /// The raw bytes of an HTTP/1.1 response, sent after a pause.
     Late(Duration, Vec<u8>),
+    /// The raw bytes of an HTTP/1.1 response in pieces, each written and flushed after its
+    /// pause. With `close`, the connection ends after the last piece; without it, the
+    /// connection stays open and silent.
+    Pieces(Vec<(Duration, Vec<u8>)>, bool),
+    /// The raw bytes of an HTTP/1.1 response, after which the connection ends without the
+    /// closing alert of TLS: what whoever carries the bytes of a connection can do to it.
+    Abrupt(Vec<u8>),
     /// No answer: the connection stays open and silent.
     Hang,
 }
@@ -281,8 +288,45 @@ impl Reply {
         match self {
             Reply::Raw(bytes) | Reply::Late(_, bytes) => Reply::Late(pause, bytes),
             Reply::KeepAlive(_, bytes) => Reply::KeepAlive(pause, bytes),
+            Reply::Pieces(pieces, close) => Reply::Pieces(pieces, close),
+            Reply::Abrupt(bytes) => Reply::Abrupt(bytes),
             Reply::Hang => Reply::Hang,
         }
+    }
+
+    /// A response under `Transfer-Encoding: chunked` with the given headers, whose body
+    /// arrives in `chunks`: the head and the first chunk at once, every further chunk
+    /// `pause` after the one before, and then the end of the body.
+    pub fn chunked(
+        status: u16,
+        headers: &[(&str, &str)],
+        chunks: &[&[u8]],
+        pause: Duration,
+    ) -> Reply {
+        let mut head = format!("HTTP/1.1 {status} Status\r\n").into_bytes();
+        for (name, value) in headers {
+            head.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+        }
+        head.extend_from_slice(b"transfer-encoding: chunked\r\n\r\n");
+        let mut pieces = Vec::new();
+        for (index, chunk) in chunks.iter().enumerate() {
+            let mut piece = match index {
+                0 => std::mem::take(&mut head),
+                _ => Vec::new(),
+            };
+            piece.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            piece.extend_from_slice(chunk);
+            piece.extend_from_slice(b"\r\n");
+            let wait = match index {
+                0 => Duration::ZERO,
+                _ => pause,
+            };
+            pieces.push((wait, piece));
+        }
+        let mut last = head;
+        last.extend_from_slice(b"0\r\n\r\n");
+        pieces.push((pause, last));
+        Reply::Pieces(pieces, true)
     }
 
     /// The same response, on a connection that stays open for the next request.
@@ -292,6 +336,8 @@ impl Reply {
             Reply::Late(pause, bytes) | Reply::KeepAlive(pause, bytes) => {
                 Reply::KeepAlive(pause, bytes)
             }
+            Reply::Pieces(pieces, _) => Reply::Pieces(pieces, false),
+            Reply::Abrupt(bytes) => Reply::Abrupt(bytes),
             Reply::Hang => Reply::Hang,
         }
     }
@@ -670,6 +716,25 @@ async fn serve_stream<IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                 tls.write_all(&bytes).await?;
                 tls.flush().await?;
             }
+            Reply::Pieces(pieces, close) => {
+                for (pause, bytes) in pieces {
+                    tokio::time::sleep(pause).await;
+                    tls.write_all(&bytes).await?;
+                    tls.flush().await?;
+                }
+                if close {
+                    tls.shutdown().await?;
+                } else {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                }
+                return Ok(());
+            }
+            Reply::Abrupt(bytes) => {
+                tls.write_all(&bytes).await?;
+                tls.flush().await?;
+                // The stream is dropped without its shutdown: no closing alert is written.
+                return Ok(());
+            }
             Reply::Hang => {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
                 return Ok(());
@@ -734,6 +799,61 @@ impl Forwarded {
             .iter()
             .find(|(header, _)| header == name)
             .map(|(_, value)| value.as_str())
+    }
+}
+
+/// The response stream of a `vault/send` call (enclave.md 5.16).
+#[derive(Clone, Debug)]
+pub struct Sent {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    /// The parts of the body, in the order they were written.
+    pub parts: Vec<Vec<u8>>,
+    /// The end record. Null when the stream ended without one.
+    pub end: Value,
+}
+
+impl Sent {
+    /// The body: the parts one after another.
+    pub fn body(&self) -> Vec<u8> {
+        self.parts.concat()
+    }
+
+    /// The value of a response header of the host.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(header, _)| header == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// Reads the response stream of `vault/send`: the meta behind its length, the parts of the
+/// body, each behind its length, and the end record behind the length 0.
+pub fn decode_stream(bytes: &[u8]) -> Sent {
+    let length = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+    let meta_length = length(0);
+    let meta: Value = serde_json::from_slice(&bytes[4..4 + meta_length]).unwrap();
+    let mut at = 4 + meta_length;
+    let mut parts = Vec::new();
+    let mut end = Value::Null;
+    while at + 4 <= bytes.len() {
+        let part_length = length(at);
+        at += 4;
+        if part_length == 0 {
+            end = serde_json::from_slice(&bytes[at..]).unwrap();
+            at = bytes.len();
+            break;
+        }
+        parts.push(bytes[at..at + part_length].to_vec());
+        at += part_length;
+    }
+    assert_eq!(at, bytes.len(), "the stream is whole records");
+    Sent {
+        status: meta["status"].as_u64().unwrap() as u16,
+        headers: header_pairs(&meta["headers"]),
+        parts,
+        end,
     }
 }
 
@@ -1001,6 +1121,36 @@ impl Harness {
         assert_eq!(content_type, frame::CONTENT_TYPE);
         let (meta, payload) = frame::decode(&bytes).unwrap();
         Ok(decode_batch(&meta, &payload))
+    }
+
+    /// A `vault/send` call. `Err` carries the status and the failure body of a call that sent
+    /// no response of a host on.
+    pub async fn vault_send(&self, meta: Value, payload: &[u8]) -> Result<Sent, (u16, Value)> {
+        let mut request = frame::encode_head(&meta);
+        request.extend_from_slice(payload);
+        let (status, content_type, bytes) =
+            self.send(Method::POST, "/v1/vault/send", request).await;
+        if status != StatusCode::OK {
+            assert_eq!(content_type, "application/json");
+            return Err((status.as_u16(), serde_json::from_slice(&bytes).unwrap()));
+        }
+        assert_eq!(content_type, frame::STREAM_CONTENT_TYPE);
+        Ok(decode_stream(&bytes))
+    }
+
+    /// Sends one request to the router and returns the response as the router gives it: the
+    /// body has not been read.
+    pub async fn respond(&self, method: Method, path: &str, body: Vec<u8>) -> Response<Body> {
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-length", body.len())
+            .body(Body::from(body))
+            .unwrap();
+        TowerToHyperService::new(self.router.clone())
+            .call(request)
+            .await
+            .unwrap()
     }
 
     /// The node signing public key.

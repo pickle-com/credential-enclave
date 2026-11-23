@@ -301,18 +301,69 @@ async fn the_kind_of_a_record_decides_the_fields_it_releases() {
     }
     assert_eq!(harness.head_seq("user-1"), seq);
 
-    // A plaintext that lacks the value, and a seed that is not base32.
+    // A plaintext the value cannot be taken from: no member of that name, a member that is no
+    // string, a plaintext that is no object, a seed that is not base32. The node reads the
+    // plaintext for the value after the store confirmed the entry of the call: each call
+    // leaves its entry and hands nothing out.
+    let unreadable = [
+        ("vault_password", json!({"other": "x"}), "password"),
+        ("vault_password", json!({"value": 7}), "password"),
+        ("vault_password", json!(["hunter2"]), "password"),
+        ("vault_password", json!("hunter2"), "password"),
+        ("vault_totp", json!({"value": "not base32!"}), "totp"),
+        ("vault_totp", json!({"seed": "JBSWY3DPEHPK3PXP"}), "totp"),
+        (
+            "vault_card",
+            json!({"number": "4242424242424242"}),
+            "card_cvc",
+        ),
+    ];
+    for (index, (kind, plaintext, field)) in unreadable.into_iter().enumerate() {
+        let record = app.record(kind, "vault", &plaintext);
+        let outcome = release(&harness, "user-1", &record, field).await;
+        assert_eq!(
+            code(&outcome),
+            (422, "record_invalid"),
+            "{kind} {plaintext}"
+        );
+        assert_eq!(
+            outcome.1.as_object().unwrap().len(),
+            2,
+            "{kind} {plaintext}"
+        );
+        let entry = seq + 1 + index as u64;
+        assert_eq!(harness.head_seq("user-1"), entry, "{kind} {plaintext}");
+        let event = app.logged(&harness, &provider, &json!({"seq": entry, "index": 0}));
+        let expected = match field {
+            "totp" => "totp_issued",
+            _ => "secret_released",
+        };
+        assert_eq!(
+            (&event["t"], &event["record_id"]),
+            (&json!(expected), &record["id"]),
+            "{kind} {plaintext}"
+        );
+    }
+    // The same plaintexts with a field their kind does not have are refused before an entry,
+    // like every plaintext: the answer says nothing of what the record holds.
+    let seq = harness.head_seq("user-1");
     let empty = app.record("vault_password", "vault", &json!({"other": "x"}));
     assert_eq!(
-        code(&release(&harness, "user-1", &empty, "password").await),
-        (422, "record_invalid")
-    );
-    let broken = app.record("vault_totp", "vault", &json!({"value": "not base32!"}));
-    assert_eq!(
-        code(&release(&harness, "user-1", &broken, "totp").await),
-        (422, "record_invalid")
+        code(&release(&harness, "user-1", &empty, "totp").await),
+        (403, "not_allowed")
     );
     assert_eq!(harness.head_seq("user-1"), seq);
+    // A card without a CVC still releases its number.
+    let number_only = app.record(
+        "vault_card",
+        "vault",
+        &json!({"number": "4242424242424242"}),
+    );
+    let (status, released) = release(&harness, "user-1", &number_only, "card_number").await;
+    assert_eq!(
+        (status, &released["value"]),
+        (200, &json!("4242424242424242"))
+    );
 }
 
 #[tokio::test]

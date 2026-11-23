@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use axum::extract::{Request, State};
 use axum::response::Response;
-use credential_enclave_protocol::keys::LogStoreId;
+use credential_enclave_protocol::keys::{LogStoreId, Role};
 use credential_enclave_protocol::secret::Secret;
 use credential_enclave_protocol::ProtocolError;
 
@@ -33,8 +33,20 @@ pub async fn config(State(node): State<Arc<Node>>, request: Request) -> Response
 /// `endpoint` in `log_store` (enclave.md 5.14): an `http://host:port` or `https://host:port`
 /// origin it writes to in path-style. A node of the nitro platform refuses a configuration
 /// with `endpoint`.
+///
+/// `role` names the role of the node (protocol.md 4.1): the one value is `forward`, and a
+/// configuration without the key is the configuration of a node of the delegation role. A
+/// node takes its role once. A configuration of the other role than the node has is
+/// `invalid_request` and changes nothing.
 async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
     let body = JsonBody::read(request).await?;
+    match body.get("role") {
+        None => {}
+        Some(role) if role.as_str() == Role::Forward.binding_value() => {
+            return forward_role(node, &body);
+        }
+        Some(_) => return Err(invalid("role")),
+    }
     let mut endpoint = None;
     let log_store = match body.get("log_store") {
         None => None,
@@ -104,6 +116,14 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
             },
         );
     }
+    // The configuration is that of a node of the delegation role: a node that has no role
+    // takes that role with it, and a node of the forward role refuses it.
+    if !node.role.take(Role::Delegation) {
+        return Err(ApiError::with_message(
+            ProtocolError::InvalidRequest,
+            "the node has the forward role",
+        ));
+    }
     if let Some(id) = log_store {
         if !node.log_store.set_id(id) || !node.log_store.set_endpoint(endpoint) {
             return Err(ApiError::with_message(
@@ -113,5 +133,36 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
         }
     }
     node.set_config(OperatorConfig { providers: parsed });
+    Ok(json_ok(&Configured { configured: true }))
+}
+
+/// The configuration of a node of the forward role: `{"role":"forward"}`.
+///
+/// Such a node holds no client value of a provider and has no log store: it calls no token
+/// address and writes no entry. A configuration that names the forward role together with a
+/// log store or with the client values of a provider is `invalid_request`. So is this
+/// configuration for a node that has the delegation role: a node that took a call of the
+/// delegation role, or a configuration without a role, does not become a node of the forward
+/// role.
+fn forward_role(node: &Node, body: &JsonBody) -> Result<Response, ApiError> {
+    let no_providers = match body.get("providers") {
+        None => true,
+        Some(providers) => providers.as_object().is_some_and(|map| map.is_empty()),
+    };
+    if !no_providers || body.get("log_store").is_some() {
+        return Err(ApiError::with_message(
+            ProtocolError::InvalidRequest,
+            "a node of the forward role takes no provider and no log store",
+        ));
+    }
+    if !node.role.take(Role::Forward) {
+        return Err(ApiError::with_message(
+            ProtocolError::InvalidRequest,
+            "the node has the delegation role",
+        ));
+    }
+    node.set_config(OperatorConfig {
+        providers: HashMap::new(),
+    });
     Ok(json_ok(&Configured { configured: true }))
 }
