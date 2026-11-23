@@ -17,9 +17,11 @@
 //!    call holds its place from before it reads the closing flag to the end of its response
 //!    body. So a closed node that holds no place has no such request in progress and begins
 //!    none;
-//! 3. closes the door of the inbound relay ([`InboundDoor::close`]): the relay takes the
-//!    connections that wait in the queue of its listener and closes the listener. A caller
-//!    that connects from then on is refused by the kernel. A connection the relay took while
+//! 3. closes the door of the inbound relay ([`InboundDoor::close`]): the relay takes its
+//!    listener off the network of the pod, takes the connections that wait in the queue of
+//!    the listener and those whose handshake the kernel had answered, and closes the listener
+//!    (`crate::relay::HANDSHAKE_GRACE` later). A caller that connects from then on is refused
+//!    by the kernel. A connection the relay took while
 //!    the enclave ended would end without a response, and its caller could not tell whether
 //!    the node had acted on its request: a refused connection did not open, and its caller
 //!    takes any call to another node, as it does with the answer `closing`;
@@ -245,8 +247,9 @@ impl<'a> Wait<'a> {
                     .unwrap_or(None);
                 match answer {
                     Some(0) => {
-                        // The relay closes its listener at once. A relay that does not is
-                        // not waited for past the limit of the calls.
+                        // The relay closes its listener within the wait for the handshakes
+                        // the kernel had answered. A relay that does not is not waited for
+                        // past the limit of the calls.
                         let _ = tokio::time::timeout_at(limit, self.door.close()).await;
                         ended = Some(Instant::now() + CALLERS_WAIT);
                         log(&format!(

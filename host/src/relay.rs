@@ -24,10 +24,12 @@
 //! pipe ends at once.
 //!
 //! The inbound relay takes connections until the shutdown of the pod closes its door
-//! ([`InboundDoor`]). It then takes the connections that wait in the queue of its listener,
-//! closes the listener, and holds its pipes until they end: a caller that connects from then
-//! on is refused by the kernel, which is a connection that did not open, and no connection the
-//! relay took is left without the node behind it (`crate::calls`).
+//! ([`InboundDoor`]). It then takes its listener off the network of the pod, takes the
+//! connections that wait in the queue of the listener and those whose handshake the kernel
+//! had answered, closes the listener ([`close_listener`]), and holds its pipes until they end:
+//! a caller that connects from then on is refused by the kernel, which is a connection that
+//! did not open, and no connection the relay took is left without the node behind it
+//! (`crate::calls`).
 //!
 //! One of the two streams of a pipe is the node, and the end of its bytes says more than the
 //! end of a direction: a node that closed its write side is done with the connection. It
@@ -1186,8 +1188,9 @@ impl DoorOrder {
 /// not have), and the caller of such a call gets the answer whole, whenever the rest of its
 /// request arrives.
 ///
-/// The relay returns when the shutdown closes `door`: it takes the connections that wait in
-/// the queue of the listener, closes the listener, and drops its half of the door
+/// The relay returns when the shutdown closes `door`: it takes its listener off the network
+/// of the pod, takes the connections that wait in the queue of the listener and those whose
+/// handshake the kernel had answered, closes the listener, and drops its half of the door
 /// ([`close_listener`]). The pipes it started go on until they end.
 pub async fn serve(
     listener: TcpListener,
@@ -1206,7 +1209,7 @@ pub async fn serve(
             Err(error) => pause_after_failed_accept(AcceptFailure::of(&error)).await,
         }
     }
-    close_listener(listener, &node, &counters);
+    close_listener(listener, &node, &counters).await;
 }
 
 /// Takes one connection of a caller: a place of the relay and a pipe to a new connection to
@@ -1233,15 +1236,35 @@ fn take(caller: TcpStream, node: &Arc<dyn NodeConnector>, counters: &Arc<Inbound
     });
 }
 
-/// Closes the listener of the inbound relay. The kernel resets every connection that waits in
-/// the queue of a listener when the listener is closed, and the caller of such a connection
-/// reads a connection that opened and ended without a response. So the relay first takes the
-/// connections of the queue, as it took every connection before, and closes the listener when
-/// an accept finds none: the node behind them is alive (the shutdown ends the enclave only
-/// after the relay holds no connection, `crate::calls`). A connection whose handshake the
-/// kernel completes between that accept and the close is still reset: nothing a program can
-/// call closes that gap, which is the time between two system calls.
-fn close_listener(
+/// How long the inbound relay waits, once its listener is off the network of the pod, for the
+/// handshakes the kernel had answered before: 50 milliseconds. A caller has an open connection
+/// as soon as the answer of the kernel to its request reaches it, and the kernel puts that
+/// connection into the queue of the listener when the last segment of the handshake arrives,
+/// one round trip of the network later.
+pub const HANDSHAKE_GRACE: Duration = Duration::from_millis(50);
+
+/// Closes the listener of the inbound relay so that no caller reads a connection that opened
+/// and ended without a response. When a listener is closed the kernel resets every connection
+/// that waits in its queue and every connection whose handshake it has answered and not
+/// completed, and the caller of such a connection cannot tell whether the node acted on its
+/// request. So the relay
+///
+/// 1. takes the listener off the network of the pod ([`leave_the_network`]): a connection
+///    request that arrives from another machine from here on finds no listener, and the kernel
+///    refuses it at once, which is a connection that did not open;
+/// 2. takes the connections of the queue, as it took every connection before;
+/// 3. waits [`HANDSHAKE_GRACE`] for the handshakes the kernel had answered before step 1, and
+///    takes the connections they became;
+/// 4. closes the listener.
+///
+/// The node behind the connections it takes is alive (the shutdown ends the enclave only after
+/// the relay holds no connection, `crate::calls`) and answers each of them. What is left is a
+/// handshake whose last segment arrives later than the wait (a segment the network lost and
+/// its sender repeats): its connection is reset at step 4. Where step 1 fails (a system that
+/// is not Linux, a kernel that does not take the binding), steps 1 and 3 are left out, and a
+/// connection whose handshake the kernel answered before the close and did not put into the
+/// queue before the last accept is reset.
+async fn close_listener(
     listener: TcpListener,
     node: &Arc<dyn NodeConnector>,
     counters: &Arc<InboundCounters>,
@@ -1252,6 +1275,36 @@ fn close_listener(
     let Ok(listener) = listener.into_std() else {
         return;
     };
+    let left = leave_the_network(&listener);
+    take_the_queue(&listener, node, counters);
+    if left.is_ok() {
+        tokio::time::sleep(HANDSHAKE_GRACE).await;
+        take_the_queue(&listener, node, counters);
+    }
+}
+
+/// Takes `listener` off the network of the pod: binds it to the loopback device, so that a
+/// connection request that arrives through another device (every request of another machine)
+/// finds no listener and is refused by the kernel. A handshake the kernel has answered
+/// belongs to the listener and completes: its connection comes to the queue of the listener.
+/// The connections the listener made are not touched. A process needs no capability to bind
+/// a socket to a device for the first time. Fails when the kernel does not take the binding.
+#[cfg(target_os = "linux")]
+fn leave_the_network(listener: &std::net::TcpListener) -> io::Result<()> {
+    socket2::SockRef::from(listener).bind_device(Some(b"lo"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn leave_the_network(_listener: &std::net::TcpListener) -> io::Result<()> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
+}
+
+/// Takes every connection that waits in the queue of a listener that left the runtime.
+fn take_the_queue(
+    listener: &std::net::TcpListener,
+    node: &Arc<dyn NodeConnector>,
+    counters: &Arc<InboundCounters>,
+) {
     // The queue holds at most the connections the listener was opened for.
     for _ in 0..INBOUND_LISTEN_BACKLOG {
         match listener.accept() {
@@ -2838,6 +2891,42 @@ mod tests {
             caller.shutdown().await.unwrap();
         }
         closed_pipes(&counters, 3).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_listener_that_left_the_network_keeps_the_connections_of_its_queue() {
+        let listener =
+            listen_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), LISTEN_BACKLOG).unwrap();
+        let address = listener.local_addr().unwrap();
+        // A caller whose connection waits in the queue of the listener, with its request.
+        let mut waiting = TcpStream::connect(address).await.unwrap();
+        waiting.write_all(b"queued").await.unwrap();
+
+        // The binding needs no capability: this test runs as any user.
+        let listener = listener.into_std().unwrap();
+        leave_the_network(&listener).unwrap();
+        // The connection of the queue is there to take, and its bytes pass both ways.
+        let (taken, _) = listener.accept().unwrap();
+        taken.set_nonblocking(true).unwrap();
+        let mut taken = TcpStream::from_std(taken).unwrap();
+        let mut buffer = [0u8; 6];
+        taken.read_exact(&mut buffer).await.unwrap();
+        assert_eq!(&buffer, b"queued");
+        taken.write_all(b"answer").await.unwrap();
+        waiting.read_exact(&mut buffer).await.unwrap();
+        assert_eq!(&buffer, b"answer");
+        // The queue holds nothing more.
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        // The listener is bound to the loopback device, and to no other device after it: a
+        // request of another machine arrives through another device and finds no listener.
+        assert_eq!(
+            socket2::SockRef::from(&listener).device().unwrap(),
+            Some(b"lo".to_vec())
+        );
     }
 
     #[tokio::test]
