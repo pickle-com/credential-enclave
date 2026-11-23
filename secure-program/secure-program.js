@@ -182,7 +182,8 @@
   const LOG_BLOCKED_MS = 3 * DAY_MS;
   // A round that leaves reads undone because there was more to read than one round reads (more
   // listing pages, more nodes without a judgement, more bodies than its requests name, an answer
-  // of the bodies that ended before its last key) is not complete, and the next round reads on.
+  // of the bodies that ended before its last key, more than fits its time) is not complete, and
+  // the next round reads on.
   // An account in normal use is read to its end within a few such rounds, whatever it holds: the
   // rounds of a synchronization that end that way in a row, beyond this many, are rounds whose
   // reads are held back (someone writes objects under the prefix of the account faster than the
@@ -4413,98 +4414,115 @@
     let place = origin === "sync" && log.resume !== null ? log.resume
       : { key_marker: "", version_id_marker: "", top: "", until: "", tail: false };
     const pageLimit = origin === "screen" ? 1 : LOG_CONTROL_PAGES;
-    for (let page = 0; page < pageLimit && !complete; page += 1) {
-      const wanted = [{ prefix: "c", key_marker: place.key_marker, version_id_marker: place.version_id_marker }];
-      if (origin === "screen") wanted.push({ prefix: "u", key_marker: "", version_id_marker: "" });
-      let listings = null;
-      try {
-        listings = await readListings(turn, wanted);
-      } catch (failure) {
-        if (isStoreFailure(failure) && failure.kind === "absent" && turnLeft(turn) > 0) {
-          if (!known) {
-            absent = true;
-            complete = true;
+    // The time of a round is one of the things it has only so much of. A failure that arrives
+    // once that time has passed (the failure of the request that was waiting, or of the one
+    // after it) ends the reading and not the round: the round is judged on what it read, and
+    // counts as one that had more to read than it read. It keeps what it judged, so the next
+    // round reads on. A runtime that goes down ends the round.
+    let expired = false;
+    const ranOut = function (failure) {
+      if (failureCode(failure) === "cancelled" || turnLeft(turn) > 0) throw failure;
+      expired = true;
+      run.over = true;
+      run.cut = true;
+      if (run.detail === "") run.detail = "round:time";
+    };
+    try {
+      for (let page = 0; page < pageLimit && !complete; page += 1) {
+        const wanted = [{ prefix: "c", key_marker: place.key_marker, version_id_marker: place.version_id_marker }];
+        if (origin === "screen") wanted.push({ prefix: "u", key_marker: "", version_id_marker: "" });
+        let listings = null;
+        try {
+          listings = await readListings(turn, wanted);
+        } catch (failure) {
+          if (isStoreFailure(failure) && failure.kind === "absent" && turnLeft(turn) > 0) {
+            if (!known) {
+              absent = true;
+              complete = true;
+              break;
+            }
+            run.blocked = true;
+            if (run.detail === "") run.detail = failure.detail.slice(0, 64);
+            if (origin === "screen") {
+              run.pagesHeld.add(0);
+              run.pageWatch = true;
+            }
             break;
           }
-          run.blocked = true;
-          if (run.detail === "") run.detail = failure.detail.slice(0, 64);
-          if (origin === "screen") {
+          noteFailure(turn, run, failure);
+          // The pages that begin the two listings, which the screen reads and a round of a
+          // synchronization does not: the rounds make that read again, and go on making it with
+          // every round until the screen reads those pages itself (pageWatch).
+          if (origin === "screen" && heldKind(failure)) {
             run.pagesHeld.add(0);
             run.pageWatch = true;
           }
           break;
         }
-        noteFailure(turn, run, failure);
-        // The pages that begin the two listings, which the screen reads and a round of a
-        // synchronization does not: the rounds make that read again, and go on making it with
-        // every round until the screen reads those pages itself (pageWatch).
-        if (origin === "screen" && heldKind(failure)) {
-          run.pagesHeld.add(0);
-          run.pageWatch = true;
+        const control = listings[0];
+        // The store of format 3 answered: the routes of its bodies and documents exist.
+        run.store3 = true;
+        if (origin === "screen") {
+          run.pagesRead.add(0);
+          run.pageSeen = true;
         }
-        break;
-      }
-      const control = listings[0];
-      // The store of format 3 answered: the routes of its bodies and documents exist.
-      run.store3 = true;
-      if (origin === "screen") {
-        run.pagesRead.add(0);
-        run.pageSeen = true;
-      }
-      if (place.key_marker === "") {
-        pages.c = control;
-        if (listings.length > 1) pages.u = listings[1];
-        if (place.top === "" && control.keys.length > 0) place.top = control.keys[0].tail;
-      }
-      let items = freshControl(log, run, control);
-      if (page === 0) {
-        // With the first page: the keys whose read an earlier read found held back (the listing
-        // of that read named them), and the entries the screen wants read. The keys held back
-        // stand first, so that no number of new keys takes the requests of the round from them.
-        // What the round reads under a key the log screen asked for is kept for the screen
-        // (keep), and a key the screen asks for now is marked as one it asked for (shown).
-        const fresh = new Set(items.map(function (item) { return item.parsed.key; }));
-        const named = new Map();
-        const first = [];
-        for (const key of withheld.keys) {
-          const parsed = parseAccountKey(key);
-          if (parsed === null || named.has(parsed.key)) continue;
-          const asked = withheld.shown.indexOf(key) >= 0;
-          const item = { parsed: parsed, fresh: fresh.has(parsed.key), held: true, keep: asked, shown: asked };
-          named.set(parsed.key, item);
-          first.push(item);
+        if (place.key_marker === "") {
+          pages.c = control;
+          if (listings.length > 1) pages.u = listings[1];
+          if (place.top === "" && control.keys.length > 0) place.top = control.keys[0].tail;
         }
-        const rest = items.filter(function (item) { return !named.has(item.parsed.key); });
-        for (const item of rest) named.set(item.parsed.key, item);
-        items = first.concat(rest);
-        for (const more of typeof extra === "function" ? extra(pages) : []) {
-          const listed = named.get(more.parsed.key);
-          if (listed !== undefined) {
-            listed.shown = true;
+        let items = freshControl(log, run, control);
+        if (page === 0) {
+          // With the first page: the keys whose read an earlier read found held back (the listing
+          // of that read named them), and the entries the screen wants read. The keys held back
+          // stand first, so that no number of new keys takes the requests of the round from them.
+          // What the round reads under a key the log screen asked for is kept for the screen
+          // (keep), and a key the screen asks for now is marked as one it asked for (shown).
+          const fresh = new Set(items.map(function (item) { return item.parsed.key; }));
+          const named = new Map();
+          const first = [];
+          for (const key of withheld.keys) {
+            const parsed = parseAccountKey(key);
+            if (parsed === null || named.has(parsed.key)) continue;
+            const asked = withheld.shown.indexOf(key) >= 0;
+            const item = { parsed: parsed, fresh: fresh.has(parsed.key), held: true, keep: asked, shown: asked };
+            named.set(parsed.key, item);
+            first.push(item);
+          }
+          const rest = items.filter(function (item) { return !named.has(item.parsed.key); });
+          for (const item of rest) named.set(item.parsed.key, item);
+          items = first.concat(rest);
+          for (const more of typeof extra === "function" ? extra(pages) : []) {
+            const listed = named.get(more.parsed.key);
+            if (listed !== undefined) {
+              listed.shown = true;
+              continue;
+            }
+            const item = { parsed: more.parsed, fresh: false, shown: true };
+            named.set(more.parsed.key, item);
+            items.push(item);
+          }
+        }
+        await readEntries(turn, keys, log, run, items, budget);
+        if (place.key_marker === "") await judgeSample(turn, log, run, control);
+        const met = place.until !== "" && control.keys.some(function (parsed) { return parsed.tail >= place.until; });
+        if (met || !control.truncated) {
+          if (place.tail) {
+            // The rest of an earlier listing is read: now the keys that arrived above it since.
+            place = { key_marker: "", version_id_marker: "", top: "", until: place.top, tail: false };
+            if (place.until === "") complete = true;
             continue;
           }
-          const item = { parsed: more.parsed, fresh: false, shown: true };
-          named.set(more.parsed.key, item);
-          items.push(item);
+          complete = true;
+          break;
         }
+        place = {
+          key_marker: control.next_key_marker, version_id_marker: control.next_version_id_marker,
+          top: place.top, until: place.until, tail: place.tail,
+        };
       }
-      await readEntries(turn, keys, log, run, items, budget);
-      if (place.key_marker === "") await judgeSample(turn, log, run, control);
-      const met = place.until !== "" && control.keys.some(function (parsed) { return parsed.tail >= place.until; });
-      if (met || !control.truncated) {
-        if (place.tail) {
-          // The rest of an earlier listing is read: now the keys that arrived above it since.
-          place = { key_marker: "", version_id_marker: "", top: "", until: place.top, tail: false };
-          if (place.until === "") complete = true;
-          continue;
-        }
-        complete = true;
-        break;
-      }
-      place = {
-        key_marker: control.next_key_marker, version_id_marker: control.next_version_id_marker,
-        top: place.top, until: place.until, tail: place.tail,
-      };
+    } catch (failure) {
+      ranOut(failure);
     }
     const readFailed = run.blocked || run.silent || run.unreachable;
     if (!complete && !readFailed) run.truncated = true;
@@ -4522,44 +4540,52 @@
     // round, and not as old as the round after the screen last asked.
     const again = withheld.pages.slice();
     if (origin === "sync" && withheld.watch_ms > started && again.indexOf(0) < 0) again.push(0);
-    for (const before of again) {
-      if (run.pagesRead.has(before) || run.pagesHeld.has(before)) continue;
-      let listings = null;
-      try {
-        listings = await readListings(turn, screenPages(before));
-      } catch (failure) {
-        if (isStoreFailure(failure) && failure.kind === "absent" && !run.store3 && turnLeft(turn) > 0) {
-          // No store of format 3, and so no such page: the rounds read it no longer.
-          run.pagesRead.add(before);
-          if (before === 0) run.pageSeen = true;
+    try {
+      for (const before of expired ? [] : again) {
+        if (run.pagesRead.has(before) || run.pagesHeld.has(before)) continue;
+        let listings = null;
+        try {
+          listings = await readListings(turn, screenPages(before));
+        } catch (failure) {
+          if (isStoreFailure(failure) && failure.kind === "absent" && !run.store3 && turnLeft(turn) > 0) {
+            // No store of format 3, and so no such page: the rounds read it no longer.
+            run.pagesRead.add(before);
+            if (before === 0) run.pageSeen = true;
+            continue;
+          }
+          noteFailure(turn, run, heldBack(failure));
           continue;
         }
-        noteFailure(turn, run, heldBack(failure));
-        continue;
+        run.pagesRead.add(before);
+        const page = choosePage(
+          { c: listings[0], u: listings[1] }, before === 0 ? Infinity : before, LOG_RECOVERED_PAGE_EVENTS);
+        run.pagesKept.set(before, { more: page.more, keys: page.chosen });
+        const wanted = [];
+        for (const parsed of page.chosen) {
+          if (had.entries.has("3:" + parsed.tail)) continue;
+          if (run.entries.has(parsed.key)) run.kept.add(parsed.key);
+          else if (wanted.length < LOG_SCREEN_BODIES) wanted.push({ parsed: parsed, fresh: false, shown: true, keep: true });
+        }
+        await readEntries(turn, keys, log, run, wanted, budget);
       }
-      run.pagesRead.add(before);
-      const page = choosePage(
-        { c: listings[0], u: listings[1] }, before === 0 ? Infinity : before, LOG_RECOVERED_PAGE_EVENTS);
-      run.pagesKept.set(before, { more: page.more, keys: page.chosen });
-      const wanted = [];
-      for (const parsed of page.chosen) {
-        if (had.entries.has("3:" + parsed.tail)) continue;
-        if (run.entries.has(parsed.key)) run.kept.add(parsed.key);
-        else if (wanted.length < LOG_SCREEN_BODIES) wanted.push({ parsed: parsed, fresh: false, shown: true, keep: true });
+      if (!expired) {
+        try {
+          await followLegacy(turn, keys, log, run);
+        } catch (failure) {
+          noteFailure(turn, run, heldBack(failure));
+        }
+        // The reads of the bucket of format 1 and format 2 that the log screen made and found held
+        // back.
+        await rereadChains(turn, keys, run, withheld);
       }
-      await readEntries(turn, keys, log, run, wanted, budget);
-    }
-    try {
-      await followLegacy(turn, keys, log, run);
     } catch (failure) {
-      noteFailure(turn, run, heldBack(failure));
+      ranOut(failure);
     }
-    // The reads of the bucket of format 1 and format 2 that the log screen made and found held
-    // back.
-    await rereadChains(turn, keys, run, withheld);
-    // The judgement.
+    // The judgement. A round whose time ran out asks whether the backend can be reached in a
+    // turn of its own.
     const now = native.nowMs();
-    const denied = run.blocked || (run.silent && await reachJudged(turn, started));
+    const judging = expired ? newTurn(2 * LOG_API_TIMEOUT_MS, "") : turn;
+    const denied = run.blocked || (run.silent && await reachJudged(judging, started));
     const unreachable = !denied && (run.unreachable || run.silent);
     // The rounds of a synchronization in a row that left reads undone because there was more to
     // read than a round reads. A round that read everything it had to read ends the row; a round

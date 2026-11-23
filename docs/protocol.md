@@ -1657,8 +1657,9 @@ the backend answered another request of the runtime within 60 s.
 A round that leaves reads undone because there was more to read than one round reads (the control
 listing goes on beyond its four pages, more nodes are without a judgement than its document
 requests name, more bodies are to be read than its body requests name, an answer of the bodies
-ends before its last key, the chains of formats 1 and 2 hold more than it follows) is pending, and
-the next round reads on from where it stopped. Eight such rounds read 32 listing pages, the
+ends before its last key, the chains of formats 1 and 2 hold more than it follows, or its time of
+60 s passes before it has read everything) is pending, and the next round reads on from where it
+stopped: a round whose time passes is judged on what it read and keeps what it judged. Eight such rounds read 32 listing pages, the
 documents of 1,024 nodes and 6,400 bodies, which an account in normal use does not hold within the
 retention of the store. The rounds of synchronizations that end that way in a row are counted, a
 round that reads everything ends the row, and from the ninth on such a round is a round whose
@@ -1716,8 +1717,9 @@ or another address, for the listing of a node document), `document:{status}` (th
 that listing with that status), `bodies:missing`, `bodies:hash`, `bodies:skipped`,
 `receiver:missing` and `receiver:rejected` (the receiving node of a transfer of formats 1 and 2),
 `listings:{status}` and `objects:{status}` (a read of the bucket of formats 1 and 2),
-`round:unfinished` (a round counted as held back because the rounds keep ending with more to read
-than a round reads) and `screen:held` (a count the log screen keeps of its reads marks the log).
+`round:time` (the time of the round passed before it had read everything), `round:unfinished` (a
+round counted as held back because the rounds keep ending with more to read than a round reads)
+and `screen:held` (a count the log screen keeps of its reads marks the log).
 
 ### The log screen
 

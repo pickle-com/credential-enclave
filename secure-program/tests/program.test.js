@@ -1082,6 +1082,36 @@ test("an account with more to read than one round reads is read to its end by th
   assert.equal(wide.world.reports.slice(-1)[0].undocumented_nodes, 0);
 });
 
+test("a round whose time runs out is judged on what it read and keeps it: slow answers leave the rounds pending, each reads on from where the one before stopped, and the last one verifies", async () => {
+  const fx = S.fixture(source);
+  const world = fx.world;
+  world.pageSize = 3;
+  for (let i = 0; i < 20; i += 1) {
+    world.advance(1000);
+    fx.nodes[0].record("c", [{ t: "connection_created", time_ms: world.now, record_id: "r" + i, provider: "slack", scope: "" }]);
+  }
+  // Every request of the reads is answered, nine seconds after it was sent: a listing page takes
+  // 27 seconds (the address, the listing, the bodies), and a round has 60.
+  world.fault("POST /api/secure/log/read", { delay_ms: 9000 });
+  world.fault("POST /api/secure/log/bodies", { delay_ms: 9000 });
+  world.fault("S3 " + world.shardHost, { delay_ms: 9000 });
+  await S.start(fx);
+  const states = [world.state.log.status + ":" + world.state.log.store + ":" + world.state.log.store_failure];
+  const seen = [world.stored("log.seen").length];
+  for (let turn = 0; turn < 4 && world.state.log.status !== "verified"; turn += 1) {
+    world.advance(2 * 60000);
+    await S.event(fx, "foreground");
+    states.push(world.state.log.status + ":" + world.state.log.store + ":" + world.state.log.store_failure);
+    seen.push(world.stored("log.seen").length);
+    assert.equal(world.stored("log.blocked").count, 0);
+  }
+  assert.deepEqual(states.slice(0, 3), Array(3).fill("pending:truncated:round:time"));
+  assert.equal(states[states.length - 1], "verified:verified:");
+  // Each round judged the keys of the pages it read, and the next did not read them again.
+  assert.deepEqual(seen, [6, 12, 18, 21]);
+  assert.equal(world.stored("log.round").unfinished, 0);
+});
+
 test("a device without a network, and a store that fails, leave the log pending and count no blocked round, however long", async () => {
   const offline = S.fixture(source);
   await S.start(offline);
