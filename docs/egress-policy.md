@@ -487,12 +487,18 @@ share of the budget for what it holds in memory: its request frame and a fixed p
 its entry, and for a read 6 bytes (a folder listing, a search) or 2 bytes (one message) per
 byte of its IMAP input while the input arrives, within the input bound of its connection. A
 literal the server declares is held against that bound and taken into the share when it is
-declared, before a buffer is made for it. Every call has an end-to-end 30 second deadline
-including admission. IMAP reads use EXAMINE and BODY.PEEK. SMTP performs one transaction; no
-transport failure triggers a second connection or submission.
+declared, before a buffer is made for it; its declaration counts as input as well, and the
+text of one response has a bound of its own, so neither the number of the literals of a
+response nor the length of a line lets a connection hold more than its share covers
+(enclave.md, "Mail call surface"). Every call has an end-to-end 30 second deadline including
+admission. IMAP reads use EXAMINE and BODY.PEEK. SMTP performs one transaction; no transport
+failure triggers a second connection or submission.
 
 Fixed by: `enclave/src/tests/mail.rs` and `enclave/src/tests/mail_connections.rs` (the order
-of a call, the entry of every read over a kept session, no read over a session after a
-revoke, after the end of a grant or while the node closes, the end of a session at its idle
-time and at the age of its login), the unit tests of `enclave/src/mail_sessions.rs` and of
-`enclave/src/imap.rs`, and the canary test, which makes the three calls.
+of a call, the entry of every read over a kept session, that a read sends no command over a
+kept session before the log store confirmed its entry and none when the store refuses it, no
+read over a session after a revoke, after the end of a grant, after `grants/prune` or while
+the node closes, the end of a session at its idle time and at the age of its login, the
+bounds of the input of a connection), the unit tests of `enclave/src/mail_sessions.rs`, of
+`enclave/src/mail.rs` and of `enclave/src/imap.rs`, and the canary test, which makes the three
+calls.
