@@ -1724,15 +1724,31 @@ Where the proofs come from. Whoever hands them over, the checks above decide.
   nodes are judged; and before its judgement, for the measurements it noted. One request names
   eight measurements at most, and a round sends four such requests at most; a round that leaves
   a measurement unasked has more to read than it read ("The round"). A runtime asks for one
-  measurement not sooner than an hour after it asked last. No request goes out while the device
-  has met no such measurement, and a stale runtime sends none. A request that fails, a backend
-  without the route (the status 404) and an answer without proofs that pass leave the
-  measurement what it was: nothing counts as a read held back, and what a measurement no list
-  has means for the log is judged by A1 as before (7.4).
+  measurement not sooner than an hour after it asked last, and a round asks for a measurement
+  once. No request goes out while the device has met no such measurement, and a stale runtime
+  sends none.
+
+  What the answer means for A1 (7.4). A measurement no list has marks the log only for a runtime
+  that knows that the backend hands out no release proofs that show it: the backend answered a
+  request for the proofs of that measurement, the answer is not earlier than the time the device
+  first saw the measurement and not older than one hour, and no proofs of it showed the
+  measurement (it carried none, or proofs that fail a check, or proofs the runtime did not
+  verify because eight had failed within the hour). A backend without the route (the status 404
+  and no code of its own) answers so. A request that fails any other way is no answer: the
+  measurement waits, the round is pending, and the next round asks again without waiting for
+  the hour. Past the 24 hours of A1, in a runtime that knows that no later program is served, a
+  round whose request for the proofs failed on the side of the server (an error status, an
+  answer that is no JSON object, or no answer while the backend answered another request of the
+  runtime within 60 s) is a round held back (A3); a request that failed with the network of the
+  device leaves the round pending and counts nothing. So a device that could not ask, or was
+  not answered, states nothing of a release whose proofs it has not seen, and a backend that
+  does not answer the route for three days marks the log by A3. A release whose proofs hold and
+  state a later program is judged without a further answer.
 
 A node kept as one of a later release is asked for the proofs of its measurement again when the
 last request for them is an hour old: the proofs of a release may reach the backend after its
-nodes. A runtime verifies no further proofs while 8 of them failed within an hour, and it does
+nodes. A request to a node for proofs that failed is none the measurement was asked with: the
+next step asks again. A runtime verifies no further proofs while 8 of them failed within an hour, and it does
 not verify again the proofs it refused last for a measurement: the same value reaches it from a
 node, from a node document and from the backend. Proofs that fail are logged with the check that
 failed (`release proofs refused: p4: identity 11`).
@@ -2068,9 +2084,9 @@ conditions holds, and each holds only in a situation that is a problem:
 
 | | Condition | When it holds |
 | --- | --- | --- |
-| A1 | The key of the account went to a node of a release the program does not accept | A node of an accepted measurement wrote `grant_transferred_out` under the device's own `key_id` naming a measurement no list of the program has and no release proofs show as that of a release the program accepts ("The release proofs"), or a node whose document states such a measurement wrote an entry under that `key_id`; 24 hours have passed since the device first saw that measurement; and the runtime knows that no later program than this one is served ("A runtime behind the served program"). Until all of that holds the measurement waits and the round is pending: a program that lists a new release is served before a node of that release takes a grant, and a device may run the program before it for longer than a day. The program that lists the release clears the condition, and so do release proofs that show the measurement as that of a release the program accepts. Once it holds, every round that ends states it, however its reads ended, and for a measurement the device kept the events of the app state it without a read when the runtime knows by then that no later program is served (a new runtime that learns it from the backend has read nothing at its event `session_ready`). A receiving node whose document the device has not seen is no measurement: it waits for its document, a round whose request for that document is answered without one that verifies is a round held back (A3), and no time marks the log for it. The receiving node of a transfer a round judged is kept whatever kept its document from that round |
+| A1 | The key of the account went to a node of a release the program does not accept | A node of an accepted measurement wrote `grant_transferred_out` under the device's own `key_id` naming a measurement no list of the program has and no release proofs show as that of a release the program accepts ("The release proofs"), or a node whose document states such a measurement wrote an entry under that `key_id`; 24 hours have passed since the device first saw that measurement; the runtime knows that no later program than this one is served ("A runtime behind the served program"); and the runtime knows that the backend hands out no release proofs that show the measurement (the backend answered a request for them not earlier than the device first saw the measurement and not longer than one hour ago: "The release proofs"). Until all of that holds the measurement waits and the round is pending: a program that lists a new release is served before a node of that release takes a grant, and a device may run the program before it for longer than a day. The program that lists the release clears the condition, and so do release proofs that show the measurement as that of a release the program accepts. Once it holds, every round that ends states it, however its reads ended, and for a measurement the device kept the events of the app state it without a read when the runtime knows by then that no later program is served and that the backend hands out no release proofs that show the measurement (a new runtime has asked for neither at its event `session_ready`: the round of that event asks for the proofs before it reads). A receiving node whose document the device has not seen is no measurement: it waits for its document, a round whose request for that document is answered without one that verifies is a round held back (A3), and no time marks the log for it. The receiving node of a transfer a round judged is kept whatever kept its document from that round |
 | A2 | The signatures of a node that passed attestation contradict each other | Under a key of a node of an accepted measurement: an entry of the device's own `key_id` that the node signed and that does not open; two different bodies of one `seq` that both verify; or the body the key names for which the answers of two rounds carried no signature that verifies. The first two are marks no answer can make up, and stay. The third holds until an answer carries a signature that verifies for that key: the key is read again by every round, and a round it is held back from is a round held back (A3) |
-| A3 | The operator domain has held the reads back for three days | Three rounds in a row or more were held back and the first of them is three days old; or the log screen notes three or more reads of one kind as held back from it (the later pages, the listings of one chain of formats 1 and 2, the pages that held no entry), on three days within 30 days, that it has not read since, and the first of them is three days old. A round is held back when a route of the reads answers with an error status, or does not answer within its limit while the backend answered another request of the runtime within 60 s; when an address is not the one of the request; when the store answers an address not older than 240 s with a status other than 200, 429 and 5xx; when the backend hands out no body, or another body, for a key of the listing whose node the device has a judgement of; when an answer of the bodies names none of the keys of a request, or names a key and not one before it in the request; when the backend hands out no verifying document for the node of a key of the listing and the store does not show that it holds none (it holds a version under the key of that node document or more than a page there, the answer gives no address of that listing or another address, or the store refuses the address); when the backend answers the request for the document of the receiving node of a transfer without a document that verifies (a transfer an entry of format 3 names, and a transfer a node of a release before v2.4.0 made on or after 2026-11-23T00:00:00Z: "Formats 1 and 2"); when a key whose signature an answer did not carry is held back from a round (A2); when a measurement past the 24 hours of A1 cannot be judged because the checks of the app for a new program fail on the side of the server ("A runtime behind the served program"); when more objects lie under a `seq` of a chain of formats 1 and 2 than are read there and none of the ones read is the entry of the node, or a listing page of such a chain goes on and shows the node writing nowhere ("Formats 1 and 2"); when a read the log screen made of the bucket of formats 1 and 2 is still held back; and, beyond eight rounds in a row that left reads undone because there was more to read than a round reads, when the first round of a synchronization ends that way again. A round that made every read, the reads held back before included, clears the count of the rounds. A read the screen makes itself ends the reads it noted that this read covers, and the reads it noted end together when the last of them is 30 days old |
+| A3 | The operator domain has held the reads back for three days | Three rounds in a row or more were held back and the first of them is three days old; or the log screen notes three or more reads of one kind as held back from it (the later pages, the listings of one chain of formats 1 and 2, the pages that held no entry), on three days within 30 days, that it has not read since, and the first of them is three days old. A round is held back when a route of the reads answers with an error status, or does not answer within its limit while the backend answered another request of the runtime within 60 s; when an address is not the one of the request; when the store answers an address not older than 240 s with a status other than 200, 429 and 5xx; when the backend hands out no body, or another body, for a key of the listing whose node the device has a judgement of; when an answer of the bodies names none of the keys of a request, or names a key and not one before it in the request; when the backend hands out no verifying document for the node of a key of the listing and the store does not show that it holds none (it holds a version under the key of that node document or more than a page there, the answer gives no address of that listing or another address, or the store refuses the address); when the backend answers the request for the document of the receiving node of a transfer without a document that verifies (a transfer an entry of format 3 names, and a transfer a node of a release before v2.4.0 made on or after 2026-11-23T00:00:00Z: "Formats 1 and 2"); when a key whose signature an answer did not carry is held back from a round (A2); when a measurement past the 24 hours of A1 cannot be judged because the checks of the app for a new program fail on the side of the server ("A runtime behind the served program"), or because the request for its release proofs fails on the side of the server ("The release proofs"); when more objects lie under a `seq` of a chain of formats 1 and 2 than are read there and none of the ones read is the entry of the node, or a listing page of such a chain goes on and shows the node writing nowhere ("Formats 1 and 2"); when a read the log screen made of the bucket of formats 1 and 2 is still held back; and, beyond eight rounds in a row that left reads undone because there was more to read than a round reads, when the first round of a synchronization ends that way again. A round that made every read, the reads held back before included, clears the count of the rounds. A read the screen makes itself ends the reads it noted that this read covers, and the reads it noted end together when the last of them is 30 days old |
 | A4 | An entry the device saw left the listing within its retention | A key of the sample that is younger than 364 days and lies in the range the listing covered is in neither of two readings of the listing. The condition ends for a key when a listing a round reads names it again |
 
 A device without a network, a store that answers 5xx or 429, and an address that aged while the
@@ -2095,7 +2111,7 @@ The program publishes the result as `state.log`:
 | --- | --- |
 | `status` | `verified`, `pending`, `attention` |
 | `verified_ms` | The time of the last round that ended `verified` or `attention` |
-| `newer_release_nodes` | The measurements that wait for A1: within its 24 hours, or past them while the runtime does not know that no later program is served |
+| `newer_release_nodes` | The measurements that wait for A1: within its 24 hours, or past them while the runtime does not know that no later program is served or that the backend hands out no release proofs that show the measurement |
 | `unknown_nodes` | The measurements for which A1 holds |
 | `unverified_nodes` | The nodes for which A2 holds |
 | `missing` | The keys for which A4 holds |
@@ -2129,7 +2145,9 @@ nowhere), `round:time` (the time of the round passed before it had read everythi
 `round:unfinished` (a round counted as held back because the rounds keep ending with more to read
 than a round reads), `screen:held` (the reads the log screen notes as held back from it mark the
 log), `delivery:{status}` and `delivery:silent` (the checks of the app for a new program failed
-on the side of the server while a measurement waited to be judged), `program:stale` (the report
+on the side of the server while a measurement waited to be judged), `proofs:{status}`,
+`proofs:timeout`, `proofs:transport` and `proofs:invalid` (the request for the release proofs of
+a measurement that waited to be judged failed on the side of the server), `program:stale` (the report
 of a stale runtime), and `{request}:suspended` and `round:suspended` (a request, or the round,
 ended in a runtime that did not run for a part of it, or the round ended its reading because the
 app went to the background).
@@ -2169,9 +2187,11 @@ without a round, with the summary the device kept marked as not complete.
 
 A1 holds for a measurement no list has only when, besides the 24 hours since the device first saw
 it, the runtime read the served version, that version is not above its own, and the reading is
-not earlier than the time the device first saw the measurement and not older than one hour. A
+not earlier than the time the device first saw the measurement and not older than one hour, and
+the backend answered a request of the runtime for the release proofs of the measurement within
+the same bounds, without proofs that show it ("The release proofs"). A
 round that holds such a measurement and no reading that young asks for the account once before it
-judges. A backend that names no served version leaves such a measurement waiting: it marks
+judges, and every round asks for the release proofs of such a measurement before it reads. A backend that names no served version leaves such a measurement waiting: it marks
 nothing, and no round counts as held back for it.
 
 A build with the bridge primitive `programDelivery` knows the delivery of the program itself, and

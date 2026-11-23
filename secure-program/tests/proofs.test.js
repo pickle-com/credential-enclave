@@ -428,12 +428,22 @@ test("a request for release proofs that fails leaves the node one of a later rel
   const fx = laterFixture("v2.5.0", { nodes: 1 });
   const world = fx.world;
   world.releaseProofs.set("v2.5.0", model.proofsOf(fx.parties, "v2.5.0", fx.laterMeasurement));
+  // (The backend of this test hands out no proofs for the digest of a measurement: the node is
+  // the one place the proofs come from.)
+  world.routes.proofs = false;
   world.fault((line, request) => request.path === "/api/secure/nodes" && request.query.proofs === "1", { status: 503, body: { detail: "unavailable" } }, 1);
   await S.start(fx);
   assert.equal(fx.nodes[0].grants.has(world.userId), true);
   assert.equal(fx.later.grants.has(world.userId), false);
   assert.equal(world.state.grant.state, "active");
   assert.ok(world.logs.some((line) => line.indexOf("release proofs request failed") === 0));
+  // A request that failed is none the measurement was asked with: the next step asks again,
+  // without waiting for the hour, and the node receives its grant.
+  const before = world.requests.length;
+  world.advance(2 * 60000);
+  await S.event(fx, "foreground");
+  assert.deepEqual(attestationRequests(world, before), [{ nodes: [fx.later.id], proofs: "1" }]);
+  assert.equal(fx.later.grants.has(world.userId), true);
 });
 
 test("what the device keeps of release proofs: a program of another version reads it as nothing, proofs that were altered are verified by no runtime and kept no longer, and the end of the account erases it", async () => {
@@ -819,7 +829,7 @@ test("a release among them without release proofs that hold stays a measurement 
 test("the release of a closed node whose node document carries no release proofs: the backend hands the proofs out for the digest of the measurement and the log is verified; without them, from a backend without the route, and with proofs that fail, the log is pending for a day and then marked", async () => {
   // The listed node hands the key to a node of release v2.5.0, which hands it to a node of
   // release v2.6.0 and is closed. The node of v2.6.0 is alive and the backend holds its proofs.
-  const scene = async (given) => {
+  const scene = async (given, days) => {
     const fx = partiesFixture();
     const world = fx.world;
     await S.start(fx);
@@ -830,7 +840,7 @@ test("the release of a closed node whose node document carries no release proofs
     moveKey(world, closed.node, "v2.5.0", alive.node, alive.measurement, "v2.6.0");
     given(world, closed);
     const before = world.requests.length;
-    const lines = await freshInstallation(fx, 2);
+    const lines = await freshInstallation(fx, days === undefined ? 2 : days);
     return { fx: fx, world: world, closed: closed, lines: lines, asked: proofRequests(world, before) };
   };
   // The backend holds the proofs of v2.5.0: one request names the digest of its measurement.
@@ -853,10 +863,46 @@ test("the release of a closed node whose node document carries no release proofs
   assert.equal(absent.world.state.log.store, "verified");
   assert.deepEqual(absent.world.stored("log.blocked"), { first_ms: 0, count: 0 });
   assert.ok(absent.world.logs.some((line) => line.indexOf("release proofs request failed") === 0));
-  // A backend that answers the request with an error.
+  // A backend that answers the request with an error has not said that it hands out no proofs:
+  // the measurement waits, and past its day each round that cannot ask is a round held back
+  // (the log is marked for that after three days, and for nothing else). Every round asks
+  // again, once.
   const failing = await scene((world) => world.fault("GET " + PROOFS_PATH, { status: 503, body: { detail: "unavailable" } }));
-  assert.deepEqual(failing.lines, marked);
+  assert.deepEqual(failing.lines, ["pending told pending grant active", "pending told pending grant active", "pending told pending grant active"]);
+  assert.equal(failing.asked.length, 3);
+  assert.equal(failing.world.stored("log.blocked").count, 2);
+  assert.equal(failing.world.state.log.store + ":" + failing.world.state.log.store_failure, "blocked:proofs:503");
+  await nextDay(failing.fx);
+  assert.equal(told(failing.world), "pending told pending grant active");
+  await nextDay(failing.fx);
+  assert.equal(told(failing.world), "attention told attention:verification_blocked grant active");
+  assert.equal(failing.world.state.log.unknown_nodes, 0);
+  // The backend answers again, without proofs: the count ends and the measurement marks the log.
+  failing.world.faults.length = 0;
+  failing.world.advance(2 * 60000);
+  await S.event(failing.fx, "foreground");
   assert.deepEqual(failing.world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  assert.equal(told(failing.world), "attention told attention:unlisted_release grant active");
+  // A device without a network a day later: nothing is asked, so the measurement waits and
+  // nothing counts. When the backend answers again, without proofs, the measurement marks the
+  // log.
+  const offline = await scene(() => {}, 0);
+  assert.deepEqual(offline.lines, ["pending told pending grant active"]);
+  offline.world.fault(() => true, "transport");
+  offline.world.advance(25 * HOUR_MS);
+  Promise.resolve(offline.fx.program.onEvent("foreground", {})).then(() => {}, () => {});
+  await offline.world.settle(1000);
+  assert.equal(told(offline.world), "pending told pending grant active");
+  assert.deepEqual(offline.world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  offline.world.faults.length = 0;
+  offline.world.advance(2 * 60000);
+  await S.event(offline.fx, "foreground");
+  assert.equal(told(offline.world), "attention told attention:unlisted_release grant active");
+  // The one request that fails on the device while the backend answers the others of the
+  // runtime is a request the operator domain did not answer: a round held back.
+  const silent = await scene((world) => world.fault("GET " + PROOFS_PATH, "transport"));
+  assert.equal(silent.lines[2], "pending told pending grant active");
+  assert.equal(silent.world.stored("log.blocked").count, 2);
   // Proofs that fail, proofs of another measurement, and an answer for a digest that was not
   // asked for.
   const forged = await scene((world, closed) => world.measureProofs.set(digestOf(closed.measurement),
@@ -1101,4 +1147,49 @@ test("release proofs that reach the device after it read the entries of a node: 
   // A day later the measurement that took the key marks the log.
   await nextDay(fx);
   assert.equal(told(world), "attention told attention:unlisted_release grant active");
+});
+
+test("a device that could not get the release proofs of a release when it first saw it, and that leaves the app a day later before the proofs are answered, is told nothing: a measurement marks the log only once the backend answered a request for its proofs", async () => {
+  const fx = partiesFixture();
+  const world = fx.world;
+  await S.start(fx);
+  const later = releaseNode(fx, "v2.5.0", { carried: false });
+  const first = fx.nodes[0];
+  first.record("c", [{
+    t: "grant_transferred_out", time_ms: world.now, to: later.node.id, release: "v2.5.0",
+    pcr0: later.measurement.pcr0, pcr1: later.measurement.pcr1, pcr2: later.measurement.pcr2,
+  }]);
+  later.node.grants.set(world.userId, first.grants.get(world.userId));
+  later.node.record("c", [{ t: "grant_transferred_in", time_ms: world.now, from: first.id, release: "v2.4.0", not_after_ms: world.now + 30 * S.DAY_MS, custody: "enclave" }]);
+  // The synchronization that first sees the release: the request to the node for its proofs and
+  // the request for the proofs of the measurement both fail.
+  world.fault((line, request) => request.path === "/api/secure/nodes" && request.query.proofs === "1", { status: 503, body: { detail: "unavailable" } }, 1);
+  world.fault("GET " + PROOFS_PATH, { status: 503, body: { detail: "unavailable" } }, 2);
+  await nextDay(fx);
+  assert.equal(told(world), "pending told pending grant active");
+  assert.equal(later.node.commands.length, 0);
+  // A day later the app is opened and left after three seconds, while the requests that call a
+  // node and the request for the proofs are still on their way. The measurement is past its
+  // day and the runtime knows that no later program is served, and nothing is stated: the
+  // backend has not answered whether it hands out proofs.
+  world.faults.length = 0;
+  world.fault("GET /api/secure/nodes", { delay_ms: 9000 });
+  world.fault("GET " + PROOFS_PATH, { delay_ms: 9000 });
+  world.advance(25 * HOUR_MS);
+  Promise.resolve(fx.program.onEvent("foreground", {})).then(() => {}, () => {});
+  await world.settle(3000);
+  fx.program.onEvent("background", {});
+  await world.drain();
+  assert.equal(told(world), "pending told pending grant active");
+  assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  // The next stay: the round is answered the proofs of the measurement and the log is
+  // verified. The synchronization after it hands the node its grant.
+  world.faults.length = 0;
+  world.advance(10 * 60000);
+  await S.event(fx, "foreground");
+  assert.equal(told(world), "verified told ok grant active");
+  world.advance(2 * 60000);
+  await S.event(fx, "foreground");
+  assert.equal(later.node.commands.length, 1);
+  assert.equal(world.securityStatuses.filter((item) => item.status === "attention").length, 0);
 });

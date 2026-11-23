@@ -4361,14 +4361,16 @@ test("a build that knows the delivery of the program itself judges by what the a
   assert.equal(lied.world.state.log.status, "pending");
   assert.equal(lied.world.state.log.newer_release_nodes, 1);
   // A day later, in a new runtime. The check the app made as it began ended with no later
-  // program, after the device first saw the measurement: the log is marked, by the event
-  // session_ready itself and by the round, whatever the backend names.
+  // program, after the device first saw the measurement: the log is marked by the round of the
+  // event session_ready, whatever the backend names of the served program. The event itself
+  // states nothing: this runtime has not asked yet whether the backend hands out release proofs
+  // of the measurement, and the round asks before it reads.
   lied.world.advance(25 * HOUR_MS);
   lied.delivery.settled_ms = lied.world.now;
   lied.world.advance(30000);
   S.load(lied.fx);
   Promise.resolve(lied.fx.program.onEvent("session_ready", {})).then(() => {}, () => {});
-  assert.equal(lied.world.state.log.status, "attention");
+  assert.equal(lied.world.state.log.status, "pending");
   await lied.world.settle(1000);
   assert.equal(lied.world.state.log.status, "attention");
   assert.deepEqual(lied.world.securityStatuses.slice(-1)[0].reasons, ["unlisted_release"]);

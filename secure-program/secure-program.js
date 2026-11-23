@@ -2224,7 +2224,10 @@
   // digest, the proofs this runtime refused last for a measurement (as JSON text, for
   // PROOF_REFUSED_KEPT measurements), proofAsked, by digest, the time the grant step of this
   // runtime last asked a node for the release proofs of a measurement, and proofSought the time
-  // a round of this runtime last asked the backend for them.
+  // a round of this runtime last asked the backend for them. proofAnswered is, by digest, the
+  // time the backend last answered such a request of a round without proofs that show the
+  // measurement, and proofFailed the last such request that failed since ({ms, kind, detail}:
+  // the time, what the failure means for a round, and its name for the report).
   let provenKept = null;
   let provenSaved = null;
   const provenHere = new Set();
@@ -2232,6 +2235,8 @@
   const proofRefused = new Map();
   const proofAsked = new Map();
   const proofSought = new Map();
+  const proofAnswered = new Map();
+  const proofFailed = new Map();
   // The nodes of an accepted release that this runtime found to take the grant command of a
   // later program only (the program_min of their binding is above VERSION): the grant step asks
   // such a node once in a runtime.
@@ -2408,6 +2413,8 @@
     proofRefused.clear();
     proofAsked.clear();
     proofSought.clear();
+    proofAnswered.clear();
+    proofFailed.clear();
   }
 
   /** Whether the grant step may ask a node for the release proofs of a measurement now: no
@@ -2440,19 +2447,22 @@
    *  call sends one request, for PROOF_REQUEST_MEASURES measurements at most, and a round
    *  (run) sends PROOF_ROUND_REQUESTS of them at most. Of the answer, an element counts when it
    *  names a measurement of the request for the first time and carries proofs whose statement
-   *  states that measurement. A request that fails, a backend without the route and an answer
-   *  without proofs that hold leave the measurements what they were: nothing is counted as
-   *  held back, and what a measurement no list has means for the log is judged as before.
-   *  Returns {shown, left}: the number of measurements the answer showed as those of an
-   *  accepted release, and whether a measurement that is due was not asked for (the request
-   *  was full, or the requests of the round were spent). */
+   *  states that measurement. An answer without proofs that hold, and a backend without the
+   *  route, leave the measurements what they were and are noted as the answer that the backend
+   *  hands out no such proofs (proofAnswered: proofsDenied). A request that fails otherwise is
+   *  noted with what its failure means for a round (proofFailed), and its measurements are
+   *  asked for again by the next round. Returns {shown, left}: the number of measurements the
+   *  answer showed as those of an accepted release, and whether a measurement that is due was
+   *  not asked for (the request was full, or the requests of the round were spent). */
   async function seekProofs(turn, run, digests) {
     const now = native.nowMs();
     const wanted = [];
     let left = false;
+    // The measurements this round asked for: a round asks for a measurement once.
+    if (run.proofsAsked === undefined) run.proofsAsked = new Set();
     for (const digest of digests) {
       if (typeof digest !== "string" || !canonical32(digest) || wanted.indexOf(digest) >= 0) continue;
-      if (buildOfMeasure(digest) !== undefined || provenLater(digest)) continue;
+      if (buildOfMeasure(digest) !== undefined || provenLater(digest) || run.proofsAsked.has(digest)) continue;
       const last = proofSought.get(digest) || 0;
       if (last !== 0 && last <= now && now - last < PROOF_RETRY_MS) continue;
       if (wanted.length >= PROOF_REQUEST_MEASURES || whole(run.proofRequests) >= PROOF_ROUND_REQUESTS) {
@@ -2463,14 +2473,36 @@
     }
     if (wanted.length === 0) return { shown: 0, left: left };
     run.proofRequests = whole(run.proofRequests) + 1;
-    for (const digest of wanted) proofSought.set(digest, now);
+    for (const digest of wanted) {
+      proofSought.set(digest, now);
+      run.proofsAsked.add(digest);
+    }
     let answer = null;
     try {
       answer = (await api(turn, "GET", PROOFS_PATH, null, { measures: wanted.join(",") }, LOG_API_TIMEOUT_MS)).json;
     } catch (error) {
       if (failureCode(error) === "cancelled" || !(turnLeft(turn) > 0)) throw error;
       native.log("release proofs request failed: " + failureCode(error));
+      const failure = backendFailure(error, "proofs");
+      const failed = native.nowMs();
+      for (const digest of wanted) {
+        if (isStoreFailure(failure) && failure.kind === "absent") {
+          // A backend without the route hands out no proofs.
+          proofAnswered.set(digest, failed);
+          proofFailed.delete(digest);
+          continue;
+        }
+        proofSought.delete(digest);
+        proofFailed.set(digest, {
+          ms: failed, kind: isStoreFailure(failure) ? failure.kind : "", detail: isStoreFailure(failure) ? failure.detail : "",
+        });
+      }
       return { shown: 0, left: left };
+    }
+    const arrived = native.nowMs();
+    for (const digest of wanted) {
+      proofAnswered.set(digest, arrived);
+      proofFailed.delete(digest);
     }
     let shown = 0;
     const answered = new Set();
@@ -2497,6 +2529,36 @@
       const b = isObject(unaccepted[y]) && unaccepted[y].held === true ? 0 : 1;
       return a - b;
     });
+  }
+
+  /** Whether this runtime knows that the backend hands out no release proofs that show the
+   *  measurement (by its digest), for a measurement the device first saw at firstMs (A1): only
+   *  then does a measurement no list has mark the log. The backend answered a request of a
+   *  round for the release proofs of the measurement (seekProofs), the answer is not earlier
+   *  than firstMs and not older than SERVED_FRESH_MS, and no proofs of it showed the
+   *  measurement. A measurement whose proofs hold and state a later program is judged already
+   *  (provenLater). So a device that could not ask, or was not answered, states nothing of a
+   *  measurement whose proofs it has not seen, as it states nothing while it does not know what
+   *  program is served (releaseConfirmed). */
+  function proofsDenied(digest, firstMs, now) {
+    if (provenLater(digest)) return true;
+    const answered = proofAnswered.get(digest) || 0;
+    return answered >= firstMs && answered <= now && now - answered <= SERVED_FRESH_MS;
+  }
+
+  /** Whether the last request of a round for the release proofs of the measurement (by its
+   *  digest) failed for a reason on the side of the server, since the last answer: the backend
+   *  answered with an error status or with a body that is no answer, or it did not answer while
+   *  it answered another request of this runtime around that time. Returns the name of the
+   *  failure for the report, or the empty string. A request that failed with the network of
+   *  the device, or in a runtime that did not run, is none. */
+  function proofsRefused(digest) {
+    const failed = proofFailed.get(digest);
+    if (failed === undefined || failed.ms < (proofAnswered.get(digest) || 0)) return "";
+    if (failed.kind === "blocked" || (failed.kind === "silent" && answeredAround(failed.ms))) {
+      return failed.detail === "" ? "proofs" : failed.detail;
+    }
+    return "";
   }
 
   // ---- Keys ----
@@ -6287,7 +6349,8 @@
   /** Judges, without a read, the measurements no list of this program has that this device kept
    *  (A1): a measurement that held the key of this account, that the device first saw
    *  LOG_RELEASE_GRACE_MS ago or longer, and for which this runtime knows that no later program
-   *  is served (releaseConfirmed) marks the log now, at every event of the app, whatever the
+   *  is served (releaseConfirmed) and that the backend hands out no release proofs that show it
+   *  (proofsDenied) marks the log now, at every event of the app, whatever the
    *  rounds after it read or fail to read. So a new runtime states nothing before it has read
    *  what is served, and a stale runtime states nothing at all. A measurement a list of this
    *  program has is left to the rounds, which forget it. (A receiving node whose document the
@@ -6305,7 +6368,10 @@
         if (item === null || typeof item !== "object" || item.held !== true) continue;
         if (buildOfMeasure(digest) !== undefined) continue;
         const first = whole(item.first_ms);
-        if (first > 0 && first <= now && now - first >= LOG_RELEASE_GRACE_MS && releaseConfirmed(first, now)) established += 1;
+        if (first > 0 && first <= now && now - first >= LOG_RELEASE_GRACE_MS && releaseConfirmed(first, now) &&
+            proofsDenied(digest, first, now)) {
+          established += 1;
+        }
       }
       const before = keptLogState();
       if (established === 0 || before.status === "attention") return;
@@ -6784,8 +6850,11 @@
     let grace = 0;
     let established = 0;
     // Whether a measurement past its grace waits because this runtime does not know that no
-    // later program is served.
+    // later program is served, and the name of the failure of the request for the release
+    // proofs of a measurement that waits for nothing but the answer to that request, when the
+    // request failed on the side of the server.
     let waiting = false;
+    let unproved = "";
     const releases = [];
     const heldNodes = [];
     for (const digest of Object.keys(log.unaccepted)) {
@@ -6807,11 +6876,14 @@
         continue;
       }
       // Past its grace, the measurement marks the log when this runtime knows that no later
-      // program is served. Otherwise it waits as within its grace: the round is not complete.
-      const stands = !within && releaseConfirmed(whole(item.first_ms), now);
+      // program is served and that the backend hands out no release proofs that show the
+      // measurement. Otherwise it waits as within its grace: the round is not complete.
+      const confirmed = !within && releaseConfirmed(whole(item.first_ms), now);
+      const stands = confirmed && proofsDenied(digest, whole(item.first_ms), now);
       if (stands) established += 1;
       else grace += 1;
-      if (!within && !stands) waiting = true;
+      if (!within && !confirmed) waiting = true;
+      if (confirmed && !stands && unproved === "") unproved = proofsRefused(digest);
       const release = typeof item.release === "string" && item.release !== "" ? item.release.slice(0, 64) : "unknown";
       if (releases.indexOf(release) < 0) releases.push(release);
       if (item.held === true && NODE_ID.test(node) && heldNodes.indexOf(node) < 0) heldNodes.push(node);
@@ -6836,6 +6908,14 @@
         blocked = true;
         if (run.detail === "") run.detail = "delivery:" + (info.failed_status === 0 ? "silent" : String(info.failed_status));
       }
+    }
+    // A measurement past its grace waits for the answer to the request for its release proofs,
+    // and that request failed for a reason on the side of the server: the operator domain keeps
+    // the device from learning whether the release has proofs, and the round is one held back.
+    // A request that failed with the network of the device leaves the round pending.
+    if (unproved !== "") {
+      blocked = true;
+      if (run.detail === "") run.detail = unproved.slice(0, 64);
     }
     if (blocked) {
       if (log.blocked.count === 0 || log.blocked.first_ms === 0 || log.blocked.first_ms > now) log.blocked.first_ms = now;
@@ -10332,6 +10412,9 @@
       } else {
         if (failureCode(again.error) === "cancelled" || !(turnLeft(turn) > 0)) throw again.error;
         native.log("release proofs request failed: " + failureCode(again.error));
+        // A request that failed is none the measurements were asked with: the next step asks.
+        proofNodes.forEach(function (id, measure) { proofAsked.delete(measure); });
+        proofNodes.clear();
       }
     }
     for (const item of unlisted) {
