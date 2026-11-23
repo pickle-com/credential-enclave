@@ -2706,7 +2706,7 @@ async fn walk() -> Canary {
         .await;
     assert_eq!(code(&outcome), (400, "invalid_request"));
     let outside = (0..2u32)
-        .find(|pod| !crate::subset::assign(&user, 2, 1).contains(pod))
+        .find(|pod| !super::assign(&user, 2, 1).contains(pod))
         .unwrap();
     let prune =
         json!({"subset": {"pods": 2, "pod": outside, "copies": 1}, "after": "", "limit": 1000});

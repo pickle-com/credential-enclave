@@ -47,7 +47,7 @@ use crate::log_store;
 use crate::state::{
     events, lock, Account, AccountLock, ActiveGrant, EventPlace, GrantState, Handover, Node,
 };
-use crate::subset::Subset;
+use credential_enclave_protocol::subset::Subset;
 
 /// The `seq` of the control entry a place names. A control event is never in an open batch,
 /// so its place always names an entry.

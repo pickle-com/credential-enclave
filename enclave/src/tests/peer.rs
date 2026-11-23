@@ -1047,7 +1047,7 @@ async fn a_full_page_of_1000_grants_fits_one_import_call() {
 fn share(user_ids: &[&str], pods: u32, pod: u32, copies: u32) -> Vec<String> {
     user_ids
         .iter()
-        .filter(|user_id| crate::subset::assign(user_id, pods, copies).contains(&pod))
+        .filter(|user_id| super::assign(user_id, pods, copies).contains(&pod))
         .map(|user_id| user_id.to_string())
         .collect()
 }

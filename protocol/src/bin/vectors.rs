@@ -34,7 +34,7 @@ use credential_enclave_protocol::secret_use::{
     REFUSED_HEADERS, REFUSED_SCHEMES,
 };
 use credential_enclave_protocol::vault_secret::{self, Reach};
-use credential_enclave_protocol::{purpose, statement, totp};
+use credential_enclave_protocol::{purpose, statement, subset, totp};
 use ed25519_dalek::SigningKey;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -2160,6 +2160,244 @@ fn sealed_release() -> Value {
     })
 }
 
+/// The delegation subset (protocol.md 10.4): the nodes of an account in a pool, without
+/// `groups` and with them, two pools that place an account in three groups, and `subset`
+/// objects with the verdict of their form. The verdicts are written here by hand, and the
+/// generator stops when the library gives another one.
+fn subset_vectors() -> Value {
+    let uuid = "00000000-0000-4000-8000-000000000007";
+    let (a, b, c) = ("us-west-2a", "us-west-2b", "us-west-2c");
+    let round: Vec<&str> = (0..15).map(|ordinal| [a, b, c][ordinal % 3]).collect();
+    // The cases of one account whose groups have the same names are the pools of one fleet:
+    // a pool of the delegation role (`copies` 2, `skip` 0) and a pool of the reserve role
+    // (`copies` 1, `skip` 2).
+    let cases: Vec<(&str, u32, Option<Vec<&str>>, u32)> = vec![
+        ("user-1", 2, None, 0),
+        (uuid, 2, None, 0),
+        ("alice", 3, None, 0),
+        ("bob", 1, None, 0),
+        ("사용자 1", 2, None, 0),
+        ("carol", 5, None, 0),
+        ("alice", 3, None, 2),
+        ("user-1", 2, Some(vec![a, b, c, a, b, c]), 0),
+        ("user-1", 1, Some(vec![a, b, c]), 2),
+        (uuid, 2, Some(round.clone()), 0),
+        (uuid, 1, Some(vec![c, a, b]), 2),
+        ("alice", 2, Some(vec![a, a, a, b, b, c, c]), 0),
+        ("alice", 1, Some(vec![b, c, a, b]), 2),
+        ("사용자 1", 3, Some(vec![c, c, b, b, a, a]), 0),
+        (
+            "bob",
+            1,
+            Some(vec!["zone_1.a", "Zone-2", "zone_1.a", "Zone-2"]),
+            1,
+        ),
+        ("carol", 1, Some(vec!["a", "a"]), 0),
+    ];
+    let pods_of = |user_id: &str, groups: &Option<Vec<&str>>| -> u32 {
+        match (groups, user_id) {
+            (Some(groups), _) => u32::try_from(groups.len()).expect("a pool of some nodes"),
+            (None, "user-1") => 3,
+            (None, "alice") => 5,
+            (None, "bob") => 4,
+            (None, "사용자 1") => 6,
+            (None, "carol") => 2,
+            (None, _) => 12,
+        }
+    };
+    let cases: Vec<Value> = cases
+        .into_iter()
+        .map(|(user_id, copies, groups, skip)| {
+            let pods = pods_of(user_id, &groups);
+            let placement = subset::Placement::new(pods, copies, groups.as_deref(), skip)
+                .expect("the values of a case are a placement");
+            let mut case = Map::new();
+            case.insert("user_id".to_string(), json!(user_id));
+            case.insert("pods".to_string(), json!(pods));
+            case.insert("copies".to_string(), json!(copies));
+            case.insert("skip".to_string(), json!(skip));
+            match &groups {
+                Some(groups) => {
+                    let order = placement.group_order(user_id);
+                    let ranked: Vec<Vec<u32>> = order
+                        .iter()
+                        .map(|group| placement.ranked(user_id, Some(group)))
+                        .collect();
+                    case.insert("groups".to_string(), json!(groups));
+                    case.insert("group_order".to_string(), json!(order));
+                    case.insert("group_ranked".to_string(), json!(ranked));
+                }
+                None => {
+                    case.insert("ranked".to_string(), json!(placement.ranked(user_id, None)));
+                }
+            }
+            let assigned = placement.assign(user_id);
+            for pod in 0..pods {
+                assert_eq!(placement.holds(user_id, pod), assigned.contains(&pod));
+            }
+            case.insert("assign".to_string(), json!(assigned));
+            Value::Object(case)
+        })
+        .collect();
+
+    // Two pools of one fleet whose nodes run in the same three groups: the two nodes of an
+    // account in the pool of the delegation role and its node in the pool of the reserve
+    // role lie in three different groups.
+    let calls_groups = vec![a, b, c, b, a, c, a];
+    let reserve_groups = vec![c, a, b, c];
+    let calls = subset::Placement::new(7, 2, Some(&calls_groups), 0).expect("a placement");
+    let reserve = subset::Placement::new(4, 1, Some(&reserve_groups), 2).expect("a placement");
+    let accounts: Vec<Value> = ["user-1", uuid, "alice", "bob", "사용자 1", "carol"]
+        .into_iter()
+        .map(|user_id| {
+            let (of_calls, of_reserve) = (calls.assign(user_id), reserve.assign(user_id));
+            let group_of = |groups: &[&str], ordinal: &u32| -> String {
+                let index = usize::try_from(*ordinal).expect("an ordinal");
+                groups[index].to_string()
+            };
+            let mut groups: Vec<String> = of_calls
+                .iter()
+                .map(|ordinal| group_of(&calls_groups, ordinal))
+                .collect();
+            groups.extend(
+                of_reserve
+                    .iter()
+                    .map(|ordinal| group_of(&reserve_groups, ordinal)),
+            );
+            assert_eq!(groups, calls.group_order(user_id), "{user_id}");
+            assert_eq!(groups, reserve.group_order(user_id), "{user_id}");
+            json!({"user_id": user_id, "calls": of_calls, "reserve": of_reserve, "groups": groups})
+        })
+        .collect();
+    let pools = json!({
+        "calls": {"pods": 7, "copies": 2, "skip": 0, "groups": calls_groups},
+        "reserve": {"pods": 4, "copies": 1, "skip": 2, "groups": reserve_groups},
+        "accounts": accounts,
+    });
+
+    let objects = [
+        (json!({"pods": 3, "pod": 1, "copies": 2}), true),
+        (json!({"pods": 1024, "pod": 1023, "copies": 1}), true),
+        (json!({"pods": 2, "pod": 0, "copies": 5}), true),
+        (
+            json!({"pods": 3, "pod": 1, "copies": 2, "groups": null, "skip": null}),
+            true,
+        ),
+        (json!({"pods": 3, "pod": 1, "copies": 2, "skip": 2}), true),
+        (
+            json!({"pods": 3, "pod": 1, "copies": 2, "other": "not read"}),
+            true,
+        ),
+        (
+            json!({"pods": 3, "pod": 0, "copies": 2, "groups": [a, b, c]}),
+            true,
+        ),
+        (
+            json!({"pods": 3, "pod": 0, "copies": 3, "groups": [a, b, c], "skip": 0}),
+            true,
+        ),
+        (
+            json!({"pods": 3, "pod": 2, "copies": 1, "groups": [a, b, c], "skip": 2}),
+            true,
+        ),
+        (
+            json!({"pods": 4, "pod": 3, "copies": 1, "groups": [a, a, b, b], "skip": 1}),
+            true,
+        ),
+        (
+            json!({"pods": 2, "pod": 0, "copies": 1, "groups": ["Zone_1.a-b", "z".repeat(63)]}),
+            true,
+        ),
+        (json!({"pods": 0, "pod": 0, "copies": 1}), false),
+        (json!({"pods": 1025, "pod": 0, "copies": 1}), false),
+        (json!({"pods": 3, "pod": 3, "copies": 1}), false),
+        (json!({"pods": 3, "pod": 0, "copies": 0}), false),
+        (json!({"pods": 3, "pod": 0}), false),
+        (json!({"pods": "3", "pod": 0, "copies": 1}), false),
+        (json!({"pods": 3.5, "pod": 0, "copies": 1}), false),
+        (json!({"pods": -3, "pod": 0, "copies": 1}), false),
+        (json!({"pods": 3, "pod": 0, "copies": 4294967296u64}), false),
+        (json!([3, 0, 1]), false),
+        (
+            json!({"pods": 3, "pod": 0, "copies": 1, "skip": "2"}),
+            false,
+        ),
+        (json!({"pods": 3, "pod": 0, "copies": 1, "skip": -1}), false),
+        (
+            json!({"pods": 3, "pod": 0, "copies": 1, "skip": 4294967296u64}),
+            false,
+        ),
+        (
+            json!({"pods": 3, "pod": 0, "copies": 1, "groups": [a, b]}),
+            false,
+        ),
+        (
+            json!({"pods": 3, "pod": 0, "copies": 1, "groups": [a, b, c, a]}),
+            false,
+        ),
+        (
+            json!({"pods": 3, "pod": 0, "copies": 1, "groups": [0, 1, 2]}),
+            false,
+        ),
+        (
+            json!({"pods": 3, "pod": 0, "copies": 1, "groups": [a, null, c]}),
+            false,
+        ),
+        (
+            json!({"pods": 3, "pod": 0, "copies": 1, "groups": "abc"}),
+            false,
+        ),
+        (
+            json!({"pods": 2, "pod": 0, "copies": 1, "groups": ["", b]}),
+            false,
+        ),
+        (
+            json!({"pods": 2, "pod": 0, "copies": 1, "groups": ["us west", b]}),
+            false,
+        ),
+        (
+            json!({"pods": 2, "pod": 0, "copies": 1, "groups": ["a\nzone\nb", b]}),
+            false,
+        ),
+        (
+            json!({"pods": 2, "pod": 0, "copies": 1, "groups": ["영역", b]}),
+            false,
+        ),
+        (
+            json!({"pods": 2, "pod": 0, "copies": 1, "groups": ["z".repeat(64), b]}),
+            false,
+        ),
+        (
+            json!({"pods": 3, "pod": 0, "copies": 4, "groups": [a, b, c]}),
+            false,
+        ),
+        (
+            json!({"pods": 3, "pod": 0, "copies": 2, "groups": [a, b, c], "skip": 2}),
+            false,
+        ),
+        (
+            json!({"pods": 3, "pod": 0, "copies": 1, "groups": [a, b, c], "skip": 3}),
+            false,
+        ),
+        (
+            json!({"pods": 3, "pod": 0, "copies": 2, "groups": [a, a, a]}),
+            false,
+        ),
+    ];
+    let objects: Vec<Value> = objects
+        .into_iter()
+        .map(|(object, valid)| {
+            assert_eq!(
+                subset::Subset::from_value(&object).is_some(),
+                valid,
+                "{object}"
+            );
+            json!({"subset": object, "valid": valid})
+        })
+        .collect();
+    json!({"cases": cases, "pools": pools, "objects": objects})
+}
+
 fn generate() -> String {
     let document = json!({
         "v": 1,
@@ -2193,7 +2431,17 @@ fn generate() -> String {
             "is `header:<name>`, with the placeholder `placeholder_text` in them: `valid` says ",
             "whether a node of the forward role puts a value in the place of the placeholder, ",
             "and `refused_schemes` lists the names of the authentication schemes behind which ",
-            "it puts none."
+            "it puts none. `subset` holds the delegation subset (protocol.md 10.4). A case of ",
+            "`cases` is a pool of `pods` nodes with `copies` nodes per account, with the group ",
+            "of every ordinal in `groups` or without groups, and `skip` groups passed over: ",
+            "`assign` lists the ordinals that hold the delegation of `user_id` in the order the ",
+            "account takes them. Without `groups`, `ranked` lists every ordinal in the order of ",
+            "its rank. With `groups`, `group_order` lists the groups in the order of the ",
+            "account and `group_ranked` the ordinals of each of them, in the same order, by ",
+            "their rank. `pools` holds two pools whose nodes run in the same groups, and for ",
+            "each account its nodes in both and the three groups those nodes run in. `objects` ",
+            "holds `subset` objects of a request: `valid` says whether a node reads the object ",
+            "or answers `invalid_request`."
         ),
         "key_derivation": key_derivation(),
         "record": record(),
@@ -2206,6 +2454,7 @@ fn generate() -> String {
         "attestation": attestation(),
         "totp": totp_vectors(),
         "transfer": transfer(),
+        "subset": subset_vectors(),
         "vault_secret": vault_secret_forms(),
         "sealed_release": sealed_release(),
         "basic_credentials": basic_credentials(),

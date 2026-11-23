@@ -28,8 +28,8 @@ use crate::oauth::{ProviderError, Withheld};
 use crate::platform::{Listener, PlatformError};
 use crate::providers::{ClientKind, Definition};
 use crate::state::{Node, OperatorConfig, ProviderCredentials};
-use crate::subset::Subset;
 use credential_enclave_protocol::record::Record;
+use credential_enclave_protocol::subset::Subset;
 
 mod attestation;
 mod close;
@@ -654,7 +654,9 @@ fn missing(key: &str) -> ApiError {
         "cursor" => "cursor is missing or invalid",
         "limit" => "limit is missing or invalid",
         "subset" => {
-            "subset is missing or invalid: pods 1 to 1024, pod below pods, copies at least 1"
+            "subset is missing or invalid: pods 1 to 1024, pod below pods, copies at least 1, \
+             and groups, when present, one name per ordinal with at least skip plus copies \
+             different names"
         }
         _ => "a field is missing or invalid",
     };
@@ -666,8 +668,9 @@ pub fn record_of(body: &JsonBody, key: &str) -> Result<Record, ApiError> {
     Ok(Record::from_value(body.object(key)?)?)
 }
 
-/// The optional `subset` of a call (enclave.md 5.13 and 5.15): `None` when the key is absent
-/// or null, `invalid_request` when its value is not a subset object within its bounds.
+/// The optional `subset` of a call (enclave.md 5.13 and 5.15, protocol.md 10.4): `None` when
+/// the key is absent or null, `invalid_request` when its value is not a subset object within
+/// its bounds.
 pub fn subset_of(body: &JsonBody) -> Result<Option<Subset>, ApiError> {
     match body.get("subset") {
         None => Ok(None),

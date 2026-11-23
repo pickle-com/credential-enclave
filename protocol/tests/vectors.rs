@@ -14,6 +14,7 @@ use credential_enclave_protocol::log::{self, EntryKind, EntryParts, Head, Last, 
 use credential_enclave_protocol::purpose;
 use credential_enclave_protocol::record::{open_record, record_aad, seal_record, Record};
 use credential_enclave_protocol::secret::Secret;
+use credential_enclave_protocol::subset;
 use credential_enclave_protocol::totp::totp;
 use ed25519_dalek::SigningKey;
 use serde_json::Value;
@@ -977,4 +978,148 @@ fn totp_codes() {
             text(case, "code")
         );
     }
+}
+
+#[test]
+fn delegation_subset() {
+    let all = vectors();
+    let vector = &all["subset"];
+    let numbers = |value: &Value| -> Vec<u32> {
+        let numbers = value.as_array().expect("an array of numbers");
+        numbers
+            .iter()
+            .map(|number| u32::try_from(number.as_u64().unwrap()).unwrap())
+            .collect()
+    };
+    let names = |value: &Value| -> Vec<String> {
+        let names = value.as_array().expect("an array of names");
+        names
+            .iter()
+            .map(|name| name.as_str().unwrap().to_string())
+            .collect()
+    };
+    let placement_of = |value: &Value| -> (subset::Placement, Option<Vec<String>>) {
+        let number = |key: &str| u32::try_from(value[key].as_u64().unwrap()).unwrap();
+        let groups = value.get("groups").map(names);
+        let listed: Option<Vec<&str>> = groups
+            .as_ref()
+            .map(|groups| groups.iter().map(String::as_str).collect());
+        let placement = subset::Placement::new(
+            number("pods"),
+            number("copies"),
+            listed.as_deref(),
+            number("skip"),
+        )
+        .expect("the values of a case are a placement");
+        (placement, groups)
+    };
+
+    let cases = vector["cases"].as_array().unwrap();
+    assert_eq!(cases.len(), 16);
+    let mut grouped = 0;
+    for case in cases {
+        let user_id = text(case, "user_id");
+        let (placement, groups) = placement_of(case);
+        assert_eq!(
+            placement.assign(user_id),
+            numbers(&case["assign"]),
+            "{case}"
+        );
+        let pods = placement.pods();
+        match &groups {
+            None => {
+                let ranked = numbers(&case["ranked"]);
+                assert_eq!(placement.ranked(user_id, None), ranked, "{case}");
+                // The nodes of the account are the first `copies` ordinals of that order.
+                let copies = case["copies"].as_u64().unwrap() as usize;
+                let first = &ranked[..copies.min(ranked.len())];
+                assert_eq!(numbers(&case["assign"]), first, "{case}");
+            }
+            Some(groups) => {
+                grouped += 1;
+                let order = names(&case["group_order"]);
+                assert_eq!(placement.group_order(user_id), order, "{case}");
+                let ranked = case["group_ranked"].as_array().unwrap();
+                assert_eq!(ranked.len(), order.len());
+                // The nodes of the account: the ordinal that ranks first in each of its
+                // `copies` groups from the position `skip` on.
+                let skip = case["skip"].as_u64().unwrap() as usize;
+                let copies = case["copies"].as_u64().unwrap() as usize;
+                let mut expected = Vec::new();
+                for (position, (group, ordinals)) in order.iter().zip(ranked).enumerate() {
+                    let ordinals = numbers(ordinals);
+                    assert_eq!(placement.ranked(user_id, Some(group)), ordinals, "{case}");
+                    assert!(ordinals
+                        .iter()
+                        .all(|ordinal| &groups[*ordinal as usize] == group));
+                    if (skip..skip + copies).contains(&position) {
+                        expected.push(ordinals[0]);
+                    }
+                }
+                assert_eq!(numbers(&case["assign"]), expected, "{case}");
+            }
+        }
+        // The share of a node: the answer for every ordinal of the pool.
+        for pod in 0..pods {
+            let holds = numbers(&case["assign"]).contains(&pod);
+            assert_eq!(placement.holds(user_id, pod), holds, "{case} {pod}");
+        }
+    }
+    assert_eq!(grouped, 9);
+
+    // The first six cases are the vectors of the releases before v2.4.0, and a `skip` without
+    // groups changes nothing.
+    let assigned = |index: usize| -> std::collections::BTreeSet<u32> {
+        numbers(&cases[index]["assign"]).into_iter().collect()
+    };
+    let set = |ordinals: &[u32]| ordinals.iter().copied().collect();
+    assert_eq!(assigned(0), set(&[0, 1]));
+    assert_eq!(assigned(1), set(&[2, 6]));
+    assert_eq!(assigned(2), set(&[0, 2, 3]));
+    assert_eq!(assigned(3), set(&[1]));
+    assert_eq!(assigned(4), set(&[0, 4]));
+    assert_eq!(assigned(5), set(&[0, 1]));
+    assert_eq!(cases[6]["skip"], 2);
+    assert_eq!(cases[6]["assign"], cases[2]["assign"]);
+
+    // Two pools with the same groups: three nodes of an account, in three groups.
+    let pools = &vector["pools"];
+    let (calls, calls_groups) = placement_of(&pools["calls"]);
+    let (reserve, reserve_groups) = placement_of(&pools["reserve"]);
+    let (calls_groups, reserve_groups) = (calls_groups.unwrap(), reserve_groups.unwrap());
+    let accounts = pools["accounts"].as_array().unwrap();
+    assert_eq!(accounts.len(), 6);
+    for account in accounts {
+        let user_id = text(account, "user_id");
+        let (of_calls, of_reserve) = (numbers(&account["calls"]), numbers(&account["reserve"]));
+        assert_eq!(calls.assign(user_id), of_calls, "{account}");
+        assert_eq!(reserve.assign(user_id), of_reserve, "{account}");
+        assert_eq!((of_calls.len(), of_reserve.len()), (2, 1));
+        let mut groups: Vec<String> = of_calls
+            .iter()
+            .map(|ordinal| calls_groups[*ordinal as usize].clone())
+            .collect();
+        groups.push(reserve_groups[of_reserve[0] as usize].clone());
+        assert_eq!(groups, names(&account["groups"]), "{account}");
+        let distinct: std::collections::BTreeSet<&String> = groups.iter().collect();
+        assert_eq!(distinct.len(), 3, "{account}");
+    }
+
+    let objects = vector["objects"].as_array().unwrap();
+    assert_eq!(objects.len(), 38);
+    for object in objects {
+        let valid = object["valid"].as_bool().unwrap();
+        assert_eq!(
+            subset::Subset::from_value(&object["subset"]).is_some(),
+            valid,
+            "{object}"
+        );
+    }
+    assert_eq!(
+        objects
+            .iter()
+            .filter(|object| object["valid"] == true)
+            .count(),
+        11
+    );
 }
