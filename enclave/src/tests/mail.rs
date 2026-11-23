@@ -15,7 +15,7 @@ use tokio_rustls::TlsAcceptor;
 
 use super::quiet_provider_and_log_store;
 use crate::frame::{self, META_LIMIT_BYTES};
-use crate::mail::{self, LiteralScan};
+use crate::mail;
 use crate::state::Limits;
 use crate::testing::{App, Harness};
 
@@ -683,30 +683,6 @@ async fn mixed_admission_scenario() -> Value {
         "imap_logins_observed":server.passwords.lock().unwrap().len(),
         "real_credentials":false, "real_email_sent":false,
     })
-}
-
-#[test]
-fn literal_scan_refuses_a_declaration_above_the_bound() {
-    let accepted =
-        b"* LIST () \"/\" {5}\r\nhello\r\n* 1 FETCH (BODY[] {9}\r\n{99999}\r\n)\r\nA1 OK done\r\n";
-    for chunk in [1usize, 3, 7, accepted.len()] {
-        let mut scan = LiteralScan::Text;
-        for piece in accepted.chunks(chunk) {
-            scan.feed(piece, 9).unwrap();
-        }
-        assert_eq!(scan, LiteralScan::Text, "chunks of {chunk}");
-    }
-    let mut scan = LiteralScan::Text;
-    assert_eq!(scan.feed(accepted, 8), Err(9));
-    let mut scan = LiteralScan::Text;
-    scan.feed(b"* OK {12}x is text\r\n* OK {}\r\n{{3}\r\nabc", 3)
-        .unwrap();
-    assert_eq!(scan, LiteralScan::Text);
-    let mut scan = LiteralScan::Text;
-    assert_eq!(
-        scan.feed(b"* 1 FETCH (BODY[] {99999999999999999999999}\r\n", 64),
-        Err(u64::MAX)
-    );
 }
 
 #[tokio::test]

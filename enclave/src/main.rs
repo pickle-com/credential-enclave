@@ -39,6 +39,7 @@ mod clock;
 mod descriptors;
 mod egress;
 mod frame;
+mod imap;
 mod inbound;
 mod lineage;
 mod load;

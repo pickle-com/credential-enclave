@@ -1,4 +1,8 @@
 //! Fixed Naver IMAP/SMTP operations. Authentication bytes only reach in-node TLS streams.
+//!
+//! The responses of the IMAP server are read by the reader of this program (`crate::imap`),
+//! which reads what the commands of a mail call need and passes over the rest. This module
+//! sends those commands and decides what a response is to the command it answers.
 
 use std::{
     collections::BTreeMap,
@@ -8,15 +12,12 @@ use std::{
     time::Duration,
 };
 
-use async_imap::imap_proto::{
-    AttributeValue, MailboxDatum, MessageSection, Response, SectionPath, Status,
-};
-use async_imap::{Client, Session};
 use base64::{engine::general_purpose::STANDARD, Engine};
+use credential_enclave_protocol::encoding::to_json;
 use credential_enclave_protocol::record::{Kind, Record};
 use credential_enclave_protocol::secret::Secret;
 use credential_enclave_protocol::ProtocolError;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter,
@@ -24,6 +25,7 @@ use tokio::io::{
 };
 use zeroize::Zeroizing;
 
+use crate::imap::{self, Code, Condition, Fetched, Response, Status, Step};
 use crate::platform::Stream;
 use crate::provider_response::{self, CheckedResponse};
 use crate::state::{open_for, GrantView, Limits, Node};
@@ -43,15 +45,19 @@ pub(crate) fn message_input_bytes(limits: &Limits) -> usize {
     limits.body_bytes + 1024 * 1024
 }
 
-/// Whether a `NO` reply to `LOGIN` says that the server refused the credentials. `text` is the
-/// SDK's rendering of the reply: its response code and its information. Two forms count: the
-/// RFC 5530 response code `AUTHENTICATIONFAILED`, and the information `Authentication failed`
-/// that imap.naver.com sends with its own response code `[AUTH]`
+/// Protocol input an SMTP connection accepts.
+pub(crate) const SMTP_INPUT_BYTES: usize = 64 * 1024;
+
+/// The most bytes a connection to the IMAP server takes from its stream in one read.
+const IMAP_READ_BYTES: usize = 16 * 1024;
+
+/// Whether a `NO` reply to `LOGIN` says that the server refused the credentials. Two forms
+/// count: the RFC 5530 response code `AUTHENTICATIONFAILED`, and the information
+/// `Authentication failed` that imap.naver.com sends with its own response code `[AUTH]`
 /// (`NO [AUTH] "name": Authentication failed. (Please check your username, password)`). Any
 /// other `NO` is a provider failure.
-fn credentials_refused(text: &str) -> bool {
-    let text = text.to_ascii_lowercase();
-    text.contains("authenticationfailed") || text.contains("authentication failed")
+fn credentials_refused(status: &Status) -> bool {
+    status.mentions(b"authenticationfailed") || status.mentions(b"authentication failed")
 }
 
 /// Only the mail call opens this kind. Neither field implements response serialization.
@@ -124,33 +130,32 @@ impl AppPassword {
             .map_err(|_| ProtocolError::ResponseWithheld)
     }
 
-    async fn imap(
-        &self,
-        node: &Node,
-        response_bytes: usize,
-    ) -> Result<Session<MailStream>, MailError> {
+    /// Opens a connection to imap.naver.com and authenticates: sink K6 of the egress policy.
+    /// The connection delivers at most `input_bytes` of protocol input.
+    async fn imap(&self, node: &Node, input_bytes: usize) -> Result<ImapSession, MailError> {
         let stream = node
             .egress
             .open_mail(node.platform.as_ref(), "imap.naver.com", 993, CALL_TIMEOUT)
             .await
             .map_err(|_| MailError::Unavailable)?;
-        let mut client = Client::new(limited(stream, response_bytes));
-        client
-            .read_response()
-            .await
-            .map_err(|_| MailError::Unavailable)?
-            .ok_or(MailError::Unavailable)?;
+        let mut connection = ImapConnection::new(stream, input_bytes);
+        // The greeting of the server: a connection it refuses, or ends, carries no login.
+        match connection.response().await? {
+            Response::Untagged(status)
+                if matches!(status.condition, Condition::Ok | Condition::Preauth) => {}
+            _ => return Err(MailError::Unavailable),
+        }
         let login = self
             .identity
             .strip_suffix("@naver.com")
             .ok_or(MailError::Invalid)?;
-        client
+        connection
             .login(login, self.password.expose_secret())
-            .await
-            .map_err(|(error, _)| match error {
-                async_imap::error::Error::No(text) if credentials_refused(&text) => MailError::Auth,
-                _ => MailError::Unavailable,
-            })
+            .await?;
+        Ok(ImapSession {
+            connection,
+            in_step: true,
+        })
     }
 
     async fn smtp(&self, node: &Node) -> Result<Smtp, MailError> {
@@ -160,7 +165,10 @@ impl AppPassword {
             .await
             .map_err(|_| MailError::Unavailable)?;
         let mut smtp = Smtp {
-            io: BufReader::new(BufWriter::new(limited(stream, 65536))),
+            io: BufReader::new(BufWriter::new(MailStream::bounded(
+                stream,
+                SMTP_INPUT_BYTES,
+            ))),
             size: None,
         };
         if smtp.reply().await?.0 != 220 {
@@ -210,103 +218,13 @@ impl AppPassword {
         request.validate()?;
         // A UID search can expand into a large set before pagination. Bound listing and
         // header input separately from a raw message, whose content has the frame limit.
-        let response_bytes = if request.action == "read" {
+        let input_bytes = if request.action == "read" {
             message_input_bytes(&node.limits)
         } else {
             LISTING_INPUT_BYTES
         };
-        let mut session = self.imap(node, response_bytes).await?;
-        if request.action == "folders" {
-            let folders = list_folders(&mut session).await?;
-            return Ok(MailData::Json(json!({"folders": folders})));
-        }
-        let mailbox = session
-            .examine(&request.mailbox)
-            .await
-            .map_err(|_| MailError::Unavailable)?;
-        let validity = mailbox.uid_validity.ok_or(MailError::Unavailable)?;
-        if request
-            .uid_validity
-            .is_some_and(|expected| expected != validity)
-        {
-            return Err(MailError::MailboxChanged);
-        }
-        if request.action == "search" {
-            let upper = request
-                .before_uid
-                .unwrap_or(mailbox.uid_next.unwrap_or(u32::MAX))
-                .saturating_sub(1);
-            if upper == 0 {
-                return Ok(MailData::Json(
-                    json!({"uid_validity": validity, "messages": [], "next_uid": null}),
-                ));
-            }
-            let mut uids = search_uids(&mut session, request.query(upper)?).await?;
-            uids.sort_unstable_by(|a, b| b.cmp(a));
-            uids.dedup();
-            let more = uids.len() > request.limit;
-            uids.truncate(request.limit);
-            let next = if more { uids.last().copied() } else { None };
-            let mut messages = Vec::new();
-            if !uids.is_empty() {
-                let set = uids
-                    .iter()
-                    .map(u32::to_string)
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let rows =
-                    uid_fetch(&mut session, &set, "(UID RFC822.SIZE BODY.PEEK[HEADER])").await?;
-                let mut by_uid: BTreeMap<u32, (Option<u32>, Option<Vec<u8>>)> = BTreeMap::new();
-                for row in rows {
-                    let Some(uid) = row.uid else {
-                        continue;
-                    };
-                    if !uids.contains(&uid) {
-                        continue;
-                    }
-                    let entry = by_uid.entry(uid).or_insert((None, None));
-                    if row.size.is_some() {
-                        entry.0 = row.size;
-                    }
-                    if row.header.is_some() {
-                        entry.1 = row.header;
-                    }
-                }
-                for uid in &uids {
-                    if let Some((size, header)) = by_uid.get(uid) {
-                        messages.push(json!({
-                            "uid": uid,
-                            "size": size,
-                            "headers_b64": STANDARD.encode(header.as_deref().unwrap_or_default()),
-                        }));
-                    }
-                }
-            }
-            return Ok(MailData::Json(
-                json!({"uid_validity": validity, "messages": messages, "next_uid": next}),
-            ));
-        }
-        let uid = request.uid.ok_or(MailError::Invalid)?;
-        let uid_set = uid.to_string();
-        let sizes = uid_fetch(&mut session, &uid_set, "(UID RFC822.SIZE)").await?;
-        let size = sizes
-            .iter()
-            .find(|row| row.uid == Some(uid))
-            .and_then(|row| row.size)
-            .ok_or(MailError::Missing)?;
-        if size as usize > node.limits.body_bytes {
-            return Err(MailError::TooLarge);
-        }
-        let rows = uid_fetch(&mut session, &uid_set, "(UID BODY.PEEK[])").await?;
-        let body = rows
-            .into_iter()
-            .find(|row| row.uid == Some(uid))
-            .and_then(|row| row.body)
-            .ok_or(MailError::Missing)?;
-        if body.len() > node.limits.body_bytes {
-            return Err(MailError::TooLarge);
-        }
-        Ok(MailData::Raw(body))
+        let mut session = self.imap(node, input_bytes).await?;
+        session.read(request, &node.limits).await
     }
 
     pub(crate) fn validate_submission(
@@ -369,9 +287,9 @@ impl AppPassword {
         }
         let code = smtp.command(b".\r\n").await?.0;
         match code {
-            250 => Ok(MailData::Json(
-                json!({"status": "accepted", "smtp_code": code}),
-            )),
+            250 => Ok(MailData::Json(to_json(
+                &json!({"status": "accepted", "smtp_code": code}),
+            ))),
             400..=599 => Ok(rejected(code)),
             _ => Err(MailError::Unavailable),
         }
@@ -379,11 +297,14 @@ impl AppPassword {
 }
 
 fn rejected(code: u16) -> MailData {
-    MailData::Json(json!({"status": "rejected", "smtp_code": code}))
+    MailData::Json(to_json(&json!({"status": "rejected", "smtp_code": code})))
 }
 
+/// What a mail call answers with.
 pub enum MailData {
-    Json(Value),
+    /// A JSON document, serialized.
+    Json(Vec<u8>),
+    /// A message as the server holds it.
     Raw(Vec<u8>),
 }
 
@@ -414,7 +335,7 @@ impl ReadMail {
         if !matches!(self.action.as_str(), "folders" | "search" | "read")
             || !(1..=50).contains(&self.limit)
             || self.mailbox.is_empty()
-            || self.mailbox.len() > 1024
+            || self.mailbox.len() > imap::FOLDER_NAME_BYTES
             || self.mailbox.chars().any(char::is_control)
         {
             return Err(MailError::Invalid);
@@ -450,161 +371,285 @@ impl ReadMail {
     }
 }
 
-async fn list_folders(session: &mut Session<MailStream>) -> Result<Vec<Value>, MailError> {
-    let tag = session
-        .run_command("LIST \"\" \"*\"")
-        .await
-        .map_err(|_| MailError::Unavailable)?;
-    let mut folders = Vec::new();
-    loop {
-        let response = session
-            .read_response()
-            .await
-            .map_err(|_| MailError::Unavailable)?
-            .ok_or(MailError::Unavailable)?;
-        match response.parsed() {
-            Response::MailboxData(MailboxDatum::List(data)) => {
-                folders.push(json!({"name": data.name.as_ref()}));
-            }
-            Response::Done {
-                tag: response_tag,
-                status: Status::Ok,
-                ..
-            } if *response_tag == tag => return Ok(folders),
-            Response::Done { .. }
-            | Response::Data {
-                status: Status::Bye,
-                ..
-            } => return Err(MailError::Unavailable),
-            _ => {}
+/// The folders of an account, as a folder listing answers.
+#[derive(Serialize)]
+struct Folders<'a> {
+    folders: Vec<Folder<'a>>,
+}
+
+#[derive(Serialize)]
+struct Folder<'a> {
+    name: &'a str,
+}
+
+/// One page of a search, as a search answers.
+#[derive(Serialize)]
+struct Page {
+    uid_validity: u32,
+    messages: Vec<Listed>,
+    next_uid: Option<u32>,
+}
+
+/// One message of a page: its UID, its size, and its header block in base64.
+#[derive(Serialize)]
+struct Listed {
+    uid: u32,
+    size: Option<u64>,
+    headers_b64: String,
+}
+
+/// An authenticated connection to imap.naver.com: the session of one login with the
+/// application password of one record.
+pub(crate) struct ImapSession {
+    connection: ImapConnection,
+    /// True while every command the node sent got its tagged completion: the next command
+    /// starts an exchange of its own. False from the moment a command is sent to the moment
+    /// its completion was read, and for good once the connection failed in between.
+    in_step: bool,
+}
+
+/// What a response is to the command with a tag.
+enum Turn {
+    /// The tagged completion of the command, and whether its condition is `OK`.
+    Completed(bool),
+    /// The server ends the connection (`BYE`), or completes a command the node did not send.
+    Ended,
+    /// Data, of the command or unsolicited. An untagged `NO` or `BAD` is a warning (RFC 3501
+    /// sections 7.1.2 and 7.1.3): the completion of the command says how the command ended.
+    Data,
+}
+
+fn turn(response: &Response, tag: &str) -> Turn {
+    match response {
+        Response::Tagged(completed, status) if completed == tag.as_bytes() => {
+            Turn::Completed(status.condition == Condition::Ok)
         }
+        Response::Tagged(..) => Turn::Ended,
+        Response::Untagged(status) if status.condition == Condition::Bye => Turn::Ended,
+        _ => Turn::Data,
     }
 }
 
-struct FetchedMessage {
-    uid: Option<u32>,
-    size: Option<u32>,
-    header: Option<Vec<u8>>,
-    body: Option<Vec<u8>>,
-}
+impl ImapSession {
+    /// Sends a command and returns its tag. The session is out of step until the completion
+    /// of the command was read.
+    async fn send(&mut self, command: String) -> Result<String, MailError> {
+        self.in_step = false;
+        self.connection.command(&command).await
+    }
 
-async fn uid_fetch(
-    session: &mut Session<MailStream>,
-    set: &str,
-    items: &str,
-) -> Result<Vec<FetchedMessage>, MailError> {
-    let tag = session
-        .run_command(format!("UID FETCH {set} {items}"))
-        .await
-        .map_err(|_| MailError::Unavailable)?;
-    let mut rows = Vec::new();
-    loop {
-        let response = session
-            .read_response()
-            .await
-            .map_err(|_| MailError::Unavailable)?
-            .ok_or(MailError::Unavailable)?;
-        match response.parsed() {
-            Response::Fetch(_, attrs) => {
-                let mut row = FetchedMessage {
-                    uid: None,
-                    size: None,
-                    header: None,
-                    body: None,
-                };
-                for attr in attrs {
-                    match attr {
-                        AttributeValue::Uid(uid) => row.uid = Some(*uid),
-                        AttributeValue::Rfc822Size(size) => row.size = Some(*size),
-                        AttributeValue::BodySection {
-                            section: Some(SectionPath::Full(MessageSection::Header)),
-                            data: Some(header),
-                            ..
-                        }
-                        | AttributeValue::Rfc822Header(Some(header)) => {
-                            row.header = Some(header.to_vec());
-                        }
-                        AttributeValue::BodySection {
-                            section: None,
-                            data: Some(body),
-                            ..
-                        }
-                        | AttributeValue::Rfc822(Some(body)) => {
-                            row.body = Some(body.to_vec());
-                        }
-                        _ => {}
+    /// Ends a command at its completion: the session is in step again, and the command
+    /// succeeded when its condition is `OK`.
+    fn completed<T>(&mut self, ok: bool, value: T) -> Result<T, MailError> {
+        self.in_step = true;
+        match ok {
+            true => Ok(value),
+            false => Err(MailError::Unavailable),
+        }
+    }
+
+    /// The commands of one read, and what the read answers with.
+    async fn read(&mut self, request: &ReadMail, limits: &Limits) -> Result<MailData, MailError> {
+        if request.action == "folders" {
+            let names = self.list_folders().await?;
+            let folders = names
+                .iter()
+                .map(|name| Folder {
+                    name: name.as_str(),
+                })
+                .collect();
+            return Ok(MailData::Json(to_json(&Folders { folders })));
+        }
+        let (validity, uid_next) = self.examine(&request.mailbox).await?;
+        if request
+            .uid_validity
+            .is_some_and(|expected| expected != validity)
+        {
+            return Err(MailError::MailboxChanged);
+        }
+        if request.action == "search" {
+            let upper = request
+                .before_uid
+                .unwrap_or(uid_next.unwrap_or(u32::MAX))
+                .saturating_sub(1);
+            let mut page = Page {
+                uid_validity: validity,
+                messages: Vec::new(),
+                next_uid: None,
+            };
+            if upper == 0 {
+                return Ok(MailData::Json(to_json(&page)));
+            }
+            let mut uids = self.search_uids(request.query(upper)?).await?;
+            uids.sort_unstable_by(|a, b| b.cmp(a));
+            uids.dedup();
+            let more = uids.len() > request.limit;
+            uids.truncate(request.limit);
+            page.next_uid = if more { uids.last().copied() } else { None };
+            if !uids.is_empty() {
+                let set = uids
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let mut rows = self
+                    .uid_fetch(&set, "(UID RFC822.SIZE BODY.PEEK[HEADER])", &uids)
+                    .await?;
+                for uid in &uids {
+                    // The header of a message leaves the rows when its text is made: a
+                    // page holds each header once, in one of the two forms.
+                    if let Some(row) = rows.remove(uid) {
+                        page.messages.push(Listed {
+                            uid: *uid,
+                            size: row.size,
+                            headers_b64: STANDARD.encode(row.header.unwrap_or_default()),
+                        });
                     }
                 }
-                rows.push(row);
             }
-            Response::Done {
-                tag: response_tag,
-                status: Status::Ok,
-                ..
-            } if *response_tag == tag => return Ok(rows),
-            Response::Done { .. }
-            | Response::Data {
-                status: Status::Bye,
-                ..
-            } => return Err(MailError::Unavailable),
-            _ => {}
+            return Ok(MailData::Json(to_json(&page)));
         }
+        let uid = request.uid.ok_or(MailError::Invalid)?;
+        let uid_set = uid.to_string();
+        let size = self
+            .uid_fetch(&uid_set, "(UID RFC822.SIZE)", &[uid])
+            .await?
+            .remove(&uid)
+            .and_then(|row| row.size)
+            .ok_or(MailError::Missing)?;
+        if size > limits.body_bytes as u64 {
+            return Err(MailError::TooLarge);
+        }
+        let body = self
+            .uid_fetch(&uid_set, "(UID BODY.PEEK[])", &[uid])
+            .await?
+            .remove(&uid)
+            .and_then(|row| row.body)
+            .ok_or(MailError::Missing)?;
+        if body.len() > limits.body_bytes {
+            return Err(MailError::TooLarge);
+        }
+        Ok(MailData::Raw(body))
     }
-}
 
-async fn search_uids(
-    session: &mut Session<MailStream>,
-    pieces: Vec<String>,
-) -> Result<Vec<u32>, MailError> {
-    let mut pieces = pieces.into_iter();
-    let tag = session
-        .run_command(pieces.next().ok_or(MailError::Invalid)?)
-        .await
-        .map_err(|_| MailError::Unavailable)?;
-    for piece in pieces {
+    /// `LIST "" "*"`: the names of the folders of the account.
+    async fn list_folders(&mut self) -> Result<Vec<String>, MailError> {
+        let tag = self.send("LIST \"\" \"*\"".to_string()).await?;
+        let mut folders = Vec::new();
         loop {
-            let response = session
-                .read_response()
-                .await
-                .map_err(|_| MailError::Unavailable)?
-                .ok_or(MailError::Unavailable)?;
-            match response.parsed() {
-                Response::Continue(_) => break,
-                Response::Done { .. }
-                | Response::Data {
-                    status: Status::Bye,
-                    ..
-                } => return Err(MailError::Unavailable),
-                _ => {}
+            let response = self.connection.response().await?;
+            match turn(&response, &tag) {
+                Turn::Completed(ok) => return self.completed(ok, folders),
+                Turn::Ended => return Err(MailError::Unavailable),
+                Turn::Data => {
+                    if let Response::List(name) = response {
+                        folders.push(name);
+                    }
+                }
             }
         }
-        session
-            .run_command_untagged(piece)
-            .await
-            .map_err(|_| MailError::Unavailable)?;
     }
-    let mut uids = Vec::new();
-    loop {
-        let response = session
-            .read_response()
-            .await
-            .map_err(|_| MailError::Unavailable)?
-            .ok_or(MailError::Unavailable)?;
-        match response.parsed() {
-            Response::MailboxData(MailboxDatum::Search(values)) => {
-                uids.extend(values.iter().copied())
+
+    /// `EXAMINE`: opens a mailbox for reading and returns its generation (`UIDVALIDITY`) and
+    /// the UID its next message gets (`UIDNEXT`), when the server names one. A mailbox the
+    /// server does not open, and one whose generation it does not name, fail the read.
+    async fn examine(&mut self, mailbox: &str) -> Result<(u32, Option<u32>), MailError> {
+        let tag = self
+            .send(format!("EXAMINE {}", imap::quoted(mailbox)))
+            .await?;
+        let (mut validity, mut uid_next) = (None, None);
+        loop {
+            let response = self.connection.response().await?;
+            match turn(&response, &tag) {
+                Turn::Completed(ok) => {
+                    let validity = self.completed(ok, validity)?;
+                    return Ok((validity.ok_or(MailError::Unavailable)?, uid_next));
+                }
+                Turn::Ended => return Err(MailError::Unavailable),
+                Turn::Data => {
+                    if let Response::Untagged(status) = response {
+                        match (status.condition, status.code) {
+                            (Condition::Ok, Code::UidValidity(value)) => validity = Some(value),
+                            (Condition::Ok, Code::UidNext(value)) => uid_next = Some(value),
+                            _ => {}
+                        }
+                    }
+                }
             }
-            Response::Done {
-                tag: response_tag,
-                status: Status::Ok,
-                ..
-            } if *response_tag == tag => return Ok(uids),
-            Response::Done { .. }
-            | Response::Data {
-                status: Status::Bye,
-                ..
-            } => return Err(MailError::Unavailable),
-            _ => {}
+        }
+    }
+
+    /// `UID FETCH set items`: the messages of `wanted` the server answers with, by UID. The
+    /// items of one message can arrive in more than one response: they are put together. A
+    /// response about another message (an unsolicited one, or one without a UID) is dropped
+    /// when it was read, so the rows hold the messages the read asked for and no more.
+    async fn uid_fetch(
+        &mut self,
+        set: &str,
+        items: &str,
+        wanted: &[u32],
+    ) -> Result<BTreeMap<u32, Fetched>, MailError> {
+        let tag = self.send(format!("UID FETCH {set} {items}")).await?;
+        let mut rows: BTreeMap<u32, Fetched> = BTreeMap::new();
+        loop {
+            let response = self.connection.response().await?;
+            match turn(&response, &tag) {
+                Turn::Completed(ok) => return self.completed(ok, rows),
+                Turn::Ended => return Err(MailError::Unavailable),
+                Turn::Data => {
+                    let Response::Fetch(fetched) = response else {
+                        continue;
+                    };
+                    let Some(uid) = fetched.uid.filter(|uid| wanted.contains(uid)) else {
+                        continue;
+                    };
+                    let row = rows.entry(uid).or_default();
+                    row.uid = Some(uid);
+                    row.size = fetched.size.or(row.size);
+                    if fetched.header.is_some() {
+                        row.header = fetched.header;
+                    }
+                    if fetched.body.is_some() {
+                        row.body = fetched.body;
+                    }
+                }
+            }
+        }
+    }
+
+    /// `UID SEARCH`: the UIDs the server answers with. Every piece after the first is the
+    /// octets of a literal, sent after the continuation request of the server.
+    async fn search_uids(&mut self, pieces: Vec<String>) -> Result<Vec<u32>, MailError> {
+        let mut pieces = pieces.into_iter();
+        let tag = self.send(pieces.next().ok_or(MailError::Invalid)?).await?;
+        for piece in pieces {
+            loop {
+                let response = self.connection.response().await?;
+                match turn(&response, &tag) {
+                    // The server completed the command where the node expected to go on.
+                    Turn::Completed(_) => return self.completed(false, Vec::new()),
+                    Turn::Ended => return Err(MailError::Unavailable),
+                    Turn::Data => {
+                        if response == Response::Continue {
+                            break;
+                        }
+                    }
+                }
+            }
+            self.connection.line(&piece).await?;
+        }
+        let mut uids = Vec::new();
+        loop {
+            let response = self.connection.response().await?;
+            match turn(&response, &tag) {
+                Turn::Completed(ok) => return self.completed(ok, uids),
+                Turn::Ended => return Err(MailError::Unavailable),
+                Turn::Data => {
+                    if let Response::Search(values) = response {
+                        uids.extend(values);
+                    }
+                }
+            }
         }
     }
 }
@@ -748,131 +793,221 @@ impl Smtp {
     }
 }
 
-/// Caps bytes delivered to the protocol client at `limit`, and refuses a literal declaration
-/// above `limit` before the client's parser reads it. async-imap 0.12 grows its parser buffer
-/// to a declared literal length with a zero-filled allocation (at most 512 MiB) before the
-/// octets arrive, so without the guard a server's declaration alone would commit that memory.
-/// With it, the parser buffer never exceeds `limit` plus one block, and the API reserves
-/// memory by `limit` instead of the parser maximum.
-fn limited(stream: Stream, limit: usize) -> MailStream {
-    let (read, write) = tokio::io::split(stream);
-    let read = LiteralGuard {
-        inner: read.take(limit as u64),
-        bound: limit,
-        scan: LiteralScan::Text,
-    };
-    MailStream(Box::new(tokio::io::join(read, write)))
+/// A connection to the IMAP server: the byte pipe with TLS that ends inside the node, the
+/// reader of its responses ([`crate::imap`]) and the bound of its protocol input.
+///
+/// The connection takes at most `left` further bytes from its stream. A literal the server
+/// declares is held against that bound when it is declared: a declaration above what is left
+/// of the bound ends the input before the buffer of the literal is made, because its octets
+/// could not arrive under the bound. So what a connection holds of its input never exceeds
+/// its input bound, whatever length a server declares.
+pub(crate) struct ImapConnection {
+    stream: Stream,
+    reader: imap::Reader,
+    /// Bytes the stream delivered. The reader took the first `taken` of them.
+    buffer: Vec<u8>,
+    taken: usize,
+    /// Bytes the connection may still take from its stream.
+    left: usize,
+    /// The number of the last tag.
+    tags: u64,
 }
 
-/// Where a scan of server bytes stands between literal declarations. RFC 3501 section 4.3:
-/// a literal is `{` digits `}` CRLF followed by that many octets, and a quoted string holds
-/// no CR or LF, so a declaration is recognized without tracking quoted strings. A line of
-/// text that ends in `{digits}` is read as a declaration here and by the protocol parser
-/// alike, so the two never disagree about where the octets are.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LiteralScan {
-    /// Outside a declaration.
-    Text,
-    /// After `{`: the digits read so far.
-    Digits(u64),
-    /// After `}`: the declared length, expecting CR.
-    Closed(u64),
-    /// After CR: the declared length, expecting LF.
-    Cr(u64),
-    /// Inside the octets of a literal: those still to come.
-    Octets(u64),
-}
-
-impl LiteralScan {
-    /// Advances over `bytes`. `Err(length)` is a declaration above `bound`; the scan does not
-    /// continue past it.
-    pub(crate) fn feed(&mut self, bytes: &[u8], bound: usize) -> Result<(), u64> {
-        for &byte in bytes {
-            *self = match (*self, byte) {
-                (Self::Octets(remaining), _) if remaining > 1 => Self::Octets(remaining - 1),
-                (Self::Octets(_), _) => Self::Text,
-                (Self::Text, b'{') => Self::Digits(0),
-                (Self::Text, _) => Self::Text,
-                (Self::Digits(length), b'0'..=b'9') => Self::Digits(
-                    length
-                        .saturating_mul(10)
-                        .saturating_add(u64::from(byte - b'0')),
-                ),
-                (Self::Digits(length), b'}') => Self::Closed(length),
-                (Self::Closed(length), b'\r') => Self::Cr(length),
-                (Self::Cr(length), b'\n') => {
-                    if length > bound as u64 {
-                        return Err(length);
-                    }
-                    if length == 0 {
-                        Self::Text
-                    } else {
-                        Self::Octets(length)
-                    }
-                }
-                (Self::Digits(_) | Self::Closed(_) | Self::Cr(_), b'{') => Self::Digits(0),
-                (Self::Digits(_) | Self::Closed(_) | Self::Cr(_), _) => Self::Text,
-            };
+impl ImapConnection {
+    fn new(stream: Stream, input_bytes: usize) -> ImapConnection {
+        ImapConnection {
+            stream,
+            reader: imap::Reader::default(),
+            buffer: Vec::new(),
+            taken: 0,
+            left: input_bytes,
+            tags: 0,
         }
+    }
+
+    /// Writes one line of a command.
+    async fn line(&mut self, text: &str) -> Result<(), MailError> {
+        let written = async {
+            self.stream.write_all(text.as_bytes()).await?;
+            self.stream.write_all(b"\r\n").await?;
+            self.stream.flush().await
+        };
+        written.await.map_err(|_| MailError::Unavailable)
+    }
+
+    /// The tag of the next command.
+    fn next_tag(&mut self) -> String {
+        self.tags = self.tags.saturating_add(1);
+        format!("a{}", self.tags)
+    }
+
+    /// Sends a command under a new tag and returns the tag.
+    async fn command(&mut self, command: &str) -> Result<String, MailError> {
+        let tag = self.next_tag();
+        self.line(&format!("{tag} {command}")).await?;
+        Ok(tag)
+    }
+
+    /// `LOGIN` with the account name and the application password, each as a quoted string.
+    /// The line that holds the password is overwritten when it was written. A `NO` that says
+    /// the server refused the credentials is [`MailError::Auth`].
+    async fn login(&mut self, user: &str, password: &str) -> Result<(), MailError> {
+        let tag = self.next_tag();
+        // Room for the whole line, every character escaped: no shorter buffer with a part
+        // of the password is left behind by a growth.
+        let mut line = Zeroizing::new(String::with_capacity(
+            tag.len()
+                .saturating_add(16)
+                .saturating_add(user.len().saturating_add(password.len()).saturating_mul(2)),
+        ));
+        line.push_str(&tag);
+        line.push_str(" LOGIN ");
+        for (text, behind) in [(user, " "), (password, "\r\n")] {
+            line.push('"');
+            for character in text.chars() {
+                if matches!(character, '"' | '\\') {
+                    line.push('\\');
+                }
+                line.push(character);
+            }
+            line.push('"');
+            line.push_str(behind);
+        }
+        let written = async {
+            self.stream.write_all(line.as_bytes()).await?;
+            self.stream.flush().await
+        };
+        written.await.map_err(|_| MailError::Unavailable)?;
+        loop {
+            let response = self.response().await?;
+            match turn(&response, &tag) {
+                Turn::Completed(true) => return Ok(()),
+                Turn::Completed(false) => {
+                    return match response {
+                        Response::Tagged(_, status)
+                            if status.condition == Condition::No
+                                && credentials_refused(&status) =>
+                        {
+                            Err(MailError::Auth)
+                        }
+                        _ => Err(MailError::Unavailable),
+                    };
+                }
+                Turn::Ended => return Err(MailError::Unavailable),
+                Turn::Data => {}
+            }
+        }
+    }
+
+    /// The next response of the server. The end of the connection, the end of the input the
+    /// connection may take, and bytes that are no response are [`MailError::Unavailable`].
+    async fn response(&mut self) -> Result<Response, MailError> {
+        loop {
+            let ahead = self.buffer.get(self.taken..).unwrap_or_default();
+            let (taken, step) = self.reader.feed(ahead);
+            self.taken = self.taken.saturating_add(taken);
+            if self.taken >= self.buffer.len() {
+                self.buffer.clear();
+                self.taken = 0;
+            }
+            match step {
+                Step::Response(raw) => return imap::parse(raw).ok_or(MailError::Unavailable),
+                Step::Malformed => return Err(MailError::Unavailable),
+                Step::Literal(octets) => {
+                    // The octets the stream has not delivered yet arrive within what is
+                    // left of the bound, or the input ends here.
+                    let ahead = self.buffer.len().saturating_sub(self.taken) as u64;
+                    if octets.saturating_sub(ahead) > self.left as u64 {
+                        return Err(MailError::Unavailable);
+                    }
+                    self.reader.admit();
+                }
+                Step::More => self.fill().await?,
+            }
+        }
+    }
+
+    /// Takes the next bytes from the stream, within the bound of the connection. The reader
+    /// took every byte the buffer held: the buffer is empty.
+    async fn fill(&mut self) -> Result<(), MailError> {
+        let window = IMAP_READ_BYTES.min(self.left);
+        if window == 0 {
+            return Err(MailError::Unavailable);
+        }
+        self.buffer.reserve(window);
+        let read = (&mut self.stream)
+            .take(window as u64)
+            .read_buf(&mut self.buffer)
+            .await
+            .map_err(|_| MailError::Unavailable)?;
+        if read == 0 {
+            return Err(MailError::Unavailable);
+        }
+        self.left = self.left.saturating_sub(read);
         Ok(())
     }
 }
 
-/// The read half of a mail connection: every byte passes the literal scan before the
-/// protocol client sees it.
-struct LiteralGuard<R> {
-    inner: R,
-    bound: usize,
-    scan: LiteralScan,
+/// The connection to the SMTP server: the byte pipe with TLS that ends inside the node, and
+/// the bound of its input. At its bound the connection delivers no further byte.
+///
+/// Debug never includes transport buffers or authentication bytes.
+struct MailStream {
+    inner: Stream,
+    /// Bytes the connection may still deliver.
+    left: usize,
 }
 
-impl<R: AsyncRead + Unpin> AsyncRead for LiteralGuard<R> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        let filled = buf.filled().len();
-        std::task::ready!(Pin::new(&mut this.inner).poll_read(cx, buf))?;
-        let arrived = buf.filled().get(filled..).unwrap_or_default();
-        if this.scan.feed(arrived, this.bound).is_err() {
-            return Poll::Ready(Err(io::Error::other(
-                "a literal declaration above the response bound",
-            )));
+impl MailStream {
+    fn bounded(inner: Stream, input_bytes: usize) -> MailStream {
+        MailStream {
+            inner,
+            left: input_bytes,
         }
-        Poll::Ready(Ok(()))
     }
 }
 
-/// Debug never includes transport buffers or authentication bytes.
-struct MailStream(Stream);
 impl fmt::Debug for MailStream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("MailStream(..)")
     }
 }
+
 impl AsyncRead for MailStream {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
+        let this = self.get_mut();
+        let window = buf.remaining().min(this.left);
+        if window == 0 {
+            // The end of the input.
+            return Poll::Ready(Ok(()));
+        }
+        let read = {
+            let mut within = ReadBuf::new(buf.initialize_unfilled_to(window));
+            std::task::ready!(Pin::new(&mut this.inner).poll_read(cx, &mut within))?;
+            within.filled().len()
+        };
+        buf.advance(read);
+        this.left = this.left.saturating_sub(read);
+        Poll::Ready(Ok(()))
     }
 }
+
 impl AsyncWrite for MailStream {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().0).poll_write(cx, bytes)
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, bytes)
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().0).poll_flush(cx)
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }

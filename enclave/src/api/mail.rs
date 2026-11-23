@@ -66,14 +66,14 @@ fn resize(node: &Node, budget: &mut OwnedSemaphorePermit, keep: usize) -> Result
 }
 
 /// What a mail call holds in memory at once, by operation. The protocol input of a mail
-/// connection is capped at the stream, and a literal declaration above the cap is refused
-/// before the protocol parser allocates for it (`mail::LiteralGuard`), so the parser buffer
-/// is bounded by the cap and not by the parser's own maximum.
+/// connection has a bound, and a literal the server declares above what is left of the bound
+/// ends the input before a buffer is made for it (`mail::ImapConnection`), so what a
+/// connection holds of its input is bounded by its bound and not by a length a server names.
 ///
 /// | operation | input cap | held at once | reserve |
 /// | --- | --- | --- | --- |
-/// | verify, folders, search | 4 MiB | parser buffer (the parsed rows borrow it), base64 headers, JSON, frame | cap × 6 + 2 × META |
-/// | read | body limit + 1 MiB | parser buffer (≤ cap) and the message copy (≤ body limit) | cap + body limit + 2 × META |
+/// | verify, folders, search | 4 MiB | the responses as they were read, the names or the headers taken from them, the base64 text of the headers, the JSON, the copy the check of the response makes | cap × 6 + 2 × META |
+/// | read | body limit + 1 MiB | the response as it was read (≤ cap), whose literal becomes the message (≤ body limit), and the copy the check of the response makes | cap + body limit + 2 × META |
 /// | submit | the request frame | the payload | payload + 2 × META |
 ///
 /// The request frame is read under a reservation of its declared length (the frame limit
@@ -217,7 +217,9 @@ async fn run(node: &Node, request: Request, operation: &str) -> Result<Response,
                     "identity": identity, "time_ms": node.now_ms(),
                 })),
             );
-            MailData::Json(json!({"identity": identity, "node": node.node, "statement": statement}))
+            MailData::Json(to_json(
+                &json!({"identity": identity, "node": node.node, "statement": statement}),
+            ))
         }),
         "read" => {
             credentials
@@ -231,7 +233,7 @@ async fn run(node: &Node, request: Request, operation: &str) -> Result<Response,
         _ => return Err(invalid("operation")),
     };
     let (status, content_type, body) = match outcome {
-        Ok(MailData::Json(value)) => (200, "application/json", to_json(&value)),
+        Ok(MailData::Json(bytes)) => (200, "application/json", bytes),
         Ok(MailData::Raw(bytes)) => (200, "message/rfc822", bytes),
         Err(MailError::Auth) => (
             401,
