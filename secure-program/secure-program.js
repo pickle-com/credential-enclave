@@ -1,9 +1,9 @@
 // The secure program of the Pickle apps. The secure executor of the iOS app (JavaScriptCore) and
 // of the Android app (QuickJS) runs this file. It owns the device side of the credential protocol:
 // the creation and derivation of the master key, the verification of the attestation of enclave
-// nodes, the sealed delivery of grants and revokes, the encryption of credential records, the
-// verification and decryption of the credential log, the node ledger, and the transfer of the
-// master key between the devices of one account.
+// nodes, the sealed delivery of grants and revokes, the encryption of credential records and of
+// vault secrets, the reading and judging of the credential log, and the transfer of the master key
+// between the devices of one account.
 //
 // This file is the source of truth. The repository pickle-com/interactive-character vendors a
 // byte-identical copy at backend/assets/ui/secure-program.js and serves it to the apps. A release
@@ -14,135 +14,259 @@
 //
 // Native functions reach the program through the global `native` only (the bridge primitives of
 // the apps); every cryptographic algorithm is a bridge primitive. This file parses formats only
-// (base64url, UTF-8, CBOR, query strings). The top level of the file is evaluated with the bridge
-// closed, so the top level defines things and calls nothing.
+// (base64url, UTF-8, CBOR, query strings, the XML of a listing). The top level of the file is
+// evaluated with the bridge closed, so the top level defines things and calls nothing.
 // Contract: docs/ssot/client/secure-executor.md of pickle-com/interactive-character.
+//
+// How the work of the program is ordered (docs/protocol.md, "The program of the app"): three
+// lines, each running one piece of work at a time (the procedures a user starts, the
+// synchronizations, the reads of the log screen), two locks (the grants, one round of the log),
+// a time limit on every request and on every procedure, and no loop without a bound on its turns.
 (function () {
   "use strict";
 
   // ---- Constants ----
 
-  const VERSION = 42;
+  const VERSION = 43;
   const MASTER_KEY_SERVICE = "com.pickle.client.secure.master-key";
+  const DAY_MS = 86400000;
+
+  // ---- The time limits ----
+  // Every request the program sends has a time limit: the program lets the request race a sleep of
+  // the bridge and treats the request as failed with the code timeout when the sleep ends first
+  // (an answer that arrives later is dropped). The timeoutMs of native.http applies to requests
+  // of an absolute address only, so the requests to the backend are bound the same way.
+  //   API_TIMEOUT_MS         a request to the backend outside the log
+  //   LOG_API_TIMEOUT_MS     a request to the backend of a round or of the log screen
+  //   LOG_STORE_TIMEOUT_MS   a request to the log store (Amazon S3)
+  //   NODE_TIMEOUT_MS        a command to a node, carried by the relay route of the backend
+  const API_TIMEOUT_MS = 30000;
+  const LOG_API_TIMEOUT_MS = 10000;
+  const LOG_STORE_TIMEOUT_MS = 10000;
+  const NODE_TIMEOUT_MS = 30000;
+  // The longest time one procedure takes, from its call to its end, without the time the device
+  // spent in an operation that waits for the user (webAuth, deviceOwnerAuth, promptSecret,
+  // presentSecret). The executors end a procedure at 120 seconds from outside the queue of the
+  // runtime and leave its JavaScript running; a procedure that ends itself before that leaves no
+  // work behind that holds a line.
+  const PROCEDURE_LIMIT_MS = 100000;
+  // The bridge cuts a sleep at 60 seconds: a wait longer than this is made of sleeps of this
+  // length at most.
+  const SLEEP_STEP_MS = 30000;
+
+  // ---- Grants ----
+  // The lifetime of a grant is a number of days the user chooses (an integer from 1 to 30, 30 by
+  // default). The renewal interval is the smaller of 24 hours and half of that lifetime.
+  const GRANT_DAYS_MAX = 30;
+  const GRANT_RENEW_MS = 86400000;
+  // A synchronization a push with the reason grant_required started hands a grant again to a node
+  // the backend reports no grant row for, when the last grant this device sent that node is older
+  // than this.
+  const GRANT_REFILL_MS = 60000;
+  // The nodes one attestation request names, and the most such requests one step sends.
+  const ATTESTATION_NODES = 32;
+  const ATTESTATION_REQUESTS = 4;
+  // How far the time of a reply of a node may lie before the time of the attestation document of
+  // that node (the correction error of the clock of the node).
+  const REPLY_SKEW_MS = 5000;
+
+  // ---- The node ledger of the programs before v43 ----
+  // The settings of the delegation (the revocation time, the resumption time, the lifetime of a
+  // grant and the time it was set) are shared by the devices of an account in a synchronized key
+  // store item, in the form the programs before v43 gave it (the node ledger). This program keeps
+  // the settings there. It judges nothing by the nodes of that ledger; it writes a node of a
+  // release before LOG_FORMAT_3_FROM that it hands a grant to into the ledger, in the form of
+  // those programs, and uploads the sealed ledger by their rule, because a device of the account
+  // that still runs such a program counts a chain of a node no ledger of the account explains as
+  // a delegation the app did not make.
   const LEDGER_SERVICE = "com.pickle.client.secure.ledger";
   const LEDGER_STORE_KEY = "ledger";
-  // The shared ledger: the node ledger of this account sealed with a key derived from the master key
-  // (deriveKeys: ledgerKey) and kept by the backend (one value per account), so that every device of
-  // the account knows the grants the other devices handed out (a node another device delegated to
-  // is not a delegation the app did not make). The backend cannot read or forge it; a value it
-  // withholds leaves the judgement of this device as it is. The device store keeps the sorted ids of
-  // the nodes of origin grant the last upload or merge covered: an upload follows when this device
-  // holds a grant node the backend value did not cover.
   const LEDGER_SHARE_PATH = "/api/secure/ledger";
   const LEDGER_SHARE_STORE_KEY = "ledger_shared";
   const LEDGER_SHARE_NONCE_BYTES = 12;
-  // A verification run that took longer than this (the app was suspended while it ran: the heads
-  // and listings it judged are older than the nodes it now sees) is judged again on fresh reads
-  // before anything is published or reported.
-  const LOG_RUN_STALE_MS = 600000;
-  // One request to the log store is made up to this many times: a transport failure, a 429 and a
-  // 5xx status are tried again after the pauses below (milliseconds, one per further attempt).
-  const LOG_STORE_ATTEMPTS = 3;
-  const LOG_STORE_RETRY_MS = [500, 1500];
-  // The lifetime of a grant is a number of days the user chooses (an integer from 1 to 30, 30 by
-  // default). The renewal interval is the smaller of 24 hours and half of that lifetime.
-  const DAY_MS = 86400000;
-  const GRANT_DAYS_MAX = 30;
-  const GRANT_RENEW_MS = 86400000;
-  // The period of the log verification (24 hours), the most keys one run of the index
-  // verification walks (every node together) and the most entry bodies one run reads (the control
-  // entries, the entries of format 1, the entries nobody vouches for, a seq with two linked keys,
-  // the landing after expired entries).
-  const LOG_VERIFY_INTERVAL_MS = 86400000;
-  const LOG_VERIFY_KEYS = 8000;
-  const LOG_VERIFY_BODIES = 2000;
-  // The time one run of the index verification may spend (milliseconds, from its first read): a
-  // run that reaches it leaves the chains it has not walked, and the rest of the chain it was
-  // walking, pending at their verification points, and the next synchronization (every
-  // synchronization until a run ends within the budget, not only the next period) or the next log
-  // screen walks on from there. The procedures of the program run one after another and the
-  // executors end a procedure at 120 seconds: a run of minutes (the control entries of many nodes
-  // read by content after the fleet of the operator moved the delegations around) would hold the
-  // grants, the vault and the log screen behind it. A synchronization that a user procedure
-  // starts (the creation or reset of the master key, the access switch, the transfer of the key)
-  // leaves the verification to the next synchronization of the runtime (afterGrants).
-  const LOG_VERIFY_TIME_MS = 10000;
-  // The least steps (keys walked, bodies read) a run makes before its time budget stops it: a run
-  // moves on however slow the reads are (the reads ahead are stopped at the budget; the walk then
-  // takes the objects read ahead and stops after these steps).
-  const LOG_VERIFY_LEAST_STEPS = 8;
-  // The log store (docs/protocol.md 7.4 and 7.6): the most listing pages one run reads per node
-  // (1,000 keys each), the most object versions one address request names (the limit of the
-  // backend route), the digits of seq and of time_ms in an object key, the most events one entry
-  // holds, and the timeout of one request to the store.
-  const LOG_STORE_PAGES = 8;
-  const LOG_STORE_OBJECTS = 100;
-  const LOG_STORE_SEQ_DIGITS = 20;
-  const LOG_STORE_TIME_DIGITS = 13;
-  // The characters of the first five parts of a key of format 2 (seq, time_ms, the kind letter, the
-  // count as three digits, the key_id as 16 characters, with their four separators): an input of
-  // the chain hash (docs/protocol.md 7.1).
-  const LOG_STORE_KEY_FIELDS_CHARS = LOG_STORE_SEQ_DIGITS + 1 + LOG_STORE_TIME_DIGITS + 1 + 1 + 1 + 3 + 1 + 16;
-  const LOG_ENTRY_EVENTS = 128;
-  const LOG_STORE_TIMEOUT_MS = 20000;
-  // The nodes one verification run examines beyond the ledger (the node discovery listing). More
-  // unknown prefixes than this leave the rest to the next synchronizations (the run is pending and
-  // its store state truncated for the report; the store was read): a node under examination stays
-  // in the ledger with its verification point until its chain is walked to the head, so the next
-  // run does not examine it again from the start and the window moves on to the nodes after it.
-  const LOG_STORE_NODES = 16;
-  // The retention of an object of the store (Object Lock, days): an entry older than this may be gone
-  // (its lock ended; the lifecycle rule of the bucket removes it at 400 days), so a gap of entries
-  // older than this is expired, not missing (docs/protocol.md 7.4).
-  const LOG_EXPIRES_DAYS = 365;
-  // A gap below the vouched end whose next listed key is younger than this is pending, not
-  // attention: the node writes an entry the store did not confirm again, with the next write of
-  // the account and in its sweep (docs/protocol.md 7.6), so a gap that stays beyond this time is an
-  // omission.
-  const LOG_GAP_GRACE_MS = 3600000;
-  // Reads of the store that have kept failing for this long mark the log (attention): a pending
-  // the operator keeps up is not a verification that completes.
-  const LOG_STORE_STALE_MS = 3 * DAY_MS;
-  // The route of the report of one verification run.
-  const LOG_REPORT_PATH = "/api/secure/log/verified";
-  // The route that hands out the listing addresses of one verification run in one response (the node
-  // discovery listing and the listing of every node of the ledger), and the most object versions the
-  // run requests addresses for and reads ahead of the judgement (the control entries and the format 1
-  // entries of the first listing page of every node; the limit of the address route).
-  const LOG_LISTINGS_PATH = "/api/secure/log/store/listings";
-  const LOG_PREFETCH_OBJECTS = 100;
-  // The most reads of objects of the store in flight at once (the objects read ahead of a run and
-  // the objects a walk reads ahead of its steps). A hundred reads sent at once starve the requests
-  // to the backend the device sends beside them (their transport fails on the device before the
-  // store answered them).
-  const LOG_STORE_CONCURRENCY = 8;
+  const LEDGER_LIMIT_BYTES = 65536;
+
+  // ---- The log (docs/protocol.md section 7) ----
+  // The keys of the program store that hold what this device knows of the log of the account. No
+  // secret value is among them; what names services and addresses (the kept screen) is sealed with
+  // a key derived from the master key.
+  //   log.grants      the nodes this device handed a grant to: {node: {granted_ms, not_after_ms,
+  //                   release, first_ms, platform, attempted_ms}}
+  //   log.cursor      the newest control key of the last round that covered the whole listing
+  //   log.resume      where a round that was cut short by its page limit goes on
+  //   log.nodes       what the node documents said: {node: {m, p, r, f, c}} (the digest of the
+  //                   measurement, the platform, the release, the time first seen, the time a
+  //                   contradiction of its signatures was found)
+  //   log.unaccepted  the measurements no list of this program has: {digest: {first_ms, release,
+  //                   held, node}} (held: the key of this account went to a node of it)
+  //   log.blocked     the blocked rounds in a row: {first_ms, count}
+  //   log.sample      the newest control keys the last round verified (LOG_SAMPLE_KEYS at most)
+  //   log.seen        the digests of the control keys judged (LOG_SEEN_KEYS at most)
+  //   log.missing     the keys of log.sample that left the listing within their retention
+  //   log.legacy      the chains of format 1 and format 2: {nodes: {node: {seq, time_ms, until_ms,
+  //                   closed}}, found_ms, found: [node]}
+  //   log.round       the last round: {v, done_ms, tried_ms, last, told, state}
+  //   log.cache       the kept screen, sealed
+  //   log.migrated    the mark that the ledger of the program before was carried over
+  const STORE_GRANTS = "log.grants";
+  const STORE_CURSOR = "log.cursor";
+  const STORE_RESUME = "log.resume";
+  const STORE_NODES = "log.nodes";
+  const STORE_UNACCEPTED = "log.unaccepted";
+  const STORE_BLOCKED = "log.blocked";
+  const STORE_SAMPLE = "log.sample";
+  const STORE_SEEN = "log.seen";
+  const STORE_MISSING = "log.missing";
+  const STORE_LEGACY = "log.legacy";
+  const STORE_ROUND = "log.round";
+  const STORE_CACHE = "log.cache";
+  const STORE_MIGRATED = "log.migrated";
+  const STORE_OUTCOMES = "outcomes";
   // The key of the device store that marks the sealing check as done for this device and account: a
   // query of the pending values (GET /api/secure/sealing) that found none, or an upload that left none.
   // Writing a master key (a new key, a replaced key, a transferred key) clears it.
   const SEALING_CHECK_STORE_KEY = "sealing_checked";
+  // The keys of the program store the programs before v43 wrote and this one does not read.
+  const RETIRED_STORE_KEYS = ["log_summary"];
+
+  // The first release whose nodes write format 3 (major, minor, patch). A node of a release before
+  // it wrote format 1 or format 2 into the bucket its binding names.
+  const LOG_FORMAT_3_FROM = [2, 4, 0];
+  // A round runs when the last completed one is this old.
+  const LOG_ROUND_INTERVAL_MS = 86400000;
+  // A round that ended pending is tried again by the next synchronization, not sooner than this
+  // after the round before.
+  const LOG_ROUND_RETRY_MS = 60000;
+  // The longest time one round takes, from its start (a round runs in a turn of its own: a
+  // synchronization and the log screen wait for it within their own turns).
+  const LOG_ROUND_LIMIT_MS = 60000;
+  // An event of the app itself (the start of the runtime, the return to the foreground) is served
+  // by the synchronization that runs when that one began less than this ago.
+  const EVENT_SYNC_FRESH_MS = 5000;
+  // The listing pages of the control prefix one round reads (1,000 object versions each).
+  const LOG_CONTROL_PAGES = 4;
+  // The nodes one document request names and the most such requests one round sends, the keys one
+  // body request names and the most such requests one round sends for its judgement.
+  const LOG_DOCUMENT_NODES = 64;
+  const LOG_DOCUMENT_REQUESTS = 2;
+  const LOG_BODY_KEYS = 200;
+  const LOG_ROUND_BODY_REQUESTS = 4;
+  // The time a measurement no list of this program has may hold the key of the account before it
+  // marks the log: a program that lists a new release is served before a node of that release
+  // takes a grant, and a runtime loads the served program at the next start or return to the
+  // foreground.
+  const LOG_RELEASE_GRACE_MS = 86400000;
+  // The reads the operator domain holds back mark the log when this many rounds in a row were
+  // blocked and the first of them is this old.
+  const LOG_BLOCKED_ROUNDS = 3;
+  const LOG_BLOCKED_MS = 3 * DAY_MS;
+  // A request of a round that was not answered counts as held back by the operator domain when
+  // the backend answered another request of this runtime within this time of it.
+  const LOG_REACH_MS = 60000;
+  // An address the backend signed is valid for 300 seconds. A refusal of the store for an address
+  // older than this is the age of the address (the app was suspended), not a refusal.
+  const LOG_URL_FRESH_MS = 240000;
+  const LOG_SAMPLE_KEYS = 64;
+  const LOG_SEEN_KEYS = 4096;
+  const LOG_MISSING_KEYS = 16;
+  const LOG_NODES_KEPT = 256;
+  // The retention of an object of the store (Object Lock, days). The absence of a key older than
+  // this says nothing; a key is expected in the listing while it is a day younger than this.
+  const LOG_RETENTION_DAYS = 365;
+  // The most events one entry holds (docs/protocol.md 7.1).
+  const LOG_ENTRY_EVENTS = 128;
+  const RTIME_MAX = 9999999999999;
+
+  // ---- The log screen ----
+  // The events of one later page, the events of the first page the device keeps, the days of the
+  // summary, the most entries one opening counts into it, the body requests one opening of the
+  // screen sends (for its page, its round and its summary together), the time a call of read_log
+  // waits for the read of the store before it answers from what the device kept, and the bodies
+  // one read of a later page asks for at most.
+  const LOG_SCREEN_EVENTS = 50;
+  const LOG_KEEP_EVENTS = 50;
+  const LOG_SUMMARY_DAYS = 7;
+  const LOG_SUMMARY_ENTRIES = 1000;
+  const LOG_SUMMARY_REQUESTS = 5;
+  const LOG_SCREEN_WAIT_MS = 3000;
+  const LOG_SCREEN_BODIES = 200;
+
+  // ---- The chains of format 1 and format 2 (the bucket the binding names) ----
+  // The chains one round follows, the nodes one address request names, the listing pages of one
+  // chain and the entry bodies one round reads, the pages of the node discovery listing, the time
+  // after the end of a grant at which the chain of its node is read for the last time, the reads
+  // of the store in flight at once, the object versions one address request names, the digits of
+  // seq and of time_ms in an object key, the listings one call of the screen spends on going down
+  // the chains, the steps that find the end of a chain nothing else gives, and the entries the
+  // screen keeps opened in a runtime.
+  const LEGACY_NODES = 64;
+  const LEGACY_LISTING_NODES = 16;
+  const LEGACY_ROUND_PAGES = 2;
+  const LEGACY_ROUND_BODIES = 64;
+  const LEGACY_DISCOVERY_PAGES = 2;
+  const LEGACY_CLOSE_SLACK_MS = DAY_MS;
+  const LEGACY_FOUND_INTERVAL_MS = DAY_MS;
+  const LOG_STORE_CONCURRENCY = 8;
+  const LOG_STORE_OBJECTS = 100;
+  const LOG_STORE_SEQ_DIGITS = 20;
+  const LOG_STORE_TIME_DIGITS = 13;
+  const LEGACY_SCREEN_LISTS = 12;
+  const LEGACY_TOP_STEPS = 48;
+  const LEGACY_DISPLAY_ENTRIES = 1000;
+  const LEGACY_DISPLAY_LIST = 1000;
+  // One request to the log store is made up to this many times: a transport failure, a 429 and a
+  // 5xx status are tried again after the pauses below (milliseconds, one per further attempt).
+  const LOG_STORE_ATTEMPTS = 2;
+  const LOG_STORE_RETRY_MS = [500];
   // The query keys a presigned listing address may carry besides the signature keys (X-Amz-...):
   // the versions listing, its prefix and delimiter, the markers of the page, the page size (1000)
   // and the encoding of the names in the response (url: the keys are decoded).
   const LISTING_QUERY_KEYS = [
     "versions", "prefix", "delimiter", "key-marker", "version-id-marker", "max-keys", "encoding-type",
   ];
-  // The log screen: the days of the summary (the counts of the events of the entries of that window,
-  // kept per device as the summary tally), the entries one read of the screen counts into the tally
-  // before answering and each step of the count that goes on apart from the calls, the most entries
-  // of the window the tally counts, the key of the tally in the device store, the events of one
-  // later page, the keys one listing of the screen reads down a chain, the entries the screen keeps
-  // opened in a runtime, and the objects whose addresses are requested along with the one being
-  // read.
-  const LOG_SUMMARY_DAYS = 7;
-  const LOG_SUMMARY_STEP = 100;
-  const LOG_SUMMARY_ENTRIES = 1000;
-  const LOG_SUMMARY_STORE_KEY = "log_summary";
-  const LOG_SCREEN_EVENTS = 50;
-  const LOG_DISPLAY_LIST = 1000;
-  const LOG_DISPLAY_ENTRIES = 1000;
-  const LOG_DISPLAY_AHEAD = 10;
-  // The limit of the serialized node ledger (UTF-8, bytes).
-  const LEDGER_LIMIT_BYTES = 65536;
+
+  // ---- Routes ----
+  const LOG_READ_PATH = "/api/secure/log/read";
+  const LOG_BODIES_PATH = "/api/secure/log/bodies";
+  const LOG_DOCUMENTS_PATH = "/api/secure/log/documents";
+  const LOG_REPORT_PATH = "/api/secure/log/verified";
+  const LOG_LISTINGS_PATH = "/api/secure/log/store/listings";
+  const LOG_OBJECTS_PATH = "/api/secure/log/store/objects";
+  const GRANTS_PATH = "/api/secure/grants";
+  const NODES_PATH = "/api/secure/nodes";
+  const OUTCOMES_PATH = "/api/secure/procedures/outcomes";
+  const SYNC_REPORT_PATH = "/api/secure/sync/report";
+  const VAULT_PATH = "/api/secure/vault";
+
+  // ---- The outcomes of the procedures ----
+  // The upper bounds of the classes a time is counted into (ms; a longer time is the last class),
+  // the calls reported one by one that a report carries, the time from which a call is reported
+  // one by one, the pause before such a report, and the interval of the report of the counts.
+  const OUTCOME_BOUNDS_MS = [250, 1000, 3000, 10000, 30000];
+  const OUTCOME_EVENTS = 32;
+  const OUTCOME_SLOW_MS = 10000;
+  const OUTCOMES_WAIT_MS = 5000;
+  const OUTCOMES_INTERVAL_MS = DAY_MS;
+  const OUTCOME_NAMES_MAX = 64;
+
+  // ---- The vault ----
+  // The lengths the plaintext of a record of kind vault_secret is padded to (bytes), and the
+  // limits of the form of a vault secret (docs/protocol.md section 6).
+  const VAULT_PADDED_BYTES = [256, 512, 1024, 2048, 4096, 8192, 12272];
+  const VAULT_SITES_MAX = 8;
+  const VAULT_SLOTS_MAX = 4;
+  const VAULT_SLOT_NAME_BYTES = 64;
+  // The request headers no slot names: the headers a node of the forward role does not send for
+  // its caller, and the headers it refuses a call for (docs/protocol.md 10.5).
+  const VAULT_RESERVED_HEADERS = [
+    "host", "content-length", "transfer-encoding", "connection", "keep-alive", "proxy-connection",
+    "upgrade", "te", "trailer", "expect", "accept-encoding", "proxy-authorization", "range",
+    "if-range", "accept-charset",
+    "x-http-method-override", "x-http-method", "x-method-override", "forwarded", "x-forwarded-host",
+    "x-forwarded-server", "x-forwarded-uri", "x-forwarded-prefix", "x-original-url",
+    "x-original-uri", "x-original-host", "x-rewrite-url", "x-host", "x-http-host-override",
+  ];
+
   // The DER of the AWS Nitro Enclaves Root-G1 certificate (base64url). Its SHA-256 is
   // 641a0321a3e244efe456463195d606317ed7cdcc3c1756e09893f3c68f79bb5b.
   const NITRO_ROOT =
@@ -161,10 +285,15 @@
   // PRERELEASE_BUILDS when the server target is in PRERELEASE_TARGETS). A document that verifies
   // (certificate chain, signature, nonce, binding, challenge statement) with a measurement no list
   // has is the document of a release later than this program (verifyNitro): the node receives no
-  // grant, and the verification of the log leaves its chain pending for a program that lists the
-  // release (verifyAll) instead of marking the log. A node of a release with log_store true writes
+  // grant, and the key of the account moving to such a measurement marks the log once
+  // LOG_RELEASE_GRACE_MS has passed (judgeRound). A node of a release with log_store true writes
   // the log entry to the log store (storage from which nothing is deleted) before the act the entry
-  // precedes, and the binding of such a node must name the value of LOG_STORES.
+  // precedes, and the binding of such a node must name the value of LOG_STORES. The name of the
+  // release decides the format of its log (logFormatOf): a release from LOG_FORMAT_3_FROM on
+  // writes format 3.
+  //
+  // A new release of the enclave is one more element at the end of this list, in the form of the
+  // elements before it: {release: "v2.4.0", pcr0, pcr1, pcr2, log_store: true}.
   const ACCEPTED_RELEASES = [
     // pickle-com/credential-enclave v1.1.0 (commit 98cdbef4902e17d079e2a003804db6b3b10a8140).
     {
@@ -297,32 +426,48 @@
       log_store: true,
     },
   ];
-  // The log store per server target: the S3 Object Lock bucket and region that receive the
-  // credential log of that env. A nitro node of a release with log_store true is accepted only when
-  // the log of its binding equals this value: every node that receives a user key is a node that
-  // writes to this bucket first.
+  // The log store per server target (docs/protocol.md 7.6). bucket and region are the value the
+  // binding of a node names: the bucket that holds the entries of format 1 and format 2. A nitro
+  // node of a release with log_store true is accepted only when the log of its binding equals this
+  // value: every node that receives a user key is a node that writes to the log store of this
+  // environment first. The entries of format 3 are in shards buckets: bucket number i of them is
+  // named "{h8}-{shard_base}-{i as four digits}", where h8 is the first 8 characters of the
+  // lower-case hexadecimal SHA-256 of the rest of the name (shardBucket). The entries of an
+  // account are in the bucket whose number is the first two bytes of SHA-256(user_id), read as a
+  // big-endian integer, modulo shards; the node document of a node is in the bucket of its node id
+  // by the same rule.
   // local is the S3 stand-in of the local stack. It is not the store of a server target (the bridge
   // of a debug build reports the server target prod whatever backend the app talks to): it names
-  // the bucket of the path-style addresses a debug build accepts (storeAddressAccepted). A release
-  // build pins every address to the host of the store of its server target.
+  // the buckets of the path-style addresses a debug build accepts (storeAddressAccepted). A release
+  // build pins every address to the host of a bucket of its server target.
   const LOG_STORES = {
-    alpha: { bucket: "character-credential-log-alpha-1", region: "us-west-2" },
-    dev: { bucket: "character-credential-log-dev-1", region: "us-west-2" },
-    prod: { bucket: "character-credential-log-prod-1", region: "us-west-2" },
-    local: { bucket: "character-credential-log-local-1", region: "us-west-2" },
+    alpha: {
+      bucket: "character-credential-log-alpha-1", region: "us-west-2",
+      shards: 32, shard_base: "character-credential-log-alpha-2",
+    },
+    dev: {
+      bucket: "character-credential-log-dev-1", region: "us-west-2",
+      shards: 32, shard_base: "character-credential-log-dev-2",
+    },
+    prod: {
+      bucket: "character-credential-log-prod-1", region: "us-west-2",
+      shards: 1024, shard_base: "character-credential-log-prod-2",
+    },
+    local: {
+      bucket: "character-credential-log-local-1", region: "us-west-2",
+      shards: 4, shard_base: "character-credential-log-local-2",
+    },
   };
   // The server targets that accept a node of platform local (an ordinary process that no
-  // attestation verifies: the custody operator). A release build whose server target is outside
-  // this list refuses local nodes. A DEBUG build always accepts them.
+  // attestation verifies: the custody operator). A build whose server target is outside this list
+  // refuses local nodes unless it is a debug build or a build made for the local stack
+  // (localAccepted).
   const OPERATOR_CUSTODY_TARGETS = ["alpha", "dev"];
   // The record kinds this program makes in the migration (the device-side sealing of what was
   // stored before the switch), and the most rounds of fetching and uploading one sync runs (one
   // fetch carries up to 100 items).
   const SEALING_KINDS = ["oauth_imported", "vault_password", "vault_totp", "vault_card"];
   const SEALING_ROUNDS = 5;
-  // How far the time of a reply of a node may lie before the time of the attestation document of
-  // that node (the correction error of the clock of the node).
-  const REPLY_SKEW_MS = 5000;
 
   // ---- Bytes ----
 
@@ -545,17 +690,77 @@
     return native.error("attestation_failed", reason);
   }
 
-  /** The verification of an AWS Nitro attestation document (COSE_Sign1). document and nonce are
-   *  bytes. On success it returns the binding bytes (user_data), the measurement and the time of
-   *  the document (milliseconds), whether the measurement is on the accepted list (listed) and
-   *  whether the binding must name the log store (logStore); on a mismatch it throws
-   *  attestation_failed. A document that verifies with a measurement no list has is not a
-   *  mismatch: it is the document of a release later than this program (the list is a constant of
-   *  the program, and a new release of the enclave reaches the app as a new program), returned with
-   *  listed false. The caller hands such a node no key (renewGrants, sendGrant). When gate is false
-   *  the measurement decides nothing (the target of a revoke: the signature of the document, the
-   *  nonce and the binding are checked as before, a zero PCR is not refused, and listed is returned
-   *  all the same). */
+  /** Whether this build takes a node of platform local (an ordinary process that no attestation
+   *  verifies): its server target is in OPERATOR_CUSTODY_TARGETS, it is a debug build, or it is a
+   *  build made for the local stack (deviceInfo().local_stack_build, a key only a build that knows
+   *  it reports). */
+  function localAccepted() {
+    const device = native.deviceInfo();
+    return OPERATOR_CUSTODY_TARGETS.indexOf(device.server_target) >= 0 || device.debug_build === true ||
+      device.local_stack_build === true;
+  }
+
+  /** The builds whose measurements this runtime accepts: ACCEPTED_RELEASES, and PRERELEASE_BUILDS
+   *  when the server target is in PRERELEASE_TARGETS. */
+  function acceptedBuilds() {
+    const prerelease = PRERELEASE_TARGETS.indexOf(native.deviceInfo().server_target) >= 0;
+    return ACCEPTED_RELEASES.concat(prerelease ? PRERELEASE_BUILDS : []);
+  }
+
+  /** The element of acceptedBuilds a measurement {pcr0, pcr1, pcr2} equals, undefined when none. */
+  function listedBuild(measurement) {
+    return acceptedBuilds().find(function (build) {
+      return build.pcr0 === measurement.pcr0 && build.pcr1 === measurement.pcr1 &&
+        build.pcr2 === measurement.pcr2;
+    });
+  }
+
+  /** The digest of a measurement: the base64url SHA-256 of its three PCR values in hexadecimal.
+   *  The program keeps a measurement in this form. */
+  function measureOf(measurement) {
+    return native.sha256(encode(utf8(measurement.pcr0 + measurement.pcr1 + measurement.pcr2)));
+  }
+
+  // The digests of the measurements of acceptedBuilds, by digest: the build. Computed at the first
+  // use in a runtime (the top level calls nothing).
+  let acceptedDigests = null;
+
+  /** The build of acceptedBuilds with the digest measure, undefined when none. */
+  function buildOfMeasure(measure) {
+    if (acceptedDigests === null) {
+      acceptedDigests = new Map();
+      for (const build of acceptedBuilds()) acceptedDigests.set(measureOf(build), build);
+    }
+    return acceptedDigests.get(measure);
+  }
+
+  /** The format of the log of the nodes of a release, by its name: 3 from LOG_FORMAT_3_FROM on,
+   *  2 before it (the releases that wrote format 1 or format 2 into the bucket of their binding).
+   *  A name of another form than v{major}.{minor}.{patch} is a build made before the first release
+   *  when it begins with "pre-", and a release of the present format otherwise. */
+  function logFormatOf(release) {
+    const name = String(release);
+    const match = /^v(\d+)\.(\d+)\.(\d+)/.exec(name);
+    if (match === null) return name.slice(0, 4) === "pre-" ? 2 : 3;
+    for (let at = 0; at < 3; at += 1) {
+      const part = Number(match[at + 1]);
+      if (part !== LOG_FORMAT_3_FROM[at]) return part > LOG_FORMAT_3_FROM[at] ? 3 : 2;
+    }
+    return 3;
+  }
+
+  /** The verification of an AWS Nitro attestation document (COSE_Sign1). document is bytes; nonce
+   *  is the bytes the document must carry, or null when the caller compares the nonce itself (a
+   *  node document: the nonce follows from the signing key the binding names). On success it
+   *  returns the binding bytes (user_data), the nonce of the document, the measurement and the
+   *  time of the document (milliseconds), the build of the accepted lists the measurement equals
+   *  (build, undefined when none) and whether the binding must name the log store (logStore); on a
+   *  mismatch it throws attestation_failed. A document that verifies with a measurement no list
+   *  has is not a mismatch: it is the document of a release later than this program (the list is a
+   *  constant of the program, and a new release of the enclave reaches the app as a new program),
+   *  returned without a build. The caller hands such a node no key. When gate is false the
+   *  measurement decides nothing (the target of a revoke: the signature of the document, the nonce
+   *  and the binding are checked as before, and a zero PCR is not refused). */
   function verifyNitro(document, nonce, gate) {
     const cose = cborDecode(document);
     if (!Array.isArray(cose) || cose.length !== 4) throw attestationFailure("cose shape");
@@ -615,11 +820,11 @@
     });
     if (!signed) throw attestationFailure("cose signature");
 
-    if (!equal(documentNonce, nonce)) throw attestationFailure("nonce");
+    if (nonce !== null && !equal(documentNonce, nonce)) throw attestationFailure("nonce");
 
     // The measurement: PCR0, PCR1 and PCR2 must all equal one element of the accepted list for the
     // node to receive a grant. A PCR whose value is all zero is the value of a debug-mode enclave
-    // and is accepted by no list: it is refused here, so a document returned with listed false is
+    // and is accepted by no list: it is refused here, so a document returned without a build is
     // the document of an enclave of a build this program does not list (a later release).
     const measurement = { pcr0: "", pcr1: "", pcr2: "" };
     for (const index of [0, 1, 2]) {
@@ -627,36 +832,63 @@
       if (value === undefined || (gate && /^0+$/.test(hex(value)))) throw attestationFailure("measurement");
       measurement["pcr" + index] = hex(value);
     }
-    const prerelease = PRERELEASE_TARGETS.indexOf(native.deviceInfo().server_target) >= 0;
-    const accepted = ACCEPTED_RELEASES.concat(prerelease ? PRERELEASE_BUILDS : []).find(function (release) {
-      return release.pcr0 === measurement.pcr0 && release.pcr1 === measurement.pcr1 &&
-        release.pcr2 === measurement.pcr2;
-    });
+    const build = listedBuild(measurement);
     return {
-      binding: userData, measurement: measurement, timeMs: timestamp, listed: accepted !== undefined,
+      binding: userData, nonce: documentNonce, measurement: measurement, timeMs: timestamp, build: build,
       // The binding of a node of a listed release that writes to the log store, and of a release
       // later than this program (every release from v1.1.0 on writes to it), must name the store.
-      logStore: gate && (accepted === undefined || accepted.log_store === true),
+      logStore: gate && (build === undefined || build.log_store === true),
     };
   }
 
   /** The verification of a document of platform local: UTF-8 JSON {v, platform, binding, nonce,
-   *  time_ms} without a signature (a node that no attestation verifies). Only a DEBUG build or an
-   *  app whose server target is in OPERATOR_CUSTODY_TARGETS accepts it (when gate is false this
-   *  condition is not checked: the target of a revoke). The verification is the nonce match only.
-   *  On success it returns the binding bytes and the time of the document (milliseconds). */
+   *  time_ms} without a signature (a node that no attestation verifies). Only a build that takes
+   *  local nodes accepts it (localAccepted; when gate is false this condition is not checked: the
+   *  target of a revoke). The verification is the nonce match only (nonce null: the caller
+   *  compares it). On success it returns the binding bytes, the nonce and the time of the document
+   *  (milliseconds). */
   function verifyLocal(document, nonce, gate) {
-    const device = native.deviceInfo();
-    if (gate && device.debug_build !== true && OPERATOR_CUSTODY_TARGETS.indexOf(device.server_target) < 0) {
-      throw attestationFailure("local platform is not accepted by this build");
-    }
+    if (gate && !localAccepted()) throw attestationFailure("local platform is not accepted by this build");
     const fields = JSON.parse(text(document));
     if (fields === null || typeof fields !== "object" || fields.v !== 1 || fields.platform !== "local" ||
         !Number.isSafeInteger(fields.time_ms) || fields.time_ms < 0) {
       throw attestationFailure("local document shape");
     }
-    if (!equal(decode(fields.nonce), nonce)) throw attestationFailure("nonce");
-    return { binding: decode(fields.binding), timeMs: fields.time_ms };
+    const documentNonce = decode(fields.nonce);
+    if (nonce !== null && !equal(documentNonce, nonce)) throw attestationFailure("nonce");
+    return { binding: decode(fields.binding), nonce: documentNonce, timeMs: fields.time_ms };
+  }
+
+  /** Reads a binding (docs/protocol.md 4.1): UTF-8 JSON {v, sign, seal, release, log}, at most 512
+   *  bytes. A binding without the key role is the binding of a node that takes the calls that use
+   *  a credential, and a binding whose role is reserve the binding of a node that holds
+   *  delegations and hands them on but takes no such call: both receive a grant. A binding with
+   *  any other role (forward: a node that holds no delegation, receives no command and writes no
+   *  entry; a role this program does not know) is refused. When logStore is true the binding must
+   *  name the log store of this server target. Returns {signPk, sealPk, release}. */
+  function readBinding(bindingBytes, logStore) {
+    if (bindingBytes.length > 512) throw attestationFailure("binding size");
+    const binding = JSON.parse(text(bindingBytes));
+    if (binding === null || typeof binding !== "object" || binding.v !== 1 ||
+        typeof binding.release !== "string" || binding.release === "") {
+      throw attestationFailure("binding shape");
+    }
+    if (binding.role !== undefined && binding.role !== "reserve") throw attestationFailure("binding role");
+    const signPk = decode(binding.sign);
+    const sealPk = decode(binding.seal);
+    if (signPk.length !== 32 || sealPk.length !== 32) throw attestationFailure("binding keys");
+    // The log store: the binding names the bucket a node of that release writes to. A node that
+    // writes somewhere other than the store of this server target, and a node that names no
+    // store, is not accepted.
+    if (logStore) {
+      const expected = LOG_STORES[native.deviceInfo().server_target];
+      const log = binding.log;
+      if (expected === undefined || log === null || typeof log !== "object" ||
+          log.bucket !== expected.bucket || log.region !== expected.region) {
+        throw attestationFailure("log store");
+      }
+    }
+    return { signPk: signPk, sealPk: sealPk, release: binding.release };
   }
 
   /** Verifies one attestation response of a node. nonce is the value sent with the request
@@ -669,10 +901,11 @@
    *  checked with the signing public key the document binds. When gate is false the acceptance
    *  conditions (the accepted measurements, debug mode, a build that accepts local) are not
    *  checked: used only for the target of a revoke, which hands no user key over. Returns {node,
-   *  signPk, sealPk, release, platform, custody, timeMs, measurement, listed}. listed is false for
-   *  a nitro document that verified with a measurement no list has (a release later than this
-   *  program, verifyNitro): such a node receives no grant and its chain is left to a program that
-   *  lists the release (renewGrants, verifyAll). */
+   *  signPk, sealPk, release, platform, custody, timeMs, measure, listed, format}. listed is false
+   *  for a nitro document that verified with a measurement no list has (a release later than this
+   *  program, verifyNitro): such a node receives no grant. measure is the digest of the
+   *  measurement (the empty string for platform local) and format the format of the log of the
+   *  node. */
   function verifyAttestation(response, nonce, gate) {
     try {
       if (response === null || typeof response !== "object" || response.v !== 1) {
@@ -680,46 +913,21 @@
       }
       const document = decode(response.document);
       const sent = decode(nonce);
-      let bindingBytes = null;
-      let measurement = null;
-      let timeMs = 0;
-      let logStore = false;
+      let verified = null;
+      let measure = "";
       let listed = true;
+      let build = undefined;
       if (response.platform === "nitro") {
-        const verified = verifyNitro(document, sent, gate !== false);
-        bindingBytes = verified.binding;
-        measurement = verified.measurement;
-        timeMs = verified.timeMs;
-        logStore = verified.logStore;
-        listed = verified.listed;
+        verified = verifyNitro(document, sent, gate !== false);
+        measure = measureOf(verified.measurement);
+        build = verified.build;
+        listed = build !== undefined;
       } else if (response.platform === "local") {
-        const verified = verifyLocal(document, sent, gate !== false);
-        bindingBytes = verified.binding;
-        timeMs = verified.timeMs;
+        verified = verifyLocal(document, sent, gate !== false);
       } else {
         throw attestationFailure("unknown platform");
       }
-      // The binding: UTF-8 JSON {v, sign, seal, release}, at most 512 bytes.
-      if (bindingBytes.length > 512) throw attestationFailure("binding size");
-      const binding = JSON.parse(text(bindingBytes));
-      if (binding === null || typeof binding !== "object" || binding.v !== 1 ||
-          typeof binding.release !== "string" || binding.release === "") {
-        throw attestationFailure("binding shape");
-      }
-      const signPk = decode(binding.sign);
-      const sealPk = decode(binding.seal);
-      if (signPk.length !== 32 || sealPk.length !== 32) throw attestationFailure("binding keys");
-      // The log store: the binding names the bucket a node of that release writes to. A node that
-      // writes somewhere other than the bucket of this server target, and a node that names no
-      // bucket, is not accepted.
-      if (logStore) {
-        const expected = LOG_STORES[native.deviceInfo().server_target];
-        const log = binding.log;
-        if (expected === undefined || log === null || typeof log !== "object" ||
-            log.bucket !== expected.bucket || log.region !== expected.region) {
-          throw attestationFailure("log store");
-        }
-      }
+      const binding = readBinding(verified.binding, verified.logStore === true);
       // The challenge statement: the signed value that this node issued the challenge of the
       // response in answer to the nonce of this request. The challenge is plaintext outside the
       // document, so without the statement the relay could hand the challenge of an earlier request
@@ -727,20 +935,75 @@
       // without the statement, or with a statement that does not match, is not accepted.
       let statement = null;
       try {
-        statement = openSigned(response.challenge_statement, encode(signPk), purpose("challenge") + "\n");
+        statement = openSigned(response.challenge_statement, encode(binding.signPk), purpose("challenge") + "\n");
       } catch (error) {
         throw attestationFailure("challenge statement");
       }
-      if (statement.type !== "challenge" || statement.node !== encode(signPk) ||
+      if (statement.type !== "challenge" || statement.node !== encode(binding.signPk) ||
           statement.nonce !== encode(sent) || typeof response.challenge !== "string" ||
           statement.challenge !== response.challenge) {
         throw attestationFailure("challenge statement");
       }
       return {
-        node: encode(signPk), signPk: encode(signPk), sealPk: encode(sealPk),
+        node: encode(binding.signPk), signPk: encode(binding.signPk), sealPk: encode(binding.sealPk),
         release: binding.release, platform: response.platform,
-        custody: response.platform === "nitro" ? "enclave" : "operator", timeMs: timeMs,
-        measurement: measurement, listed: listed,
+        custody: response.platform === "nitro" ? "enclave" : "operator", timeMs: verified.timeMs,
+        measure: measure, listed: listed,
+        format: response.platform === "nitro" ? (build === undefined ? 3 : logFormatOf(build.release))
+          : logFormatOf(binding.release),
+      };
+    } catch (error) {
+      if (error && error.code === "attestation_failed") throw error;
+      throw attestationFailure(String((error && error.message) || error));
+    }
+  }
+
+  /** The nonce of the document inside a node document (docs/protocol.md 7.7): the SHA-256 of the
+   *  purpose string and the 32 bytes of the signing public key of the node. No requester chose it:
+   *  a document with this nonce was made by the node for its node document. */
+  function nodeDocumentNonce(signPk) {
+    return decode(native.sha256(encode(concat(utf8(purposeV3("node-document") + "\n"), signPk))));
+  }
+
+  /** Verifies the node document of the node id: the object {v, platform, document, node, release}
+   *  a node of format 3 wrote to the log store, or the attestation document the backend kept of a
+   *  node of an earlier release, in the same form. It proves that the signing key id was created
+   *  inside an enclave of the measurement the document states: the document is verified like an
+   *  attestation response without a requester (the certificate chain at the time of the document,
+   *  the signature, the measurement, the binding and its log store), the signing key of its
+   *  binding is id, and the nonce of the document of a node that writes format 3 is the one of
+   *  nodeDocumentNonce (a node of an earlier release wrote no node document: its document answered
+   *  a request, and its nonce is not compared). Returns {platform, release, measure, listed,
+   *  format} and throws attestation_failed for a document that does not verify. */
+  function verifyNodeDocument(object, id) {
+    try {
+      if (object === null || typeof object !== "object" || object.v !== 1) {
+        throw attestationFailure("node document shape");
+      }
+      const document = decode(object.document);
+      let verified = null;
+      let measure = "";
+      let build = undefined;
+      if (object.platform === "nitro") {
+        verified = verifyNitro(document, null, true);
+        measure = measureOf(verified.measurement);
+        build = verified.build;
+      } else if (object.platform === "local") {
+        verified = verifyLocal(document, null, true);
+      } else {
+        throw attestationFailure("unknown platform");
+      }
+      const binding = readBinding(verified.binding, verified.logStore === true);
+      if (object.node !== id || encode(binding.signPk) !== id) throw attestationFailure("another node");
+      if (object.release !== binding.release) throw attestationFailure("another release");
+      const format = object.platform === "nitro" ? (build === undefined ? 3 : logFormatOf(build.release))
+        : logFormatOf(binding.release);
+      if (format === 3 && !equal(verified.nonce, nodeDocumentNonce(binding.signPk))) {
+        throw attestationFailure("node document nonce");
+      }
+      return {
+        platform: object.platform, release: binding.release, measure: measure,
+        listed: object.platform !== "nitro" || build !== undefined, format: format,
       };
     } catch (error) {
       if (error && error.code === "attestation_failed") throw error;
@@ -760,6 +1023,15 @@
     return encode(utf8(purpose(name)));
   }
 
+  /** The purpose strings of format 2 and of format 3 of the log. */
+  function purposeV2(name) {
+    return "pickle.secure.v2." + name;
+  }
+
+  function purposeV3(name) {
+    return "pickle.secure.v3." + name;
+  }
+
   function userId() {
     return native.deviceInfo().user_id;
   }
@@ -776,10 +1048,11 @@
 
   /** Every key derived from the master key (nothing is stored: the same master key gives the same
    *  values): the account signing seed and public key, the log decryption private key and public
-   *  key, the user key of each custody, the key that seals the shared ledger (ledgerKey: it leaves
-   *  the device in no form), and the key_id. userKeys.enclave is handed only to nitro nodes whose
-   *  attestation was verified, and userKeys.operator to local nodes: the user key of the enclave
-   *  custody never goes to an unverified party. */
+   *  key, the user key of each custody, the key that seals the shared ledger (ledgerKey) and the
+   *  key that seals the kept log screen (cacheKey), neither of which leaves the device in any form,
+   *  and the key_id. userKeys.enclave is handed only to nitro nodes whose attestation was verified,
+   *  and userKeys.operator to local nodes: the user key of the enclave custody never goes to an
+   *  unverified party. */
   function deriveKeys(masterKey) {
     const signSeed = native.hkdf("sha256", masterKey, null, info("sign"), 32);
     const logSk = native.hkdf("sha256", masterKey, null, info("log"), 32);
@@ -794,11 +1067,13 @@
         operator: native.hkdf("sha256", masterKey, null, info("user-key.operator"), 32),
       },
       ledgerKey: native.hkdf("sha256", masterKey, null, info("ledger"), 32),
+      cacheKey: native.hkdf("sha256", masterKey, null, info("log-cache"), 32),
       keyId: hex(decode(native.sha256(signPk)).subarray(0, 8)),
     };
   }
 
   function writeMasterKey(bytes) {
+    if (accountClosed) return;
     const item = masterKeyItem();
     native.keychainSet({
       service: item.service, account: item.account, value: bytes,
@@ -813,32 +1088,269 @@
     native.keychainDelete(masterKeyItem());
   }
 
+  // ---- The program store ----
+
+  /** The JSON value the program store keeps under key; fallback when there is none or it does not
+   *  parse. */
+  function storedJson(key, fallback) {
+    const kept = native.storeGet(key);
+    if (kept === null) return fallback;
+    try {
+      const value = JSON.parse(kept);
+      return value === null || value === undefined ? fallback : value;
+    } catch (error) {
+      return fallback;
+    }
+  }
+
+  function storeJson(key, value) {
+    native.storeSet(key, value === null || value === undefined ? null : JSON.stringify(value));
+  }
+
+  /** A stored value when it is a plain object (not an array), otherwise a new empty object. */
+  function storedObject(key) {
+    const value = storedJson(key, null);
+    return value !== null && typeof value === "object" && !Array.isArray(value) ? value : {};
+  }
+
+  /** The value when it is a non-negative integer, otherwise 0. */
+  function whole(value) {
+    return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+  }
+
+  // ---- Turns: the bounded time of one piece of work ----
+
+  function noop() {}
+
+  function failureCode(error) {
+    return error && error.code ? String(error.code) : "program_error";
+  }
+
+  // The time this runtime spent in operations that wait for the user (webAuth, deviceOwnerAuth,
+  // promptSecret, presentSecret). That time is taken out of the time of every turn, as the
+  // executors take it out of the time of every procedure.
+  let interactiveDepth = 0;
+  let interactiveSince = 0;
+  let interactiveClosedMs = 0;
+
+  function interactiveMs() {
+    const open = interactiveDepth > 0 ? Math.max(0, native.nowMs() - interactiveSince) : 0;
+    return interactiveClosedMs + open;
+  }
+
+  /** A turn: the time one piece of work may take from its call (limitMs, Infinity for work that
+   *  is bound by the limits of its requests alone). name is the name the outcome of the work is
+   *  counted under (the empty string: not counted). */
+  function newTurn(limitMs, name) {
+    return {
+      name: typeof name === "string" ? name : "", calledMs: native.nowMs(), startedMs: 0,
+      limitMs: limitMs, interactiveAtCall: interactiveMs(), id: "",
+    };
+  }
+
+  /** The counted time of a turn: the time since its call without the time the runtime spent in
+   *  operations that wait for the user. */
+  function turnSpent(turn) {
+    return Math.max(0, native.nowMs() - turn.calledMs - (interactiveMs() - turn.interactiveAtCall));
+  }
+
+  function turnLeft(turn) {
+    return turn.limitMs === Infinity ? Infinity : turn.limitMs - turnSpent(turn);
+  }
+
+  function timeoutError(what) {
+    return native.error("timeout", what);
+  }
+
+  /** Waits for ms milliseconds in sleeps of SLEEP_STEP_MS at most (the bridge cuts a longer
+   *  sleep), and ends early once stop.done is set. The number of sleeps is bounded by the time. */
+  async function pause(ms, stop) {
+    const end = native.nowMs() + ms;
+    const steps = Math.ceil(ms / SLEEP_STEP_MS) + 1;
+    for (let step = 0; step < steps; step += 1) {
+      const left = end - native.nowMs();
+      if (left <= 0 || (stop !== undefined && stop.done)) return;
+      await native.sleep(Math.min(left, SLEEP_STEP_MS));
+    }
+  }
+
+  /** The value of promise, or the failure timeout when limitMs or the rest of the turn passes
+   *  first (what names the wait). The promise goes on by itself after a timeout and its outcome is
+   *  dropped. A wait without a limit in a turn without a limit is the promise itself. */
+  function limited(turn, promise, limitMs, what) {
+    const left = Math.min(limitMs, turnLeft(turn));
+    if (left === Infinity) return promise;
+    if (!(left > 0)) {
+      promise.then(noop, noop);
+      return Promise.reject(timeoutError(what));
+    }
+    const stop = { done: false };
+    const guarded = promise.then(
+      function (value) { stop.done = true; return value; },
+      function (error) { stop.done = true; throw error; });
+    const timer = pause(left, stop).then(function () { throw timeoutError(what); });
+    guarded.then(noop, noop);
+    timer.then(noop, noop);
+    return Promise.race([guarded, timer]);
+  }
+
+  /** An operation that waits for the user: start() returns its promise. The time it takes is not
+   *  counted into any turn. A turn whose time has passed starts no such operation. */
+  async function interactive(turn, start) {
+    if (!(turnLeft(turn) > 0)) throw timeoutError("interactive");
+    if (interactiveDepth === 0) interactiveSince = native.nowMs();
+    interactiveDepth += 1;
+    try {
+      return await start();
+    } finally {
+      interactiveDepth -= 1;
+      if (interactiveDepth === 0) {
+        try {
+          interactiveClosedMs += Math.max(0, native.nowMs() - interactiveSince);
+        } catch (error) {
+          // The bridge is closed: the runtime is going down and counts no time any more.
+        }
+      }
+    }
+  }
+
+  /** A line: pieces of work that run one at a time, in the order of their calls. run(turn, work)
+   *  starts work when the work before it ended and returns its outcome. The wait for the line and
+   *  the work itself are bound by the turn: when its time passes, the call fails with timeout and
+   *  the line goes on to the next piece of work (the work that was running ends at its next
+   *  request, which the same turn bounds). With fresh true the time of the turn begins when the
+   *  work begins (work an event starts: nobody waits on a limit that began at the event). busy()
+   *  says whether work is running or waiting. */
+  function newLine() {
+    let tail = Promise.resolve();
+    let pending = 0;
+    return {
+      busy: function () { return pending > 0; },
+      run: function (turn, work, fresh) {
+        const before = tail;
+        let release = noop;
+        tail = new Promise(function (resolve) { release = resolve; });
+        pending += 1;
+        const done = function () {
+          pending -= 1;
+          release();
+        };
+        const waiting = fresh === true ? before : limited(turn, before, Infinity, "line");
+        return waiting.then(
+          function () {
+            let running = null;
+            try {
+              const now = native.nowMs();
+              if (fresh === true) {
+                turn.calledMs = now;
+                turn.interactiveAtCall = interactiveMs();
+              }
+              turn.startedMs = now;
+              running = limited(turn, Promise.resolve(work()), Infinity, "procedure");
+            } catch (error) {
+              running = Promise.reject(error);
+            }
+            return running.then(
+              function (value) { done(); return value; },
+              function (error) { done(); throw error; });
+          },
+          function (error) {
+            // The turn ended while it waited: its place is given up when the work before it ends.
+            before.then(done, done);
+            throw error;
+          });
+      },
+    };
+  }
+
+  // The three lines (the procedures a user starts, the synchronizations, the reads of the log
+  // screen) and the two locks (the judgement of the key with the grants that follow it, one round
+  // of the log). A lock is a line: whoever holds it runs alone, and everything it waits for while
+  // it holds the lock is a request with a time limit.
+  const userLine = newLine();
+  const syncLine = newLine();
+  const screenLine = newLine();
+  const grantLock = newLine();
+  const roundLock = newLine();
+
+  /** A turn for work nothing waits on with a limit of its own (a report, the polling of a key
+   *  transfer): each of its requests has its time limit. */
+  function freeTurn() {
+    return newTurn(Infinity, "");
+  }
+
   // ---- The api ----
 
-  /** A call of an api route (the account credential is carried). The values of query are strings.
-   *  Returns {status, json} where json is the JSON object of the response body. A response outside
-   *  2xx throws the first string among code, detail and error of the body (or "http_" + status
-   *  when there is none) as the failure code, and a 2xx response whose body is not a JSON object is
-   *  invalid_response. */
-  async function api(method, path, body, query) {
-    const request = { method: method, path: path };
-    if (query) request.query = query;
-    if (body !== undefined && body !== null) request.body = JSON.stringify(body);
-    const response = await native.http(request);
+  // The time the backend last answered a request of this runtime, with any status (0: never). A
+  // round uses it to tell a request the operator domain held back from a device without a network.
+  let lastAnswerMs = 0;
+
+  /** One request to a route of the backend (the account credential is carried). The values of
+   *  query are strings. Returns {status, json, code}: json is the JSON object of the response body
+   *  (null when the body is not one) and code the first string among code, detail and error of a
+   *  body outside 2xx (null when there is none). The request is given up after limitMs
+   *  (API_TIMEOUT_MS when none is given) or when the time of the turn passes: the failure timeout.
+   *  A failure of the transport is the failure transport. */
+  async function request(turn, method, path, body, query, limitMs) {
+    const sent = { method: method, path: path };
+    if (query) sent.query = query;
+    if (body !== undefined && body !== null) sent.body = JSON.stringify(body);
+    let pending = null;
+    try {
+      pending = native.http(sent);
+    } catch (error) {
+      pending = Promise.reject(error);
+    }
+    const limit = Number.isSafeInteger(limitMs) && limitMs > 0 ? limitMs : API_TIMEOUT_MS;
+    const response = await limited(turn, pending, limit, method + " " + path);
+    lastAnswerMs = native.nowMs();
     let json = null;
     try {
       json = JSON.parse(response.body);
     } catch (error) {
       json = null;
     }
-    const isObject = json !== null && typeof json === "object" && !Array.isArray(json);
-    if (response.status < 200 || response.status > 299) {
-      const candidates = isObject ? [json.code, json.detail, json.error] : [];
-      const code = candidates.find(function (value) { return typeof value === "string" && value !== ""; });
-      throw native.error(code === undefined ? "http_" + response.status : code, method + " " + path);
+    if (json === null || typeof json !== "object" || Array.isArray(json)) json = null;
+    let code = null;
+    if (json !== null && (response.status < 200 || response.status > 299)) {
+      const found = [json.code, json.detail, json.error].find(function (value) {
+        return typeof value === "string" && value !== "";
+      });
+      code = found === undefined ? null : found;
     }
-    if (!isObject) throw native.error("invalid_response", method + " " + path);
-    return { status: response.status, json: json };
+    return { status: response.status, json: json, code: code };
+  }
+
+  /** A call of an api route. Returns {status, json} where json is the JSON object of the response
+   *  body. A response outside 2xx throws the first string among code, detail and error of the body
+   *  (or "http_" + status when there is none) as the failure code, with the status as the status
+   *  of the failure, and a 2xx response whose body is not a JSON object is invalid_response. */
+  async function api(turn, method, path, body, query, limitMs) {
+    const answer = await request(turn, method, path, body, query, limitMs);
+    if (answer.status < 200 || answer.status > 299) {
+      const refused = native.error(answer.code === null ? "http_" + answer.status : answer.code, method + " " + path);
+      refused.status = answer.status;
+      throw refused;
+    }
+    if (answer.json === null) {
+      const invalid = native.error("invalid_response", method + " " + path);
+      invalid.status = answer.status;
+      throw invalid;
+    }
+    return { status: answer.status, json: answer.json };
+  }
+
+  /** The status of a failure of api (0 for a failure that is not an answer of the backend). */
+  function failureStatus(error) {
+    return error && Number.isSafeInteger(error.status) ? error.status : 0;
+  }
+
+  /** Whether a failure of api says that the backend has no such route or has turned its store
+   *  off: the status 404 without a code of the route's own, or the code log_store_disabled. */
+  function routeAbsent(error) {
+    const code = failureCode(error);
+    if (code === "log_store_disabled") return true;
+    return failureStatus(error) === 404 && (code === "http_404" || code === "Not Found" || code === "not_found");
   }
 
   /** The outcome of a promise as a value: {ok: true, value} or {ok: false, error}. The requests of one
@@ -877,42 +1389,15 @@
     };
   }
 
-  // The gate of the reads of objects of the store (LOG_STORE_CONCURRENCY in flight at once).
+  // The gate of the reads of the bucket of format 1 and format 2 (LOG_STORE_CONCURRENCY in flight
+  // at once).
   const storeGate = gate(LOG_STORE_CONCURRENCY);
 
-  /** The error of a read of the store that was not sent because the time budget of its run was
-   *  spent before its turn (a skipped read ahead, never the read a step waits for). */
-  function skippedRead() {
-    return { log_store_skipped: true };
-  }
-
-  function isSkippedRead(error) {
-    return error !== null && typeof error === "object" && error.log_store_skipped === true;
-  }
-
-  /** The settled outcomes of work over items, in order, each call through the store gate (at most
-   *  LOG_STORE_CONCURRENCY in flight). An item whose turn comes when stop() is true is not sent:
-   *  its outcome is the skipped read. */
-  function pooled(items, work, stop) {
+  /** The settled outcomes of work over items, in order, each call through the store gate. */
+  function pooled(items, work) {
     return Promise.all(items.map(function (item) {
-      return settled(storeGate.run(function () {
-        if (stop !== undefined && stop()) return Promise.reject(skippedRead());
-        return work(item);
-      }));
+      return settled(storeGate.run(function () { return work(item); }));
     }));
-  }
-
-  /** Whether the time budget of a verification run has passed (budgets.deadline: the time of the
-   *  device at which the run stops reading ahead; absent for a reader without a run). */
-  function deadlinePassed(budgets) {
-    return budgets !== undefined && budgets !== null && budgets.deadline !== undefined &&
-      native.nowMs() >= budgets.deadline;
-  }
-
-  /** Whether the walk of a verification run stops: its time budget has passed and the run made
-   *  its least steps (budgets.progress: the keys walked and the bodies read in this run). */
-  function timeBudgetSpent(budgets) {
-    return deadlinePassed(budgets) && budgets.progress >= LOG_VERIFY_LEAST_STEPS;
   }
 
   // ---- Signed values ----
@@ -965,11 +1450,6 @@
   /** The days of the grant lifetime: the value when it is an integer from 1 to 30, otherwise 30. */
   function grantDays(value) {
     return Number.isSafeInteger(value) && value >= 1 && value <= GRANT_DAYS_MAX ? value : GRANT_DAYS_MAX;
-  }
-
-  /** The value when it is a non-negative integer, otherwise 0. */
-  function whole(value) {
-    return Number.isSafeInteger(value) && value >= 0 ? value : 0;
   }
 
   /** One point of a chain {seq, hash, time_ms}: time_ms is the time of the entry at that point
@@ -1131,6 +1611,7 @@
    *  first, then the nodes whose verification reached the final head (final is set and
    *  checkpoint.seq equals final.seq), oldest gone_ms first, until it fits. */
   function saveLedger(ledger) {
+    if (accountClosed) return;
     let json = JSON.stringify(ledger);
     if (utf8(json).length > LEDGER_LIMIT_BYTES) {
       const clean = Object.keys(ledger.nodes).filter(function (id) {
@@ -1160,19 +1641,13 @@
     if (native.storeGet(LEDGER_STORE_KEY) !== json) native.storeSet(LEDGER_STORE_KEY, json);
   }
 
-  // ---- The shared ledger ----
+  // ---- The shared ledger (for the devices of the account that run a program before v43) ----
 
-  /** The ids of the nodes a ledger explains as delegations of this account (origin grant: a grant
-   *  of a device, the record of a grant it sent, or a traced transfer), sorted. */
+  /** The ids of the nodes a ledger explains as delegations of this account (origin grant), sorted. */
   function grantNodeIds(ledger) {
     return Object.keys(ledger.nodes).filter(function (id) {
       return ledger.nodes[id].origin === "grant";
     }).sort();
-  }
-
-  /** The ids of the nodes a ledger marks as delegations the app did not make. */
-  function unknownNodeIds(ledger) {
-    return Object.keys(ledger.nodes).filter(function (id) { return ledger.nodes[id].unknown_ms !== 0; });
   }
 
   /** The additional authenticated data of the shared ledger: the purpose, the account and the
@@ -1219,36 +1694,33 @@
       ledger.ttl_set_ms <= shared.ttl_set_ms;
   }
 
-  /** Whether this device has a grant node the last upload or merge did not cover. */
+  /** Whether the ledger of this device holds a grant node the last exchange did not cover. */
   function ledgerShareDue(ledger) {
+    const ids = grantNodeIds(ledger);
+    if (ids.length === 0) return false;
     const covered = native.storeGet(LEDGER_SHARE_STORE_KEY);
-    return covered === null || JSON.stringify(grantNodeIds(ledger)) !== covered;
+    return covered === null || JSON.stringify(ids) !== covered;
   }
 
-  /** The exchange of the ledger with the backend: the shared value is read (fetched: the settled
-   *  outcome of the GET when the caller sent it ahead, else sent here), merged into ledger (the
-   *  grants of the other devices of the account enter; a node this device found in the store only
-   *  that another device delegated to loses its mark), and, when the shared value does not cover
-   *  the merged ledger, the merged ledger is sealed and uploaded. The merged ledger replaces the
-   *  nodes and settings of ledger in place and is saved. A failure of either request is logged and
-   *  changes nothing else. Returns {cleared}: whether a mark of a delegation the app did not make
-   *  was cleared by the merge (the caller verifies the log again at once). */
-  async function shareLedger(keys, ledger, fetched) {
-    const outcome = await (fetched === undefined || fetched === null ? settled(api("GET", LEDGER_SHARE_PATH)) : fetched);
-    if (!outcome.ok) {
-      native.log("shared ledger read: " + failureCode(outcome.error));
-      return { cleared: false };
+  /** The exchange of the ledger with the backend, as the programs before v43 make it: the shared
+   *  value is read and merged into the ledger of this device (the nodes and the settings of the
+   *  other devices enter the ledger, which this program judges nothing by), and, when the shared
+   *  value does not cover the merged ledger, the merged ledger is sealed and uploaded. The upload
+   *  replaces the value of the backend, so the value is read first: an upload of this ledger alone
+   *  would drop the nodes the other devices wrote. A failure of either request is logged and
+   *  changes nothing else. */
+  async function shareLedger(turn, keys) {
+    const fetched = await settled(api(turn, "GET", LEDGER_SHARE_PATH));
+    if (!fetched.ok) {
+      native.log("shared ledger read: " + failureCode(fetched.error));
+      return;
     }
-    const shared = openSharedLedger(keys, outcome.value.json.ledger);
-    let cleared = false;
+    const ledger = loadLedger();
+    const shared = openSharedLedger(keys, fetched.value.json.ledger);
     if (shared !== null) {
-      const marked = unknownNodeIds(ledger);
-      // store_failing_ms is not merged: the time the reads of the store of this device began to
-      // fail is a fact of this device (the stale judgement of publishLogState rests on it).
       const merged = mergeLedger(ledger, shared);
       // The gone time of a node this device granted to at least as recently as the shared value
-      // did is the one this device knows: a shared value from before the node was granted again
-      // does not make a living node gone.
+      // did is the one this device knows.
       for (const id of Object.keys(merged.nodes)) {
         const mine = ledger.nodes[id];
         const theirs = shared.nodes[id];
@@ -1261,21 +1733,66 @@
       ledger.ttl_days = merged.ttl_days;
       ledger.ttl_set_ms = merged.ttl_set_ms;
       ledger.nodes = merged.nodes;
-      const still = new Set(unknownNodeIds(ledger));
-      cleared = marked.some(function (id) { return !still.has(id); });
       saveLedger(ledger);
     }
     if (shared === null || !ledgerCovered(ledger, shared)) {
       try {
-        await api("PUT", LEDGER_SHARE_PATH, sealLedger(keys, ledger));
+        await api(turn, "PUT", LEDGER_SHARE_PATH, sealLedger(keys, ledger));
       } catch (error) {
         native.log("shared ledger write: " + failureCode(error));
-        return { cleared: cleared };
+        return;
       }
     }
     native.storeSet(LEDGER_SHARE_STORE_KEY, JSON.stringify(grantNodeIds(ledger)));
-    return { cleared: cleared };
   }
+
+  // Whether an exchange of the ledger is in flight (one at a time).
+  let ledgerShareFlight = false;
+
+  /** Starts the exchange of the ledger when this device holds a grant node the last exchange did
+   *  not cover, or when force is set (a setting of the delegation changed). Nothing waits for it. */
+  function shareLedgerSoon(keys, force) {
+    if (ledgerShareFlight || accountClosed || (force !== true && !ledgerShareDue(loadLedger()))) return;
+    ledgerShareFlight = true;
+    shareLedger(freeTurn(), keys).then(noop, function (error) {
+      try {
+        native.log("shared ledger: " + failureCode(error));
+      } catch (closed) {
+        // The bridge is closed.
+      }
+    }).then(function () { ledgerShareFlight = false; });
+  }
+
+  /** Writes a node of a release before LOG_FORMAT_3_FROM that this device handed a grant to into
+   *  the ledger, in the form of the programs before v43: origin grant, the grant time, the expiry,
+   *  and, for a node the ledger did not hold, a verification point at seq 0. A node the ledger
+   *  holds keeps its verification point. */
+  function noteLedgerGrant(ledger, node, grantedMs, notAfterMs, sentMs) {
+    let record = ledger.nodes[node.node];
+    if (record === undefined) {
+      record = {
+        sign_pk: node.signPk, seal_pk: node.sealPk, platform: node.platform, release: node.release,
+        first_ms: sentMs, granted_ms: 0, not_after_ms: 0,
+        checkpoint: { seq: 0, hash: ZERO_HASH, time_ms: 0 }, final: null, gone_ms: 0, origin: "grant",
+        unknown_ms: 0, sealed_ms: 0, attempted_ms: sentMs,
+      };
+      ledger.nodes[node.node] = record;
+    }
+    if (record.seal_pk === "") {
+      record.seal_pk = node.sealPk;
+      record.platform = node.platform;
+      record.release = node.release;
+    }
+    record.granted_ms = grantedMs;
+    record.not_after_ms = notAfterMs;
+    record.attempted_ms = sentMs;
+    record.origin = "grant";
+    record.unknown_ms = 0;
+    record.sealed_ms = 0;
+    record.gone_ms = 0;
+  }
+
+  // ---- The grants of this device ----
 
   /** The lifetime of a grant as the ledger sets it (milliseconds). */
   function grantTtlMs(ledger) {
@@ -1293,29 +1810,122 @@
     return ledger.revoked_ms > ledger.resumed_ms;
   }
 
+  /** Whether the entries of a node are in the log store: every node but one of a build that writes
+   *  no entry to the store (a prerelease build without log_store). */
+  function writesToStore(platform, release) {
+    if (platform === "local") return true;
+    const build = ACCEPTED_RELEASES.concat(PRERELEASE_BUILDS).find(function (item) {
+      return item.release === release;
+    });
+    return build === undefined || build.log_store === true;
+  }
+
+  /** One record of the grants of this device, read from a stored value: null when it is none. */
+  function grantRecord(value) {
+    if (value === null || typeof value !== "object") return null;
+    return {
+      granted_ms: whole(value.granted_ms), not_after_ms: whole(value.not_after_ms),
+      release: typeof value.release === "string" ? value.release : "",
+      first_ms: whole(value.first_ms), platform: value.platform === "local" ? "local" : "nitro",
+      attempted_ms: whole(value.attempted_ms),
+    };
+  }
+
+  /** Carries the node ledger of the program before v43 over, once per installation and account:
+   *  a node of the ledger with a grant time becomes a grant of this device, and every node the
+   *  ledger explains becomes a chain of format 1 or format 2 this program reads on from the
+   *  verification point of the ledger (closed when that point reached the final head of the node
+   *  or the build of the node wrote no entry to the store). The marks of the earlier program (gaps,
+   *  ends it could not confirm, nodes it could not explain, the time its reads began to fail) are
+   *  not carried over: the first round of this program judges by its own conditions. Nothing is
+   *  carried over while the device holds no master key. */
+  function migrateLedger() {
+    if (native.storeGet(STORE_MIGRATED) !== null || readMasterKey() === null) return;
+    const ledger = loadLedger();
+    const grants = storedObject(STORE_GRANTS);
+    const legacy = loadLegacy();
+    for (const id of Object.keys(ledger.nodes)) {
+      const node = ledger.nodes[id];
+      if (node.origin !== "grant") continue;
+      if (node.granted_ms > 0 && grantRecord(grants[id]) === null) {
+        grants[id] = {
+          granted_ms: node.granted_ms, not_after_ms: node.not_after_ms, release: node.release,
+          first_ms: node.first_ms, platform: node.platform === "local" ? "local" : "nitro",
+          attempted_ms: node.attempted_ms,
+        };
+      }
+      if (legacy.nodes[id] === undefined) {
+        const ended = node.final !== null && node.checkpoint.seq >= node.final.seq;
+        legacy.nodes[id] = {
+          seq: node.checkpoint.seq, time_ms: node.checkpoint.time_ms, until_ms: node.not_after_ms,
+          closed: ended || !writesToStore(node.platform, node.release),
+        };
+      }
+    }
+    storeJson(STORE_GRANTS, grants);
+    saveLegacy(legacy);
+    for (const key of RETIRED_STORE_KEYS) native.storeSet(key, null);
+    native.storeSet(STORE_MIGRATED, String(VERSION));
+  }
+
+  /** The grants of this device: {node: {granted_ms, not_after_ms, release, first_ms, platform,
+   *  attempted_ms}}. granted_ms is 0 for a node this device verified and sent a grant that the
+   *  node did not confirm. A record whose grant ended longer ago than the retention of the log is
+   *  dropped. */
+  function loadGrants() {
+    migrateLedger();
+    const kept = storedObject(STORE_GRANTS);
+    const grants = Object.create(null);
+    const horizon = native.nowMs() - (LOG_RETENTION_DAYS + GRANT_DAYS_MAX + 5) * DAY_MS;
+    for (const id of Object.keys(kept)) {
+      const record = NODE_ID.test(id) ? grantRecord(kept[id]) : null;
+      if (record === null) continue;
+      if (Math.max(record.not_after_ms, record.attempted_ms, record.granted_ms) < horizon) continue;
+      grants[id] = record;
+    }
+    return grants;
+  }
+
+  function saveGrants(grants) {
+    if (accountClosed) return;
+    storeJson(STORE_GRANTS, grants);
+  }
+
   /** Whether that node holds a grant within its time. A grant handed before the last revocation
    *  time counts as revoked and is not counted. */
-  function holdsGrant(ledger, id, now) {
-    const node = ledger.nodes[id];
-    return node !== undefined && node.granted_ms > ledger.revoked_ms && node.not_after_ms > now;
+  function holdsGrant(ledger, grants, id, now) {
+    const record = grants[id];
+    return record !== undefined && record.granted_ms > ledger.revoked_ms && record.not_after_ms > now;
   }
 
   /** The published state grant: accepted is the Set of node ids accepted this time. When every one
    *  of them holds a grant within its time the state is active, when only some do it is partial,
    *  when none does it is none, and when delegation is off it is off. not_after_ms is the earliest
    *  end among those grants. */
-  function grantState(ledger, accepted, now) {
+  function grantState(ledger, grants, accepted, now) {
     if (delegationOff(ledger)) return { state: "off", not_after_ms: 0 };
     let holding = 0;
     let earliest = 0;
     accepted.forEach(function (id) {
-      if (!holdsGrant(ledger, id, now)) return;
+      if (!holdsGrant(ledger, grants, id, now)) return;
       holding += 1;
-      const limit = ledger.nodes[id].not_after_ms;
+      const limit = grants[id].not_after_ms;
       earliest = earliest === 0 ? limit : Math.min(earliest, limit);
     });
     const state = holding === 0 ? "none" : holding === accepted.size ? "active" : "partial";
     return { state: state, not_after_ms: earliest };
+  }
+
+  /** The custody of a record the app makes: among the nodes this device handed a grant to that
+   *  hold it within its time, enclave is preferred. null when there is no such node. */
+  function heldCustody(ledger, grants, now) {
+    let found = null;
+    for (const id of Object.keys(grants)) {
+      if (!holdsGrant(ledger, grants, id, now)) continue;
+      if (grants[id].platform === "nitro") return "enclave";
+      found = "operator";
+    }
+    return found;
   }
 
   // ---- Delegation ----
@@ -1326,7 +1936,7 @@
    *  its type, node, account, challenge and key_id being those of the sent command. A failure reply
    *  signed by the node has its code as the failure code. node is {node, signPk, sealPk}. Returns
    *  the verified reply body. */
-  async function sendCommand(node, command, replyType, keys) {
+  async function sendCommand(turn, node, command, replyType, keys) {
     const payload = utf8(JSON.stringify(command));
     const signature = native.ed25519Sign(
       keys.signSeed, encode(concat(utf8(purpose("command") + "\n"), payload)));
@@ -1336,8 +1946,8 @@
       info: info("message"), aad: encode(utf8(node.node)), plaintext: encode(signed),
     });
     const envelope = { v: 1, node: node.node, enc: sealed.enc, ct: sealed.ciphertext };
-    const path = "/api/secure/nodes/" + node.node + "/messages";
-    const response = await api("POST", path, { envelope: envelope });
+    const path = NODES_PATH + "/" + node.node + "/messages";
+    const response = await api(turn, "POST", path, { envelope: envelope }, null, NODE_TIMEOUT_MS);
     const reply = openSigned(response.json.reply, node.signPk, purpose("reply") + "\n");
     if (reply.node !== node.node) throw native.error("bad_signature", "reply is from another node");
     // The failure reply of a node that could not open the envelope has an empty account, challenge
@@ -1365,12 +1975,12 @@
    *  The expiry is the time of the attestation document of that node (node.timeMs) plus the
    *  lifetime (the device clock is not used: the grant of a device whose clock runs ahead is not
    *  refused). The expiry the node accepted is not_after_ms of the reply. Returns {granted_ms,
-   *  not_after_ms} for the ledger, both in device clock time: not_after_ms is now plus the lifetime
-   *  the node accepted (the expiry of the reply minus the time of the document). */
-  async function sendGrant(node, challenge, keys, ttlMs) {
+   *  not_after_ms}, both in device clock time: not_after_ms is now plus the lifetime the node
+   *  accepted (the expiry of the reply minus the time of the document). */
+  async function sendGrant(turn, node, challenge, keys, ttlMs) {
     // The user key goes to a node of a listed release only (verifyAttestation).
     if (node.listed !== true) throw attestationFailure("measurement");
-    const reply = await sendCommand(node, {
+    const reply = await sendCommand(turn, node, {
       v: 1, type: "grant", user_id: userId(), node: node.node, challenge: challenge,
       sign_pk: keys.signPk, log_pk: keys.logPk, custody: node.custody,
       user_key: keys.userKeys[node.custody], not_after_ms: node.timeMs + ttlMs, policy: {},
@@ -1381,8 +1991,8 @@
   }
 
   /** Sends the revocation of a grant: the node erases the user key of that account. */
-  async function sendRevoke(node, challenge, keys) {
-    await sendCommand(node, {
+  async function sendRevoke(turn, node, challenge, keys) {
+    await sendCommand(turn, node, {
       v: 1, type: "revoke", user_id: userId(), node: node.node, challenge: challenge,
       sign_pk: keys.signPk,
     }, "revoke_reply", keys);
@@ -1390,47 +2000,24 @@
 
   // ---- Records ----
 
-  /** The custody of a record the app makes: among the nodes of the ledger that hold a grant within
-   *  its time, enclave is preferred. null when there is no such node. */
-  function heldCustody(ledger, now) {
-    let found = null;
-    for (const id of Object.keys(ledger.nodes)) {
-      if (!holdsGrant(ledger, id, now)) continue;
-      if (ledger.nodes[id].platform === "nitro") return "enclave";
-      found = "operator";
-    }
-    return found;
-  }
-
-  /** Decides the custody of a record the app makes. When delegation is off it is delegation_off.
-   *  When no node holds a grant within its time, one sync runs and the ledger is read again. When
-   *  there still is none it is grant_required (no record is made under a custody that no node can
-   *  open). */
-  async function recordCustody() {
-    const ledger = loadLedger();
-    if (delegationOff(ledger)) throw native.error("delegation_off", "delegation is turned off");
-    let custody = heldCustody(ledger, native.nowMs());
-    if (custody === null) {
-      const outcome = await runSync();
-      if (outcome.keyState !== "present") throw native.error("key_required", outcome.keyState);
-      custody = heldCustody(loadLedger(), native.nowMs());
-    }
-    if (custody === null) throw native.error("grant_required", "no node holds a grant");
-    return custody;
+  /** The additional authenticated data of a record: it binds the id, the account, the key_id, the
+   *  custody, the kind and the provider. */
+  function recordAad(id, user, keyId, custody, kind, provider) {
+    return encode(utf8([purpose("record"), "1", id, user, keyId, custody, kind, provider].join("\n")));
   }
 
   /** Makes one credential record. The record key is derived from the user key of that custody with
-   *  the record id (16 random bytes) as the salt, and the plaintext bytes (plaintext: base64url)
-   *  are encrypted with ChaCha20-Poly1305 under a random 12-byte nonce. The AAD binds the id, the
-   *  account, the key_id, the custody, the kind and the provider. */
-  function sealRecordBytes(keys, custody, kind, provider, plaintext) {
-    const id = native.randomBytes(16);
+   *  the record id (16 random bytes, or the id given: writing a record again keeps its id) as the
+   *  salt, and the plaintext bytes (plaintext: base64url) are encrypted with ChaCha20-Poly1305
+   *  under a random 12-byte nonce. */
+  function sealRecordBytes(keys, custody, kind, provider, plaintext, givenId) {
+    const id = givenId === undefined ? native.randomBytes(16) : givenId;
     const nonce = native.randomBytes(12);
     const user = userId();
     const recordKey = native.hkdf("sha256", keys.userKeys[custody], id, info("record"), 32);
-    const aad = [purpose("record"), "1", id, user, keys.keyId, custody, kind, provider].join("\n");
     const ct = native.aeadSeal({
-      alg: "chacha20poly1305", key: recordKey, nonce: nonce, aad: encode(utf8(aad)), plaintext: plaintext,
+      alg: "chacha20poly1305", key: recordKey, nonce: nonce,
+      aad: recordAad(id, user, keys.keyId, custody, kind, provider), plaintext: plaintext,
     });
     return {
       v: 1, id: id, user_id: user, key_id: keys.keyId, custody: custody, kind: kind,
@@ -1443,12 +2030,41 @@
     return sealRecordBytes(keys, custody, kind, provider, encode(utf8(JSON.stringify(plaintextObject))));
   }
 
+  /** Opens a record of this account and key with the user key the device derives: the plaintext
+   *  as a JSON object. The record must be of the kind and the provider given. A record of another
+   *  account, key, kind or form, and one that does not open, is record_invalid. */
+  function openRecord(keys, record, kind, provider) {
+    const shaped = record !== null && typeof record === "object" && record.v === 1 &&
+      typeof record.id === "string" && typeof record.nonce === "string" && typeof record.ct === "string" &&
+      (record.custody === "enclave" || record.custody === "operator");
+    if (!shaped || record.user_id !== userId() || record.key_id !== keys.keyId ||
+        record.kind !== kind || record.provider !== provider) {
+      throw native.error("record_invalid", kind);
+    }
+    let plain = null;
+    try {
+      const recordKey = native.hkdf("sha256", keys.userKeys[record.custody], record.id, info("record"), 32);
+      plain = JSON.parse(text(decode(native.aeadOpen({
+        alg: "chacha20poly1305", key: recordKey, nonce: record.nonce,
+        aad: recordAad(record.id, record.user_id, record.key_id, record.custody, record.kind, record.provider),
+        ciphertext: record.ct,
+      }))));
+    } catch (error) {
+      plain = null;
+    }
+    if (plain === null || typeof plain !== "object" || Array.isArray(plain)) {
+      throw native.error("record_invalid", kind);
+    }
+    return plain;
+  }
+
   // ---- The log ----
 
   const PROVIDER_NAMES = new Map([
     ["google_workspace", "Google"], ["microsoft", "Microsoft"], ["slack", "Slack"],
     ["notion", "Notion"], ["x", "X"], ["link", "Link"], ["granola", "Granola"],
     ["mercury", "Mercury"], ["naver_mail", "NAVER Mail"], ["github", "GitHub"],
+    ["vault", "Vault"],
   ]);
 
   // For every service (a product inside a provider) of a provider request: the display name, the
@@ -1550,21 +2166,9 @@
     }
   }
 
-  /** Verifies one signed head and returns the end of the chain {seq, hash, time_ms} (time_ms is
-   *  the node time at which the head was signed). When nonce is null the head must be the final
-   *  head a node left at its orderly shutdown (final true and an empty nonce), otherwise the head
-   *  that answered that nonce (final false). */
-  function openHead(signed, node, id, nonce) {
-    const body = openSigned(signed, node.sign_pk, purpose("head") + "\n");
-    const point = chainPoint(body);
-    const fresh = nonce === null
-      ? body.final === true && body.nonce === ""
-      : body.final === false && sameBytes(body.nonce, nonce);
-    if (body.type !== "head" || body.node !== id || body.user_id !== userId() || point === null || !fresh) {
-      throw native.error("bad_signature", "head is not for this chain");
-    }
-    return point;
-  }
+  // The base64url of 32 zero bytes: the end of a chain without entries and the prev of the first
+  // entry.
+  // (ZERO_HASH and NODE_ID are defined with the node ledger above.)
 
   /** Opens the event (the plaintext) of one log entry body of format 1 with the log decryption
    *  private key. An entry whose key_id is not ours is not opened and gives null. */
@@ -1580,13 +2184,14 @@
   }
 
   /** Opens the events (the plaintext: a JSON array of count events) of one log entry body of
-   *  format 2 with the log decryption private key. The caller checked that the key_id is ours. A
-   *  plaintext that is not an array of count objects is bad_signature. */
-  function openEventsV2(body, keys) {
+   *  format 2 or format 3 (version) with the log decryption private key. The caller checked that
+   *  the key_id is ours. A plaintext that is not an array of count objects is bad_signature. */
+  function openEvents(body, keys, version) {
     const aad = [body.node, body.user_id, body.key_id, String(body.seq)].join("\n");
+    const purposeOf = version === 3 ? purposeV3 : purposeV2;
     const events = JSON.parse(text(decode(native.hpkeOpen({
       kem: "x25519", kdf: "sha256", aead: "chacha20poly1305", recipientPrivateKey: keys.logSk,
-      enc: body.enc, info: infoV2("log-entry"), aad: encode(utf8(aad)), ciphertext: body.ct,
+      enc: body.enc, info: encode(utf8(purposeOf("log-entry"))), aad: encode(utf8(aad)), ciphertext: body.ct,
     }))));
     const shaped = Array.isArray(events) && events.length === body.count &&
       events.every(function (event) { return event !== null && typeof event === "object"; });
@@ -1594,71 +2199,28 @@
     return events;
   }
 
-  /** The tracing of a delegation transfer: when the events of a verified entry (null when the
-   *  entry is not ours) hold the event grant_transferred_out, the receiving node (to) is added to
-   *  the ledger. A node id is the signing public key of that node, so the entries and the head of
-   *  that node verify with that value. The expiry of the added node is the expiry of the giving
-   *  node (the latest the transferred grant can be alive). The app never handed a grant directly,
-   *  so granted_ms is 0 (the next sync verifies the attestation of that node and sends a grant)
-   *  and the sealing public key is empty. Without this tracing, missing log entries of
-   *  credentials used on the node that took over the delegation would not show in the
-   *  verification of the app. */
-  function followTransfer(ledger, node, body, events) {
-    if (events === null) return;
-    const event = events.find(function (event) { return event.t === "grant_transferred_out"; });
-    if (event === undefined) return;
-    const to = event.to;
-    if (typeof to !== "string" || !NODE_ID.test(to)) return;
-    const known = ledger.nodes[to];
-    if (known !== undefined) {
-      // A node the log store listing put into the ledger before this trace reached it: the
-      // transfer explains it, so it takes the shape of a traced node.
-      if (known.origin === "store") {
-        known.origin = "grant";
-        known.unknown_ms = 0;
-        known.sealed_ms = 0;
-        known.platform = node.platform;
-        known.release = node.release;
-        known.first_ms = Math.min(known.first_ms, whole(body.time_ms));
-        known.not_after_ms = Math.max(known.not_after_ms, node.not_after_ms);
-        known.gone_ms = 0;
-      }
-      return;
-    }
-    ledger.nodes[to] = {
-      sign_pk: to, seal_pk: "", platform: node.platform, release: node.release,
-      first_ms: whole(body.time_ms), granted_ms: 0, not_after_ms: node.not_after_ms,
-      checkpoint: { seq: 0, hash: ZERO_HASH, time_ms: 0 }, final: null, gone_ms: 0, origin: "grant",
-      unknown_ms: 0, sealed_ms: 0,
-    };
-  }
-
   // ---- The log store ----
 
-  // The tail of an object key of the log store under the node prefix (docs/protocol.md 7.6). Format
-  // 2 (the releases from v2.0.0 on): the seq as digits, the time_ms of the entry as digits, the kind
-  // letter (c: a control entry, u: a use entry), the count of events as three digits, the key_id, the
-  // base64url of the body hash and of the entry hash. Format 1 (the releases before v2.0.0): the seq
-  // as digits and the base64url of the entry hash.
-  const STORE_KEY_V2 = new RegExp(
-    "^(\\d{" + LOG_STORE_SEQ_DIGITS + "})-(\\d{" + LOG_STORE_TIME_DIGITS + "})-([cu])-(\\d{3})-" +
-    "([0-9a-f]{16})-([A-Za-z0-9_-]{43})-([A-Za-z0-9_-]{43})$");
-  const STORE_KEY_V1 = new RegExp("^(\\d{" + LOG_STORE_SEQ_DIGITS + "})-([A-Za-z0-9_-]{43})$");
   // The events a control entry holds (one per entry) and the events a use entry holds
-  // (docs/protocol.md 7.1).
+  // (docs/protocol.md 7.1) in the chains of format 2. A key of format 3 names the event of its
+  // control entry itself, and a release may add names.
   const CONTROL_EVENTS = [
     "grant_accepted", "grant_revoked", "connection_created", "connection_removed",
     "grant_transferred_out", "grant_transferred_in",
   ];
   const USE_EVENTS = ["provider_request", "credential_refreshed", "mail_request", "secret_released", "totp_issued"];
 
-  /** A failed read of the log store. kind is unreachable (a listing or an object could not be
-   *  fetched or read), url_rejected (an address the backend handed out does not name the bucket of
-   *  this server target or the key, prefix, markers and query of the request), truncated (a listing
-   *  went on beyond LOG_STORE_PAGES pages, or more unknown node prefixes than LOG_STORE_NODES) or
-   *  disabled (the backend of this env has no log store). detail names what failed, for the report
-   *  of the run: the request (listing, object, discovery, address) and the transport failure or the
-   *  HTTP status, as "{request}:{transport | status | code}". */
+  /** A failed read of the log. kind says what the failure means for the round:
+   *    blocked      the operator domain held the read back (the backend refused, an address is not
+   *                 the one of the request, the store refused a fresh address, a body or a document
+   *                 the listing names was not handed out)
+   *    silent       the backend did not answer in time: blocked when the backend answered another
+   *                 request of this runtime around that time, unreachable otherwise (reachJudged)
+   *    unreachable  the device or the store failed (no network, a 5xx status of the store, an
+   *                 address that aged while the app was suspended)
+   *    absent       the backend has no such store
+   *  detail names the request and what it answered, for the report of the round, as
+   *  "{request}:{status | code}". */
   function storeFailure(kind, detail) {
     return { log_store_failure: true, kind: kind, detail: typeof detail === "string" ? detail : "" };
   }
@@ -1667,16 +2229,15 @@
     return error !== null && typeof error === "object" && error.log_store_failure === true;
   }
 
-  /** Records a store failure of this run in store (the state of the store reads of the run): the
-   *  refusal of a backend without a log store is absent for a debug build and refused for a release
-   *  build, any other failure is its kind. The detail of the first failure of the run is kept. */
-  function storeFailed(store, error) {
-    if (error.kind === "disabled") {
-      store.state = native.deviceInfo().debug_build === true ? "absent" : "refused";
-    } else {
-      store.state = error.kind;
-    }
-    if (store.detail === "") store.detail = error.detail;
+  /** The failure of a read of the log for a failed request to the backend (name: the request). */
+  function backendFailure(error, name) {
+    if (isStoreFailure(error)) return error;
+    const code = failureCode(error);
+    if (routeAbsent(error)) return storeFailure("absent", name + ":" + code);
+    if (failureStatus(error) !== 0) return storeFailure("blocked", name + ":" + failureStatus(error));
+    if (code === "timeout" || code === "transport") return storeFailure("silent", name + ":" + code);
+    if (code === "invalid_response") return storeFailure("blocked", name + ":invalid");
+    return error;
   }
 
   /** The log store of this server target (an element of LOG_STORES), undefined when the target has
@@ -1685,25 +2246,55 @@
     return LOG_STORES[native.deviceInfo().server_target];
   }
 
-  /** The host of the log store of this server target (the virtual-hosted S3 address), null when
-   *  the target has none. */
-  function logStoreHost() {
-    const store = logStore();
-    return store === undefined ? null : store.bucket + ".s3." + store.region + ".amazonaws.com";
-  }
-
   /** Whether a debug build may call the S3 stand-in of the local stack: an address over http or
-   *  https, at the host the backend hands out, in the path-style form of the bucket of
-   *  LOG_STORES.local (storeAddressAccepted). The bridge of a debug build reports the server target
-   *  prod whatever backend the app talks to, so the build configuration alone decides. A release
-   *  build calls the host of the store of its server target and nothing else. */
+   *  https, at the host the backend hands out, in the path-style form of a bucket of
+   *  LOG_STORES.local. The bridge of a debug build reports the server target prod whatever backend
+   *  the app talks to, so the build configuration alone decides. A release build calls the host of
+   *  a bucket of its server target and nothing else. */
   function storeUnpinned() {
     return native.deviceInfo().debug_build === true;
   }
 
-  /** The object key prefix of this account in the log store. */
+  /** The name of the bucket of format 3 that holds the objects of owner (the user_id of an
+   *  account, or a node id) in the log store given (docs/protocol.md 7.6). */
+  function shardBucket(store, owner) {
+    const digest = decode(native.sha256(encode(utf8(owner))));
+    const index = ((digest[0] << 8) | digest[1]) % store.shards;
+    const tail = store.shard_base + "-" + String(index).padStart(4, "0");
+    return hex(decode(native.sha256(encode(utf8(tail)))).subarray(0, 4)) + "-" + tail;
+  }
+
+  /** The object key prefix of this account in the bucket of format 1 and format 2. */
   function accountPrefix() {
     return "v1/accounts/" + userId() + "/";
+  }
+
+  /** The prefix of the entries of format 3 of this account: letter c for the control entries, u
+   *  for the use entries. */
+  function entryPrefix(letter) {
+    return "a3/" + userId() + "/" + letter + "/";
+  }
+
+  /** Reads the query string of a URL as a table from name to value. */
+  function parseQuery(url) {
+    const out = Object.create(null);
+    const start = url.indexOf("?");
+    if (start < 0) return out;
+    const end = url.indexOf("#", start);
+    const query = url.slice(start + 1, end < 0 ? url.length : end);
+    function component(value) {
+      try {
+        return decodeURIComponent(value.replace(/\+/g, " "));
+      } catch (error) {
+        return value;
+      }
+    }
+    for (const pair of query.split("&")) {
+      if (pair === "") continue;
+      const at = pair.indexOf("=");
+      out[component(at < 0 ? pair : pair.slice(0, at))] = at < 0 ? "" : component(pair.slice(at + 1));
+    }
+    return out;
   }
 
   /** The parts of an address: the host (lower case, with its port when one is given), the path
@@ -1743,24 +2334,32 @@
     });
   }
 
-  /** Whether the host and the path of a store address are the ones of this store for key (the empty
-   *  key is a listing): the host of the log store of the server target and the path "/" + key (the
-   *  virtual-hosted form), or, in a debug build only, any host with the path-style form
-   *  "/{bucket}/" + key of the stand-in of the local stack (a listing may also be "/{bucket}"). An
-   *  address of another host in the virtual-hosted form is refused in every build. */
-  function storeAddressAccepted(parts, key) {
-    const host = logStoreHost();
-    if (host !== null && parts.host === host && parts.path === "/" + key) return true;
-    if (!storeUnpinned()) return false;
-    const bucket = LOG_STORES.local.bucket;
-    return parts.path === "/" + bucket + "/" + key || (key === "" && parts.path === "/" + bucket);
+  /** Whether the host and the path of a store address name the object key (the empty key: a
+   *  listing) of the bucket of this server target (pinned) or, in a debug build only, of the bucket
+   *  of the local stack in the path-style form at any host (local; a listing may also be
+   *  "/{bucket}"). An address of another host in the virtual-hosted form is refused in every
+   *  build. */
+  function addressOfBucket(parts, key, pinned, local) {
+    const store = logStore();
+    if (store !== undefined && pinned !== null &&
+        parts.host === pinned + ".s3." + store.region + ".amazonaws.com" && parts.path === "/" + key) {
+      return true;
+    }
+    if (!storeUnpinned() || local === null) return false;
+    return parts.path === "/" + local + "/" + key || (key === "" && parts.path === "/" + local);
   }
 
-  /** Whether a listing address the backend handed out is called: the host and path of the store,
-   *  only the query keys of LISTING_QUERY_KEYS and the signature, the query versions, the prefix
-   *  expected, the delimiter "/" for the node discovery listing and absent otherwise, the markers the
-   *  ones requested (absent when none was requested), a page size of 1000 when given and the
-   *  encoding url when given. */
+  /** Whether an address of the bucket of format 1 and format 2 is one of this store for key. */
+  function storeAddressAccepted(parts, key) {
+    const store = logStore();
+    return addressOfBucket(parts, key, store === undefined ? null : store.bucket, LOG_STORES.local.bucket);
+  }
+
+  /** Whether a listing address of the bucket of format 1 and format 2 the backend handed out is
+   *  called: the host and path of the store, only the query keys of LISTING_QUERY_KEYS and the
+   *  signature, the query versions, the prefix expected, the delimiter "/" for the node discovery
+   *  listing and absent otherwise, the markers the ones requested (absent when none was requested),
+   *  a page size of 1000 when given and the encoding url when given. */
   function listingUrlAccepted(url, expected) {
     const parts = splitUrl(url, storeUnpinned());
     if (parts === null || !storeAddressAccepted(parts, "")) return false;
@@ -1783,35 +2382,79 @@
     return true;
   }
 
-  /** Whether an object address the backend handed out is called: the host and path of the store for
-   *  that key, the query versionId of that version and no other query key besides the signature. */
+  /** Whether a listing address of format 3 the backend handed out is called (docs/protocol.md
+   *  7.4): the host of the bucket computed from the user_id of this account, the path "/", the
+   *  query versions, the prefix of the control or of the use entries of this account, a page size
+   *  of 1000, the markers the ones requested (absent when none was requested), the encoding url
+   *  when given, and no query key besides these and the signature. */
+  function readUrlAccepted(url, letter, keyMarker, versionIdMarker) {
+    const parts = splitUrl(url, storeUnpinned());
+    if (parts === null) return false;
+    const store = logStore();
+    const user = userId();
+    const pinned = store === undefined ? null : shardBucket(store, user);
+    if (!addressOfBucket(parts, "", pinned, shardBucket(LOG_STORES.local, user))) return false;
+    const query = parts.query;
+    if (!queryKeysAccepted(query, ["versions", "prefix", "key-marker", "version-id-marker", "max-keys", "encoding-type"])) {
+      return false;
+    }
+    if (!("versions" in query) || query.prefix !== entryPrefix(letter)) return false;
+    if (query["max-keys"] !== "1000") return false;
+    if ("encoding-type" in query && query["encoding-type"] !== "url") return false;
+    if (keyMarker === "" ? "key-marker" in query : query["key-marker"] !== keyMarker) return false;
+    if (versionIdMarker === "" ? "version-id-marker" in query : query["version-id-marker"] !== versionIdMarker) {
+      return false;
+    }
+    return true;
+  }
+
+  /** Whether an object address of the bucket of format 1 and format 2 the backend handed out is
+   *  called: the host and path of the store for that key, the query versionId of that version and
+   *  no other query key besides the signature. */
   function objectUrlAccepted(url, key, versionId) {
     const parts = splitUrl(url, storeUnpinned());
     return parts !== null && storeAddressAccepted(parts, key) &&
       parts.query.versionId === versionId && queryKeysAccepted(parts.query, ["versionId"]);
   }
 
-  /** One GET of the log store: {status, body}. A transport failure, a 429 and a 5xx status are tried
-   *  again (LOG_STORE_ATTEMPTS attempts in all, with the pauses of LOG_STORE_RETRY_MS between them);
-   *  a transport failure that remains is unreachable, with the request named in its detail. */
-  async function fetchStore(url, request) {
-    const name = typeof request === "string" ? request : "object";
-    for (let attempt = 1; ; attempt += 1) {
+  /** One GET of the log store: {status, body}. Each attempt has LOG_STORE_TIMEOUT_MS. A failure
+   *  of the transport, a timeout, a 429 and a 5xx status are tried again (LOG_STORE_ATTEMPTS
+   *  attempts in all, with the pauses of LOG_STORE_RETRY_MS between them); a failure that remains
+   *  is unreachable, with the request named in its detail. */
+  async function fetchStore(turn, url, name) {
+    for (let attempt = 1; attempt <= LOG_STORE_ATTEMPTS; attempt += 1) {
       let response = null;
       try {
-        response = await native.http({ method: "GET", url: url, timeoutMs: LOG_STORE_TIMEOUT_MS });
+        response = await limited(
+          turn, native.http({ method: "GET", url: url, timeoutMs: LOG_STORE_TIMEOUT_MS }),
+          LOG_STORE_TIMEOUT_MS, name);
       } catch (error) {
-        if (attempt >= LOG_STORE_ATTEMPTS) throw storeFailure("unreachable", name + ":transport");
-        await native.sleep(LOG_STORE_RETRY_MS[attempt - 1]);
+        if (failureCode(error) === "cancelled") throw error;
+        if (attempt >= LOG_STORE_ATTEMPTS || !(turnLeft(turn) > 0)) {
+          throw storeFailure("unreachable", name + ":" + (failureCode(error) === "timeout" ? "timeout" : "transport"));
+        }
+        await limited(turn, native.sleep(LOG_STORE_RETRY_MS[attempt - 1]), LOG_STORE_TIMEOUT_MS, name);
         continue;
       }
       const again = response.status === 429 || (response.status >= 500 && response.status <= 599);
       if (again && attempt < LOG_STORE_ATTEMPTS) {
-        await native.sleep(LOG_STORE_RETRY_MS[attempt - 1]);
+        await limited(turn, native.sleep(LOG_STORE_RETRY_MS[attempt - 1]), LOG_STORE_TIMEOUT_MS, name);
         continue;
       }
       return { status: response.status, body: typeof response.body === "string" ? response.body : "" };
     }
+    throw storeFailure("unreachable", name + ":transport");
+  }
+
+  /** The failure of a read for a response of the store outside 200 to an address signed at
+   *  signedMs: a 5xx status and a 429 are the store failing (unreachable); any other status is a
+   *  refusal of the address the backend signed (blocked), unless the address had aged (the app was
+   *  suspended between the answer of the backend and the call: unreachable, the next round reads
+   *  again). */
+  function storeRefusal(status, name, signedMs) {
+    if (status === 429 || (status >= 500 && status <= 599)) return storeFailure("unreachable", name + ":" + status);
+    const aged = native.nowMs() - signedMs > LOG_URL_FRESH_MS;
+    return storeFailure(aged ? "unreachable" : "blocked", name + ":" + status);
   }
 
   const XML_ENTITIES = { amp: "&", lt: "<", gt: ">", quot: "\"", apos: "'" };
@@ -1885,17 +2528,304 @@
     };
   }
 
+  // ---- Format 3: the keys, the listings, the bodies and the node documents ----
+
+  const KEY_PART_43 = /^[A-Za-z0-9_-]{43}$/;
+  const KEY_ID = /^[0-9a-f]{16}$/;
+  const EVENT_NAME = /^[a-z0-9_]{1,64}$/;
+  const PLAIN_NUMBER = /^[1-9][0-9]{0,15}$/;
+
+  /** Whether a part of a key is the one way to write 32 bytes in base64url. */
+  function canonical32(value) {
+    if (!KEY_PART_43.test(value)) return false;
+    try {
+      return encode(decode(value)) === value;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  /** The first part of the name of an entry of format 3 for the time ms: 9999999999999 minus the
+   *  time, as 13 digits. The keys of a prefix sort with the latest entry first. */
+  function rtimeDigits(ms) {
+    return String(RTIME_MAX - Math.min(RTIME_MAX, Math.max(0, ms))).padStart(13, "0");
+  }
+
+  /** Reads an object key as the key of an entry of format 3 of this account under the prefix of
+   *  letter (docs/protocol.md 7.6): {key, tail, letter, time_ms, node, seq, event, count, key_id,
+   *  body_hash}. tail is the part after the prefix: the tails of a prefix sort with the latest
+   *  entry first. event is the name of the one event of a control entry (the empty string for a
+   *  use entry). null for a key of any other shape: such a key is not an entry. */
+  function parseEntryKey(key, letter) {
+    const prefix = entryPrefix(letter);
+    if (typeof key !== "string" || key.slice(0, prefix.length) !== prefix) return null;
+    const tail = key.slice(prefix.length);
+    const parts = tail.split(".");
+    if (parts.length !== 6 || !/^[0-9]{13}$/.test(parts[0])) return null;
+    if (!canonical32(parts[1]) || !canonical32(parts[5]) || !KEY_ID.test(parts[4])) return null;
+    if (!PLAIN_NUMBER.test(parts[2])) return null;
+    const seq = Number(parts[2]);
+    if (!Number.isSafeInteger(seq)) return null;
+    let count = 1;
+    let event = "";
+    if (letter === "c") {
+      if (!EVENT_NAME.test(parts[3])) return null;
+      event = parts[3];
+    } else {
+      if (!PLAIN_NUMBER.test(parts[3])) return null;
+      count = Number(parts[3]);
+      if (!(count >= 1 && count <= LOG_ENTRY_EVENTS)) return null;
+    }
+    return {
+      key: key, tail: tail, letter: letter, time_ms: RTIME_MAX - Number(parts[0]), node: parts[1],
+      seq: seq, event: event, count: count, key_id: parts[4], body_hash: parts[5],
+    };
+  }
+
+  /** Verifies the object {body, sig} of a key of format 3 (docs/protocol.md 7.4): the SHA-256 of
+   *  the body against the body_hash of the key, the signature under the signing key that the node
+   *  id of the key is, and the fields v, node, user_id, key_id, seq, time_ms, kind and count of the
+   *  body against the key and the account. Returns {body, failure}: body is the parsed body or
+   *  null, and failure names the first check that failed (body, signature, fields) or is empty.
+   *  The function does not judge the node: whether the signing key was created inside an enclave of
+   *  an accepted measurement is what the node document says. */
+  function checkEntry(parsed, entry) {
+    const failed = function (failure) { return { body: null, failure: failure }; };
+    let bytes = null;
+    try {
+      bytes = decode(entry.body);
+      if (!sameBytes(native.sha256(encode(bytes)), parsed.body_hash)) return failed("body");
+    } catch (error) {
+      return failed("body");
+    }
+    let signed = false;
+    try {
+      signed = native.ed25519Verify(
+        parsed.node, encode(concat(utf8(purposeV3("log-entry") + "\n"), bytes)), entry.sig) === true;
+    } catch (error) {
+      signed = false;
+    }
+    if (!signed) return failed("signature");
+    let body = null;
+    try {
+      body = JSON.parse(text(bytes));
+    } catch (error) {
+      body = null;
+    }
+    if (body === null || typeof body !== "object" || body.v !== 3 || body.node !== parsed.node ||
+        body.user_id !== userId() || body.key_id !== parsed.key_id || body.seq !== parsed.seq ||
+        body.time_ms !== parsed.time_ms || body.kind !== parsed.letter || body.count !== parsed.count) {
+      return failed("fields");
+    }
+    return { body: body, failure: "" };
+  }
+
+  /** The events of a verified entry of format 3 whose key_id is ours: the plaintext opened with
+   *  the log decryption key, an array of count events (the one event of a control entry has the
+   *  name its key writes). null when the entry does not open to that. */
+  function entryEvents(parsed, body, keys) {
+    try {
+      const events = openEvents(body, keys, 3);
+      if (parsed.letter === "c" && (events.length !== 1 || events[0].t !== parsed.event)) return null;
+      return events;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  /** The listings of format 3 for the pages given ([{prefix, key_marker, version_id_marker}], the
+   *  empty string for no marker), read in one stage: the addresses from the backend in one request
+   *  (LOG_READ_PATH), each checked before it is called (readUrlAccepted), and the listings from the
+   *  store, which the operator domain cannot change. Returns one {letter, keys, tails, truncated,
+   *  next_key_marker, next_version_id_marker} per page: keys are the entries the page names (a key
+   *  counts once however many versions the listing shows, in the order of the listing: the latest
+   *  first), tails the set of their tails. Throws a store failure. */
+  async function readListings(turn, pages) {
+    let answer = null;
+    try {
+      answer = (await api(turn, "POST", LOG_READ_PATH, { pages: pages }, null, LOG_API_TIMEOUT_MS)).json;
+    } catch (error) {
+      throw backendFailure(error, "read");
+    }
+    const signedMs = native.nowMs();
+    const given = Array.isArray(answer.pages) ? answer.pages : [];
+    if (given.length !== pages.length) throw storeFailure("blocked", "read:url");
+    for (let at = 0; at < pages.length; at += 1) {
+      const item = given[at];
+      const wanted = pages[at];
+      if (item === null || typeof item !== "object" || item.prefix !== wanted.prefix ||
+          !readUrlAccepted(item.url, wanted.prefix, wanted.key_marker, wanted.version_id_marker)) {
+        throw storeFailure("blocked", "read:url");
+      }
+    }
+    const fetched = await stage(given.map(function (item) { return fetchStore(turn, item.url, "listing"); }));
+    const out = [];
+    for (let at = 0; at < pages.length; at += 1) {
+      if (!fetched[at].ok) throw fetched[at].error;
+      const response = fetched[at].value;
+      if (response.status !== 200) throw storeRefusal(response.status, "listing", signedMs);
+      const listing = parseListVersions(response.body);
+      if (listing === null) throw storeFailure("unreachable", "listing:body");
+      const letter = pages[at].prefix;
+      const keys = [];
+      const tails = new Set();
+      for (const version of listing.versions) {
+        const parsed = parseEntryKey(version.key, letter);
+        if (parsed === null || tails.has(parsed.tail)) continue;
+        tails.add(parsed.tail);
+        keys.push(parsed);
+      }
+      out.push({
+        letter: letter, keys: keys, tails: tails, truncated: listing.truncated && listing.nextKeyMarker !== null,
+        next_key_marker: listing.nextKeyMarker === null ? "" : listing.nextKeyMarker,
+        next_version_id_marker: listing.nextVersionIdMarker === null ? "" : listing.nextVersionIdMarker,
+      });
+    }
+    return out;
+  }
+
+  /** The bodies of entries of format 3 from the backend (LOG_BODIES_PATH; LOG_BODY_KEYS keys at
+   *  most): a table from key to {body, sig}, or to null for a key the backend reports missing. A
+   *  key the answer does not name is absent from the table (the backend cuts a long answer short).
+   *  The backend reads the objects in the region of the store and hands them on; a body is checked
+   *  against the body_hash of its key and the signature of its node, so the backend cannot hand
+   *  out another one. Throws a store failure. */
+  async function readBodies(turn, keys) {
+    let answer = null;
+    try {
+      answer = (await api(turn, "POST", LOG_BODIES_PATH, { keys: keys }, null, LOG_API_TIMEOUT_MS)).json;
+    } catch (error) {
+      throw backendFailure(error, "bodies");
+    }
+    const wanted = new Set(keys);
+    const out = new Map();
+    for (const item of Array.isArray(answer.entries) ? answer.entries : []) {
+      if (item !== null && typeof item === "object" && wanted.has(item.key) &&
+          typeof item.body === "string" && typeof item.sig === "string") {
+        out.set(item.key, { body: item.body, sig: item.sig });
+      }
+    }
+    for (const key of Array.isArray(answer.missing) ? answer.missing : []) {
+      if (wanted.has(key) && !out.has(key)) out.set(key, null);
+    }
+    return out;
+  }
+
+  /** The node documents of nodes from the backend (LOG_DOCUMENTS_PATH; LOG_DOCUMENT_NODES nodes
+   *  at most): a table from node id to the document object, or to null for a node the backend
+   *  reports none for. A node document proves itself (verifyNodeDocument), so the backend may hand
+   *  it on. Throws a store failure. */
+  async function readDocuments(turn, nodes) {
+    let answer = null;
+    try {
+      answer = (await api(turn, "POST", LOG_DOCUMENTS_PATH, { nodes: nodes }, null, LOG_API_TIMEOUT_MS)).json;
+    } catch (error) {
+      throw backendFailure(error, "documents");
+    }
+    const wanted = new Set(nodes);
+    const out = new Map();
+    for (const item of Array.isArray(answer.documents) ? answer.documents : []) {
+      if (item !== null && typeof item === "object" && wanted.has(item.node) &&
+          item.document !== null && typeof item.document === "object") {
+        out.set(item.node, item.document);
+      }
+    }
+    for (const node of Array.isArray(answer.missing) ? answer.missing : []) {
+      if (wanted.has(node) && !out.has(node)) out.set(node, null);
+    }
+    return out;
+  }
+
+  // ---- What the node documents said (log.nodes) ----
+
+  /** The kept judgements of nodes: {node: {m, p, r, f, c}} (the digest of the measurement, the
+   *  platform, the release, the time first seen, the time a contradiction of its signatures was
+   *  found; 0 for none). */
+  function loadNodes() {
+    const kept = storedObject(STORE_NODES);
+    const nodes = Object.create(null);
+    for (const id of Object.keys(kept)) {
+      const value = kept[id];
+      if (!NODE_ID.test(id) || value === null || typeof value !== "object") continue;
+      nodes[id] = {
+        m: typeof value.m === "string" ? value.m : "", p: value.p === "local" ? "local" : "nitro",
+        r: typeof value.r === "string" ? value.r : "", f: whole(value.f), c: whole(value.c),
+      };
+    }
+    return nodes;
+  }
+
+  /** Writes the kept judgements. Above LOG_NODES_KEPT nodes, the nodes seen first leave first (a
+   *  node with a contradiction stays). */
+  function saveNodes(nodes) {
+    const ids = Object.keys(nodes);
+    if (ids.length > LOG_NODES_KEPT) {
+      ids.sort(function (x, y) { return nodes[x].f - nodes[y].f; });
+      for (const id of ids) {
+        if (Object.keys(nodes).length <= LOG_NODES_KEPT) break;
+        if (nodes[id].c === 0) delete nodes[id];
+      }
+    }
+    storeJson(STORE_NODES, nodes);
+  }
+
+  /** What this device knows of the node id: {state, release, platform, format, measure}, or null
+   *  for a node it has no judgement of. state is accepted for a node this device verified and
+   *  handed a grant to, and for a node whose document verified with a measurement of the accepted
+   *  lists (or of platform local, in a build that takes local nodes); unaccepted for a node whose
+   *  document verified with a measurement no list of this program has. The lists are read at every
+   *  call: a program that lists a release accepts the nodes an earlier program kept as unaccepted. */
+  function nodeVerdict(grants, nodes, id) {
+    const kept = nodes[id];
+    if (kept !== undefined && kept.p === "nitro" && kept.m !== "") {
+      const build = buildOfMeasure(kept.m);
+      return {
+        state: build === undefined ? "unaccepted" : "accepted", release: kept.r, platform: "nitro",
+        format: build === undefined ? 3 : logFormatOf(build.release), measure: kept.m,
+      };
+    }
+    const granted = grants[id];
+    if (granted !== undefined) {
+      return {
+        state: "accepted", release: granted.release, platform: granted.platform,
+        format: logFormatOf(granted.release), measure: "",
+      };
+    }
+    if (kept !== undefined && kept.p === "local" && localAccepted()) {
+      return { state: "accepted", release: kept.r, platform: "local", format: logFormatOf(kept.r), measure: "" };
+    }
+    return null;
+  }
+
+  // ---- Format 1 and format 2: the chains in the bucket the binding names ----
+  //
+  // A node of a release before LOG_FORMAT_3_FROM wrote one chain per account under the prefix
+  // v1/accounts/{user_id}/{node}/. This program reads those chains for two things only: to show
+  // their entries on the log screen, and to find a transfer of the delegation that such a node
+  // made to another node (followLegacy). It verifies an entry by the signature of the node whose
+  // id its prefix names and by the body hash of its key, and opens it with the key of this
+  // account. It reads no head, verifies no chain equation, and judges neither an empty seq nor a
+  // node no grant explains.
+
+  // The tail of an object key under the node prefix (docs/protocol.md 7.6). Format 2 (the releases
+  // from v2.0.0 to the last before LOG_FORMAT_3_FROM): the seq as digits, the time_ms of the entry
+  // as digits, the kind letter (c: a control entry, u: a use entry), the count of events as three
+  // digits, the key_id, the base64url of the body hash and of the entry hash. Format 1 (the
+  // releases before v2.0.0): the seq as digits and the base64url of the entry hash.
+  const STORE_KEY_V2 = new RegExp(
+    "^(\\d{" + LOG_STORE_SEQ_DIGITS + "})-(\\d{" + LOG_STORE_TIME_DIGITS + "})-([cu])-(\\d{3})-" +
+    "([0-9a-f]{16})-([A-Za-z0-9_-]{43})-([A-Za-z0-9_-]{43})$");
+  const STORE_KEY_V1 = new RegExp("^(\\d{" + LOG_STORE_SEQ_DIGITS + "})-([A-Za-z0-9_-]{43})$");
+
   /** The seq of an object key as LOG_STORE_SEQ_DIGITS digits with leading zeros (the order of the
    *  keys is the order of seq). */
   function seqDigits(seq) {
-    let digits = String(seq);
-    while (digits.length < LOG_STORE_SEQ_DIGITS) digits = "0" + digits;
-    return digits;
+    return String(seq).padStart(LOG_STORE_SEQ_DIGITS, "0");
   }
 
   /** The parts an object key under the node prefix names: {format: 2, seq, time_ms, kind, count,
-   *  key_id, body_hash, entry_hash} for a key of format 2 (seq 1 or more, count 1 to
-   *  LOG_ENTRY_EVENTS), {format: 1, seq, hash} for a key of format 1, null for any other key. */
+   *  key_id, body_hash} for a key of format 2 (seq 1 or more, count 1 to LOG_ENTRY_EVENTS),
+   *  {format: 1, seq} for a key of format 1, null for any other key. */
   function parseStoreKey(key, prefix) {
     if (typeof key !== "string" || key.slice(0, prefix.length) !== prefix) return null;
     const tail = key.slice(prefix.length);
@@ -1908,665 +2838,1135 @@
           count < 1 || count > LOG_ENTRY_EVENTS) {
         return null;
       }
-      return {
-        format: 2, seq: seq, time_ms: timeMs, kind: v2[3], count: count, key_id: v2[5],
-        body_hash: v2[6], entry_hash: v2[7], fields: tail.slice(0, LOG_STORE_KEY_FIELDS_CHARS),
-      };
+      return { format: 2, seq: seq, time_ms: timeMs, kind: v2[3], count: count, key_id: v2[5], body_hash: v2[6] };
     }
     const v1 = STORE_KEY_V1.exec(tail);
     if (v1 === null) return null;
     const seq = Number(v1[1]);
-    return Number.isSafeInteger(seq) && seq > 0 ? { format: 1, seq: seq, hash: v1[2] } : null;
+    return Number.isSafeInteger(seq) && seq > 0 ? { format: 1, seq: seq } : null;
   }
 
-  /** One page of a listing of the log store through an address the backend hands out: nodes true
-   *  is the node discovery listing of the account prefix (delimiter "/"), otherwise the object
-   *  versions of the node prefix after the markers. Throws a store failure. */
-  async function listStorePage(nodes, node, keyMarker, versionIdMarker) {
-    const query = {};
-    if (nodes) query.nodes = "1";
-    if (node !== null) query.node = node;
-    if (keyMarker !== null) query.key_marker = keyMarker;
-    if (versionIdMarker !== null) query.version_id_marker = versionIdMarker;
-    let listing = null;
+  /** The key marker of the listing of one node after the seq afterSeq: every key of that seq sorts
+   *  before it. */
+  function listingMarker(id, afterSeq) {
+    return accountPrefix() + id + "/" + seqDigits(afterSeq) + "-~";
+  }
+
+  /** The listing addresses of the bucket of format 1 and format 2 in one request
+   *  (LOG_LISTINGS_PATH): the node discovery listing of the account prefix (discovery) and the
+   *  listing of every node of targets ({node, key_marker, version_id_marker}; LEGACY_LISTING_NODES
+   *  at most) from its marker. Every address is checked (listingUrlAccepted); an address that is
+   *  not the one requested and a missing address reject the whole response. Returns {signedMs,
+   *  discovery: url | null, nodes: [url]} in the order of targets. Throws a store failure. */
+  async function legacyAddresses(turn, discovery, targets) {
+    let response = null;
     try {
-      listing = (await api("GET", "/api/secure/log/store", null, query)).json;
+      response = (await api(
+        turn, "POST", LOG_LISTINGS_PATH, { discovery: discovery, nodes: targets }, null, LOG_API_TIMEOUT_MS)).json;
     } catch (error) {
-      throw storeFailure(
-        error && error.code === "log_store_disabled" ? "disabled" : "unreachable",
-        "address:" + failureCode(error));
+      throw backendFailure(error, "listings");
     }
-    const expected = {
-      prefix: accountPrefix() + (node === null ? "" : node + "/"), nodes: nodes,
-      keyMarker: keyMarker, versionIdMarker: versionIdMarker,
-    };
-    if (!listingUrlAccepted(listing.list_url, expected)) throw storeFailure("url_rejected", "listing:url");
-    const response = await fetchStore(listing.list_url, "listing");
-    const parsed = response.status === 200 ? parseListVersions(response.body) : null;
-    if (parsed === null) throw storeFailure("unreachable", "listing:" + response.status);
+    const out = { signedMs: native.nowMs(), discovery: null, nodes: [] };
+    if (discovery) {
+      const item = response.discovery;
+      const expected = { prefix: accountPrefix(), nodes: true, keyMarker: null, versionIdMarker: null };
+      if (item === null || typeof item !== "object" || !listingUrlAccepted(item.list_url, expected)) {
+        throw storeFailure("blocked", "listings:url");
+      }
+      out.discovery = item.list_url;
+    }
+    const listed = Array.isArray(response.nodes) ? response.nodes : [];
+    if (listed.length !== targets.length) throw storeFailure("blocked", "listings:url");
+    for (let at = 0; at < targets.length; at += 1) {
+      const wanted = targets[at];
+      const item = listed[at];
+      const expected = {
+        prefix: accountPrefix() + wanted.node + "/", nodes: false,
+        keyMarker: wanted.key_marker, versionIdMarker: wanted.version_id_marker,
+      };
+      if (item === null || typeof item !== "object" || item.node !== wanted.node ||
+          !listingUrlAccepted(item.list_url, expected)) {
+        throw storeFailure("blocked", "listings:url");
+      }
+      out.nodes.push(item.list_url);
+    }
+    return out;
+  }
+
+  /** One listing of the bucket of format 1 and format 2 through an address the backend signed at
+   *  signedMs: the parsed listing. Throws a store failure. */
+  async function legacyListing(turn, url, signedMs) {
+    const response = await storeGate.run(function () { return fetchStore(turn, url, "chain"); });
+    if (response.status !== 200) throw storeRefusal(response.status, "chain", signedMs);
+    const parsed = parseListVersions(response.body);
+    if (parsed === null) throw storeFailure("unreachable", "chain:body");
     return parsed;
   }
 
-  /** The nodes of this account in the log store: the common prefixes of the account prefix (the
-   *  node discovery listing). A prefix that does not name a node id is left out. */
-  async function discoverStoreNodes(reads) {
+  /** The listings of several chains in one stage: targets are {node, key_marker,
+   *  version_id_marker}; the addresses are requested LEGACY_LISTING_NODES per request, the
+   *  requests and then the listings sent together. Returns the settled outcomes in the order of
+   *  targets ({ok, value: listing} or {ok: false, error}). */
+  async function legacyListings(turn, targets) {
+    const batches = [];
+    for (let at = 0; at < targets.length; at += LEGACY_LISTING_NODES) {
+      batches.push(targets.slice(at, at + LEGACY_LISTING_NODES));
+    }
+    const addressed = await stage(batches.map(function (batch) { return legacyAddresses(turn, false, batch); }));
+    const reads = [];
+    for (let at = 0; at < batches.length; at += 1) {
+      const outcome = addressed[at];
+      for (let i = 0; i < batches[at].length; i += 1) {
+        reads.push(outcome.ok
+          ? legacyListing(turn, outcome.value.nodes[i], outcome.value.signedMs)
+          : Promise.reject(outcome.error));
+      }
+    }
+    return stage(reads);
+  }
+
+  /** The nodes of this account in the bucket of format 1 and format 2: the common prefixes of the
+   *  account prefix (the node discovery listing), LEGACY_DISCOVERY_PAGES pages at most. A prefix
+   *  that does not name a node id is left out. Throws a store failure. */
+  async function discoverLegacyNodes(turn) {
     const prefix = accountPrefix();
     const nodes = [];
     let keyMarker = null;
     let versionIdMarker = null;
-    for (let page = 0; page < LOG_STORE_PAGES; page += 1) {
-      // The first page was read ahead (beginVerificationReads) when the run has it; the pages after
-      // it, and the first page when the read ahead did not arrive, are read here.
-      const ready = page === 0 && reads && reads.discovery !== null ? reads.discovery : null;
-      const listing = ready !== null ? ready : await listStorePage(true, null, keyMarker, versionIdMarker);
+    for (let page = 0; page < LEGACY_DISCOVERY_PAGES; page += 1) {
+      let url = null;
+      let signedMs = 0;
+      if (page === 0) {
+        const addresses = await legacyAddresses(turn, true, []);
+        url = addresses.discovery;
+        signedMs = addresses.signedMs;
+      } else {
+        let listing = null;
+        const query = { nodes: "1", key_marker: keyMarker };
+        if (versionIdMarker !== null) query.version_id_marker = versionIdMarker;
+        try {
+          listing = (await api(turn, "GET", "/api/secure/log/store", null, query, LOG_API_TIMEOUT_MS)).json;
+        } catch (error) {
+          throw backendFailure(error, "listings");
+        }
+        signedMs = native.nowMs();
+        const expected = { prefix: prefix, nodes: true, keyMarker: keyMarker, versionIdMarker: versionIdMarker };
+        if (!listingUrlAccepted(listing.list_url, expected)) throw storeFailure("blocked", "listings:url");
+        url = listing.list_url;
+      }
+      const listing = await legacyListing(turn, url, signedMs);
       for (const common of listing.prefixes) {
         if (common.slice(0, prefix.length) !== prefix || common.slice(-1) !== "/") continue;
         const id = common.slice(prefix.length, -1);
         if (NODE_ID.test(id) && nodes.indexOf(id) < 0) nodes.push(id);
       }
-      if (!listing.truncated || listing.nextKeyMarker === null) return nodes;
+      if (!listing.truncated || listing.nextKeyMarker === null) break;
       keyMarker = listing.nextKeyMarker;
       versionIdMarker = listing.nextVersionIdMarker;
     }
-    throw storeFailure("truncated", "discovery:pages");
+    return nodes;
   }
 
-  /** The index of completeness of one chain after afterSeq: the object versions of the node prefix
-   *  listed from the key marker of that seq, at most pages pages. entries maps a seq to its
-   *  candidates {key, versionId, isLatest, parts} (the node wrote one key per seq; another key with
-   *  the same seq is an object someone else put there, and only a key the chain equation or a
-   *  verified object confirms counts), min is the smallest listed seq (0 when none), max the
-   *  largest (afterSeq when none), truncated whether the listing went on beyond pages pages. */
-  async function storeIndex(id, afterSeq, pages, reads) {
-    const prefix = accountPrefix() + id + "/";
-    const index = { entries: new Map(), min: 0, max: afterSeq, truncated: false };
-    let keyMarker = listingMarker(id, afterSeq);
-    let versionIdMarker = null;
-    for (let page = 0; page < pages; page += 1) {
-      // The first page was read ahead (beginVerificationReads) when the run has the page of this very
-      // marker; every other page is read here.
-      const ready = page === 0 ? prefetchedPage(reads, id, keyMarker) : null;
-      const listing = ready !== null ? ready : await listStorePage(false, id, keyMarker, versionIdMarker);
-      addListing(index, listing, prefix, afterSeq);
-      if (!listing.truncated || listing.nextKeyMarker === null) return index;
-      keyMarker = listing.nextKeyMarker;
-      versionIdMarker = listing.nextVersionIdMarker;
-    }
-    index.truncated = true;
-    return index;
-  }
-
-  /** The key marker of the listing of one node from its verification point: every key of that seq
-   *  sorts before it (docs/protocol.md 7.4 step 2). */
-  function listingMarker(id, afterSeq) {
-    return accountPrefix() + id + "/" + seqDigits(afterSeq) + "-~";
-  }
-
-  /** Adds the versions of one listing page to an index (storeIndex): the keys under prefix whose seq
-   *  is after afterSeq, grouped by seq. */
-  function addListing(index, listing, prefix, afterSeq) {
-    for (const version of listing.versions) {
-      const parts = parseStoreKey(version.key, prefix);
-      if (parts === null || parts.seq <= afterSeq) continue;
-      if (!index.entries.has(parts.seq)) index.entries.set(parts.seq, []);
-      index.entries.get(parts.seq).push({
-        key: version.key, versionId: version.versionId, isLatest: version.isLatest, parts: parts,
-      });
-      if (index.min === 0 || parts.seq < index.min) index.min = parts.seq;
-      if (parts.seq > index.max) index.max = parts.seq;
-    }
-  }
-
-  /** The listing page of a node read ahead of the judgement, when the run has one and it is the page
-   *  of this very key marker (the first page from the verification point of the node when the reads
-   *  were begun); null otherwise. */
-  function prefetchedPage(reads, id, keyMarker) {
-    if (!reads) return null;
-    const page = reads.pages.get(id);
-    return page !== undefined && page.keyMarker === keyMarker ? page.listing : null;
-  }
-
-  /** The smallest listed seq after seq (the far end of a gap), seq itself when none is listed. */
-  function nextListedSeq(index, seq) {
-    let next = Infinity;
-    for (const listed of index.entries.keys()) {
-      if (listed > seq && listed < next) next = listed;
-    }
-    return next === Infinity ? seq : next;
-  }
-
-  /** The addresses the backend hands out for the object versions of the candidates wanted (at most
-   *  LOG_STORE_OBJECTS). Returns a table from key + "\n" + versionId to the address. An address
-   *  that does not name its key and version, and a candidate without an address, reject the batch. */
-  async function storeObjectUrls(wanted) {
+  /** The signed values of object versions of the bucket of format 1 and format 2: wanted are
+   *  {key, versionId} (LOG_STORE_OBJECTS at most). The addresses come from the backend in one
+   *  request (LOG_OBJECTS_PATH), each checked (objectUrlAccepted), and the objects from the store
+   *  (through the store gate). Returns a table from key + "\n" + versionId to {body, sig}, or to
+   *  null for a version the store does not hold or that is no signed value. Throws a store
+   *  failure. */
+  async function legacyObjects(turn, wanted) {
+    const out = new Map();
+    if (wanted.length === 0) return out;
     let signed = null;
     try {
-      signed = (await api("POST", "/api/secure/log/store/objects", {
+      signed = (await api(turn, "POST", LOG_OBJECTS_PATH, {
         objects: wanted.map(function (item) { return { key: item.key, version_id: item.versionId }; }),
-      })).json;
+      }, null, LOG_API_TIMEOUT_MS)).json;
     } catch (error) {
-      throw storeFailure(
-        error && error.code === "log_store_disabled" ? "disabled" : "unreachable",
-        "address:" + failureCode(error));
+      throw backendFailure(error, "objects");
     }
+    const signedMs = native.nowMs();
     const urls = new Map();
     for (const item of Array.isArray(signed.objects) ? signed.objects : []) {
       if (item === null || typeof item !== "object" ||
           !objectUrlAccepted(item.url, item.key, item.version_id)) {
-        throw storeFailure("url_rejected", "object:url");
+        throw storeFailure("blocked", "objects:url");
       }
       urls.set(item.key + "\n" + item.version_id, item.url);
     }
     for (const item of wanted) {
-      if (!urls.has(item.key + "\n" + item.versionId)) throw storeFailure("url_rejected", "object:url");
+      if (!urls.has(item.key + "\n" + item.versionId)) throw storeFailure("blocked", "objects:url");
     }
-    return urls;
-  }
-
-  /** The signed value {body, sig} stored as one object version of the log store and the size of the
-   *  response: {signed, bytes}. signed is null when the store has no such version (404). Any other
-   *  response outside 200 (a refused or expired address, a failing store) is unreachable: the run
-   *  stays pending and the next one reads the version again. */
-  async function fetchStoreObject(url) {
-    const response = await fetchStore(url, "object");
-    if (response.status === 404) return { signed: null, bytes: response.body.length };
-    if (response.status !== 200) throw storeFailure("unreachable", "object:" + response.status);
-    let value = null;
-    try {
-      value = JSON.parse(response.body);
-    } catch (error) {
-      value = null;
+    const names = wanted.map(function (item) { return item.key + "\n" + item.versionId; });
+    const fetched = await pooled(names, function (name) { return fetchStore(turn, urls.get(name), "object"); });
+    for (let at = 0; at < names.length; at += 1) {
+      if (!fetched[at].ok) throw fetched[at].error;
+      const response = fetched[at].value;
+      if (response.status === 404) {
+        out.set(names[at], null);
+        continue;
+      }
+      if (response.status !== 200) throw storeRefusal(response.status, "object", signedMs);
+      let value = null;
+      try {
+        value = JSON.parse(response.body);
+      } catch (error) {
+        value = null;
+      }
+      const shaped = value !== null && typeof value === "object" &&
+        typeof value.body === "string" && typeof value.sig === "string";
+      out.set(names[at], shaped ? { body: value.body, sig: value.sig } : null);
     }
-    if (value === null || typeof value !== "object" ||
-        typeof value.body !== "string" || typeof value.sig !== "string") {
-      return { signed: null, bytes: response.body.length };
-    }
-    return { signed: { body: value.body, sig: value.sig }, bytes: response.body.length };
+    return out;
   }
 
-  /** A reader of object versions of the store that requests addresses in batches: object(candidate,
-   *  ahead) returns the signed value of that version (null when the store has no such version) and
-   *  requests, along with its address, the addresses of the candidates of ahead (the objects the
-   *  caller will read next), LOG_STORE_OBJECTS addresses per request, and reads the objects of the
-   *  batch ahead of the steps that want them (through the store gate, in the order of the batch;
-   *  a read ahead whose turn comes after the time budget of the run is spent is skipped and read
-   *  when a step wants it). fetched and bytes count the objects read and their size. budgets is the
-   *  budgets of the run (absent for a reader without a run). */
-  function storeReader(reads, budgets) {
-    const urls = new Map();
-    // The reads ahead by object name: the settled outcome of fetchStoreObject.
-    const ahead = new Map();
-    const read = function (name, skippable) {
-      return settled(storeGate.run(function () {
-        if (skippable && deadlinePassed(budgets)) return Promise.reject(skippedRead());
-        return fetchStoreObject(urls.get(name));
-      }));
-    };
-    const reader = {
-      fetched: 0,
-      bytes: 0,
-      object: async function (candidate, aheadOf) {
-        const name = candidate.key + "\n" + candidate.versionId;
-        // An object read ahead of the judgement (completeVerificationReads) is that very version.
-        const ready = reads ? reads.objects.get(name) : undefined;
-        if (ready !== undefined) {
-          reader.fetched += 1;
-          reader.bytes += ready.bytes;
-          return ready.signed;
-        }
-        if (!urls.has(name)) {
-          const wanted = [candidate];
-          for (const other of aheadOf) {
-            if (wanted.length >= LOG_STORE_OBJECTS) break;
-            if (other !== candidate && !urls.has(other.key + "\n" + other.versionId)) wanted.push(other);
-          }
-          const signed = await storeObjectUrls(wanted);
-          signed.forEach(function (url, key) { urls.set(key, url); });
-          for (const item of wanted) {
-            const other = item.key + "\n" + item.versionId;
-            if (!ahead.has(other)) ahead.set(other, read(other, other !== name));
-          }
-        }
-        let outcome = ahead.get(name);
-        ahead.delete(name);
-        if (outcome === undefined) outcome = read(name, false);
-        let result = await outcome;
-        // The read ahead was skipped (the budget was spent before its turn): the step reads it.
-        if (!result.ok && isSkippedRead(result.error)) result = await read(name, false);
-        if (!result.ok) throw result.error;
-        reader.fetched += 1;
-        reader.bytes += result.value.bytes;
-        return result.value.signed;
-      },
-    };
-    return reader;
-  }
-
-  /** The purpose strings of format 2 of the log. */
-  function purposeV2(name) {
-    return "pickle.secure.v2." + name;
-  }
-
-  function infoV2(name) {
-    return encode(utf8(purposeV2(name)));
-  }
-
-  /** The chain hash of format 2 (docs/protocol.md 7.1): SHA-256 of the chain prefix, the entry hash
-   *  before, the body hash of the key parts and the first five parts of that key (parts.fields). A
-   *  key whose entry hash satisfies the equation carries the seq, time, kind, count and key_id the
-   *  node wrote. prevHash is a base64url string; a malformed hash gives null. */
-  function chainHash(prevHash, parts) {
-    try {
-      const prev = decode(prevHash);
-      const body = decode(parts.body_hash);
-      if (prev.length !== 32 || body.length !== 32) return null;
-      return native.sha256(encode(concat(utf8(purposeV2("log-chain") + "\n"), prev, body, utf8(parts.fields))));
-    } catch (error) {
-      return null;
-    }
-  }
-
-  /** The hash of the body of a signed value (base64url). */
-  function bodyHashOf(signed) {
-    return native.sha256(encode(decode(signed.body)));
-  }
-
-  /** Whether a gap below the vouched end is young: every key of the first seq listed after it is a
-   *  key of format 2 younger than LOG_GAP_GRACE_MS before headTime (the node time of the head, or
-   *  now). The node writes an entry the store did not confirm again within its sweep, so such a gap
-   *  is pending; a gap that stays is missing. */
-  function gapIsYoung(index, farSeq, headTime) {
-    const after = index.entries.get(farSeq);
-    if (after === undefined || after.length === 0) return false;
-    return after.every(function (candidate) {
-      return candidate.parts.format === 2 && headTime - candidate.parts.time_ms < LOG_GAP_GRACE_MS;
-    });
-  }
-
-  /** Checks one signed object version against the parts of its key, the node signature, the
-   *  account, seq and, when cursor is given, prev as the hash of the entry before. For format 2 the
-   *  body carries the key_id, count, kind and time_ms of the key, SHA-256(body) is the body hash of
-   *  the key, the entry hash of the key is the chain hash of prev, the body hash and the five parts
-   *  of the key, and the plaintext
-   *  (opened when the key_id is ours) holds count events: one control event for a control entry, use
-   *  events for a use entry. For format 1 the entry hash of the key is the chain hash of the body.
-   *  Returns {entry, failure}: entry is {format, seq, body, hash, time_ms, ours, events} (events null
-   *  when the key_id is not ours) or null, and failure names what failed (signature, hash, open) or
-   *  is empty. */
-  function checkEntry(signed, node, id, parts, cursor, keys) {
-    const failed = function (failure) { return { entry: null, failure: failure }; };
+  /** Checks one signed object version of a chain of format 1 or format 2 against the parts of its
+   *  key: the signature of the node id of its prefix, the account and the seq, and, for format 2,
+   *  the key_id, count, kind and time_ms of the key and the body hash of the key. The plaintext is
+   *  opened when the key_id is ours: one control event for a control entry, use events for a use
+   *  entry. Returns {format, seq, body, time_ms, ours, events} (events null when the key_id is not
+   *  ours) or null for an object that is not that entry. */
+  function checkLegacyEntry(signed, id, parts, keys) {
     let body = null;
     try {
       body = parts.format === 2
-        ? openSigned(signed, node.sign_pk, purposeV2("log-entry") + "\n", 2)
-        : openSigned(signed, node.sign_pk, purpose("log-entry") + "\n", 1);
+        ? openSigned(signed, id, purposeV2("log-entry") + "\n", 2)
+        : openSigned(signed, id, purpose("log-entry") + "\n", 1);
     } catch (error) {
-      return failed("signature");
+      return null;
     }
-    if (body.node !== id || body.user_id !== userId() || body.seq !== parts.seq ||
-        (cursor !== null && !sameBytes(body.prev, cursor.hash))) {
-      return failed("hash");
-    }
-    let hash = null;
-    try {
-      if (parts.format === 2) {
-        if (body.key_id !== parts.key_id || body.count !== parts.count || body.kind !== parts.kind ||
-            body.time_ms !== parts.time_ms || !sameBytes(bodyHashOf(signed), parts.body_hash)) {
-          return failed("hash");
-        }
-        hash = chainHash(body.prev, parts);
-        if (hash === null || !sameBytes(hash, parts.entry_hash)) return failed("hash");
-      } else {
-        hash = native.sha256(encode(concat(utf8(purpose("log-chain") + "\n"), decode(signed.body))));
-        if (!sameBytes(hash, parts.hash)) return failed("hash");
+    if (body.node !== id || body.user_id !== userId() || body.seq !== parts.seq) return null;
+    if (parts.format === 2) {
+      let hashed = false;
+      try {
+        hashed = sameBytes(native.sha256(encode(decode(signed.body))), parts.body_hash);
+      } catch (error) {
+        hashed = false;
       }
-    } catch (error) {
-      return failed("hash");
+      if (!hashed || body.key_id !== parts.key_id || body.count !== parts.count ||
+          body.kind !== parts.kind || body.time_ms !== parts.time_ms) {
+        return null;
+      }
     }
     const ours = body.key_id === keys.keyId;
     let events = null;
     if (ours) {
       try {
-        events = parts.format === 2 ? openEventsV2(body, keys) : [openEvent(body, keys)];
+        events = parts.format === 2 ? openEvents(body, keys, 2) : [openEvent(body, keys)];
       } catch (error) {
-        return failed("open");
+        return null;
       }
       if (parts.format === 2) {
         const allowed = parts.kind === "c" ? CONTROL_EVENTS : USE_EVENTS;
-        if (parts.kind === "c" && events.length !== 1) return failed("open");
-        const kinds = events.every(function (event) {
-          return event !== null && typeof event === "object" && allowed.indexOf(event.t) >= 0;
-        });
-        if (!kinds) return failed("open");
+        if (parts.kind === "c" && events.length !== 1) return null;
+        if (!events.every(function (event) { return allowed.indexOf(event.t) >= 0; })) return null;
       }
     }
     return {
-      entry: {
-        format: parts.format, seq: parts.seq, body: body, hash: hash, time_ms: whole(body.time_ms),
-        ours: ours, events: events,
-      },
-      failure: "",
+      format: parts.format, seq: parts.seq, body: body, time_ms: whole(body.time_ms), ours: ours, events: events,
     };
   }
 
-  /** Whether the entries of a node are in the log store: every node but one of a build that writes
-   *  no entry to the store (a prerelease build without log_store). */
-  function writesToStore(node) {
-    if (node.origin === "store" || node.platform === "local") return true;
-    const builds = ACCEPTED_RELEASES.concat(PRERELEASE_BUILDS);
-    const build = builds.find(function (item) { return item.release === node.release; });
-    return build === undefined || build.log_store === true;
+  // ---- The chains this device follows (log.legacy) ----
+
+  /** The kept state of the chains of format 1 and format 2: {nodes: {node: {seq, time_ms,
+   *  until_ms, closed}}}. seq is the seq up to which the control entries of the chain were read
+   *  (the verification point of the program before v43 for a node its ledger held), time_ms the
+   *  time of the entry there (0 when it is not known), until_ms the latest time the node can hold
+   *  a grant this device knows of, and closed whether the chain is read no more. */
+  function loadLegacy() {
+    const kept = storedObject(STORE_LEGACY);
+    const legacy = { nodes: Object.create(null) };
+    const nodes = kept.nodes !== null && typeof kept.nodes === "object" ? kept.nodes : {};
+    for (const id of Object.keys(nodes)) {
+      const value = nodes[id];
+      if (!NODE_ID.test(id) || value === null || typeof value !== "object") continue;
+      legacy.nodes[id] = {
+        seq: whole(value.seq), time_ms: whole(value.time_ms), until_ms: whole(value.until_ms),
+        closed: value.closed === true,
+      };
+    }
+    return legacy;
   }
 
-  /** The content verification of one seq (docs/protocol.md 7.4): the candidate objects (the latest
-   *  version first) are read until one verifies against cursor (null: no prev check). Every object
-   *  read spends one body of the budget, and nothing is read once the budget is spent. ahead names
-   *  the candidates whose addresses are requested along. Returns the verified entry or null. */
-  async function contentStep(node, id, cursor, candidates, keys, budgets, reader, ahead) {
-    const ordered = candidates.slice().sort(function (a, b) {
-      return (b.isLatest ? 1 : 0) - (a.isLatest ? 1 : 0);
-    });
-    for (const candidate of ordered) {
-      if (budgets.bodies <= 0) return null;
-      budgets.bodies -= 1;
-      budgets.progress += 1;
-      const signed = await reader.object(candidate, ahead);
-      if (signed === null) continue;
-      const checked = checkEntry(signed, node, id, candidate.parts, cursor, keys);
-      if (checked.entry !== null) return checked.entry;
+  /** Writes the kept state. Above 2 * LEGACY_NODES chains, the closed chains with the earliest
+   *  end leave first. */
+  function saveLegacy(legacy) {
+    const ids = Object.keys(legacy.nodes);
+    if (ids.length > 2 * LEGACY_NODES) {
+      const closed = ids.filter(function (id) { return legacy.nodes[id].closed; });
+      closed.sort(function (x, y) { return legacy.nodes[x].until_ms - legacy.nodes[y].until_ms; });
+      for (const id of closed) {
+        if (Object.keys(legacy.nodes).length <= 2 * LEGACY_NODES) break;
+        delete legacy.nodes[id];
+      }
     }
+    storeJson(STORE_LEGACY, legacy);
+  }
+
+  // ---- The round: one reading and judging of the log of the account (docs/protocol.md 7.4) ----
+  //
+  // What makes the log complete is not something a round verifies: a node writes the entry of an
+  // act to the log store and acts only after the store confirmed it, and no object version of the
+  // store can be deleted for 365 days. So the listing of the prefix of an account, read from the
+  // store itself, names every act that took place with the key of the account. A round reads that
+  // listing and judges four things, which hold in a situation that is a problem and in no other:
+  //   A1  the key of the account went to a node of a release this program does not accept
+  //   A2  the signatures of a node that passed attestation contradict each other
+  //   A3  the operator domain has been holding the reads back for LOG_BLOCKED_MS
+  //   A4  an entry this device saw left the listing within its retention
+  // A round reads the control entries only (grants, revocations, connections, transfers of the
+  // delegation): the use entries are read by the log screen.
+
+  /** The digest by which the program remembers that it judged a key: 9 bytes of its SHA-256. */
+  function keyDigest(key) {
+    return encode(decode(native.sha256(encode(utf8(key)))).subarray(0, 9));
+  }
+
+  /** The time of the entry a tail of a key of format 3 names (its first 13 characters). */
+  function tailTime(tail) {
+    return RTIME_MAX - Number(String(tail).slice(0, 13));
+  }
+
+  /** Everything this device keeps of the log of the account, read from the program store. */
+  function loadLog() {
+    const strings = function (key, limit) {
+      const kept = storedJson(key, []);
+      return (Array.isArray(kept) ? kept : []).filter(function (item) {
+        return typeof item === "string" && item !== "";
+      }).slice(0, limit);
+    };
+    const blocked = storedObject(STORE_BLOCKED);
+    const resume = storedJson(STORE_RESUME, null);
+    const seen = strings(STORE_SEEN, LOG_SEEN_KEYS);
+    const missing = storedJson(STORE_MISSING, []);
+    const cursor = native.storeGet(STORE_CURSOR);
+    return {
+      grants: loadGrants(), nodes: loadNodes(), unaccepted: storedObject(STORE_UNACCEPTED),
+      blocked: { first_ms: whole(blocked.first_ms), count: whole(blocked.count) },
+      sample: strings(STORE_SAMPLE, LOG_SAMPLE_KEYS), seen: { list: seen, set: new Set(seen) },
+      missing: (Array.isArray(missing) ? missing : []).filter(function (item) {
+        return item !== null && typeof item === "object" && typeof item.key === "string";
+      }).slice(0, LOG_MISSING_KEYS),
+      legacy: loadLegacy(), round: storedObject(STORE_ROUND), cursor: cursor === null ? "" : cursor,
+      resume: resume !== null && typeof resume === "object" && typeof resume.key_marker === "string" ? {
+        key_marker: resume.key_marker,
+        version_id_marker: typeof resume.version_id_marker === "string" ? resume.version_id_marker : "",
+        top: typeof resume.top === "string" ? resume.top : "",
+        until: typeof resume.until === "string" ? resume.until : "", tail: resume.tail === true,
+      } : null,
+    };
+  }
+
+  /** Remembers that a key was judged. Above LOG_SEEN_KEYS digests the ones added first leave. */
+  function markSeen(log, digest) {
+    if (log.seen.set.has(digest)) return;
+    log.seen.set.add(digest);
+    log.seen.list.push(digest);
+    if (log.seen.list.length > LOG_SEEN_KEYS) log.seen.set.delete(log.seen.list.shift());
+  }
+
+  /** Notes a measurement no list of this program has (digest: the digest of the measurement, or
+   *  "node:" and a node id when only the node is known). held says that the key of this account
+   *  went to a node of it. The time it was first seen is kept. */
+  function noteUnaccepted(log, digest, release, node, held) {
+    let item = log.unaccepted[digest];
+    if (item === null || typeof item !== "object") {
+      item = { first_ms: native.nowMs(), release: String(release || "").slice(0, 64), held: false, node: node };
+      log.unaccepted[digest] = item;
+    }
+    if (held) item.held = true;
+  }
+
+  /** Notes that the signatures of the node id contradict each other (A2). */
+  function noteConflict(log, id, verdict) {
+    let kept = log.nodes[id];
+    if (kept === undefined) {
+      kept = { m: verdict.measure, p: verdict.platform, r: verdict.release, f: native.nowMs(), c: 0 };
+      log.nodes[id] = kept;
+    }
+    if (kept.c === 0) kept.c = native.nowMs();
+  }
+
+  /** Notes a failed read of a round: what the failure means for the round, and the detail of the
+   *  first one for the report. A failure that is not one of the log (the bridge closed, a defect)
+   *  is thrown, and so is every failure once the time of the turn has passed: a round that ran out
+   *  of time judges nothing. */
+  function noteFailure(turn, run, failure) {
+    if (!isStoreFailure(failure) || !(turnLeft(turn) > 0)) throw failure;
+    // A backend without the store that was asked for holds nothing back.
+    if (failure.kind === "absent") return;
+    if (run.detail === "") run.detail = failure.detail.slice(0, 64);
+    if (failure.kind === "blocked") run.blocked = true;
+    else if (failure.kind === "silent") run.silent = true;
+    else if (failure.kind === "unreachable") run.unreachable = true;
+  }
+
+  /** Whether a string is 96 lower-case hexadecimal characters (one PCR). */
+  function hex96(value) {
+    return typeof value === "string" && /^[0-9a-f]{96}$/.test(value);
+  }
+
+  /** Judges the event of a transfer of the delegation that an accepted node wrote for the key of
+   *  this account (grant_transferred_out): the measurement the event names, or, for an event
+   *  without one, what this device knows of the receiving node. A measurement no list of this
+   *  program has is noted as holding the key (A1). Returns the id of a receiving node this device
+   *  has no judgement of (the caller asks for its document), or null. */
+  function judgeTransfer(log, event) {
+    const to = typeof event.to === "string" && NODE_ID.test(event.to) ? event.to : "";
+    if (hex96(event.pcr0) && hex96(event.pcr1) && hex96(event.pcr2)) {
+      const measurement = { pcr0: event.pcr0, pcr1: event.pcr1, pcr2: event.pcr2 };
+      if (listedBuild(measurement) === undefined) {
+        noteUnaccepted(log, measureOf(measurement), event.release, to, true);
+      }
+      return null;
+    }
+    if (to === "") return null;
+    const verdict = nodeVerdict(log.grants, log.nodes, to);
+    if (verdict === null) return to;
+    if (verdict.state === "unaccepted") noteUnaccepted(log, verdict.measure, verdict.release, to, true);
     return null;
   }
 
-  /** The candidates of the seqs after seq whose objects the walk will read by content as well, in
-   *  the order of seq: every candidate when nothing vouches for the chain, otherwise the format 1
-   *  candidates of the seqs that follow without a break (a format 2 chain with a head is walked by
-   *  its keys, so only the seq at hand is read). */
-  function contentAhead(index, seq, vouched) {
-    const ahead = [];
-    for (let next = seq + 1; next <= index.max; next += 1) {
-      if (vouched !== null && next > vouched) break;
-      const candidates = index.entries.get(next);
-      if (candidates === undefined) {
-        if (vouched !== null) break;
+  /** Asks for the node documents of ids (LOG_DOCUMENT_NODES per request, budget.documents requests
+   *  at most, sent together) and keeps what they say in log.nodes. Returns a table from node id to
+   *  "missing" (the backend has none), "rejected" (the document does not verify) or "unasked" (the
+   *  budget was spent) for the nodes that got no judgement. A failed request is noted on run and
+   *  leaves its nodes unasked. */
+  async function learnNodes(turn, log, run, ids, budget) {
+    const left = new Map();
+    const requests = [];
+    for (let at = 0; at < ids.length; at += LOG_DOCUMENT_NODES) {
+      const batch = ids.slice(at, at + LOG_DOCUMENT_NODES);
+      if (budget.documents <= 0) {
+        for (const id of batch) left.set(id, "unasked");
         continue;
       }
-      const taken = vouched === null
-        ? candidates
-        : candidates.filter(function (candidate) { return candidate.parts.format === 1; });
-      if (taken.length === 0) break;
-      for (const candidate of taken) ahead.push(candidate);
-      if (ahead.length >= LOG_STORE_OBJECTS) break;
+      budget.documents -= 1;
+      requests.push({ ids: batch, sent: settled(readDocuments(turn, batch)) });
     }
-    return ahead;
-  }
-
-  /** Verifies one (node, account) chain from the verification point of the ledger (docs/protocol.md
-   *  7.4). The head is the head received for a fresh nonce when the node is alive, and the stored
-   *  final head when the node is gone. A node whose head equals the verification point is verified
-   *  without a listing. summary is the element of the log node query for that node (undefined when
-   *  absent), budgets the keys and bodies this run may still spend, store the state of the store
-   *  reads of this run (a failure changes it). Returns {state, checked, missing, expired, ours,
-   *  cutShort} whose state is verified, pending (a budget ran out, the store could not be read, or
-   *  the store has pages or entries still to confirm) or attention (a gap, a mismatch, or a part
-   *  that cannot be checked); cutShort is true when a budget of the run (time, keys, bodies, or the
-   *  listing pages of this chain) ended the walk before the head: the run is cut short (verifyRun). */
-  async function verifyChain(ledger, id, summary, budgets, keys, store, reads) {
-    const node = ledger.nodes[id];
-    const stored = summary === undefined ? { live: false, final_head: null } : summary;
-    const outcome = { state: "verified", checked: 0, missing: 0, expired: 0, ours: false, cutShort: false };
-    if (node.final !== null && node.checkpoint.seq >= node.final.seq) return outcome;
-    if (!writesToStore(node)) {
-      // A node of a build that wrote no entry to the store has no chain here. A gone one leaves
-      // the ledger; a living one is not walked.
-      if (node.gone_ms !== 0) delete ledger.nodes[id];
-      return outcome;
-    }
-
-    const resolved = await headFor(node, id, stored, reads ? reads.heads.get(id) : undefined);
-    if (resolved.attention) {
-      outcome.state = "attention";
-      return outcome;
-    }
-    const head = resolved.head;
-    if (resolved.final) node.final = { seq: head.seq, hash: head.hash };
-    if (head !== null && head.seq === node.checkpoint.seq && sameBytes(head.hash, node.checkpoint.hash)) {
-      // Nothing was written since the verification point: the listing is not read this run.
-      return outcome;
-    }
-    if (store.state !== "verified") {
-      // The store could not be read earlier in this run, or this env has no store to read: the
-      // chain waits for a run that reads it.
-      outcome.state = "pending";
-      return outcome;
-    }
-    return walkStore(ledger, node, id, head, budgets, keys, store, outcome, reads);
-  }
-
-  /** The head of one chain for this run (docs/protocol.md 7.4 step 1): the final head the ledger
-   *  keeps; otherwise the head a living node signed for a fresh nonce (the status request read ahead
-   *  in reads when the run has one, sent here when the node summary says the node lives); otherwise
-   *  the final head the backend keeps for a gone node. Returns {head, final, attention}: head is null
-   *  when none was obtained (a gone node without a final head), final is true when the head is the
-   *  final head of the backend (the ledger records it), attention is true when a head did not verify.
-   *  The status of a node is used only when the summary says the node lives (the head of a gone node
-   *  is its final head): a status read ahead for a node the summary says is gone is not looked at,
-   *  whatever it answered. A status that fails with anything but node_not_found is thrown (as the
-   *  request itself would be). */
-  async function headFor(node, id, stored, prefetched) {
-    let head = node.final;
-    if (head !== null) return { head: head, final: false, attention: false };
-    let answered = null;
-    if (prefetched !== undefined && stored.live === true) {
-      const outcome = await prefetched.result;
-      if (outcome.ok) {
-        answered = { head: outcome.value.json.head, nonce: prefetched.nonce };
-      } else if (outcome.error && outcome.error.code !== "node_not_found") {
-        throw outcome.error;
+    for (const item of requests) {
+      const outcome = await item.sent;
+      if (!outcome.ok) {
+        noteFailure(turn, run, outcome.error);
+        for (const id of item.ids) left.set(id, outcome.error.kind === "absent" ? "absent" : "unasked");
+        continue;
       }
-    } else if (prefetched === undefined && stored.live === true) {
-      const nonce = native.randomBytes(32);
-      try {
-        const response = await api("POST", "/api/secure/nodes/" + id + "/status", { nonce: nonce });
-        answered = { head: response.json.head, nonce: nonce };
-      } catch (error) {
-        if (error.code !== "node_not_found") throw error;
+      for (const id of item.ids) {
+        const document = outcome.value.get(id);
+        if (document === undefined || document === null) {
+          left.set(id, "missing");
+          continue;
+        }
+        try {
+          const facts = verifyNodeDocument(document, id);
+          log.nodes[id] = { m: facts.measure, p: facts.platform, r: facts.release, f: native.nowMs(), c: 0 };
+        } catch (error) {
+          if (failureCode(error) !== "attestation_failed") throw error;
+          left.set(id, "rejected");
+        }
       }
     }
-    if (answered !== null) {
-      try {
-        return { head: openHead(answered.head, node, id, answered.nonce), final: false, attention: false };
-      } catch (error) {
-        return { head: null, final: false, attention: true };
-      }
-    }
-    if (stored.final_head !== null && stored.final_head !== undefined) {
-      try {
-        return { head: openHead(stored.final_head, node, id, null), final: true, attention: false };
-      } catch (error) {
-        return { head: null, final: false, attention: true };
-      }
-    }
-    return { head: null, final: false, attention: false };
+    return left;
   }
 
-  /** The verification of one chain with the listing of the log store as the index of completeness
-   *  (docs/protocol.md 7.4). Every seq after the verification point up to the vouched end (the seq of
-   *  the head) must have a key that the chain equation links to the hash before it: a use entry of
-   *  format 2 with exactly one such key advances the walk without a read, every other seq (a control
-   *  entry, a seq with two linked keys, a chain nobody vouches for, format 1) is read by content and
-   *  the first object that verifies is the entry. A seq without a linked key below the vouched end
-   *  is a gap (missing). Beyond the vouched end the walk stops (the next run reads from a newer
-   *  head). A listing that starts beyond the seq after the verification point is read from its first
-   *  verifying entry: the entries before it are expired when the verification point, or the entry
-   *  itself, is older than the retention of the store, otherwise missing. For a node found in the
-   *  store only, a prefix that is not a chain is left out. */
-  /** An entry sealed to the key of this account verified on the chain of node. The fact stays with
-   *  a node found in the store only (sealed_ms: the time it was first verified) so that the run
-   *  that marks the node may be a later one than the run that verified the entry: a run cut short
-   *  by its budget leaves the node at its verification point and the next run reads nothing new
-   *  from it (verifyRun). */
-  function sealedToThisKey(node, outcome) {
-    outcome.ours = true;
-    if (node.origin === "store" && node.sealed_ms === 0) node.sealed_ms = native.nowMs();
+  /** Reads and verifies the entries of format 3 that items name ([{parsed, fresh}]: fresh marks a
+   *  control key this device has not judged) and judges them. The documents of the nodes this
+   *  device has no judgement of and the bodies of the entries are requested in one stage
+   *  (budget.documents and budget.bodies requests at most). For every item whose body arrived,
+   *  run.entries receives {parsed, state, verdict, ours, events}: state is ok for a verified entry,
+   *  and signature, fields or open for an object that is not the entry its key names. What the
+   *  judgement finds is written into log:
+   *    a body the backend did not hand out, a body that is not the one the key names, and a key
+   *    of a node without a document that verifies are reads the operator domain held back
+   *    (run.blocked): a node writes its document before it acts, and the listing named the key.
+   *    An object of a node id without a document whose signature is not one of the key that node
+   *    id is, and a body under a key its node did not write for it, are objects someone else put
+   *    there: they are no entries (run.junk) and mark nothing;
+   *    an entry of this key written by a node of a measurement no list has, and a transfer of the
+   *    delegation to such a measurement, are noted (A1);
+   *    a signature of an accepted node that does not verify over the body its key names, an entry
+   *    of this key it signed that does not open, and two bodies it signed for one seq are noted on
+   *    the node (A2).
+   *  A fresh control key that was judged is remembered (markSeen); one whose read was held back or
+   *  cut short is judged again by the next round. */
+  async function readEntries(turn, keys, log, run, items, budget) {
+    if (items.length === 0) return;
+    const unknown = [];
+    for (const item of items) {
+      const id = item.parsed.node;
+      if (nodeVerdict(log.grants, log.nodes, id) === null && unknown.indexOf(id) < 0) unknown.push(id);
+    }
+    const learning = learnNodes(turn, log, run, unknown, budget);
+    const wanted = items.map(function (item) { return item.parsed.key; });
+    const requests = [];
+    for (let at = 0; at < wanted.length && budget.bodies > 0; at += LOG_BODY_KEYS) {
+      budget.bodies -= 1;
+      requests.push(settled(readBodies(turn, wanted.slice(at, at + LOG_BODY_KEYS))));
+    }
+    const left = await learning;
+    const bodies = new Map();
+    for (const sent of requests) {
+      const outcome = await sent;
+      if (!outcome.ok) {
+        noteFailure(turn, run, outcome.error);
+        continue;
+      }
+      outcome.value.forEach(function (value, key) { bodies.set(key, value); });
+    }
+    // The verified entries by node and seq: two of them with two bodies contradict each other.
+    const signedBySeq = new Map();
+    const transfers = [];
+    for (const item of items) {
+      const parsed = item.parsed;
+      const digest = item.fresh ? keyDigest(parsed.key) : "";
+      const verdict = nodeVerdict(log.grants, log.nodes, parsed.node);
+      const entry = bodies.get(parsed.key);
+      const checked = entry === undefined || entry === null ? { body: null, failure: "body" } : checkEntry(parsed, entry);
+      if (verdict === null) {
+        const why = left.get(parsed.node);
+        if ((why !== "missing" && why !== "rejected") || entry === undefined) {
+          run.cut = true;
+          continue;
+        }
+        run.undocumented.add(parsed.node);
+        if (checked.failure === "signature") {
+          // The body its key names, without a signature of the key its node id is: an object
+          // nobody who holds that key wrote. It is no entry, and the screen leaves it out.
+          run.junk.add(parsed.key);
+          if (item.fresh) markSeen(log, digest);
+          continue;
+        }
+        // Whoever holds the key of that node id may have signed this entry, and no document says
+        // what that node is: a node writes its document before it acts, so the document, or the
+        // body that would show the object to be no entry, is held back.
+        run.blocked = true;
+        if (run.detail === "") run.detail = "documents:" + why;
+        continue;
+      }
+      if (entry === undefined) {
+        run.cut = true;
+        continue;
+      }
+      run.bodies += 1;
+      if (checked.failure === "body") {
+        run.blocked = true;
+        if (run.detail === "") run.detail = entry === null ? "bodies:missing" : "bodies:hash";
+        continue;
+      }
+      const record = { parsed: parsed, state: "ok", verdict: verdict, ours: false, events: null };
+      run.entries.set(parsed.key, record);
+      if (item.fresh) markSeen(log, digest);
+      if (checked.failure === "signature") {
+        // The body is the one the key names and the signature of the node does not verify over it.
+        record.state = "signature";
+        if (verdict.state === "accepted") noteConflict(log, parsed.node, verdict);
+        continue;
+      }
+      if (checked.failure === "fields") {
+        // A body the node signed, under a key the node did not write for it: not an entry.
+        record.state = "fields";
+        run.junk.add(parsed.key);
+        continue;
+      }
+      const name = parsed.node + ":" + parsed.seq;
+      const before = signedBySeq.get(name);
+      if (before !== undefined && before !== parsed.body_hash && verdict.state === "accepted") {
+        noteConflict(log, parsed.node, verdict);
+      }
+      signedBySeq.set(name, parsed.body_hash);
+      record.ours = parsed.key_id === keys.keyId;
+      if (record.ours) {
+        record.events = entryEvents(parsed, checked.body, keys);
+        if (record.events === null) {
+          record.state = "open";
+          if (verdict.state === "accepted") noteConflict(log, parsed.node, verdict);
+          continue;
+        }
+        if (verdict.state === "unaccepted") {
+          noteUnaccepted(log, verdict.measure, verdict.release, parsed.node, true);
+        } else if (parsed.letter === "c" && parsed.event === "grant_transferred_out") {
+          const receiver = judgeTransfer(log, record.events[0]);
+          if (receiver !== null) transfers.push({ to: receiver, event: record.events[0] });
+        }
+      }
+      if (parsed.letter === "c") {
+        run.checked += 1;
+        run.verified.push(parsed.tail);
+      }
+    }
+    // The receiving nodes of transfers whose events name no measurement: their documents.
+    if (transfers.length > 0) {
+      const ids = [];
+      for (const transfer of transfers) {
+        if (ids.indexOf(transfer.to) < 0) ids.push(transfer.to);
+      }
+      await learnNodes(turn, log, run, ids, budget);
+      for (const transfer of transfers) {
+        const verdict = nodeVerdict(log.grants, log.nodes, transfer.to);
+        if (verdict === null) noteUnaccepted(log, "node:" + transfer.to, transfer.event.release, transfer.to, true);
+        else if (verdict.state === "unaccepted") {
+          noteUnaccepted(log, verdict.measure, verdict.release, transfer.to, true);
+        }
+      }
+    }
   }
 
-  async function walkStore(ledger, node, id, head, budgets, keys, store, outcome, reads) {
-    let cursor = node.checkpoint;
-    if (head !== null &&
-        (head.seq < cursor.seq || (head.seq === cursor.seq && !sameBytes(head.hash, cursor.hash)))) {
-      outcome.state = "attention";
-      return outcome;
+  /** The control keys of one listing page that a round has still to judge, and the keys of one
+   *  node and seq with two different bodies (their entries are read whether or not they were
+   *  judged before): [{parsed, fresh}]. A key older than the retention of the store is left out
+   *  (its node document may be gone with it). */
+  function freshControl(log, run, listing) {
+    const horizon = native.nowMs() - LOG_RETENTION_DAYS * DAY_MS;
+    const bySeq = new Map();
+    for (const parsed of listing.keys) {
+      const name = parsed.node + ":" + parsed.seq;
+      bySeq.set(name, (bySeq.get(name) || 0) + 1);
     }
-    let index = null;
+    const items = [];
+    for (const parsed of listing.keys) {
+      if (parsed.time_ms < horizon) continue;
+      run.controlKeys += 1;
+      run.nodes.add(parsed.node);
+      const seen = log.seen.set.has(keyDigest(parsed.key));
+      if (!seen) items.push({ parsed: parsed, fresh: true });
+      else if (bySeq.get(parsed.node + ":" + parsed.seq) > 1) items.push({ parsed: parsed, fresh: false });
+    }
+    return items;
+  }
+
+  /** A4 for a listing page read from the start of the control prefix: the keys of the sample this
+   *  device keeps that are within their retention (with a day to spare) and within the range the
+   *  page covers, and are not in the page. The same page is read once more, and a key absent from
+   *  both readings is noted as missing. */
+  async function judgeSample(turn, log, run, listing) {
+    const now = native.nowMs();
+    const expected = log.sample.filter(function (tail) {
+      const age = now - tailTime(tail);
+      if (!(age < (LOG_RETENTION_DAYS - 1) * DAY_MS)) return false;
+      if (!listing.truncated) return true;
+      return listing.keys.length > 0 && tail <= listing.keys[listing.keys.length - 1].tail;
+    });
+    let gone = expected.filter(function (tail) { return !listing.tails.has(tail); });
+    if (gone.length === 0) return;
+    let again = null;
     try {
-      index = await storeIndex(id, cursor.seq, LOG_STORE_PAGES, reads);
-    } catch (error) {
-      if (!isStoreFailure(error)) throw error;
-      storeFailed(store, error);
-      outcome.state = "pending";
-      return outcome;
+      again = (await readListings(turn, [{ prefix: "c", key_marker: "", version_id_marker: "" }]))[0];
+    } catch (failure) {
+      noteFailure(turn, run, failure);
+      return;
     }
-    rememberKeys(id, index.entries);
-    if (node.final !== null && index.max > node.final.seq) {
-      // The store holds entries after the final head of the node.
-      outcome.state = "attention";
-      return outcome;
+    gone = gone.filter(function (tail) { return !again.tails.has(tail); });
+    for (const tail of gone) {
+      const known = log.missing.some(function (item) { return item.key === tail; });
+      if (!known && log.missing.length < LOG_MISSING_KEYS) log.missing.push({ key: tail, found_ms: now });
     }
-    const vouched = head !== null ? head.seq : null;
-    const discovered = node.origin === "store";
-    const headTime = head !== null && head.time_ms !== 0 ? head.time_ms : native.nowMs();
-    const retention = LOG_EXPIRES_DAYS * DAY_MS;
-    const reader = storeReader(reads, budgets);
-    try {
-      if (index.min !== 0 && index.min > cursor.seq + 1) {
-        // The listing begins beyond the seq after the verification point: the entries between are
-        // expired or missing. The landing is the first listed entry that verifies by content.
-        const seqs = Array.from(index.entries.keys()).sort(function (a, b) { return a - b; });
-        let landed = null;
+  }
+
+  // ---- The round and the chains of format 1 and format 2 ----
+
+  /** Puts a chain of format 1 or format 2 among the chains this device follows: the node id, and
+   *  the latest time the node can hold the grant that reached it. */
+  function followChain(log, id, untilMs) {
+    const kept = log.legacy.nodes[id];
+    if (kept === undefined) {
+      log.legacy.nodes[id] = { seq: 0, time_ms: 0, until_ms: untilMs, closed: false };
+      return;
+    }
+    if (untilMs > kept.until_ms) {
+      kept.until_ms = untilMs;
+      kept.closed = false;
+    }
+  }
+
+  /** The part of a round that reads the chains of format 1 and format 2 this device follows: the
+   *  chains of the nodes of releases before LOG_FORMAT_3_FROM that it handed a grant to, and of
+   *  the nodes such a node handed the delegation on to. Each open chain is listed from the seq up
+   *  to which it was read (LEGACY_ROUND_PAGES pages per round), the control entries of the new keys
+   *  are read (LEGACY_ROUND_BODIES per round), and a transfer of the delegation (the event
+   *  grant_transferred_out of this key) is followed: a receiving node whose document verifies with
+   *  a measurement no list has is noted (A1), a receiving node of a release that writes format 3
+   *  has its entries in the listing of format 3, and any other receiving node is a node of the
+   *  release of the giving node (it wrote no node document), whose chain is followed in turn. A
+   *  chain is closed by the first reading that reached its end after the grant of its node ran
+   *  out (LEGACY_CLOSE_SLACK_MS later): a node holds no key after that. The keys read are handed
+   *  to the log screen (rememberKeys). */
+  async function followLegacy(turn, keys, log, run) {
+    const legacy = log.legacy;
+    const now = native.nowMs();
+    for (const id of Object.keys(log.grants)) {
+      const record = log.grants[id];
+      if (logFormatOf(record.release) === 3 || !writesToStore(record.platform, record.release)) continue;
+      followChain(log, id, record.not_after_ms);
+    }
+    let open = Object.keys(legacy.nodes).filter(function (id) { return !legacy.nodes[id].closed; });
+    if (open.length === 0) return;
+    open.sort(function (x, y) { return legacy.nodes[y].until_ms - legacy.nodes[x].until_ms; });
+    if (open.length > LEGACY_NODES) {
+      open = open.slice(0, LEGACY_NODES);
+      run.cut = true;
+    }
+    let bodiesLeft = LEGACY_ROUND_BODIES;
+    const receivers = new Map();
+    for (let pass = 0; pass < LEGACY_ROUND_PAGES && open.length > 0; pass += 1) {
+      const targets = open.map(function (id) {
+        return { node: id, key_marker: listingMarker(id, legacy.nodes[id].seq), version_id_marker: null };
+      });
+      const listings = await legacyListings(turn, targets);
+      const plans = [];
+      const wanted = [];
+      for (let at = 0; at < open.length; at += 1) {
+        const id = open[at];
+        const outcome = listings[at];
+        if (!outcome.ok) {
+          noteFailure(turn, run, outcome.error);
+          continue;
+        }
+        const prefix = accountPrefix() + id + "/";
+        const entries = new Map();
+        for (const version of outcome.value.versions) {
+          const parts = parseStoreKey(version.key, prefix);
+          if (parts === null || parts.seq <= legacy.nodes[id].seq) continue;
+          if (!entries.has(parts.seq)) entries.set(parts.seq, []);
+          entries.get(parts.seq).push({
+            key: version.key, versionId: version.versionId, isLatest: version.isLatest, parts: parts,
+          });
+        }
+        rememberKeys(id, entries);
+        run.nodes.add(id);
+        const seqs = Array.from(entries.keys()).sort(function (a, b) { return a - b; });
+        const plan = {
+          id: id, seqs: seqs, entries: entries, reads: new Map(), stop: 0,
+          more: outcome.value.truncated && outcome.value.nextKeyMarker !== null,
+        };
         for (const seq of seqs) {
-          if (vouched !== null && seq > vouched) break;
-          if (budgets.bodies <= 0 || timeBudgetSpent(budgets)) break;
-          landed = await contentStep(
-            node, id, null, index.entries.get(seq), keys, budgets, reader, contentAhead(index, seq, vouched));
-          if (landed !== null) break;
-        }
-        const beyond = landed !== null &&
-          ((cursor.time_ms !== 0 && headTime - cursor.time_ms > retention) ||
-           headTime - landed.time_ms > retention);
-        if (landed === null && (budgets.bodies <= 0 || timeBudgetSpent(budgets))) {
-          // A budget of the run ran out before a landing was read: the next run reads on.
-          outcome.state = "pending";
-          outcome.cutShort = true;
-        } else if (!beyond) {
-          if (!discovered) {
-            outcome.missing += (landed === null ? nextListedSeq(index, cursor.seq) : landed.seq) - cursor.seq - 1;
-            // A young gap is an entry the node has still to write again (pending); an old one is
-            // an omission.
-            const young = landed !== null && headTime - landed.time_ms < LOG_GAP_GRACE_MS;
-            outcome.state = young ? "pending" : "attention";
+          const candidates = entries.get(seq).slice().sort(function (a, b) {
+            return (b.isLatest ? 1 : 0) - (a.isLatest ? 1 : 0);
+          }).slice(0, 2);
+          const control = candidates.some(function (candidate) {
+            return candidate.parts.format === 1 || candidate.parts.kind === "c";
+          });
+          if (!control) continue;
+          if (bodiesLeft < candidates.length) {
+            // The entries of this round are spent: the chain is read on from here by the next.
+            plan.stop = seq;
+            run.cut = true;
+            break;
           }
-        } else {
-          outcome.expired += landed.seq - cursor.seq - 1;
-          followTransfer(ledger, node, landed.body, landed.events);
-          if (landed.ours) sealedToThisKey(node, outcome);
-          cursor = { seq: landed.seq, hash: landed.hash, time_ms: landed.time_ms };
-          outcome.checked += 1;
+          bodiesLeft -= candidates.length;
+          plan.reads.set(seq, candidates);
+          for (const candidate of candidates) wanted.push(candidate);
         }
+        plans.push(plan);
       }
-      while (outcome.state === "verified" && cursor.seq < index.max) {
-        if (timeBudgetSpent(budgets)) {
-          // The time budget of the run is spent: the walk stops at its cursor (the verification
-          // point moves there below) and the next run walks on from it.
-          outcome.state = "pending";
-          outcome.cutShort = true;
-          break;
+      let objects = new Map();
+      try {
+        for (let at = 0; at < wanted.length; at += LOG_STORE_OBJECTS) {
+          const batch = await legacyObjects(turn, wanted.slice(at, at + LOG_STORE_OBJECTS));
+          batch.forEach(function (value, name) { objects.set(name, value); });
         }
-        const next = cursor.seq + 1;
-        if (vouched !== null && next > vouched) break;
-        const candidates = index.entries.get(next);
-        if (candidates === undefined) {
-          if (discovered) break;
-          const far = nextListedSeq(index, next);
-          outcome.missing += far - next;
-          outcome.state = gapIsYoung(index, far, headTime) ? "pending" : "attention";
-          break;
-        }
-        const linked = candidates.filter(function (candidate) {
-          return candidate.parts.format === 2 &&
-            sameBytes(candidate.parts.entry_hash, chainHash(cursor.hash, candidate.parts));
-        });
-        const legacy = candidates.filter(function (candidate) { return candidate.parts.format === 1; });
-        let step = null;
-        if (linked.length === 1 && linked[0].parts.kind === "u" && vouched !== null) {
-          if (budgets.keys <= 0) {
-            // The keys budget of the run is spent: as the time budget, the walk stops here and the
-            // run is cut short.
-            outcome.state = "pending";
-            outcome.cutShort = true;
+      } catch (failure) {
+        noteFailure(turn, run, failure);
+        objects = null;
+      }
+      const again = [];
+      for (const plan of plans) {
+        const chain = legacy.nodes[plan.id];
+        let reached = chain.seq;
+        let reachedMs = chain.time_ms;
+        let held = false;
+        for (const seq of plan.seqs) {
+          if (plan.stop !== 0 && seq >= plan.stop) {
+            held = true;
             break;
           }
-          budgets.keys -= 1;
-          budgets.progress += 1;
-          const parts = linked[0].parts;
-          step = { seq: next, hash: parts.entry_hash, time_ms: parts.time_ms, ours: parts.key_id === keys.keyId };
-        } else if (linked.length > 0 || legacy.length > 0) {
-          if (budgets.bodies <= 0) {
-            outcome.state = "pending";
-            outcome.cutShort = true;
-            break;
-          }
-          step = await contentStep(
-            node, id, cursor, linked.length > 0 ? linked : legacy, keys, budgets, reader,
-            contentAhead(index, next, vouched));
-          if (step === null) {
-            if (budgets.bodies <= 0) {
-              outcome.state = "pending";
-              outcome.cutShort = true;
-            } else if (vouched !== null) {
-              // Below the vouched end a seq whose objects do not verify is an entry that was
-              // changed or an object someone else put there in the place of one.
-              outcome.state = "attention";
+          const candidates = plan.reads.get(seq);
+          if (candidates !== undefined) {
+            if (objects === null) {
+              held = true;
+              break;
             }
-            // Beyond anything the node vouches for, an object that does not verify is someone
-            // else's and ends the walk without a mark.
+            for (const candidate of candidates) {
+              const signed = objects.get(candidate.key + "\n" + candidate.versionId);
+              const entry = signed === undefined || signed === null
+                ? null : checkLegacyEntry(signed, plan.id, candidate.parts, keys);
+              run.bodies += 1;
+              if (entry === null) continue;
+              run.checked += 1;
+              if (entry.events !== null) {
+                for (const event of entry.events) {
+                  if (event.t === "grant_transferred_out" && typeof event.to === "string" && NODE_ID.test(event.to)) {
+                    receivers.set(event.to, Math.max(receivers.get(event.to) || 0, chain.until_ms));
+                  }
+                }
+              }
+              break;
+            }
+          }
+          reached = seq;
+          const first = plan.entries.get(seq)[0].parts;
+          reachedMs = first.format === 2 ? first.time_ms : reachedMs;
+        }
+        chain.seq = reached;
+        chain.time_ms = reachedMs;
+        if (held) continue;
+        if (plan.more) {
+          again.push(plan.id);
+          continue;
+        }
+        if (now > chain.until_ms + LEGACY_CLOSE_SLACK_MS) chain.closed = true;
+      }
+      open = again;
+    }
+    if (open.length > 0) run.cut = true;
+    if (receivers.size === 0) return;
+    // The receiving nodes this device has no judgement of: their documents, when the backend has
+    // any. A node without one is a node of the release of the giving node.
+    const unknown = [];
+    receivers.forEach(function (untilMs, id) {
+      if (nodeVerdict(log.grants, log.nodes, id) === null) unknown.push(id);
+    });
+    const asked = { documents: 1, bodies: 0 };
+    const left = unknown.length === 0 ? new Map()
+      : await learnNodes(turn, log, run, unknown.slice(0, LOG_DOCUMENT_NODES), asked);
+    receivers.forEach(function (untilMs, id) {
+      const verdict = nodeVerdict(log.grants, log.nodes, id);
+      if (verdict === null) {
+        if (left.get(id) === "unasked") run.cut = true;
+        followChain(log, id, untilMs);
+      } else if (verdict.state === "unaccepted") {
+        noteUnaccepted(log, verdict.measure, verdict.release, id, true);
+      } else if (verdict.format !== 3) {
+        followChain(log, id, untilMs);
+      }
+    });
+  }
+
+  // ---- The state a round publishes ----
+
+  // The state of the log as the last round left it (runtime lifetime; the device keeps it in
+  // log.round, and the executor keeps the published tree).
+  let logState = null;
+
+  function emptyLogState() {
+    return {
+      status: "pending", verified_ms: 0, unverified_nodes: 0, missing: 0, expired: 0,
+      unknown_nodes: 0, newer_release_nodes: 0, store: "pending", store_failure: "", store_failing_ms: 0,
+      program_version: VERSION,
+    };
+  }
+
+  /** The state of the log this device keeps: the one the last round of this program published, or
+   *  the empty state when this program has ended no round on this installation. */
+  function keptLogState() {
+    if (logState !== null) return logState;
+    const round = storedObject(STORE_ROUND);
+    const kept = round.v === VERSION && round.state !== null && typeof round.state === "object" ? round.state : null;
+    logState = emptyLogState();
+    if (kept !== null && (kept.status === "verified" || kept.status === "pending" || kept.status === "attention")) {
+      logState.status = kept.status;
+      for (const name of ["verified_ms", "unverified_nodes", "missing", "unknown_nodes", "newer_release_nodes", "store_failing_ms"]) {
+        logState[name] = whole(kept[name]);
+      }
+      logState.store = typeof kept.store === "string" ? kept.store : "pending";
+      logState.store_failure = typeof kept.store_failure === "string" ? kept.store_failure : "";
+    }
+    return logState;
+  }
+
+  /** Whether a round is due: this program has ended none on this installation, the last one that
+   *  ended verified or attention is LOG_ROUND_INTERVAL_MS old, or the last one ended pending (then
+   *  not sooner than LOG_ROUND_RETRY_MS after it). */
+  function roundDue() {
+    const round = storedObject(STORE_ROUND);
+    const now = native.nowMs();
+    if (round.v !== VERSION) return true;
+    const tried = whole(round.tried_ms);
+    if (round.last !== "verified" && round.last !== "attention") {
+      return now < tried || now - tried >= LOG_ROUND_RETRY_MS;
+    }
+    const done = whole(round.done_ms);
+    return now < done || now - done >= LOG_ROUND_INTERVAL_MS;
+  }
+
+  /** Tells the app the judgement of a round (the bridge primitive securityStatus, in the builds
+   *  that have it): ok for a verified round, attention with one reason per condition that holds,
+   *  and pending for a round that did not complete, unless the value told last is attention (an
+   *  attention is not covered by a round that could not judge). Returns the value now told. */
+  function tellStatus(status, reasons, told) {
+    if (typeof native.securityStatus !== "function") return told;
+    const value = status === "verified" ? "ok" : status;
+    if (value === "pending" && told === "attention") return told;
+    try {
+      native.securityStatus({ status: value, reasons: value === "attention" ? reasons.slice(0, 8) : [] });
+    } catch (error) {
+      if (failureCode(error) === "cancelled") throw error;
+      native.log("security status: " + failureCode(error));
+      return told;
+    }
+    return value;
+  }
+
+  /** Reports the result of one round to the backend (the one way the server learns what the device
+   *  judged). Nothing waits for the answer: a failure is logged when it arrives and changes
+   *  nothing. */
+  function reportRound(state, run, counts, elapsedMs) {
+    const body = {
+      status: state.status, store: state.store, nodes: run.nodes.size, keys_checked: run.checked,
+      bodies_fetched: run.bodies, missing: state.missing, expired: 0, unknown_nodes: state.unknown_nodes,
+      newer_release_nodes: state.newer_release_nodes, elapsed_ms: elapsedMs, program_version: VERSION,
+      store_failure: state.store_failure, unknown_node_ids: counts.heldNodes.slice(0, 16),
+      unaccepted_releases: counts.releases.slice(0, 16), blocked_attempts: counts.blockedRounds,
+      undocumented_nodes: run.undocumented.size, control_keys: run.controlKeys,
+    };
+    if (run.screenMs !== null) body.screen_ms = run.screenMs;
+    settled(api(freeTurn(), "POST", LOG_REPORT_PATH, body, null, LOG_API_TIMEOUT_MS)).then(function (outcome) {
+      try {
+        if (!outcome.ok) native.log("round report: " + failureCode(outcome.error));
+      } catch (error) {
+        // The bridge is closed.
+      }
+    });
+  }
+
+  /** Whether the backend answered a request of this runtime around a round that began at
+   *  startedMs (from LOG_REACH_MS before it): a request of the round that was not answered was
+   *  then held back by the operator domain and not lost with the network of the device. When
+   *  nothing answered in that time, the account query is asked once. */
+  async function reachJudged(turn, startedMs) {
+    if (lastAnswerMs >= startedMs - LOG_REACH_MS) return true;
+    try {
+      await request(turn, "GET", "/api/secure/account", null, null, LOG_API_TIMEOUT_MS);
+      return true;
+    } catch (error) {
+      if (failureCode(error) === "cancelled" || !(turnLeft(turn) > 0)) throw error;
+      return false;
+    }
+  }
+
+  /** One round (docs/protocol.md 7.4). origin is sync (a synchronization started it: the control
+   *  prefix is read, LOG_CONTROL_PAGES listing pages at most) or screen (the log screen started
+   *  it: the first page of the control prefix and of the use prefix are read together, and extra,
+   *  when given, names the further entries the screen wants read along with what the round reads:
+   *  extra(pages) returns [{parsed}]). The steps:
+   *    1 the listing addresses from the backend, each checked before it is called
+   *    2 the control listing from the store. A round reads the listing from its start: an entry a
+   *      node wrote late lies below the entries this device saw before, so the round judges every
+   *      key it has not judged (log.seen) wherever it lies. A listing longer than the pages of one
+   *      round is read on by the next round from where this one stopped (log.resume)
+   *    3 the documents of the nodes this device has no judgement of, and 4 the bodies of the keys
+   *      it has not judged, in one stage (readEntries)
+   *    5 the chains of format 1 and format 2 this device follows (followLegacy)
+   *    6 the judgement, the published state, the report
+   *  A backend that states it has no store of format 3 (the route is absent, or it answers
+   *  log_store_disabled) is read as an environment without entries of format 3, unless this device
+   *  knows otherwise: it handed a grant to a node of a release that writes format 3, or it read
+   *  that store before. Then the answer is a read the operator domain holds back.
+   *  Returns {log, pages: {c, u}, entries, absent}: the published state, the first listing pages
+   *  (null when they were not read), the entries read by key, and whether the environment has no
+   *  store of format 3. */
+  async function runRound(turn, keys, origin, extra) {
+    const started = native.nowMs();
+    const log = loadLog();
+    const run = {
+      origin: origin, detail: "", blocked: false, silent: false, unreachable: false, truncated: false,
+      cut: false, controlKeys: 0, checked: 0, bodies: 0, nodes: new Set(), undocumented: new Set(),
+      verified: [], entries: new Map(), junk: new Set(), screenMs: null,
+    };
+    const budget = { documents: LOG_DOCUMENT_REQUESTS, bodies: origin === "screen" ? LOG_SUMMARY_REQUESTS : LOG_ROUND_BODY_REQUESTS };
+    const pages = { c: null, u: null };
+    let absent = false;
+    let complete = false;
+    // Where this round reads the control listing: from its start, or on from where the round
+    // before stopped (a synchronization only: the screen reads the first page).
+    let place = origin === "sync" && log.resume !== null ? log.resume
+      : { key_marker: "", version_id_marker: "", top: "", until: "", tail: false };
+    const pageLimit = origin === "screen" ? 1 : LOG_CONTROL_PAGES;
+    for (let page = 0; page < pageLimit && !complete; page += 1) {
+      const wanted = [{ prefix: "c", key_marker: place.key_marker, version_id_marker: place.version_id_marker }];
+      if (origin === "screen") wanted.push({ prefix: "u", key_marker: "", version_id_marker: "" });
+      let listings = null;
+      try {
+        listings = await readListings(turn, wanted);
+      } catch (failure) {
+        if (isStoreFailure(failure) && failure.kind === "absent" && turnLeft(turn) > 0) {
+          const known = log.cursor !== "" || log.seen.list.length > 0 || log.resume !== null ||
+            Object.keys(log.grants).some(function (id) { return logFormatOf(log.grants[id].release) === 3; });
+          if (!known) {
+            absent = true;
+            complete = true;
             break;
           }
-          followTransfer(ledger, node, step.body, step.events);
-        } else {
-          // Keys of format 2 only, none of which the chain equation links: the entry of the chain
-          // is not among them (an object someone else put at this seq while the entry of the node
-          // waits to be written, or an omission).
-          if (discovered) break;
-          outcome.missing += 1;
-          outcome.state = gapIsYoung(index, next, headTime) ? "pending" : "attention";
+          run.blocked = true;
+          if (run.detail === "") run.detail = failure.detail.slice(0, 64);
           break;
         }
-        if (vouched !== null && next === vouched && !sameBytes(step.hash, head.hash)) {
-          outcome.state = "attention";
-          break;
-        }
-        if (step.ours) sealedToThisKey(node, outcome);
-        cursor = { seq: next, hash: step.hash, time_ms: step.time_ms };
-        outcome.checked += 1;
+        noteFailure(turn, run, failure);
+        break;
       }
-    } catch (error) {
-      if (!isStoreFailure(error)) throw error;
-      storeFailed(store, error);
-      outcome.state = "pending";
+      const control = listings[0];
+      if (place.key_marker === "") {
+        pages.c = control;
+        if (listings.length > 1) pages.u = listings[1];
+        if (place.top === "" && control.keys.length > 0) place.top = control.keys[0].tail;
+      }
+      const items = freshControl(log, run, control);
+      if (page === 0 && typeof extra === "function") {
+        const named = new Set(items.map(function (item) { return item.parsed.key; }));
+        for (const item of extra(pages)) {
+          if (!named.has(item.parsed.key)) items.push({ parsed: item.parsed, fresh: false });
+        }
+      }
+      await readEntries(turn, keys, log, run, items, budget);
+      if (place.key_marker === "") await judgeSample(turn, log, run, control);
+      const met = place.until !== "" && control.keys.some(function (parsed) { return parsed.tail >= place.until; });
+      if (met || !control.truncated) {
+        if (place.tail) {
+          // The rest of an earlier listing is read: now the keys that arrived above it since.
+          place = { key_marker: "", version_id_marker: "", top: "", until: place.top, tail: false };
+          if (place.until === "") complete = true;
+          continue;
+        }
+        complete = true;
+        break;
+      }
+      place = {
+        key_marker: control.next_key_marker, version_id_marker: control.next_version_id_marker,
+        top: place.top, until: place.until, tail: place.tail,
+      };
     }
-    budgets.fetched += reader.fetched;
-    if (outcome.state === "verified" &&
-        (index.truncated || (vouched !== null && vouched > index.max))) {
-      // The listing of this chain goes on beyond LOG_STORE_PAGES pages (or the head lies beyond
-      // the pages listed): the walk stops at the last listed entry, the run is cut short, and the
-      // next run lists on from the verification point.
-      outcome.state = "pending";
-      outcome.cutShort = true;
+    const readFailed = run.blocked || run.silent || run.unreachable;
+    if (!complete && !readFailed) run.truncated = true;
+    try {
+      await followLegacy(turn, keys, log, run);
+    } catch (failure) {
+      noteFailure(turn, run, failure);
     }
-    node.checkpoint = cursor;
-    anchorDisplay(id, cursor);
-    return outcome;
+    // The judgement.
+    const now = native.nowMs();
+    const blocked = run.blocked || (run.silent && await reachJudged(turn, started));
+    const unreachable = !blocked && (run.unreachable || run.silent);
+    let grace = 0;
+    let established = 0;
+    const releases = [];
+    const heldNodes = [];
+    for (const digest of Object.keys(log.unaccepted)) {
+      const item = log.unaccepted[digest];
+      const node = item !== null && typeof item === "object" && typeof item.node === "string" ? item.node : "";
+      const listed = item === null || typeof item !== "object" ? true
+        : digest.slice(0, 5) === "node:"
+          ? (function () {
+            const verdict = nodeVerdict(log.grants, log.nodes, digest.slice(5));
+            return verdict !== null && verdict.state === "accepted";
+          })()
+          : buildOfMeasure(digest) !== undefined;
+      if (listed) {
+        delete log.unaccepted[digest];
+        continue;
+      }
+      const age = now - whole(item.first_ms);
+      const within = age >= 0 && age < LOG_RELEASE_GRACE_MS;
+      if (item.held !== true && !within) {
+        // A measurement that was listed to this device and never held its key: nothing to judge.
+        if (age >= 30 * DAY_MS) delete log.unaccepted[digest];
+        continue;
+      }
+      if (within) grace += 1;
+      else established += 1;
+      const release = typeof item.release === "string" && item.release !== "" ? item.release.slice(0, 64) : "unknown";
+      if (releases.indexOf(release) < 0) releases.push(release);
+      if (item.held === true && NODE_ID.test(node) && heldNodes.indexOf(node) < 0) heldNodes.push(node);
+    }
+    const conflicts = Object.keys(log.nodes).filter(function (id) { return log.nodes[id].c !== 0; }).length;
+    if (blocked) {
+      if (log.blocked.count === 0 || log.blocked.first_ms === 0 || log.blocked.first_ms > now) log.blocked.first_ms = now;
+      log.blocked.count += 1;
+    } else if (!unreachable) {
+      log.blocked = { first_ms: 0, count: 0 };
+    }
+    const held = log.blocked.count >= LOG_BLOCKED_ROUNDS && now - log.blocked.first_ms >= LOG_BLOCKED_MS;
+    const reasons = [];
+    if (established > 0) reasons.push("unlisted_release");
+    if (conflicts > 0) reasons.push("conflicting_signatures");
+    if (held) reasons.push("verification_blocked");
+    if (log.missing.length > 0) reasons.push("missing_entries");
+    const status = reasons.length > 0 ? "attention"
+      : blocked || unreachable || run.truncated || run.cut || grace > 0 ? "pending" : "verified";
+    const before = keptLogState();
+    const state = {
+      status: status, verified_ms: status === "pending" ? before.verified_ms : now,
+      unverified_nodes: conflicts, missing: log.missing.length, expired: 0, unknown_nodes: established,
+      newer_release_nodes: grace,
+      store: blocked ? "blocked" : unreachable ? "unreachable" : run.truncated ? "truncated" : "verified",
+      store_failure: run.detail, store_failing_ms: log.blocked.first_ms, program_version: VERSION,
+    };
+    // What the device keeps of this round.
+    if (complete && !absent && !readFailed) {
+      if (place.top !== "") log.cursor = place.top;
+      log.resume = null;
+    } else if (run.truncated && origin === "sync") {
+      // A walk toward the end of the listing that the page limit cut: the round that reads its
+      // rest then reads the keys that arrived above its start since (tail).
+      log.resume = {
+        key_marker: place.key_marker, version_id_marker: place.version_id_marker, top: place.top,
+        until: place.until, tail: place.tail || place.until === "",
+      };
+    } else if (run.truncated && log.resume === null && pages.c !== null) {
+      log.resume = {
+        key_marker: pages.c.next_key_marker, version_id_marker: pages.c.next_version_id_marker,
+        top: place.top, until: "", tail: true,
+      };
+    }
+    if (pages.c !== null || run.verified.length > 0) {
+      const horizon = now - (LOG_RETENTION_DAYS - 1) * DAY_MS;
+      const sample = log.sample.concat(run.verified).filter(function (tail, at, all) {
+        return all.indexOf(tail) === at && tailTime(tail) >= horizon;
+      }).sort();
+      log.sample = sample.slice(0, LOG_SAMPLE_KEYS);
+    }
+    const told = tellStatus(status, reasons, typeof log.round.told === "string" && log.round.v === VERSION ? log.round.told : "");
+    saveNodes(log.nodes);
+    storeJson(STORE_UNACCEPTED, log.unaccepted);
+    storeJson(STORE_BLOCKED, log.blocked);
+    storeJson(STORE_SAMPLE, log.sample);
+    storeJson(STORE_SEEN, log.seen.list);
+    storeJson(STORE_MISSING, log.missing);
+    saveLegacy(log.legacy);
+    native.storeSet(STORE_CURSOR, log.cursor === "" ? null : log.cursor);
+    storeJson(STORE_RESUME, log.resume);
+    storeJson(STORE_ROUND, {
+      v: VERSION, tried_ms: now, last: status, told: told, state: state,
+      done_ms: status === "pending" ? (log.round.v === VERSION ? whole(log.round.done_ms) : 0) : now,
+    });
+    logState = state;
+    native.publish({ state: { log: state } });
+    run.elapsedMs = Math.max(0, now - started);
+    run.report = function (screenMs) {
+      run.screenMs = screenMs === undefined ? null : screenMs;
+      reportRound(state, run, { releases: releases, heldNodes: heldNodes, blockedRounds: log.blocked.count },
+        Math.max(0, native.nowMs() - started));
+    };
+    if (origin !== "screen") run.report();
+    return {
+      log: state, pages: pages, entries: run.entries, junk: run.junk, absent: absent, report: run.report,
+    };
+  }
+
+  // The round in flight (null: none). A round that a synchronization asks for while one runs takes
+  // the result of the one that runs.
+  let roundFlight = null;
+
+  /** Asks for a round and waits for it within the turn of the caller. A round runs in a turn of
+   *  its own (LOG_ROUND_LIMIT_MS from its start), one at a time (the round lock). */
+  function requestRound(turn, keys, origin, extra) {
+    if (origin === "sync" && roundFlight !== null) return limited(turn, roundFlight, Infinity, "round");
+    const own = newTurn(LOG_ROUND_LIMIT_MS, "");
+    const flight = roundLock.run(own, function () { return runRound(own, keys, origin, extra); }, true);
+    const ended = function () {
+      if (roundFlight === flight) roundFlight = null;
+    };
+    flight.then(ended, ended);
+    roundFlight = flight;
+    return limited(turn, flight, Infinity, "round");
   }
 
   let formats = null;
@@ -2611,23 +4011,33 @@
 
   /** The display kind of an event (the plaintext of an entry). kind is the kind the definition
    *  chooses its wording by (request, grant_renewed, grant_revoked, connected, disconnected,
-   *  signed_in, used, moved, filled, code, other), action is the action of a request (read,
-   *  send_mail, send_message, payment, delete, change, verify), service is the service id of the
-   *  icon and the name, detail is a value outside the wording (the expiry date, the recipients or
-   *  the mailbox of a mail, the host of a filled site), field is the kind of the filled vault value,
-   *  and method and target describe one request. */
+   *  signed_in, used, moved, filled, code, secret_sent, secret_saved, other), action is the action
+   *  of a request (read, send_mail, send_message, payment, delete, change, verify), service is the
+   *  service id of the icon and the name, detail is a value outside the wording (the expiry date,
+   *  the recipients or the mailbox of a mail, the host a vault value went to, the site of a
+   *  password the vault made), field is the kind of the filled vault value (for a vault secret put
+   *  into a request, the slot; for a value saved by a node, the kind of its record), name is the
+   *  name of a vault secret, and method and target describe one request. A vault secret a node
+   *  put into a request (a provider_request of provider vault) is secret_sent, and a value a node
+   *  saved into the vault (a connection_created of kind vault_secret or vault_password) is
+   *  secret_saved. */
   function describeEvent(event) {
     const kind = event.t;
     const provider = typeof event.provider === "string" ? event.provider : "";
     const shown = {
       kind: "other", action: "", provider: provider, service: provider, detail: "", field: "",
-      method: "", target: "",
+      method: "", target: "", name: "",
     };
     if (kind === "grant_accepted") {
       shown.kind = "grant_renewed";
       shown.detail = formatTime(event.not_after_ms, "date");
     } else if (kind === "grant_revoked") {
       shown.kind = "grant_revoked";
+    } else if (kind === "connection_created" && (event.kind === "vault_secret" || event.kind === "vault_password")) {
+      shown.kind = "secret_saved";
+      shown.field = event.kind;
+      shown.name = typeof event.name === "string" ? event.name : "";
+      shown.detail = typeof event.site === "string" ? event.site : "";
     } else if (kind === "connection_created") {
       shown.kind = "connected";
     } else if (kind === "connection_removed") {
@@ -2640,6 +4050,13 @@
       shown.kind = "used";
     } else if (kind === "grant_transferred_out" || kind === "grant_transferred_in") {
       shown.kind = "moved";
+    } else if (kind === "provider_request" && provider === "vault") {
+      shown.kind = "secret_sent";
+      shown.name = typeof event.name === "string" ? event.name : "";
+      shown.field = typeof event.slot === "string" ? event.slot : "";
+      shown.method = String(event.method);
+      shown.detail = String(event.host);
+      shown.target = String(event.host) + String(event.path);
     } else if (kind === "provider_request") {
       const method = String(event.method);
       const host = String(event.host);
@@ -2658,6 +4075,7 @@
     } else if (kind === "secret_released") {
       shown.kind = "filled";
       shown.field = String(event.field);
+      shown.name = typeof event.name === "string" ? event.name : "";
       shown.detail = originHost(event.origin);
     } else if (kind === "totp_issued") {
       shown.kind = "code";
@@ -2674,7 +4092,8 @@
       id: itemId, time_ms: timeMs, kind: described.kind, action: described.action,
       provider: described.provider, service: described.service,
       context: typeof event.context === "string" ? event.context : "", detail: described.detail,
-      field: described.field, method: described.method, target: described.target, verified: true,
+      field: described.field, method: described.method, target: described.target, name: described.name,
+      verified: true,
     };
   }
 
@@ -2774,7 +4193,7 @@
           ? "" : "ui_image/" + service.image,
         icon_glyph: item.kind === "request" && service !== undefined && service.glyph,
         context: item.context, context_kind: contextKind(item.context),
-        detail: item.detail, field: item.field,
+        detail: item.detail, field: item.field, name: typeof item.name === "string" ? item.name : "",
         count: 1, verified: item.verified,
         requests: item.kind === "request" ? [requestRow(item)] : [],
       });
@@ -2837,22 +4256,30 @@
   }
 
   // ---- The log screen ----
+  //
+  // The screen shows the entries of the account, the latest first: the entries of format 3 from
+  // the two listings of the account (control and use), and below and between them the entries of
+  // the chains of format 1 and format 2. An entry is shown as verified when the signature of the
+  // node of its key verifies over the body its key names, and it is opened with the key of this
+  // account. The first page and the summary are kept on the device, sealed with a key derived
+  // from the master key, and answer the next opening before any request.
 
-  // What the screen read in this runtime (a new runtime starts empty). displayNodes maps a node id
-  // to {candidates: Map<seq, candidate[]>, floor, exhausted, sorted, anchor, linked}: the keys the
+  // The chains of format 1 and format 2 the screen knows keys of (runtime lifetime). displayNodes
+  // maps a node id to {candidates: Map<seq, candidate[]>, floor, exhausted, sorted}: the keys the
   // screen knows, the smallest seq whose listing was read (0 while none was), whether the listing
-  // reached the start of the chain (or everything below is expired), the seqs in descending order
-  // (null when the candidates changed), the verification point of the ledger the keys of the chain
-  // are found from (anchorDisplay) and the keys of the chain found from it (linkedKeys, null until
-  // computed). displayEntries maps "node:seq" to the entry the screen opened {id, seq, time_ms,
-  // items}, at most LOG_DISPLAY_ENTRIES of them (the oldest read leaves first).
+  // reached the start of the chain, and the seqs in descending order (null when the candidates
+  // changed). displayEntries maps "node:seq" to the entry the screen opened {id, time_ms, count,
+  // items}, at most LEGACY_DISPLAY_ENTRIES of them (the oldest read leaves first).
   const displayNodes = new Map();
   const displayEntries = new Map();
+  // The node documents the reads of later pages learned (runtime lifetime; a round keeps its own
+  // in the program store).
+  const pageNodes = Object.create(null);
 
   function displayNode(id) {
     let node = displayNodes.get(id);
     if (node === undefined) {
-      node = { candidates: new Map(), floor: 0, exhausted: false, sorted: null, anchor: null, linked: null };
+      node = { candidates: new Map(), floor: 0, exhausted: false, sorted: null };
       displayNodes.set(id, node);
     }
     return node;
@@ -2867,53 +4294,9 @@
       if (node.floor === 0 || seq < node.floor) node.floor = seq;
     });
     node.sorted = null;
-    node.linked = null;
   }
 
-  /** Makes the verification point of the ledger (checkpoint {seq, hash}) the anchor of the keys the
-   *  screen knows of node id: the keys of the chain are found from it (linkedKeys). */
-  function anchorDisplay(id, checkpoint) {
-    const node = displayNode(id);
-    const same = node.anchor !== null && node.anchor.seq === checkpoint.seq &&
-      sameBytes(node.anchor.hash, checkpoint.hash);
-    if (same) return;
-    node.anchor = { seq: checkpoint.seq, hash: checkpoint.hash };
-    node.linked = null;
-  }
-
-  /** The keys of the chain among the keys the screen knows of a node: a table from seq to the one
-   *  candidate of that seq the chain names. At the anchor (the verification point of the ledger) it
-   *  is the key whose entry hash is the hash of the point; below it, seq by seq, it is the key whose
-   *  entry hash the chain equation of the key above links to (that hash alone is the prev of the
-   *  key above, and the five parts of a key are an input of its hash, so no other key links). The
-   *  walk ends at a seq the screen knows no key of, at a seq no key of format 2 links at, and at
-   *  the start of the chain. A key the table does not name is not a key the app verified: the
-   *  operator domain can add objects under any key, and the screen counts and orders by the keys of
-   *  the chain alone. */
-  function linkedKeys(node) {
-    if (node.linked !== null) return node.linked;
-    const linked = new Map();
-    if (node.anchor !== null && node.anchor.seq > 0) {
-      let above = null;
-      for (let seq = node.anchor.seq; seq >= 1; seq -= 1) {
-        const candidates = node.candidates.get(seq);
-        if (candidates === undefined) break;
-        const found = candidates.find(function (candidate) {
-          if (candidate.parts.format !== 2) return false;
-          return above === null
-            ? sameBytes(candidate.parts.entry_hash, node.anchor.hash)
-            : sameBytes(chainHash(candidate.parts.entry_hash, above.parts), above.parts.entry_hash);
-        });
-        if (found === undefined) break;
-        linked.set(seq, found);
-        above = found;
-      }
-    }
-    node.linked = linked;
-    return linked;
-  }
-
-  /** The seqs the screen knows of node id, the largest first. */
+  /** The seqs the screen knows of a chain, the largest first. */
   function sortedSeqs(node) {
     if (node.sorted === null) {
       node.sorted = Array.from(node.candidates.keys()).sort(function (a, b) { return b - a; });
@@ -2921,204 +4304,153 @@
     return node.sorted;
   }
 
-  /** The candidates of seq among the keys the screen knows: the key of the chain (linkedKeys) first
-   *  when it is known, then the others with the latest version first, so a read tries them in that
-   *  order. */
+  /** The candidates of seq among the keys the screen knows, the latest version first, two at
+   *  most (a write a node repeated adds a version of the same object). */
   function orderedCandidates(node, seq) {
-    const candidates = (node.candidates.get(seq) || []).slice().sort(function (a, b) {
+    return (node.candidates.get(seq) || []).slice().sort(function (a, b) {
       return (b.isLatest ? 1 : 0) - (a.isLatest ? 1 : 0);
-    });
-    const named = linkedKeys(node).get(seq);
-    if (named === undefined) return candidates;
-    return [named].concat(candidates.filter(function (candidate) { return candidate !== named; }));
+    }).slice(0, 2);
   }
 
-  /** The time of the key of seq of node id: the time_ms of a key of format 2, null for a key of
-   *  format 1 (the entry carries the time). */
-  function keyTimeOf(node, seq) {
+  /** The time and the number of events the key of seq names: {time_ms, count} for a key of format
+   *  2, null for a key of format 1 (the entry carries the time). */
+  function keyFacts(node, seq) {
     const candidates = orderedCandidates(node, seq);
-    return candidates.length > 0 && candidates[0].parts.format === 2 ? candidates[0].parts.time_ms : null;
+    if (candidates.length === 0 || candidates[0].parts.format !== 2) return null;
+    return { time_ms: candidates[0].parts.time_ms, count: candidates[0].parts.count };
   }
 
-  /** Reads the keys of node id below the seqs the screen knows: a listing from the key marker of
-   *  seq from = max(0, beforeSeq - LOG_DISPLAY_LIST - 1), continued while its pages end before
-   *  beforeSeq, at most LOG_STORE_PAGES pages. The keys with from < seq < beforeSeq enter the keys
-   *  the screen knows and the floor becomes from + 1. The chain is exhausted when the listing began
-   *  at seq 0 or added no key (everything below is expired). Throws a store failure. */
-  async function loadKeysBefore(id, beforeSeq) {
-    const node = displayNode(id);
-    const prefix = accountPrefix() + id + "/";
-    const from = Math.max(0, beforeSeq - LOG_DISPLAY_LIST - 1);
-    let keyMarker = prefix + seqDigits(from) + "-~";
-    let versionIdMarker = null;
-    let added = 0;
-    for (let page = 0; page < LOG_STORE_PAGES; page += 1) {
-      const listing = await listStorePage(false, id, keyMarker, versionIdMarker);
-      let last = from;
-      for (const version of listing.versions) {
+  /** Lists chains of format 1 and format 2 in one stage: targets are [{id, after, below, probe}]
+   *  (the keys of node id above the seq after; with below, only the keys under that seq). The keys
+   *  enter the keys the screen knows, unless probe is set (a listing that only looks where a chain
+   *  ends). Each target receives last (the largest seq the listing named, after when none) and
+   *  more (whether the listing goes on); a target whose listing failed receives neither. Throws a
+   *  failure that is not one of the store. */
+  async function loadChainKeys(turn, targets) {
+    const listings = await legacyListings(turn, targets.map(function (target) {
+      return { node: target.id, key_marker: listingMarker(target.id, target.after), version_id_marker: null };
+    }));
+    for (let at = 0; at < targets.length; at += 1) {
+      const target = targets[at];
+      const outcome = listings[at];
+      if (!outcome.ok) {
+        if (!isStoreFailure(outcome.error)) throw outcome.error;
+        continue;
+      }
+      const prefix = accountPrefix() + target.id + "/";
+      const entries = new Map();
+      let last = target.after;
+      for (const version of outcome.value.versions) {
         const parts = parseStoreKey(version.key, prefix);
-        if (parts === null) continue;
+        if (parts === null || parts.seq <= target.after) continue;
         if (parts.seq > last) last = parts.seq;
-        if (parts.seq <= from || parts.seq >= beforeSeq) continue;
-        if (!node.candidates.has(parts.seq)) {
-          node.candidates.set(parts.seq, []);
-          added += 1;
-        }
-        node.candidates.get(parts.seq).push({
+        if (target.below !== undefined && parts.seq >= target.below) continue;
+        if (!entries.has(parts.seq)) entries.set(parts.seq, []);
+        entries.get(parts.seq).push({
           key: version.key, versionId: version.versionId, isLatest: version.isLatest, parts: parts,
         });
       }
-      if (!listing.truncated || listing.nextKeyMarker === null || last >= beforeSeq - 1) break;
-      keyMarker = listing.nextKeyMarker;
-      versionIdMarker = listing.nextVersionIdMarker;
+      target.more = outcome.value.truncated && outcome.value.nextKeyMarker !== null;
+      target.last = last;
+      if (target.probe === true) continue;
+      const node = displayNode(target.id);
+      rememberKeys(target.id, entries);
+      if (node.floor === 0 || target.after + 1 < node.floor) node.floor = target.after + 1;
+      // The listing began at the start of the chain, or named nothing under the keys known
+      // (everything below is gone with its retention): there is nothing further down.
+      if (target.after === 0 || (target.below !== undefined && entries.size === 0)) node.exhausted = true;
     }
-    node.sorted = null;
-    node.linked = null;
-    node.floor = from + 1;
-    if (from === 0 || added === 0) node.exhausted = true;
   }
 
-  /** The hash the entry of seq must name as prev when the screen knows it: the zero hash for the
-   *  first entry, the entry hash of the key of the chain at seq - 1 (linkedKeys); null when the key
-   *  of the chain before it is not known (the chain is then the matter of the index verification). */
-  function linkedBefore(node, seq) {
-    if (seq === 1) return { hash: ZERO_HASH };
-    const before = linkedKeys(node).get(seq - 1);
-    return before === undefined ? null : { hash: before.parts.entry_hash };
+  /** Finds the end of a chain the device knows no seq of: listings that only look (probe), from
+   *  seq 0, jumping ahead while the chain goes on and halving the range once a jump passed the
+   *  end, LEGACY_TOP_STEPS at most. Returns the largest seq seen (0 for a chain without keys), or
+   *  -1 when a listing failed or the listings of this call are spent. */
+  async function findChainTop(turn, id, budget) {
+    let known = 0;
+    let high = 0;
+    let jump = 4 * LEGACY_DISPLAY_LIST;
+    let probe = 0;
+    for (let step = 0; step < LEGACY_TOP_STEPS; step += 1) {
+      if (budget.lists <= 0) return -1;
+      budget.lists -= 1;
+      const target = { id: id, after: probe, probe: true };
+      await loadChainKeys(turn, [target]);
+      if (target.last === undefined) return -1;
+      if (target.last > probe) {
+        known = target.last;
+        if (!target.more) return known;
+        if (high !== 0 && high - known <= 1) return known;
+        probe = high === 0 ? known + jump : known + Math.floor((high - known) / 2);
+        if (high === 0) jump *= 4;
+      } else {
+        // Nothing above the probe: the end is at or below it.
+        high = probe;
+        if (high - known <= 1) return known;
+        probe = known + Math.floor((high - known) / 2);
+      }
+    }
+    return known;
   }
 
-  /** The entry of seq of node id as the screen shows it: {id, seq, time_ms, items}. The candidate
-   *  objects are read in the order of orderedCandidates until one verifies: the screen checks the
-   *  signature of the node, the key, the body hash of an entry and, when the key before it is known
-   *  and alone, its prev (linkedBefore). The entries the screen opened are kept for the runtime. */
-  async function displayEntry(ledger, id, seq, keys, reader) {
+  /** The entry of seq of a chain as the screen shows it: {id, time_ms, count, items}, from the
+   *  signed values of its candidate object versions (objects: a table from key and version to the
+   *  signed value). The first candidate that verifies is the entry; when none does, the entry is
+   *  one item that is not verified. null when no candidate was read. The entries the screen opened
+   *  are kept for the runtime. */
+  function legacyEntry(keys, id, seq, objects) {
     const name = id + ":" + seq;
     const kept = displayEntries.get(name);
     if (kept !== undefined) return kept;
     const node = displayNode(id);
-    const signer = ledger.nodes[id] !== undefined ? ledger.nodes[id] : { sign_pk: id };
-    const before = linkedBefore(node, seq);
-    const candidates = orderedCandidates(node, seq);
-    const ahead = [];
-    for (const lower of sortedSeqs(node)) {
-      if (lower >= seq) continue;
-      if (ahead.length >= LOG_DISPLAY_AHEAD) break;
-      for (const candidate of orderedCandidates(node, lower)) ahead.push(candidate);
-    }
     let verified = null;
     let keyTime = 0;
-    for (const candidate of candidates) {
+    let read = false;
+    for (const candidate of orderedCandidates(node, seq)) {
       if (candidate.parts.format === 2 && keyTime === 0) keyTime = candidate.parts.time_ms;
-      const signed = await reader.object(candidate, ahead);
+      const signed = objects.get(candidate.key + "\n" + candidate.versionId);
+      if (signed === undefined) continue;
+      read = true;
       if (signed === null) continue;
-      const checked = checkEntry(signed, signer, id, candidate.parts, before, keys);
-      if (checked.entry !== null) {
-        verified = checked.entry;
-        break;
-      }
+      verified = checkLegacyEntry(signed, id, candidate.parts, keys);
+      if (verified !== null) break;
     }
+    if (!read) return null;
+    const items = openEntryItems(id, seq, verified, keyTime);
     const entry = {
-      id: id, seq: seq, time_ms: verified !== null ? verified.time_ms : keyTime,
-      items: openEntryItems(id, seq, verified, keyTime),
+      id: "2:" + name, time_ms: verified !== null ? verified.time_ms : keyTime, count: items.length, items: items,
     };
-    if (displayEntries.size >= LOG_DISPLAY_ENTRIES) {
+    if (displayEntries.size >= LEGACY_DISPLAY_ENTRIES) {
       displayEntries.delete(displayEntries.keys().next().value);
     }
     displayEntries.set(name, entry);
     return entry;
   }
 
-  /** The time of the entry of seq of node id: the time_ms of its key (format 2), otherwise the
-   *  time_ms of the entry read from the store (format 1). */
-  async function entryTime(ledger, id, seq, keys, reader) {
-    const keyTime = keyTimeOf(displayNode(id), seq);
-    if (keyTime !== null) return keyTime;
-    return (await displayEntry(ledger, id, seq, keys, reader)).time_ms;
+  /** The object versions of the candidates of the seqs given ([{id, seq}]) that the screen has
+   *  not opened, read in batches of LOG_STORE_OBJECTS: a table from key and version to the signed
+   *  value. Throws a store failure. */
+  async function readChainObjects(turn, wanted) {
+    const versions = [];
+    for (const item of wanted) {
+      if (displayEntries.has(item.id + ":" + item.seq)) continue;
+      for (const candidate of orderedCandidates(displayNode(item.id), item.seq)) versions.push(candidate);
+    }
+    const objects = new Map();
+    for (let at = 0; at < versions.length; at += LOG_STORE_OBJECTS) {
+      const batch = await legacyObjects(turn, versions.slice(at, at + LOG_STORE_OBJECTS));
+      batch.forEach(function (value, name) { objects.set(name, value); });
+    }
+    return objects;
   }
 
-  /** The largest seq of node id below startSeq whose entry is before beforeMs, 0 when there is
-   *  none. The keys are read further down the chain while the seqs known are not enough: from the
-   *  floor of the keys known, or, while none is known, from startSeq when it is a seq and from the
-   *  verification point of the ledger otherwise (a chain whose start the ledger knows is
-   *  exhausted). */
-  async function pointerBelow(ledger, id, beforeMs, startSeq, keys, reader) {
-    const node = displayNode(id);
-    for (;;) {
-      for (const seq of sortedSeqs(node)) {
-        if (seq >= startSeq) continue;
-        if ((await entryTime(ledger, id, seq, keys, reader)) < beforeMs) return seq;
-      }
-      if (node.exhausted) return 0;
-      let below = node.floor !== 0 ? node.floor : startSeq;
-      if (below === Infinity) {
-        below = ledger.nodes[id] !== undefined ? ledger.nodes[id].checkpoint.seq + 1 : 1;
-      }
-      if (below <= 1) {
-        node.exhausted = true;
-        return 0;
-      }
-      await loadKeysBefore(id, below);
-    }
-  }
-
-  /** The entries of the screen before beforeMs (every node of ids, the latest first) until their
-   *  events reach limit; the entries of the same millisecond as the last one stay on the same
-   *  page. Returns {entries, items, last_ms, has_more}: the entries read, their items with the
-   *  latest first (the events of one entry in the reverse of their index), the time of the last
-   *  entry and whether an entry before it exists. */
-  async function collectEntries(ledger, ids, keys, beforeMs, limit) {
-    const reader = storeReader();
-    const pointers = new Map();
-    for (const id of ids) {
-      pointers.set(id, await pointerBelow(ledger, id, beforeMs, Infinity, keys, reader));
-    }
-    const entries = [];
-    const items = [];
-    let count = 0;
-    let lastMs = 0;
-    for (;;) {
-      let bestId = null;
-      let bestSeq = 0;
-      let bestTime = -1;
-      for (const id of ids) {
-        const seq = pointers.get(id);
-        if (seq === 0) continue;
-        const time = await entryTime(ledger, id, seq, keys, reader);
-        if (time > bestTime || (time === bestTime && id < bestId)) {
-          bestId = id;
-          bestSeq = seq;
-          bestTime = time;
-        }
-      }
-      if (bestId === null) break;
-      if (count >= limit && bestTime !== lastMs) break;
-      const entry = await displayEntry(ledger, bestId, bestSeq, keys, reader);
-      entries.push(entry);
-      for (let at = entry.items.length - 1; at >= 0; at -= 1) items.push(entry.items[at]);
-      count += entry.items.length;
-      lastMs = bestTime;
-      pointers.set(bestId, await pointerBelow(ledger, bestId, beforeMs, bestSeq, keys, reader));
-    }
-    let hasMore = false;
-    pointers.forEach(function (seq) { if (seq !== 0) hasMore = true; });
-    return { entries: entries, items: items, last_ms: lastMs, has_more: hasMore };
-  }
-
-  /** Anchors the keys the screen knows of every node of ids that the ledger knows at the
-   *  verification point of the ledger (anchorDisplay). */
-  function anchorScreen(ledger, ids) {
-    for (const id of ids) {
-      if (ledger.nodes[id] !== undefined) anchorDisplay(id, ledger.nodes[id].checkpoint);
-    }
-  }
-
-  /** The nodes the screen shows: the nodes of the ledger with a verified entry or found in the store,
-   *  and the nodes the screen knows keys of. */
-  function screenNodes(ledger) {
-    const ids = [];
-    for (const id of Object.keys(ledger.nodes)) {
-      const node = ledger.nodes[id];
-      if (node.checkpoint.seq > 0 || node.origin === "store") ids.push(id);
+  /** The nodes whose chains of format 1 and format 2 the screen shows: the chains this device
+   *  follows, the node prefixes the node discovery listing named, and the nodes the screen knows
+   *  keys of. */
+  function chainNodes(cache) {
+    const ids = Object.keys(loadLegacy().nodes);
+    for (const id of cache.found) {
+      if (ids.indexOf(id) < 0) ids.push(id);
     }
     displayNodes.forEach(function (node, id) {
       if (ids.indexOf(id) < 0 && node.candidates.size > 0) ids.push(id);
@@ -3126,46 +4458,262 @@
     return ids;
   }
 
-  // ---- The summary of the last LOG_SUMMARY_DAYS days ----
+  /** What the device knows of the end of a chain the screen has not listed: {seq, time_ms} from
+   *  the kept screen or from the chains this device follows; null when nothing is known. */
+  function chainHint(cache, legacy, id) {
+    const kept = cache.tops[id];
+    const followed = legacy.nodes[id];
+    if (kept !== undefined && (followed === undefined || kept.seq >= followed.seq)) return kept;
+    return followed === undefined ? null : { seq: followed.seq, time_ms: followed.time_ms };
+  }
 
-  // The summary tally: what this device counted of the entries of the window of the last
-  // LOG_SUMMARY_DAYS days, kept in the device store under LOG_SUMMARY_STORE_KEY (a device counts for
-  // itself: the ledger is synchronized between the devices of an account, the tally is not).
-  // buckets maps the start of an hour (ms, as a decimal string) to the counts of the events of that
-  // hour {reads, sends, changes, entries, providers} (the shape countInto fills, plus the entries
-  // counted into the bucket); nodes maps a node id to the range {lo, hi} of the seqs of that node
-  // whose entries were counted (lo is hi + 1 while none was). An entry is counted once, each of
-  // its events into the bucket of the time of the event; an entry the device cannot open (another
-  // key) adds nothing but is passed over like the others.
-  const SUMMARY_BUCKET_MS = 3600000;
+  /** The next step of one chain for a page of entries before beforeMs, below the seq pointer:
+   *    {step: "entry", seq, time, count}  its next entry, with the time and the number of events
+   *                                       its key names (for a chain of format 1, whose keys name
+   *                                       no time, of the entry the screen opened)
+   *    {step: "top", hint, time}          the chain is not listed yet: time is the time the
+   *                                       device knows of its end (Infinity when it knows none)
+   *    {step: "below", time}              the keys listed are used up and the chain goes on below
+   *                                       them: time is the time of the lowest key listed
+   *    {step: "open", seqs, time}         a chain of format 1 whose next entries are not opened
+   *  time is the latest time the next entry of the chain can have. null when the chain has no
+   *  entry left for the page. */
+  function nextOfChain(cache, legacy, id, pointer, beforeMs) {
+    const node = displayNode(id);
+    if (node.candidates.size === 0) {
+      if (node.exhausted) return null;
+      const hint = chainHint(cache, legacy, id);
+      return { id: id, step: "top", hint: hint, time: hint === null || hint.time_ms === 0 ? Infinity : hint.time_ms };
+    }
+    const seqs = sortedSeqs(node);
+    let lowest = Infinity;
+    const unopened = [];
+    for (const seq of seqs) {
+      if (seq >= pointer) continue;
+      const facts = keyFacts(node, seq);
+      if (facts !== null) {
+        lowest = facts.time_ms;
+        if (facts.time_ms < beforeMs) return { id: id, step: "entry", seq: seq, time: facts.time_ms, count: facts.count };
+        continue;
+      }
+      const opened = displayEntries.get(id + ":" + seq);
+      if (opened === undefined) {
+        unopened.push(seq);
+        if (unopened.length >= LOG_SCREEN_EVENTS) break;
+        continue;
+      }
+      if (unopened.length > 0) break;
+      lowest = opened.time_ms;
+      if (opened.time_ms < beforeMs) return { id: id, step: "entry", seq: seq, time: opened.time_ms, count: 1 };
+    }
+    if (unopened.length > 0) {
+      const hint = cache.tops[id];
+      const bound = lowest !== Infinity ? lowest : hint !== undefined && hint.time_ms !== 0 ? hint.time_ms : Infinity;
+      return { id: id, step: "open", seqs: unopened, time: bound };
+    }
+    if (!node.exhausted && node.floor > 1) return { id: id, step: "below", time: lowest };
+    return null;
+  }
 
-  function loadSummaryTally() {
-    const kept = native.storeGet(LOG_SUMMARY_STORE_KEY);
-    if (kept !== null) {
-      try {
-        const tally = JSON.parse(kept);
-        if (tally !== null && typeof tally === "object" && tally.v === 1 &&
-            tally.buckets !== null && typeof tally.buckets === "object" &&
-            tally.nodes !== null && typeof tally.nodes === "object") {
-          return tally;
+  /** The entries of the chains of format 1 and format 2 before beforeMs, the latest first, until
+   *  their events reach limit or the next one is not later than floorMs (0: no such bound; the
+   *  entries of the same millisecond as the last one stay on the page). The chains are merged by
+   *  the times their keys name; a chain the screen has not listed takes part with the time the
+   *  device knows of its end and is listed when its turn comes, so a chain older than the page
+   *  costs no request. budget bounds the listings of this call (lists). Returns {entries, more}:
+   *  more says that entries before the last one exist or may exist. Throws a store failure. */
+  async function chainPage(turn, keys, cache, beforeMs, limit, floorMs, budget) {
+    const legacy = loadLegacy();
+    const ids = chainNodes(cache);
+    const pointers = new Map();
+    const done = new Set();
+    const chosen = [];
+    let count = 0;
+    let lastMs = 0;
+    let more = false;
+    let opens = 2;
+    const turns = limit + 4 * ids.length + 3 * LEGACY_SCREEN_LISTS + 16;
+    let round = 0;
+    for (; round < turns; round += 1) {
+      let best = null;
+      for (const id of ids) {
+        if (done.has(id)) continue;
+        const next = nextOfChain(cache, legacy, id, pointers.has(id) ? pointers.get(id) : Infinity, beforeMs);
+        if (next === null) {
+          done.add(id);
+          continue;
         }
-      } catch (error) {
-        // A value that is not a tally starts a new one.
+        if (best === null || next.time > best.time || (next.time === best.time && next.id < best.id)) best = next;
+      }
+      if (best === null) break;
+      const under = floorMs > 0 && best.time <= floorMs;
+      if (best.step === "entry") {
+        if (under || (count >= limit && best.time !== lastMs)) {
+          more = true;
+          break;
+        }
+        chosen.push(best);
+        count += best.count;
+        lastMs = best.time;
+        pointers.set(best.id, best.seq);
+        continue;
+      }
+      // The chain is listed or opened before its next entry is known; best.time bounds the time of
+      // that entry from above. A chain that lies before this page is left for a later page.
+      if (under || (count >= limit && best.time < lastMs)) {
+        more = true;
+        done.add(best.id);
+        continue;
+      }
+      const node = displayNode(best.id);
+      if (best.step === "open") {
+        if (opens <= 0) {
+          more = true;
+          break;
+        }
+        opens -= 1;
+        const objects = await readChainObjects(turn, best.seqs.map(function (seq) { return { id: best.id, seq: seq }; }));
+        for (const seq of best.seqs) {
+          if (legacyEntry(keys, best.id, seq, objects) === null) {
+            displayEntries.set(best.id + ":" + seq, {
+              id: "2:" + best.id + ":" + seq, time_ms: 0, count: 1, items: openEntryItems(best.id, seq, null, 0),
+            });
+          }
+        }
+        const top = displayEntries.get(best.id + ":" + sortedSeqs(node)[0]);
+        if (top !== undefined) cache.tops[best.id] = { seq: sortedSeqs(node)[0], time_ms: top.time_ms };
+        continue;
+      }
+      if (budget.lists <= 0) {
+        more = true;
+        break;
+      }
+      if (best.step === "top") {
+        const top = best.hint === null ? await findChainTop(turn, best.id, budget) : best.hint.seq;
+        const target = { id: best.id, after: Math.max(0, top - LEGACY_DISPLAY_LIST) };
+        if (top >= 0 && budget.lists > 0) {
+          budget.lists -= 1;
+          await loadChainKeys(turn, [target]);
+        }
+        if (target.last === undefined) {
+          more = true;
+          done.add(best.id);
+          continue;
+        }
+        if (node.candidates.size === 0) node.exhausted = true;
+      } else {
+        budget.lists -= 1;
+        const below = node.floor;
+        const target = { id: best.id, after: Math.max(0, below - LEGACY_DISPLAY_LIST - 1), below: below };
+        await loadChainKeys(turn, [target]);
+        if (target.last === undefined) {
+          more = true;
+          done.add(best.id);
+          continue;
+        }
+      }
+      const seqs = sortedSeqs(node);
+      if (seqs.length > 0) {
+        const facts = keyFacts(node, seqs[0]);
+        if (facts !== null) cache.tops[best.id] = { seq: seqs[0], time_ms: facts.time_ms };
       }
     }
-    return { v: 1, buckets: {}, nodes: {} };
+    if (round >= turns) more = true;
+    const objects = await readChainObjects(turn, chosen);
+    const entries = [];
+    for (const item of chosen) {
+      const entry = legacyEntry(keys, item.id, item.seq, objects);
+      if (entry !== null) entries.push(entry);
+    }
+    return { entries: entries, more: more };
   }
 
-  function saveSummaryTally(tally) {
-    native.storeSet(LOG_SUMMARY_STORE_KEY, JSON.stringify(tally));
+  // ---- The kept screen ----
+
+  function emptyTally() {
+    return { buckets: {}, top: "", floor: "", chains: {} };
   }
 
-  /** The start of the window of the summary: LOG_SUMMARY_DAYS before now. */
+  function emptyCache() {
+    return { v: 1, saved_ms: 0, entries: [], has_more: false, tally: emptyTally(), tops: {}, found: [], found_ms: 0 };
+  }
+
+  function cacheAad(keys) {
+    return encode(utf8(purpose("log-cache") + "\n" + userId() + "\n" + keys.keyId));
+  }
+
+  /** The kept screen of this device and key: the entries of the first page it showed last, the
+   *  summary tally, and what it knows of the chains of format 1 and format 2. The value names
+   *  services and addresses, so the program store holds it sealed with a key derived from the
+   *  master key (ChaCha20-Poly1305, a fresh nonce). A value of another key, or one that does not
+   *  open, is no kept screen. */
+  function loadCache(keys) {
+    const cache = emptyCache();
+    const sealed = storedJson(STORE_CACHE, null);
+    if (sealed === null || typeof sealed !== "object" || sealed.key_id !== keys.keyId ||
+        typeof sealed.nonce !== "string" || typeof sealed.ct !== "string") {
+      return cache;
+    }
+    let kept = null;
+    try {
+      kept = JSON.parse(text(decode(native.aeadOpen({
+        alg: "chacha20poly1305", key: keys.cacheKey, nonce: sealed.nonce, aad: cacheAad(keys), ciphertext: sealed.ct,
+      }))));
+    } catch (error) {
+      return cache;
+    }
+    if (kept === null || typeof kept !== "object" || kept.v !== 1) return cache;
+    cache.saved_ms = whole(kept.saved_ms);
+    cache.has_more = kept.has_more === true;
+    for (const entry of Array.isArray(kept.entries) ? kept.entries : []) {
+      if (entry !== null && typeof entry === "object" && typeof entry.id === "string" && Array.isArray(entry.items)) {
+        cache.entries.push({ id: entry.id, time_ms: whole(entry.time_ms), count: whole(entry.count), items: entry.items });
+      }
+    }
+    const tally = kept.tally;
+    if (tally !== null && typeof tally === "object" && tally.buckets !== null && typeof tally.buckets === "object") {
+      cache.tally = {
+        buckets: tally.buckets, top: typeof tally.top === "string" ? tally.top : "",
+        floor: typeof tally.floor === "string" ? tally.floor : "",
+        chains: tally.chains !== null && typeof tally.chains === "object" ? tally.chains : {},
+      };
+    }
+    const tops = kept.tops !== null && typeof kept.tops === "object" ? kept.tops : {};
+    for (const id of Object.keys(tops)) {
+      if (NODE_ID.test(id) && tops[id] !== null && typeof tops[id] === "object") {
+        cache.tops[id] = { seq: whole(tops[id].seq), time_ms: whole(tops[id].time_ms) };
+      }
+    }
+    for (const id of Array.isArray(kept.found) ? kept.found : []) {
+      if (typeof id === "string" && NODE_ID.test(id) && cache.found.indexOf(id) < 0) cache.found.push(id);
+    }
+    cache.found_ms = whole(kept.found_ms);
+    return cache;
+  }
+
+  function saveCache(keys, cache) {
+    const nonce = native.randomBytes(12);
+    const ct = native.aeadSeal({
+      alg: "chacha20poly1305", key: keys.cacheKey, nonce: nonce, aad: cacheAad(keys),
+      plaintext: encode(utf8(JSON.stringify(cache))),
+    });
+    storeJson(STORE_CACHE, { v: 1, key_id: keys.keyId, nonce: nonce, ct: ct });
+  }
+
+  // ---- The summary of the last LOG_SUMMARY_DAYS days ----
+
+  // The summary tally: what this device counted of the entries of the window, kept with the kept
+  // screen. buckets maps the start of an hour (ms, as a decimal string) to the counts of the
+  // events of that hour {reads, sends, changes, entries, providers}; top and floor are the tails
+  // of the latest and the earliest key of format 3 counted (every key between them was counted);
+  // chains maps a node id to the range {lo, hi} of the seqs of its chain of format 2 whose entries
+  // were counted. An entry is counted once, each of its events into the bucket of its time.
+  const SUMMARY_BUCKET_MS = 3600000;
+
   function summarySince(now) {
     return now - LOG_SUMMARY_DAYS * DAY_MS;
   }
 
-  /** The start of the hour of ms (the key of a bucket). */
   function summaryHour(ms) {
     return Math.floor(ms / SUMMARY_BUCKET_MS) * SUMMARY_BUCKET_MS;
   }
@@ -3174,22 +4722,22 @@
   function pruneSummary(tally, since) {
     const floor = summaryHour(since);
     for (const key of Object.keys(tally.buckets)) {
-      if (Number(key) < floor) delete tally.buckets[key];
+      if (!(Number(key) >= floor)) delete tally.buckets[key];
     }
   }
 
   function summaryBucket(tally, ms) {
     const key = String(summaryHour(ms));
     let bucket = tally.buckets[key];
-    if (bucket === undefined) {
+    if (bucket === undefined || bucket === null || typeof bucket !== "object" || !Array.isArray(bucket.providers)) {
       bucket = { reads: 0, sends: 0, changes: 0, entries: 0, providers: [] };
       tally.buckets[key] = bucket;
     }
     return bucket;
   }
 
-  /** Counts one entry the screen opened (displayEntry) into the tally: the entry into the bucket
-   *  of its time and every item of it into the bucket of the time of the item. */
+  /** Counts one opened entry into the tally: the entry into the bucket of its time and every item
+   *  of it into the bucket of the time of the item. */
   function countEntryInto(tally, entry) {
     summaryBucket(tally, entry.time_ms).entries += 1;
     for (const item of entry.items) countInto(summaryBucket(tally, item.time_ms), item);
@@ -3200,26 +4748,28 @@
     const floor = summaryHour(since);
     let entries = 0;
     for (const key of Object.keys(tally.buckets)) {
-      if (Number(key) >= floor) entries += tally.buckets[key].entries;
+      if (Number(key) >= floor) entries += whole(tally.buckets[key].entries);
     }
     return entries;
   }
 
   /** The summary of the window from the tally {reads, sends, changes, providers_text, truncated}:
-   *  the sums of the buckets from since, the providers in the order of their latest use (the
-   *  buckets are merged from the latest), and truncated as given (whether entries of the window
-   *  remain to be counted: the screen shows the counts with a plus). */
+   *  the sums of the buckets from since, the providers in the order of their latest use, and
+   *  truncated as given (whether entries of the window are not counted: the screen shows the
+   *  counts with a plus). null when nothing was ever counted and nothing remains to count. */
   function summaryResult(tally, since, truncated) {
     const floor = summaryHour(since);
     const hours = Object.keys(tally.buckets).map(Number).filter(function (hour) { return hour >= floor; });
+    if (hours.length === 0 && !truncated) return null;
     hours.sort(function (a, b) { return b - a; });
     const total = { reads: 0, sends: 0, changes: 0, providers: [] };
     for (const hour of hours) {
-      const bucket = tally.buckets[String(hour)];
-      total.reads += bucket.reads;
-      total.sends += bucket.sends;
-      total.changes += bucket.changes;
+      const bucket = summaryBucket(tally, hour);
+      total.reads += whole(bucket.reads);
+      total.sends += whole(bucket.sends);
+      total.changes += whole(bucket.changes);
       for (const used of bucket.providers) {
+        if (used === null || typeof used !== "object" || !Array.isArray(used.services)) continue;
         let merged = null;
         for (const entry of total.providers) {
           if (entry.provider === used.provider) merged = entry;
@@ -3239,221 +4789,646 @@
     };
   }
 
-  /** Reads, for every node of ids, the keys of the window (the entries since since) the screen does
-   *  not know yet: down the chain from the verification point until a key older than since or the
-   *  start of the chain, at most two listings per node and call. */
-  async function loadSummaryKeys(ledger, ids, since) {
-    for (const id of ids) {
-      const node = displayNode(id);
-      for (let round = 0; round < 2; round += 1) {
-        if (node.exhausted) break;
-        const seqs = sortedSeqs(node);
-        if (seqs.length > 0) {
-          const oldest = keyTimeOf(node, seqs[seqs.length - 1]);
-          if (oldest === null || oldest < since) break;
-        }
-        const start = node.floor !== 0 ? node.floor
-          : ledger.nodes[id] !== undefined ? ledger.nodes[id].checkpoint.seq + 1 : 1;
-        if (start <= 1) {
-          node.exhausted = true;
-          break;
-        }
-        await loadKeysBefore(id, start);
-      }
+  /** The use keys of format 3 of the window that the tally has not counted, from the first listing
+   *  page of the use prefix: the keys later than tally.top (the one nearest to it first) and the
+   *  keys earlier than tally.floor (the one nearest to it first), room of them at most. When more
+   *  keys are later than tally.top than LOG_SUMMARY_ENTRIES (a long absence, a very active
+   *  account), the tally starts over from the latest key. Returns {above, below, reset}. */
+  function summaryKeys(tally, listing, since, room) {
+    const inWindow = listing.keys.filter(function (parsed) { return parsed.time_ms >= since; });
+    let above = tally.top === "" ? [] : inWindow.filter(function (parsed) { return parsed.tail < tally.top; });
+    let below = tally.top === "" ? inWindow : inWindow.filter(function (parsed) { return parsed.tail > tally.floor; });
+    let reset = false;
+    if (above.length > LOG_SUMMARY_ENTRIES) {
+      reset = true;
+      above = [];
+      below = inWindow;
     }
+    above = above.slice().reverse().slice(0, room);
+    below = below.slice(0, Math.max(0, room - above.length));
+    return { above: above, below: below, reset: reset };
   }
 
-  // The summary tally of this runtime (loaded from the device store at its first use and written
-  // after every step of the count) and whether the count goes on apart from the procedure calls.
-  let summaryState = null;
-  let summaryRunning = false;
+  // ---- The pages of the screen ----
 
-  function summaryTally() {
-    if (summaryState === null) summaryState = loadSummaryTally();
-    return summaryState;
+  /** The items of one entry of format 3 the screen read (record: what readEntries left for its
+   *  key, undefined when the entry was not read): {id, time_ms, count, items}. An entry that was
+   *  not read, or whose object is not the entry its key names, is one item that is not verified;
+   *  an entry of another key_id (the delegation of another key) is one item that is not opened. */
+  function entryOfRecord(parsed, record) {
+    const base = parsed.node + ":" + parsed.seq;
+    let items = null;
+    if (record === undefined || record.state !== "ok") {
+      items = openEntryItems(parsed.node, parsed.seq, null, parsed.time_ms);
+    } else if (!record.ours) {
+      items = openEntryItems(parsed.node, parsed.seq, { time_ms: parsed.time_ms, events: null }, parsed.time_ms);
+    } else {
+      items = record.events.map(function (event, index) {
+        const time = whole(event.time_ms);
+        return eventItem(base + ":" + index, time === 0 ? parsed.time_ms : time, event);
+      });
+    }
+    return { id: "3:" + parsed.tail, time_ms: parsed.time_ms, count: parsed.count, items: items };
   }
 
-  /** Whether entries of the window of node id are not counted: a key above the counted range, the
-   *  key below the range being in the window (its time since or later, or a key of format 1), or
-   *  keys below the range not read yet. */
-  function summaryUncounted(tally, id, since) {
-    const node = displayNode(id);
-    const seqs = sortedSeqs(node);
-    const range = tally.nodes[id];
-    if (range === undefined) return seqs.length > 0;
-    if (seqs.length > 0 && seqs[0] > range.hi) return true;
-    let next = 0;
-    for (const seq of seqs) {
-      if (seq < range.lo) {
-        next = seq;
+  /** The keys of format 3 before beforeMs that the two listing pages name, the latest first, until
+   *  their events reach limit (the keys of the same millisecond as the last one stay on the page).
+   *  Only the range both listings cover is used: below the last key of a listing that goes on, the
+   *  other listing may hold later keys. Returns {chosen, more}: more says that keys before the last
+   *  chosen one exist or may exist. */
+  function choosePage(pages, beforeMs, limit) {
+    const lists = [pages.c, pages.u].filter(function (listing) { return listing !== null; });
+    let bound = null;
+    for (const listing of lists) {
+      if (!listing.truncated || listing.keys.length === 0) continue;
+      const last = listing.keys[listing.keys.length - 1].tail;
+      if (bound === null || last < bound) bound = last;
+    }
+    let merged = [];
+    for (const listing of lists) merged = merged.concat(listing.keys);
+    merged = merged.filter(function (parsed) {
+      return parsed.time_ms < beforeMs && (bound === null || parsed.tail <= bound);
+    });
+    merged.sort(function (a, b) { return a.tail < b.tail ? -1 : a.tail > b.tail ? 1 : 0; });
+    const chosen = [];
+    let count = 0;
+    let at = 0;
+    for (; at < merged.length; at += 1) {
+      const parsed = merged[at];
+      if (count >= limit && parsed.time_ms !== chosen[chosen.length - 1].time_ms) break;
+      chosen.push(parsed);
+      count += parsed.count;
+    }
+    return { chosen: chosen, more: at < merged.length || bound !== null, count: count };
+  }
+
+  /** Merges the entries of format 3 and the entries of the chains of format 1 and format 2 of one
+   *  page by time, the latest first, until their events reach limit (the entries of the same
+   *  millisecond as the last one stay on the page). Returns {entries, items, last_ms, has_more}:
+   *  items are the items of the entries with the latest first (the events of one entry in the
+   *  reverse of their index). */
+  function mergePage(first, second, limit, more) {
+    const all = first.concat(second).sort(function (a, b) { return b.time_ms - a.time_ms; });
+    const entries = [];
+    const items = [];
+    let count = 0;
+    let lastMs = 0;
+    let left = false;
+    for (const entry of all) {
+      if (count >= limit && entry.time_ms !== lastMs) {
+        left = true;
         break;
       }
+      entries.push(entry);
+      for (let at = entry.items.length - 1; at >= 0; at -= 1) items.push(entry.items[at]);
+      count += entry.items.length;
+      lastMs = entry.time_ms;
     }
-    if (next === 0) return !node.exhausted;
-    const time = keyTimeOf(node, next);
-    return time === null || time >= since;
+    return { entries: entries, items: items, last_ms: lastMs, has_more: left || more };
   }
 
-  /** Counts up to max entries of the window (since) into the tally over the nodes of ids and
-   *  returns {truncated, remaining}: whether entries of the window are not counted
-   *  (summaryUncounted: the screen shows the counts with a plus) and whether the count goes on
-   *  (entries above a range, or entries not counted while the window holds fewer than
-   *  LOG_SUMMARY_ENTRIES counted entries). For each node the entries above
-   *  the counted range come first, the oldest of them first (the range stays one range), then the
-   *  entries below it, the newest first, reading more keys down the chain when the keys known end
-   *  above since; a seq without a key (a gap) is passed over. A node the tally has no range for
-   *  starts at its newest key and descends; when the keys above the range of a node outnumber
-   *  LOG_SUMMARY_ENTRIES (a long absence, a very active account) the tally is emptied and every
-   *  node starts over at its newest key, so that the window counts the newest entries. The descent
-   *  stops when the window holds LOG_SUMMARY_ENTRIES counted entries. An entry older than since
-   *  (the time of its key) is passed over without being read and ends the descent. Throws a store
-   *  failure. */
-  async function summaryStep(ledger, ids, keys, tally, since, max) {
-    const reader = storeReader();
-    for (const id of ids) {
-      const seqs = sortedSeqs(displayNode(id));
-      const range = tally.nodes[id];
-      if (seqs.length > 0 && range !== undefined && seqs[0] - range.hi > LOG_SUMMARY_ENTRIES) {
+  /** The key marker of a listing of format 3 that begins below the time beforeMs: every key of an
+   *  entry of that millisecond or later sorts before it. The empty string for no bound. */
+  function pageMarker(letter, beforeMs) {
+    if (beforeMs === Infinity) return "";
+    return entryPrefix(letter) + rtimeDigits(beforeMs) + "~";
+  }
+
+  /** One later page of the screen: the entries before beforeMs, read without a round. The two
+   *  listings of format 3 are read from the marker of that time and the entries of the page from
+   *  the backend, each verified as a round verifies it; what the page finds changes no kept
+   *  judgement (the rounds judge). The entries of the chains of format 1 and format 2 are merged
+   *  in. Returns the page of mergePage. */
+  async function readPage(turn, keys, cache, beforeMs, limit) {
+    let chosen = { chosen: [], more: false, count: 0 };
+    const records = new Map();
+    const junk = new Set();
+    let unread = false;
+    try {
+      const listings = await readListings(turn, [
+        { prefix: "c", key_marker: pageMarker("c", beforeMs), version_id_marker: "" },
+        { prefix: "u", key_marker: pageMarker("u", beforeMs), version_id_marker: "" },
+      ]);
+      chosen = choosePage({ c: listings[0], u: listings[1] }, beforeMs, limit);
+      const log = loadLog();
+      for (const id of Object.keys(pageNodes)) {
+        if (log.nodes[id] === undefined) log.nodes[id] = pageNodes[id];
+      }
+      const run = {
+        detail: "", blocked: false, silent: false, unreachable: false, cut: false, checked: 0, bodies: 0,
+        nodes: new Set(), undocumented: new Set(), verified: [], entries: records, junk: junk,
+      };
+      const wanted = chosen.chosen.slice(0, LOG_SCREEN_BODIES).map(function (parsed) { return { parsed: parsed, fresh: false }; });
+      await readEntries(turn, keys, log, run, wanted, { documents: 1, bodies: 1 });
+      for (const id of Object.keys(log.nodes)) pageNodes[id] = log.nodes[id];
+    } catch (failure) {
+      if (!isStoreFailure(failure) || !(turnLeft(turn) > 0)) throw failure;
+      if (failure.kind !== "absent") unread = true;
+    }
+    if (unread && chosen.chosen.length === 0) throw native.error("log_store_unreachable", "log screen");
+    const first = chosen.chosen.filter(function (parsed) { return !junk.has(parsed.key); })
+      .map(function (parsed) { return entryOfRecord(parsed, records.get(parsed.key)); });
+    const floorMs = chosen.count >= limit && first.length > 0 ? first[first.length - 1].time_ms : 0;
+    let chains = { entries: [], more: false };
+    try {
+      chains = await chainPage(turn, keys, cache, beforeMs, limit, floorMs, { lists: LEGACY_SCREEN_LISTS });
+    } catch (failure) {
+      if (!isStoreFailure(failure) || !(turnLeft(turn) > 0)) throw failure;
+      if (failure.kind !== "absent" && first.length === 0) throw native.error("log_store_unreachable", "log screen");
+    }
+    return mergePage(first, chains.entries, limit, chosen.more || chains.more);
+  }
+
+  /** The first page of the screen and the summary, read from the store: one round started by the
+   *  screen (the first listing pages of the control and of the use prefix, the judgement, and the
+   *  bodies of the entries of the page and of the summary in the same requests), then the entries
+   *  of the chains of format 1 and format 2 that belong on the page and into the window of the
+   *  summary. The page and the tally are kept for the next opening. Returns {page, summary, log}. */
+  async function readScreen(turn, keys, limit) {
+    const began = native.nowMs();
+    const cache = loadCache(keys);
+    const since = summarySince(began);
+    const tally = cache.tally;
+    pruneSummary(tally, since);
+    const keptById = new Map();
+    for (const entry of cache.entries) keptById.set(entry.id, entry);
+    let plan = null;
+    // The time each step took from the start of the read (ms), for the report of the round.
+    const timing = { listing: 0, bodies: 0, summary: 0, total: 0 };
+    const round = await requestRound(turn, keys, "screen", function (pages) {
+      timing.listing = Math.max(0, native.nowMs() - began);
+      const chosen = choosePage(pages, Infinity, limit);
+      const fetch = chosen.chosen.filter(function (parsed) { return !keptById.has("3:" + parsed.tail); });
+      const room = Math.max(0, LOG_SUMMARY_REQUESTS * LOG_BODY_KEYS - fetch.length - 100);
+      const counted = pages.u === null ? { above: [], below: [], reset: false }
+        : summaryKeys(tally, pages.u, since, Math.min(room, LOG_SUMMARY_ENTRIES));
+      plan = { chosen: chosen, counted: counted };
+      return fetch.concat(counted.above, counted.below).map(function (parsed) { return { parsed: parsed }; });
+    });
+    timing.bodies = Math.max(0, native.nowMs() - began);
+    let first = [];
+    let more = false;
+    let floorMs = 0;
+    let truncated = false;
+    if (plan !== null) {
+      first = plan.chosen.chosen.filter(function (parsed) { return !round.junk.has(parsed.key); }).map(function (parsed) {
+        const kept = keptById.get("3:" + parsed.tail);
+        return kept !== undefined ? kept : entryOfRecord(parsed, round.entries.get(parsed.key));
+      });
+      more = plan.chosen.more;
+      if (plan.chosen.count >= limit && first.length > 0) floorMs = first[first.length - 1].time_ms;
+      // The summary: the keys above the counted range from the one nearest to it, then the keys
+      // below it; the range stays one range, so the count stops at the first entry not read.
+      if (plan.counted.reset) {
         tally.buckets = {};
-        tally.nodes = {};
+        tally.top = "";
+        tally.floor = "";
+        tally.chains = {};
+      }
+      for (const parsed of plan.counted.above) {
+        if (!round.entries.has(parsed.key)) break;
+        countEntryInto(tally, entryOfRecord(parsed, round.entries.get(parsed.key)));
+        tally.top = parsed.tail;
+      }
+      for (const parsed of plan.counted.below) {
+        if (!round.entries.has(parsed.key)) break;
+        countEntryInto(tally, entryOfRecord(parsed, round.entries.get(parsed.key)));
+        if (tally.top === "") tally.top = parsed.tail;
+        tally.floor = parsed.tail;
+      }
+      const use = round.pages.u;
+      if (use !== null) {
+        const window = use.keys.filter(function (parsed) { return parsed.time_ms >= since; });
+        const uncounted = window.some(function (parsed) {
+          return tally.top === "" || parsed.tail < tally.top || parsed.tail > tally.floor;
+        });
+        const beyond = use.truncated && use.keys.length > 0 && use.keys[use.keys.length - 1].time_ms >= since;
+        truncated = uncounted || beyond;
+      }
+    } else if (!round.absent) {
+      // The listings of format 3 were not read: the entries of format 3 the device kept stand in.
+      first = cache.entries.filter(function (entry) { return entry.id.slice(0, 2) === "3:"; });
+      more = cache.has_more;
+      truncated = true;
+    }
+    // The chains of format 1 and format 2: the node prefixes of the account once in
+    // LEGACY_FOUND_INTERVAL_MS, the entries of the page, and the entries of the window.
+    const budget = { lists: LEGACY_SCREEN_LISTS };
+    let chains = { entries: [], more: false };
+    try {
+      if (began - cache.found_ms >= LEGACY_FOUND_INTERVAL_MS || began < cache.found_ms) {
+        cache.found = await discoverLegacyNodes(turn);
+        cache.found_ms = began;
+      }
+      chains = await chainPage(turn, keys, cache, Infinity, limit, floorMs, budget);
+      if (await countChains(turn, keys, cache, tally, since, budget)) truncated = true;
+    } catch (failure) {
+      if (!isStoreFailure(failure) || !(turnLeft(turn) > 0)) throw failure;
+      if (failure.kind !== "absent") truncated = true;
+    }
+    timing.summary = Math.max(0, native.nowMs() - began);
+    const page = mergePage(first, chains.entries, limit, more || chains.more);
+    // What the device keeps: the entries of the page up to LOG_KEEP_EVENTS events, and the tally.
+    const kept = [];
+    let keptEvents = 0;
+    for (const entry of page.entries) {
+      if (keptEvents >= LOG_KEEP_EVENTS) break;
+      kept.push(entry);
+      keptEvents += entry.items.length;
+    }
+    cache.entries = kept;
+    cache.has_more = page.has_more || kept.length < page.entries.length;
+    cache.saved_ms = native.nowMs();
+    saveCache(keys, cache);
+    timing.total = Math.max(0, native.nowMs() - began);
+    round.report(timing);
+    return { page: page, summary: summaryResult(tally, since, truncated), log: round.log };
+  }
+
+  /** The range {lo, hi} of the seqs of a chain whose entries the tally counted, when the tally
+   *  holds one; null otherwise. */
+  function countedRange(tally, id) {
+    const range = tally.chains[id];
+    const shaped = range !== null && typeof range === "object" && Number.isSafeInteger(range.lo) &&
+      Number.isSafeInteger(range.hi);
+    return shaped ? range : null;
+  }
+
+  /** Counts the entries of the window of the summary (from since) of the chains of format 2 into
+   *  the tally: for every chain the screen knows keys of in the window, the entries above the
+   *  counted range (the one nearest to it first) and the entries below it (the one nearest to it
+   *  first), read in one batch (LOG_SUMMARY_ENTRIES entries at most in the window). The counted
+   *  range of a chain stays one range: the count of a chain stops at the first entry that was not
+   *  read. A chain whose known end lies in the window and whose keys of the window the screen has
+   *  not listed is listed once per call. A key of format 1 names no time and ends the descent of
+   *  its chain (the releases that wrote format 1 ended before any window this program counts).
+   *  Returns whether entries of the window remain uncounted. */
+  async function countChains(turn, keys, cache, tally, since, budget) {
+    const legacy = loadLegacy();
+    const ids = chainNodes(cache);
+    const targets = [];
+    for (const id of ids) {
+      const node = displayNode(id);
+      const seqs = sortedSeqs(node);
+      if (node.exhausted || targets.length >= budget.lists) continue;
+      if (seqs.length === 0) {
+        const hint = chainHint(cache, legacy, id);
+        if (hint !== null && hint.time_ms >= since) {
+          targets.push({ id: id, after: Math.max(0, hint.seq - LEGACY_DISPLAY_LIST) });
+        }
+        continue;
+      }
+      const lowest = keyFacts(node, seqs[seqs.length - 1]);
+      if (lowest !== null && lowest.time_ms >= since && node.floor > 1) {
+        targets.push({ id: id, after: Math.max(0, node.floor - LEGACY_DISPLAY_LIST - 1), below: node.floor });
       }
     }
-    let budget = max;
+    if (targets.length > 0) {
+      budget.lists -= targets.length;
+      await loadChainKeys(turn, targets);
+    }
+    const plans = [];
+    const wanted = [];
+    let uncounted = false;
+    let room = Math.max(0, LOG_SUMMARY_ENTRIES - summaryEntries(tally, since));
     for (const id of ids) {
       const node = displayNode(id);
       const seqs = sortedSeqs(node);
       if (seqs.length === 0) continue;
-      let range = tally.nodes[id];
-      if (range === undefined) {
-        range = { lo: seqs[0] + 1, hi: seqs[0] };
-        tally.nodes[id] = range;
+      const range = countedRange(tally, id);
+      const inWindow = function (seq) {
+        const facts = keyFacts(node, seq);
+        return facts !== null && facts.time_ms >= since;
+      };
+      // Above the counted range from the seq nearest to it, below it from the seq nearest to it.
+      const above = range === null ? [] : seqs.filter(function (seq) { return seq > range.hi; }).reverse();
+      const below = [];
+      for (const seq of seqs) {
+        if (range !== null && seq >= range.lo) continue;
+        if (!inWindow(seq)) break;
+        below.push(seq);
       }
-      while (budget > 0 && range.hi < seqs[0]) {
-        const seq = range.hi + 1;
-        if (node.candidates.has(seq)) {
-          const time = keyTimeOf(node, seq);
-          if (time === null || time >= since) {
-            const entry = await displayEntry(ledger, id, seq, keys, reader);
-            if (entry.time_ms >= since) countEntryInto(tally, entry);
-            budget -= 1;
-          }
+      const plan = { id: id, above: [], below: [] };
+      for (const seq of above) {
+        if (!inWindow(seq)) continue;
+        if (room <= 0) {
+          uncounted = true;
+          break;
         }
-        range.hi = seq;
+        room -= 1;
+        plan.above.push(seq);
       }
-      while (budget > 0 && summaryEntries(tally, since) < LOG_SUMMARY_ENTRIES) {
-        const seq = range.lo - 1;
-        if (seq < 1) break;
-        if (!node.candidates.has(seq)) {
-          if (seq < node.floor) {
-            if (node.exhausted) break;
-            await loadKeysBefore(id, node.floor);
-            continue;
-          }
-          range.lo = seq;
-          continue;
+      for (const seq of below) {
+        if (room <= 0) {
+          uncounted = true;
+          break;
         }
-        const time = keyTimeOf(node, seq);
-        if (time !== null && time < since) break;
-        const entry = await displayEntry(ledger, id, seq, keys, reader);
-        if (entry.time_ms < since) break;
-        countEntryInto(tally, entry);
-        range.lo = seq;
-        budget -= 1;
+        room -= 1;
+        plan.below.push(seq);
+      }
+      const lowest = keyFacts(node, seqs[seqs.length - 1]);
+      if (lowest !== null && lowest.time_ms >= since && !node.exhausted && node.floor > 1) uncounted = true;
+      if (plan.above.length + plan.below.length === 0) continue;
+      plans.push(plan);
+      for (const seq of plan.above.concat(plan.below)) wanted.push({ id: id, seq: seq });
+    }
+    if (wanted.length === 0) return uncounted;
+    const objects = await readChainObjects(turn, wanted);
+    for (const plan of plans) {
+      let range = countedRange(tally, plan.id);
+      const count = function (seq) {
+        const entry = legacyEntry(keys, plan.id, seq, objects);
+        if (entry === null) return false;
+        if (entry.time_ms >= since) countEntryInto(tally, entry);
+        if (range === null) {
+          range = { lo: seq, hi: seq };
+          tally.chains[plan.id] = range;
+        }
+        if (seq < range.lo) range.lo = seq;
+        if (seq > range.hi) range.hi = seq;
+        return true;
+      };
+      for (const seq of plan.above) {
+        if (!count(seq)) {
+          uncounted = true;
+          break;
+        }
+      }
+      for (const seq of plan.below) {
+        if (!count(seq)) {
+          uncounted = true;
+          break;
+        }
       }
     }
-    let uncounted = false;
-    let above = false;
-    for (const id of ids) {
-      if (summaryUncounted(tally, id, since)) uncounted = true;
-      const range = tally.nodes[id];
-      const seqs = sortedSeqs(displayNode(id));
-      if (range !== undefined && seqs.length > 0 && seqs[0] > range.hi) above = true;
-    }
-    const capped = summaryEntries(tally, since) >= LOG_SUMMARY_ENTRIES;
-    return { truncated: uncounted, remaining: uncounted && (above || !capped) };
+    return uncounted;
   }
 
-  /** The count that goes on apart from the procedure calls while entries of the window remain:
-   *  steps of LOG_SUMMARY_STEP entries, the tally written after each. A store failure ends it (the
-   *  next read_log goes on from the tally), and the end of the runtime ends it at its next call of
-   *  the bridge. */
-  async function summaryLoop(ledger, ids, keys) {
-    try {
-      for (;;) {
-        const tally = summaryTally();
-        const since = summarySince(native.nowMs());
-        pruneSummary(tally, since);
-        await loadSummaryKeys(ledger, ids, since);
-        const step = await summaryStep(ledger, ids, keys, tally, since, LOG_SUMMARY_STEP);
-        saveSummaryTally(tally);
-        if (!step.remaining) break;
+  // ---- The outcomes of the procedures ----
+  //
+  // What the server learns of how the procedures of this program end. Nothing of the bridge reports
+  // the failure or the time of a procedure, so without this a procedure that fails or waits on a
+  // device leaves no trace outside that device. The program counts, per name, the calls that ended
+  // and their times (the time a call waited for its line and the time from its call to its end,
+  // without the time the device waited for the user), and keeps the counts in the program store
+  // (STORE_OUTCOMES). A call that failed, or that took OUTCOME_SLOW_MS or longer, is also kept one
+  // by one with its failure code. A call that has not ended is kept as open: the calls a runtime
+  // finds open at its start were cut off with the runtime before it (the app was ended, or the
+  // executor gave the call up), and they are reported as interrupted, each with the time the app
+  // had gone to the background while it was open (0: it was cut off in the foreground). A report
+  // (OUTCOMES_PATH) names procedures, failure codes and times, and nothing of the arguments or the
+  // results of a call. What a report the backend accepted carried leaves the store. The failure
+  // cancelled (the runtime went down, or the user closed what the procedure waited in) is not a
+  // failure of the procedure. A backend without the route turns the reports of this runtime off.
+  // The names: the name of a procedure, event_sync for a synchronization an event started, and
+  // log_screen for a read of the log screen from the store.
+
+  let outcomeState = null;
+  let outcomeSeq = 0;
+  let outcomesFlight = false;
+  let outcomesOff = false;
+  let outcomesDue = false;
+  // Whether the account of this runtime ended: nothing is counted or kept after that.
+  let accountClosed = false;
+
+  function emptyOutcomes(now) {
+    return { v: 1, since_ms: now, open: {}, done: {}, events: [], interrupted: [], dropped: 0, background_ms: 0 };
+  }
+
+  /** The kept outcomes of this device and account, read from the program store at their first use
+   *  in a runtime: the calls the store holds as open then are the calls of an earlier runtime that
+   *  did not end, and they become interrupted. */
+  function outcomes() {
+    if (outcomeState !== null) return outcomeState;
+    const now = native.nowMs();
+    let state = emptyOutcomes(now);
+    const raw = storedJson(STORE_OUTCOMES, null);
+    if (raw !== null && typeof raw === "object" && raw.v === 1 && raw.open !== null && typeof raw.open === "object" &&
+        raw.done !== null && typeof raw.done === "object" && Array.isArray(raw.events) && Array.isArray(raw.interrupted)) {
+      state = raw;
+      state.since_ms = whole(raw.since_ms);
+      state.dropped = whole(raw.dropped);
+      state.background_ms = whole(raw.background_ms);
+      state.events = raw.events.slice(0, OUTCOME_EVENTS);
+      state.interrupted = raw.interrupted.slice(0, OUTCOME_EVENTS);
+    }
+    for (const id of Object.keys(state.open)) {
+      const call = state.open[id];
+      if (Array.isArray(call) && typeof call[0] === "string" && state.interrupted.length < OUTCOME_EVENTS) {
+        state.interrupted.push({
+          name: call[0], called_ms: whole(call[1]), found_ms: now, background_ms: state.background_ms,
+        });
+      } else {
+        state.dropped += 1;
       }
-    } catch (error) {
-      native.log("summary count: " + failureCode(error));
     }
-    summaryRunning = false;
+    const found = Object.keys(state.open).length > 0;
+    state.open = {};
+    state.background_ms = 0;
+    outcomeState = state;
+    if (found) {
+      saveOutcomes();
+      outcomesSoon();
+    }
+    return state;
   }
 
-  /** The summary of the window for read_log (the keys of the window were read: loadSummaryKeys):
-   *  when the store was read in this call and no count goes on, a step of at most LOG_SUMMARY_STEP
-   *  entries first, and the count going on apart from the calls when it has more to do. truncated
-   *  while entries of the window are not counted, a count goes on, or the store could not be read
-   *  in this call. null when the store could not be read and nothing was ever counted. */
-  async function readSummary(ledger, ids, keys, since) {
-    const tally = summaryTally();
-    pruneSummary(tally, since);
-    let truncated = true;
-    if (ids.length > 0 && !summaryRunning) {
-      const step = await summaryStep(ledger, ids, keys, tally, since, LOG_SUMMARY_STEP);
-      saveSummaryTally(tally);
-      truncated = step.truncated;
-      if (step.remaining) {
-        summaryRunning = true;
-        summaryLoop(ledger, ids, keys);
+  function saveOutcomes() {
+    if (outcomeState !== null) storeJson(STORE_OUTCOMES, outcomeState);
+  }
+
+  /** The class of a time among OUTCOME_BOUNDS_MS (the index of the first bound it is below; the
+   *  number of bounds for a longer time). */
+  function outcomeClass(ms) {
+    for (let at = 0; at < OUTCOME_BOUNDS_MS.length; at += 1) {
+      if (ms < OUTCOME_BOUNDS_MS[at]) return at;
+    }
+    return OUTCOME_BOUNDS_MS.length;
+  }
+
+  /** Sends the kept outcomes. One report is in flight at a time. When the backend accepted it,
+   *  what it carried leaves the kept outcomes (the calls that ended meanwhile stay); a report that
+   *  failed leaves them as they are, for the next one. */
+  function reportOutcomes() {
+    outcomesDue = false;
+    if (outcomesFlight || outcomesOff || accountClosed || outcomeState === null) return;
+    const state = outcomeState;
+    const now = native.nowMs();
+    const names = Object.keys(state.done);
+    if (names.length === 0 && state.events.length === 0 && state.interrupted.length === 0) return;
+    const sent = {
+      done: names.map(function (name) {
+        const done = state.done[name];
+        return {
+          name: name, calls: whole(done.calls), failed: whole(done.failed), wait_ms: whole(done.wait_ms),
+          total_ms: whole(done.total_ms), max_ms: whole(done.max_ms), classes: done.classes.slice(),
+        };
+      }),
+      events: state.events.slice(), interrupted: state.interrupted.slice(), dropped: state.dropped,
+    };
+    const body = {
+      program_version: VERSION, since_ms: state.since_ms, until_ms: now, bounds_ms: OUTCOME_BOUNDS_MS,
+      done: sent.done, events: sent.events, interrupted: sent.interrupted, dropped: sent.dropped,
+    };
+    outcomesFlight = true;
+    settled(api(freeTurn(), "POST", OUTCOMES_PATH, body)).then(function (outcome) {
+      outcomesFlight = false;
+      if (!outcome.ok) {
+        const status = failureStatus(outcome.error);
+        if (status === 404 || status === 405) outcomesOff = true;
+        return;
       }
+      if (accountClosed || outcomeState === null) return;
+      const kept = outcomeState;
+      for (const item of sent.done) {
+        const done = kept.done[item.name];
+        if (done === undefined) continue;
+        done.calls -= item.calls;
+        done.failed -= item.failed;
+        done.wait_ms -= item.wait_ms;
+        done.total_ms -= item.total_ms;
+        for (let at = 0; at < done.classes.length; at += 1) done.classes[at] -= whole(item.classes[at]);
+        if (done.calls <= 0) delete kept.done[item.name];
+      }
+      kept.events = kept.events.slice(sent.events.length);
+      kept.interrupted = kept.interrupted.slice(sent.interrupted.length);
+      kept.dropped = Math.max(0, kept.dropped - sent.dropped);
+      kept.since_ms = now;
+      saveOutcomes();
+    }).then(noop, noop);
+  }
+
+  /** Has the kept outcomes reported OUTCOMES_WAIT_MS from now (once, however often it is asked). */
+  function outcomesSoon() {
+    if (outcomesDue || outcomesOff) return;
+    outcomesDue = true;
+    native.sleep(OUTCOMES_WAIT_MS).then(reportOutcomes).then(noop, noop);
+  }
+
+  /** Reports the kept outcomes when the last report is OUTCOMES_INTERVAL_MS old (the end of a
+   *  synchronization asks). */
+  function outcomesDaily() {
+    if (outcomeState === null || outcomesOff || accountClosed) return;
+    const now = native.nowMs();
+    if (now < outcomeState.since_ms || now - outcomeState.since_ms >= OUTCOMES_INTERVAL_MS) reportOutcomes();
+  }
+
+  /** Notes that the app went to the background (gone true) or came back to the foreground, for
+   *  the calls that are open. The program store is written only when the note changes. */
+  function noteBackground(gone) {
+    if (outcomeState === null || outcomesOff || accountClosed) return;
+    const at = gone && Object.keys(outcomeState.open).length > 0 ? native.nowMs() : 0;
+    if (whole(outcomeState.background_ms) === at) return;
+    outcomeState.background_ms = at;
+    saveOutcomes();
+  }
+
+  /** Counts the end of the call of a turn: code is ok or the failure code. */
+  function endCall(turn, code) {
+    const state = outcomes();
+    const now = native.nowMs();
+    const total = turnSpent(turn);
+    const waited = turn.startedMs === 0 ? total : Math.max(0, turn.startedMs - turn.calledMs);
+    delete state.open[turn.id];
+    let done = state.done[turn.name];
+    if (done === undefined || done === null || !Array.isArray(done.classes) ||
+        done.classes.length !== OUTCOME_BOUNDS_MS.length + 1) {
+      if (Object.keys(state.done).length >= OUTCOME_NAMES_MAX) {
+        state.dropped += 1;
+        saveOutcomes();
+        return;
+      }
+      done = {
+        calls: 0, failed: 0, wait_ms: 0, total_ms: 0, max_ms: 0,
+        classes: OUTCOME_BOUNDS_MS.map(function () { return 0; }).concat([0]),
+      };
+      state.done[turn.name] = done;
     }
-    if (ids.length === 0 && Object.keys(tally.buckets).length === 0) return null;
-    return summaryResult(tally, since, truncated);
+    const failed = code !== "ok" && code !== "cancelled";
+    done.calls += 1;
+    if (failed) done.failed += 1;
+    done.wait_ms += waited;
+    done.total_ms += total;
+    if (total > done.max_ms) done.max_ms = total;
+    done.classes[outcomeClass(total)] += 1;
+    if (failed || total >= OUTCOME_SLOW_MS) {
+      if (state.events.length < OUTCOME_EVENTS) {
+        state.events.push({ name: turn.name, code: failed ? code.slice(0, 64) : "ok", wait_ms: waited, total_ms: total, at_ms: now });
+      } else {
+        state.events.shift();
+        state.events.push({ name: turn.name, code: failed ? code.slice(0, 64) : "ok", wait_ms: waited, total_ms: total, at_ms: now });
+        state.dropped += 1;
+      }
+      outcomesSoon();
+    }
+    saveOutcomes();
   }
 
-  // ---- Procedures ----
-
-  // The result of the last log verification (runtime lifetime). sync decides the time of the next
-  // verification from it. store is the state of the log store reads of that run: verified,
-  // unreachable, url_rejected, truncated, refused (a release build whose backend has no log store),
-  // absent (a debug build whose backend has no log store) or pending (no run yet).
-  let logState = {
-    status: "pending", verified_ms: 0, unverified_nodes: 0, missing: 0, expired: 0,
-    unknown_nodes: 0, newer_release_nodes: 0, store: "pending", store_failing_ms: 0,
-    program_version: VERSION,
-  };
-
-  // The nodes of a release later than this program, by node id: the release their binding names.
-  // renewGrants fills it from the attestations it verified in this runtime (a document that
-  // verifies with a measurement no list of this program has). The verification of the log
-  // (verifyAll) does not read the chain of such a node and leaves the run pending: the program
-  // that lists the release grants to the node and verifies its chain from the verified point the
-  // ledger keeps (seq 0 for a node no program walked). The runtime of a program that lists the
-  // release is a new runtime (the executor replaces the runtime with the program), so nothing here
-  // outlives the program that noted it.
-  const newerReleaseNodes = new Map();
-
-  function failureCode(error) {
-    return error && error.code ? String(error.code) : "program_error";
+  /** Work whose calls are counted under name: call(args, turn) returns the promise of the work in
+   *  the turn of the call (PROCEDURE_LIMIT_MS from the call). The counting never changes what a
+   *  call returns or throws. */
+  function tracked(name, call) {
+    return function (args) {
+      let turn = null;
+      try {
+        turn = newTurn(PROCEDURE_LIMIT_MS, name);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+      let counted = false;
+      try {
+        if (name !== "" && !outcomesOff && !accountClosed) {
+          const state = outcomes();
+          outcomeSeq += 1;
+          turn.id = String(turn.calledMs) + "-" + String(outcomeSeq);
+          state.open[turn.id] = [name, turn.calledMs];
+          saveOutcomes();
+          counted = true;
+        }
+      } catch (error) {
+        counted = false;
+      }
+      const ended = function (code) {
+        if (!counted || accountClosed) return;
+        try {
+          endCall(turn, code);
+        } catch (error) {
+          // Counting failed (the bridge is closed): the call ends as it ends.
+        }
+      };
+      let run = null;
+      try {
+        run = Promise.resolve(call(args === null || typeof args !== "object" ? {} : args, turn));
+      } catch (error) {
+        run = Promise.reject(error);
+      }
+      return run.then(
+        function (value) { ended("ok"); return value; },
+        function (error) { ended(failureCode(error)); throw error; });
+    };
   }
+
+  /** A counted procedure that runs on the line of the procedures a user starts. */
+  function userProcedure(name, work) {
+    return tracked(name, function (args, turn) {
+      return userLine.run(turn, function () { return work(turn, args); });
+    });
+  }
+
+  // ---- The key of the account ----
 
   // The mismatch marker of the runtime lifetime: the last account query answered a user_id other
   // than the bound userId (so that the account end of that runtime does not erase the master key of
   // another account).
   let accountMismatch = false;
 
-  /** The key_id registered on the account (null when there is none). When the user_id of the
+  /** The key_id registered on the account (null when there is none), from the account query
+   *  (fetched: the promise of the query when the caller sent it ahead). When the user_id of the
    *  response differs from the bound userId (the account the server authenticated and the bound
    *  account of this device differ), the key is not read, key_state account_mismatch is published
-   *  and the call ends with account_mismatch (a response without user_id is a server from before
-   *  this change and counts as no mismatch). */
-  async function registeredKeyId() {
-    const body = (await api("GET", "/api/secure/account")).json;
+   *  and the call ends with account_mismatch (a response without user_id counts as no mismatch). */
+  async function registeredKeyId(turn, fetched) {
+    const body = (await (fetched === undefined ? api(turn, "GET", "/api/secure/account") : fetched)).json;
     if (typeof body.user_id === "string" && body.user_id !== "" && body.user_id !== userId()) {
       accountMismatch = true;
       native.publish({
@@ -3474,9 +5449,9 @@
   /** Registers the account signing public key and the log public key on the account. proof is the
    *  signature of the account signing key over the account id. When replace is false, an account
    *  with another registered key fails with key_exists. */
-  async function registerKey(keys, replace) {
+  async function registerKey(turn, keys, replace) {
     const proof = native.ed25519Sign(keys.signSeed, encode(utf8(purpose("register") + "\n" + userId())));
-    await api("PUT", "/api/secure/account/key", {
+    await api(turn, "PUT", "/api/secure/account/key", {
       sign_pk: keys.signPk, log_pk: keys.logPk, proof: proof, replace: replace,
     });
   }
@@ -3491,15 +5466,15 @@
    *  registered on the account, and key_state and key_id are published. When there is a master key
    *  and the account has no registered key, its public key is registered. When the account query
    *  fails nothing is published and the failure is thrown. */
-  async function judgeKey() {
+  async function judgeKey(turn, fetched) {
     const masterKey = readMasterKey();
-    const registered = await registeredKeyId();
+    const registered = await registeredKeyId(turn, fetched);
     if (masterKey === null) return publishKey(registered === null ? "absent" : "waiting", null);
     const keys = deriveKeys(masterKey);
     let keyState = registered === null || registered === keys.keyId ? "present" : "mismatch";
     if (registered === null) {
       try {
-        await registerKey(keys, false);
+        await registerKey(turn, keys, false);
       } catch (error) {
         // Another device registered another key between the query and the registration.
         if (error.code !== "key_exists") throw error;
@@ -3510,670 +5485,307 @@
   }
 
   /** The derived keys when key_state is present. Otherwise key_required. */
-  async function presentKeys() {
-    const judged = await judgeKey();
+  async function presentKeys(turn) {
+    const judged = await judgeKey(turn);
     if (judged.keyState !== "present") throw native.error("key_required", judged.keyState);
     return judged.keys;
   }
 
-  /** The living nodes with their attestations for a fresh nonce: {nonce, nodes}. The request of the
-   *  delegation step (renewGrants), sent ahead when the caller knows that the step will follow. */
-  async function fetchOffered() {
+  // ---- The grants: the nodes of the account and the commands ----
+
+  /** The nodes the backend lists for this account, each with the expiry of the grant the backend
+   *  recorded for the account on that node: [{node, not_after_ms}] (not_after_ms null when it
+   *  recorded none). One request the backend answers without calling a node. The list says which
+   *  nodes are there to delegate to; whether a node is handed a key is decided by its attestation
+   *  alone (renewGrants), and when a grant was handed and when it ends is what this device kept. */
+  async function fetchListed(turn) {
+    const listed = (await api(turn, "GET", GRANTS_PATH)).json.nodes;
+    const out = [];
+    for (const item of Array.isArray(listed) ? listed : []) {
+      if (item === null || typeof item !== "object" || typeof item.node !== "string" || !NODE_ID.test(item.node)) continue;
+      if (out.some(function (other) { return other.node === item.node; })) continue;
+      out.push({ node: item.node, not_after_ms: Number.isSafeInteger(item.not_after_ms) && item.not_after_ms > 0 ? item.not_after_ms : null });
+    }
+    return out;
+  }
+
+  /** The attestations of nodes for a fresh nonce: {nonce, nodes}. With ids, the attestations of
+   *  those nodes (the ones among them that are alive and answer; ATTESTATION_NODES ids per request,
+   *  ATTESTATION_REQUESTS requests at most, sent together); with null, those of every node the
+   *  backend lists for the account. Each attestation is a call of its node, so a caller names the
+   *  nodes it has a command for. */
+  async function fetchOffered(turn, ids) {
     const nonce = native.randomBytes(32);
-    const nodes = (await api("GET", "/api/secure/nodes", null, { nonce: nonce })).json.nodes;
+    if (ids === null) {
+      const nodes = (await api(turn, "GET", NODES_PATH, null, { nonce: nonce })).json.nodes;
+      return { nonce: nonce, nodes: Array.isArray(nodes) ? nodes : [] };
+    }
+    const requests = [];
+    for (let at = 0; at < ids.length && requests.length < ATTESTATION_REQUESTS; at += ATTESTATION_NODES) {
+      requests.push(api(turn, "GET", NODES_PATH, null, {
+        nonce: nonce, nodes: ids.slice(at, at + ATTESTATION_NODES).join(","),
+      }));
+    }
+    const nodes = [];
+    for (const answer of await Promise.all(requests)) {
+      for (const response of Array.isArray(answer.json.nodes) ? answer.json.nodes : []) nodes.push(response);
+    }
     return { nonce: nonce, nodes: nodes };
   }
 
-  /** presentKeys together with the node list of the delegation step: when the keychain holds a master
-   *  key, the node list is requested along with the account query (one stage) so that the grants of
-   *  liveGrantLedger follow one round trip after the keys. offered is null when no master key is held
-   *  (the account query alone decides the key state and no delegation follows) and when the node list
-   *  request failed (renewGrants then requests the list itself). */
-  async function presentKeysWithNodes() {
-    const judging = judgeKey();
-    // No list while delegation is off: liveGrantLedger refuses before it would delegate.
-    const pending = readMasterKey() !== null && !delegationOff(loadLedger()) ? settled(fetchOffered()) : null;
-    const judged = await judging;
-    if (judged.keyState !== "present") throw native.error("key_required", judged.keyState);
-    const offered = pending === null ? null : await pending;
-    return { keys: judged.keys, offered: offered !== null && offered.ok ? offered.value : null };
-  }
-
-  /** Renews the grant of every living node. A node that is in the ledger and whose last grant is
-   *  within the renewal interval (grantRenewMs) is skipped (not when force is true); every other
-   *  node has its attestation verified, receives a grant with the lifetime the ledger sets, and is
-   *  written to the ledger. The grants go out together (one stage): the nodes are independent of
-   *  each other and the relay writes one row per node. A node of the ledger that is not in the
-   *  response list gets its gone time. offered is the node list already requested (fetchOffered:
-   *  {nonce, nodes}); without it the list is requested here. Returns the Set of accepted node ids,
-   *  the number of nodes whose attestation failed to verify, the number of nodes whose attestation
-   *  verified but did not take the grant, and the number of nodes of a release later than this
-   *  program (their documents verified with a measurement no list has: they receive no grant and
-   *  are noted in newerReleaseNodes for the verification of the log). */
-  async function renewGrants(keys, ledger, force, offered) {
-    if (offered === undefined || offered === null) offered = await fetchOffered();
-    const nonce = offered.nonce;
-    const listed = new Set();
+  /** Hands the grants of this account to the nodes that are to receive one (steps 3 and 4 of a
+   *  synchronization). The nodes the backend lists for the account are read first (fetchListed: no
+   *  node is called; options.listed is the settled outcome of that request when the caller sent it
+   *  ahead), and the attestation is requested of the nodes that are to receive a grant only. A
+   *  listed node receives a grant when
+   *    this device keeps no grant of it (or one from before the last revocation),
+   *    the last grant this device handed it is the renewal interval old (grantRenewMs),
+   *    options.refill is set (a push with the reason grant_required started the synchronization),
+   *    the backend reports no grant row of the account on it, and the last grant this device sent
+   *    it is GRANT_REFILL_MS old, or
+   *    options.force is set (a new lifetime applies at once).
+   *  A synchronization without such a node sends no request that calls a node. A node whose
+   *  attestation is requested has it verified and receives a grant with the lifetime the ledger
+   *  sets; the grants go out together (one stage). A node is kept among the grants of this device
+   *  before its grant goes out (with the attempt time): a node that takes the grant whose reply
+   *  never reaches this program is a node this device handed its key to. A node whose document
+   *  verifies with a measurement no list has is a node of a later release: it receives no grant,
+   *  it is kept as such (log.nodes) and not asked again by this program. A backend without the
+   *  route of the list (404) is asked for the attestations of every node it lists, and what this
+   *  device kept decides which of them receives a grant; any other failure of the list is the
+   *  failure of this step. Returns {accepted, rejected, failed, later, granted, ledgerChanged}:
+   *  the Set of the ids of the nodes that hold or were sent a grant, the number of nodes whose
+   *  attestation failed to verify, of nodes that did not take the grant, of nodes of a later
+   *  release, and of nodes that took a grant now. */
+  async function renewGrants(turn, keys, ledger, grants, options) {
     const accepted = new Set();
+    const nodes = loadNodes();
+    const unaccepted = storedObject(STORE_UNACCEPTED);
+    let noted = false;
+    let later = 0;
+    const now = native.nowMs();
+    const fresh = function (id) {
+      const known = grants[id];
+      return known !== undefined && known.granted_ms > ledger.revoked_ms &&
+        known.granted_ms <= now + GRANT_REFILL_MS && now - known.granted_ms < grantRenewMs(ledger);
+    };
+    // A node an earlier synchronization of this program found to be of a later release.
+    const laterKnown = function (id) {
+      const kept = nodes[id];
+      return kept !== undefined && kept.p === "nitro" && kept.m !== "" && buildOfMeasure(kept.m) === undefined;
+    };
+    const sent = options.listed !== undefined && options.listed !== null
+      ? await options.listed : await settled(fetchListed(turn));
+    let offered = null;
+    const due = new Set();
+    if (!sent.ok) {
+      if (failureStatus(sent.error) !== 404) throw sent.error;
+      offered = await fetchOffered(turn, null);
+    } else {
+      for (const item of sent.value) {
+        const known = grants[item.node];
+        if (options.force !== true && laterKnown(item.node)) {
+          later += 1;
+          continue;
+        }
+        const refill = options.refill === true && item.not_after_ms === null && known !== undefined &&
+          now - Math.max(known.granted_ms, known.attempted_ms) >= GRANT_REFILL_MS;
+        if (options.force === true || !fresh(item.node) || refill) due.add(item.node);
+        else accepted.add(item.node);
+      }
+      offered = due.size === 0 ? { nonce: "", nodes: [] } : await fetchOffered(turn, Array.from(due));
+    }
     let rejected = 0;
     let failed = 0;
-    let later = 0;
     // The nodes that receive a grant in this run, in the order of the list.
     const wanted = [];
-    for (const response of Array.isArray(offered.nodes) ? offered.nodes : []) {
+    for (const response of offered.nodes) {
       const claimed = response !== null && typeof response === "object" ? response.node : undefined;
-      listed.add(claimed);
-      const known = typeof claimed === "string" ? ledger.nodes[claimed] : undefined;
-      if (force !== true && known !== undefined && known.granted_ms > ledger.revoked_ms &&
-          native.nowMs() - known.granted_ms < grantRenewMs(ledger)) {
+      if (!sent.ok && options.force !== true && typeof claimed === "string" && fresh(claimed)) {
         accepted.add(claimed);
         continue;
       }
       let node = null;
       try {
-        node = verifyAttestation(response, nonce);
+        node = verifyAttestation(response, offered.nonce);
       } catch (error) {
         rejected += 1;
         native.log("attestation rejected: " + String(error.message));
         continue;
       }
-      listed.add(node.node);
+      if (sent.ok && !due.has(node.node)) continue;
+      if (wanted.some(function (item) { return item.node.node === node.node; })) continue;
       if (!node.listed) {
-        // A node of a release later than this program: its document verified, its measurement is
-        // on no list of this program. It receives no grant, and the verification of the log leaves
-        // its chain pending (verifyAll) until the program that lists the release judges it.
-        newerReleaseNodes.set(node.node, node.release);
         later += 1;
         native.log("attestation of a later release: " + node.release);
+        nodes[node.node] = { m: node.measure, p: "nitro", r: node.release, f: now, c: 0 };
+        if (unaccepted[node.measure] === undefined) {
+          unaccepted[node.measure] = { first_ms: now, release: String(node.release).slice(0, 64), held: false, node: node.node };
+        }
+        noted = true;
         continue;
       }
       accepted.add(node.node);
       wanted.push({ node: node, challenge: response.challenge });
     }
-    // A node the ledger does not know is written to it before its grant goes out (origin grant,
-    // no grant time, the attempt time): a node that takes the grant whose reply never reaches
-    // this program (the connection drops, the app is suspended, the node ends) is a delegation
-    // this app made, not one it did not make. The ledger is saved before the stage.
-    const sent = native.nowMs();
-    let recorded = false;
+    if (noted) {
+      saveNodes(nodes);
+      storeJson(STORE_UNACCEPTED, unaccepted);
+    }
+    const sentMs = native.nowMs();
     for (const item of wanted) {
       const node = item.node;
-      if (ledger.nodes[node.node] !== undefined) continue;
-      ledger.nodes[node.node] = {
-        sign_pk: node.signPk, seal_pk: node.sealPk, platform: node.platform, release: node.release,
-        first_ms: sent, granted_ms: 0, not_after_ms: 0,
-        checkpoint: { seq: 0, hash: ZERO_HASH, time_ms: 0 }, final: null, gone_ms: 0, origin: "grant",
-        unknown_ms: 0, attempted_ms: sent,
+      const known = grants[node.node];
+      grants[node.node] = {
+        granted_ms: known === undefined ? 0 : known.granted_ms,
+        not_after_ms: known === undefined ? 0 : known.not_after_ms,
+        release: node.release, first_ms: known === undefined ? sentMs : known.first_ms,
+        platform: node.platform, attempted_ms: sentMs,
       };
-      recorded = true;
     }
-    if (recorded) saveLedger(ledger);
-    // Whether a node this app found in the store only (a mark of a delegation it did not make)
-    // took a grant this time: the mark is cleared and the caller verifies the log again at once.
-    let cleared = false;
+    if (wanted.length > 0) saveGrants(grants);
     const results = await stage(wanted.map(function (item) {
-      return sendGrant(item.node, item.challenge, keys, grantTtlMs(ledger));
+      return sendGrant(turn, item.node, item.challenge, keys, grantTtlMs(ledger));
     }));
+    let granted = 0;
+    let ledgerChanged = false;
     for (let i = 0; i < wanted.length; i += 1) {
       const node = wanted[i].node;
       const result = results[i];
-      const existing = ledger.nodes[node.node];
       if (!result.ok) {
-        // A node that did not take the grant keeps no grant time in the ledger (the published
-        // state grant becomes partial or none); the record of the attempt stays.
+        // A node that did not take the grant keeps no new grant time (the published state grant
+        // becomes partial or none); the record of the attempt stays.
         failed += 1;
-        if (existing !== undefined) existing.attempted_ms = sent;
         native.log("grant failed: " + failureCode(result.error));
         continue;
       }
-      const grant = result.value;
-      // The grant time written to the ledger is after the last revocation time (a device clock
-      // that runs backwards does not make a grant after a revoke read as one before it).
-      const granted = Math.max(grant.granted_ms, ledger.revoked_ms + 1);
-      if (existing.seal_pk === "") {
-        // A node that entered the ledger through the tracing of a delegation transfer: the values
-        // of the attestation verified this time are filled in.
-        existing.seal_pk = node.sealPk;
-        existing.platform = node.platform;
-        existing.release = node.release;
+      // The grant time kept is after the last revocation time (a device clock that runs backwards
+      // does not make a grant after a revoke read as one before it).
+      const grantedMs = Math.max(result.value.granted_ms, ledger.revoked_ms + 1);
+      grants[node.node].granted_ms = grantedMs;
+      grants[node.node].not_after_ms = result.value.not_after_ms;
+      granted += 1;
+      if (node.format !== 3) {
+        noteLedgerGrant(ledger, node, grantedMs, result.value.not_after_ms, sentMs);
+        ledgerChanged = true;
       }
-      if (existing.origin === "store" || existing.unknown_ms !== 0) cleared = true;
-      existing.granted_ms = granted;
-      existing.not_after_ms = grant.not_after_ms;
-      existing.attempted_ms = sent;
-      existing.origin = "grant";
-      existing.unknown_ms = 0;
-      // A node that took the grant is alive: the gone time of a run that did not list it, or that
-      // found it in the store only, is cleared (the heads of living nodes are read ahead).
-      existing.gone_ms = 0;
     }
-    const now = native.nowMs();
-    for (const id of Object.keys(ledger.nodes)) {
-      if (!listed.has(id) && ledger.nodes[id].gone_ms === 0) ledger.nodes[id].gone_ms = now;
-    }
-    return { accepted: accepted, rejected: rejected, failed: failed, later: later, cleared: cleared };
-  }
-
-  /** The published state log of one run and its bookkeeping in the ledger: store_failing_ms starts
-   *  at the first run whose store reads failed and clears at the first run that read the store
-   *  (storeRead: every read of the store the run made succeeded, or the node discovery window left
-   *  nodes of the listing to the next runs), pending at its walk or not. A run cut
-   *  short by its time budget or by LOG_STORE_NODES reads the store and leaves entries pending, and
-   *  LOG_STORE_STALE_MS marks reads that keep failing, not a walk that has entries left (the fleet of
-   *  the operator writing control entries or bringing up nodes faster than a device walks them would
-   *  otherwise mark every such device after three days). The state is attention when any node has a gap, a mismatch, or a part that
-   *  cannot be checked, when an entry of a node no grant of this app explains verified, when a
-   *  release build is refused the log store, and when the reads of the store have been failing for
-   *  LOG_STORE_STALE_MS; otherwise pending when a chain has entries left to verify, the store could
-   *  not be read in this run, or a node of a release later than this program has a chain here
-   *  (newer_release_nodes: a program that lists the release reads it); otherwise verified. A run
-   *  that is pending keeps verified_ms, so the next synchronization runs the verification again.
-   *  program_version names the program that judged the published value: the executor keeps the
-   *  published state across runtimes, and the first synchronization of the runtime of a later
-   *  program judges it again (afterGrants: verified_ms starts at 0 in every runtime). */
-  /** Whether the run read the store: every read of the store it made answered (verified), or the
-   *  node discovery window left nodes of the listing to the next runs (truncated, discovery:nodes:
-   *  the chains the run examined were read). A node discovery listing that went on beyond
-   *  LOG_STORE_PAGES pages (truncated, discovery:pages) is not a read: the run saw no chain, so
-   *  the mark of failing reads runs (LOG_STORE_STALE_MS) as for a store that cannot be listed. */
-  function storeRead(store) {
-    return store.state === "verified" || (store.state === "truncated" && store.detail === "discovery:nodes");
-  }
-
-  function publishLogState(ledger, store, counts, now) {
-    const read = storeRead(store);
-    const unread = !read && store.state !== "absent" && store.state !== "refused";
-    if (unread) {
-      if (ledger.store_failing_ms === 0) ledger.store_failing_ms = now;
-    } else if (read) {
-      ledger.store_failing_ms = 0;
-    }
-    const stale = unread && now - ledger.store_failing_ms >= LOG_STORE_STALE_MS;
-    saveLedger(ledger);
-    const attention = counts.unverified > 0 || counts.unknown > 0 || store.state === "refused" || stale;
-    const status = attention ? "attention"
-      : counts.pending || unread || counts.later > 0 ? "pending"
-      : "verified";
-    logState = {
-      status: status,
-      verified_ms: status === "pending" ? logState.verified_ms : now,
-      unverified_nodes: counts.unverified, missing: counts.missing, expired: counts.expired,
-      unknown_nodes: counts.unknown, newer_release_nodes: counts.later, store: store.state,
-      store_failure: store.detail, store_failing_ms: ledger.store_failing_ms, program_version: VERSION,
+    return {
+      accepted: accepted, rejected: rejected, failed: failed, later: later, granted: granted,
+      ledgerChanged: ledgerChanged,
     };
-    native.publish({ state: { log: logState } });
-    return logState;
   }
 
-  /** Reports the result of one verification run to the backend (the one way the server learns what
-   *  the device verified). The run does not wait for the answer: the report is sent and a failure
-   *  is logged when it arrives; it changes nothing. store_failure names the first failed read of
-   *  the store (the empty string when none failed) and unknown_node_ids the nodes counted as
-   *  delegations the app did not make (node ids are public values: the attestation route lists
-   *  them). */
-  function reportVerification(result, counts, nodes, elapsedMs) {
-    settled(api("POST", LOG_REPORT_PATH, {
-      status: result.status, store: result.store, nodes: nodes, keys_checked: counts.keys,
-      bodies_fetched: counts.bodies, missing: counts.missing, expired: counts.expired,
-      unknown_nodes: counts.unknown, newer_release_nodes: counts.later, elapsed_ms: elapsedMs,
-      program_version: VERSION, store_failure: result.store_failure,
-      unknown_node_ids: counts.unknownIds.slice(0, LOG_STORE_NODES),
-    })).then(function (outcome) {
-      if (!outcome.ok) native.log("verification report: " + failureCode(outcome.error));
+  /** Sends a revoke to every node the backend lists for the account, also to nodes this device
+   *  handed no grant to: a node hands delegations to nodes of the same release, so a node this
+   *  device never handed a grant to can hold the user key of this account. The revoke of a node
+   *  without a grant changes nothing and passes. The attestation of every listed node is requested
+   *  (the time of the document that decides the freshness of the reply and the check of the
+   *  challenge statement come from it). A revoke does not check the acceptance conditions (the
+   *  accepted measurements, a build that accepts local): that gate decides who receives a user key,
+   *  and a revoke command carries no secret. Returns whether a listed node did not confirm the
+   *  revoke (nodes whose attestation failed to verify or did not arrive included). */
+  async function revokeEverywhere(turn, keys) {
+    const listed = await settled(fetchListed(turn));
+    if (!listed.ok && failureStatus(listed.error) !== 404) throw listed.error;
+    const ids = listed.ok ? listed.value.map(function (item) { return item.node; }) : null;
+    if (ids !== null && ids.length === 0) return false;
+    const offered = await fetchOffered(turn, ids);
+    const confirmed = new Set();
+    const results = await stage(offered.nodes.map(async function (response) {
+      const target = verifyAttestation(response, offered.nonce, false);
+      await sendRevoke(turn, target, response.challenge, keys);
+      confirmed.add(target.node);
+    }));
+    let incomplete = false;
+    for (const result of results) {
+      if (!result.ok) {
+        incomplete = true;
+        native.log("revoke failed: " + failureCode(result.error));
+      }
+    }
+    if (ids !== null && ids.some(function (id) { return !confirmed.has(id); })) incomplete = true;
+    return incomplete;
+  }
+
+  /** The step of the grants, for a caller that holds the grant lock: with delegation on, the
+   *  grants are handed to the nodes that are to receive one (renewGrants); with delegation off,
+   *  the revoke is sent again to every listed node (it reaches the nodes that were not reached
+   *  when it was turned off, and the nodes that took over a delegation from them; a failure does
+   *  not stop the step). What this device keeps is written and the state grant is published.
+   *  Returns {ledger, grants, renewed, grant}. */
+  async function grantStep(turn, keys, options) {
+    const ledger = loadLedger();
+    const grants = loadGrants();
+    let renewed = { accepted: new Set(), rejected: 0, failed: 0, later: 0, granted: 0, ledgerChanged: false };
+    if (!delegationOff(ledger)) {
+      renewed = await renewGrants(turn, keys, ledger, grants, options);
+    } else {
+      try {
+        await revokeEverywhere(turn, keys);
+      } catch (error) {
+        if (failureCode(error) === "cancelled" || !(turnLeft(turn) > 0)) throw error;
+        native.log("revoke retry failed: " + failureCode(error));
+      }
+    }
+    saveGrants(grants);
+    if (renewed.ledgerChanged) saveLedger(ledger);
+    const grant = grantState(ledger, grants, renewed.accepted, native.nowMs());
+    native.publish({
+      state: { grant: grant, grant_days: ledger.ttl_days },
+      runtime: { rejected_nodes: renewed.rejected },
+    });
+    return { ledger: ledger, grants: grants, renewed: renewed, grant: grant };
+  }
+
+  /** The front of a procedure that needs a node holding the grant of this account: under the grant
+   *  lock, the account query and the list of the nodes are sent together, the key is judged, and
+   *  the grants are handed to the nodes that are to receive one. When delegation is off it is
+   *  delegation_off; when no listed node holds a grant it is grant_required (attestation_failed
+   *  when every listed node failed the attestation verification or is of a release later than this
+   *  program). Returns {keys, ledger, grants}. */
+  function withGrants(turn) {
+    return grantLock.run(turn, async function () {
+      const account = api(turn, "GET", "/api/secure/account");
+      account.then(noop, noop);
+      const held = readMasterKey() !== null;
+      if (held && delegationOff(loadLedger())) {
+        const judged = await judgeKey(turn, account);
+        if (judged.keyState !== "present") throw native.error("key_required", judged.keyState);
+        throw native.error("delegation_off", "delegation is turned off");
+      }
+      const listed = held ? settled(fetchListed(turn)) : null;
+      const judged = await judgeKey(turn, account);
+      if (judged.keyState !== "present") throw native.error("key_required", judged.keyState);
+      const step = await grantStep(turn, judged.keys, { listed: listed });
+      if (delegationOff(step.ledger)) throw native.error("delegation_off", "delegation is turned off");
+      if (step.grant.state === "none") {
+        const refused = step.renewed.rejected + step.renewed.later > 0 && step.renewed.accepted.size === 0;
+        throw native.error(refused ? "attestation_failed" : "grant_required", "no listed node holds a grant");
+      }
+      shareLedgerSoon(judged.keys);
+      return { keys: judged.keys, ledger: step.ledger, grants: step.grants };
     });
   }
 
-  /** The reads of one verification run sent ahead of its judgement (one stage): the node summary of
-   *  the account, the listing addresses of the node discovery listing and of every chain of the
-   *  ledger the run will walk (one request: LOG_LISTINGS_PATH), and the status (head) of every living
-   *  node of the ledger. nodes is null for the reads of a run (every node of the ledger, with the
-   *  node discovery listing) or the ids of the nodes of the second look of verifyRun (those nodes
-   *  alone, without the discovery listing). The judgement (verifyAll) uses a response only when it
-   *  is the very response the judgement would have requested (the same node, marker, nonce, object
-   *  version); what did not arrive is requested there. Returns the reads object
-   *  completeVerificationReads fills. */
-  function beginVerificationReads(ledger, nodes) {
-    const reads = {
-      summaries: settled(api("GET", "/api/secure/log/nodes")),
-      heads: new Map(),
-      targets: [],
-      listings: null,
-      discovery: null,
-      pages: new Map(),
-      objects: new Map(),
-    };
-    for (const id of nodes === null ? Object.keys(ledger.nodes) : nodes) {
-      const node = ledger.nodes[id];
-      // A node of a release later than this program is not read (verifyAll leaves it pending).
-      if (node === undefined || !writesToStore(node) || newerReleaseNodes.has(id)) continue;
-      if (node.final !== null && node.checkpoint.seq >= node.final.seq) continue;
-      if (reads.targets.length < LOG_STORE_NODES) {
-        reads.targets.push({
-          node: id, key_marker: listingMarker(id, node.checkpoint.seq), version_id_marker: null,
-        });
-      }
-      if (node.gone_ms === 0 && node.final === null) {
-        const nonce = native.randomBytes(32);
-        reads.heads.set(id, {
-          nonce: nonce,
-          result: settled(api("POST", "/api/secure/nodes/" + id + "/status", { nonce: nonce })),
-        });
-      }
+  /** Decides the custody of a record the app makes. When delegation is off it is delegation_off.
+   *  When no node this device handed a grant to holds it within its time, the grants are handed
+   *  first (withGrants). When there still is none it is grant_required (no record is made under a
+   *  custody that no node can open). */
+  async function recordCustody(turn) {
+    let ledger = loadLedger();
+    if (delegationOff(ledger)) throw native.error("delegation_off", "delegation is turned off");
+    let custody = heldCustody(ledger, loadGrants(), native.nowMs());
+    if (custody === null) {
+      const held = await withGrants(turn);
+      ledger = held.ledger;
+      custody = heldCustody(ledger, held.grants, native.nowMs());
     }
-    reads.listings = settled(requestListings(nodes === null, reads.targets));
-    return reads;
+    if (custody === null) throw native.error("grant_required", "no node holds a grant");
+    return custody;
   }
 
-  /** The node summary table of one verification run from its reads (the log node query sent ahead):
-   *  the node of each summary maps to it. A query that failed is thrown: the run cannot judge
-   *  without it. */
-  async function readSummaries(reads) {
-    const outcome = await reads.summaries;
-    if (!outcome.ok) throw outcome.error;
-    const listed = outcome.value.json.nodes;
-    const summaries = Object.create(null);
-    for (const summary of Array.isArray(listed) ? listed : []) {
-      if (summary !== null && typeof summary === "object" && typeof summary.node === "string") {
-        summaries[summary.node] = summary;
-      }
-    }
-    return summaries;
-  }
-
-  /** The listing addresses of one run in one request: the node discovery listing of the account
-   *  prefix (discovery) and the listing of every node of nodes ({node, key_marker,
-   *  version_id_marker}) from its marker. Every address is checked as the address of one listing
-   *  request is (listingUrlAccepted); an address that is not the one requested, a node that is not
-   *  the one requested, and a missing address reject the whole response (url_rejected). Returns
-   *  {discovery: url | null, nodes: Map<node, {url, keyMarker}>}. */
-  async function requestListings(discovery, nodes) {
-    let response = null;
-    try {
-      response = (await api("POST", LOG_LISTINGS_PATH, { discovery: discovery, nodes: nodes })).json;
-    } catch (error) {
-      throw storeFailure(
-        error && error.code === "log_store_disabled" ? "disabled" : "unreachable",
-        "address:" + failureCode(error));
-    }
-    const out = { discovery: null, nodes: new Map() };
-    if (discovery) {
-      const item = response.discovery;
-      const expected = { prefix: accountPrefix(), nodes: true, keyMarker: null, versionIdMarker: null };
-      if (item === null || typeof item !== "object" || !listingUrlAccepted(item.list_url, expected)) {
-        throw storeFailure("url_rejected", "discovery:url");
-      }
-      out.discovery = item.list_url;
-    }
-    const listed = Array.isArray(response.nodes) ? response.nodes : [];
-    if (listed.length !== nodes.length) throw storeFailure("url_rejected", "listing:url");
-    for (let i = 0; i < nodes.length; i += 1) {
-      const wanted = nodes[i];
-      const item = listed[i];
-      const expected = {
-        prefix: accountPrefix() + wanted.node + "/", nodes: false,
-        keyMarker: wanted.key_marker, versionIdMarker: wanted.version_id_marker,
-      };
-      if (item === null || typeof item !== "object" || item.node !== wanted.node ||
-          !listingUrlAccepted(item.list_url, expected)) {
-        throw storeFailure("url_rejected", "listing:url");
-      }
-      out.nodes.set(wanted.node, { url: item.list_url, keyMarker: wanted.key_marker });
-    }
-    return out;
-  }
-
-  /** The stages after the first of the reads of a run: B, the discovery listing and the listing of
-   *  every node whose head differs from its verification point (a node whose head equals it is not
-   *  listed: docs/protocol.md 7.4 step 1); C, one address request for the object versions the
-   *  judgement reads by content on those pages (the control entries and the format 1 entries up to
-   *  the vouched end, every candidate of a chain nobody vouches for), at most LOG_PREFETCH_OBJECTS;
-   *  D, those objects. A read that fails is not kept: the judgement requests it again. Nothing here
-   *  changes the ledger or the judgement; summaries is the node summary table of the run. */
-  async function completeVerificationReads(ledger, reads, summaries, budgets) {
-    const listings = await reads.listings;
-    const outcomes = new Map();
-    for (const [id, entry] of reads.heads) {
-      outcomes.set(id, { outcome: await entry.result, nonce: entry.nonce });
-    }
-    if (!listings.ok) return;
-    const gets = [];
-    if (listings.value.discovery !== null) gets.push({ kind: "discovery", url: listings.value.discovery });
-    for (const target of reads.targets) {
-      const node = ledger.nodes[target.node];
-      const address = listings.value.nodes.get(target.node);
-      if (node === undefined || address === undefined) continue;
-      const stored = summaries[target.node] === undefined
-        ? { live: false, final_head: null }
-        : summaries[target.node];
-      const decision = headAhead(node, target.node, stored, outcomes.get(target.node));
-      if (decision === null) continue;
-      // A head at the verification point (nothing written since) is not listed; a head before it, or
-      // at it with another hash, is a mismatch the judgement marks without a listing (walkStore).
-      if (decision.head !== null && decision.head.seq <= node.checkpoint.seq) continue;
-      gets.push({
-        kind: "node", id: target.node, url: address.url, keyMarker: address.keyMarker,
-        vouched: decision.head === null ? null : decision.head.seq,
-      });
-    }
-    const pages = await stage(gets.map(function (item) { return fetchStore(item.url, "listing"); }));
-    const wanted = [];
-    for (let i = 0; i < gets.length; i += 1) {
-      const item = gets[i];
-      const page = pages[i];
-      if (!page.ok || page.value.status !== 200) continue;
-      const parsed = parseListVersions(page.value.body);
-      if (parsed === null) continue;
-      if (item.kind === "discovery") {
-        reads.discovery = parsed;
-        continue;
-      }
-      reads.pages.set(item.id, { keyMarker: item.keyMarker, listing: parsed });
-      const node = ledger.nodes[item.id];
-      const index = { entries: new Map(), min: 0, max: node.checkpoint.seq, truncated: false };
-      addListing(index, parsed, accountPrefix() + item.id + "/", node.checkpoint.seq);
-      const seqs = Array.from(index.entries.keys()).sort(function (a, b) { return a - b; });
-      for (const seq of seqs) {
-        if (item.vouched !== null && seq > item.vouched) break;
-        const candidates = index.entries.get(seq).slice().sort(function (a, b) {
-          return (b.isLatest ? 1 : 0) - (a.isLatest ? 1 : 0);
-        });
-        for (const candidate of candidates) {
-          if (item.vouched !== null && candidate.parts.format === 2 && candidate.parts.kind === "u") continue;
-          if (wanted.length >= LOG_PREFETCH_OBJECTS) break;
-          wanted.push(candidate);
-        }
-        if (wanted.length >= LOG_PREFETCH_OBJECTS) break;
-      }
-    }
-    if (wanted.length === 0) return;
-    let urls = null;
-    try {
-      urls = await storeObjectUrls(wanted);
-    } catch (error) {
-      return;
-    }
-    // The objects are read through the store gate; a read whose turn comes after the time budget of
-    // the run is spent is skipped (the judgement reads what it still wants, within its budget).
-    const bodies = await pooled(wanted, function (candidate) {
-      return fetchStoreObject(urls.get(candidate.key + "\n" + candidate.versionId));
-    }, function () { return deadlinePassed(budgets); });
-    for (let i = 0; i < wanted.length; i += 1) {
-      if (bodies[i].ok) reads.objects.set(wanted[i].key + "\n" + wanted[i].versionId, bodies[i].value);
-    }
-  }
-
-  /** The head the judgement will have for one chain, from the reads alone (nothing is sent and
-   *  nothing is recorded): the final head of the ledger, the head of the status read ahead (read is
-   *  {outcome, nonce}; used, as headFor uses it, only for a node the summary says lives), or the
-   *  final head of the node summary. Returns {head} (head null when the judgement will have none)
-   *  or null when the judgement will mark the chain without reading its listing (a head that does
-   *  not verify, a status failure the judgement throws). */
-  function headAhead(node, id, stored, read) {
-    if (node.final !== null) return { head: node.final };
-    if (read !== undefined && stored.live === true) {
-      const outcome = read.outcome;
-      if (outcome.ok) {
-        try {
-          return { head: openHead(outcome.value.json.head, node, id, read.nonce) };
-        } catch (error) {
-          return null;
-        }
-      }
-      if (outcome.error && outcome.error.code !== "node_not_found") return null;
-    }
-    if (stored.final_head !== null && stored.final_head !== undefined) {
-      try {
-        return { head: openHead(stored.final_head, node, id, null) };
-      } catch (error) {
-        return null;
-      }
-    }
-    return { head: null };
-  }
-
-  /** The log verification (docs/protocol.md 7.4): lists the nodes of the account in the log store,
-   *  checks the chain of every node of the ledger and then of at most LOG_STORE_NODES nodes of the
-   *  listing the ledger does not know (a node found in the store only is kept in the ledger, with
-   *  origin store and unknown_ms, only when an entry sealed to the key of this account verified on
-   *  it and no traced transfer explains it after the second look of verifyRun: a delegation the app
-   *  did not make, counted as unknown in every run until a traced transfer explains the node),
-   *  publishes the state log (publishLogState) and reports the run. A node of a
-   *  release later than this program (newerReleaseNodes), of the ledger or of the listing, is not
-   *  read: it is counted in newer_release_nodes and leaves the run pending, not attention, and the
-   *  program that lists the release reads its chain. One run spends at most LOG_VERIFY_KEYS keys
-   *  and LOG_VERIFY_BODIES bodies over every node. A run whose node discovery listing cannot be
-   *  read verifies nothing (the verification points stay). */
-  async function verifyAll(ledger, keys, reads) {
-    let started = native.nowMs();
-    let run = await verifyRun(ledger, keys, reads);
-    if (native.nowMs() - started >= LOG_RUN_STALE_MS) {
-      // The run took longer than a run takes (the app was suspended while it ran): the heads and
-      // listings it judged are older than the nodes it now sees (a node that came up, a transfer
-      // made meanwhile), so it is judged again on fresh reads and only that judgement is published.
-      started = native.nowMs();
-      run = await verifyRun(ledger, keys, null);
-    }
-    // A run cut short by its time budget, or one that left nodes found in the store only to the
-    // next runs (LOG_STORE_NODES), with the store read (verified, or truncated by that window) is
-    // walked on by the next synchronization of this runtime (verifyDue), not only by the next period.
-    verificationCutShort = (run.counts.cutShort || run.counts.moreToExamine === true) && storeRead(run.store);
-    verificationDeferred = false;
-    const result = publishLogState(ledger, run.store, run.counts, run.now);
-    reportVerification(result, run.counts, Object.keys(ledger.nodes).length, native.nowMs() - started);
-    return result;
-  }
-
-  /** One judgement of the log (the body of verifyAll): returns {store, counts, now} for
-   *  publishLogState and reportVerification, which the caller does. counts.unknownIds are the ids
-   *  of the nodes counted as unknown.
-   *
-   *  The heads of the nodes of the ledger are read in the first stage of the reads of the run and
-   *  the node discovery listing after them. A transfer of the delegation that lands between the two
-   *  (the giving node writes grant_transferred_out, the store confirms it, the grant goes over, the
-   *  receiving node writes grant_transferred_in: docs/protocol.md 10.1) shows the receiving node in
-   *  the listing while the chain of the giving node is walked to a head signed before the transfer,
-   *  so the trace does not reach the receiving node in that walk. Before a node found in the store
-   *  only is counted as a delegation the app did not make, the run therefore reads once more (the
-   *  second look): the node summary, the status of every node whose head the first stage read and
-   *  whose chain verified to that head, and the listing addresses of those nodes; it then walks
-   *  those chains on from their verification points to the new heads, within the key and body
-   *  budgets of the run. A transfer traced there explains the node (followTransfer). Only a node
-   *  still unexplained after that is marked. A run that finds no such node makes no further read. */
-  async function verifyRun(ledger, keys, reads) {
-    // The budgets of the run: keys and bodies over every node, and the time from here (the reads
-    // ahead included) at which the run stops walking (LOG_VERIFY_TIME_MS).
-    const budgets = {
-      keys: LOG_VERIFY_KEYS, bodies: LOG_VERIFY_BODIES, fetched: 0, progress: 0,
-      deadline: native.nowMs() + LOG_VERIFY_TIME_MS,
-    };
-    // The reads of the run were sent ahead by the caller (together with its own requests) or are
-    // sent now; the judgement below uses them only where they are the very responses it would request.
-    if (!reads) reads = beginVerificationReads(ledger, null);
-    const summaries = await readSummaries(reads);
-    await completeVerificationReads(ledger, reads, summaries, budgets);
-    const store = { state: "verified", detail: "" };
-    const now = native.nowMs();
-    const counts = {
-      pending: false, unverified: 0, missing: 0, expired: 0, unknown: 0, later: 0, keys: 0, bodies: 0,
-      unknownIds: [], cutShort: false,
-    };
-    // The listing addresses of the run that the backend refused or that did not name the listings
-    // requested are the store failure of the run, as the refusal of one listing address is
-    // (listStorePage). A listing request that did not arrive is sent again by the judgement.
-    const listings = await reads.listings;
-    let discovered = [];
-    try {
-      if (!listings.ok && isStoreFailure(listings.error) && listings.error.kind !== "unreachable") {
-        throw listings.error;
-      }
-      discovered = await discoverStoreNodes(reads);
-    } catch (error) {
-      if (!isStoreFailure(error)) throw error;
-      storeFailed(store, error);
-      if (store.state !== "absent" && store.state !== "refused") {
-        counts.pending = true;
-        return { store: store, counts: counts, now: now };
-      }
-    }
-    // The nodes of the listing the ledger does not know: examined after the nodes of the ledger (the
-    // key order of the nodes object is the order of the queue), at most LOG_STORE_NODES in one run.
-    // A node of a release later than this program is not examined: its chain waits for the program
-    // that lists the release (pending), and it does not enter the ledger here.
-    const unknownIds = discovered.filter(function (id) { return ledger.nodes[id] === undefined; });
-    const examinable = unknownIds.filter(function (id) { return !newerReleaseNodes.has(id); }).sort();
-    // The nodes of a later release this run left out, each once (a node of the listing can enter
-    // the ledger later in the run through the tracing of a transfer).
-    const later = new Set(unknownIds.filter(function (id) { return newerReleaseNodes.has(id); }));
-    // The window of this run begins after the node the last run examined last (the discovery cursor
-    // of the ledger, in the id order of the listing) and wraps to the start of the listing. A node
-    // examined to its head that holds nothing sealed to this key leaves the ledger below and the
-    // listing names it again: the cursor, not the ledger, carries the window past it, so every
-    // unknown node is examined within ceil(n / LOG_STORE_NODES) + 1 runs whatever the runs leave in
-    // the ledger (a program whose window began at the start of the listing at every run never
-    // examined the nodes beyond LOG_STORE_NODES such nodes).
-    const after = ledger.discovery_after;
-    const ahead = examinable.filter(function (id) { return id > after; });
-    const behind = examinable.filter(function (id) { return id <= after; });
-    const examined = ahead.concat(behind).slice(0, LOG_STORE_NODES);
-    if (examined.length > 0) ledger.discovery_after = examined[examined.length - 1];
-    for (const id of examined) {
-      ledger.nodes[id] = {
-        sign_pk: id, seal_pk: "", platform: "", release: "", first_ms: now, granted_ms: 0,
-        not_after_ms: 0, checkpoint: { seq: 0, hash: ZERO_HASH, time_ms: 0 }, final: null, gone_ms: now,
-        origin: "store", unknown_ms: 0, sealed_ms: 0,
-      };
-    }
-    // The nodes whose verified entries include one sealed to the key of this account.
-    const ours = new Set();
-    // The nodes whose last walk in this run verified the chain to its head.
-    const reached = new Set();
-    const queued = new Set();
-    /** Walks the chains of the nodes of ids on the summaries and reads given. The verification of
-     *  a chain can add nodes to the ledger (the tracing of a delegation transfer): the added nodes
-     *  are walked in this run too, each once. */
-    const walk = async function (ids, summaries, reads) {
-      const queue = ids.slice();
-      for (const id of queue) queued.add(id);
-      while (queue.length > 0) {
-        if (timeBudgetSpent(budgets)) {
-          // The time budget of the run is spent: the chains not walked yet stay at their
-          // verification points (pending) and the next run walks them.
-          counts.pending = true;
-          break;
-        }
-        const id = queue.shift();
-        if (ledger.nodes[id] === undefined) continue;
-        if (newerReleaseNodes.has(id)) {
-          // A node of the ledger (traced from a transfer, or marked by the program that found it in
-          // the store) of a release later than this program: its chain is not read in this run and
-          // its mark is not counted; the program that lists the release judges it.
-          later.add(id);
-          continue;
-        }
-        const outcome = await verifyChain(ledger, id, summaries[id], budgets, keys, store, reads);
-        counts.missing += outcome.missing;
-        counts.expired += outcome.expired;
-        if (outcome.ours) ours.add(id);
-        if (outcome.state === "pending") counts.pending = true;
-        if (outcome.cutShort) counts.cutShort = true;
-        if (outcome.state === "attention") counts.unverified += 1;
-        if (outcome.state === "verified") reached.add(id);
-        else reached.delete(id);
-        for (const added of Object.keys(ledger.nodes)) {
-          if (!queued.has(added)) {
-            queued.add(added);
-            queue.push(added);
-          }
-        }
-      }
-    };
-    await walk(Object.keys(ledger.nodes), summaries, reads);
-    // The nodes found in the store only that hold an entry sealed to this key (verified in this run
-    // or in an earlier one: sealed_ms) and that no trace reached: the marks this run would make.
-    const unexplained = function () {
-      return Object.keys(ledger.nodes).filter(function (id) {
-        const node = ledger.nodes[id];
-        return node.origin === "store" && node.unknown_ms === 0 && (ours.has(id) || node.sealed_ms !== 0);
-      });
-    };
-    const found = unexplained();
-    if (found.length > 0 && store.state === "verified" && !timeBudgetSpent(budgets)) {
-      // The second look: the nodes whose head the first stage of the reads holds (reads.heads) and
-      // whose chain verified to that head are read again (the summary, the status, the listing
-      // addresses) and walked on from their verification points. The walk of a chain whose first
-      // walk ended pending or attention is not repeated: it would count its gap or its budget twice.
-      const again = Object.keys(ledger.nodes).filter(function (id) {
-        return reads.heads.has(id) && reached.has(id);
-      });
-      if (again.length > 0) {
-        const readsAgain = beginVerificationReads(ledger, again);
-        const summariesAgain = await readSummaries(readsAgain);
-        await completeVerificationReads(ledger, readsAgain, summariesAgain, budgets);
-        const listingsAgain = await readsAgain.listings;
-        if (!listingsAgain.ok && isStoreFailure(listingsAgain.error) && listingsAgain.error.kind !== "unreachable") {
-          storeFailed(store, listingsAgain.error);
-          counts.pending = true;
-        } else {
-          await walk(again, summariesAgain, readsAgain);
-        }
-        native.log("second look: " + found.length + " node(s) found in the store only, the heads of " +
-          again.length + " node(s) read again, " + unexplained().length + " left unexplained");
-      }
-    }
-    counts.keys = LOG_VERIFY_KEYS - budgets.keys;
-    counts.bodies = budgets.fetched;
-    counts.later = later.size;
-    // More nodes found in the store only than this run examines (LOG_STORE_NODES): the rest are
-    // examined by the next synchronizations (verifyDue), the run is pending, and the report names
-    // the store truncated. The store was read: this is not a failing read (publishLogState).
-    counts.moreToExamine = examinable.length > examined.length;
-    if (counts.moreToExamine) {
-      counts.pending = true;
-      if (store.state === "verified") storeFailed(store, storeFailure("truncated", "discovery:nodes"));
-    }
-    // Whether a budget of the run cut it short: the time budget (a walk above stopped at it, or the
-    // second look was not made), or the keys or bodies budget or the listing pages of one chain
-    // (a walk above stopped before its head: outcome.cutShort). The next synchronization walks on.
-    counts.cutShort = counts.cutShort || timeBudgetSpent(budgets);
-    if (counts.cutShort) counts.pending = true;
-    // A node found in the store only whose chain holds an entry sealed to this key (sealed_ms: the
-    // fact stays with the node across runs) is a delegation the app did not make and no verified
-    // transfer explained (a trace that reaches the node, in the first walk or in the second look of
-    // this run or of an earlier one, changes its origin before this mark). The mark stays in the
-    // ledger. A run cut short makes no mark: the trace that explains the node may be in a chain, or
-    // in the part of a chain, the run has not walked yet (the giving node's transfer entry beyond
-    // the keys the run could walk). A node that has stayed unexplained for LOG_STORE_STALE_MS since
-    // that entry was first verified is marked by a run cut short as well: the runs of those days
-    // walked the chains that could have explained it.
-    for (const id of Object.keys(ledger.nodes)) {
-      const node = ledger.nodes[id];
-      if (node.origin !== "store" || node.unknown_ms !== 0 || node.sealed_ms === 0) continue;
-      if (!counts.cutShort || now - node.sealed_ms >= LOG_STORE_STALE_MS) node.unknown_ms = now;
-    }
-    for (const id of Object.keys(ledger.nodes)) {
-      const node = ledger.nodes[id];
-      if (node.origin !== "store") continue;
-      if (node.unknown_ms !== 0) {
-        // The mark of a node of a release later than this program was counted above (pending).
-        if (!newerReleaseNodes.has(id)) {
-          counts.unknown += 1;
-          counts.unknownIds.push(id);
-        }
-      } else if (node.sealed_ms === 0 && discovered.length > 0 && discovered.indexOf(id) < 0) {
-        // A node found in the store only whose prefix the listing of this run no longer names and
-        // whose chain held nothing sealed to this key: nothing to keep.
-        delete ledger.nodes[id];
-      }
-      // Otherwise the node stays with its verification point: the next run walks on from there when
-      // its examination is not complete (the run was cut short, or the walk did not reach the head),
-      // and reads nothing new from it when the chain was walked to its head and holds nothing sealed
-      // to this key (a clean prefix: an object someone put under the account prefix, or the chain a
-      // node wrote under an earlier key of the account). A clean prefix that left the ledger was
-      // examined again by the next run and, with more such prefixes than LOG_STORE_NODES, kept the
-      // verification pending and running at every synchronization.
-    }
-    return { store: store, counts: counts, now: now };
-  }
+  // ---- The synchronization ----
 
   /** The migration of what was stored before the switch: the tokens of connections and the vault
    *  values that were stored under the KMS envelope of the operator before the switch are handed out
@@ -4183,27 +5795,14 @@
    *  is the opened bytes as they are (re-serializing the JSON would change integers above 2^53, the
    *  notation of numbers and escape sequences): only that it is a JSON object is checked. Nothing is
    *  done when no node holds a grant (no node could open those records). A failure is only logged
-   *  and does not change the result of sync. first is the settled outcome of the first query (sent
-   *  ahead, together with the first reads of the verification) or null when this device and account
-   *  completed the check before (SEALING_CHECK_STORE_KEY): then nothing is queried. A query that found
-   *  no item, and an upload that left none, mark the check as complete; a failed query marks nothing
-   *  (the next sync queries again). Returns the number of stored items. */
-  async function sealPending(keys, ledger, first) {
-    let sealed = 0;
-    if (first === null || first === undefined) return 0;
+   *  and does not change the result of sync. A query that found no item, and an upload that left
+   *  none, mark the check as complete (SEALING_CHECK_STORE_KEY); a failed query marks nothing (the
+   *  next sync queries again). The rounds of fetching and uploading are bounded (SEALING_ROUNDS). */
+  async function sealPending(turn, keys, custody) {
     try {
-      const custody = heldCustody(ledger, native.nowMs());
-      if (custody === null) return 0;
       const user = userId();
       for (let round = 0; round < SEALING_ROUNDS; round += 1) {
-        let pending = null;
-        if (round === 0) {
-          const outcome = await first;
-          if (!outcome.ok) throw outcome.error;
-          pending = outcome.value.json;
-        } else {
-          pending = (await api("GET", "/api/secure/sealing")).json;
-        }
+        const pending = (await api(turn, "GET", "/api/secure/sealing")).json;
         const items = Array.isArray(pending.items) ? pending.items : [];
         const records = [];
         for (const item of items) {
@@ -4227,307 +5826,300 @@
           break;
         }
         if (records.length === 0) break;
-        const stored = (await api("PUT", "/api/secure/sealing", { items: records })).json;
-        sealed += Array.isArray(stored.sealed) ? stored.sealed.length : 0;
+        await api(turn, "PUT", "/api/secure/sealing", { items: records });
         // The check is marked complete only by a query that found nothing: after an upload the next
         // sync queries once more (an item the backend rejected stays pending and is offered again).
         if (pending.more !== true) break;
       }
     } catch (error) {
+      if (failureCode(error) === "cancelled" || !(turnLeft(turn) > 0)) throw error;
       native.log("sealing pending records failed: " + failureCode(error));
     }
-    return sealed;
   }
 
-  /** From the delegation step of sync to its end: when delegation is on the grants of the living
-   *  nodes are renewed, the ledger is saved, grant is published, the steps after the grants run
-   *  (afterGrants: the sealing check, the completion of an application password setup, the log
-   *  verification when its period has elapsed), and runtime.ready is published. offered is the node
-   *  list already requested (null: renewGrants requests it). */
-  async function delegate(keys, ledger, offered, shared, deferVerification) {
-    let renewed = { accepted: new Set(), rejected: 0, cleared: false };
-    // The ledgers of the other devices of the account enter before the grants go out (shared is
-    // the settled outcome of the request runSync sent ahead; null when the run does not exchange:
-    // shareWanted): a node they delegated to is renewed by this device (it is a grant node now),
-    // and a mark this device left on such a node is cleared (the verification runs again below).
-    const merged = shared === null ? { cleared: false } : await shareLedger(keys, ledger, shared);
-    if (!delegationOff(ledger)) {
-      renewed = await renewGrants(keys, ledger, undefined, offered);
-    } else {
-      // While delegation is off the revoke is sent again to every living node: it reaches the nodes
-      // that were not reached when it was turned off, and the nodes that took over a delegation
-      // from them. A failure does not stop sync.
-      try {
-        await revokeEverywhere(keys, ledger);
-      } catch (error) {
-        native.log("revoke retry failed: " + failureCode(error));
-      }
-    }
-    saveLedger(ledger);
-    const grant = grantState(ledger, renewed.accepted, native.nowMs());
-    native.publish({
-      state: { grant: grant, grant_days: ledger.ttl_days },
-      runtime: { rejected_nodes: renewed.rejected },
-    });
-    await afterGrants(keys, ledger, merged.cleared || renewed.cleared, deferVerification === true);
-    native.publish({ runtime: { ready: true } });
-    // The grants of this run (a node the backend value did not cover) are shared after the run.
-    if (ledgerShareDue(ledger)) await shareLedger(keys, ledger);
-    return { grant: grant, accepted: renewed.accepted.size, rejected: renewed.rejected };
-  }
-
-  /** The steps of delegate after the grants: the sealing check (when this device and account have
-   *  not completed one), the completion of an application password setup, and the log verification
-   *  when its period has elapsed or when cleared is true (a mark of a delegation the app did not
-   *  make was cleared by the grants or the shared ledger of this run: the judgement is made again
-   *  at once instead of at the next period). The query of the sealing check and the first reads of
-   *  the verification (beginVerificationReads) are sent together as one stage; the steps then run
-   *  in the order of v29 on the responses. While delegation is off only the verification runs. */
-  // Whether the last verification run of this runtime was cut short by its time budget with the
-  // store read: the next synchronization walks on (a new runtime starts from the period rule).
-  let verificationCutShort = false;
-  // Whether a synchronization a user procedure started left a due verification to the next
-  // synchronization of this runtime.
-  let verificationDeferred = false;
-
-  /** Whether the log verification runs in this synchronization: its period has elapsed, the last
-   *  run of this runtime was cut short by its time budget, or a user procedure left it to this
-   *  synchronization. */
-  function verifyDue() {
-    return verificationDeferred || verificationCutShort ||
-      native.nowMs() - logState.verified_ms >= LOG_VERIFY_INTERVAL_MS;
-  }
-
-  /** Whether a synchronization exchanges the ledger with the backend before its grants: when the
-   *  verification is due (the ledgers of the other devices are read before the judgement), when
-   *  this ledger marks a node as a delegation the app did not make (another device may explain
-   *  it), and when this device holds a grant node the last exchange did not cover. */
-  function shareWanted(ledger) {
-    return verifyDue() || unknownNodeIds(ledger).length > 0 || ledgerShareDue(ledger);
-  }
-
-  async function afterGrants(keys, ledger, cleared, deferVerification) {
-    const on = !delegationOff(ledger);
-    let due = cleared === true || verifyDue();
-    if (due && deferVerification === true) {
-      // A synchronization a user procedure started returns without the verification (the user is
-      // waiting for the grants, the key or the transfer): the next synchronization of the runtime
-      // (the next foreground, push or session) runs it (verifyDue).
-      verificationDeferred = true;
-      due = false;
-    }
-    // The query of the sealing check is sent only when a node holds a grant: without one nothing
-    // could be sealed (sealPending) and the account is not asked.
-    const sealing = on && needsSealingCheck() && heldCustody(ledger, native.nowMs()) !== null
-      ? settled(api("GET", "/api/secure/sealing"))
-      : null;
-    const reads = due ? beginVerificationReads(ledger, null) : null;
-    if (on) {
-      await sealPending(keys, ledger, sealing);
-      await finishAppPasswordSetup(keys, ledger);
-    }
-    if (due) await verifyAll(ledger, keys, reads);
-  }
-
-  /** Whether the sealing check has still to run for this device and account. */
-  function needsSealingCheck() {
-    return native.storeGet(SEALING_CHECK_STORE_KEY) === null;
-  }
-
-  /** The body of sync. A failure publishes its code to state.error, a success clears it. */
-  async function runSync() {
+  /** One synchronization (docs/protocol.md, "The program of the app"). trigger says what started
+   *  it: {refill} (a push with the reason grant_required: a node the backend reports no grant row
+   *  for is handed a grant again). The steps:
+   *    1 the account query and, when this device holds a master key, the list of the nodes of the
+   *      account, sent together
+   *    2 the judgement of the key (judgeKey)
+   *    3 which listed nodes are to receive a grant, 4 their attestations and the grants
+   *      (renewGrants), or 5, with delegation off, the revoke to every listed node
+   *    6 the published state grant and runtime.ready
+   *    7 what follows the grants: the sealing check, the completion of an application password
+   *      setup, and a round of the log when one is due
+   *    8 the catch-up of a transfer of the master key
+   *  Steps 1 to 5 run under the grant lock. A failure publishes its code to state.error, a success
+   *  clears it. Returns {keyState, keyId, grant, granted, rejected}. */
+  async function runSync(turn, trigger) {
     try {
-      // The node list of the delegation step is requested along with the account query when this
-      // device holds a master key and delegation is on; a device without a key delegates nothing,
-      // and while delegation is off the revoke is sent again with a list of its own (delegate).
-      const judging = judgeKey();
-      const held = readMasterKey() !== null;
-      const current = held ? loadLedger() : null;
-      const pending = held && !delegationOff(current) ? settled(fetchOffered()) : null;
-      // The shared ledger of the account is requested along with the account query (one stage)
-      // when the run exchanges it (shareWanted).
-      const shared = held && shareWanted(current) ? settled(api("GET", LEDGER_SHARE_PATH)) : null;
-      const judged = await judging;
-      let outcome = { grant: { state: "none", not_after_ms: 0 }, accepted: 0, rejected: 0 };
-      if (judged.keyState === "present") {
-        const offered = pending === null ? null : await pending;
-        outcome = await delegate(
-          judged.keys, loadLedger(), offered !== null && offered.ok ? offered.value : null, shared);
-      } else {
-        native.publish({ runtime: { ready: true } });
+      const step = await grantLock.run(turn, async function () {
+        const account = api(turn, "GET", "/api/secure/account");
+        account.then(noop, noop);
+        const held = readMasterKey() !== null;
+        const listed = held && !delegationOff(loadLedger()) ? settled(fetchListed(turn)) : null;
+        const judged = await judgeKey(turn, account);
+        if (judged.keyState !== "present") return { judged: judged, grants: null };
+        return { judged: judged, grants: await grantStep(turn, judged.keys, { listed: listed, refill: trigger.refill === true }) };
+      });
+      const judged = step.judged;
+      let grant = { state: "none", not_after_ms: 0 };
+      let granted = 0;
+      let rejected = 0;
+      if (step.grants !== null) {
+        const keys = judged.keys;
+        grant = step.grants.grant;
+        granted = step.grants.renewed.granted;
+        rejected = step.grants.renewed.rejected;
+        const ledger = step.grants.ledger;
+        if (!delegationOff(ledger)) {
+          const custody = heldCustody(ledger, step.grants.grants, native.nowMs());
+          if (custody !== null && native.storeGet(SEALING_CHECK_STORE_KEY) === null) {
+            await sealPending(turn, keys, custody);
+          }
+          await finishAppPasswordSetup(turn, keys, ledger, step.grants.grants);
+        }
+        if (roundDue()) {
+          try {
+            await requestRound(turn, keys, "sync");
+          } catch (error) {
+            if (failureCode(error) === "cancelled") throw error;
+            native.log("round: " + failureCode(error));
+          }
+        }
+        shareLedgerSoon(keys);
       }
-      native.publish({ state: { error: null } });
+      native.publish({ state: { error: null }, runtime: { ready: true } });
       // Catching up on the master key transfer: a device with the key reads the pending requests, a
       // device with a transfer in progress advances one step, and the polling loop is started again.
-      // A failure does not change the result of sync.
-      try {
-        if (judged.keyState === "present") await checkTransferRequests();
-        else await transferStep();
-        if (transferRun !== null && !transferTerminal(transferRun.phase)) transferLoop();
-      } catch (error) {
-        native.log("transfer sync: " + failureCode(error));
-      }
-      return {
-        keyState: judged.keyState, keyId: judged.keyId, grant: outcome.grant,
-        accepted: outcome.accepted, rejected: outcome.rejected,
-      };
+      // The transfer belongs to the line of the procedures a user starts; the synchronization does
+      // not wait for it.
+      userLine.run(freeTurn(), function () { return transferCatchUp(judged.keyState === "present"); }).then(noop, function (error) {
+        try {
+          native.log("transfer sync: " + failureCode(error));
+        } catch (closed) {
+          // The bridge is closed.
+        }
+      });
+      outcomesDaily();
+      return { keyState: judged.keyState, keyId: judged.keyId, grant: grant, granted: granted, rejected: rejected };
     } catch (error) {
       native.publish({ state: { error: failureCode(error) } });
       throw error;
     }
   }
 
-  async function sync() {
-    const outcome = await runSync();
+  // The synchronization that waits for the one that runs (null: none): {trigger, promise}. A
+  // trigger that arrives while one waits is served by it. runningSync is the one that runs (null:
+  // none): {startedMs, promise}.
+  let waitingSync = null;
+  let runningSync = null;
+
+  /** Asks for a synchronization on the line of the synchronizations: one runs and at most one
+   *  waits. A trigger that arrives while one waits joins it (its refill is taken over). An event
+   *  of the app itself (own: the start of the runtime, the return to the foreground) is also
+   *  served by the synchronization that runs when it began less than EVENT_SYNC_FRESH_MS ago: what
+   *  it reads is as new as what a synchronization of that event would read. Otherwise a new
+   *  synchronization is put on the line, which runs at once when none runs. The time of a
+   *  synchronization begins when it begins. Returns the promise of its result. */
+  function requestSync(trigger) {
+    if (waitingSync !== null) {
+      if (trigger.refill === true) waitingSync.trigger.refill = true;
+      return waitingSync.promise;
+    }
+    if (trigger.own === true && runningSync !== null &&
+        native.nowMs() - runningSync.startedMs < EVENT_SYNC_FRESH_MS) {
+      return runningSync.promise;
+    }
+    const entry = { trigger: { refill: trigger.refill === true }, promise: null };
+    const waits = syncLine.busy();
+    const start = tracked(trigger.name, function (args, turn) {
+      return syncLine.run(turn, function () {
+        if (waitingSync === entry) waitingSync = null;
+        const running = { startedMs: native.nowMs(), promise: entry.promise };
+        runningSync = running;
+        const ended = function () {
+          if (runningSync === running) runningSync = null;
+        };
+        const work = runSync(turn, entry.trigger);
+        work.then(ended, ended);
+        return work;
+      }, true);
+    });
+    entry.promise = start({});
+    if (waits) waitingSync = entry;
+    return entry.promise;
+  }
+
+  /** The procedure sync: a synchronization, within the turn of the call. */
+  async function syncProcedure(turn) {
+    const outcome = await limited(turn, requestSync({ name: "", refill: false }), Infinity, "sync");
     return { key_state: outcome.keyState, grant: outcome.grant };
   }
 
-  /** The front of a connection: checks that delegation is on and that at least one living node
-   *  holds the grant of this account. The list of living nodes is fetched again and a node without
-   *  a grant (a node that restarted) receives one. When delegation is off it is delegation_off; when
-   *  no living node holds a grant it is grant_required (attestation_failed when every living node
-   *  failed the attestation verification or is of a release later than this program). Returns the
-   *  renewed ledger. */
-  async function liveGrantLedger(keys, offered) {
-    const ledger = loadLedger();
-    if (delegationOff(ledger)) throw native.error("delegation_off", "delegation is turned off");
-    const renewed = await renewGrants(keys, ledger, undefined, offered);
-    saveLedger(ledger);
-    const grant = grantState(ledger, renewed.accepted, native.nowMs());
-    native.publish({ state: { grant: grant }, runtime: { rejected_nodes: renewed.rejected } });
-    if (grant.state === "none") {
-      const allRejected = renewed.rejected + renewed.later > 0 && renewed.accepted.size === 0;
-      throw native.error(allRejected ? "attestation_failed" : "grant_required", "no live node holds a grant");
+  /** A synchronization an event started (counted as event_sync). own says that the event is one of
+   *  the app itself. For a push, the report of the synchronization follows it (SYNC_REPORT_PATH):
+   *  the backend learns that the device woke and whether it can hand a grant. Nothing waits for
+   *  the answer of the report. */
+  function eventSync(push, own) {
+    const began = native.nowMs();
+    const reason = push !== null && typeof push.reason === "string" && /^[a-z0-9_]{1,32}$/.test(push.reason)
+      ? push.reason : "unknown";
+    const run = requestSync({
+      name: "event_sync", refill: push !== null && reason === "grant_required", own: own === true,
+    });
+    if (push === null) return run;
+    const report = function (outcome) {
+      settled(api(freeTurn(), "POST", SYNC_REPORT_PATH, {
+        trigger: "push", reason: reason,
+        key_state: outcome === null ? "unknown" : outcome.keyState,
+        grant: outcome === null ? "unknown" : outcome.grant.state,
+        granted: outcome === null ? 0 : outcome.granted, rejected: outcome === null ? 0 : outcome.rejected,
+        elapsed_ms: Math.max(0, native.nowMs() - began), program_version: VERSION,
+      })).then(function (sent) {
+        try {
+          if (!sent.ok) native.log("sync report: " + failureCode(sent.error));
+        } catch (closed) {
+          // The bridge is closed.
+        }
+      });
+    };
+    return run.then(
+      function (outcome) { report(outcome); return outcome; },
+      function (error) {
+        if (failureCode(error) !== "cancelled") report(null);
+        throw error;
+      });
+  }
+
+  // ---- The key procedures ----
+
+  /** Forgets what this device kept of the log of the account (a new key begins a new log): the
+   *  grants, the judgements, the kept screen. The ledger of the earlier programs is not carried
+   *  over again. */
+  function clearLog() {
+    for (const key of [STORE_GRANTS, STORE_CURSOR, STORE_RESUME, STORE_NODES, STORE_UNACCEPTED, STORE_BLOCKED,
+      STORE_SAMPLE, STORE_SEEN, STORE_MISSING, STORE_LEGACY, STORE_ROUND, STORE_CACHE]) {
+      native.storeSet(key, null);
     }
-    return ledger;
+    native.storeSet(STORE_MIGRATED, String(VERSION));
+    logState = emptyLogState();
+    displayNodes.clear();
+    displayEntries.clear();
+    logPagePlaces = [];
   }
 
   /** Key creation: a new key is made only when the keychain has no master key and the account has
    *  no registered key. The account registration comes first and the keychain is written only after
    *  it succeeded: when two devices create a key at the same time, the one that loses the
-   *  registration does not write to the keychain. */
-  async function createKey() {
-    // The node list of the delegation step is requested along with the account query (one stage):
-    // the key is made for the grants that follow. The registration waits for the account query.
-    const judging = judgeKey();
-    const pending = settled(fetchOffered());
-    const judged = await judging;
-    if (judged.keyState !== "absent") return { key_state: judged.keyState, key_id: judged.keyId };
-    const masterKey = native.randomBytes(32);
-    const keys = deriveKeys(masterKey);
-    try {
-      await registerKey(keys, false);
-    } catch (error) {
-      if (error.code !== "key_exists") throw error;
-      const outcome = await runSync();
-      return { key_state: outcome.keyState, key_id: outcome.keyId };
-    }
-    writeMasterKey(masterKey);
-    publishKey("present", keys);
-    const offered = await pending;
-    await delegate(keys, loadLedger(), offered.ok ? offered.value : null, null, true);
-    return { key_state: "present", key_id: keys.keyId };
+   *  registration does not write to the keychain. The grants follow under the same lock. */
+  function createKey(turn) {
+    return grantLock.run(turn, async function () {
+      const judged = await judgeKey(turn);
+      if (judged.keyState !== "absent") return { key_state: judged.keyState, key_id: judged.keyId };
+      const masterKey = native.randomBytes(32);
+      const keys = deriveKeys(masterKey);
+      try {
+        await registerKey(turn, keys, false);
+      } catch (error) {
+        if (error.code !== "key_exists") throw error;
+        const again = await judgeKey(turn);
+        return { key_state: again.keyState, key_id: again.keyId };
+      }
+      writeMasterKey(masterKey);
+      publishKey("present", keys);
+      await grantStep(turn, keys, {});
+      native.publish({ runtime: { ready: true } });
+      return { key_state: "present", key_id: keys.keyId };
+    });
   }
 
   /** Key replacement: while waiting for the key of another device, or while another key is
    *  registered, the key of the account is replaced with a new one. The nodes of the old ledger
-   *  belong to the records of the old key, so a new node ledger is made. */
-  async function resetKey() {
-    const judging = judgeKey();
-    const pending = settled(fetchOffered());
-    const judged = await judging;
-    if (judged.keyState !== "waiting" && judged.keyState !== "mismatch") {
-      throw native.error("invalid_state", judged.keyState);
-    }
-    const masterKey = native.randomBytes(32);
-    const keys = deriveKeys(masterKey);
-    await registerKey(keys, true);
-    writeMasterKey(masterKey);
-    const ledger = emptyLedger();
-    saveLedger(ledger);
-    logState = {
-      status: "pending", verified_ms: 0, unverified_nodes: 0, missing: 0, expired: 0,
-      unknown_nodes: 0, newer_release_nodes: 0, store: "pending", store_failing_ms: 0,
-      program_version: VERSION,
-    };
-    publishKey("present", keys);
-    const offered = await pending;
-    await delegate(keys, ledger, offered.ok ? offered.value : null, null, true);
-    return { key_state: "present", key_id: keys.keyId };
+   *  belong to the records of the old key, so a new node ledger is made and what this device kept
+   *  of the log is forgotten. */
+  function resetKey(turn) {
+    return grantLock.run(turn, async function () {
+      const judged = await judgeKey(turn);
+      if (judged.keyState !== "waiting" && judged.keyState !== "mismatch") {
+        throw native.error("invalid_state", judged.keyState);
+      }
+      const masterKey = native.randomBytes(32);
+      const keys = deriveKeys(masterKey);
+      await registerKey(turn, keys, true);
+      writeMasterKey(masterKey);
+      saveLedger(emptyLedger());
+      clearLog();
+      native.publish({ state: { log: logState } });
+      publishKey("present", keys);
+      await grantStep(turn, keys, {});
+      native.publish({ runtime: { ready: true } });
+      return { key_state: "present", key_id: keys.keyId };
+    });
   }
 
-  /** Reads the query string of a URL as a table from name to value. */
-  function parseQuery(url) {
-    const out = Object.create(null);
-    const start = url.indexOf("?");
-    if (start < 0) return out;
-    const end = url.indexOf("#", start);
-    const query = url.slice(start + 1, end < 0 ? url.length : end);
-    function component(value) {
-      try {
-        return decodeURIComponent(value.replace(/\+/g, " "));
-      } catch (error) {
-        return value;
-      }
+  // ---- Connections ----
+
+  /** Verifies a statement a node signed (docs/protocol.md 8.2) and returns its body. The node
+   *  must be one this device verified by its attestation and sent a grant: the node id is the
+   *  signing key of the node. A statement of another node, and one that does not verify, is null. */
+  function nodeStatement(grants, node, statement) {
+    if (typeof node !== "string" || grants[node] === undefined) return null;
+    try {
+      return openSigned(statement, node, purpose("statement") + "\n");
+    } catch (error) {
+      return null;
     }
-    for (const pair of query.split("&")) {
-      if (pair === "") continue;
-      const at = pair.indexOf("=");
-      out[component(at < 0 ? pair : pair.slice(0, at))] = at < 0 ? "" : component(pair.slice(at + 1));
-    }
-    return out;
   }
 
   /** A connection: opens the authorization address a node made in the web authentication session
    *  and, after the callback, checks the completion statement of the node. The authorization address
-   *  is opened only after a statement of a node of the ledger over its account, the whole account
-   *  signing public key (sign_pk, 32 bytes) and the hash of that address verified. A comparison of
-   *  the key_id (8 bytes) alone is not a binding: a node takes a new grant of the same account from
-   *  anyone, so the grant of another key whose first 8 bytes agree passes that comparison. */
-  async function connect(args) {
+   *  is opened only after a statement of a node this device handed a grant to verified over its
+   *  account, the whole account signing public key (sign_pk, 32 bytes) and the hash of that
+   *  address. A comparison of the key_id (8 bytes) alone is not a binding: a node takes a new grant
+   *  of the same account from anyone, so the grant of another key whose first 8 bytes agree passes
+   *  that comparison. */
+  async function connect(turn, args) {
     const target = typeof args.target === "string" ? args.target.trim() : "";
     if (target === "") throw native.error("invalid_input", "target");
-    const { keys, offered } = await presentKeysWithNodes();
-    const ledger = await liveGrantLedger(keys, offered);
+    const held = await withGrants(turn);
+    const keys = held.keys;
 
-    const request = { target: target };
+    const sent = { target: target };
     for (const name of ["login_hint", "request_id"]) {
-      if (typeof args[name] === "string") request[name] = args[name];
+      if (typeof args[name] === "string") sent[name] = args[name];
     }
     for (const name of ["reward_notice", "new_account"]) {
-      if (typeof args[name] === "boolean") request[name] = args[name];
+      if (typeof args[name] === "boolean") sent[name] = args[name];
     }
-    const begin = (await api("POST", "/api/secure/connections/begin", request)).json;
+    const begin = (await api(turn, "POST", "/api/secure/connections/begin", sent)).json;
     const user = userId();
-    const node = typeof begin.node === "string" ? ledger.nodes[begin.node] : undefined;
-    let authorized = false;
-    try {
-      const statement = openSigned(begin.statement, node.sign_pk, purpose("statement") + "\n");
-      authorized = statement.type === "oauth_begin" && statement.node === begin.node &&
-        statement.user_id === user && sameBytes(statement.sign_pk, keys.signPk) &&
-        typeof begin.state === "string" && statement.state === begin.state &&
-        typeof begin.authorization_url === "string" &&
-        sameBytes(statement.url_sha256, native.sha256(encode(utf8(begin.authorization_url))));
-    } catch (error) {
-      authorized = false;
-    }
+    const opening = nodeStatement(held.grants, begin.node, begin.statement);
+    const authorized = opening !== null && opening.type === "oauth_begin" && opening.node === begin.node &&
+      opening.user_id === user && sameBytes(opening.sign_pk, keys.signPk) &&
+      typeof begin.state === "string" && opening.state === begin.state &&
+      typeof begin.authorization_url === "string" &&
+      sameBytes(opening.url_sha256, native.sha256(encode(utf8(begin.authorization_url))));
     if (!authorized) throw native.error("unverified_authorization", "begin statement");
 
-    const returned = await native.webAuth({
-      url: begin.authorization_url, callbackScheme: "pickle", ephemeral: begin.ephemeral_session === true,
+    const returned = await interactive(turn, function () {
+      return native.webAuth({
+        url: begin.authorization_url, callbackScheme: "pickle", ephemeral: begin.ephemeral_session === true,
+      });
     });
     // A session closed without a return: the callback may have stored the connection and the user
     // closed the window on the second screen (the repository picker of GitHub). When the completion
     // of that authorization (kept as node_state) exists, it is connected, not cancelled.
-    const nodeState = typeof begin.state === "string" ? begin.state.split(".")[0] : "";
+    const nodeState = begin.state.split(".")[0];
     const query = returned === null
       ? { oauth_status: "connected", oauth_state: nodeState, closed_early: "true" }
       : parseQuery(String(returned));
     if (returned === null) {
       let kept = null;
       try {
-        kept = (await api("GET", "/api/secure/connections/completion", null, { state: nodeState })).json;
+        kept = (await api(turn, "GET", "/api/secure/connections/completion", null, { state: nodeState })).json;
       } catch (error) {
+        if (failureCode(error) === "cancelled" || !(turnLeft(turn) > 0)) throw error;
         kept = null;
       }
       if (kept === null) throw native.error("cancelled", "web session closed");
@@ -4537,16 +6129,10 @@
     }
     if (!query.oauth_state) throw native.error("unverified_connection", "callback state");
     const completion = (await api(
-      "GET", "/api/secure/connections/completion", null, { state: query.oauth_state })).json;
-    let completed = false;
-    try {
-      const statement = openSigned(completion.statement, node.sign_pk, purpose("statement") + "\n");
-      completed = statement.type === "oauth_complete" && statement.node === begin.node &&
-        statement.user_id === user && sameBytes(statement.sign_pk, keys.signPk) &&
-        statement.state === begin.state;
-    } catch (error) {
-      completed = false;
-    }
+      turn, "GET", "/api/secure/connections/completion", null, { state: query.oauth_state })).json;
+    const closing = nodeStatement(held.grants, begin.node, completion.statement);
+    const completed = closing !== null && closing.type === "oauth_complete" && closing.node === begin.node &&
+      closing.user_id === user && sameBytes(closing.sign_pk, keys.signPk) && closing.state === begin.state;
     if (!completed) throw native.error("unverified_connection", "completion statement");
     const reward = Number(query.oauth_reward);
     return {
@@ -4563,13 +6149,13 @@
    *  on or off: PUT /api/integrations/{provider}/{connection_id}/writes. A setting that uses no
    *  credential, but one that decides how the credential is used, so it is a procedure of this
    *  program (secure_run of the definition calls it). */
-  async function setConnectionWrites(args) {
+  async function setConnectionWrites(turn, args) {
     const provider = stringArgument(args.provider).trim();
     const connectionId = stringArgument(args.connection_id).trim();
     const kind = stringArgument(args.kind).trim();
     if (provider === "" || connectionId === "" || kind === "") throw native.error("invalid_input", "writes");
     await api(
-      "PUT",
+      turn, "PUT",
       "/api/integrations/" + encodeURIComponent(provider) + "/" + encodeURIComponent(connectionId) + "/writes",
       { kind: kind, enabled: args.enabled === true },
     );
@@ -4582,15 +6168,17 @@
    *  the return place (the Setup URL) refreshes the list of installation accounts before sending the
    *  user back to pickle://oauth. Closing the window changes nothing, so the result is an empty
    *  object (not a cancellation). */
-  async function manageRepositories(args) {
+  async function manageRepositories(turn, args) {
     const provider = stringArgument(args.provider).trim();
     if (provider === "") throw native.error("invalid_input", "provider");
     const minted = (await api(
-      "POST", "/api/integrations/" + encodeURIComponent(provider) + "/installation-url", {})).json;
+      turn, "POST", "/api/integrations/" + encodeURIComponent(provider) + "/installation-url", {})).json;
     if (typeof minted.url !== "string" || minted.url === "") {
       throw native.error("connect_failed", "installation url");
     }
-    const returned = await native.webAuth({ url: minted.url, callbackScheme: "pickle", ephemeral: false });
+    const returned = await interactive(turn, function () {
+      return native.webAuth({ url: minted.url, callbackScheme: "pickle", ephemeral: false });
+    });
     if (returned === null) return {};
     const query = parseQuery(String(returned));
     if (query.oauth_status !== "connected") {
@@ -4601,36 +6189,31 @@
 
   /** An application password is encrypted on the device, and the completion statement is checked
    *  against the delegated node and the record. */
-  async function connectAppPassword(args) {
+  async function connectAppPassword(turn, args) {
     const username = stringArgument(args.username).trim().toLowerCase();
     const password = stringArgument(args.password);
     if (!username || !password) throw native.error("invalid_input", "mail connection");
-    const { keys, offered } = await presentKeysWithNodes();
-    const ledger = await liveGrantLedger(keys, offered);
-    const custody = await recordCustody();
-    const record = sealRecord(keys, custody, "app_password", "naver_mail", {
+    const held = await withGrants(turn);
+    const custody = heldCustody(held.ledger, held.grants, native.nowMs());
+    if (custody === null) throw native.error("grant_required", "no node holds a grant");
+    const record = sealRecord(held.keys, custody, "app_password", "naver_mail", {
       username: username, password: password,
     });
-    return saveAppPasswordRecord(keys, ledger, record, args);
+    return saveAppPasswordRecord(turn, held.keys, held.grants, record, args);
   }
 
-  async function saveAppPasswordRecord(keys, ledger, record, args) {
+  async function saveAppPasswordRecord(turn, keys, grants, record, args) {
     const body = { record: record };
     if (typeof args.request_id === "string") body.request_id = args.request_id;
     if (typeof args.setup_id === "string") body.setup_id = args.setup_id;
-    const saved = (await api("PUT", "/api/secure/connections/naver_mail/app-password", body)).json;
-    const node = typeof saved.node === "string" ? ledger.nodes[saved.node] : undefined;
-    let verified = false;
-    try {
-      const statement = openSigned(saved.statement, node.sign_pk, purpose("statement") + "\n");
-      verified = statement.type === "app_password_verified" && statement.node === saved.node &&
-        statement.user_id === userId() && sameBytes(statement.sign_pk, keys.signPk) &&
-        statement.provider === "naver_mail" && statement.record_id === record.id &&
-        statement.key_id === keys.keyId && statement.identity === saved.identity &&
-        sameBytes(statement.ciphertext_sha256, native.sha256(encode(utf8(record.ct))));
-    } catch (error) {
-      verified = false;
-    }
+    const saved = (await api(turn, "PUT", "/api/secure/connections/naver_mail/app-password", body)).json;
+    const statement = nodeStatement(grants, saved.node, saved.statement);
+    const verified = statement !== null && statement.type === "app_password_verified" &&
+      statement.node === saved.node && statement.user_id === userId() &&
+      sameBytes(statement.sign_pk, keys.signPk) && statement.provider === "naver_mail" &&
+      statement.record_id === record.id && statement.key_id === keys.keyId &&
+      statement.identity === saved.identity &&
+      sameBytes(statement.ciphertext_sha256, native.sha256(encode(utf8(record.ct))));
     if (!verified) throw native.error("unverified_connection", "mail completion statement");
     return { provider: "naver_mail", connection_id: saved.connection_id, identity: saved.identity };
   }
@@ -4642,7 +6225,7 @@
   const MAIL_SETUP_TTL_MS = 2 * 60 * 60 * 1000;
 
   function mailSetupItem() {
-    return {service: "com.pickle.client.secure.mail-setup", account: userId(), synchronizable: false};
+    return { service: "com.pickle.client.secure.mail-setup", account: userId(), synchronizable: false };
   }
 
   function readMailSetup() {
@@ -4651,14 +6234,17 @@
   }
 
   function writeMailSetup(value) {
+    if (accountClosed) return;
     const item = mailSetupItem();
-    native.keychainSet({service: item.service, account: item.account, synchronizable: false,
-      accessible: "after_first_unlock", value: encode(utf8(JSON.stringify(value)))});
+    native.keychainSet({
+      service: item.service, account: item.account, synchronizable: false,
+      accessible: "after_first_unlock", value: encode(utf8(JSON.stringify(value))),
+    });
   }
 
-  async function beginAppPasswordSetup(args) {
-    const { keys, offered } = await presentKeysWithNodes();
-    await liveGrantLedger(keys, offered);
+  async function beginAppPasswordSetup(turn, args) {
+    const held = await withGrants(turn);
+    const keys = held.keys;
     let identity = stringArgument(args.identity).trim().toLowerCase();
     if (identity && identity.indexOf("@") < 0) identity += "@naver.com";
     if (identity && !/^[a-z0-9_.-]{1,64}@naver\.com$/.test(identity)) {
@@ -4668,12 +6254,12 @@
     if (local && (local.intent.key_id !== keys.keyId || local.intent.expires_ms <= native.nowMs())) {
       // The capturing state of the server does not release its observation protection on a
       // cancellation alone.
-      await api("DELETE", MAIL_SETUP_PATH + "/" + local.intent.id);
+      await api(turn, "DELETE", MAIL_SETUP_PATH + "/" + local.intent.id);
       native.keychainDelete(mailSetupItem());
       local = null;
     }
     if (local) {
-      const remote = (await api("GET", MAIL_SETUP_PATH, null, {setup_id: local.intent.id})).json.setup;
+      const remote = (await api(turn, "GET", MAIL_SETUP_PATH, null, { setup_id: local.intent.id })).json.setup;
       if (remote && remote.setup_id === local.intent.id && remote.request.payload === local.signed.payload &&
           (remote.phase === "failed" || remote.phase === "cancelled")) {
         native.keychainDelete(mailSetupItem());
@@ -4686,36 +6272,38 @@
     if (!local) {
       const sk = native.randomBytes(32);
       const now = Math.floor(native.nowMs());
-      const intent = {id: native.randomBytes(16), user_id: userId(), key_id: keys.keyId,
+      const intent = {
+        id: native.randomBytes(16), user_id: userId(), key_id: keys.keyId,
         provider: "naver_mail", recipient_pk: native.x25519PublicKey(sk), identity: identity,
-        request_id: stringArgument(args.request_id), issued_ms: now, expires_ms: now + MAIL_SETUP_TTL_MS};
+        request_id: stringArgument(args.request_id), issued_ms: now, expires_ms: now + MAIL_SETUP_TTL_MS,
+      };
       const payload = encode(utf8(JSON.stringify(intent)));
-      const signature = native.ed25519Sign(keys.signSeed,
-        encode(concat(utf8(MAIL_SETUP_CONTEXT + "\n"), decode(payload))));
-      local = {intent: intent, sk: sk, signed: {payload: payload, signature: signature}, record: null};
+      const signature = native.ed25519Sign(
+        keys.signSeed, encode(concat(utf8(MAIL_SETUP_CONTEXT + "\n"), decode(payload))));
+      local = { intent: intent, sk: sk, signed: { payload: payload, signature: signature }, record: null };
       // The same request and reception key are used again when the POST response is lost.
       writeMailSetup(local);
     }
-    const saved = (await api("POST", MAIL_SETUP_PATH, local.signed)).json;
-    native.publish({state: {mail_setup: {phase: saved.phase, error: null}}});
+    const saved = (await api(turn, "POST", MAIL_SETUP_PATH, local.signed)).json;
+    native.publish({ state: { mail_setup: { phase: saved.phase, error: null } } });
     return saved;
   }
 
-  async function finishAppPasswordSetup(keys, ledger) {
+  async function finishAppPasswordSetup(turn, keys, ledger, grants) {
     const local = readMailSetup();
     if (!local) return;
     const intent = local.intent;
     if (intent.user_id !== userId() || intent.key_id !== keys.keyId || intent.expires_ms <= native.nowMs()) {
       native.keychainDelete(mailSetupItem());
-      native.publish({state: {mail_setup: {phase: "expired", error: null}}});
+      native.publish({ state: { mail_setup: { phase: "expired", error: null } } });
       return;
     }
     try {
-      const pending = (await api("GET", MAIL_SETUP_PATH, null, {setup_id: intent.id})).json.setup;
+      const pending = (await api(turn, "GET", MAIL_SETUP_PATH, null, { setup_id: intent.id })).json.setup;
       if (!pending) {
         if (local.completed) {
           native.keychainDelete(mailSetupItem());
-          native.publish({state: {mail_setup: {phase: "connected", identity: local.completed.identity, error: null}}});
+          native.publish({ state: { mail_setup: { phase: "connected", identity: local.completed.identity, error: null } } });
         }
         return;
       }
@@ -4723,13 +6311,13 @@
           pending.request.signature !== local.signed.signature) {
         throw native.error("unverified_connection", "mail setup request");
       }
-      native.publish({state: {mail_setup: {phase: pending.phase, error: null}}});
+      native.publish({ state: { mail_setup: { phase: pending.phase, error: null } } });
       if (pending.phase === "failed" || pending.phase === "cancelled") {
         native.keychainDelete(mailSetupItem());
         return;
       }
       if (pending.phase !== "captured" && pending.phase !== "connected") return;
-      const custody = heldCustody(ledger, native.nowMs());
+      const custody = heldCustody(ledger, grants, native.nowMs());
       if (custody === null) return;
       if (!local.record) {
         if (!pending.capture) throw native.error("invalid_response", "mail setup capture");
@@ -4750,47 +6338,50 @@
         // registration.
         writeMailSetup(local);
       }
-      const saved = await saveAppPasswordRecord(keys, ledger, local.record, {
+      const saved = await saveAppPasswordRecord(turn, keys, grants, local.record, {
         setup_id: intent.id, request_id: intent.request_id,
       });
       local.completed = saved;
       writeMailSetup(local);
-      await api("DELETE", MAIL_SETUP_PATH + "/" + intent.id);
+      await api(turn, "DELETE", MAIL_SETUP_PATH + "/" + intent.id);
       native.keychainDelete(mailSetupItem());
-      native.publish({state: {mail_setup: {phase: "connected", identity: saved.identity, error: null}}});
+      native.publish({ state: { mail_setup: { phase: "connected", identity: saved.identity, error: null } } });
     } catch (error) {
+      if (failureCode(error) === "cancelled") throw error;
       // Neither the remote error body nor a secret is published. The next sync resumes the stored
       // request.
-      native.publish({state: {mail_setup: {phase: "pending", error: failureCode(error)}}});
+      native.publish({ state: { mail_setup: { phase: "pending", error: failureCode(error) } } });
     }
   }
 
-  async function cancelAppPasswordSetup() {
+  async function cancelAppPasswordSetup(turn) {
     const local = readMailSetup();
-    if (local) await api("DELETE", MAIL_SETUP_PATH + "/" + local.intent.id);
+    if (local) await api(turn, "DELETE", MAIL_SETUP_PATH + "/" + local.intent.id);
     native.keychainDelete(mailSetupItem());
-    native.publish({state: {mail_setup: null}});
+    native.publish({ state: { mail_setup: null } });
     return {};
   }
 
+  // ---- The vault ----
+
   /** Storing a site login: the password and the TOTP seed each become a record in the vault. An
    *  empty one is not sent (the backend keeps the existing record). */
-  async function storeLogin(args) {
+  async function storeLogin(turn, args) {
     const username = stringArgument(args.username).trim();
     const password = stringArgument(args.password);
     const totp = stringArgument(args.totp).replace(/\s/g, "").toUpperCase();
     if (username === "" || typeof args.name !== "string") throw native.error("invalid_input", "login");
     if (totp !== "" && !/^[A-Z2-7]+=*$/.test(totp)) throw native.error("invalid_input", "totp");
-    const keys = await presentKeys();
+    const keys = await presentKeys(turn);
     const body = { name: args.name, username: username };
     if (password !== "" || totp !== "") {
-      const custody = await recordCustody();
+      const custody = await recordCustody(turn);
       if (password !== "") {
         body.password = sealRecord(keys, custody, "vault_password", "vault", { value: password });
       }
       if (totp !== "") body.totp = sealRecord(keys, custody, "vault_totp", "vault", { value: totp });
     }
-    const saved = (await api("PUT", "/api/secure/vault/login", body)).json;
+    const saved = (await api(turn, "PUT", VAULT_PATH + "/login", body)).json;
     return { name: saved.name };
   }
 
@@ -4820,7 +6411,7 @@
   /** Storing a card: the number and the CVC become one record in the vault. When both the number
    *  and the CVC are empty, neither the record nor brand and last4 are sent (the backend keeps the
    *  existing values). */
-  async function storeCard(args) {
+  async function storeCard(turn, args) {
     const number = stringArgument(args.number).replace(/[\s-]/g, "");
     const cvc = stringArgument(args.cvc).trim();
     const expiry = stringArgument(args.expiry).replace(/[^0-9]/g, "");
@@ -4833,7 +6424,7 @@
     const month = Number(expiry.slice(0, 2));
     const year = expiry.length === 4 ? 2000 + Number(expiry.slice(2)) : Number(expiry.slice(2));
     if (month < 1 || month > 12 || year < 2000 || year > 2099) throw native.error("invalid_input", "expiry");
-    const keys = await presentKeys();
+    const keys = await presentKeys(turn);
     const body = {
       name: stringArgument(args.name), label: stringArgument(args.label),
       cardholder: stringArgument(args.cardholder),
@@ -4846,13 +6437,342 @@
     body.exp_year = year;
     body.postal = stringArgument(args.postal);
     if (number !== "") {
-      const custody = await recordCustody();
+      const custody = await recordCustody(turn);
       body.value = sealRecord(keys, custody, "vault_card", "vault", { number: number, cvc: cvc });
     }
     body.request_id = stringArgument(args.request_id);
-    const saved = (await api("PUT", "/api/secure/vault/card", body)).json;
+    const saved = (await api(turn, "PUT", VAULT_PATH + "/card", body)).json;
     return { name: saved.name };
   }
+
+  // ---- Vault secrets (docs/protocol.md section 6, kind vault_secret) ----
+  //
+  // A vault secret is a value under a name, with the hosts it may go to (sites) and the places it
+  // may be put (slots). The reach (sites and slots) and the name are part of the plaintext of the
+  // record, so whoever cannot encrypt under the user key cannot change them. The value of a secret
+  // is never part of a request, of a published value or of the program store: it goes into the
+  // record this device seals, and, when the user asks to see it, to the protected sheet of the app
+  // (in a build without that sheet, into the result of the procedure).
+
+  const SECRET_NAME = /^[A-Z][A-Z0-9_]{0,63}$/;
+
+  /** Whether the two protected sheets of the app exist in this build (promptSecret, presentSecret). */
+  function protectedSheets() {
+    return typeof native.promptSecret === "function" && typeof native.presentSecret === "function";
+  }
+
+  /** Whether host is the host of a site: a DNS name in lower case of at most 253 bytes with two or
+   *  more labels, each label 1 to 63 characters of a to z, 0 to 9 and "-" that neither begins nor
+   *  ends with "-", whose last label begins with a letter (an address in any spelling is no host). */
+  function isSiteHost(host) {
+    if (typeof host !== "string" || host.length > 253) return false;
+    const labels = host.split(".");
+    if (labels.length < 2) return false;
+    for (const label of labels) {
+      if (!/^[a-z0-9-]{1,63}$/.test(label) || label[0] === "-" || label[label.length - 1] === "-") return false;
+    }
+    return /^[a-z]/.test(labels[labels.length - 1]);
+  }
+
+  /** Whether a name holds neither a control character nor a white space character. */
+  function plainName(name) {
+    for (const symbol of name) {
+      const code = symbol.codePointAt(0);
+      if (code <= 0x20 || (code >= 0x7f && code <= 0xa0) || code === 0x1680 || (code >= 0x2000 && code <= 0x200a) ||
+          code === 0x2028 || code === 0x2029 || code === 0x202f || code === 0x205f || code === 0x3000) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /** Whether a text is a slot: field (an input of a web page), path, basic:user, basic:password,
+   *  header:<name> (1 to 64 characters of a to z, 0 to 9 and "-", and no header a node of the
+   *  forward role drops or refuses), query:<name> and form:<name> (1 to 64 unreserved characters),
+   *  or json:<name> (1 to 64 bytes without a control or white space character, object keys joined
+   *  by "."). The name is what follows the first colon. */
+  function isSlot(slot) {
+    if (typeof slot !== "string") return false;
+    if (slot === "field" || slot === "path" || slot === "basic:user" || slot === "basic:password") return true;
+    const colon = slot.indexOf(":");
+    if (colon < 0) return false;
+    const kind = slot.slice(0, colon);
+    const name = slot.slice(colon + 1);
+    const size = utf8(name).length;
+    if (size < 1 || size > VAULT_SLOT_NAME_BYTES) return false;
+    if (kind === "header") return /^[a-z0-9-]+$/.test(name) && VAULT_RESERVED_HEADERS.indexOf(name) < 0;
+    if (kind === "query" || kind === "form") return /^[A-Za-z0-9._~-]+$/.test(name);
+    if (kind === "json") {
+      return plainName(name) && name.split(".").every(function (key) { return key !== ""; });
+    }
+    return false;
+  }
+
+  /** Reads the reach of a vault secret: sites is the string "any" or 1 to VAULT_SITES_MAX hosts,
+   *  no host twice; slots is 1 to VAULT_SLOTS_MAX slots, no slot twice, and either the one slot
+   *  field or slots of a request; a secret whose sites is "any" has the one slot field. Returns
+   *  {sites, slots} or null for any other form. */
+  function readReach(sites, slots) {
+    let hosts = null;
+    if (sites === "any") {
+      hosts = "any";
+    } else if (Array.isArray(sites) && sites.length >= 1 && sites.length <= VAULT_SITES_MAX) {
+      hosts = [];
+      for (const host of sites) {
+        if (!isSiteHost(host) || hosts.indexOf(host) >= 0) return null;
+        hosts.push(host);
+      }
+    } else {
+      return null;
+    }
+    if (!Array.isArray(slots) || slots.length < 1 || slots.length > VAULT_SLOTS_MAX) return null;
+    const places = [];
+    for (const slot of slots) {
+      if (!isSlot(slot) || places.indexOf(slot) >= 0) return null;
+      places.push(slot);
+    }
+    const typed = places.length === 1 && places[0] === "field";
+    if (places.indexOf("field") >= 0 && !typed) return null;
+    if (hosts === "any" && !typed) return null;
+    return { sites: hosts, slots: places };
+  }
+
+  /** A list argument of a definition action: an array, the JSON of one, the string "any", or
+   *  names separated by commas or white space. */
+  function listArgument(value) {
+    if (Array.isArray(value)) return value;
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim();
+    if (trimmed === "any") return "any";
+    if (trimmed[0] === "[") {
+      try {
+        const parsed = JSON.parse(trimmed);
+        return Array.isArray(parsed) ? parsed : null;
+      } catch (error) {
+        return null;
+      }
+    }
+    return trimmed.split(/[\s,]+/).filter(function (part) { return part !== ""; });
+  }
+
+  /** The plaintext of a record of kind vault_secret as a device writes it (base64url of the UTF-8
+   *  JSON): value, name, sites, slots, source and pad, in this order. pad is a string of "."
+   *  that brings the plaintext to the shortest length of VAULT_PADDED_BYTES it fits, so the length
+   *  of the record tells the operator domain, which stores it, one of seven steps and not the
+   *  length of the value. A value that is empty or holds U+0000 is invalid_input, and a plaintext
+   *  above the longest step is too_large. */
+  function secretPlaintext(value, name, reach, source) {
+    if (typeof value !== "string" || value === "" || value.indexOf("\u0000") >= 0) {
+      throw native.error("invalid_input", "value");
+    }
+    const written = function (pad) {
+      return utf8(JSON.stringify({
+        value: value, name: name, sites: reach.sites, slots: reach.slots, source: source, pad: pad,
+      }));
+    };
+    const bare = written("").length;
+    const padded = VAULT_PADDED_BYTES.find(function (step) { return step >= bare; });
+    if (padded === undefined) throw native.error("too_large", "value");
+    return encode(written(".".repeat(padded - bare)));
+  }
+
+  /** The language of the lines this program writes for the user: ko, ja or en, by the locale of
+   *  the device. */
+  function language() {
+    const locale = String(native.deviceInfo().locale || "");
+    return locale.indexOf("ko") === 0 ? "ko" : locale.indexOf("ja") === 0 ? "ja" : "en";
+  }
+
+  const SLOT_WORDS = {
+    en: { field: "typed into its pages", path: "the path of a request", "basic:user": "the user name of a request", "basic:password": "the password of a request", header: "request header ", query: "request parameter ", form: "form field ", json: "JSON field ", any: "Any website", below: " and the hosts below it" },
+    ko: { field: "웹 페이지에 입력", path: "요청의 주소 경로", "basic:user": "요청의 사용자 이름", "basic:password": "요청의 비밀번호", header: "요청 헤더 ", query: "요청 매개변수 ", form: "폼 필드 ", json: "JSON 필드 ", any: "모든 웹사이트", below: "과 그 하위 호스트" },
+    ja: { field: "ページに入力", path: "リクエストのパス", "basic:user": "リクエストのユーザー名", "basic:password": "リクエストのパスワード", header: "リクエストヘッダー ", query: "リクエストパラメータ ", form: "フォーム項目 ", json: "JSON項目 ", any: "すべてのウェブサイト", below: "とその下位ホスト" },
+  };
+
+  /** The lines that say where the value of a vault secret can go, one per host: the host and the
+   *  places of the reach, in the language of the device. The lines are made from the reach that is
+   *  sealed into the record, so what the user reads is what the record binds. */
+  function destinationLines(reach) {
+    const words = SLOT_WORDS[language()];
+    const places = reach.slots.map(function (slot) {
+      if (words[slot] !== undefined) return words[slot];
+      const colon = slot.indexOf(":");
+      return words[slot.slice(0, colon)] + slot.slice(colon + 1);
+    }).join(", ");
+    const typed = reach.slots.length === 1 && reach.slots[0] === "field";
+    const hosts = reach.sites === "any" ? [words.any] : reach.sites.map(function (host) {
+      return typed ? host + words.below : host;
+    });
+    return hosts.map(function (host) { return (host + " · " + places).slice(0, 200); });
+  }
+
+  const OWNER_AUTH_REASONS = {
+    en: { reveal: "Show the saved value", change: "Change where the saved value can be used", remove: "Delete the saved value" },
+    ko: { reveal: "저장된 값 보기", change: "저장된 값이 쓰이는 곳 변경", remove: "저장된 값 삭제" },
+    ja: { reveal: "保存した値を表示", change: "保存した値の使用先を変更", remove: "保存した値を削除" },
+  };
+
+  /** The device owner authentication a procedure asks for before it reads or changes a secret.
+   *  A refusal is auth_failed. */
+  async function ownerAuth(turn, purposeOf) {
+    const reason = OWNER_AUTH_REASONS[language()][purposeOf];
+    const passed = await interactive(turn, function () { return native.deviceOwnerAuth(reason); });
+    if (passed !== true) throw native.error("auth_failed", "device owner authentication");
+  }
+
+  /** The keys of the master key this device holds; key_required when it holds none. */
+  function heldKeys() {
+    const masterKey = readMasterKey();
+    if (masterKey === null) throw native.error("key_required", "no master key on this device");
+    return deriveKeys(masterKey);
+  }
+
+  function secretName(args) {
+    const name = stringArgument(args.name).trim();
+    if (!SECRET_NAME.test(name)) throw native.error("invalid_input", "name");
+    return name;
+  }
+
+  /** The title a protected sheet shows: the label of the item, or its name. */
+  function sheetTitle(label, name) {
+    const title = typeof label === "string" && label.trim() !== "" ? label.trim() : name;
+    return title.slice(0, 120);
+  }
+
+  /** store_secret: makes the value the user entered a record of kind vault_secret and uploads it.
+   *  The name, the sites and the slots of the item come from the backend and are checked against
+   *  the form of a vault secret before they enter the plaintext. Without a name, the item is made
+   *  first from the label, sites and slots given (an item the user adds on the vault screen). In a
+   *  build with the protected sheets the value is asked for in the input sheet, with the lines of
+   *  where the value can go made from the reach that is sealed; otherwise it is the argument
+   *  value. A node that holds the grant is made sure of before the value is asked for. */
+  async function storeSecret(turn, args) {
+    const keys = await presentKeys(turn);
+    const custody = await recordCustody(turn);
+    let name = stringArgument(args.name).trim();
+    if (name === "") {
+      const wanted = readReach(listArgument(args.sites), listArgument(args.slots));
+      if (wanted === null) throw native.error("invalid_input", "sites and slots");
+      const made = (await api(turn, "POST", VAULT_PATH + "/secret", {
+        label: stringArgument(args.label).trim(), sites: wanted.sites, slots: wanted.slots,
+      })).json;
+      name = stringArgument(made.name);
+    }
+    if (!SECRET_NAME.test(name)) throw native.error("invalid_input", "name");
+    const item = (await api(turn, "GET", VAULT_PATH + "/secret/" + name)).json;
+    const reach = readReach(item.sites, item.slots);
+    if (item.name !== name || reach === null) throw native.error("invalid_response", "secret");
+    let value = args.value;
+    if (protectedSheets()) {
+      const answer = await interactive(turn, function () {
+        return native.promptSecret({ title: sheetTitle(item.label, name), destinations: destinationLines(reach) });
+      });
+      if (answer === null || typeof answer !== "object") throw native.error("cancelled", "secret prompt");
+      value = answer.value;
+    }
+    const record = sealRecordBytes(keys, custody, "vault_secret", "vault", secretPlaintext(value, name, reach, "device"));
+    const saved = (await api(turn, "PUT", VAULT_PATH + "/secret/" + name, {
+      record: record, sites: reach.sites, slots: reach.slots,
+    })).json;
+    return { name: name, state: typeof saved.state === "string" ? saved.state : "ready" };
+  }
+
+  /** The plaintext of the record of the item name, opened with the user key of this device:
+   *  {value, reach, source}. A record whose plaintext names another name, or has another form, is
+   *  record_invalid; an item without a record is secret_empty. */
+  function openSecret(keys, item, name) {
+    if (item.record === undefined || item.record === null) throw native.error("secret_empty", name);
+    const plain = openRecord(keys, item.record, "vault_secret", "vault");
+    const reach = readReach(plain.sites, plain.slots);
+    if (plain.name !== name || typeof plain.value !== "string" || reach === null ||
+        (plain.source !== "device" && plain.source !== "operator")) {
+      throw native.error("record_invalid", "vault_secret");
+    }
+    return { value: plain.value, reach: reach, source: plain.source };
+  }
+
+  /** reveal_secret: shows the value of an item to the user. The device owner authentication comes
+   *  before the query. The record is opened on this device; nothing of the value passes a server.
+   *  In a build with the protected sheets the value is shown in the display sheet and is not part
+   *  of the result. */
+  async function revealSecret(turn, args) {
+    const name = secretName(args);
+    const keys = heldKeys();
+    await ownerAuth(turn, "reveal");
+    const item = (await api(turn, "GET", VAULT_PATH + "/secret/" + name)).json;
+    const secret = openSecret(keys, item, name);
+    if (!protectedSheets()) {
+      return { name: name, value: secret.value, sites: secret.reach.sites, slots: secret.reach.slots, source: secret.source };
+    }
+    await interactive(turn, function () {
+      return native.presentSecret({
+        title: sheetTitle(item.label, name), value: secret.value, destinations: destinationLines(secret.reach),
+      });
+    });
+    return { name: name };
+  }
+
+  /** update_secret: changes the reach of an item. The device owner authentication comes before
+   *  the query. An item with a record has it opened and sealed again under the same id with the new
+   *  reach (the source of the value stays what it was). */
+  async function updateSecret(turn, args) {
+    const name = secretName(args);
+    const reach = readReach(listArgument(args.sites), listArgument(args.slots));
+    if (reach === null) throw native.error("invalid_input", "sites and slots");
+    const keys = heldKeys();
+    await ownerAuth(turn, "change");
+    const item = (await api(turn, "GET", VAULT_PATH + "/secret/" + name)).json;
+    const body = { sites: reach.sites, slots: reach.slots };
+    if (item.record !== undefined && item.record !== null) {
+      const secret = openSecret(keys, item, name);
+      body.record = sealRecordBytes(
+        keys, item.record.custody, "vault_secret", "vault",
+        secretPlaintext(secret.value, name, reach, secret.source), item.record.id);
+    }
+    const saved = (await api(turn, "POST", VAULT_PATH + "/secret/" + name + "/binding", body)).json;
+    return { name: name, sites: saved.sites === undefined ? reach.sites : saved.sites, slots: saved.slots === undefined ? reach.slots : saved.slots };
+  }
+
+  /** delete_secret: removes an item. The device owner authentication comes before the request. */
+  async function deleteSecret(turn, args) {
+    const name = secretName(args);
+    await ownerAuth(turn, "remove");
+    await api(turn, "DELETE", VAULT_PATH + "/secret/" + name);
+    return { name: name };
+  }
+
+  /** reveal_login_password: shows a password the vault made for a login (a record of kind
+   *  vault_password whose plaintext says that a node made it: source operator). The device owner
+   *  authentication comes before the query. args.at names an earlier password of the login by its
+   *  time; without it the current one is shown. */
+  async function revealLoginPassword(turn, args) {
+    const site = stringArgument(args.site).trim();
+    if (site === "" || site.length > 253) throw native.error("invalid_input", "site");
+    const keys = heldKeys();
+    await ownerAuth(turn, "reveal");
+    const listed = (await api(turn, "GET", VAULT_PATH + "/login/" + encodeURIComponent(site) + "/passwords")).json;
+    const wanted = typeof args.at === "string" && /^[0-9]+$/.test(args.at) ? Number(args.at) : args.at;
+    let found = listed.current === undefined ? null : listed.current;
+    if (wanted !== undefined && wanted !== null && wanted !== "") {
+      const all = (found === null ? [] : [found]).concat(Array.isArray(listed.history) ? listed.history : []);
+      found = all.find(function (item) { return item !== null && typeof item === "object" && item.at === wanted; });
+    }
+    if (found === undefined || found === null || typeof found !== "object" ||
+        found.record === undefined || found.record === null) {
+      throw native.error("password_unavailable", "login password");
+    }
+    const plain = openRecord(keys, found.record, "vault_password", "vault");
+    if (plain.source !== "operator" || typeof plain.value !== "string" || plain.value === "") {
+      throw native.error("record_invalid", "vault_password");
+    }
+    if (!protectedSheets()) return { site: site, value: plain.value };
+    await interactive(turn, function () {
+      return native.presentSecret({ title: site.slice(0, 120), value: plain.value });
+    });
+    return { site: site };
+  }
+
+  // ---- The procedures of the log screen ----
 
   // The places of the later pages of the log screen (runtime lifetime): {id, before_ms, after_day,
   // rows, opened}. The screen draws a page for each place and reads it with read_log_page when it
@@ -4881,75 +6801,115 @@
     return Number.isSafeInteger(before) && before >= 1 ? before : null;
   }
 
-  /** A failed read of the store while the screen reads it: the failure code names the kind. */
-  function screenStoreError(error) {
-    return isStoreFailure(error) ? native.error("log_store_" + error.kind, "log screen") : error;
-  }
-
-  /** The log query (the first page of the log screen): verifies the chains (index verification),
-   *  reads the latest entries until limit events (the list, as day groups) and counts the summary
-   *  of the last LOG_SUMMARY_DAYS days (readSummary). limit is a number or its decimal string (the
-   *  arguments of a definition action arrive as evaluated strings). When the verification could not
-   *  read the store (its state is not verified: a store that failed, an address that was rejected,
-   *  an env without a store) the screen reads nothing: the list is empty, the summary is the tally
-   *  kept (null when there is none) and the state of the verification says why. The list of the
-   *  places of the later pages becomes the one place of the second page (an empty list when there
-   *  is no more). */
-  async function readLog(args) {
+  /** The limit argument of read_log and read_security_record: a number or its decimal string (the
+   *  arguments of a definition action arrive as evaluated strings), from 1 to 500; fallback when
+   *  it is neither. */
+  function screenLimit(args, fallback) {
     const textual = typeof args.limit === "string" && args.limit.trim() !== "";
     const given = textual ? Number(args.limit) : args.limit;
-    const limit = Number.isFinite(given) ? Math.min(500, Math.max(1, Math.floor(given))) : 100;
-    // The screen judges the log on the ledger of now: the shared ledger of the account and the
-    // node list are requested along with the account query of presentKeys when this device holds a
-    // master key (without one the key state is not present and nothing is read), the grants of the
-    // living nodes are renewed (a node that came up since the last synchronization enters the
-    // ledger before the judgement), and the reads of the verification follow.
-    const ledger = loadLedger();
-    const held = readMasterKey() !== null;
-    const judging = presentKeys();
-    const shared = held ? settled(api("GET", LEDGER_SHARE_PATH)) : null;
-    const pending = held && !delegationOff(ledger) ? settled(fetchOffered()) : null;
-    const keys = await judging;
-    await shareLedger(keys, ledger, shared);
-    if (pending !== null) {
-      // A node list or a grant that fails does not keep the screen from judging the log.
-      try {
-        const offered = await pending;
-        await renewGrants(keys, ledger, undefined, offered.ok ? offered.value : null);
-      } catch (error) {
-        native.log("grants before the log screen: " + failureCode(error));
-      }
-      saveLedger(ledger);
+    return Number.isFinite(given) ? Math.min(500, Math.max(1, Math.floor(given))) : fallback;
+  }
+
+  /** The page of the screen the device kept: the entries of the first page it showed last, up to
+   *  limit events. null when it kept none. */
+  function keptPage(cache, limit) {
+    if (cache.saved_ms === 0) return null;
+    const entries = [];
+    const items = [];
+    let count = 0;
+    for (const entry of cache.entries) {
+      if (count >= limit) break;
+      entries.push(entry);
+      for (let at = entry.items.length - 1; at >= 0; at -= 1) items.push(entry.items[at]);
+      count += entry.items.length;
     }
-    const log = await verifyAll(ledger, keys, null);
-    if (ledgerShareDue(ledger)) await shareLedger(keys, ledger);
-    const ids = log.store === "verified" ? screenNodes(ledger) : [];
-    anchorScreen(ledger, ids);
-    const since = summarySince(native.nowMs());
-    let first = { entries: [], items: [], last_ms: 0, has_more: false };
-    let summary = null;
-    try {
-      if (ids.length > 0) {
-        // The keys of the window first: a chain whose start the screen knows is exhausted without a
-        // listing, and the list then reads no keys below it.
-        await loadSummaryKeys(ledger, ids, since);
-        first = await collectEntries(ledger, ids, keys, Infinity, limit);
-      }
-      summary = await readSummary(ledger, ids, keys, since);
-    } catch (error) {
-      throw screenStoreError(error);
-    }
-    const groups = displayGroups(first.items);
-    const next = logPageAfter(first, 0, groups.length);
-    logPagePlaces = next === null ? [] : [next];
-    publishLogPages();
     return {
-      status: log.status, verified_ms: log.verified_ms, unverified_nodes: log.unverified_nodes,
-      missing: log.missing, expired: log.expired, unknown_nodes: log.unknown_nodes,
-      newer_release_nodes: log.newer_release_nodes, store: log.store,
-      store_failing_ms: log.store_failing_ms, has_more: first.has_more, summary: summary,
-      days: displayDays(groups),
+      entries: entries, items: items, last_ms: entries.length === 0 ? 0 : entries[entries.length - 1].time_ms,
+      has_more: cache.has_more || entries.length < cache.entries.length,
     };
+  }
+
+  /** The result of read_log for one page of the screen: the list as day groups, the summary, and
+   *  the state of the log. For an answer made from the kept screen alone the status is pending
+   *  (the screen asks again, and the read that goes on answers then), cached is true and cached_ms
+   *  is the time the device kept the screen. The place of the second page becomes the list of the
+   *  places of the later pages, unless that place already begins the list (a read that changed
+   *  nothing leaves the pages the screen opened below it alone). */
+  function screenResult(page, summary, log, cachedMs) {
+    const groups = displayGroups(page.items);
+    const next = logPageAfter(page, 0, groups.length);
+    const same = next !== null && logPagePlaces.length > 0 && logPagePlaces[0].before_ms === next.before_ms &&
+      logPagePlaces[0].rows === next.rows;
+    if (!same) {
+      logPagePlaces = next === null ? [] : [next];
+      publishLogPages();
+    }
+    return {
+      status: cachedMs === null ? log.status : "pending", verified_ms: log.verified_ms,
+      unverified_nodes: log.unverified_nodes, missing: log.missing, expired: 0,
+      unknown_nodes: log.unknown_nodes, newer_release_nodes: log.newer_release_nodes, store: log.store,
+      store_failing_ms: log.store_failing_ms, has_more: page.has_more, summary: summary,
+      days: displayDays(groups), cached: cachedMs !== null, cached_ms: cachedMs === null ? 0 : cachedMs,
+    };
+  }
+
+  /** The answer of read_log from the kept screen alone: no request is sent. An empty list when
+   *  the device kept no screen. */
+  function keptAnswer(keys, limit) {
+    const cache = loadCache(keys);
+    const page = keptPage(cache, limit) || { entries: [], items: [], last_ms: 0, has_more: false };
+    const since = summarySince(native.nowMs());
+    pruneSummary(cache.tally, since);
+    const summary = cache.saved_ms === 0 ? null : summaryResult(cache.tally, since, true);
+    return screenResult(page, summary, keptLogState(), cache.saved_ms);
+  }
+
+  // The read of the first page from the store in flight (null: none): {promise, limit}.
+  let screenFlight = null;
+
+  // A read of the first page from the store, counted under the name log_screen, on the line of the
+  // screen.
+  const countedScreenRead = tracked("log_screen", function (args, turn) {
+    return screenLine.run(turn, function () { return readScreen(turn, heldKeys(), args.limit); });
+  });
+
+  /** The read of the first page from the store that a call of read_log waits for: the one in
+   *  flight when it reads at least limit events, otherwise a new one. */
+  function screenRead(limit) {
+    if (screenFlight !== null && screenFlight.limit >= limit) return screenFlight.promise;
+    const flight = { limit: limit, promise: null };
+    flight.promise = countedScreenRead({ limit: limit });
+    const ended = function () {
+      if (screenFlight === flight) screenFlight = null;
+    };
+    flight.promise.then(ended, ended);
+    screenFlight = flight;
+    return flight.promise;
+  }
+
+  /** read_log: the first page of the log screen and the summary. The call starts a read of the
+   *  screen from the store (or joins the one in flight) and waits for it for LOG_SCREEN_WAIT_MS;
+   *  when the read has not ended by then, the call answers from the screen the device kept, with
+   *  the status pending, and the read goes on (the screen asks again and receives what was read).
+   *  With the argument kept true the call answers from the kept screen at once, without waiting. */
+  async function readLog(turn, args) {
+    const limit = screenLimit(args, 100);
+    const keys = heldKeys();
+    const read = screenRead(limit);
+    read.then(noop, noop);
+    if (args.kept === true || args.kept === "true") return keptAnswer(keys, limit);
+    const waited = await Promise.race([
+      settled(read),
+      pause(Math.min(LOG_SCREEN_WAIT_MS, Math.max(0, turnLeft(turn)))).then(function () { return null; }),
+    ]);
+    if (waited === null) return keptAnswer(keys, limit);
+    if (!waited.ok) {
+      const code = failureCode(waited.error);
+      if (code === "cancelled" || code === "key_required") throw waited.error;
+      native.log("log screen: " + code);
+      return keptAnswer(keys, limit);
+    }
+    return screenResult(waited.value.page, waited.value.summary, waited.value.log, null);
   }
 
   /** Records that the screen started reading the page of that place (at the call of read_log_page:
@@ -4966,25 +6926,17 @@
     publishLogPages();
   }
 
-  /** One later page of the log screen: the entries before before_ms until LOG_SCREEN_EVENTS events,
-   *  as the list of day groups (consecutive requests and days that straddle a page boundary are
-   *  grouped per page). The chains are not verified (read_log does that): the signature check of
-   *  each entry is the verified of the group. When that place is the last of the list and there is
-   *  more, the next place is appended (a call that reads an earlier page again, and a call that
-   *  ended after read_log replaced the list, append nothing). */
-  async function readLogPage(args) {
+  /** read_log_page: one later page of the log screen, the entries before before_ms until
+   *  LOG_SCREEN_EVENTS events, as the list of day groups (consecutive requests and days that
+   *  straddle a page boundary are grouped per page). When that place is the last of the list and
+   *  there is more, the next place is appended (a call that reads an earlier page again, and a call
+   *  that ended after read_log replaced the list, append nothing). */
+  async function readLogPage(turn, args) {
     const before = logPageCursor(args.before_ms);
     if (before === null) throw native.error("invalid_input", "before_ms");
-    const keys = await presentKeys();
-    const ledger = loadLedger();
-    const ids = screenNodes(ledger);
-    anchorScreen(ledger, ids);
-    let page = null;
-    try {
-      page = await collectEntries(ledger, ids, keys, before, LOG_SCREEN_EVENTS);
-    } catch (error) {
-      throw screenStoreError(error);
-    }
+    const keys = heldKeys();
+    const cache = loadCache(keys);
+    const page = await readPage(turn, keys, cache, before, LOG_SCREEN_EVENTS);
     const groups = displayGroups(page.items);
     const last = logPagePlaces.length === 0 ? null : logPagePlaces[logPagePlaces.length - 1];
     const next = last !== null && last.before_ms === before ? logPageAfter(page, last.rows, groups.length) : null;
@@ -4995,124 +6947,165 @@
     return { has_more: page.has_more, days: displayDays(groups) };
   }
 
-  /** Setting the grant lifetime: days is an integer from 1 to 30 (or its decimal string). A grant
-   *  of that lifetime is handed again to every living node (without regard to the renewal interval:
-   *  a shortened lifetime applies at once), and when every node took it the value is written to the
-   *  ledger. When any node did not take the grant the lifetime of the ledger is left unchanged (the
-   *  grant times and expiries of the nodes that took it are written) and the call fails with
-   *  grant_incomplete: that node may still hold a grant of the earlier lifetime. When delegation is
-   *  off only the value is written. */
-  async function setGrantDays(args) {
+  // The code the security record screen of the app shows a display group under, by its kind and,
+  // for a request, by its action.
+  const RECORD_KINDS = {
+    grant_renewed: "delegation_renewed", grant_revoked: "delegation_revoked", moved: "delegation_moved",
+    connected: "connected", disconnected: "disconnected", signed_in: "sign_in_renewed",
+    used: "credential_used", filled: "value_filled", secret_sent: "value_sent", secret_saved: "value_saved",
+    code: "code_issued", other_key: "other_key", unverified: "unverified",
+  };
+  const RECORD_ACTIONS = {
+    read: "read", change: "changed", delete: "deleted", send_mail: "mail_sent",
+    send_message: "message_sent", payment: "payment_requested", verify: "sign_in_checked",
+  };
+
+  /** One item of the security record screen for a display group: {id, time_ms, kind, subject,
+   *  detail, count}. subject is the name of what the record is about (the service of a request,
+   *  the name of a vault value) and detail the place (the address of a request, the host a value
+   *  went to, the end of a grant). */
+  function recordItem(group) {
+    let kind = RECORD_KINDS[group.kind];
+    let subject = group.service_name !== "" ? group.service_name : group.provider_name;
+    let detail = group.detail;
+    if (group.kind === "request") {
+      kind = RECORD_ACTIONS[group.action];
+      detail = group.requests.length > 0 ? group.requests[group.requests.length - 1].target : "";
+    } else if (group.kind === "filled" || group.kind === "secret_sent" || group.kind === "secret_saved") {
+      subject = group.name !== "" ? group.name : group.field;
+    } else if (group.kind === "code") {
+      subject = "";
+    }
+    return {
+      id: group.id, time_ms: group.time_ms, kind: kind === undefined ? "other" : kind,
+      subject: String(subject).slice(0, 300), detail: String(detail).slice(0, 300), count: group.count,
+    };
+  }
+
+  /** read_security_record: the access record of the security record screen the app binary draws.
+   *  Without before_ms it reads the first page from the store (a round runs with it, and its
+   *  judgement reaches the app through securityStatus); with before_ms the page before that time.
+   *  Returns {items, next_before_ms}: the items with the latest first, and the before_ms of the
+   *  next page (null when there is none). */
+  async function readSecurityRecord(turn, args) {
+    const limit = screenLimit(args, LOG_SCREEN_EVENTS);
+    const keys = heldKeys();
+    const before = args.before_ms === undefined || args.before_ms === null ? null : logPageCursor(args.before_ms);
+    if (before === null && args.before_ms !== undefined && args.before_ms !== null) {
+      throw native.error("invalid_input", "before_ms");
+    }
+    const page = before === null
+      ? (await readScreen(turn, keys, limit)).page
+      : await readPage(turn, keys, loadCache(keys), before, limit);
+    const items = displayGroups(page.items).map(recordItem);
+    return { items: items, next_before_ms: page.has_more && page.last_ms >= 1 ? page.last_ms : null };
+  }
+
+  // ---- The settings of the delegation ----
+
+  /** set_grant_days: the lifetime of a grant, an integer from 1 to 30 (or its decimal string). A
+   *  grant of that lifetime is handed again to every listed node (without regard to the renewal
+   *  interval: a shortened lifetime applies at once), and when every node took it the value is
+   *  written to the ledger. When any node did not take the grant the lifetime of the ledger is left
+   *  unchanged (the grant times and expiries of the nodes that took it are kept) and the call fails
+   *  with grant_incomplete: that node may still hold a grant of the earlier lifetime. When
+   *  delegation is off only the value is written. */
+  function setGrantDays(turn, args) {
     const textual = typeof args.days === "string" && /^[0-9]+$/.test(args.days);
     const days = textual ? Number(args.days) : args.days;
     if (!Number.isSafeInteger(days) || days < 1 || days > GRANT_DAYS_MAX) {
       throw native.error("invalid_input", "days");
     }
-    const keys = await presentKeys();
-    const ledger = loadLedger();
-    const kept = { ttl_days: ledger.ttl_days, ttl_set_ms: ledger.ttl_set_ms };
-    ledger.ttl_days = days;
-    ledger.ttl_set_ms = Math.max(native.nowMs(), ledger.ttl_set_ms + 1);
-    let renewed = { accepted: new Set(), rejected: 0, failed: 0 };
-    if (!delegationOff(ledger)) renewed = await renewGrants(keys, ledger, true);
-    if (renewed.failed > 0) {
-      ledger.ttl_days = kept.ttl_days;
-      ledger.ttl_set_ms = kept.ttl_set_ms;
-    }
-    saveLedger(ledger);
-    const grant = grantState(ledger, renewed.accepted, native.nowMs());
-    native.publish({
-      state: { grant: grant, grant_days: ledger.ttl_days },
-      runtime: { rejected_nodes: renewed.rejected },
-    });
-    if (renewed.failed > 0) throw native.error("grant_incomplete", "a live node did not take the grant");
-    return { grant: grant, days: ledger.ttl_days };
-  }
-
-  /** Sends a revoke to every living node, also to nodes that are not in the ledger: a node hands
-   *  delegations to nodes of the same release (the delegation transfer), so a node this device
-   *  never handed a grant to can hold the user key of this account. The revoke of a node without a
-   *  grant changes nothing and passes. A node whose sealing public key is in the ledger is sealed to
-   *  with that key, every other node with the key obtained by verifying its attestation. Returns
-   *  whether a living node did not confirm the revoke (nodes whose attestation failed to verify
-   *  included: there is no key to seal the revoke to for them). */
-  async function revokeEverywhere(keys, ledger) {
-    const nonce = native.randomBytes(32);
-    const offered = (await api("GET", "/api/secure/nodes", null, { nonce: nonce })).json.nodes;
-    let incomplete = false;
-    for (const response of Array.isArray(offered) ? offered : []) {
-      const id = response !== null && typeof response === "object" ? response.node : undefined;
-      const known = typeof id === "string" ? ledger.nodes[id] : undefined;
-      try {
-        // The attestation of this response is verified for nodes of the ledger too: the time of the
-        // document that decides the freshness of the reply and the check of the challenge statement
-        // come from it. A revoke does not check the acceptance conditions (the accepted
-        // measurements, a build that accepts local): that gate decides who receives a user key, and
-        // a revoke command carries no secret. The revoke also reaches a node of a release that left
-        // the list, and a node that took over a delegation from it.
-        const target = verifyAttestation(response, nonce, false);
-        if (known !== undefined && target.node !== id) throw attestationFailure("another node");
-        await sendRevoke(target, response.challenge, keys);
-      } catch (error) {
-        incomplete = true;
-        native.log("revoke failed: " + failureCode(error));
+    return grantLock.run(turn, async function () {
+      const keys = await presentKeys(turn);
+      const ledger = loadLedger();
+      const kept = { ttl_days: ledger.ttl_days, ttl_set_ms: ledger.ttl_set_ms };
+      ledger.ttl_days = days;
+      ledger.ttl_set_ms = Math.max(native.nowMs(), ledger.ttl_set_ms + 1);
+      saveLedger(ledger);
+      let grant = grantState(ledger, loadGrants(), new Set(), native.nowMs());
+      let failed = 0;
+      if (!delegationOff(ledger)) {
+        let step = null;
+        try {
+          step = await grantStep(turn, keys, { force: true });
+        } catch (error) {
+          const back = loadLedger();
+          back.ttl_days = kept.ttl_days;
+          back.ttl_set_ms = kept.ttl_set_ms;
+          saveLedger(back);
+          throw error;
+        }
+        grant = step.grant;
+        failed = step.renewed.failed;
       }
-    }
-    return incomplete;
+      const written = loadLedger();
+      if (failed > 0) {
+        written.ttl_days = kept.ttl_days;
+        written.ttl_set_ms = kept.ttl_set_ms;
+        saveLedger(written);
+      }
+      native.publish({ state: { grant: grant, grant_days: written.ttl_days } });
+      shareLedgerSoon(keys, true);
+      if (failed > 0) throw native.error("grant_incomplete", "a listed node did not take the grant");
+      return { grant: grant, days: written.ttl_days };
+    });
   }
 
-  /** The delegation switch. Turning it off sends a revoke to every living node and writes the
-   *  revocation time to the ledger (a node that is not alive has no user key any more). When a
-   *  living node did not answer the revoke, the revocation time is written and the call fails with
-   *  revoke_incomplete (the syncs while off send the revoke again). Turning it on writes the
-   *  resumption time and hands the grants again. */
-  async function setDelegation(args) {
+  /** set_delegation: the delegation switch. Turning it off sends a revoke to every listed node and
+   *  writes the revocation time to the ledger (a node that is not alive has no user key any more).
+   *  When a listed node did not confirm the revoke, the revocation time is written and the call
+   *  fails with revoke_incomplete (the synchronizations while off send the revoke again). Turning
+   *  it on writes the resumption time and hands the grants again. */
+  function setDelegation(turn, args) {
     if (typeof args.enabled !== "boolean") throw native.error("invalid_input", "enabled");
-    const keys = await presentKeys();
-    const ledger = loadLedger();
-    // The resumption time is not before the revocation time and the revocation time is after the
-    // resumption time: the last operation decides the state of the switch even when the device
-    // clock runs backwards or the clock of another device runs ahead.
-    if (args.enabled) {
-      ledger.resumed_ms = Math.max(native.nowMs(), ledger.revoked_ms);
-      return { grant: (await delegate(keys, ledger, undefined, null, true)).grant };
-    }
-    const incomplete = await revokeEverywhere(keys, ledger);
-    // The revocation time is after the resumption time and not before any grant time of the
-    // ledger: even when the device clock ran backwards or the clock of the device that wrote a
-    // grant runs ahead, a grant handed before the revoke is not read as one after it.
-    let revoked = Math.max(native.nowMs(), ledger.resumed_ms + 1);
-    for (const id of Object.keys(ledger.nodes)) revoked = Math.max(revoked, ledger.nodes[id].granted_ms);
-    ledger.revoked_ms = revoked;
-    saveLedger(ledger);
-    const grant = grantState(ledger, new Set(), ledger.revoked_ms);
-    native.publish({ state: { grant: grant } });
-    if (incomplete) throw native.error("revoke_incomplete", "a live node did not confirm");
-    return { grant: grant };
+    return grantLock.run(turn, async function () {
+      const keys = await presentKeys(turn);
+      const ledger = loadLedger();
+      // The resumption time is not before the revocation time and the revocation time is after the
+      // resumption time: the last operation decides the state of the switch even when the device
+      // clock runs backwards or the clock of another device runs ahead.
+      if (args.enabled) {
+        ledger.resumed_ms = Math.max(native.nowMs(), ledger.revoked_ms);
+        saveLedger(ledger);
+        const step = await grantStep(turn, keys, {});
+        native.publish({ runtime: { ready: true } });
+        shareLedgerSoon(keys, true);
+        return { grant: step.grant };
+      }
+      const incomplete = await revokeEverywhere(turn, keys);
+      // The revocation time is after the resumption time and not before any grant time this device
+      // or the ledger keeps: even when the device clock ran backwards or the clock of the device
+      // that wrote a grant runs ahead, a grant handed before the revoke is not read as one after it.
+      let revoked = Math.max(native.nowMs(), ledger.resumed_ms + 1);
+      const grants = loadGrants();
+      for (const id of Object.keys(grants)) revoked = Math.max(revoked, grants[id].granted_ms);
+      const written = loadLedger();
+      for (const id of Object.keys(written.nodes)) revoked = Math.max(revoked, written.nodes[id].granted_ms);
+      written.revoked_ms = revoked;
+      saveLedger(written);
+      const grant = grantState(written, grants, new Set(), revoked);
+      native.publish({ state: { grant: grant } });
+      shareLedgerSoon(keys, true);
+      if (incomplete) throw native.error("revoke_incomplete", "a listed node did not confirm");
+      return { grant: grant };
+    });
   }
 
   /** An account end that erases the account records: deletes the master key item, the node ledger
-   *  (the keychain item and the device copy) and the summary tally. */
+   *  (the keychain item and the device copy), the reception key of a mail setup, and everything
+   *  the program store holds of the account. */
   async function eraseAccountKeys() {
     deleteMasterKey();
     native.keychainDelete(ledgerItem());
     native.keychainDelete(mailSetupItem());
-    native.storeSet(LEDGER_STORE_KEY, null);
-    native.storeSet(LOG_SUMMARY_STORE_KEY, null);
-    native.storeSet(SEALING_CHECK_STORE_KEY, null);
-    summaryState = null;
-  }
-
-  // ---- Serialization ----
-
-  let queue = Promise.resolve();
-
-  /** Procedures and event handlers run one at a time: the next starts after the previous one ended,
-   *  and the failure of the previous one does not block the next. */
-  function serial(work) {
-    const run = queue.then(work);
-    queue = run.then(function () {}, function () {});
-    return run;
+    for (const key of [LEDGER_STORE_KEY, LEDGER_SHARE_STORE_KEY, SEALING_CHECK_STORE_KEY, STORE_GRANTS,
+      STORE_CURSOR, STORE_RESUME, STORE_NODES, STORE_UNACCEPTED, STORE_BLOCKED, STORE_SAMPLE, STORE_SEEN,
+      STORE_MISSING, STORE_LEGACY, STORE_ROUND, STORE_CACHE, STORE_MIGRATED, STORE_OUTCOMES].concat(RETIRED_STORE_KEYS)) {
+      native.storeSet(key, null);
+    }
+    outcomeState = null;
+    logState = null;
   }
 
   // ---- Master key transfer (device approval transfer) ----
@@ -5132,11 +7125,13 @@
 
   const TRANSFER_PATH = "/api/secure/transfers";
   // The server polling interval. The lifetime of a request (600 seconds) is set by the server and
-  // arrives as expires_ms of the response.
+  // arrives as expires_ms of the response; the program follows a transfer no longer than
+  // TRANSFER_LIFETIME_MAX_MS from the time it learned of it, whatever the server states.
   const TRANSFER_POLL_MS = 2000;
+  const TRANSFER_LIFETIME_MAX_MS = 900000;
   // The budget for which the code entry procedure waits inside itself for the sealed envelope
-  // (below the 120-second procedure limit).
-  const TRANSFER_INLINE_WAIT_MS = 90000;
+  // (below the limit of a procedure).
+  const TRANSFER_INLINE_WAIT_MS = 60000;
   const TRANSFER_CODE_MODULUS = 1000000;
   // The terminal phases: done (the requesting device received the key, the approving device handed
   // the envelope over), failed (confirmation tag mismatch, verification failure), expired (not
@@ -5217,8 +7212,8 @@
   /** The session key: derived from the X25519 shared secret with the transcript (the account, the
    *  request id, ya, yb) bound into the info. */
   function transferSessionKey(shared, requestId, ya, yb) {
-    const info = concat(utf8(purpose("transfer.session")), transferTranscript(requestId, ya, yb));
-    return native.hkdf("sha256", shared, null, encode(info), 32);
+    const bound = concat(utf8(purpose("transfer.session")), transferTranscript(requestId, ya, yb));
+    return native.hkdf("sha256", shared, null, encode(bound), 32);
   }
 
   function transferTag(sessionKey, side) {
@@ -5235,13 +7230,14 @@
   }
 
   /** The 6-digit code: drawn without bias from 4 random bytes (only values below a multiple of the
-   *  code space are taken). */
+   *  code space are taken; 64 draws at most, each of which fails once in a thousand). */
   function transferCode() {
-    for (;;) {
+    for (let draw = 0; draw < 64; draw += 1) {
       const bytes = decode(native.randomBytes(4));
       const value = bytes[0] * 16777216 + bytes[1] * 65536 + bytes[2] * 256 + bytes[3];
       if (value < 4294000000) return String(value % TRANSFER_CODE_MODULUS).padStart(6, "0");
     }
+    throw native.error("crypto_failed", "transfer code");
   }
 
   /** The device description: platform, model and app_version of deviceInfo. A value that is not a
@@ -5256,6 +7252,14 @@
 
   function transferTerminal(phase) {
     return TRANSFER_TERMINAL.indexOf(phase) >= 0;
+  }
+
+  /** The time until which this program follows a transfer: the expiry the server states, not later
+   *  than TRANSFER_LIFETIME_MAX_MS from now. */
+  function transferExpiry(stated) {
+    const limit = native.nowMs() + TRANSFER_LIFETIME_MAX_MS;
+    const given = Number(stated);
+    return Number.isFinite(given) && given > 0 ? Math.min(given, limit) : limit;
   }
 
   function transferView() {
@@ -5294,9 +7298,9 @@
 
   /** The server state of the request. A missing request (404) is an expiry or the cleanup of the
    *  other device, and gives null. */
-  async function transferFetch() {
+  async function transferFetch(turn) {
     try {
-      return (await api("GET", TRANSFER_PATH + "/" + transferRun.requestId)).json.transfer;
+      return (await api(turn, "GET", TRANSFER_PATH + "/" + transferRun.requestId)).json.transfer;
     } catch (error) {
       if (error.code === "not_found") return null;
       throw error;
@@ -5304,9 +7308,10 @@
   }
 
   /** One step: reads the server state and does the next thing of the role of this device. */
-  async function transferStep() {
+  async function transferStep(turn) {
     if (transferRun === null || transferTerminal(transferRun.phase)) return;
-    const remote = await transferFetch();
+    const remote = await transferFetch(turn);
+    if (transferRun === null || transferTerminal(transferRun.phase)) return;
     if (remote === null) {
       // An absence seen by the approving device that handed the envelope over is the receipt
       // confirmation of the requesting device (done); every other absence is an expiry.
@@ -5325,30 +7330,43 @@
         transferRun.phase = "code_entry";
         publishTransfer();
       } else if (phase === "sealed" && transferRun.phase === "replied") {
-        await transferReceive(remote);
+        await transferReceive(turn, remote);
       }
     } else if (phase === "replied" && transferRun.phase === "approved") {
-      await transferSeal(remote);
+      await transferSeal(turn, remote);
     }
   }
 
-  /** The polling loop: advances one step on the serial queue at every interval until the transfer
-   *  in progress settles. It runs inside the runtime apart from the procedure calls, a transport
-   *  failure is left to the next poll, and every other failure ends the transfer as failed. */
+  /** Whether a failure of a step of the transfer is one the next poll may get past: the transport,
+   *  a request that was not answered in time, a 5xx status. */
+  function transferRetryable(error) {
+    const code = failureCode(error);
+    return code === "transport" || code === "timeout" || /^http_5/.test(code);
+  }
+
+  /** The polling loop: advances one step on the line of the procedures a user starts at every
+   *  interval until the transfer in progress settles or its expiry passes (the number of its
+   *  turns is bounded by the longest lifetime of a transfer). It runs inside the runtime apart
+   *  from the procedure calls, a failure the next poll may get past is left to it, and every other
+   *  failure ends the transfer as failed. */
   async function transferLoop() {
     if (transferLoopActive) return;
     transferLoopActive = true;
     try {
-      while (transferRun !== null && !transferTerminal(transferRun.phase)) {
+      const polls = Math.ceil(TRANSFER_LIFETIME_MAX_MS / TRANSFER_POLL_MS) + 1;
+      for (let poll = 0; poll < polls; poll += 1) {
+        if (transferRun === null || transferTerminal(transferRun.phase)) break;
         if (native.nowMs() > transferRun.expiresMs) {
           transferSettle("expired");
           break;
         }
         await native.sleep(TRANSFER_POLL_MS);
         try {
-          await serial(transferStep);
+          const turn = freeTurn();
+          await userLine.run(turn, function () { return transferStep(turn); });
         } catch (error) {
-          if (error.code === "transport" || /^http_5/.test(String(error.code))) continue;
+          if (failureCode(error) === "cancelled") break;
+          if (transferRetryable(error)) continue;
           native.log("transfer: " + failureCode(error));
           transferSettle("failed", failureCode(error));
         }
@@ -5358,27 +7376,32 @@
     }
   }
 
+  /** Starts the polling loop. Nothing waits for it. */
+  function startTransferLoop() {
+    transferLoop().then(noop, noop);
+  }
+
   /** The requesting device: creates a transfer request and waits for the approval. It holds only
    *  when key_state is waiting. */
-  async function beginTransfer() {
+  async function beginTransfer(turn) {
     if (transferRun !== null && !transferTerminal(transferRun.phase)) return { transfer: transferView() };
-    const judged = await judgeKey();
+    const judged = await judgeKey(turn);
     if (judged.keyState !== "waiting") throw native.error("invalid_state", judged.keyState);
     const device = transferDevice();
-    const created = (await api("POST", TRANSFER_PATH, { device: device })).json.transfer;
+    const created = (await api(turn, "POST", TRANSFER_PATH, { device: device })).json.transfer;
     transferRun = {
       role: "requesting", requestId: String(created.request_id), phase: "requested", device: device,
-      approver: null, expiresMs: Number(created.expires_ms), failure: null, yb: null, ya: null,
+      approver: null, expiresMs: transferExpiry(created.expires_ms), failure: null, yb: null, ya: null,
       scalar: null, sessionKey: null, code: null,
     };
     publishTransfer();
-    transferLoop();
+    startTransferLoop();
     return { transfer: transferView() };
   }
 
   /** The requesting device: makes the PAKE message and the confirmation tag from the code on the
    *  screen of the approving device and uploads them. */
-  async function enterTransferCode(args) {
+  async function enterTransferCode(turn, args) {
     const code = typeof args.code === "string" ? args.code.replace(/\D/g, "") : "";
     if (code.length !== 6) throw native.error("invalid_input", "code");
     if (transferRun === null || transferRun.role !== "requesting" || transferRun.phase !== "code_entry") {
@@ -5389,7 +7412,7 @@
     const ya = native.x25519(scalar, generator);
     const sessionKey = transferSessionKey(
       native.x25519(scalar, transferRun.yb), transferRun.requestId, ya, transferRun.yb);
-    await api("PUT", TRANSFER_PATH + "/" + transferRun.requestId + "/reply", {
+    await api(turn, "PUT", TRANSFER_PATH + "/" + transferRun.requestId + "/reply", {
       ya: ya, ta: transferTag(sessionKey, "request"),
     });
     transferRun.ya = ya;
@@ -5397,27 +7420,29 @@
     transferRun.phase = "replied";
     publishTransfer();
     // The envelope of the approving device arrives within seconds of the reply, so this procedure
-    // waits for it inside itself (a budget within the procedure limit): when it ends the screen
-    // shows the result at once. When it does not arrive within the budget the polling loop takes
-    // over.
-    const deadline = native.nowMs() + TRANSFER_INLINE_WAIT_MS;
-    while (transferRun !== null && !transferTerminal(transferRun.phase) && native.nowMs() < deadline) {
+    // waits for it inside itself: when it ends the screen shows the result at once. The wait ends
+    // with the budget below or with the time of the procedure, whichever is first; the polling
+    // loop then takes over.
+    const deadline = native.nowMs() + Math.min(TRANSFER_INLINE_WAIT_MS, Math.max(0, turnLeft(turn) - 2 * API_TIMEOUT_MS));
+    const polls = Math.ceil(TRANSFER_INLINE_WAIT_MS / TRANSFER_POLL_MS);
+    for (let poll = 0; poll < polls; poll += 1) {
+      if (transferRun === null || transferTerminal(transferRun.phase) || native.nowMs() >= deadline) break;
       await native.sleep(TRANSFER_POLL_MS);
       try {
-        await transferStep();
+        await transferStep(turn);
       } catch (error) {
-        if (error.code !== "transport" && !/^http_5/.test(String(error.code))) throw error;
+        if (!transferRetryable(error) || !(turnLeft(turn) > 0)) throw error;
       }
     }
-    if (transferRun !== null && !transferTerminal(transferRun.phase)) transferLoop();
+    if (transferRun !== null && !transferTerminal(transferRun.phase)) startTransferLoop();
     return { transfer: transferView() };
   }
 
   /** The requesting device: the reception of the sealed master key. The confirmation tag of the
    *  approving device is compared and the ciphertext opened, and the key is written to the keychain
    *  only when the key_id of the derived account signing public key equals the registered key_id of
-   *  the account. */
-  async function transferReceive(remote) {
+   *  the account. The grants to the nodes of the account follow. */
+  async function transferReceive(turn, remote) {
     const run = transferRun;
     if (!equal(decode(transferTag(run.sessionKey, "approve")), decode(String(remote.tb)))) {
       transferSettle("failed", "bad_tag");
@@ -5435,7 +7460,7 @@
       return;
     }
     const keys = deriveKeys(masterKey);
-    const registered = await registeredKeyId();
+    const registered = await registeredKeyId(turn);
     if (registered !== keys.keyId) {
       transferSettle("failed", "key_mismatch");
       return;
@@ -5443,59 +7468,77 @@
     writeMasterKey(masterKey);
     publishKey("present", keys);
     try {
-      await api("POST", TRANSFER_PATH + "/" + run.requestId + "/ack", {});
+      await api(turn, "POST", TRANSFER_PATH + "/" + run.requestId + "/ack", {});
     } catch (error) {
+      if (failureCode(error) === "cancelled") throw error;
       native.log("transfer ack: " + failureCode(error));
     }
     transferSettle("done");
-    await delegate(keys, loadLedger(), undefined, null, true);
+    // The device holds the key now: a synchronization hands the grants (nothing waits for it here).
+    requestSync({ name: "event_sync", refill: false }).then(noop, noop);
   }
 
   /** The approving device: when it has the key and no transfer is in progress, the oldest pending
    *  request is raised to pending approval. */
-  async function checkTransferRequests() {
+  async function checkTransferRequests(turn) {
     if (transferRun !== null && !transferTerminal(transferRun.phase)) return;
     if (readMasterKey() === null) return;
-    const pending = (await api("GET", TRANSFER_PATH)).json.transfers;
+    const pending = (await api(turn, "GET", TRANSFER_PATH)).json.transfers;
     if (!Array.isArray(pending) || pending.length === 0) return;
-    const request = pending[0];
+    if (transferRun !== null && !transferTerminal(transferRun.phase)) return;
+    const waiting = pending[0];
     transferRun = {
-      role: "approving", requestId: String(request.request_id), phase: "pending_approval",
-      device: request.device, approver: transferDevice(), expiresMs: Number(request.expires_ms),
+      role: "approving", requestId: String(waiting.request_id), phase: "pending_approval",
+      device: waiting.device, approver: transferDevice(), expiresMs: transferExpiry(waiting.expires_ms),
       failure: null, yb: null, ya: null, scalar: null, sessionKey: null, code: null,
     };
     publishTransfer();
+  }
+
+  /** The catch-up of a transfer after a synchronization: a device with the key reads the pending
+   *  requests, a device with a transfer in progress advances one step, and the polling loop is
+   *  started again. */
+  async function transferCatchUp(present) {
+    const turn = freeTurn();
+    if (present) await checkTransferRequests(turn);
+    else await transferStep(turn);
+    if (transferRun !== null && !transferTerminal(transferRun.phase)) startTransferLoop();
   }
 
   /** The device owner authentication prompt of approve_transfer, in the device language (en, ko, ja).
    *  The text names the requesting device, so the prompt itself says what is being approved. */
   function transferAuthReason(device) {
     const model = device && typeof device.model === "string" && device.model !== "" ? device.model : null;
-    const locale = String(native.deviceInfo().locale || "");
-    if (locale.indexOf("ko") === 0) return (model === null ? "이 기기" : model) + "에 암호화 키 공유 승인";
-    if (locale.indexOf("ja") === 0) return (model === null ? "このデバイス" : model) + "への暗号化キー共有の承認";
+    const spoken = language();
+    if (spoken === "ko") return (model === null ? "이 기기" : model) + "에 암호화 키 공유 승인";
+    if (spoken === "ja") return (model === null ? "このデバイス" : model) + "への暗号化キー共有の承認";
     return "Approve sharing your encryption key with " + (model === null ? "this device" : model);
   }
 
   /** The approving device: after the device owner authentication, makes the code and the PAKE
    *  message, uploads the approval and shows the code. */
-  async function approveTransfer(args) {
+  async function approveTransfer(turn, args) {
     if (transferRun === null || transferRun.role !== "approving" || transferRun.phase !== "pending_approval") {
       throw native.error("invalid_state", transferRun === null ? "none" : transferRun.phase);
     }
     if (typeof args.request_id === "string" && args.request_id !== transferRun.requestId) {
       throw native.error("invalid_state", "request");
     }
-    const keys = await presentKeys();
-    if (!(await native.deviceOwnerAuth(transferAuthReason(transferRun.device)))) throw native.error("auth_failed", "device owner authentication");
-    // The ledger of this device is shared before the key goes out: the device that receives the
-    // key finds the grants this device made at its first synchronization.
-    await shareLedger(keys, loadLedger());
+    const keys = await presentKeys(turn);
+    const reason = transferAuthReason(transferRun.device);
+    const passed = await interactive(turn, function () { return native.deviceOwnerAuth(reason); });
+    if (passed !== true) throw native.error("auth_failed", "device owner authentication");
+    if (transferRun === null || transferRun.role !== "approving" || transferRun.phase !== "pending_approval") {
+      throw native.error("invalid_state", transferRun === null ? "none" : transferRun.phase);
+    }
+    // The ledger of this device is shared before the key goes out: a device that receives the key
+    // and runs a program before v43 finds the grants this device made at its first synchronization.
+    if (ledgerShareDue(loadLedger())) await shareLedger(turn, keys);
     const code = transferCode();
     const scalar = native.randomBytes(32);
     const yb = native.x25519(scalar, transferGenerator(transferRun.requestId, code));
     try {
-      await api("PUT", TRANSFER_PATH + "/" + transferRun.requestId + "/approval", {
+      await api(turn, "PUT", TRANSFER_PATH + "/" + transferRun.requestId + "/approval", {
         yb: yb, device: transferRun.approver,
       });
     } catch (error) {
@@ -5514,21 +7557,22 @@
     transferRun.yb = yb;
     transferRun.phase = "approved";
     publishTransfer();
-    transferLoop();
+    startTransferLoop();
     return { transfer: transferView() };
   }
 
   /** The approving device: compares the reply of the requesting device with the confirmation tag
    *  (a mismatch is reported to the server as a failure) and uploads the master key sealed with the
    *  session key. */
-  async function transferSeal(remote) {
+  async function transferSeal(turn, remote) {
     const run = transferRun;
     const ya = String(remote.ya);
     const sessionKey = transferSessionKey(native.x25519(run.scalar, ya), run.requestId, ya, run.yb);
     if (!equal(decode(transferTag(sessionKey, "request")), decode(String(remote.ta)))) {
       try {
-        await api("POST", TRANSFER_PATH + "/" + run.requestId + "/fail", {});
+        await api(turn, "POST", TRANSFER_PATH + "/" + run.requestId + "/fail", {});
       } catch (error) {
+        if (failureCode(error) === "cancelled") throw error;
         native.log("transfer fail: " + failureCode(error));
       }
       transferSettle("failed", "code_mismatch");
@@ -5543,7 +7587,7 @@
     const ciphertext = native.aeadSeal({
       alg: envelope.alg, key: envelope.key, nonce: envelope.nonce, aad: envelope.aad, plaintext: masterKey,
     });
-    await api("PUT", TRANSFER_PATH + "/" + run.requestId + "/envelope", {
+    await api(turn, "PUT", TRANSFER_PATH + "/" + run.requestId + "/envelope", {
       ciphertext: ciphertext, tb: transferTag(sessionKey, "approve"),
     });
     run.scalar = null;
@@ -5555,12 +7599,12 @@
   /** Both devices: ends the transfer in progress on the server (cancelled on the requesting device,
    *  declined on an approving device still waiting for the approval, cancelled on an approving
    *  device showing the code) and clears the state. A settled transfer only has its state cleared. */
-  async function cancelTransfer() {
+  async function cancelTransfer(turn) {
     if (transferRun === null) return {};
     if (!transferTerminal(transferRun.phase)) {
       const declined = transferRun.role === "approving" && transferRun.phase === "pending_approval";
       try {
-        await api("DELETE", TRANSFER_PATH + "/" + transferRun.requestId, null,
+        await api(turn, "DELETE", TRANSFER_PATH + "/" + transferRun.requestId, null,
           declined ? { reason: "declined" } : undefined);
       } catch (error) {
         if (error.code !== "not_found" && error.code !== "invalid_phase") throw error;
@@ -5572,78 +7616,100 @@
 
   /** Both devices: advances one step now and starts the polling loop (retry from the screen, return
    *  to the foreground). */
-  async function pollTransfer() {
+  async function pollTransfer(turn) {
     if (transferRun !== null && !transferTerminal(transferRun.phase)) {
-      await transferStep();
-      if (transferRun !== null && !transferTerminal(transferRun.phase)) transferLoop();
+      await transferStep(turn);
+      if (transferRun !== null && !transferTerminal(transferRun.phase)) startTransferLoop();
     }
     return { transfer: transferView() };
   }
 
   // ---- Registration ----
 
+  /** A counted procedure that runs on the line of the reads of the log screen. */
+  function screenProcedure(name, work) {
+    return tracked(name, function (args, turn) {
+      return screenLine.run(turn, function () { return work(turn, args); });
+    });
+  }
+
+  const readLogPageProcedure = screenProcedure("read_log_page", readLogPage);
+
   globalThis.secureProgram = {
     version: VERSION,
     procedures: {
-      sync: function () { return serial(sync); },
-      create_key: function () { return serial(createKey); },
-      reset_key: function () { return serial(resetKey); },
-      begin_transfer: function () { return serial(beginTransfer); },
-      enter_transfer_code: function (args) {
-        return serial(function () { return enterTransferCode(args); });
-      },
-      approve_transfer: function (args) {
-        return serial(function () { return approveTransfer(args); });
-      },
-      cancel_transfer: function () { return serial(cancelTransfer); },
-      poll_transfer: function () { return serial(pollTransfer); },
-      connect: function (args) { return serial(function () { return connect(args); }); },
-      set_connection_writes: function (args) {
-        return serial(function () { return setConnectionWrites(args); });
-      },
-      manage_repositories: function (args) {
-        return serial(function () { return manageRepositories(args); });
-      },
-      begin_app_password_setup: function (args) {
-        return serial(function () { return beginAppPasswordSetup(args); });
-      },
-      cancel_app_password_setup: function () { return serial(cancelAppPasswordSetup); },
-      connect_app_password: function (args) {
-        return serial(function () { return connectAppPassword(args); });
-      },
-      store_login: function (args) { return serial(function () { return storeLogin(args); }); },
-      store_card: function (args) { return serial(function () { return storeCard(args); }); },
-      read_log: function (args) { return serial(function () { return readLog(args); }); },
+      sync: tracked("sync", function (args, turn) { return syncProcedure(turn); }),
+      create_key: userProcedure("create_key", createKey),
+      reset_key: userProcedure("reset_key", resetKey),
+      begin_transfer: userProcedure("begin_transfer", beginTransfer),
+      enter_transfer_code: userProcedure("enter_transfer_code", enterTransferCode),
+      approve_transfer: userProcedure("approve_transfer", approveTransfer),
+      cancel_transfer: userProcedure("cancel_transfer", cancelTransfer),
+      poll_transfer: userProcedure("poll_transfer", pollTransfer),
+      connect: userProcedure("connect", connect),
+      set_connection_writes: userProcedure("set_connection_writes", setConnectionWrites),
+      manage_repositories: userProcedure("manage_repositories", manageRepositories),
+      begin_app_password_setup: userProcedure("begin_app_password_setup", beginAppPasswordSetup),
+      cancel_app_password_setup: userProcedure("cancel_app_password_setup", cancelAppPasswordSetup),
+      connect_app_password: userProcedure("connect_app_password", connectAppPassword),
+      store_login: userProcedure("store_login", storeLogin),
+      store_card: userProcedure("store_card", storeCard),
+      store_secret: userProcedure("store_secret", storeSecret),
+      reveal_secret: userProcedure("reveal_secret", revealSecret),
+      update_secret: userProcedure("update_secret", updateSecret),
+      delete_secret: userProcedure("delete_secret", deleteSecret),
+      reveal_login_password: userProcedure("reveal_login_password", revealLoginPassword),
+      set_grant_days: userProcedure("set_grant_days", setGrantDays),
+      set_delegation: userProcedure("set_delegation", setDelegation),
+      // read_log answers within LOG_SCREEN_WAIT_MS and waits on no line: the read of the store it
+      // starts runs on the line of the screen (screenRead).
+      read_log: tracked("read_log", function (args, turn) { return readLog(turn, args); }),
       read_log_page: function (args) {
-        const before = logPageCursor(args.before_ms);
+        const before = args !== null && typeof args === "object" ? logPageCursor(args.before_ms) : null;
         if (before !== null) openLogPage(before);
-        return serial(function () { return readLogPage(args); });
+        return readLogPageProcedure(args);
       },
-      set_grant_days: function (args) { return serial(function () { return setGrantDays(args); }); },
-      set_delegation: function (args) { return serial(function () { return setDelegation(args); }); },
+      read_security_record: screenProcedure("read_security_record", readSecurityRecord),
     },
     onEvent: function (name, payload) {
       if (name === "session_ready") {
         // A new runtime does not take over the transfer of the previous runtime (the secrets exist
-        // in the runtime only): the transfer state is cleared.
+        // in the runtime only): the transfer state is cleared. The calls the runtime before left
+        // open are counted as interrupted (outcomes), and the build is asked for its protected
+        // sheets.
         resetTransfer();
-        return serial(sync);
+        native.publish({ runtime: { protected_sheets: protectedSheets() } });
+        outcomes();
+        return eventSync(null, true);
       }
-      if (name === "foreground") return serial(sync);
+      if (name === "foreground") {
+        noteBackground(false);
+        return eventSync(null, true);
+      }
+      if (name === "background") {
+        noteBackground(true);
+        return undefined;
+      }
       if (name === "push") {
-        if (payload && payload.reason === "transfer_request") return serial(checkTransferRequests);
-        return serial(sync);
-      }
-      if (name === "account_end") transferRun = null;
-      if (name === "account_end" && payload &&
-          (payload.reason === "account_deleted" || payload.reason === "dev_reset")) {
-        // The deletion or reset of a runtime whose account mismatched does not erase the master key
-        // of another account (the runtime goes down).
-        if (accountMismatch) {
-          accountMismatch = false;
-          return undefined;
+        if (payload && payload.reason === "transfer_request") {
+          const turn = newTurn(PROCEDURE_LIMIT_MS, "");
+          return userLine.run(turn, function () { return checkTransferRequests(turn); });
         }
-        return serial(eraseAccountKeys);
+        return eventSync(payload !== null && typeof payload === "object" ? payload : {}, false);
+      }
+      if (name === "account_end") {
+        transferRun = null;
+        if (payload && (payload.reason === "account_deleted" || payload.reason === "dev_reset")) {
+          // The deletion or reset of a runtime whose account mismatched does not erase the master key
+          // of another account (the runtime goes down).
+          if (accountMismatch) {
+            accountMismatch = false;
+            return undefined;
+          }
+          // Work that is still running writes nothing of the account after this.
+          accountClosed = true;
+          return eraseAccountKeys();
+        }
       }
       return undefined;
     },
