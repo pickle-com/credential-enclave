@@ -1230,8 +1230,9 @@ test("an account with more to read than one round reads is read to its end by th
   assert.equal(wide.world.reports.slice(-1)[0].undocumented_nodes, 0);
 
   // 61 control entries in listing pages of one: sixteen rounds. The eight rounds of the first
-  // synchronization leave the log pending. The first round of the second counts as a round held
-  // back (pending, not attention), and the round that reaches the end clears that count.
+  // synchronization leave the log pending. Every one of them judged entries its node wrote and
+  // nothing else: the rounds catch up, none of them adds to the row of the rounds that count,
+  // and no round of the second synchronization is a round held back.
   const deep = S.fixture(source, { device: { securityStatus: true } });
   deep.world.pageSize = 1;
   for (let i = 0; i < 60; i += 1) {
@@ -1241,11 +1242,13 @@ test("an account with more to read than one round reads is read to its end by th
   await S.start(deep);
   await deep.world.settle(1000);
   assert.deepEqual(told(deep.world), Array(8).fill("pending:truncated:0"));
-  assert.equal(deep.world.stored("log.round").unfinished, 8);
+  assert.equal(deep.world.stored("log.round").unfinished, 0);
+  assert.ok(deep.world.stored("log.round").row_ms > 0);
   deep.world.advance(4 * DAY_MS);
   await S.event(deep, "foreground");
   await deep.world.settle(1000);
-  assert.deepEqual(told(deep.world).slice(8), Array(7).fill("pending:blocked:1").concat(["verified:verified:0"]));
+  assert.deepEqual(told(deep.world).slice(8), Array(7).fill("pending:truncated:0").concat(["verified:verified:0"]));
+  assert.equal(deep.world.stored("log.round").row_ms, 0);
   assert.equal(judgedKeys(deep.world), 61);
   assert.deepEqual(deep.world.stored("log.blocked"), { first_ms: 0, count: 0 });
   assert.ok(deep.world.securityStatuses.every((status) => status.status !== "attention"));
@@ -5921,4 +5924,123 @@ test("a round that is about to mark a log that is not marked asks what is served
     assert.equal(held.world.state.log.status, served === "later" ? "pending" : "attention", served);
     assert.equal(opened.value.status, served === "later" ? "pending" : "attention", served);
   }
+});
+
+// ---- The last list before the tag: a device that has much to read ----
+
+/** A fixture with one node of a release before v2.4.0 whose chain of format 2 this device follows:
+ *  a new installation of this program (it hands the node its grant), or an installation that
+ *  carries the ledger of the program before it over (migrated: the node holds a grant of two
+ *  hours ago, and the ledger verified its chain to that entry). program: the program to run (the
+ *  checked-out one when absent). */
+async function chainFixture(migrated, program) {
+  const fx = S.fixture(program === undefined ? source : program, { nodes: 0, legacy: 1, device: { securityStatus: true } });
+  const world = fx.world;
+  const node = fx.legacy[0];
+  if (migrated) {
+    const seal = { logPk: fx.keys.logPk, keyId: fx.keys.keyId };
+    node.grants.set(world.userId, {
+      sign_pk: b64u(fx.keys.signPk), log_pk: b64u(fx.keys.logPk), key_id: fx.keys.keyId, custody: "enclave",
+      not_after_ms: world.now + 29 * DAY_MS,
+    });
+    node.appendEntry(world.userId, "c", [{
+      t: "grant_accepted", time_ms: world.now - 2 * HOUR_MS, not_after_ms: world.now + 29 * DAY_MS, custody: "enclave",
+    }], Object.assign({ timeMs: world.now - 2 * HOUR_MS }, seal));
+    writeLedger(fx, {}, [{
+      node: node, fields: {
+        granted_ms: world.now - 2 * HOUR_MS, not_after_ms: world.now + 29 * DAY_MS,
+        checkpoint: { seq: 1, hash: b64u(node.chains.get(world.userId)[0].entryHash), time_ms: world.now - 2 * HOUR_MS },
+      },
+    }]);
+  }
+  await S.start(fx);
+  return fx;
+}
+
+/** Has the node write count control entries on its chain, one millisecond apart from now on (the
+ *  entries the grants of other devices of the account leave on a chain of format 2). */
+function pileEntries(fx, node, count) {
+  const world = fx.world;
+  for (let i = 0; i < count; i += 1) {
+    world.advance(1);
+    node.record("c", [{ t: "grant_accepted", time_ms: world.now, not_after_ms: world.now + 30 * DAY_MS, custody: "enclave" }]);
+  }
+}
+
+/** The program with another number of control entries of the chains a round reads (the checked-out
+ *  program reads 512: the model writes and reads an entry in milliseconds, so the tests that
+ *  need many rounds run on a program that reads fewer). */
+function withChainEntries(count) {
+  const kept = "const LEGACY_ROUND_BODIES = 512;";
+  assert.ok(source.indexOf(kept) >= 0);
+  return source.replace(kept, "const LEGACY_ROUND_BODIES = " + count + ";");
+}
+
+test("a device that comes back to more control entries on a chain of format 2 than its rounds read in a day reads them over as many rounds as that takes, and nothing marks the log: the rounds that leave reads undone judged what the node wrote and nothing else", async () => {
+  // The checked-out program: a round reads 512 control entries of the chains, so 600 of them
+  // take two rounds of one synchronization.
+  const whole = await chainFixture(false);
+  pileEntries(whole, whole.legacy[0], 600);
+  const reports = whole.world.reports.length;
+  await nextDay(whole);
+  await whole.world.settle(30000);
+  assert.deepEqual(whole.world.reports.slice(reports).map((report) => report.status + ":" + report.blocked_attempts),
+    ["pending:0", "verified:0"]);
+  assert.equal(whole.world.stored("log.round").unfinished, 0);
+
+  // A program whose round reads 16 of them (128 in the eight rounds of a synchronization): a
+  // device that synchronizes once a day reads 40 in one day, 300 in three and 700 in six. No
+  // round of those days counts, in a new installation and in one that carried the ledger over.
+  const small = withChainEntries(16);
+  for (const [backlog, migrated, days] of [[40, false, 1], [300, false, 3], [700, false, 6], [300, true, 3]]) {
+    const label = backlog + (migrated ? ", carried over" : ", new");
+    const fx = await chainFixture(migrated, small);
+    const world = fx.world;
+    pileEntries(fx, fx.legacy[0], backlog);
+    const states = [];
+    for (let day = 0; day < 8 && states.slice(-1)[0] !== "verified:0:0"; day += 1) {
+      world.advance(25 * HOUR_MS);
+      await S.event(fx, "foreground");
+      await world.settle(30000);
+      states.push(world.state.log.status + ":" + world.stored("log.blocked").count + ":" + world.stored("log.round").unfinished);
+    }
+    assert.deepEqual(states, Array(days - 1).fill("pending:0:0").concat(["verified:0:0"]), label);
+    assert.ok(world.securityStatuses.every((told) => told.status !== "attention"), label);
+    assert.ok(world.reports.every((report) => report.status !== "attention" && report.blocked_attempts === 0), label);
+    assert.ok(world.stored("log.legacy").nodes[fx.legacy[0].id].seq >= backlog, label);
+  }
+});
+
+test("control entries that arrive on a chain faster than the device reads them, day after day, are reads held back as before: once the rounds read nothing but entries written after they began to fall behind, they count, and the log is marked; when the entries stop arriving the rounds reach the end and the mark is cleared", async () => {
+  // A program whose round reads 16 control entries of the chains (128 in a synchronization), and
+  // 150 new ones before every synchronization.
+  const fx = await chainFixture(false, withChainEntries(16));
+  const world = fx.world;
+  const node = fx.legacy[0];
+  const states = [];
+  for (let day = 0; day < 8; day += 1) {
+    pileEntries(fx, node, 150);
+    world.advance(25 * HOUR_MS);
+    await S.event(fx, "foreground");
+    await world.settle(30000);
+    states.push(world.state.log.status + ":" + world.stored("log.blocked").count);
+  }
+  // The first day the rounds read entries written before they fell behind: nothing counts. From
+  // the second day on they read entries written since and do not reach the end: the rounds of
+  // the second and third day fill the row, the first round of each day after them counts, and
+  // the log is marked three days after the first of those.
+  assert.deepEqual(states, ["pending:0", "pending:0", "pending:0", "pending:1", "pending:2", "pending:3", "attention:4", "attention:5"]);
+  assert.equal(world.state.log.store_failure, "round:unfinished");
+  assert.deepEqual(world.securityStatuses.slice(-1)[0].reasons, ["verification_blocked"]);
+  // The entries stop arriving: the rounds read what is left, and the round that reaches the end
+  // clears the count and the mark.
+  for (let day = 0; day < 6 && world.state.log.status !== "verified"; day += 1) {
+    world.advance(25 * HOUR_MS);
+    await S.event(fx, "foreground");
+    await world.settle(30000);
+  }
+  assert.equal(world.state.log.status, "verified");
+  assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  assert.equal(world.stored("log.round").unfinished, 0);
+  assert.equal(world.securityStatuses.slice(-1)[0].status, "ok");
 });

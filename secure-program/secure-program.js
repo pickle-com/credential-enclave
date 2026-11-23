@@ -141,8 +141,9 @@
   //                   closed, read_ms}}, waiting: {node: {until_ms, time_ms, strict}}} (waiting:
   //                   the receiving nodes of transfers whose documents this device has still to
   //                   judge; strict: nothing but a document judges the node)
-  //   log.round       the last round: {v, done_ms, tried_ms, last, told, state, unfinished}
-  //                   (unfinished: the rounds in a row that had more to read than they read)
+  //   log.round       the last round: {v, done_ms, tried_ms, last, told, state, unfinished,
+  //                   row_ms} (unfinished: the rounds in a row that had more to read than they
+  //                   read and were not catching up; row_ms: the time that row began, 0 for none)
   //   log.cache       the kept screen, sealed (the first page, the time the screen last read
   //                   its listings itself, the summary tally, what it knows of the chains)
   //   log.migrated    the mark that the ledger of the program before was carried over
@@ -353,7 +354,7 @@
   const LEGACY_NODES = 64;
   const LEGACY_LISTING_NODES = 16;
   const LEGACY_ROUND_PASSES = 4;
-  const LEGACY_ROUND_BODIES = 64;
+  const LEGACY_ROUND_BODIES = 512;
   const LEGACY_SEQ_READS = 8;
   // The seqs at the end of a listing page of a chain that a round reads to see how far the node
   // wrote, when their keys name no control entry.
@@ -4259,6 +4260,7 @@
           // so no act of a node stands behind this object: it is no entry.
           run.entries.set(parsed.key, { parsed: parsed, state: "absent", verdict: null, ours: false, events: null });
           run.junk.add(parsed.key);
+          run.spoiled += 1;
           run.settled.add(parsed.key);
           if (item.keep === true) run.kept.add(parsed.key);
           if (item.fresh) markSeen(log, digest);
@@ -4329,6 +4331,7 @@
         // A body the node signed, under a key the node did not write for it: not an entry.
         record.state = "fields";
         run.junk.add(parsed.key);
+        run.spoiled += 1;
         continue;
       }
       const name = parsed.node + ":" + parsed.seq;
@@ -4355,6 +4358,12 @@
       if (parsed.letter === "c") {
         run.checked += 1;
         run.verified.push(parsed.tail);
+        // An entry an accepted node wrote that this read judged for the first time: the reading
+        // moved on by it (run.gained, with the time of the entry).
+        if (item.fresh && verdict.state === "accepted") {
+          run.gained += 1;
+          if (parsed.time_ms < run.oldest) run.oldest = parsed.time_ms;
+        }
       }
     }
     // A key the log screen asked for that no answer reached is asked for by the rounds, in front
@@ -4427,6 +4436,11 @@
       run.controlKeys += 1;
       run.nodes.add(parsed.node);
       const seen = log.seen.set.has(keyDigest(parsed.key));
+      // (A key judged before is one the reading passes: run.passed, with the time of its entry.)
+      if (seen) {
+        run.passed += 1;
+        if (parsed.time_ms < run.oldest) run.oldest = parsed.time_ms;
+      }
       if (!seen) items.push({ parsed: parsed, fresh: true });
       else if (bySeq.get(parsed.node + ":" + parsed.seq) > 1) items.push({ parsed: parsed, fresh: false });
     }
@@ -4665,13 +4679,22 @@
             const signed = objects.get(candidate.key + "\n" + candidate.versionId);
             const body = signed === undefined || signed === null ? null : legacyBody(signed, plan.id, candidate.parts);
             run.bodies += 1;
-            if (body === null) continue;
+            if (body === null) {
+              // An object version that was read and is nothing the node signed for this seq:
+              // someone else wrote it there (run.spoiled).
+              if (signed !== undefined) run.spoiled += 1;
+              continue;
+            }
             // The node signed this object for this seq: it wrote up to here.
             written = true;
             if (whole(body.time_ms) > 0) reachedMs = body.time_ms;
             const entry = control === undefined ? null : checkLegacyEntry(signed, plan.id, candidate.parts, keys);
             if (entry === null) break;
             run.checked += 1;
+            // A control entry the node wrote, read for the first time (run.gained).
+            // (An entry that names no time counts as an old one.)
+            run.gained += 1;
+            if (entry.time_ms < run.oldest) run.oldest = entry.time_ms;
             if (entry.events !== null) {
               for (const event of entry.events) {
                 if (event.t === "grant_transferred_out" && typeof event.to === "string" && NODE_ID.test(event.to)) {
@@ -4784,7 +4807,11 @@
     // goes on over pages that hold many object versions for each seq does.
     if (open.length > 0) {
       run.cut = true;
-      if (thin) run.over = true;
+      if (thin) {
+        run.over = true;
+        // (Such pages hold objects no node wrote.)
+        run.spoiled += 1;
+      }
     }
   }
 
@@ -5203,6 +5230,11 @@
       shown: new Set(), kept: new Set(), settled: new Set(), pagesHeld: new Set(), pagesRead: new Set(),
       pagesKept: new Map(), pageOf: new Map(), store3: known, objectsRead: new Set(), chainsRead: new Set(),
       crowdedRead: new Set(), nodesRead: false, chainKept: [], found: null, listed: [],
+      // What the reads of the round were spent on: the entries of accepted nodes it judged for
+      // the first time (gained), the keys it listed that were judged before (passed), the
+      // objects it read that no node wrote (spoiled), and the earliest time among the entries
+      // of the first two (oldest).
+      gained: 0, passed: 0, spoiled: 0, oldest: Infinity,
     };
     // What the rounds kept for the screen before this round: an entry kept there is not read
     // again.
@@ -5497,14 +5529,35 @@
     // LOG_UNFINISHED_ROUNDS such rounds, the reads are held back: the first round of a
     // synchronization that ends that way counts as a round held back, and the rounds that follow
     // it in that synchronization read on and neither add to that count nor end it.
+    //
+    // A round that left reads undone is one that catches up, and adds nothing to the row, when
+    // its reads were spent on what nodes wrote and on nothing else: it judged entries of accepted
+    // nodes for the first time or passed keys it had judged before (gained, passed), it read no
+    // object that no node wrote (spoiled), and one of those entries was written before the row
+    // began (row_ms: the start of the first round of the row). A device that was away has as many
+    // entries to read as its nodes wrote in that time, and reads them over as many rounds as that
+    // takes without a round of them counting. What counts as before: objects no node wrote that
+    // take the reads of a round, a round that read nothing, and rounds that read only entries
+    // written after the row began and still do not reach the end (entries arrive faster than the
+    // device reads them, and it never comes to the end of what its nodes wrote). A round that
+    // catches up beyond LOG_UNFINISHED_ROUNDS neither adds to the count of the rounds held back
+    // nor ends it.
     const over = !unreachable && (run.truncated || run.over);
     let unfinished = log.round.v === VERSION ? whole(log.round.unfinished) : 0;
+    let rowMs = log.round.v === VERSION ? whole(log.round.row_ms) : 0;
+    if (rowMs > now) rowMs = 0;
+    const catching = over && run.spoiled === 0 && run.gained + run.passed > 0 &&
+      run.oldest < (rowMs > 0 ? rowMs : started);
     if (over) {
-      if (origin === "sync") unfinished += 1;
+      if (origin === "sync") {
+        if (rowMs === 0) rowMs = started;
+        if (!catching) unfinished += 1;
+      }
     } else if (!denied && !unreachable) {
       unfinished = 0;
+      rowMs = 0;
     }
-    const beyond = over && unfinished > LOG_UNFINISHED_ROUNDS;
+    const beyond = over && !catching && unfinished > LOG_UNFINISHED_ROUNDS;
     const overrun = beyond && first === true;
     if (beyond && run.detail === "") run.detail = "round:unfinished";
     let blocked = denied || overrun;
@@ -5567,7 +5620,7 @@
     if (blocked) {
       if (log.blocked.count === 0 || log.blocked.first_ms === 0 || log.blocked.first_ms > now) log.blocked.first_ms = now;
       log.blocked.count += 1;
-    } else if (!unreachable && !beyond) {
+    } else if (!unreachable && !beyond && !(catching && unfinished > LOG_UNFINISHED_ROUNDS)) {
       log.blocked = { first_ms: 0, count: 0 };
     }
     // The reads held back from the screen that the reads of the screen count themselves.
@@ -5682,7 +5735,7 @@
       // synchronization, however soon.)
       v: VERSION, tried_ms: away ? 0 : now, last: status, open: incomplete, told: told, state: state,
       done_ms: status === "pending" ? (log.round.v === VERSION ? whole(log.round.done_ms) : 0) : now,
-      unfinished: unfinished,
+      unfinished: unfinished, row_ms: rowMs,
     });
     logState = state;
     native.publish({ state: { log: state } });
@@ -8007,7 +8060,7 @@
       detail: "", blocked: false, silent: false, unreachable: false, cut: false, over: false, checked: 0, bodies: 0,
       nodes: new Set(), undocumented: new Set(), verified: [], entries: records, junk: junk,
       withheld: new Set(), shown: new Set(), kept: new Set(), settled: new Set(), pagesHeld: new Set(),
-      pagesRead: new Set(), store3: true,
+      pagesRead: new Set(), store3: true, gained: 0, passed: 0, spoiled: 0, oldest: Infinity,
     };
     const log = loadLog();
     // What the rounds read for the screen: an entry kept there is not asked for.
