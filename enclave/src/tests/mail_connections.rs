@@ -239,11 +239,12 @@ async fn a_read_ends_where_the_body_budget_has_no_room_for_its_input() {
     assert_eq!(server.connections.load(Ordering::SeqCst), connections);
 }
 
-/// The three responses that ended the parser of imap-proto 0.17.0, and with it a node, are
-/// read inside the calls that meet them: a character outside ASCII directly behind the
-/// response code of a tagged and of an untagged status response, and `INTERNALDATE NIL`.
+/// Three responses a server can send that end the parser of the crate imap-proto 0.17.0 with
+/// a panic are read inside the calls that meet them: a character outside ASCII directly
+/// behind the response code of a tagged and of an untagged status response, and
+/// `INTERNALDATE NIL`. A node aborts on a panic, so no response may end its reader.
 #[tokio::test]
-async fn the_responses_that_ended_the_former_parser_are_read_by_a_call() {
+async fn a_call_reads_a_character_outside_ascii_behind_a_response_code_and_a_nil_date() {
     let server = ImapServer::start(|command| {
         let text = command.text;
         if text.starts_with("LOGIN ") {
@@ -770,7 +771,9 @@ async fn a_session_is_kept_when_its_read_left_it_in_step() {
             } else if text.starts_with("UID FETCH 400 ") {
                 Answer::ok(fetch_literal(400, "", "BODY[]", &long))
             } else if text.starts_with("UID FETCH 9 ") {
-                Answer::ok("")
+                // No such message, and two responses nobody asked for behind the completion,
+                // in the same bytes: the next read of the session reads them first.
+                Answer::completion("OK done\r\n* 5 EXISTS\r\n* 5 RECENT")
             } else {
                 mailbox(command)
             }

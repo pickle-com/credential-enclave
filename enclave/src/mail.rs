@@ -391,8 +391,8 @@ impl AppPassword {
     /// or fetches and changes nothing in the mailbox, so the second start repeats no act.
     ///
     /// The session comes back when the call left it in step with the server: every command
-    /// the call sent got its completion, and the connection holds no byte of a further
-    /// response. A call that ended at a failure of the connection, at the input bound or at
+    /// the call sent got its completion, and the reader of the connection stands between two
+    /// responses. A call that ended at a failure of the connection, at the input bound or at
     /// the end of its share of the body budget returns none, and the connection ends with
     /// the call.
     pub async fn read(
@@ -665,7 +665,7 @@ impl ImapSession {
 
     /// Takes the session from its call, and with it the hold of the call on its share of the
     /// body budget. True when the session can carry a further call: it is in step with the
-    /// server, and its connection holds no byte of a further response.
+    /// server, its connection has not ended, and its reader stands between two responses.
     fn rest(&mut self) -> bool {
         let at_rest = self.connection.rest();
         self.in_step && at_rest
@@ -1180,14 +1180,17 @@ impl ImapConnection {
 
     /// Takes the connection from its call, with the hold of the call on its share of the
     /// body budget, and gives back the room of its buffer. True when the connection can
-    /// carry a further call: its stream has not ended, the reader stands between two
-    /// responses, and the connection holds no byte of a further one.
+    /// carry a further call: its stream has not ended, and the reader stands between two
+    /// responses. Bytes the stream delivered behind the last response the call read (a
+    /// server may send a response nobody asked for at any time) stay for the next call, which
+    /// reads them first: they are less than one read of the connection.
     fn rest(&mut self) -> bool {
         self.allowance = None;
-        let at_rest = !self.lost && self.taken >= self.buffer.len() && self.reader.at_rest();
-        self.buffer = Vec::new();
+        let taken = self.taken.min(self.buffer.len());
+        self.buffer.drain(..taken);
+        self.buffer.shrink_to_fit();
         self.taken = 0;
-        at_rest
+        !self.lost && self.reader.at_rest()
     }
 
     /// Writes bytes of a command.

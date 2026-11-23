@@ -777,11 +777,12 @@ mod tests {
         }
     }
 
-    /// The three responses that ended the parser this reader took the place of
-    /// (`imap-proto` 0.17.0: a slice of a text at a place that is no character boundary, and
-    /// an `unwrap` of `INTERNALDATE NIL`). Each is read here as what it says.
+    /// Three responses a server can send that end the parser of the crate imap-proto 0.17.0
+    /// with a panic: a character outside ASCII directly behind the response code of a tagged
+    /// and of an untagged status response (a slice of a text at a place that is no character
+    /// boundary), and `INTERNALDATE NIL` (an `unwrap`). Each is read here as what it says.
     #[test]
-    fn the_responses_that_ended_the_former_parser_are_read() {
+    fn a_character_outside_ascii_behind_a_response_code_and_a_nil_date_are_read() {
         let found = responses(
             "a1 OK [READ-WRITE]é done\r\n\
              * OK [ALERT]한 x\r\n\
