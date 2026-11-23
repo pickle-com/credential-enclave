@@ -352,6 +352,12 @@ class Node {
     this.platform = options.platform || "nitro";
     this.format = options.format || (writesFormat3(options.release) ? 3 : 2);
     this.role = options.role;
+    // The lowest version of the program whose grant command the node takes (the program_min of
+    // its binding); undefined for a binding that states none.
+    this.programMin = options.programMin;
+    // The release proofs the node document of this node carries (release_proofs); undefined for
+    // a document without them.
+    this.documentProofs = options.documentProofs;
     // The log store the binding names: the store of the world unless the fixture names another
     // (or null for a binding without log).
     this.log = options.log === undefined ? { bucket: world.bucket, region: world.region } : options.log;
@@ -380,6 +386,7 @@ class Node {
     const binding = { v: 1, sign: b64u(this.signPk), seal: b64u(this.sealPk), release: this.release };
     if (this.log !== null) binding.log = this.log;
     if (this.role !== undefined) binding.role = this.role;
+    if (this.programMin !== undefined) binding.program_min = this.programMin;
     return binding;
   }
 
@@ -431,10 +438,12 @@ class Node {
   /** The node document as the node writes it to the log store (docs/protocol.md 7.7). */
   documentObject() {
     const nonce = sha("sha256", concat(utf8("pickle.secure.v3.node-document\n"), this.signPk));
-    return {
+    const object = {
       v: 1, platform: this.platform, document: b64u(this.platformDocument(nonce)), node: this.id,
       release: this.release,
     };
+    if (this.documentProofs !== undefined) object.release_proofs = this.documentProofs;
+    return object;
   }
 
   writeDocument() {
@@ -653,6 +662,11 @@ class World {
     this.ledgerUploads = 0;
     // The attestation documents the backend kept of the nodes of releases before v2.4.0.
     this.keptDocuments = new Map();
+    // The release proofs the backend holds, by release: it hands them out with the attestation
+    // of a node of that release when a request asks for them (the query proofs), or with every
+    // attestation when proofsUnasked is set.
+    this.releaseProofs = new Map();
+    this.proofsUnasked = false;
   }
 
   get storeHost() {
@@ -920,7 +934,14 @@ class World {
         const wanted = query.nodes.split(",");
         nodes = wanted.map((id) => this.nodes.get(id)).filter((node) => node !== undefined && node.alive);
       }
-      return json(200, { nodes: nodes.map((node, index) => Object.assign(node.attestation(query.nonce), { pod: index })) });
+      const proofs = query.proofs === "1" || this.proofsUnasked;
+      return json(200, {
+        nodes: nodes.map((node, index) => {
+          const response = Object.assign(node.attestation(query.nonce), { pod: index });
+          if (proofs && this.releaseProofs.has(node.release)) response.release_proofs = this.releaseProofs.get(node.release);
+          return response;
+        }),
+      });
     }
     const nodeRoute = /^\/api\/secure\/nodes\/([A-Za-z0-9_-]{43})\/(messages|status)$/.exec(path);
     if (nodeRoute !== null && method === "POST") {

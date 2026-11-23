@@ -162,6 +162,9 @@ binding = UTF-8(JSON {"v":1,"sign":b64u(node signing public key),"seal":b64u(nod
   least three, where the first part is two lower-case letters, the last part is one or two digits
   and every part between them is lower-case letters (`us-west-2`). A `log` of another form is
   not a binding: a verifier refuses the document.
+- `program_min`, when a binding states it, is a non-negative integer: the lowest version of the
+  secure program whose grant command the node takes ("The nodes that receive a grant" in "The
+  program of the app"). A binding without the key states none.
 
 ### 4.2 The attestation response
 
@@ -178,6 +181,11 @@ The value that the `attestation` call of a node (enclave.md 5.2) returns:
 
 `challenge` is a single-use value that this node issued (5.3). `node` and `release` are copies for
 convenience. A verifier trusts only the values it read from the `binding` inside `document`.
+
+A response may carry one more member, `release_proofs`: the release proofs of the release of the
+node ("The release proofs" in "The program of the app"). It is a public value outside the
+document, which the app verifies by its own checks whoever put it there. The app asks for it with
+the query `proofs=1` of the request for the attestation.
 
 The challenge statement:
 
@@ -254,14 +262,18 @@ own PCR0, PCR1 and PCR2.
 
 A later release (the app). A document that passes every step but step 7, with no PCR all zero, is
 the document of a node of a release that the program of the app does not list: a release later
-than the program (4.5: the list is a constant of the signed program, and a new release of the
-enclave reaches the apps as a new program). The app applies step 10 to such a document as well (a
-node of this deployment writes to the log store of the environment). The app hands such a node no
-key, as for any measurement outside the list, and does not count the document as a failed
-verification: its verification of the log (7.4) leaves the chain of that node pending, counts the
-node as a node of a later release, and the program that lists the release verifies the chain. A
-document that fails another step, a PCR all zero, and a binding that names another log store are
-failed verifications, as before.
+than the program (4.5: the list is a constant of the signed program). The app applies step 10 to
+such a document as well (a node of this deployment writes to the log store of the environment).
+When release proofs show the measurement of the document to the program ("The release proofs" in
+"The program of the app": the release key signed the measurements of the release and the public
+log recorded that, a deploy key signed them, GitHub attested them for the release workflow at the
+tag of the release in this repository, and the release is later than the listed ones), the
+release is an accepted one for that program, as an element of its list is. Without such proofs
+the app hands the node no key, as for any measurement outside the list, and does not count the
+document as a failed verification: its verification of the log (7.4) leaves the chain of that
+node pending, counts the node as a node of a later release, and the program that lists the
+release verifies the chain. A document that fails another step, a PCR all zero, and a binding
+that names another log store are failed verifications, as before.
 
 Freshness comes from the nonce. `timestamp` is not compared with the clock of the verifier. The app
 uses the `timestamp` (milliseconds) of a document that passed the verification as the present time
@@ -282,7 +294,7 @@ with the signing public key of that `binding` (4.2).
 
 | Stage | The app | A node (verification of a peer) |
 | --- | --- | --- |
-| 1, 2 | A constant list inside the signed program of the app (`[{release, pcr0, pcr1, pcr2}]`, each PCR as 96 lower-case hexadecimal characters). For every release of the enclave the list is changed and the program is signed again. An app whose program does not list a release treats the nodes of that release as nodes of a later release (4.3): no key, and a pending verification of their chains (7.4) until the app loads the program that lists it | Its own measurement. A giving node also accepts the measurement of a later release whose endorsement it verified, and a receiving node also accepts the measurements of the list of predecessors inside its program (10.3) |
+| 1, 2 | A constant list inside the signed program of the app (`[{release, pcr0, pcr1, pcr2}]`, each PCR as 96 lower-case hexadecimal characters), and the measurements of releases later than every element of that list whose release proofs the program verified on the device ("The release proofs" in "The program of the app"). A release reaches an app with a program that lists it, or with its release proofs. An app whose program does not list a release and has not verified its proofs treats the nodes of that release as nodes of a later release (4.3): no key, and a pending verification of their chains (7.4) until the app verifies the proofs or loads the program that lists it | Its own measurement. A giving node also accepts the measurement of a later release whose endorsement it verified, and a receiving node also accepts the measurements of the list of predecessors inside its program (10.3) |
 | 3 | The app obtains it by verifying the release statements of the public record (section 9) | Its own measurement, and the list of allowed measurements that the grant of that account carries (the app verifies the release statements and writes the list into the grant) |
 
 ## 5. The commands an app sends to a node
@@ -1470,7 +1482,9 @@ of the one that runs is served by that one.
    the device kept. A node the list marks `revoke_only` is none of these nodes.
 4. When a node is to receive a grant, the program requests the attestation of those nodes only
    (`GET /api/secure/nodes` with `nonce` and `nodes`, the ids joined by commas, 32 per request),
-   verifies each (4.3 and the next part), and sends the grant commands together (5.2). A
+   verifies each (4.3 and the next part), and sends the grant commands together (5.2). A node
+   whose document verifies with a measurement no list has and no release proofs showed is asked
+   once more, with the query `proofs=1` ("The release proofs"), before the commands go out. A
    synchronization without such a node sends no request that calls a node. A backend that has no
    route `GET /api/secure/grants` (status 404) is asked for the attestation of every node of the
    account instead, and what the device kept decides which of them receives a grant. Any other
@@ -1512,9 +1526,12 @@ grant to.
 A node receives a grant when its attestation verifies (4.3) and:
 
 - its measurement (PCR0, PCR1, PCR2) equals an element of the list of accepted releases of the
-  program (4.5). A document that verifies with a measurement no list has is the document of a
-  release later than the program: the node receives no grant and is not asked again by that
-  program;
+  program (4.5), or release proofs that this runtime verified show it ("The release proofs"). A
+  document that verifies with a measurement no list has and no proofs showed is the document of
+  a release later than the program: the node receives no grant and is not asked again by that
+  program, but for the release proofs of its measurement an hour after the last request for
+  them;
+- its binding states no `program_min` above the version of the program (below);
 - its binding names the log store of the server target (4.3 step 10, a node of platform
   `nitro`);
 - its binding has no `role`, or the role `reserve` (a node that holds delegations and takes no
@@ -1538,6 +1555,182 @@ confirm fails that call with `grant_incomplete` and leaves the lifetime as it wa
 lifetime, and delegation turned on again, send it nothing. The chain of format 2 such a node
 wrote is read as any chain of formats 1 and 2.
 
+A binding may state `program_min`, a non-negative integer: the lowest version of the program whose
+grant command the node takes. A node of an accepted release whose `program_min` is above the
+version of the program receives no grant of that program. It is counted with the nodes of a later
+release in the result of a synchronization, and a runtime asks it once. It is no node of a release
+the program does not accept: its entries are judged as those of an accepted node, and nothing is
+kept of its measurement. A binding whose `program_min` is anything but a non-negative integer is
+refused (the target of a revoke is read whatever it states). A binding without the key states
+none.
+
+### The release proofs
+
+The list of accepted releases is a constant of the program, so it holds the releases that existed
+when the program was written. The nodes of a release made after that state a measurement the list
+does not have. Such a measurement is that of an accepted release when release proofs show it:
+values that anyone may hand to the program, and that the program verifies on the device with
+constants of its own. With proofs that pass, the release counts as an element of the list that
+writes to the log store: a node of the measurement receives the grant by the rules of "The nodes
+that receive a grant" (its binding names the log store of the server target), the format of its
+log follows from the name of the release, and its entries, and a transfer of the key of the account
+to its measurement, are judged as those of an accepted release (7.4, A1). Without proofs that
+pass, the node is one of a later release (4.3).
+
+The proofs are a JSON object:
+
+```text
+release_proofs = {"statement": b64u(the bytes of the release statement),
+                  "entry": {"log_id": "...", "body": "...", "integrated_time": 0, "log_index": 0,
+                            "signed_entry_timestamp": "..."},
+                  "deploy_signatures": [{"key_id": "prod", "signature": "<standard base64 of 64 bytes>"}],
+                  "attestation": {the Sigstore bundle of the attestation of the release statement}}
+```
+
+`statement` and `entry` are the endorsement of 10.3 for a log of the form Rekor v1: the release
+statement is the bytes of the file `measurements.json` of the release, and the entry is what the
+log returned for the record of the signature of the release key over those bytes. `attestation` is
+the bundle the release workflow of this repository attaches to the GitHub release of the tag as
+`release-statement.sigstore.json` (enclave.md 11.2). The program does not read other members.
+
+Every check must hold, for a measurement M (PCR0, PCR1 and PCR2 of a document that verified by
+4.3):
+
+| Check | Rule |
+| --- | --- |
+| P1 | The statement is at most 16,384 bytes long and a JSON object that states `release`, `pcr0`, `pcr1` and `pcr2` once each: `release` a release tag (10.3), each PCR 96 lower-case hexadecimal characters. The three PCRs equal those of M. Other members of the statement are not read |
+| P2 | The release key signed the statement and a transparency log of the program recorded that signature: checks 2, 3 and 4 of 10.3 for a log of the form Rekor v1, with the release key and the log key the program holds. The time of the entry is compared with no clock (check 5 of 10.3 asks the clock of a node, and the notice period is 0 seconds) |
+| P3 | `deploy_signatures` has at most 8 elements, each with the texts `key_id` and `signature`. Exactly one element names the key id of the server target of the build (`prod` for the server target `prod`, `dev` for every other), and its signature is the Ed25519 signature of that deploy key over the UTF-8 bytes of `pickle-enclave-release-statement-v1`, a line feed, the lower-case hexadecimal SHA-256 of the statement and a line feed. The deploy keys are the keys with which the apps verify the deploy signature of a served program, by the same rule of the key id. The deploy signature of a program covers `pickle-secure-program-v1`, a line feed and the program, so neither signature is one of the other kind |
+| P4 | GitHub attested the statement: the attestation verifies by the rules below, under the identity of the release workflow at the tag `release` of the statement, and its in-toto statement has the predicate type `https://pickle.com/credential-enclave/release/v1` and a predicate whose `release`, `pcr0`, `pcr1` and `pcr2` equal those of the statement |
+| P5 | The release of the statement is later than every release of the list of accepted releases of the program, in the order of releases (10.3) |
+
+The attestation (P4) is a Sigstore bundle: the certificate Fulcio issued to the workflow run
+(`verificationMaterial.certificate.rawBytes`), one entry of the transparency log
+(`verificationMaterial.tlogEntries`), and the DSSE envelope of the in-toto statement
+(`dsseEnvelope`: `payload`, `payloadType`, one signature). The program checks, in this order:
+
+1. The bundle, as JSON without white space, is at most 65,536 bytes long, and it holds the
+   certificate, exactly one log entry and an envelope with exactly one signature.
+2. The payload type is `application/vnd.in-toto+json`, and the payload (standard base64) is a JSON
+   object.
+3. The certificate chain. The program holds the root certificate and the intermediate certificate
+   of the certificate authority of the public instance of Sigstore (the SHA-256 of their DER:
+   `3ba7b6cc4e95469d4d334b49cb257ad8537076fa84b0ca87ff4ecfe6a54680c1` and
+   `15d795348226b4649f750f5802592c393bee7cc53c3b86982175b7ad087efe47`). The certificate of the
+   bundle and these two are valid at the time the log took the entry (`integratedTime`: the
+   certificate is valid for ten minutes, and no clock of a device is asked). The two certificates
+   of the program are those of certificate authorities, and the certificate of the bundle is not.
+   The intermediate issued the certificate of the bundle and the root issued the intermediate:
+   the issuer name is the subject name of the issuer as encoded, and the signature is the ECDSA
+   signature of the key of the issuer over the signed part. No trust store of the device and no
+   network is asked.
+4. The identity. The certificate states each of these values in its extension
+   `1.3.6.1.4.1.57264.1.{number}`, whose value is the DER of one UTF8String. A certificate without
+   one of them, or with another value, is refused. `{tag}` is the release of the statement.
+
+   | Number | What it states | Value |
+   | --- | --- | --- |
+   | 8 | The issuer of the token the certificate was issued for | `https://token.actions.githubusercontent.com` |
+   | 9 | The workflow that signed | `https://github.com/pickle-com/credential-enclave/.github/workflows/release.yml@refs/tags/{tag}` |
+   | 11 | The runner | `github-hosted` |
+   | 12 | The repository | `https://github.com/pickle-com/credential-enclave` |
+   | 14 | The ref of the run | `refs/tags/{tag}` |
+   | 15 | The identifier of the repository | `1400118248` |
+   | 17 | The identifier of the owner of the repository | `151645824` |
+   | 18 | The workflow that started the run | The value of 9 |
+   | 20 | What started the run | `push` |
+   | 22 | The visibility of the repository when the certificate was issued | `public` |
+
+5. The signature of the envelope is the ECDSA P-256 signature of the key of the certificate over
+   the pre-authentication encoding of DSSE: `DSSEv1`, a space, the length of the payload type, a
+   space, the payload type, a space, the length of the payload, a space and the payload.
+6. The log entry. Its log is a log of the program (`logId.keyId`). Its body
+   (`canonicalizedBody`) is a JSON object of the kind `dsse` and the version `0.0.1`, whose
+   `spec.payloadHash` is the SHA-256 of the payload, and whose `spec.signatures` is one element
+   with the signature of the envelope and, as `verifier`, the PEM of the certificate of the
+   bundle. The signed entry timestamp (`inclusionPromise.signedEntryTimestamp`) is the signature
+   of the log key over the bytes of 10.3, built from the body, `integratedTime`, the log
+   identifier and `logIndex`. The audit path (`inclusionProof`: at most 64 hashes) leads from the
+   leaf of the body to `rootHash` in a tree of `treeSize` leaves, by the path computation of
+   check 9 of "The secure program release". The checkpoint (`inclusionProof.checkpoint.envelope`)
+   is the note of that size and that root, and it holds at least one line of the log key (a line
+   whose bytes begin with the first four bytes of the log identifier), and every such line is an
+   ECDSA signature of the log key over the note.
+
+The signed certificate timestamps of the certificate are not read: that Fulcio issued the
+certificate is on the log the program verifies, whose entry holds the certificate. The times and
+the indexes of an attestation are non-negative integers, or decimal digits in a text without a
+leading zero, below 2^53.
+
+The identity of step 4 is what ties an attestation to this repository. 9 and 18 together say that
+the release workflow at the tag signed and that it was started as itself: a workflow another
+workflow calls shares the run of its caller, and runs with what the caller hands it. 11 says that a
+runner GitHub hosts ran the job: a runner the owner of a repository registers signs whatever its
+owner hands it, under the same workflow and the same tag. 15 and 17 name the repository and its
+owner by identifiers that do not change and are not given to another repository: the address of 12
+alone would also be that of a repository made later under the same name. 20 says that the push of
+the tag started the run: a run started another way takes inputs that are not public. 14 and 22
+say that the run was of the tag, in a repository that was public then.
+
+The formats are read in one form. Base64 is the standard alphabet with its padding, or the
+URL-safe alphabet without padding where a value is b64u, and a text whose last character carries
+bits of no byte is refused. A text of JSON is UTF-8 and holds no number outside the finite ones,
+no half of a surrogate pair, and at most 32 arrays and objects inside one another. An element of
+DER has its shortest length form. An ECDSA signature is the DER of two non-negative integers
+without unneeded bytes. Every signature is verified by a primitive of the bridge.
+
+Where the proofs come from. Whoever hands them over, the checks above decide.
+
+- The attestation response of a node (4.2) may carry them as the member `release_proofs`. The
+  grant step asks for them: when the document of a node verifies with a measurement no list has
+  and no proofs showed, the program requests the attestation of that node once more with the
+  query `proofs=1` (`GET /api/secure/nodes` with `nonce`, `nodes` and `proofs`), for one node of
+  each such measurement and four nodes at most in one step. With proofs that pass, that node and
+  the other nodes of the measurement whose attestation the step holds receive their grants in the
+  same step. No other request carries the query, and a step whose nodes are all of listed releases
+  sends none. A request for proofs that fails leaves the node one of a later release for that
+  step and fails nothing else.
+- A node document (7.7) may carry them as the member `release_proofs`. A round that reads the
+  document of a node of a measurement no list has verifies them with that document.
+
+A node kept as one of a later release is asked for the proofs of its measurement again when the
+last request for them is an hour old: the proofs of a release may reach the backend after its
+nodes. A runtime verifies no further proofs while 8 of them failed within an hour. Proofs that
+fail are logged with the check that failed (`release proofs refused: p4: identity 11`).
+
+A node of a measurement the proofs show states the release of the proofs in its binding: a
+document of that measurement whose binding names another release fails the verification.
+
+What the device keeps (`log.proven`): the measurement, the release, the time and the proofs, under
+the version of the program that verified them. A program reads what a program of another version
+kept as nothing. The kept verdict counts where the log is judged. A node receives a key only from
+a runtime that verified the proofs itself: a runtime verifies the kept proofs again before the
+first grant it hands to a node of that measurement, and a kept verdict whose proofs fail is kept
+no longer. The device keeps four measurements at most, and the proofs of one when their JSON is
+at most 131,072 characters long (the verdict of longer proofs is kept without them, and the next
+runtime asks for the proofs again).
+
+What the proofs show, and what they do not. A release whose proofs pass has: the signature of the
+release key over its measurements in the public log, where the monitor of this repository reads
+every entry of that key (enclave.md 11.2); a signature of a deploy key of the operator; and an
+attestation that a job of the file `.github/workflows/release.yml`, as that file is at the tag in
+the repository with the identifier above, ran on a runner GitHub hosts, started by the push of the
+tag, while the repository was public, and attested these measurements. The entry of that
+attestation is in the public log with its certificate, which names the commit of the tag and the
+run. The proofs do not show what that file and the files of that commit do. A tag whose workflow
+or build attests measurements of other code is a public commit that anyone can read and build
+again, and whose measurements then differ from the attested ones; a tag that is moved or deleted
+afterwards leaves the two entries of the log, which name a commit that is not the one of the tag.
+A workflow that reads values that are not public (a cache, a secret or a variable of the
+repository, an action or an image it names by a tag, a runner image of the owner) shows that
+reference in its file. The proofs rest on GitHub (the token of the run and its claims), on Fulcio
+and on the log of Sigstore, as the release proof of the program does.
+
+When a constant of the program no longer fits (the log key or the certificates of Sigstore
+change, the repository moves), the proofs of a release made after that fail on a device that runs
+this program, and its nodes are nodes of a later release to it: the release reaches that device
+with a program that lists it.
+
 ### What the device keeps
 
 The program store holds, per account, what the device knows of its grants and of the log. None of
@@ -1548,7 +1741,8 @@ it is a secret; what names services and addresses is sealed with a key derived f
 | --- | --- |
 | `log.grants` | The nodes this device handed a grant to: the time of the grant, its end, the release and platform of the node, the time of the last attempt. A node is written before its grant goes out |
 | `log.nodes` | What the node documents that verified said: per node id the digest of the measurement, the platform, the release, the time first seen, and the time a contradiction of its signatures was found. A node id without a document that verifies is not kept, whatever the store showed of it |
-| `log.unaccepted` | The measurements no list of the program has, each with the time it was first seen and whether the key of the account went to a node of it |
+| `log.unaccepted` | The measurements no list of the program has and no release proofs showed, each with the time it was first seen, whether the key of the account went to a node of it, and the time the grant step last asked for its release proofs |
+| `log.proven` | The measurements release proofs showed to this program: per measurement the release, the three PCRs, the time and the proofs, under the version of the program that verified them ("The release proofs"). Four measurements at most |
 | `log.blocked` | The rounds in a row whose reads were held back: the time of the first and their number |
 | `log.sample` | The 64 latest control keys the device verified |
 | `log.seen`, `log.seen.{n}` | The digests of the control keys the device judged, in parts of 4,096 digests: `log.seen` names the parts, the oldest first, and `log.seen.{n}` holds one. Nine parts are kept; when one more begins, the oldest leaves with the digests it holds, so 32,768 judgements or more are remembered |

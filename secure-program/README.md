@@ -13,6 +13,14 @@ the master key between the devices of one account. What the program
 does, in which order and under which limits, is specified in protocol.md, "The program of the
 app".
 
+The program hands a grant to a node whose measurement is an element of its list of accepted
+releases, or is shown to it by release proofs that it verifies on the device (protocol.md, "The
+release proofs"): the signature of the release key over the measurements of the release in the
+public transparency log, a signature of a deploy key of the operator, and the attestation GitHub
+made of those measurements for a run of the release workflow of this repository at the tag of the
+release. A release of the enclave made after a program so reaches a device that runs that
+program. A release whose proofs fail a check is to that device a release it does not list.
+
 The program lists the log store itself (protocol.md 7.4): the listing of the two prefixes of its
 account, read from Amazon S3 through addresses it checks, names every act that took place with the
 key of the account. It judges the log by that listing and by the node documents of the nodes that
@@ -178,7 +186,7 @@ The bytes of the statement, the entry and the release proof are specified in
 `tests/` runs the program on a model of the bridge of the apps, with Node alone:
 
 ```bash
-node --test secure-program/tests/program.test.js
+node --test secure-program/tests/program.test.js secure-program/tests/proofs.test.js
 ```
 
 `tests/bridge.js` is the model: the global `native` on the crypto module of Node (HKDF, Ed25519,
@@ -201,6 +209,22 @@ of the vectors `log_v3` and `log_store` and on the forms of the vectors `vault_s
 gives the answers of the reference reader (`protocol/src/app.rs`). `tests/scenarios.js` holds the
 scenarios (worlds and runs) and returns plain results; `tests/program.test.js` fixes the expected
 results of the current program.
+
+`tests/proofs.test.js` holds the tests of the release proofs (`docs/protocol.md`, "The release
+proofs"). `tests/proofs.js` is the model of the parties that make such proofs: an operator with a
+release key and deploy keys, a transparency log of the form Rekor v1 with its tree and its
+checkpoints, a certificate authority that issues the certificate of a workflow run as Fulcio does
+(X.509 in DER, written by the encoder of that file), and the attestation of a release statement
+as the release workflow makes it. Every key is made there, and the program of a test runs with
+those keys and certificates in the place of its constants. `tests/proof-cases.js` states proofs
+that hold and proofs that differ from them in one place, each with the check that refuses them;
+the test runs every case through a synchronization and compares whether the node received the
+grant and what the program logged. `tests/fixtures/release-proofs-v2.3.0.json` holds the proofs of
+a published release from public values (its `measurements.json`, the entry of that statement on
+rekor.sigstore.dev, and its `release-statement.sigstore.json`): they run against the constants of
+the program as they are, with the deploy keys of the test and without the element of that release
+in the list. The endorsement cases of `protocol/vectors.json` run through the program as well: the
+program reads a release statement and the entry of its record as a node does.
 
 `SECURE_PROGRAM_VECTORS` names the vector files to read instead of `protocol/vectors.json` (paths
 separated by commas). A test of vectors that the files do not hold is skipped.

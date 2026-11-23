@@ -409,20 +409,28 @@ function proofsOf(parties, release, measurement, options) {
  *  authority and the deploy keys of the parties in the place of those of the operator, Sigstore
  *  and Rekor. logs replaces the log keys ([spki]: the key of parties.log when absent). */
 function withParties(source, parties, logs) {
-  const constant = (text, name, value) => {
-    const pattern = new RegExp("(\\n  const " + name + " =)[\\s\\S]*?;\\n");
-    if (!pattern.test(text)) throw new Error("the program has no constant " + name);
-    return text.replace(pattern, (match, head) => head + " " + value + ";\n");
-  };
-  let patched = constant(source, "RELEASE_KEY", JSON.stringify(b64u(parties.release.spki)));
-  patched = constant(patched, "PROOF_LOG_KEYS", JSON.stringify((logs || [parties.log.key.spki]).map(b64u)));
-  patched = constant(patched, "FULCIO_ROOT", JSON.stringify(b64u(parties.authority.root)));
-  patched = constant(patched, "FULCIO_INTERMEDIATE", JSON.stringify(b64u(parties.authority.intermediate)));
-  return constant(patched, "DEPLOY_KEYS", JSON.stringify({ prod: parties.deploy.prod.publicKey, dev: parties.deploy.dev.publicKey }));
+  let patched = withConstant(source, "RELEASE_KEY", JSON.stringify(b64u(parties.release.spki)));
+  patched = withConstant(patched, "PROOF_LOG_KEYS", JSON.stringify((logs || [parties.log.key.spki]).map(b64u)));
+  patched = withConstant(patched, "FULCIO_ROOT", JSON.stringify(b64u(parties.authority.root)));
+  patched = withConstant(patched, "FULCIO_INTERMEDIATE", JSON.stringify(b64u(parties.authority.intermediate)));
+  return withDeployKeys(patched, parties.deploy);
+}
+
+/** The source of a program whose constant name has the value given (a JavaScript expression). */
+function withConstant(source, name, value) {
+  const pattern = new RegExp("(\\n  const " + name + " =)[\\s\\S]*?;\\n");
+  if (!pattern.test(source)) throw new Error("the program has no constant " + name);
+  return source.replace(pattern, (match, head) => head + " " + value + ";\n");
+}
+
+/** The source of a program whose deploy keys are the two given ({prod, dev}, each a key pair of
+ *  ed25519KeyPair): the same program with them in the place of the deploy keys of the operator. */
+function withDeployKeys(source, deploy) {
+  return withConstant(source, "DEPLOY_KEYS", JSON.stringify({ prod: deploy.prod.publicKey, dev: deploy.dev.publicKey }));
 }
 
 module.exports = {
   b64, b64u, sha256, der, pem, ecKeyPair, ecdsaSign, certificate, makeAuthority, makeLog, treeHash, auditPath,
   ed25519KeyPair, makeParties, statementOf, deploySignature, recordedEntry, identityOf, attestationOf, proofsOf,
-  withParties, DEPLOY_CONTEXT, REPOSITORY, PREDICATE_TYPE, PAYLOAD_TYPE,
+  withParties, withDeployKeys, DEPLOY_CONTEXT, REPOSITORY, PREDICATE_TYPE, PAYLOAD_TYPE,
 };

@@ -669,7 +669,7 @@ test("a node of platform local is accepted by a build for the local stack, a deb
   }
 });
 
-test("a node of a release the program does not list receives no grant, is asked for its attestation once, and leaves the log pending for a day", async () => {
+test("a node of a release the program does not list and no release proofs show receives no grant, is asked for its attestation and once more for the release proofs of its release, and leaves the log pending for a day", async () => {
   const fx = S.fixture(source);
   const world = fx.world;
   const later = world.addNode({ release: "v2.5.0", measurement: bridge.randomMeasurement() });
@@ -679,10 +679,10 @@ test("a node of a release the program does not list receives no grant, is asked 
   assert.equal(world.state.log.status, "pending");
   assert.equal(world.state.log.newer_release_nodes, 1);
   assert.equal(world.runtime.rejected_nodes, 0);
-  assert.equal(later.attestations, 1);
-  world.advance(HOUR_MS);
+  assert.equal(later.attestations, 2);
+  world.advance(HOUR_MS / 2);
   await S.event(fx, "foreground");
-  assert.equal(later.attestations, 1);
+  assert.equal(later.attestations, 2);
   // The measurement held no key of the account: after the day it is not counted.
   await nextDay(fx);
   assert.equal(world.state.log.status, "verified");
@@ -4271,9 +4271,9 @@ test("a runtime that knows a later program is served judges nothing: a node of a
     await S.event(fx, "background");
     await world.settle(1000);
     unchanged("day " + day);
-    // The node of the new release was asked for its attestation once in the runtime, and
-    // holds no grant.
-    assert.equal(attested(), before + 1, "day " + day);
+    // The node of the new release was asked for its attestation, and once more for the release
+    // proofs of its release, once in the runtime, and holds no grant.
+    assert.equal(attested(), before + 2, "day " + day);
     assert.equal(listed.grants.has(world.userId), false, "day " + day);
     world.clearFaults();
   }

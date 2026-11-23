@@ -22,17 +22,19 @@ function otherPcr(pcr) {
 }
 
 /** The cases for a release tag that is later than every release the program lists. listed is
- *  the latest release the program lists. Returns [{name, reason, proofs, measurement, target,
- *  constants}]: reason is null for proofs that hold; target is the server target of the build
- *  (prod when absent); constants are the parties whose keys and certificates the program holds
- *  (the base parties when absent); logs the keys of the logs the program holds (that of the log
- *  of the constants when absent). */
+ *  the latest release the program lists. Returns [{name, reason, proofs, measurement, release,
+ *  target, constants, logs}]: reason is null for proofs that hold, and the text the program logs
+ *  for the check that refuses the others; measurement and release are those of the node that
+ *  presents the proofs; target is the server target of the build; constants are the parties
+ *  whose keys and certificates the program holds; logs are the keys of the logs the program
+ *  holds (null: the key of the log of the constants). */
 function proofCases(release, listed) {
   const parties = model.makeParties();
   const measurement = randomMeasurement();
   const cases = [];
   const add = (name, reason, proofs, more) => cases.push(Object.assign({
-    name: name, reason: reason, proofs: proofs, measurement: measurement, target: "prod", constants: parties, logs: null,
+    name: name, reason: reason, proofs: proofs, measurement: measurement, release: release, target: "prod",
+    constants: parties, logs: null,
   }, more || {}));
   const proofsOf = (options, forRelease, forMeasurement) =>
     model.proofsOf(parties, forRelease || release, forMeasurement || measurement, options);
@@ -56,7 +58,7 @@ function proofCases(release, listed) {
     edited((proofs) => proofs.deploy_signatures.push({ key_id: "next", signature: b64(crypto.randomBytes(64)) })));
   add("a statement with members the program does not read", null, ofStatement(statementOf({ note: ["x", { y: 1 }] })));
   add("proofs with members the program does not read", null, edited((proofs) => { proofs.note = "x"; }));
-  add("a release candidate later than the listed releases", null, proofsOf({}, release + "-rc.1"));
+  add("a release candidate later than the listed releases", null, proofsOf({}, release + "-rc.1"), { release: release + "-rc.1" });
 
   // ---- The shape ----
   for (const [name, value] of [["null", null], ["an array", []], ["a text", "proofs"], ["a number", 7]]) {

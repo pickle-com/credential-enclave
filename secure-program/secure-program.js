@@ -449,11 +449,14 @@
   // (96 lower-case hex characters each). Every element is a build that anyone can make again from
   // that tag of the public repository pickle-com/credential-enclave. A node receives a grant only
   // when PCR0, PCR1 and PCR2 of its nitro document all equal an element of this list (or of
-  // PRERELEASE_BUILDS when the server target is in PRERELEASE_TARGETS). A document that verifies
-  // (certificate chain, signature, nonce, binding, challenge statement) with a measurement no list
-  // has is the document of a release later than this program (verifyNitro): the node receives no
-  // grant, and the key of the account moving to such a measurement marks the log once
-  // LOG_RELEASE_GRACE_MS has passed (judgeRound). A node of a release with log_store true writes
+  // PRERELEASE_BUILDS when the server target is in PRERELEASE_TARGETS), or when release proofs
+  // show its measurement to be that of a release later than every element of this list (the
+  // release proofs below: such a release counts as an element with log_store true). A document
+  // that verifies (certificate chain, signature, nonce, binding, challenge statement) with a
+  // measurement no list has and no release proofs showed is the document of a release later
+  // than this program (verifyNitro): the node receives no grant, and the key of the account
+  // moving to such a measurement marks the log once LOG_RELEASE_GRACE_MS has passed
+  // (judgeRound). A node of a release with log_store true writes
   // the log entry to the log store (storage from which nothing is deleted) before the act the entry
   // precedes, and the binding of such a node must name the value of LOG_STORES. The name of the
   // release decides the format of its log (logFormatOf): a release from LOG_FORMAT_3_FROM on
@@ -713,6 +716,26 @@
   const PROOF_PATH_HASHES = 64;
   const PROOF_DEPLOY_SIGNATURES = 8;
   const PROOF_JSON_DEPTH = 32;
+  // What the device keeps of the measurements release proofs showed to this program
+  // (log.proven): {v, measures: {digest: {release, pcr0, pcr1, pcr2, proven_ms, proofs}}}. v is
+  // the version of the program that verified them: a program reads what a program of another
+  // version kept as nothing. The verdict counts where the log is judged. A node of such a
+  // measurement receives a key only from a runtime that verified the proofs itself: the kept
+  // proofs, once for a runtime (provenForGrant). PROOF_KEPT_MEASURES measurements are kept (the
+  // one shown first leaves first), and the proofs of a measurement are kept when their JSON is
+  // at most PROOF_KEPT_CHARS characters long.
+  const STORE_PROVEN = "log.proven";
+  const PROOF_KEPT_MEASURES = 4;
+  const PROOF_KEPT_CHARS = 131072;
+  // Release proofs that fail cost the device their verification: a runtime verifies no further
+  // proofs while PROOF_FAILURES of them failed within PROOF_FAILURE_SPAN_MS.
+  const PROOF_FAILURES = 8;
+  const PROOF_FAILURE_SPAN_MS = 3600000;
+  // The grant step asks for the release proofs of a measurement no list has and no proofs
+  // showed: of one node of each such measurement, of PROOF_REQUEST_NODES nodes at most in one
+  // step, and for one measurement not sooner than PROOF_RETRY_MS after it asked last.
+  const PROOF_REQUEST_NODES = 4;
+  const PROOF_RETRY_MS = 3600000;
 
   // The record kinds this program makes in the migration (the device-side sealing of what was
   // stored before the switch), and the most rounds of fetching and uploading one sync runs (one
@@ -976,13 +999,16 @@
   // use in a runtime (the top level calls nothing).
   let acceptedDigests = null;
 
-  /** The build of acceptedBuilds with the digest measure, undefined when none. */
+  /** The build of an accepted release with the digest measure, undefined when none: the build of
+   *  acceptedBuilds with that digest, or the build of a measurement release proofs showed to
+   *  this program on this installation (provenBuild). */
   function buildOfMeasure(measure) {
     if (acceptedDigests === null) {
       acceptedDigests = new Map();
       for (const build of acceptedBuilds()) acceptedDigests.set(measureOf(build), build);
     }
-    return acceptedDigests.get(measure);
+    const listed = acceptedDigests.get(measure);
+    return listed === undefined ? provenBuild(measure) : listed;
   }
 
   /** The format of the log of the nodes of a release, by its name: 3 from LOG_FORMAT_3_FROM on,
@@ -1117,8 +1143,12 @@
    *  any other role (forward: a node that holds no delegation, receives no command and writes no
    *  entry; a role this program does not know) is refused, unless anyRole is set: the target of a
    *  revoke is read whatever its role, since a revoke hands no key over. When logStore is true
-   *  the binding must name the log store of this server target. Returns {signPk, sealPk, release,
-   *  role} (role: the role of the binding, undefined when it has none). */
+   *  the binding must name the log store of this server target. A binding may state
+   *  program_min, a non-negative integer: the lowest version of the program whose grant command
+   *  the node takes. A binding without the key states none, and one whose program_min is
+   *  anything else is refused (unless anyRole is set: the target of a revoke is read whatever
+   *  it states). Returns {signPk, sealPk, release, role, programMin} (role: the role of the
+   *  binding, undefined when it has none; programMin: 0 when the binding states none). */
   function readBinding(bindingBytes, logStore, anyRole) {
     if (bindingBytes.length > 512) throw attestationFailure("binding size");
     const binding = JSON.parse(text(bindingBytes));
@@ -1129,6 +1159,8 @@
     if (anyRole !== true && binding.role !== undefined && binding.role !== "reserve") {
       throw attestationFailure("binding role");
     }
+    const programMin = binding.program_min === undefined ? 0 : countOf(binding.program_min, false);
+    if (anyRole !== true && programMin === null) throw attestationFailure("binding program_min");
     const signPk = decode(binding.sign);
     const sealPk = decode(binding.seal);
     if (signPk.length !== 32 || sealPk.length !== 32) throw attestationFailure("binding keys");
@@ -1143,7 +1175,10 @@
         throw attestationFailure("log store");
       }
     }
-    return { signPk: signPk, sealPk: sealPk, release: binding.release, role: binding.role };
+    return {
+      signPk: signPk, sealPk: sealPk, release: binding.release, role: binding.role,
+      programMin: programMin === null ? 0 : programMin,
+    };
   }
 
   /** Verifies one attestation response of a node. nonce is the value sent with the request
@@ -1156,11 +1191,15 @@
    *  checked with the signing public key the document binds. When gate is false the acceptance
    *  conditions (the accepted measurements, debug mode, a build that accepts local) are not
    *  checked: used only for the target of a revoke, which hands no user key over. Returns {node,
-   *  signPk, sealPk, release, platform, custody, timeMs, measure, listed, format}. listed is false
-   *  for a nitro document that verified with a measurement no list has (a release later than this
-   *  program, verifyNitro): such a node receives no grant. measure is the digest of the
-   *  measurement (the empty string for platform local) and format the format of the log of the
-   *  node. */
+   *  signPk, sealPk, release, platform, custody, timeMs, measure, listed, role, programMin,
+   *  format}. A nitro document that verified with a measurement no list has is that of a node of
+   *  an accepted release when release proofs show the measurement (provenForGrant: the proofs
+   *  this runtime verified before, the ones the device kept, or the member release_proofs of the
+   *  response) and the release of its binding is the release the proofs name. listed is false
+   *  for a measurement no list has and no proofs showed (a release later than this program,
+   *  verifyNitro): such a node receives no grant. measure is the digest of the measurement (the
+   *  empty string for platform local), programMin the lowest version of the program whose grant
+   *  command the node takes (0: any) and format the format of the log of the node. */
   function verifyAttestation(response, nonce, gate) {
     try {
       if (response === null || typeof response !== "object" || response.v !== 1) {
@@ -1170,13 +1209,11 @@
       const sent = decode(nonce);
       let verified = null;
       let measure = "";
-      let listed = true;
       let build = undefined;
       if (response.platform === "nitro") {
         verified = verifyNitro(document, sent, gate !== false);
         measure = measureOf(verified.measurement);
         build = verified.build;
-        listed = build !== undefined;
       } else if (response.platform === "local") {
         verified = verifyLocal(document, sent, gate !== false);
       } else {
@@ -1199,11 +1236,21 @@
           statement.challenge !== response.challenge) {
         throw attestationFailure("challenge statement");
       }
+      // A measurement no list has: the release proofs decide, for a node that may receive a key.
+      if (response.platform === "nitro" && build === undefined && gate !== false) {
+        build = provenForGrant(measure, verified.measurement, response.release_proofs);
+      }
+      // The proofs name the release of the measurement, and a node of that measurement states
+      // that release in its binding.
+      if (build !== undefined && build.proven === true && binding.release !== build.release) {
+        throw attestationFailure("release of the binding");
+      }
       return {
         node: encode(binding.signPk), signPk: encode(binding.signPk), sealPk: encode(binding.sealPk),
         release: binding.release, platform: response.platform,
         custody: response.platform === "nitro" ? "enclave" : "operator", timeMs: verified.timeMs,
-        measure: measure, listed: listed, role: binding.role,
+        measure: measure, listed: response.platform !== "nitro" || build !== undefined, role: binding.role,
+        programMin: binding.programMin,
         format: response.platform === "nitro" ? (build === undefined ? 3 : logFormatOf(build.release))
           : logFormatOf(binding.release),
       };
@@ -1229,8 +1276,10 @@
    *  nonce of an object a node wrote to the store is the one of nodeDocumentNonce. With registry
    *  true (a document the backend kept: it answered a request of the backend and carries the
    *  nonce of that request) the nonce is not compared: what the document proves does not depend
-   *  on its nonce. Returns {platform, release, measure, listed, format} and throws
-   *  attestation_failed for a document that does not verify. */
+   *  on its nonce. The object may carry the release proofs of the release of the node
+   *  (release_proofs), which count for a measurement no list has. Returns {platform, release,
+   *  measure, listed, format} and throws attestation_failed for a document that does not
+   *  verify. */
   function verifyNodeDocument(object, id, registry) {
     try {
       if (object === null || typeof object !== "object" || object.v !== 1) {
@@ -1252,11 +1301,24 @@
       const binding = readBinding(verified.binding, verified.logStore === true);
       if (object.node !== id || encode(binding.signPk) !== id) throw attestationFailure("another node");
       if (object.release !== binding.release) throw attestationFailure("another release");
-      const format = object.platform === "nitro" ? (build === undefined ? 3 : logFormatOf(build.release))
-        : logFormatOf(binding.release);
       if (registry !== true && !equal(verified.nonce, nodeDocumentNonce(binding.signPk))) {
         throw attestationFailure("node document nonce");
       }
+      // A measurement no list has is that of an accepted release when release proofs showed it
+      // to this program on this installation, or when the release proofs the object carries
+      // (release_proofs) show it now. The proofs name the release of the measurement, and a node
+      // of that measurement states that release in its binding.
+      if (object.platform === "nitro" && build === undefined) {
+        build = provenBuild(measure);
+        if (build === undefined && object.release_proofs !== undefined && object.release_proofs !== null) {
+          build = proveBuild(object.release_proofs, verified.measurement, measure) || undefined;
+        }
+      }
+      if (build !== undefined && build.proven === true && binding.release !== build.release) {
+        throw attestationFailure("release of the binding");
+      }
+      const format = object.platform === "nitro" ? (build === undefined ? 3 : logFormatOf(build.release))
+        : logFormatOf(binding.release);
       return {
         platform: object.platform, release: binding.release, measure: measure,
         listed: object.platform !== "nitro" || build !== undefined, format: format,
@@ -2098,6 +2160,138 @@
       };
     }
     return proofTrust;
+  }
+
+  // ---- The release proofs: what the device keeps (log.proven) ----
+
+  // The kept measurements (null: not read yet in this runtime), by digest: {release, pcr0, pcr1,
+  // pcr2, proven_ms, proofs}; the digests of the measurements whose proofs this runtime
+  // verified; the times release proofs failed in this runtime; and, by digest, the time this
+  // runtime last asked for the release proofs of a measurement.
+  let provenKept = null;
+  const provenHere = new Set();
+  let proofFailures = [];
+  const proofAsked = new Map();
+  // The nodes of an accepted release that this runtime found to take the grant command of a
+  // later program only (the program_min of their binding is above VERSION): the grant step asks
+  // such a node once in a runtime.
+  const laterProgram = new Set();
+
+  /** The kept measurements of this program on this installation (STORE_PROVEN). What a program
+   *  of another version kept, and an element that is not of the form this program writes, is not
+   *  read. */
+  function keptProven() {
+    if (provenKept === null) {
+      provenKept = new Map();
+      const kept = storedObject(STORE_PROVEN);
+      const measures = kept.v === VERSION && isObject(kept.measures) ? kept.measures : {};
+      for (const digest of Object.keys(measures)) {
+        const item = measures[digest];
+        if (!isObject(item) || releasePosition(item.release) === null || !hex96(item.pcr0) ||
+            !hex96(item.pcr1) || !hex96(item.pcr2)) {
+          continue;
+        }
+        provenKept.set(digest, {
+          release: item.release, pcr0: item.pcr0, pcr1: item.pcr1, pcr2: item.pcr2,
+          proven_ms: whole(item.proven_ms), proofs: isObject(item.proofs) ? item.proofs : null,
+        });
+      }
+    }
+    return provenKept;
+  }
+
+  /** Writes the kept measurements: PROOF_KEPT_MEASURES of them at most, the ones shown last. */
+  function saveProven() {
+    const kept = keptProven();
+    const digests = Array.from(kept.keys()).sort(function (x, y) { return kept.get(x).proven_ms - kept.get(y).proven_ms; });
+    while (digests.length > PROOF_KEPT_MEASURES) kept.delete(digests.shift());
+    const measures = {};
+    for (const digest of digests) measures[digest] = kept.get(digest);
+    storeJson(STORE_PROVEN, { v: VERSION, measures: measures });
+  }
+
+  /** The build of a measurement (by its digest) that release proofs showed to this program on
+   *  this installation: {release, pcr0, pcr1, pcr2, log_store, proven}, in the form of an element
+   *  of ACCEPTED_RELEASES that writes to the log store. undefined when none did. */
+  function provenBuild(measure) {
+    const item = keptProven().get(measure);
+    if (item === undefined) return undefined;
+    return { release: item.release, pcr0: item.pcr0, pcr1: item.pcr1, pcr2: item.pcr2, log_store: true, proven: true };
+  }
+
+  /** Verifies release proofs for a measurement {pcr0, pcr1, pcr2} with the digest measure
+   *  (proveRelease, with the constants of this program and the server target of this build).
+   *  Proofs that pass make the measurement one of an accepted release: the verdict is kept with
+   *  the proofs, and the build is returned (provenBuild). Proofs that fail are logged with the
+   *  check that failed and return undefined. null is returned without a verification when
+   *  PROOF_FAILURES proofs failed in this runtime within PROOF_FAILURE_SPAN_MS. */
+  function proveBuild(proofs, measurement, measure) {
+    const now = native.nowMs();
+    proofFailures = proofFailures.filter(function (time) { return time <= now && now - time < PROOF_FAILURE_SPAN_MS; });
+    if (proofFailures.length >= PROOF_FAILURES) return null;
+    let release = null;
+    try {
+      release = proveRelease(proofs, measurement, releaseTrust(), native.deviceInfo().server_target);
+    } catch (error) {
+      if (failureCode(error) === "cancelled") throw error;
+      proofFailures.push(now);
+      native.log("release proofs refused: " +
+        (failureCode(error) === "release_unproven" ? String(error.message) : failureCode(error)));
+      return undefined;
+    }
+    provenHere.add(measure);
+    const kept = keptProven();
+    const before = kept.get(measure);
+    // The kept proofs verified again: what the device keeps stays as it is.
+    if (before !== undefined && before.proofs === proofs) return provenBuild(measure);
+    const copy = JSON.stringify({
+      statement: proofs.statement, entry: proofs.entry, deploy_signatures: proofs.deploy_signatures,
+      attestation: proofs.attestation,
+    });
+    kept.set(measure, {
+      release: release, pcr0: measurement.pcr0, pcr1: measurement.pcr1, pcr2: measurement.pcr2,
+      proven_ms: before === undefined ? now : before.proven_ms,
+      proofs: copy.length <= PROOF_KEPT_CHARS ? JSON.parse(copy) : null,
+    });
+    saveProven();
+    return provenBuild(measure);
+  }
+
+  /** The build of a measurement no list has, for a node that may receive a key: undefined
+   *  unless this runtime verified release proofs of the measurement. The proofs it verified
+   *  before count; then the proofs the device kept, verified again now (a kept verdict whose
+   *  proofs fail is kept no longer); then the proofs given (the member release_proofs of an
+   *  attestation response; undefined or null: none). */
+  function provenForGrant(measure, measurement, proofs) {
+    if (provenHere.has(measure)) return provenBuild(measure);
+    const item = keptProven().get(measure);
+    if (item !== undefined && item.proofs !== null) {
+      const again = proveBuild(item.proofs, measurement, measure);
+      if (again) return again;
+      if (again === undefined) {
+        keptProven().delete(measure);
+        saveProven();
+      }
+    }
+    if (proofs === undefined || proofs === null) return undefined;
+    return proveBuild(proofs, measurement, measure) || undefined;
+  }
+
+  /** Erases what the device kept of the release proofs (with the account). */
+  function forgetProven() {
+    native.storeSet(STORE_PROVEN, null);
+    provenKept = null;
+    provenHere.clear();
+    proofAsked.clear();
+  }
+
+  /** Whether the grant step may ask for the release proofs of a measurement now: it has not
+   *  asked for them within PROOF_RETRY_MS (unaccepted: what the device kept of the measurements
+   *  no list has, where the time of the last request stands as asked_ms). */
+  function proofsDue(unaccepted, measure, now) {
+    const item = unaccepted[measure];
+    const last = Math.max(isObject(item) ? whole(item.asked_ms) : 0, proofAsked.get(measure) || 0);
+    return last === 0 || last > now || now - last >= PROOF_RETRY_MS;
   }
 
   // ---- Keys ----
@@ -3164,8 +3358,11 @@
    *  not_after_ms}, both in device clock time: not_after_ms is now plus the lifetime the node
    *  accepted (the expiry of the reply minus the time of the document). */
   async function sendGrant(turn, node, challenge, keys, ttlMs) {
-    // The user key goes to a node of a listed release only (verifyAttestation).
+    // The user key goes to a node of an accepted release only (verifyAttestation: a release of
+    // the lists, or one whose release proofs this runtime verified), and to no node that takes
+    // the grant command of a later program only.
     if (node.listed !== true) throw attestationFailure("measurement");
+    if (node.programMin > VERSION) throw attestationFailure("program_min");
     const reply = await sendCommand(turn, node, {
       v: 1, type: "grant", user_id: userId(), node: node.node, challenge: challenge,
       sign_pk: keys.signPk, log_pk: keys.logPk, custody: node.custody,
@@ -4818,8 +5015,11 @@
     const to = typeof event.to === "string" && NODE_ID.test(event.to) ? event.to : "";
     if (hex96(event.pcr0) && hex96(event.pcr1) && hex96(event.pcr2)) {
       const measurement = { pcr0: event.pcr0, pcr1: event.pcr1, pcr2: event.pcr2 };
+      // A measurement of the lists, and one release proofs showed to this program (buildOfMeasure),
+      // is that of an accepted release.
       if (listedBuild(measurement) === undefined) {
-        noteUnaccepted(log, measureOf(measurement), event.release, to, true);
+        const digest = measureOf(measurement);
+        if (buildOfMeasure(digest) === undefined) noteUnaccepted(log, digest, event.release, to, true);
       }
       return null;
     }
@@ -9684,8 +9884,10 @@
    *  those nodes (the ones among them that are alive and answer; ATTESTATION_NODES ids per request,
    *  ATTESTATION_REQUESTS requests at most, sent together); with null, those of every node the
    *  backend lists for the account. Each attestation is a call of its node, so a caller names the
-   *  nodes it has a command for. */
-  async function fetchOffered(turn, ids) {
+   *  nodes it has a command for. With proofs true the request asks for the release proofs of the
+   *  release of each node as well (the query proofs: the member release_proofs of a response):
+   *  the grant step asks so of a node whose measurement no list has and no proofs showed. */
+  async function fetchOffered(turn, ids, proofs) {
     const nonce = native.randomBytes(32);
     if (ids === null) {
       const nodes = (await api(turn, "GET", NODES_PATH, null, { nonce: nonce })).json.nodes;
@@ -9693,9 +9895,9 @@
     }
     const requests = [];
     for (let at = 0; at < ids.length && requests.length < ATTESTATION_REQUESTS; at += ATTESTATION_NODES) {
-      requests.push(api(turn, "GET", NODES_PATH, null, {
-        nonce: nonce, nodes: ids.slice(at, at + ATTESTATION_NODES).join(","),
-      }));
+      const query = { nonce: nonce, nodes: ids.slice(at, at + ATTESTATION_NODES).join(",") };
+      if (proofs === true) query.proofs = "1";
+      requests.push(api(turn, "GET", NODES_PATH, null, query));
     }
     const nodes = [];
     for (const answer of await Promise.all(requests)) {
@@ -9720,11 +9922,19 @@
    *  sets; the grants go out together (one stage). A node is kept among the grants of this device
    *  before its grant goes out (with the attempt time): a node that takes the grant whose reply
    *  never reaches this program is a node this device handed its key to. A node whose document
-   *  verifies with a measurement no list has is a node of a later release: it receives no grant,
-   *  it is kept as such (log.nodes) and not asked again by this program (a stale runtime keeps
-   *  it for its own time only). A node the list marks revoke_only (fetchListed) is none of the
-   *  nodes that are to receive a grant, whatever the options: nothing is asked of it and nothing
-   *  is counted for it. A backend without the route of the list (404) is asked for the
+   *  verifies with a measurement no list has is asked once more, with the release proofs of its
+   *  release (one node of each such measurement, PROOF_REQUEST_NODES at most): proofs that pass
+   *  make the measurement one of an accepted release, and its nodes receive their grants in
+   *  this step. Without such proofs it is a node of a later release: it receives no grant, it
+   *  is kept as such (log.nodes) and not asked again by this program but for the release
+   *  proofs of its measurement, PROOF_RETRY_MS after the last request for them (a stale runtime
+   *  keeps it for its own time only). A node of an accepted release whose binding asks for a
+   *  later program (program_min above VERSION) receives no grant either, is counted with the
+   *  nodes of a later release and is not asked again by this runtime; it is kept as nothing
+   *  else than the node of an accepted release that it is. A node the list marks revoke_only
+   *  (fetchListed) is none of the nodes that are to receive a grant, whatever the options:
+   *  nothing is asked of it and nothing is counted for it. A backend without the route of the
+   *  list (404) is asked for the
    *  attestations of every node it lists, and what this device kept decides which of them
    *  receives a grant; any other failure of the list is the failure of this step. Returns
    *  {accepted, rejected, failed, later, granted, ledgerChanged, guards}: the Set of the ids of
@@ -9745,12 +9955,18 @@
       return known !== undefined && known.granted_ms > ledger.revoked_ms &&
         known.granted_ms <= now + GRANT_REFILL_MS && now - known.granted_ms < grantRenewMs(ledger);
     };
-    // A node an earlier synchronization of this program found to be of a later release.
+    // A node an earlier synchronization of this program found to be of a later release, or to
+    // take the grant command of a later program only.
     const laterKnown = function (id) {
-      if (staleLater.has(id)) return true;
+      if (staleLater.has(id) || laterProgram.has(id)) return true;
       const kept = nodes[id];
       return kept !== undefined && kept.p === "nitro" && kept.m !== "" && buildOfMeasure(kept.m) === undefined;
     };
+    // The nodes this step asks for the release proofs of their release, by the digest of their
+    // measurement: one node of each measurement no list has and no proofs showed. retried are
+    // the ones among them that the list counted as nodes of a later release already.
+    const proofNodes = new Map();
+    const retried = new Set();
     const sent = options.listed !== undefined && options.listed !== null
       ? await options.listed : await settled(fetchListed(turn));
     let offered = null;
@@ -9769,6 +9985,15 @@
         const known = grants[item.node];
         if (options.force !== true && laterKnown(item.node)) {
           later += 1;
+          // A node kept as one of a measurement no list has: the release proofs of that
+          // measurement are asked for again when the last request for them is PROOF_RETRY_MS
+          // old (the proofs of a release may reach the backend after its nodes).
+          const kept = nodes[item.node];
+          if (kept !== undefined && kept.m !== "" && !proofNodes.has(kept.m) && proofNodes.size < PROOF_REQUEST_NODES &&
+              buildOfMeasure(kept.m) === undefined && proofsDue(unaccepted, kept.m, now)) {
+            proofNodes.set(kept.m, item.node);
+            retried.add(item.node);
+          }
           continue;
         }
         const refill = options.refill === true && item.not_after_ms === null && known !== undefined &&
@@ -9782,40 +10007,111 @@
     let failed = 0;
     // The nodes that receive a grant in this run, in the order of the list.
     const wanted = [];
-    for (const response of offered.nodes) {
+    // The responses that verified with a measurement no list has and no release proofs showed
+    // ([{node, response, nonce}]), and the ids of the nodes asked for their release proofs.
+    let unlisted = [];
+    const asked = new Set();
+    // Judges one attestation response: the node receives a grant (wanted), is one of a
+    // measurement no list has and no proofs showed (unlisted), takes the grant command of a
+    // later program only, or failed the verification (rejected: the return value is true).
+    const judge = function (response, nonce) {
       const claimed = response !== null && typeof response === "object" ? response.node : undefined;
       if (!sent.ok && options.force !== true && typeof claimed === "string" && fresh(claimed)) {
         accepted.add(claimed);
-        continue;
+        return false;
       }
       let node = null;
       try {
-        node = verifyAttestation(response, offered.nonce);
+        node = verifyAttestation(response, nonce);
       } catch (error) {
         rejected += 1;
         native.log("attestation rejected: " + String(error.message));
-        continue;
+        return true;
       }
-      if (sent.ok && !due.has(node.node)) continue;
-      if (wanted.some(function (item) { return item.node.node === node.node; })) continue;
+      if (sent.ok && !due.has(node.node) && !asked.has(node.node)) return false;
+      const same = function (item) { return item.node.node === node.node; };
+      if (wanted.some(same) || unlisted.some(same) || laterProgram.has(node.node)) return false;
       if (!node.listed) {
-        later += 1;
-        native.log("attestation of a later release: " + node.release);
-        // A stale runtime keeps the node for its own time only: it writes none of what the
-        // rounds judge by (the time a measurement was first seen among it).
-        if (staleRuntime()) {
-          staleLater.add(node.node);
-          continue;
-        }
-        nodes[node.node] = { m: node.measure, p: "nitro", r: node.release, f: now, c: 0 };
-        if (unaccepted[node.measure] === undefined) {
-          unaccepted[node.measure] = { first_ms: now, release: String(node.release).slice(0, 64), held: false, node: node.node };
-        }
-        noted = true;
-        continue;
+        unlisted.push({ node: node, response: response, nonce: nonce });
+        return false;
       }
+      // A node of an accepted release whose binding asks for a later program than this one
+      // receives no grant of this program. It is no node of a release this program does not
+      // accept: its entries are judged as those of an accepted node. A runtime keeps it for its
+      // own time and does not ask it again.
+      if (node.programMin > VERSION) {
+        if (!retried.has(node.node)) later += 1;
+        laterProgram.add(node.node);
+        native.log("node takes the grant of program " + node.programMin + " or later");
+        return false;
+      }
+      if (retried.has(node.node)) later -= 1;
       accepted.add(node.node);
       wanted.push({ node: node, challenge: response.challenge });
+      return false;
+    };
+    for (const response of offered.nodes) judge(response, offered.nonce);
+    // The release proofs (docs/protocol.md, "The release proofs"). A node whose document
+    // verifies with a measurement no list has and no proofs showed is asked for its attestation
+    // once more, with the release proofs of its release: one node of each such measurement.
+    // Proofs that pass (verifyAttestation) show the measurement to this runtime, so the
+    // responses of the first request are judged again: the other nodes of that measurement
+    // receive their grants in this step as well. Without proofs that pass, the node is one of a
+    // later release, as before. No other request carries the query proofs.
+    for (const item of unlisted) {
+      const measure = item.node.measure;
+      if (!proofNodes.has(measure) && proofNodes.size < PROOF_REQUEST_NODES && proofsDue(unaccepted, measure, now)) {
+        proofNodes.set(measure, item.node.node);
+      }
+    }
+    if (proofNodes.size > 0) {
+      proofNodes.forEach(function (id, measure) {
+        asked.add(id);
+        proofAsked.set(measure, now);
+      });
+      const again = await settled(fetchOffered(turn, Array.from(asked), true));
+      if (again.ok) {
+        const first = unlisted;
+        unlisted = [];
+        // A node whose second response failed the verification is counted once: its first
+        // response is not judged again.
+        const refused = new Set();
+        for (const response of again.value.nodes) {
+          if (judge(response, again.value.nonce) && response !== null && typeof response === "object") refused.add(response.node);
+        }
+        for (const item of first) {
+          if (!refused.has(item.node.node)) judge(item.response, item.nonce);
+        }
+      } else {
+        if (failureCode(again.error) === "cancelled" || !(turnLeft(turn) > 0)) throw again.error;
+        native.log("release proofs request failed: " + failureCode(again.error));
+      }
+    }
+    for (const item of unlisted) {
+      const node = item.node;
+      if (!retried.has(node.node)) later += 1;
+      native.log("attestation of a later release: " + node.release);
+      // A stale runtime keeps the node for its own time only: it writes none of what the
+      // rounds judge by (the time a measurement was first seen among it).
+      if (staleRuntime()) {
+        staleLater.add(node.node);
+        continue;
+      }
+      if (nodes[node.node] === undefined) nodes[node.node] = { m: node.measure, p: "nitro", r: node.release, f: now, c: 0 };
+      if (unaccepted[node.measure] === undefined) {
+        unaccepted[node.measure] = { first_ms: now, release: String(node.release).slice(0, 64), held: false, node: node.node };
+      }
+      noted = true;
+    }
+    // The time of the request for the release proofs of a measurement that no proofs showed is
+    // kept with that measurement (proofsDue).
+    if (proofNodes.size > 0 && !staleRuntime()) {
+      proofNodes.forEach(function (id, measure) {
+        if (buildOfMeasure(measure) === undefined && isObject(unaccepted[measure])) {
+          unaccepted[measure].asked_ms = now;
+          noted = true;
+        }
+      });
     }
     if (noted) {
       saveNodes(nodes);
@@ -11518,6 +11814,7 @@
    *  the program store holds of the account. */
   async function eraseAccountKeys() {
     deleteMasterKey();
+    forgetProven();
     native.keychainDelete(ledgerItem());
     native.keychainDelete(mailSetupItem());
     forgetSeen();
