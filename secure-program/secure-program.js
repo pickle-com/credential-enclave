@@ -385,6 +385,17 @@
       pcr2: "6ba116c4b0277f37dc8271a5913c7e06f9c5f66ccd684a667f0f7156adbcb14820fc89f2afd6baceea393f669a0633eb",
       log_store: true,
     },
+    // The place of the element of release v2.4.0, the first release whose nodes write format 3
+    // (LOG_FORMAT_3_FROM). Its three values are the measurement of the build of the tag v2.4.0 of
+    // pickle-com/credential-enclave, as anyone makes it again from that tag:
+    //   // pickle-com/credential-enclave v2.4.0 (commit <the commit of the tag>).
+    //   {
+    //     release: "v2.4.0",
+    //     pcr0: "<96 lower-case hexadecimal characters>",
+    //     pcr1: "<96 lower-case hexadecimal characters>",
+    //     pcr2: "<96 lower-case hexadecimal characters>",
+    //     log_store: true,
+    //   },
   ];
   // Measurements of builds that never ran in prod: builds made from commits that are not in the
   // history of the public repository (marked pre-), and releases of the public repository that went

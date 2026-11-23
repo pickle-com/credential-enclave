@@ -1424,5 +1424,5 @@ module.exports = {
   aeadSeal, aeadOpen, hpkeSeal, hpkeOpen, hpkeDeriveKeyPair,
   cbor, SecureError, signedValue, deriveAccountKeys,
   Node, World, makeNative, loadProgram, listedMeasurements, declaredVersion, randomMeasurement,
-  withListedRelease, shardBucket, SHARDS, DAY_MS, RTIME_MAX,
+  withListedRelease, writesFormat3, shardBucket, SHARDS, DAY_MS, RTIME_MAX,
 };

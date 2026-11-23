@@ -15,8 +15,8 @@ const DAY_MS = bridge.DAY_MS;
 /** A fixture: a world with an account whose key state is present, and the program that runs on
  *  it. options:
  *    target      the server target of the world (prod)
- *    legacy      the number of nodes of the latest release the checked-out program lists (a release
- *                that writes format 2); 0 when absent
+ *    legacy      the number of nodes of the latest release the checked-out program lists among
+ *                the releases that write format 2 (the releases before v2.4.0); 0 when absent
  *    nodes       the number of nodes of release v2.4.0 (format 3), listed by the program of the
  *                fixture under a measurement of the fixture; 1 when absent
  *    account     false for a device without a master key and an account without a registered key
@@ -27,7 +27,7 @@ function fixture(source, options) {
   const given = options || {};
   const world = new bridge.World({ serverTarget: given.target || "prod", device: given.device });
   const keys = given.account === false ? null : world.createAccount();
-  const listed = bridge.listedMeasurements(source);
+  const listed = bridge.listedMeasurements(source).filter((item) => !bridge.writesFormat3(item.release));
   const latest = listed[listed.length - 1];
   const measurement = bridge.randomMeasurement();
   const out = {

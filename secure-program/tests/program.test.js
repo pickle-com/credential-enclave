@@ -420,10 +420,13 @@ test("the top level of the program defines secureProgram and calls nothing", () 
 test("the program lists the releases of the public repository in order, each writing to the log store", () => {
   const listed = bridge.listedMeasurements(source);
   const names = listed.map((release) => release.release);
+  // The releases before v2.4.0 stay listed (their nodes hold grants while the fleet moves on, and
+  // their chains are read for the retention of the store); v2.4.0 follows them once it is listed.
   assert.deepEqual(names.slice(0, 11), [
     "v1.1.0", "v1.2.0", "v1.3.0", "v1.4.0", "v1.5.0", "v1.5.2", "v2.0.0", "v2.0.1", "v2.1.0", "v2.2.0",
     "v2.3.0",
   ]);
+  assert.ok(names.length === 11 || (names.length === 12 && names[11] === "v2.4.0"), names.join(" "));
   assert.ok(listed.every((release) => release.log_store === true));
   const measurements = new Set(listed.map((release) => release.pcr0 + release.pcr1 + release.pcr2));
   assert.equal(measurements.size, listed.length);
