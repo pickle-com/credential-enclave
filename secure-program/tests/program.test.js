@@ -1056,6 +1056,28 @@ test("an address of the store that gives a query key twice, or carries a fragmen
   assert.equal(chain.world.sent("S3 ").length, calls);
 });
 
+test("the bridge is asked for the device as often for a listing of many keys as for one of few: the user_id of the account is read once in a runtime", async () => {
+  const calls = async (entries) => {
+    const fx = S.fixture(source);
+    await S.start(fx);
+    const world = fx.world;
+    for (let i = 0; i < entries; i += 1) {
+      world.advance(1000);
+      fx.nodes[0].record("u", [S.providerRequest(world.now)]);
+    }
+    const before = world.deviceInfoCalls;
+    const shown = await S.call(fx, "read_log", { limit: 50 });
+    assert.equal(shown.ok, true);
+    assert.equal(shown.value.status, "verified");
+    await world.settle(60000);
+    return world.deviceInfoCalls - before;
+  };
+  const few = await calls(3);
+  const many = await calls(300);
+  assert.equal(many, few);
+  assert.ok(few < 40, String(few));
+});
+
 test("what does not mark the log: an empty seq, a node that ended without a shutdown, an entry of another key", async () => {
   const fx = S.fixture(source);
   await S.start(fx);

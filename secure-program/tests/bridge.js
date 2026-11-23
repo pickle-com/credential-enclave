@@ -619,6 +619,8 @@ class World {
     this.syncReports = [];
     this.securityStatuses = [];
     this.requests = [];
+    // How often the program asked the bridge for the device (native.deviceInfo, a synchronous call).
+    this.deviceInfoCalls = 0;
     this.account = { key: null, keys: null };
     this.nodes = new Map();
     this.buckets = new Map();
@@ -1260,6 +1262,7 @@ function makeNative(world) {
     keychainDelete: (item) => world.keychain.delete(keychainName(item)),
     nowMs: () => world.now,
     deviceInfo: () => {
+      world.deviceInfoCalls += 1;
       const info = {
         platform: device.platform, app_version: "1.1.0", app_build: "1", system_version: "26.0", model: "iPhone",
         server_target: world.serverTarget, user_id: world.userId, program_origin: "server",

@@ -1036,8 +1036,16 @@
     return "pickle.secure.v3." + name;
   }
 
+  // The user_id of the account of this runtime (null: not read yet). An executor binds a runtime
+  // to one account and makes a new runtime for another, so the bridge is asked for it once: the
+  // prefix of every key of a listing and the fields of every entry are compared with it.
+  let accountId = null;
+
   function userId() {
-    return native.deviceInfo().user_id;
+    if (accountId !== null) return accountId;
+    const id = native.deviceInfo().user_id;
+    if (typeof id === "string" && id !== "") accountId = id;
+    return id;
   }
 
   /** The keychain item of the master key: one per account, synchronized through the iCloud
