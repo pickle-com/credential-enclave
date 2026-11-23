@@ -223,6 +223,9 @@
   const LOG_WITHHELD_OBJECTS = 16;
   const LOG_WITHHELD_CHAINS = 8;
   const LOG_DENIED_CHAINS = 8;
+  // A read held back from the screen adds to the count the screen keeps of such reads when the
+  // last one counted is this old.
+  const LOG_DENIED_INTERVAL_MS = DAY_MS;
   // The retention of an object of the store (Object Lock, days). The absence of a key older than
   // this says nothing; a key is expected in the listing while it is a day younger than this.
   const LOG_RETENTION_DAYS = 365;
@@ -4474,14 +4477,14 @@
         const rest = items.filter(function (item) { return !named.has(item.parsed.key); });
         for (const item of rest) named.set(item.parsed.key, item);
         items = first.concat(rest);
-        for (const wanted of typeof extra === "function" ? extra(pages) : []) {
-          const known = named.get(wanted.parsed.key);
-          if (known !== undefined) {
-            known.shown = true;
+        for (const more of typeof extra === "function" ? extra(pages) : []) {
+          const listed = named.get(more.parsed.key);
+          if (listed !== undefined) {
+            listed.shown = true;
             continue;
           }
-          const item = { parsed: wanted.parsed, fresh: false, shown: true };
-          named.set(wanted.parsed.key, item);
+          const item = { parsed: more.parsed, fresh: false, shown: true };
+          named.set(more.parsed.key, item);
           items.push(item);
         }
       }
@@ -4661,12 +4664,12 @@
       }).sort();
       log.sample = sample.slice(0, LOG_SAMPLE_KEYS);
     }
-    const told = tellStatus(status, reasons, typeof log.round.told === "string" && log.round.v === VERSION ? log.round.told : "");
-    // What this round read under the keys the log screen had asked for is kept for the screen
-    // first: a read leaves the withheld ones, and the count of the rounds held back ends, only
-    // after what was read is where the screen takes it from.
-    // A listing page the round read again is kept as well, and a listing page the screen read
-    // itself in this round replaces nothing: what the rounds kept of it is dropped.
+    // What this round read for the log screen is kept for the screen first (the entries under
+    // the keys the screen had asked for, the listing pages, the entries and the node prefixes of
+    // the chains): a read leaves the withheld ones, the count of the rounds held back ends and
+    // the app is told the judgement only after what was read is where the screen takes it from.
+    // A listing page the screen read itself in this round is not kept: what the rounds kept of
+    // it is dropped.
     const own = origin === "screen" && pages.c !== null && had.pages.some(function (page) { return page.before === 0; });
     if (run.kept.size > 0 || run.pagesKept.size > 0 || own || run.chainKept.length > 0 || run.found !== null) {
       const recovered = loadRecovered(keys);
@@ -4688,6 +4691,7 @@
       });
       saveRecovered(keys, recovered);
     }
+    const told = tellStatus(status, reasons, typeof log.round.told === "string" && log.round.v === VERSION ? log.round.told : "");
     saveNodes(log.nodes);
     storeJson(STORE_UNACCEPTED, log.unaccepted);
     storeJson(STORE_BLOCKED, log.blocked);
@@ -5142,7 +5146,7 @@
         }
         if (failure.kind === "silent" && reads.reached === null) reads.reached = await reachJudged(turn, started);
         if (failure.kind !== "silent" || reads.reached === true) {
-          if (denyChain(target.id, target.after)) reads.judge = true;
+          if (denyChain(target.id, target.after, target.below !== undefined)) reads.judge = true;
         }
         continue;
       }
@@ -5714,12 +5718,18 @@
   }
 
   /** Writes what the rounds read for the screen. Beyond LOG_RECOVERED_KEYS entries or
-   *  LOG_RECOVERED_EVENTS events, the entries kept first leave first, and beyond
-   *  LOG_RECOVERED_PAGES listing pages the pages kept first. Nothing kept: no value. */
+   *  LOG_RECOVERED_EVENTS events, the entries kept first leave first (among the ones kept at the
+   *  same time, the earliest entry), and beyond LOG_RECOVERED_PAGES listing pages the pages kept
+   *  first. Nothing kept: no value. */
   function saveRecovered(keys, recovered) {
     let events = 0;
     recovered.entries.forEach(function (kept) { events += kept.e === null ? 0 : kept.e.items.length; });
-    for (const id of Array.from(recovered.entries.keys())) {
+    const leaving = Array.from(recovered.entries.keys()).sort(function (x, y) {
+      const a = recovered.entries.get(x);
+      const b = recovered.entries.get(y);
+      return a.t !== b.t ? a.t - b.t : a.m - b.m;
+    });
+    for (const id of leaving) {
       if (recovered.entries.size <= LOG_RECOVERED_KEYS && events <= LOG_RECOVERED_EVENTS) break;
       const kept = recovered.entries.get(id);
       events -= kept.e === null ? 0 : kept.e.items.length;
@@ -5824,19 +5834,18 @@
   //   a listing of a chain that is held back adds to the count of that chain. The screen lists
   //   a chain from its end downward, each listing below the one before, so the listing that was
   //   held back stands in the way of every listing below it. The count of a chain ends when the
-  //   screen itself reads a listing of that chain that begins at or below the lowest seq a
-  //   listing held back began after, and that either continues the keys the screen knows
-  //   downward or reaches the end of the chain (a listing that only looks for the end of a
-  //   chain ends no count).
+  //   screen itself reads a listing of that chain that covers what was held back (serveChain).
+  // A read held back adds to its count once in LOG_DENIED_INTERVAL_MS.
   // A count marks the log as the count of the rounds held back does: LOG_BLOCKED_ROUNDS reads,
   // the first of them LOG_BLOCKED_MS old.
 
   /** The counts of the reads held back from the screen: {page, chains}. page is {before_ms,
    *  limit, count, first_ms, last_ms} (the time the later page last held back begins below, the
    *  most events a page held back was asked for, the reads held back in a row, the time of the
-   *  first and of the last of them that was counted) or null; chains maps a node id to {after, count, first_ms,
-   *  last_ms} (the lowest seq a listing held back began after). A count whose last read is
-   *  older than the retention of the store is left out. */
+   *  first and of the last of them that was counted) or null; chains maps a node id to {after,
+   *  deep, count, first_ms, last_ms} (the lowest seq a listing held back began after, and
+   *  whether one of them was a listing below the keys the screen knew). A count whose last read
+   *  is older than the retention of the store is left out. */
   function loadDenied() {
     const kept = storedObject(STORE_DENIED);
     const now = native.nowMs();
@@ -5855,7 +5864,7 @@
     for (const id of Object.keys(chains).slice(0, LOG_DENIED_CHAINS)) {
       if (!NODE_ID.test(id) || !live(chains[id])) continue;
       denied.chains[id] = {
-        after: whole(chains[id].after), count: whole(chains[id].count),
+        after: whole(chains[id].after), deep: chains[id].deep === true, count: whole(chains[id].count),
         first_ms: Math.min(whole(chains[id].first_ms), now), last_ms: whole(chains[id].last_ms),
       };
     }
@@ -5891,11 +5900,13 @@
   }
 
   /** Whether a read held back at the time now adds to a count ({count, last_ms}): the first one
-   *  does, and a later one when the last read counted is LOG_ROUND_RETRY_MS old (the reads one
-   *  opening of the screen makes, and the ones it repeats at once, count once, as the rounds of
-   *  synchronizations that follow one another do). */
+   *  does, and a later one when the last read counted is LOG_DENIED_INTERVAL_MS old. The device
+   *  makes a round again by itself, with every synchronization, so rounds held back in a row are
+   *  attempts spread over time. A read of the screen is made again by the user and by the
+   *  screen within seconds, so the reads of one day count once: a count that marks the log is
+   *  made of reads held back on three days. */
   function countsAgain(kept, now) {
-    return kept.count === 0 || now < kept.last_ms || now - kept.last_ms >= LOG_ROUND_RETRY_MS;
+    return kept.count === 0 || now < kept.last_ms || now - kept.last_ms >= LOG_DENIED_INTERVAL_MS;
   }
 
   /** Counts a read of a later page of the screen that was held back. Returns whether the count
@@ -5928,11 +5939,14 @@
   }
 
   /** Counts a listing of the chain of node id that was held back from the screen (after: the
-   *  seq the listing began after). Returns whether the count marks the log now. */
-  function denyChain(id, after) {
+   *  seq the listing began after; below: whether it was a listing below the keys the screen
+   *  knows). Returns whether the count marks the log now. */
+  function denyChain(id, after, below) {
     const now = native.nowMs();
     const denied = loadDenied();
-    const kept = denied.chains[id] === undefined ? { after: after, count: 0, first_ms: now, last_ms: now } : denied.chains[id];
+    const kept = denied.chains[id] === undefined
+      ? { after: after, deep: false, count: 0, first_ms: now, last_ms: now } : denied.chains[id];
+    if (below) kept.deep = true;
     if (countsAgain(kept, now)) {
       kept.count += 1;
       kept.last_ms = now;
@@ -5944,14 +5958,19 @@
   }
 
   /** Ends the count of the chain of node id when the screen read a listing of that chain itself
-   *  (target: {after, below, probe, more}) that begins at or below the lowest seq a listing held
-   *  back began after, and that continues the keys the screen knows downward (below) or reaches
-   *  the end of the chain. Returns whether the count it ended marked the log. */
+   *  (target: {after, below, probe, more}) that covers what was held back: a listing below the
+   *  keys the screen knows that begins at or below the lowest seq a listing held back began
+   *  after; or a listing that reaches the end of the chain, when it begins at or below that seq
+   *  or when every listing held back was one of the end of the chain (what such a listing would
+   *  have named and this one does not name lies below it now, where a listing below the keys
+   *  the screen knows is what names it). A listing that only looks for the end of a chain ends
+   *  no count. Returns whether the count it ended marked the log. */
   function serveChain(id, target) {
     if (target.probe === true || (target.below === undefined && target.more === true)) return false;
     const denied = loadDenied();
     const kept = denied.chains[id];
-    if (kept === undefined || target.after > kept.after) return false;
+    if (kept === undefined) return false;
+    if (target.after > kept.after && (target.below !== undefined || kept.deep)) return false;
     delete denied.chains[id];
     saveDenied(denied);
     return heldLong(kept, native.nowMs());
@@ -6161,9 +6180,37 @@
     return entryPrefix(letter) + rtimeDigits(beforeMs) + "~";
   }
 
-  /** One later page of the screen: the entries before beforeMs, read without a round. The two
-   *  listings of format 3 are read from the marker of that time and the entries of the page from
-   *  the backend, each verified as a round verifies it; what the page finds changes no kept
+  // The listings of format 3 the screen read last in this runtime (null: none): {c, u, top}, the
+  // two listing pages as readListings returns them and the time they begin below (Infinity for
+  // the pages that begin the two listings). A listing page of the store names up to 1,000 keys,
+  // many more than one page of the screen shows, so the later pages of the screen are made from
+  // these listings as far as they reach, and the backend is asked for the address of a further
+  // listing page only below them.
+  let screenListings = null;
+
+  /** The page of the screen for the entries before beforeMs, made from the listings the screen
+   *  read in this runtime: what choosePage returns, or null when those listings do not reach far
+   *  enough. They do when they begin at or above that time and either hold a whole page above
+   *  the place where one of them goes on (the page ends above the time of the last key of such
+   *  a listing, so no entry of its last millisecond lies beyond it) or neither goes on. */
+  function ownPage(beforeMs, limit) {
+    if (screenListings === null || beforeMs > screenListings.top) return null;
+    const lists = [screenListings.c, screenListings.u].filter(function (listing) {
+      return listing !== null && listing.truncated && listing.keys.length > 0;
+    });
+    const page = choosePage(screenListings, beforeMs, limit);
+    if (lists.length === 0) return page;
+    let floor = 0;
+    for (const listing of lists) floor = Math.max(floor, listing.keys[listing.keys.length - 1].time_ms);
+    const full = page.count >= limit && page.chosen[page.chosen.length - 1].time_ms > floor;
+    return full ? page : null;
+  }
+
+  /** One later page of the screen: the entries before beforeMs, read without a round. The keys
+   *  of the page are taken from the listings of format 3 the screen read in this runtime, or,
+   *  below them, from the two listings read from the marker of that time. The entries of the
+   *  page come from the backend, each verified as a round verifies it; what the page finds
+   *  changes no kept
    *  judgement (the rounds judge). An entry the rounds read for the screen (log.recovered) is
    *  taken from there and not asked for. A read the page finds held back (its listings, the
    *  document or the body of one of its keys) and a key no answer of the bodies reached are kept
@@ -6189,8 +6236,11 @@
     const recovered = loadRecovered(keys);
     let unread = false;
     let listings = null;
+    // The listings the screen read in this runtime name the keys of the page when they reach
+    // that far: no listing is asked for then.
+    const own = ownPage(beforeMs, limit);
     try {
-      listings = await readListings(turn, screenPages(beforeMs));
+      if (own === null) listings = await readListings(turn, screenPages(beforeMs));
     } catch (failure) {
       if (!isStoreFailure(failure) || !(turnLeft(turn) > 0)) throw failure;
       // A backend that states it has no store of format 3 is believed by a device that knows of
@@ -6215,12 +6265,17 @@
       }
     }
     if (listings !== null) {
+      screenListings = { c: listings[0], u: listings[1], top: beforeMs };
+      chosen = choosePage(screenListings, beforeMs, limit);
+    } else if (own !== null) {
+      chosen = own;
+    }
+    if (listings !== null || own !== null) {
       run.pagesRead.add(beforeMs);
       // The count of the later pages held back ends here; when it marked the log, a round
       // judges and publishes that now.
       if (servePage(beforeMs, limit)) requestRound(freeTurn(), keys, "sync").then(noop, noop);
       dropRecoveredPage(keys, recovered, beforeMs);
-      chosen = choosePage({ c: listings[0], u: listings[1] }, beforeMs, limit);
     }
     if (chosen.chosen.length > 0) {
       try {
@@ -6316,6 +6371,10 @@
     let more = false;
     let floorMs = 0;
     let truncated = false;
+    // The listings this read gave the screen name the keys of its later pages as far as they
+    // reach.
+    screenListings = round.pages.c !== null && round.pages.u !== null
+      ? { c: round.pages.c, u: round.pages.u, top: Infinity } : null;
     if (plan !== null) {
       cache.listed_ms = began;
       for (const parsed of plan.chosen.chosen) {
@@ -7416,6 +7475,7 @@
     displayNodes.clear();
     displayEntries.clear();
     logPagePlaces = [];
+    screenListings = null;
   }
 
   /** Key creation: a new key is made only when the keychain has no master key and the account has

@@ -1511,11 +1511,14 @@ test("a backend that gives the rounds the listings of the first page and not the
   assert.equal(world.sent("POST /api/secure/log/read").length, after + 1);
 });
 
-test("A3: a later page of the screen that is held back is made from the listing page a round kept for it, and later pages that keep being held back where the rounds kept nothing mark the log after three such reads and three days, whatever the rounds read in between", async () => {
+test("A3: a later page of the screen that is held back is made from the listing page a round kept for it, and later pages that keep being held back where the rounds kept nothing mark the log after such reads on three days, whatever the rounds read in between", async () => {
   const fx = S.fixture(source, { device: { securityStatus: true } });
   await S.start(fx);
   const world = fx.world;
   const node = fx.nodes[0];
+  // Listing pages of three keys: the listings the first page of the screen reads do not reach
+  // the second page, and the screen asks for the listings of that page.
+  world.pageSize = 3;
   for (let i = 0; i < 4; i += 1) {
     world.advance(HOUR_MS);
     node.record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/drafts/" + i, "DELETE")]);
@@ -1548,13 +1551,14 @@ test("A3: a later page of the screen that is held back is made from the listing 
   await S.event(fx, "foreground");
   assert.equal(world.state.log.status, "verified");
   assert.equal(heldReads(world), undefined);
-  assert.deepEqual(openRecovered(fx).pages.map((page) => [page[0], page[3].length]), [[before, 5]]);
+  assert.deepEqual(openRecovered(fx).pages.map((page) => [page[0], page[2], page[3].length]), [[before, true, 3]]);
   // The same page again, held back again: it is made from what the round kept, and it does not
   // add to the count.
   const again = await onScreen(fx, mode, "read_log_page", { before_ms: before });
   assert.equal(again.ok, true);
   const deleted = shownGroups(again.value).filter((group) => group.kind === "request" && group.action === "delete");
-  assert.equal(deleted.reduce((sum, group) => sum + group.count, 0), 4);
+  assert.equal(deleted.reduce((sum, group) => sum + group.count, 0), 3);
+  assert.equal(again.value.has_more, true);
   assert.equal(world.stored("log.denied").page.count, 1);
   // New entries move the time the second page begins below. The rounds kept no page that begins
   // there: each such read of the screen is counted, and the rounds that read the page in
@@ -1596,6 +1600,7 @@ test("a later page of the screen that fails for the network of the device, or on
   const fx = S.fixture(source);
   await S.start(fx);
   const world = fx.world;
+  world.pageSize = 2;
   for (let i = 0; i < 6; i += 1) {
     world.advance(HOUR_MS);
     fx.nodes[0].record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/messages/" + i, "POST")]);
@@ -1621,6 +1626,7 @@ test("a later page of the screen that fails for the network of the device, or on
 
   // The backend answers one request for the listings of a later page with an error.
   const once = S.fixture(source);
+  once.world.pageSize = 2;
   await S.start(once);
   for (let i = 0; i < 6; i += 1) {
     once.world.advance(HOUR_MS);
@@ -1639,6 +1645,107 @@ test("a later page of the screen that fails for the network of the device, or on
   for (let day = 0; day < 4; day += 1) {
     await nextDay(once);
     assert.equal(once.world.state.log.status, "verified", "day " + day);
+  }
+});
+
+test("what the rounds keep for the screen has its limits: of entries that hold more events than the device keeps, the ones kept first leave, and the screen asks for them again", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  // Six entries of 100 events each: 600 events, and the device keeps 512. The first page of the
+  // screen shows the five latest, and the summary counts all six.
+  const heavy = [];
+  for (let i = 0; i < 6; i += 1) {
+    world.advance(HOUR_MS);
+    const events = [];
+    for (let at = 0; at < 100; at += 1) events.push(S.providerRequest(world.now + at, "/gmail/v1/users/me/messages/" + i + "-" + at, "POST"));
+    heavy.push(fx.nodes[0].record("u", events));
+  }
+  const names = heavy.map((entry) => entry.key);
+  const mode = screenOnly(fx, [], (key) => names.indexOf(key) >= 0);
+  const first = await onScreen(fx, mode, "read_log", { limit: 500 });
+  assert.equal(shownGroups(first.value).filter((group) => group.kind === "unverified").length, 5);
+  assert.equal(heldReads(world).keys.length, 6);
+  world.advance(2 * 60000);
+  await S.event(fx, "foreground");
+  assert.equal(world.state.log.status, "verified");
+  // Of the entries a round kept at the same time, the earliest leaves first.
+  const kept = openRecovered(fx);
+  assert.equal(kept.entries.length, 5);
+  assert.equal(kept.entries.reduce((sum, item) => sum + item[3].items.length, 0), 500);
+  assert.ok(kept.entries.every((item) => item[0] !== "3:" + names[0].slice(names[0].indexOf("/u/") + 3)));
+  // The five kept are shown with their events; the one that left is asked for again (for the
+  // summary), held back again, and goes to the rounds again.
+  const second = await onScreen(fx, mode, "read_log", { limit: 500 });
+  const groups = shownGroups(second.value);
+  assert.equal(groups.filter((group) => group.kind === "unverified").length, 0);
+  assert.equal(groups.filter((group) => group.kind === "request").reduce((sum, group) => sum + group.count, 0), 500);
+  assert.deepEqual(heldReads(world).keys, [names[0]]);
+});
+
+test("the later pages of the screen are made from the listings its first page read: no listing is asked for, and a page the listings do not reach is asked for from the time it begins below", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  for (let i = 0; i < 9; i += 1) {
+    world.advance(60000);
+    fx.nodes[0].record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/messages/" + i, i % 2 === 0 ? "GET" : "POST")]);
+  }
+  const first = await S.call(fx, "read_log", { limit: 3 });
+  assert.equal(first.value.has_more, true);
+  const listings = world.sent("POST /api/secure/log/read").length;
+  const later = await S.call(fx, "read_log_page", { before_ms: world.runtime.log_pages[0].before_ms });
+  assert.equal(later.ok, true);
+  assert.equal(later.value.has_more, false);
+  assert.equal(shownGroups(later.value).reduce((sum, group) => sum + group.count, 0), 7);
+  const record = await S.call(fx, "read_security_record", { limit: 50, before_ms: world.runtime.log_pages[0].before_ms });
+  assert.equal(record.value.items.reduce((sum, item) => sum + item.count, 0), 7);
+  assert.equal(world.sent("POST /api/secure/log/read").length, listings);
+  // Listing pages of four keys: the first listings do not hold the second page of the screen.
+  const short = S.fixture(source);
+  short.world.pageSize = 4;
+  await S.start(short);
+  for (let i = 0; i < 9; i += 1) {
+    short.world.advance(60000);
+    short.nodes[0].record("u", [S.providerRequest(short.world.now, "/gmail/v1/users/me/messages/" + i, "POST")]);
+  }
+  await S.call(short, "read_log", { limit: 3 });
+  const asked = short.world.sent("POST /api/secure/log/read").length;
+  const below = short.world.runtime.log_pages[0].before_ms;
+  const page = await S.call(short, "read_log_page", { before_ms: below });
+  assert.equal(page.ok, true);
+  assert.equal(shownGroups(page.value).reduce((sum, group) => sum + group.count, 0), 4);
+  assert.equal(short.world.sent("POST /api/secure/log/read").length, asked + 1);
+  const markers = JSON.parse(short.world.sent("POST /api/secure/log/read").slice(-1)[0].body).pages.map((item) => item.key_marker);
+  assert.ok(markers.every((marker) => marker.endsWith("~")));
+});
+
+test("a runtime that ends in the middle of a read of the log leaves what the device kept as it was, and the end of an account erases what the rounds kept for the screen", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  world.advance(HOUR_MS);
+  const used = fx.nodes[0].record("u", [S.providerRequest(world.now)]);
+  // The read of the screen waits for an answer that does not come, and the app is ended.
+  world.fault("POST /api/secure/log/bodies", "hang");
+  const pending = fx.program.procedures.read_log({ limit: 50 });
+  pending.then(() => {}, () => {});
+  await world.drain();
+  const before = JSON.stringify([world.stored("log.blocked"), world.stored("log.withheld"), world.stored("log.round").unfinished]);
+  world.clearFaults();
+  await S.start(fx);
+  assert.equal(JSON.stringify([world.stored("log.blocked"), world.stored("log.withheld"), world.stored("log.round").unfinished]), before);
+  assert.notEqual(world.state.log.status, "attention");
+  // A read held back from the screen, read again by a round: kept for the screen. The account
+  // ends, and nothing of it stays on the device.
+  const mode = screenOnly(fx, [], (key) => key === used.key);
+  await onScreen(fx, mode, "read_log", { limit: 50 });
+  world.advance(2 * 60000);
+  await S.event(fx, "foreground");
+  assert.notEqual(world.stored("log.recovered"), undefined);
+  await S.event(fx, "account_end", { reason: "account_deleted" });
+  for (const key of ["log.recovered", "log.withheld", "log.denied", "log.cache", "log.round"]) {
+    assert.equal(world.store.get(key), undefined, key);
   }
 });
 
@@ -2271,6 +2378,7 @@ test("A3: a listing only the screen reads that is held back is read again by eve
   // and then with the statement that it has no store of format 3.
   for (const answer of [{ status: 503, body: { detail: "log_store_unreachable" } }, { status: 409, body: { detail: "log_store_disabled" } }]) {
     const later = S.fixture(source);
+    later.world.pageSize = 2;
     await S.start(later);
     for (let i = 0; i < 4; i += 1) {
       later.world.advance(60000);
