@@ -16,6 +16,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{on, MethodFilter, MethodRouter};
 use axum::Router;
 use credential_enclave_protocol::encoding::wipe_json;
+use credential_enclave_protocol::keys::Role;
 use credential_enclave_protocol::{is_valid_name, limits, ProtocolError};
 use hyper::body::Body as HttpBody;
 use hyper_util::rt::{TokioIo, TokioTimer};
@@ -47,6 +48,9 @@ mod release;
 pub mod responses;
 mod revoke;
 mod status;
+mod vault;
+mod vault_handoff;
+mod vault_send;
 
 #[cfg(test)]
 pub(crate) use forward::ADMISSION_WAIT;
@@ -96,6 +100,9 @@ fn routes() -> Vec<Route> {
         route(Method::POST, "/v1/mail/read", mail::read),
         route(Method::POST, "/v1/mail/submit", mail::submit),
         route(Method::POST, "/v1/release", release::release),
+        route(Method::POST, "/v1/vault/store", vault::store),
+        route(Method::POST, "/v1/vault/handoff", vault_handoff::handoff),
+        route(Method::POST, "/v1/vault/send", vault_send::send),
         route(Method::POST, "/v1/close", close::close),
         route(Method::POST, "/v1/peer/export", peer::export),
         route(Method::POST, "/v1/peer/import", peer::import),
@@ -118,19 +125,84 @@ pub fn route_list() -> Vec<(Method, &'static str)> {
         .collect()
 }
 
-/// The router of every call. The handler of a call reads the body of its request under the
-/// time limit of the bytes of a body (`inbound_idle`, [`inbound::TimedBody`]).
+/// The role a call belongs to (enclave.md section 4). One node program runs in two roles, and
+/// a node answers the calls of its own role.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Of {
+    /// A call a node of either role answers, also before it took a role: `health`, `config`,
+    /// `attestation` and `close`. None of them reads or changes a delegation, a record or the
+    /// log of an account.
+    EitherRole,
+    /// A call of the delegation role: a call that reads or changes a delegation, a record or
+    /// the log of an account. A node without a role takes the delegation role with the first
+    /// such call, and a node of the forward role refuses it.
+    Delegation,
+    /// A call of the forward role: `vault/send`. Only a node that took the forward role from
+    /// its operator configuration answers it.
+    Forward,
+}
+
+/// The role the call of `path` belongs to. The calls of either role and the call of the
+/// forward role are named here. Every other call is a call of the delegation role, so a call
+/// that is added to the table of [`routes`] is one a node of the forward role refuses until
+/// this function says otherwise.
+fn role_of(path: &str) -> Of {
+    match path {
+        "/v1/health" | "/v1/config" | "/v1/attestation" | "/v1/close" => Of::EitherRole,
+        "/v1/vault/send" => Of::Forward,
+        _ => Of::Delegation,
+    }
+}
+
+/// The role rule of a call (enclave.md section 4), checked before the handler of the call
+/// reads anything of the request.
+///
+/// A call of the delegation role gives a node without a role the delegation role, and a node
+/// of the forward role refuses it with `not_allowed`: the calls that put a user key into a
+/// node (`messages`, `peer/import`) and the calls that open a record are all calls of the
+/// delegation role, so no call can make a node of the forward role hold a user key.
+fn admit(node: &Node, of: Of) -> Result<(), ApiError> {
+    match of {
+        Of::EitherRole => Ok(()),
+        Of::Delegation => match node.role.take(Role::Delegation) {
+            true => Ok(()),
+            false => Err(ApiError::with_message(
+                ProtocolError::NotAllowed,
+                "the node has the forward role and takes no call of the delegation role",
+            )),
+        },
+        Of::Forward => match node.role.get() {
+            Some(Role::Forward) => Ok(()),
+            _ => Err(ApiError::with_message(
+                ProtocolError::NotAllowed,
+                "the call is a call of the forward role, and the node has not that role",
+            )),
+        },
+    }
+}
+
+/// The router of every call. Each call passes the role rule of its path ([`admit`]) before
+/// its handler runs. The rule is part of the route of a call: a path that is not defined and
+/// a method a path does not accept pass no rule and give a node no role. The handler of a
+/// call reads the body of its request under the time limit of the bytes of a body
+/// (`inbound_idle`, [`inbound::TimedBody`]).
 pub fn router(node: Arc<Node>) -> Router {
     let mut router = Router::new();
     for (_, path, handler) in routes() {
-        let timed = middleware::from_fn_with_state(
+        let of = role_of(path);
+        let rule = middleware::from_fn_with_state(
             node.clone(),
-            |State(node): State<Arc<Node>>, request: Request, next: Next| async move {
-                next.run(inbound::timed(request, node.limits.inbound_idle))
-                    .await
+            move |State(node): State<Arc<Node>>, request: Request, next: Next| async move {
+                match admit(&node, of) {
+                    Ok(()) => {
+                        next.run(inbound::timed(request, node.limits.inbound_idle))
+                            .await
+                    }
+                    Err(refusal) => refusal.into_response(),
+                }
             },
         );
-        router = router.route(path, handler.route_layer(timed));
+        router = router.route(path, handler.route_layer(rule));
     }
     router
         .fallback(unknown_route)
@@ -521,6 +593,7 @@ fn missing(key: &str) -> ApiError {
         "after" => "after is missing or invalid",
         "nonce" => "nonce is missing or invalid",
         "record" => "record is missing or invalid",
+        "request" => "request is missing or invalid",
         "previous" => "previous is missing or invalid",
         "context" => "context is missing or invalid",
         "provider" => "provider is missing or invalid",
@@ -537,6 +610,13 @@ fn missing(key: &str) -> ApiError {
         "code" => "code is missing or invalid",
         "field" => "field is missing or invalid",
         "origin" => "origin is missing or invalid",
+        "seal_to" => "seal_to is invalid: base64url of an X25519 public key of 32 bytes",
+        "kind" => "kind is invalid: vault_secret or vault_password",
+        "name" => "name is missing or invalid",
+        "site" => "site is missing or invalid",
+        "sites" => "sites is missing or invalid",
+        "slots" => "slots is missing or invalid",
+        "value" => "value is missing or invalid",
         "method" => "method is missing or invalid",
         "url" => "url is missing or invalid",
         "headers" => "headers is missing or invalid",
@@ -545,6 +625,7 @@ fn missing(key: &str) -> ApiError {
         "requests" => "requests is missing or invalid: 1 to 100 request objects",
         "body_bytes" => "body_bytes of the requests do not add up to the payload",
         "endpoint" => "endpoint is missing or invalid",
+        "role" => "role is invalid: the one role a configuration names is forward",
         "cursor" => "cursor is missing or invalid",
         "limit" => "limit is missing or invalid",
         "subset" => {

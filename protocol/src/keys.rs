@@ -237,20 +237,94 @@ pub struct Binding {
     /// The log store of the node. A node without one writes no `log` key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log: Option<LogStoreId>,
+    /// The role of the node: `reserve` or `forward`. A node of the delegation role writes no
+    /// `role` key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 /// `binding` = `UTF-8(JSON {"v":1,"sign":b64u(node signing public key),
 /// "seal":b64u(node sealing public key),"release":<release>})`, and for a node with a log store
 /// the key `"log":{"bucket":"...","region":"..."}` after them. The platform attestation carries
-/// these bytes as its user data.
+/// these bytes as its user data. This is the binding of a node of the delegation role: it has
+/// no `role` key.
 pub fn binding(keys: &NodeKeys, release: &str, log: Option<&LogStoreId>) -> Vec<u8> {
+    role_binding(keys, release, log, Role::Delegation)
+}
+
+/// The binding of a node of `role`: the keys of [`binding`], and behind them the key `role`
+/// when the role is one a binding names ([`Role::binding_value`]).
+pub fn role_binding(
+    keys: &NodeKeys,
+    release: &str,
+    log: Option<&LogStoreId>,
+    role: Role,
+) -> Vec<u8> {
     to_json(&Binding {
         v: 1,
         sign: b64u(&keys.sign_public()),
         seal: b64u(&keys.seal_public()),
         release: release.to_string(),
         log: log.cloned(),
+        role: role.binding_value().map(str::to_string),
     })
+}
+
+/// The role of a node, as its binding states it (protocol.md 4.1). A node takes its role
+/// once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Role {
+    /// The node holds the delegations of accounts: user keys, and with them every record. It
+    /// connects to the addresses of its provider definitions and to its log store only.
+    Delegation,
+    /// The node holds the delegations of accounts as well, and gives and takes delegation
+    /// transfers: its binding names the role `reserve`. A node that hands a delegation on
+    /// tells such a node from a node of the forward role by that value.
+    Reserve,
+    /// The node holds no delegation and opens no record. It takes one vault value at a time,
+    /// sealed to it by a node of the delegation role together with the one request the value
+    /// is for, and sends that request to the host the request names (protocol.md 10.5).
+    Forward,
+}
+
+impl Role {
+    /// The value of the key `role` of a binding: `reserve` for the reserve role, `forward` for
+    /// the forward role. A node of the delegation role writes no such key.
+    pub const fn binding_value(self) -> Option<&'static str> {
+        match self {
+            Role::Delegation => None,
+            Role::Reserve => Some("reserve"),
+            Role::Forward => Some("forward"),
+        }
+    }
+
+    /// The role a binding states with its key `role`: the delegation role without the key, the
+    /// reserve role with the value `reserve`, the forward role with the value `forward`. Any
+    /// other value names no role this release knows.
+    pub fn of_binding(value: Option<&str>) -> Option<Role> {
+        match value {
+            None => Some(Role::Delegation),
+            Some("reserve") => Some(Role::Reserve),
+            Some("forward") => Some(Role::Forward),
+            Some(_) => None,
+        }
+    }
+
+    /// True for a role under which a node holds delegations: a node hands a delegation to a
+    /// node of such a role, and to no other node (protocol.md 10.1).
+    pub const fn holds_delegations(self) -> bool {
+        match self {
+            Role::Delegation | Role::Reserve => true,
+            Role::Forward => false,
+        }
+    }
+}
+
+/// The binding of a node of the forward role: the keys of [`binding`] and `"role":"forward"`
+/// after the release. A node of the forward role writes no log entry and has no log store, so
+/// its binding has no `log` key.
+pub fn forward_binding(keys: &NodeKeys, release: &str) -> Vec<u8> {
+    role_binding(keys, release, None, Role::Forward)
 }
 
 #[cfg(test)]
@@ -471,5 +545,48 @@ mod tests {
             None
         );
         assert_eq!(store(&"b".repeat(63)).shard_of(hash), None);
+    }
+
+    #[test]
+    fn the_binding_of_the_forward_role_names_the_role_and_no_log_store() {
+        let keys = NodeKeys::from_random(&[1u8; 32], &[2u8; 32]);
+        let bytes = forward_binding(&keys, "v1.0.0");
+        assert_eq!(
+            String::from_utf8(bytes.clone()).unwrap(),
+            format!(
+                "{{\"v\":1,\"sign\":\"{}\",\"seal\":\"{}\",\"release\":\"v1.0.0\",\"role\":\"forward\"}}",
+                b64u(&keys.sign_public()),
+                b64u(&keys.seal_public())
+            )
+        );
+        assert!(bytes.len() <= limits::BINDING_BYTES);
+        let read: Binding = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(read.role.as_deref(), Some("forward"));
+        assert_eq!(read.log, None);
+        // The binding of a node of the delegation role has no such key.
+        let delegation: Binding = serde_json::from_slice(&binding(&keys, "v1.0.0", None)).unwrap();
+        assert_eq!(delegation.role, None);
+
+        assert_eq!(Role::Delegation.binding_value(), None);
+        assert_eq!(Role::Reserve.binding_value(), Some("reserve"));
+        assert_eq!(Role::Forward.binding_value(), Some("forward"));
+        assert_eq!(Role::of_binding(None), Some(Role::Delegation));
+        assert_eq!(Role::of_binding(Some("reserve")), Some(Role::Reserve));
+        assert_eq!(Role::of_binding(Some("forward")), Some(Role::Forward));
+        // A binding names the reserve role behind its log store.
+        let log = LogStoreId::parse("log-bucket", "us-west-2").unwrap();
+        let reserve: Binding =
+            serde_json::from_slice(&role_binding(&keys, "v1.0.0", Some(&log), Role::Reserve))
+                .unwrap();
+        assert_eq!(
+            (reserve.role.as_deref(), reserve.log),
+            (Some("reserve"), Some(log))
+        );
+        // A node hands a delegation to a node that holds delegations, and to no other one.
+        assert!(Role::Delegation.holds_delegations() && Role::Reserve.holds_delegations());
+        assert!(!Role::Forward.holds_delegations());
+        for other in ["", "Forward", "delegation", "forward ", "witness"] {
+            assert_eq!(Role::of_binding(Some(other)), None, "{other:?}");
+        }
     }
 }

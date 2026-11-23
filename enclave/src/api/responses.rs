@@ -2,9 +2,9 @@
 //! `docs/egress-policy.md`).
 //!
 //! A response body is a value of a type that implements [`OperatorResponse`], and the functions
-//! that turn a value into a response ([`json_ok`], [`forward_frame`], the failure body of
-//! [`super::ApiError`]) take nothing else. The trait is implemented in this file only: its
-//! supertrait is private to it. So this file lists everything the operator domain can receive
+//! that turn a value into a response ([`json_ok`], [`forward_frame`], [`forward_stream`],
+//! [`send_stream`], the failure body of [`super::ApiError`]) take nothing else. The trait is
+//! implemented in this file only: its supertrait is private to it. So this file lists everything the operator domain can receive
 //! from a node. Adding a response type means changing this file.
 //!
 //! Every field carries the class of its value:
@@ -34,6 +34,7 @@ use axum::response::Response;
 use credential_enclave_protocol::encoding::{to_json, Signed};
 use credential_enclave_protocol::envelope::TransferEnvelope;
 use credential_enclave_protocol::record::Record;
+use credential_enclave_protocol::secret_use::SecretUseEnvelope;
 use hyper::body::{Body as HttpBody, Bytes, Frame, SizeHint};
 use serde::Serialize;
 use tokio::sync::OwnedSemaphorePermit;
@@ -42,7 +43,7 @@ use crate::frame;
 use crate::oauth::PublicFields;
 use crate::provider_response::CheckedResponse;
 use crate::state::GrantStatus;
-use crate::vault::ReleasedValue;
+use crate::vault::HandedOut;
 
 mod sealed {
     pub trait Sealed {}
@@ -75,6 +76,10 @@ operator_response!(
     ForwardMeta,
     ForwardBatchMeta,
     Released,
+    Stored,
+    HandedOff,
+    SendMeta,
+    StreamEnd,
     Closed,
     Exported,
     Imported,
@@ -320,6 +325,9 @@ pub struct Health<'a> {
     pub platform: &'a str,
     /// P
     pub custody: &'a str,
+    /// P: `forward` on a node of the forward role, null on every other node. The role came
+    /// with the operator configuration (E) and is a constant of the source.
+    pub role: Option<&'a str>,
     /// P: node clock.
     pub started_ms: u64,
     /// P: node clock.
@@ -502,7 +510,8 @@ pub struct ForwardMeta {
     log: Option<LogRef>,
 }
 
-/// The end record of a stream (the stream form of `POST /v1/forward`, enclave.md 5.8).
+/// The end record of a stream (the stream form of `POST /v1/forward`, enclave.md 5.8, and
+/// `POST /v1/vault/send`, enclave.md 5.16).
 #[derive(Serialize)]
 pub struct StreamEnd {
     /// P: true when every byte of the provider body was handed on.
@@ -545,8 +554,8 @@ pub enum StreamElement {
     End(Bytes),
 }
 
-/// The response body of the stream form of `forward`: the head, then what the task that reads
-/// the provider hands over, until the end record. A task that ended without an end record
+/// The response body of a stream (the stream form of `forward`, `vault/send`): the head, then
+/// what the task that reads the provider hands over, until the end record. A task that ended without an end record
 /// passed the time limit of the call while this body was not read: the body ends with the end
 /// record of that failure.
 struct StreamBody {
@@ -595,11 +604,22 @@ pub fn forward_stream(
     elements: tokio::sync::mpsc::Receiver<StreamElement>,
     late: StreamEnd,
 ) -> Response {
-    let head = frame::encode_head(&ForwardMeta {
+    let meta = ForwardMeta {
         status,
         headers,
         log,
-    });
+    };
+    stream_response(&meta, elements, late)
+}
+
+/// The 200 response that is a stream: `meta` as the head, then what `elements` hands over,
+/// until the end record. `late` is the end record of a call whose task ended without one.
+fn stream_response<T: OperatorResponse>(
+    meta: &T,
+    elements: tokio::sync::mpsc::Receiver<StreamElement>,
+    late: StreamEnd,
+) -> Response {
+    let head = frame::encode_head(meta);
     let body = StreamBody {
         head: Some(Bytes::from(head)),
         elements,
@@ -650,8 +670,33 @@ pub enum BatchResult {
 /// `POST /v1/release`.
 #[derive(Serialize)]
 pub struct Released {
-    /// V
-    pub value: ReleasedValue,
+    /// V: the value under the key `value`, or, for a call that named a key to seal it to,
+    /// the value under the seal of that key under the key `sealed`. The caller chose the key:
+    /// a sealed value is a value the operator domain reads.
+    #[serde(flatten)]
+    pub handed_out: HandedOut,
+    /// P
+    pub log: LogRef,
+}
+
+/// `POST /v1/vault/store`.
+#[derive(Serialize)]
+pub struct Stored {
+    /// C: encrypted under the user key. Its plaintext holds the value and, for a record of
+    /// kind `vault_secret`, the name, the sites and the slots the call gave (E), and the
+    /// source `operator` (P). Its `id` and its nonce are node randomness (P).
+    pub record: Record,
+    /// P
+    pub log: LogRef,
+}
+
+/// `POST /v1/vault/handoff`.
+#[derive(Serialize)]
+pub struct HandedOff {
+    /// C: one use of a vault secret, the value and the request it is for, sealed to the
+    /// sealing key of the verified node of the forward role (sink K8). `from` and `to` are the
+    /// identifiers of the two nodes (P).
+    pub envelope: SecretUseEnvelope,
     /// P
     pub log: LogRef,
 }
@@ -834,6 +879,28 @@ pub fn forward_batch_frame(results: Vec<BatchResult>, budget: OwnedSemaphorePerm
     parts.push(Bytes::from(head));
     parts.extend(bodies);
     frame_response(parts, budget)
+}
+
+/// The meta of a `POST /v1/vault/send` response: the head of the response of the host.
+#[derive(Serialize)]
+pub struct SendMeta {
+    /// R
+    status: u16,
+    /// R
+    headers: Vec<(String, String)>,
+}
+
+/// The 200 response of `vault/send` (enclave.md 5.16), a stream: the head of a response of
+/// the host whose headers passed the checks of rule E4, and the parts of the body as
+/// `elements` hands them over. `late` is the end record of a call whose task ended without
+/// one.
+pub fn send_stream(
+    status: u16,
+    headers: Vec<(String, String)>,
+    elements: tokio::sync::mpsc::Receiver<StreamElement>,
+    late: StreamEnd,
+) -> Response {
+    stream_response(&SendMeta { status, headers }, elements, late)
 }
 
 fn frame_response(parts: Vec<Bytes>, budget: OwnedSemaphorePermit) -> Response {

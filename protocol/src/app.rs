@@ -346,7 +346,7 @@ pub struct NodeFacts {
     /// PCR0, PCR1 and PCR2 of the enclave the document was made in. `None` on the local
     /// platform, whose document states no measurement and proves nothing.
     pub pcrs: Option<[[u8; 48]; 3]>,
-    /// The binding of the node: its two public keys, its release and its log store.
+    /// The binding of the node: its two public keys, its release, its log store and its role.
     pub binding: NodeBinding,
     /// The time of the document of the platform, in Unix epoch milliseconds.
     pub time_ms: u64,

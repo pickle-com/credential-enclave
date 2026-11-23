@@ -19,6 +19,11 @@ pub enum UseMode {
     /// The node hands the value to the caller, after the log entry of that release is on the
     /// chain.
     Release,
+    /// The record says it itself: its plaintext lists the slots its value may be put into
+    /// ([`crate::vault_secret`]). A record with the slot `field` is released. A record with
+    /// slots of a request is used inside a node of the forward role, and no call hands its
+    /// value out.
+    BySlot,
 }
 
 /// The kinds of a record (protocol.md section 6). The kind is part of the AAD of a record, so
@@ -30,15 +35,21 @@ pub enum UseMode {
 /// | --- | --- | --- | --- |
 /// | `oauth` | the node, from the response of a token address | enclave-use | `forward`, `refresh`, `revoke-token`, `oauth/merge` |
 /// | `oauth_imported` | the device of the account, from a token the operator domain held before it used this node | enclave-use | `forward`, `refresh`, `revoke-token` |
-/// | `vault_password` | the device of the account | release | `release` (field `password`) |
+/// | `vault_password` | the device of the account, or a node from a value its caller gave (`vault/store`) | release | `release` (field `password`) |
 /// | `vault_totp` | the device of the account | enclave-use (the seed stays, the code leaves) | `release` (field `totp`) |
 /// | `vault_card` | the device of the account | release | `release` (fields `card_number`, `card_cvc`) |
+/// | `vault_secret` | the device of the account, or a node from a value its caller gave (`vault/store`) | by the slots of the record | `release` (field `value`, for a record with the slot `field`), `vault/handoff` (for a record with slots of a request) |
 ///
-/// No call takes a plaintext from the caller and makes a record of it. A node creates a
-/// record of kind `oauth` from a token response it received itself, and writes an existing
-/// record of kind `oauth` or `oauth_imported` again after a refresh, under the same kind.
-/// The token of an `oauth_imported` record was known to the operator domain before the
-/// device encrypted it: such a record does not say that its token never left a node.
+/// No call takes a token from the caller and makes a record of it. A node creates a record
+/// of kind `oauth` from a token response it received itself, and writes an existing record of
+/// kind `oauth` or `oauth_imported` again after a refresh, under the same kind. The token of
+/// an `oauth_imported` record was known to the operator domain before the device encrypted
+/// it: such a record does not say that its token never left a node.
+///
+/// One call takes a value from the caller and makes a record of it: `vault/store`, for the
+/// kinds `vault_secret` and `vault_password`. The plaintext of that record says so
+/// (`"source":"operator"`), and a node writes no other source: a record a node made of a value
+/// of its caller is told apart from a record the device of the account made.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
     Oauth,
@@ -47,17 +58,19 @@ pub enum Kind {
     VaultPassword,
     VaultTotp,
     VaultCard,
+    VaultSecret,
 }
 
 impl Kind {
     /// Every kind.
-    pub const ALL: [Kind; 6] = [
+    pub const ALL: [Kind; 7] = [
         Kind::Oauth,
         Kind::OauthImported,
         Kind::AppPassword,
         Kind::VaultPassword,
         Kind::VaultTotp,
         Kind::VaultCard,
+        Kind::VaultSecret,
     ];
 
     /// The name the protocol writes.
@@ -69,6 +82,7 @@ impl Kind {
             Kind::VaultPassword => "vault_password",
             Kind::VaultTotp => "vault_totp",
             Kind::VaultCard => "vault_card",
+            Kind::VaultSecret => "vault_secret",
         }
     }
 
@@ -84,6 +98,7 @@ impl Kind {
                 UseMode::EnclaveUse
             }
             Kind::VaultPassword | Kind::VaultCard => UseMode::Release,
+            Kind::VaultSecret => UseMode::BySlot,
         }
     }
 }
@@ -493,6 +508,7 @@ mod tests {
             (Kind::VaultPassword, "vault_password", UseMode::Release),
             (Kind::VaultTotp, "vault_totp", UseMode::EnclaveUse),
             (Kind::VaultCard, "vault_card", UseMode::Release),
+            (Kind::VaultSecret, "vault_secret", UseMode::BySlot),
         ];
         assert_eq!(table.len(), Kind::ALL.len());
         for (kind, name, use_mode) in table {
@@ -500,7 +516,15 @@ mod tests {
             assert_eq!(Kind::parse(name), Some(kind));
             assert_eq!(kind.use_mode(), use_mode);
         }
-        for other in ["", "oauth_operator", "api_key", "OAuth", "oauth ", "vault"] {
+        for other in [
+            "",
+            "oauth_operator",
+            "api_key",
+            "OAuth",
+            "oauth ",
+            "vault",
+            "secret",
+        ] {
             assert_eq!(Kind::parse(other), None, "{other:?}");
         }
     }

@@ -34,7 +34,7 @@ async fn health_reports_the_node_in_the_key_order_of_5_1() {
     let prefix = format!(
         concat!(
             "{{\"node\":\"{}\",\"release\":\"v0.0.0-test\",\"platform\":\"local\",",
-            "\"custody\":\"operator\",\"started_ms\":{},\"time_ms\":{},",
+            "\"custody\":\"operator\",\"role\":null,\"started_ms\":{},\"time_ms\":{},",
             "\"configured\":false,\"closing\":false,\"accounts\":0,\"grants\":0,",
             "\"mail_providers\":[\"naver_mail\"],\"log_store\":null,",
             "\"log\":{{\"entries\":0,\"events\":0,\"writes\":0,\"write_failures\":0,",
@@ -449,6 +449,9 @@ async fn the_router_serves_the_calls_of_the_route_list_and_no_other() {
             "POST /v1/mail/read",
             "POST /v1/mail/submit",
             "POST /v1/release",
+            "POST /v1/vault/store",
+            "POST /v1/vault/handoff",
+            "POST /v1/vault/send",
             "POST /v1/close",
             "POST /v1/peer/export",
             "POST /v1/peer/import",

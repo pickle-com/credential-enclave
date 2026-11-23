@@ -21,7 +21,11 @@ mod mail;
 mod oauth;
 mod peer;
 mod records;
+mod roles;
 mod surface;
+mod vault;
+mod vault_handoff;
+mod vault_send;
 
 /// The seven counts of the `log` object of health that a test of the log can fix: the entries,
 /// the events, the writes, the failed writes, the open batches and the two counts of the
