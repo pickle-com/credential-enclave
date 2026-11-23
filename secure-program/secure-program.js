@@ -159,6 +159,9 @@
   // makes an item and the request that stores its value leaves the name here, and the next
   // runtime removes the item while it holds no value (removeMadeSecrets).
   const STORE_VAULT_MADE = "vault.made";
+  // The mark that this device published state.named_secrets true for the account (the answer of
+  // the account query said that the vault items with a name are on).
+  const STORE_VAULT_NAMED = "vault.named";
   const VAULT_MADE_NAMES = 8;
   // The key of the device store that marks the sealing check as done for this device and account: a
   // query of the pending values (GET /api/secure/sealing) that found none, or an upload that left none.
@@ -1015,16 +1018,20 @@
    *  a credential, and a binding whose role is reserve the binding of a node that holds
    *  delegations and hands them on but takes no such call: both receive a grant. A binding with
    *  any other role (forward: a node that holds no delegation, receives no command and writes no
-   *  entry; a role this program does not know) is refused. When logStore is true the binding must
-   *  name the log store of this server target. Returns {signPk, sealPk, release}. */
-  function readBinding(bindingBytes, logStore) {
+   *  entry; a role this program does not know) is refused, unless anyRole is set: the target of a
+   *  revoke is read whatever its role, since a revoke hands no key over. When logStore is true
+   *  the binding must name the log store of this server target. Returns {signPk, sealPk, release,
+   *  role} (role: the role of the binding, undefined when it has none). */
+  function readBinding(bindingBytes, logStore, anyRole) {
     if (bindingBytes.length > 512) throw attestationFailure("binding size");
     const binding = JSON.parse(text(bindingBytes));
     if (binding === null || typeof binding !== "object" || binding.v !== 1 ||
         typeof binding.release !== "string" || binding.release === "") {
       throw attestationFailure("binding shape");
     }
-    if (binding.role !== undefined && binding.role !== "reserve") throw attestationFailure("binding role");
+    if (anyRole !== true && binding.role !== undefined && binding.role !== "reserve") {
+      throw attestationFailure("binding role");
+    }
     const signPk = decode(binding.sign);
     const sealPk = decode(binding.seal);
     if (signPk.length !== 32 || sealPk.length !== 32) throw attestationFailure("binding keys");
@@ -1039,7 +1046,7 @@
         throw attestationFailure("log store");
       }
     }
-    return { signPk: signPk, sealPk: sealPk, release: binding.release };
+    return { signPk: signPk, sealPk: sealPk, release: binding.release, role: binding.role };
   }
 
   /** Verifies one attestation response of a node. nonce is the value sent with the request
@@ -1078,7 +1085,7 @@
       } else {
         throw attestationFailure("unknown platform");
       }
-      const binding = readBinding(verified.binding, verified.logStore === true);
+      const binding = readBinding(verified.binding, verified.logStore === true, gate === false);
       // The challenge statement: the signed value that this node issued the challenge of the
       // response in answer to the nonce of this request. The challenge is plaintext outside the
       // document, so without the statement the relay could hand the challenge of an earlier request
@@ -1099,7 +1106,7 @@
         node: encode(binding.signPk), signPk: encode(binding.signPk), sealPk: encode(binding.sealPk),
         release: binding.release, platform: response.platform,
         custody: response.platform === "nitro" ? "enclave" : "operator", timeMs: verified.timeMs,
-        measure: measure, listed: listed,
+        measure: measure, listed: listed, role: binding.role,
         format: response.platform === "nitro" ? (build === undefined ? 3 : logFormatOf(build.release))
           : logFormatOf(binding.release),
       };
@@ -1535,7 +1542,13 @@
    *  A failure of the transport is the failure transport. */
   async function request(turn, method, path, body, query, limitMs) {
     const sent = { method: method, path: path };
-    if (query) sent.query = query;
+    // Every request to a route under /api/secure/ names the version of the program that asks
+    // (the query program): what the backend answers a device may depend on the program the
+    // device runs (the nodes it lists, the node it names for a connection). A backend that does
+    // not know the query ignores it. No other request carries it.
+    const named = path.indexOf("/api/secure/") === 0
+      ? Object.assign({ program: String(VERSION) }, query === undefined || query === null ? {} : query) : query;
+    if (named) sent.query = named;
     if (body !== undefined && body !== null) sent.body = JSON.stringify(body);
     let pending = null;
     try {
@@ -4023,11 +4036,12 @@
     const requests = [];
     // The keys a request of this read named.
     const requested = new Set();
-    const ask = function (judged) {
+    const ask = function (judged, spare) {
       let wanted = [];
+      const most = Math.max(0, budget.bodies - spare) * LOG_BODY_KEYS;
       for (const item of items) {
         const parsed = item.parsed;
-        if (named.has(parsed.key) || wanted.length >= budget.bodies * LOG_BODY_KEYS || !judged(parsed.node)) continue;
+        if (named.has(parsed.key) || wanted.length >= most || !judged(parsed.node)) continue;
         named.add(parsed.key);
         wanted.push(item);
       }
@@ -4039,7 +4053,7 @@
         return a.tail < b.tail ? 1 : a.tail > b.tail ? -1 : 0;
       });
       wanted = wanted.map(function (item) { return item.parsed.key; });
-      for (let at = 0; at < wanted.length && budget.bodies > 0; at += LOG_BODY_KEYS) {
+      for (let at = 0; at < wanted.length && budget.bodies > spare; at += LOG_BODY_KEYS) {
         budget.bodies -= 1;
         const batch = wanted.slice(at, at + LOG_BODY_KEYS);
         for (const key of batch) requested.add(key);
@@ -4047,15 +4061,17 @@
       }
     };
     // The keys of the nodes this device has a judgement of go out with the request for the
-    // documents; the keys of the nodes those documents judged follow them.
-    ask(function (node) { return unknown.indexOf(node) < 0; });
+    // documents; the keys of the nodes those documents judged follow them. While a document is
+    // asked for, the first leave one request to the second: the entries of a node this read
+    // judges are read with it, however many keys of other nodes it has.
+    ask(function (node) { return unknown.indexOf(node) < 0; }, unknown.length > 0 ? 1 : 0);
     let left = new Map();
     try {
       left = await learning;
     } catch (thrown) {
       endedBy(thrown);
     }
-    if (ended === null) ask(function (node) { return nodeVerdict(log.grants, log.nodes, node) !== null; });
+    if (ended === null) ask(function (node) { return nodeVerdict(log.grants, log.nodes, node) !== null; }, 0);
     const bodies = new Map();
     // The keys of the requests that failed: their bodies are missing for that failure, not
     // because the read had more keys than its requests name.
@@ -4653,8 +4669,10 @@
   // response) of the last check that ended without one. Such a build does not judge by the word
   // of the backend: that word counts only until the check of the app that follows it has ended.
   let servedProgram = null;
-  // Whether this runtime reported that it is stale (once for a runtime).
+  // Whether this runtime reported that it is stale (once for a runtime), and the value of
+  // runtime.program_stale it published last (null: none yet).
   let staleTold = false;
+  let staleShown = null;
   // The nodes of a later release a stale runtime met in its grant step (kept for the runtime: a
   // stale runtime writes none of what the rounds judge by).
   const staleLater = new Set();
@@ -4690,7 +4708,7 @@
     servedProgram = {
       version: version, read_ms: now, claimed_ms: version > VERSION ? (running ? servedProgram.claimed_ms : now) : 0,
     };
-    if (staleRuntime()) tellStale();
+    noteStale();
   }
 
   /** What the app knows of the delivery of the program itself: {verified, settled_ms, failed_ms,
@@ -4766,6 +4784,21 @@
       now - servedProgram.read_ms <= SERVED_FRESH_MS;
   }
 
+  /** Publishes whether the runtime is stale (runtime.program_stale) when that changed since it
+   *  was published last, and reports a stale runtime once (tellStale). The screens of the app
+   *  read the value to tell the user that the app is loading a later program, and a build of the
+   *  app may take it as the occasion to load the program that waits. Returns whether the
+   *  runtime is stale. */
+  function noteStale() {
+    const stale = staleRuntime();
+    if (stale !== staleShown) {
+      staleShown = stale;
+      native.publish({ runtime: { program_stale: stale } });
+    }
+    if (stale) tellStale();
+    return stale;
+  }
+
   /** Reports once for a runtime that it is stale (the backend counts the devices that run a
    *  program behind the served one): a report of a round that is pending, with the first failed
    *  read program:stale and the version of this program. Nothing waits for the answer. */
@@ -4798,22 +4831,16 @@
     };
   }
 
-  /** The query that tells the backend the version of the program that asks (the backend chooses
-   *  by it the nodes it lists for this device), with the keys of more. */
-  function programQuery(more) {
-    return Object.assign({ program: String(VERSION) }, more === undefined ? {} : more);
-  }
-
   /** The account query. */
   function accountQuery(turn) {
-    return api(turn, "GET", ACCOUNT_PATH, null, programQuery());
+    return api(turn, "GET", ACCOUNT_PATH);
   }
 
   /** Asks the account query for what it says of the served program alone (a round that is
    *  about to judge). A request that fails leaves what the runtime knew. */
   async function readServed(turn) {
     try {
-      const answer = await request(turn, "GET", ACCOUNT_PATH, null, programQuery(), LOG_API_TIMEOUT_MS);
+      const answer = await request(turn, "GET", ACCOUNT_PATH, null, null, LOG_API_TIMEOUT_MS);
       if (answer.status === 200) learnServed(answer.json);
     } catch (error) {
       if (failureCode(error) === "cancelled" || !(turnLeft(turn) > 0)) throw error;
@@ -4874,10 +4901,7 @@
    *  state says so already. */
   function judgeKept() {
     try {
-      if (staleRuntime()) {
-        tellStale();
-        return;
-      }
+      if (noteStale()) return;
       const kept = storedObject(STORE_UNACCEPTED);
       const now = native.nowMs();
       let established = 0;
@@ -4969,7 +4993,7 @@
     if (lastAnswerMs >= startedMs - LOG_REACH_MS) return true;
     if (ask === false) return false;
     try {
-      const answer = await request(turn, "GET", ACCOUNT_PATH, null, programQuery(), LOG_API_TIMEOUT_MS);
+      const answer = await request(turn, "GET", ACCOUNT_PATH, null, null, LOG_API_TIMEOUT_MS);
       if (answer.status === 200) learnServed(answer.json);
       return true;
     } catch (error) {
@@ -5511,7 +5535,7 @@
    *  its promise gives its result. first and follow: runRound. */
   function startRound(keys, origin, extra, first, follow) {
     // A stale runtime starts no round.
-    if (staleRuntime()) return Promise.resolve(staleRound(undefined, { c: null, u: null }));
+    if (noteStale()) return Promise.resolve(staleRound(undefined, { c: null, u: null }));
     let settle = null;
     const flight = new Promise(function (resolve, reject) { settle = { resolve: resolve, reject: reject }; });
     const ended = function () {
@@ -7865,8 +7889,14 @@
           if (log.nodes[id] === undefined) log.nodes[id] = pageNodes[id];
         }
         const wanted = chosen.chosen.filter(function (parsed) { return !recovered.entries.has("3:" + parsed.tail); })
-          .slice(0, LOG_SCREEN_BODIES).map(function (parsed) { return { parsed: parsed, fresh: false, shown: true }; });
-        await readEntries(turn, keys, log, run, wanted, { documents: 1, bodies: 1 });
+          .map(function (parsed) { return { parsed: parsed, fresh: false, shown: true }; });
+        // The body requests of the page: as many as its keys fill, and one more for the keys of
+        // the nodes whose documents this read judges (those bodies are asked for after the
+        // documents: an entry of a node the runtime meets for the first time is read with its
+        // page, and not shown as unread).
+        await readEntries(turn, keys, log, run, wanted, {
+          documents: 1, bodies: Math.ceil(wanted.length / LOG_BODY_KEYS) + 1,
+        });
         for (const id of Object.keys(log.nodes)) pageNodes[id] = log.nodes[id];
       } catch (failure) {
         if (!isStoreFailure(failure) || !(turnLeft(turn) > 0)) throw failure;
@@ -7950,7 +7980,7 @@
    *  of the chains of format 1 and format 2 that belong on the page and into the window of the
    *  summary. The page and the tally are kept for the next opening. Returns {page, summary, log}. */
   async function readScreen(turn, keys, limit) {
-    if (staleRuntime()) return readStaleScreen(turn, keys, limit);
+    if (noteStale()) return readStaleScreen(turn, keys, limit);
     const began = native.nowMs();
     const cache = loadCache(keys);
     const since = summarySince(began);
@@ -8562,7 +8592,18 @@
     // The backend turns the vault items with a name on for an account. The value is what the
     // operator domain says, handed on to the screens as it is: no procedure of this program
     // acts on it.
-    if (body.named_secrets === true) native.publish({ runtime: { named_secrets: true } });
+    // The same value goes into the state, which the app keeps over its restarts (it keeps none
+    // of the runtime values), so that a screen names its items right before the first answer of
+    // a runtime. An answer that does not say true takes back a true this device published. An
+    // account that was never told true gets no such key in its state: the program remembers
+    // that it published true (STORE_VAULT_NAMED), and publishes false only then.
+    if (body.named_secrets === true) {
+      native.publish({ runtime: { named_secrets: true }, state: { named_secrets: true } });
+      if (native.storeGet(STORE_VAULT_NAMED) === null) native.storeSet(STORE_VAULT_NAMED, "1");
+    } else if (native.storeGet(STORE_VAULT_NAMED) !== null) {
+      native.publish({ state: { named_secrets: false } });
+      native.storeSet(STORE_VAULT_NAMED, null);
+    }
     const key = body.key;
     if (key === null) return null;
     if (key === undefined || typeof key !== "object" || typeof key.key_id !== "string" || key.key_id === "") {
@@ -8629,7 +8670,7 @@
    *  one). This program hands such a node no grant (an entry of a grant this program made there
    *  is one the programs before it cannot explain), and sends it the revokes. */
   async function fetchListed(turn) {
-    const listed = (await api(turn, "GET", GRANTS_PATH, null, programQuery())).json.nodes;
+    const listed = (await api(turn, "GET", GRANTS_PATH)).json.nodes;
     const out = [];
     for (const item of Array.isArray(listed) ? listed : []) {
       if (item === null || typeof item !== "object" || typeof item.node !== "string" || !NODE_ID.test(item.node)) continue;
@@ -8650,14 +8691,14 @@
   async function fetchOffered(turn, ids) {
     const nonce = native.randomBytes(32);
     if (ids === null) {
-      const nodes = (await api(turn, "GET", NODES_PATH, null, programQuery({ nonce: nonce }))).json.nodes;
+      const nodes = (await api(turn, "GET", NODES_PATH, null, { nonce: nonce })).json.nodes;
       return { nonce: nonce, nodes: Array.isArray(nodes) ? nodes : [] };
     }
     const requests = [];
     for (let at = 0; at < ids.length && requests.length < ATTESTATION_REQUESTS; at += ATTESTATION_NODES) {
-      requests.push(api(turn, "GET", NODES_PATH, null, programQuery({
+      requests.push(api(turn, "GET", NODES_PATH, null, {
         nonce: nonce, nodes: ids.slice(at, at + ATTESTATION_NODES).join(","),
-      })));
+      }));
     }
     const nodes = [];
     for (const answer of await Promise.all(requests)) {
@@ -8851,7 +8892,11 @@
     const confirmed = new Set();
     const results = await stage(offered.nodes.map(async function (response) {
       const target = verifyAttestation(response, offered.nonce, false);
-      await sendRevoke(turn, target, response.challenge, keys);
+      // A node whose binding has the role forward holds no delegation and takes no command:
+      // there is nothing to revoke on it. A node of any other role is sent the revoke, a role
+      // this program does not know among them (it hands such a node no grant, and a node of a
+      // later release that holds delegations takes the revoke as every node does).
+      if (target.role !== "forward") await sendRevoke(turn, target, response.challenge, keys);
       confirmed.add(target.node);
     }));
     let incomplete = false;
@@ -8918,6 +8963,13 @@
       if (delegationOff(step.ledger)) throw native.error("delegation_off", "delegation is turned off");
       if (step.grant.state === "none") {
         const refused = step.renewed.rejected + step.renewed.later > 0 && step.renewed.accepted.size === 0;
+        // In a stale runtime no listed node takes a grant of this program because the program
+        // is behind (every listed node is of a release it does not list, or the backend lists it
+        // none): the failure says so, and not that an attestation failed. The app loads the
+        // served program at its next start or return to the foreground.
+        if (step.renewed.accepted.size === 0 && noteStale()) {
+          throw native.error("program_stale", "a later program is served");
+        }
         throw native.error(refused ? "attestation_failed" : "grant_required", "no listed node holds a grant");
       }
       shareLedgerSoon(judged.keys);
@@ -10475,7 +10527,7 @@
     for (const key of [LEDGER_STORE_KEY, LEDGER_SHARE_STORE_KEY, SEALING_CHECK_STORE_KEY, STORE_GRANTS,
       STORE_CURSOR, STORE_RESUME, STORE_NODES, STORE_UNACCEPTED, STORE_BLOCKED, STORE_SAMPLE,
       STORE_MISSING, STORE_WITHHELD, STORE_RECOVERED, STORE_DENIED, STORE_LEGACY, STORE_ROUND, STORE_CACHE,
-      STORE_MIGRATED, STORE_OUTCOMES, STORE_VAULT_MADE].concat(RETIRED_STORE_KEYS)) {
+      STORE_MIGRATED, STORE_OUTCOMES, STORE_VAULT_MADE, STORE_VAULT_NAMED].concat(RETIRED_STORE_KEYS)) {
       native.storeSet(key, null);
     }
     outcomeState = null;
@@ -10712,10 +10764,13 @@
   }
 
   /** Whether a failure of a step of the transfer is one the next poll may get past: the transport,
-   *  a request that was not answered in time, a 5xx status. */
+   *  a request that was not answered in time, and an answer of the backend with a status of 500
+   *  to 599 or 429, whatever code its body names (the backend answers a dependency that is away
+   *  for a moment with a 503 that names it). */
   function transferRetryable(error) {
     const code = failureCode(error);
-    return code === "transport" || code === "timeout" || /^http_5/.test(code);
+    const status = failureStatus(error);
+    return code === "transport" || code === "timeout" || (status >= 500 && status <= 599) || status === 429;
   }
 
   /** The polling loop: advances one step on the line of the procedures a user starts at every

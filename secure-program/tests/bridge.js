@@ -869,6 +869,18 @@ class World {
       crypto.randomBytes(8).toString("hex");
   }
 
+  /** The node the backend names for a connection of the account: one that holds a grant of it.
+   *  A request that names the program that asks (the query program) is answered with a node of
+   *  the nodes that serve calls; a request that names none comes from a device that runs an
+   *  earlier program, and is answered with a node listed for its revokes alone (revokeOnly)
+   *  when one holds a grant. */
+  namedNode(query) {
+    const holders = this.offeredNodes().filter((candidate) => candidate.grants.has(this.userId));
+    const guard = holders.find((candidate) => candidate.revokeOnly === true);
+    const pool = holders.find((candidate) => candidate.revokeOnly !== true);
+    return query !== null && query !== undefined && query.program !== undefined ? (pool || guard) : (guard || pool);
+  }
+
   api(method, path, query, bodyText) {
     const json = (status, value) => ({ status: status, headers: {}, body: JSON.stringify(value), bodyBase64: null });
     const body = typeof bodyText === "string" && bodyText !== "" ? JSON.parse(bodyText) : null;
@@ -1092,7 +1104,7 @@ class World {
     }
     if (method === "POST" && path === "/api/secure/connections/begin") {
       // A node that holds the grant of the account states the authorization it began (8.2).
-      const node = this.offeredNodes().find((candidate) => candidate.grants.has(this.userId));
+      const node = this.namedNode(query);
       if (node === undefined) return json(409, { code: "grant_required" });
       const grant = node.grants.get(this.userId);
       const nodeState = b64u(crypto.randomBytes(16));
@@ -1105,6 +1117,20 @@ class World {
           v: 1, type: "oauth_begin", node: node.id, user_id: this.userId, key_id: grant.key_id,
           sign_pk: grant.sign_pk, provider: body.target, state: state,
           url_sha256: b64u(sha("sha256", utf8(url))), time_ms: this.now,
+        }),
+      });
+    }
+    if (method === "PUT" && path === "/api/secure/connections/naver_mail/app-password") {
+      const node = this.namedNode(query);
+      if (node === undefined) return json(409, { code: "grant_required" });
+      const grant = node.grants.get(this.userId);
+      const identity = "user@naver.com";
+      return json(200, {
+        node: node.id, connection_id: "connection-mail", identity: identity,
+        statement: signedValue(node.signSeed, "pickle.secure.v1.statement\n", {
+          v: 1, type: "app_password_verified", node: node.id, user_id: this.userId, key_id: grant.key_id,
+          sign_pk: grant.sign_pk, provider: "naver_mail", record_id: body.record.id, identity: identity,
+          ciphertext_sha256: b64u(sha("sha256", utf8(body.record.ct))), time_ms: this.now,
         }),
       });
     }
