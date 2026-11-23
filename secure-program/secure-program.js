@@ -117,7 +117,7 @@
   //                   {after, count, first_ms, last_ms}}} (the later pages of format 3, and the
   //                   listings of the chains of format 1 and format 2)
   //   log.legacy      the chains of format 1 and format 2: {nodes: {node: {seq, time_ms, until_ms,
-  //                   closed}}, waiting: {node: {until_ms, time_ms}}} (waiting: the receiving
+  //                   closed, read_ms}}, waiting: {node: {until_ms, time_ms}}} (waiting: the receiving
   //                   nodes of transfers whose documents this device has still to judge)
   //   log.round       the last round: {v, done_ms, tried_ms, last, told, state, unfinished}
   //                   (unfinished: the rounds in a row that had more to read than they read)
@@ -3255,7 +3255,8 @@
   // ---- The chains this device follows (log.legacy) ----
 
   /** The kept state of the chains of format 1 and format 2: {nodes: {node: {seq, time_ms,
-   *  until_ms, closed}}, waiting: {node: {until_ms, time_ms}}}. seq is the seq up to which the
+   *  until_ms, closed, read_ms}}, waiting: {node: {until_ms, time_ms}}} (read_ms: the time a
+   *  round last listed the chain). seq is the seq up to which the
    *  control entries of the chain were read (the verification point of the program before v43 for
    *  a node its ledger held), time_ms the time of the entry there (0 when it is not known),
    *  until_ms the latest time the node can hold a grant this device knows of, and closed whether
@@ -3271,7 +3272,7 @@
       if (!NODE_ID.test(id) || value === null || typeof value !== "object") continue;
       legacy.nodes[id] = {
         seq: whole(value.seq), time_ms: whole(value.time_ms), until_ms: whole(value.until_ms),
-        closed: value.closed === true,
+        closed: value.closed === true, read_ms: whole(value.read_ms),
       };
     }
     const waiting = kept.waiting !== null && typeof kept.waiting === "object" ? kept.waiting : {};
@@ -4024,7 +4025,7 @@
   function followChain(log, id, untilMs) {
     const kept = log.legacy.nodes[id];
     if (kept === undefined) {
-      log.legacy.nodes[id] = { seq: 0, time_ms: 0, until_ms: untilMs, closed: false };
+      log.legacy.nodes[id] = { seq: 0, time_ms: 0, until_ms: untilMs, closed: false, read_ms: 0 };
       return;
     }
     if (untilMs > kept.until_ms) {
@@ -4068,11 +4069,15 @@
     let open = Object.keys(legacy.nodes).filter(function (id) { return !legacy.nodes[id].closed; });
     const waited = Object.keys(legacy.waiting);
     if (open.length === 0 && waited.length === 0) return;
-    open.sort(function (x, y) { return legacy.nodes[y].until_ms - legacy.nodes[x].until_ms; });
+    // More open chains than a round follows: the chains listed longest ago come first (among
+    // them the ones whose grant ends last), so every chain is read within a few rounds.
+    open.sort(function (x, y) {
+      if (legacy.nodes[x].read_ms !== legacy.nodes[y].read_ms) return legacy.nodes[x].read_ms - legacy.nodes[y].read_ms;
+      return legacy.nodes[y].until_ms - legacy.nodes[x].until_ms;
+    });
     if (open.length > LEGACY_NODES) {
       open = open.slice(0, LEGACY_NODES);
       run.cut = true;
-      run.over = true;
     }
     // A control entry names one receiving node at most, and the nodes that wait are asked for
     // with the first pass: the entries of a round and the nodes that wait fit one request.
@@ -4113,6 +4118,7 @@
         }
         rememberKeys(id, entries);
         run.nodes.add(id);
+        legacy.nodes[id].read_ms = now;
         const seqs = Array.from(entries.keys()).sort(function (a, b) { return a - b; });
         const more = outcome.value.truncated && outcome.value.nextKeyMarker !== null;
         // The last seq of a listing page that goes on may have further object versions on the

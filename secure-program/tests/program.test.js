@@ -2745,6 +2745,24 @@ test("A3: a chain of format 2 whose listing goes on over pages that name few seq
   assert.deepEqual(walked, ["pending", "pending", "verified"]);
 });
 
+test("more open chains of format 2 than a round follows are all read within the rounds that follow: the chains listed longest ago come first", async () => {
+  const fx = S.fixture(source, { nodes: 0, legacy: 66 });
+  await S.start(fx);
+  const world = fx.world;
+  // The first round follows 64 chains, and is not complete.
+  const first = world.stored("log.legacy").nodes;
+  assert.equal(Object.keys(first).length, 66);
+  assert.equal(Object.keys(first).filter((id) => first[id].seq === 0).length, 2);
+  assert.equal(world.state.log.status, "pending");
+  // The next round begins with the two it left.
+  world.advance(2 * 60000);
+  await S.event(fx, "foreground");
+  const second = world.stored("log.legacy").nodes;
+  assert.equal(Object.keys(second).filter((id) => second[id].seq === 0).length, 0);
+  assert.equal(world.stored("log.round").unfinished, 0);
+  assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
+});
+
 test("what does not mark the log: an empty seq, a node that ended without a shutdown, an entry of another key", async () => {
   const fx = S.fixture(source);
   await S.start(fx);
