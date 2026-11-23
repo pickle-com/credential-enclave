@@ -621,7 +621,10 @@ class World {
     this.requests = [];
     // How often the program asked the bridge for the device (native.deviceInfo, a synchronous call).
     this.deviceInfoCalls = 0;
-    this.account = { key: null, keys: null };
+    // The account: its registered key, and what the backend says of the program it serves
+    // (servedProgram: the value of served_program_version in the answer of the account query;
+    // undefined for a backend that names none).
+    this.account = { key: null, keys: null, servedProgram: undefined };
     this.nodes = new Map();
     this.buckets = new Map();
     this.versionCounter = 0;
@@ -633,6 +636,10 @@ class World {
       platform: "ios", debug_build: false, locale: "en-US", sheets: false, securityStatus: false,
       ownerAuth: true, ownerAuths: [], prompts: [], presented: [], promptAnswer: null, webAuth: null,
       confirmations: false, confirmAnswer: true, confirmed: [],
+      // What the app knows of the delivery of the program itself (the bridge primitive
+      // programDelivery, in a build that has it): {verified, settled_ms, failed_ms,
+      // failed_status}, or a function that returns it. null: a build without the primitive.
+      delivery: null,
     };
     if (given.device) Object.assign(this.device, given.device);
     // The backend: which routes it has, and the faults of a fixture (see fault).
@@ -870,6 +877,7 @@ class World {
       const account = { user_id: this.userId, key: this.account.key === null ? null : { key_id: this.account.key.key_id } };
       // The backend names the vault items with a name only for an account it turned them on for.
       if (this.account.namedSecrets === true) account.named_secrets = true;
+      if (this.account.servedProgram !== undefined) account.served_program_version = this.account.servedProgram;
       return json(200, account);
     }
     if (method === "PUT" && path === "/api/secure/account/key") {
@@ -1239,8 +1247,8 @@ function keychainName(item) {
 /** The global native of one runtime on world: the functions of the bridge tables that the flows of
  *  the tests reach, and a stub that fails with invalid_argument for the ones they do not (the
  *  hardware key of the device, RSA). The functions a later build of the apps adds
- *  (securityStatus, promptSecret, presentSecret, confirmDestinations) exist only when the device
- *  of the world has them.
+ *  (securityStatus, promptSecret, presentSecret, confirmDestinations, programDelivery) exist only
+ *  when the device of the world has them.
  *  While world.bridgeOpen is false (the top-level evaluation) every call fails with cancelled. */
 function makeNative(world) {
   const device = world.device;
@@ -1376,6 +1384,12 @@ function makeNative(world) {
       if (!valid) return Promise.reject(new SecureError("invalid_argument", "presentSecret"));
       device.presented.push(JSON.parse(JSON.stringify(args)));
       return Promise.resolve(null);
+    };
+  }
+  if (device.delivery !== null && device.delivery !== undefined) {
+    functions.programDelivery = () => {
+      const value = typeof world.device.delivery === "function" ? world.device.delivery() : world.device.delivery;
+      return value === null || typeof value !== "object" ? value : Object.assign({}, value);
     };
   }
   if (device.confirmations) {

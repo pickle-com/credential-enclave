@@ -1323,7 +1323,7 @@ test("a read that ends because the app was suspended counts nothing: a round who
   assert.equal(world.stored("log.denied").pages.length, 1);
 });
 
-test("A1: a measurement that held the key marks the log at the next event of the app once the device first saw it a day ago, whatever the backend answers after that", async () => {
+test("A1: a measurement that held the key marks the log at an event of the app once the device first saw it a day ago and this runtime read within the hour that no later program is served, whatever the reads of the log answer: a runtime states nothing before it has read what is served", async () => {
   // Sends an event to the runtime and lets what needs no answer go on.
   const unanswered = (fx, name) => {
     Promise.resolve(fx.program.onEvent(name, {})).then(() => {}, () => {});
@@ -1343,17 +1343,27 @@ test("A1: a measurement that held the key marks the log at the next event of the
     assert.equal(world.state.log.status, "pending", name);
     assert.equal(world.state.log.newer_release_nodes, 1, name);
     const reports = world.reports.length;
-    // From here on no request of the device is answered. Within the day the log stays pending.
-    world.fault(() => true, "hang");
+    // From here on no read of the log is answered. Within the day the log stays pending.
+    world.fault((line) => line.indexOf("/api/secure/log/") >= 0, "hang");
     world.advance(HOUR_MS);
     if (name === "session_ready") S.load(fx);
     await unanswered(fx, name);
     assert.equal(world.state.log.status, "pending", name);
-    // A day after the device first saw the measurement, the event itself marks the log: no
-    // request was answered and no round ended (a new runtime judges from what the device kept).
+    // (The round that waits for its answers ends when its time has passed.)
+    await world.settle(3 * 60000);
+    assert.equal(world.state.log.status, "pending", name);
+    // A day after the device first saw the measurement. What this runtime read of the served
+    // program is a day old (a new runtime has read nothing): the event states nothing. The
+    // synchronization of that event reads that no later program is served.
     world.advance(25 * HOUR_MS);
     if (name === "session_ready") S.load(fx);
-    await unanswered(fx, name);
+    await unanswered(fx, name === "background" ? "foreground" : name);
+    assert.equal(world.state.log.status, "pending", name);
+    assert.ok(world.securityStatuses.every((told) => told.status !== "attention"), name);
+    // The next event, seconds later, marks the log itself: no read of the log was answered, and
+    // no round ended.
+    world.advance(5000);
+    await unanswered(fx, name === "session_ready" ? "foreground" : name);
     assert.equal(world.state.log.status, "attention", name);
     assert.equal(world.state.log.unknown_nodes, 1, name);
     const told = world.securityStatuses.slice(-1)[0];
@@ -1470,9 +1480,14 @@ test("a round ends its reading when the app goes to the background: it sends not
   assert.equal(world.state.log.newer_release_nodes, 1);
   assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
   assert.ok(world.securityStatuses.every((told) => told.status !== "attention"));
-  // A day later the next event of the app marks the log, however slowly the backend answers.
+  // A day later. The synchronization of the next event reads that no later program is served,
+  // and when the app leaves, the round that still waits for its answers judges: the
+  // measurement marks the log, however slowly the backend answers.
   world.advance(25 * HOUR_MS);
   Promise.resolve(fx.program.onEvent("foreground", {})).then(() => {}, () => {});
+  await world.settle(1000);
+  assert.equal(world.state.log.status, "pending");
+  fx.program.onEvent("background", {});
   await world.drain();
   assert.equal(world.state.log.status, "attention");
   assert.deepEqual(world.securityStatuses.slice(-1)[0].reasons, ["unlisted_release"]);
@@ -3964,6 +3979,292 @@ test("the chain of a node of an earlier release is closed once its grant ran out
   await nextDay(fx);
   assert.equal(world.sent("POST /api/secure/log/store/listings").length, listings);
   assert.equal(world.state.log.status, "verified");
+});
+
+// ---- The program the backend serves, and a runtime behind it ----
+
+/** What the program store holds of the values the rounds judge by, as stored: every value under
+ *  log. but the grants this device handed out (log.grants) and the kept screen (log.cache). */
+function judgedStores(world) {
+  const kept = {};
+  for (const key of Array.from(world.store.keys()).sort()) {
+    if (key.startsWith("log.") && key !== "log.grants" && key !== "log.cache") kept[key] = world.store.get(key);
+  }
+  return kept;
+}
+
+/** Has a node of a measurement no list of the program has take the key of the account over from
+ *  the node of the fixture, and write an entry. Returns the measurement. */
+function moveKeyToUnlisted(fx) {
+  const world = fx.world;
+  const other = bridge.randomMeasurement();
+  const receiver = world.addNode({ release: "v9.0.0", measurement: other, offered: false });
+  fx.nodes[0].record("c", [{
+    t: "grant_transferred_out", time_ms: world.now, to: receiver.id, release: "v9.0.0",
+    pcr0: other.pcr0, pcr1: other.pcr1, pcr2: other.pcr2,
+  }]);
+  world.advance(1000);
+  receiver.record("c", [{ t: "connection_created", time_ms: world.now, record_id: "r9", provider: "slack", scope: "" }]);
+  return other;
+}
+
+test("the requests for the account, for the nodes of the account and for their attestations name the version of the program", async () => {
+  const fx = S.fixture(source, { nodes: 2 });
+  await S.start(fx);
+  const world = fx.world;
+  world.advance(40 * DAY_MS);
+  await S.call(fx, "sync", {});
+  const asked = { "/api/secure/account": 0, "/api/secure/grants": 0, "/api/secure/nodes": 0 };
+  for (const request of world.requests) {
+    if ((request.method || "GET") !== "GET" || asked[request.path] === undefined) continue;
+    asked[request.path] += 1;
+    assert.equal(request.query.program, String(fx.version), request.path);
+  }
+  assert.ok(asked["/api/secure/account"] >= 2 && asked["/api/secure/grants"] >= 2 && asked["/api/secure/nodes"] >= 2);
+});
+
+test("a runtime that knows a later program is served judges nothing: a node of a release this program does not list that holds the key of the account marks nothing while the backend names a later version, over days and runtimes, nothing the rounds judge by is written, and the runtime reports once that it is stale", async () => {
+  const fx = S.fixture(source, { nodes: 1, legacy: 1, device: { securityStatus: true } });
+  await S.start(fx);
+  const world = fx.world;
+  for (let i = 0; i < 6; i += 1) {
+    world.advance(HOUR_MS);
+    fx.nodes[0].record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/messages/n" + i, "POST")]);
+    fx.legacy[0].record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/messages/l" + i, "GET")]);
+  }
+  // The next release is put out: a node of a measurement no list of this program has takes the
+  // key of the account over and writes an entry. This runtime read that its own program is the
+  // one served, so its round sees the measurement, and the log is pending for a day.
+  const other = moveKeyToUnlisted(fx);
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "pending");
+  assert.equal(world.state.log.newer_release_nodes, 1);
+  assert.equal(Object.values(world.stored("log.unaccepted"))[0].held, true);
+  // From here on the backend serves the next program, and lists a node of the new release.
+  world.account.servedProgram = fx.version + 1;
+  const listed = world.addNode({ release: "v9.0.0", measurement: other });
+  const kept = judgedStores(world);
+  const state = JSON.stringify(world.state.log);
+  const reports = world.reports.length;
+  const told = world.securityStatuses.length;
+  const refused = { status: 503, body: { detail: "log_store_unreachable" } };
+  const attested = () => world.sent("GET /api/secure/nodes")
+    .filter((request) => String(request.query.nodes || "").split(",").indexOf(listed.id) >= 0).length;
+  let runtimes = 0;
+  const unchanged = (label) => {
+    assert.equal(JSON.stringify(world.state.log), state, label);
+    assert.deepEqual(judgedStores(world), kept, label);
+    assert.equal(world.securityStatuses.length, told, label);
+    const sent = world.reports.slice(reports);
+    assert.equal(sent.length, runtimes, label);
+    assert.ok(sent.every((report) => report.status === "pending" && report.store_failure === "program:stale" &&
+      report.program_version === fx.version), label);
+  };
+  for (let day = 0; day < 5; day += 1) {
+    // A new runtime, more than a day after the device first saw the measurement: the event
+    // session_ready states nothing of what the device kept, and its synchronization learns that
+    // the runtime is stale.
+    world.advance(25 * HOUR_MS);
+    const before = attested();
+    await S.start(fx);
+    runtimes += 1;
+    // The events of the app, a synchronization the user asks for, and the screen with reads
+    // held back from it: its first page, a later page, a listing of a chain.
+    await S.event(fx, "foreground");
+    await S.event(fx, "push", { reason: "unknown" });
+    // The screen goes on reading the store: an entry a node wrote now is on its first page.
+    fx.nodes[0].record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/messages/s" + day, "POST")]);
+    const fresh = await S.call(fx, "read_log", { limit: 3 });
+    assert.equal(shownGroups(fresh.value).filter((group) => group.kind === "request")[0].requests[0].target.slice(-2), "s" + day);
+    world.fault("POST /api/secure/log/bodies", refused, 1);
+    const first = await S.call(fx, "read_log", { limit: 3 });
+    assert.equal(first.ok, true, "day " + day);
+    assert.equal(first.value.status, "pending", "day " + day);
+    world.fault("POST /api/secure/log/read", refused, 1);
+    await S.call(fx, "read_security_record", { limit: 3, before_ms: world.now - HOUR_MS });
+    world.fault("POST /api/secure/log/store/listings", refused, 1);
+    await S.call(fx, "read_log", { limit: 3 });
+    await S.call(fx, "sync", {});
+    await S.event(fx, "background");
+    await world.settle(1000);
+    unchanged("day " + day);
+    // The node of the new release was asked for its attestation once in the runtime, and
+    // holds no grant.
+    assert.equal(attested(), before + 1, "day " + day);
+    assert.equal(listed.grants.has(world.userId), false, "day " + day);
+    world.clearFaults();
+  }
+  // A runtime whose screen starts a round before the runtime has read what is served: the round
+  // reads, the synchronization learns that the runtime is stale, and the round judges nothing
+  // and writes nothing of what it read.
+  world.advance(25 * HOUR_MS);
+  S.load(fx);
+  const early = fx.program.procedures.read_log({ limit: 3 });
+  await world.run(fx.program.onEvent("session_ready", {}));
+  await world.run(early);
+  await world.settle(1000);
+  runtimes += 1;
+  unchanged("a round in flight");
+  // The backend names this program as the one it serves again: the round of the next
+  // synchronization judges, and the measurement, long past its day, marks the log.
+  world.account.servedProgram = fx.version;
+  world.advance(2 * 60000);
+  await S.event(fx, "foreground");
+  assert.equal(world.state.log.status, "attention");
+  assert.deepEqual(world.securityStatuses.slice(-1)[0].reasons, ["unlisted_release"]);
+  assert.equal(world.reports.slice(-1)[0].status, "attention");
+  // A round the screen starts two hours later, with no synchronization in between: what the
+  // runtime read of the served program is older than an hour, so the round asks for the account
+  // once before it judges, and the mark stays.
+  world.advance(2 * HOUR_MS);
+  const asked = world.sent("GET /api/secure/account").length;
+  const shown = await S.call(fx, "read_log", { limit: 3 });
+  assert.equal(shown.value.status, "attention");
+  assert.equal(world.state.log.status, "attention");
+  assert.equal(world.sent("GET /api/secure/account").length, asked + 1);
+});
+
+test("a backend that names no served program leaves a measurement no list has pending: nothing marks the log for it and no round counts as held back, and the rounds judge everything else as before", async () => {
+  for (const served of [null, "44", 44.5]) {
+    const label = String(served);
+    const fx = S.fixture(source, { served: served, device: { securityStatus: true } });
+    await S.start(fx);
+    const world = fx.world;
+    assert.equal(world.state.log.status, "verified", label);
+    moveKeyToUnlisted(fx);
+    const states = [];
+    for (let day = 0; day < 5; day += 1) {
+      const judged = judgedKeys(world);
+      world.advance(HOUR_MS);
+      fx.nodes[0].record("c", [{ t: "connection_created", time_ms: world.now, record_id: "d" + day, provider: "slack", scope: "" }]);
+      await nextDay(fx);
+      states.push(world.state.log.status + ":" + world.state.log.newer_release_nodes + ":" + world.state.log.unknown_nodes + ":" +
+        world.stored("log.blocked").count);
+      assert.ok(judgedKeys(world) > judged, label);
+    }
+    assert.deepEqual(states, ["pending:1:0:0", "pending:1:0:0", "pending:1:0:0", "pending:1:0:0", "pending:1:0:0"], label);
+    assert.ok(world.securityStatuses.every((told) => told.status !== "attention"), label);
+    assert.ok(world.reports.every((report) => report.status !== "attention" && report.store_failure !== "program:stale"), label);
+  }
+});
+
+test("a build that knows the delivery of the program itself judges by what the app verified: the word of the backend counts until the check of the app that follows it has ended, a measurement no list has marks the log once such a check ended after the device first saw it, and checks that fail on the side of the server are rounds held back", async () => {
+  const build = async (served) => {
+    const delivery = { verified: 0, settled_ms: 0, failed_ms: 0, failed_status: 0 };
+    const fx = S.fixture(source, { device: { securityStatus: true, delivery: delivery } });
+    delivery.verified = fx.version;
+    fx.world.account.servedProgram = served === "later" ? fx.version + 1 : fx.version;
+    await S.start(fx);
+    return { fx: fx, world: fx.world, delivery: delivery };
+  };
+  const stale = (world) => world.reports.filter((report) => report.store_failure === "program:stale").length;
+
+  // The backend names a later version from the start, and goes on naming it.
+  const lied = await build("later");
+  // The runtime began before a check of the app had ended: the word of the backend counts, and
+  // no round runs.
+  assert.equal(lied.world.reports.length, 1);
+  assert.equal(stale(lied.world), 1);
+  // The check of the app ends, with no later program. The word of the backend counts no more,
+  // however often it is said again: the round of the next synchronization runs.
+  lied.delivery.settled_ms = lied.world.now;
+  lied.world.advance(2 * 60000);
+  await S.event(lied.fx, "foreground");
+  assert.equal(lied.world.state.log.status, "verified");
+  moveKeyToUnlisted(lied.fx);
+  await nextDay(lied.fx);
+  assert.equal(lied.world.state.log.status, "pending");
+  assert.equal(lied.world.state.log.newer_release_nodes, 1);
+  // A day later, in a new runtime. The check the app made as it began ended with no later
+  // program, after the device first saw the measurement: the log is marked, by the event
+  // session_ready itself and by the round, whatever the backend names.
+  lied.world.advance(25 * HOUR_MS);
+  lied.delivery.settled_ms = lied.world.now;
+  lied.world.advance(30000);
+  S.load(lied.fx);
+  Promise.resolve(lied.fx.program.onEvent("session_ready", {})).then(() => {}, () => {});
+  assert.equal(lied.world.state.log.status, "attention");
+  await lied.world.settle(1000);
+  assert.equal(lied.world.state.log.status, "attention");
+  assert.deepEqual(lied.world.securityStatuses.slice(-1)[0].reasons, ["unlisted_release"]);
+  assert.equal(lied.world.reports.slice(-1)[0].status, "attention");
+  assert.equal(stale(lied.world), 1);
+
+  // The same backend, and the checks of the app fail on the side of the server from the day the
+  // key moved: the word of the backend does not keep the runtime from its rounds, and once the
+  // measurement is past its day, each round that cannot judge it is a round held back.
+  const held = await build("later");
+  held.delivery.settled_ms = held.world.now;
+  moveKeyToUnlisted(held.fx);
+  const states = [];
+  for (let day = 0; day < 5; day += 1) {
+    held.world.advance(25 * HOUR_MS);
+    held.delivery.failed_ms = held.world.now;
+    held.delivery.failed_status = 503;
+    await S.start(held.fx);
+    states.push(held.world.state.log.status + ":" + held.world.stored("log.blocked").count + ":" + held.world.state.log.store_failure);
+  }
+  assert.deepEqual(states, [
+    "pending:0:", "pending:1:delivery:503", "pending:2:delivery:503", "pending:3:delivery:503", "attention:4:delivery:503",
+  ]);
+  assert.deepEqual(held.world.securityStatuses.slice(-1)[0].reasons, ["verification_blocked"]);
+  assert.equal(held.world.state.log.unknown_nodes, 0);
+  // A check that ends with no later program: the count ends, and the measurement marks the log.
+  held.world.advance(2 * 60000);
+  held.delivery.settled_ms = held.world.now;
+  await S.event(held.fx, "foreground");
+  assert.deepEqual(held.world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  assert.deepEqual(held.world.securityStatuses.slice(-1)[0].reasons, ["unlisted_release"]);
+
+  // A check of the app that ended after the device first saw the measurement, within its day,
+  // and none since: the checks fail on the side of the server. A check older than an hour says
+  // nothing of what is served now, so each round past that day is a round held back as well.
+  const late = await build("same");
+  late.delivery.settled_ms = late.world.now;
+  moveKeyToUnlisted(late.fx);
+  await nextDay(late.fx);
+  late.delivery.settled_ms = late.world.now;
+  const waits = [];
+  for (let day = 0; day < 2; day += 1) {
+    late.world.advance(25 * HOUR_MS);
+    late.delivery.failed_ms = late.world.now;
+    late.delivery.failed_status = 500;
+    await S.event(late.fx, "foreground");
+    waits.push(late.world.state.log.status + ":" + late.world.stored("log.blocked").count + ":" + late.world.state.log.store_failure);
+  }
+  assert.deepEqual(waits, ["pending:1:delivery:500", "pending:2:delivery:500"]);
+
+  // A backend that names this program, and checks that fail without a response. While the
+  // backend answered nothing around the check, the device was without a network: the round is
+  // pending and counts nothing. When the backend answered other requests of the runtime around
+  // it, the check was held back.
+  const quiet = await build("same");
+  quiet.delivery.settled_ms = quiet.world.now;
+  moveKeyToUnlisted(quiet.fx);
+  await nextDay(quiet.fx);
+  const counts = [];
+  for (let day = 0; day < 2; day += 1) {
+    quiet.world.advance(25 * HOUR_MS);
+    quiet.delivery.failed_ms = quiet.world.now - 10 * 60000;
+    quiet.delivery.failed_status = 0;
+    await S.event(quiet.fx, "foreground");
+    counts.push(quiet.world.state.log.status + ":" + quiet.world.stored("log.blocked").count);
+  }
+  quiet.world.advance(25 * HOUR_MS);
+  quiet.delivery.failed_ms = quiet.world.now;
+  await S.event(quiet.fx, "foreground");
+  counts.push(quiet.world.state.log.status + ":" + quiet.world.stored("log.blocked").count + ":" + quiet.world.state.log.store_failure);
+  assert.deepEqual(counts, ["pending:0", "pending:0", "pending:1:delivery:silent"]);
+
+  // An installation that verified a later program is stale whatever the backend names: no round
+  // runs, and nothing is stated of what the device kept.
+  const ahead = await build("same");
+  assert.equal(ahead.world.state.log.status, "verified");
+  const rounds = ahead.world.reports.length;
+  ahead.delivery.verified = ahead.fx.version + 1;
+  await nextDay(ahead.fx);
+  assert.equal(ahead.world.reports.length, rounds + 1);
+  assert.equal(stale(ahead.world), 1);
 });
 
 // ---- The judgement the app is told ----

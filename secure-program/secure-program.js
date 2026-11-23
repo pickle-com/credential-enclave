@@ -196,6 +196,13 @@
   // takes a grant, and a runtime loads the served program at the next start or return to the
   // foreground.
   const LOG_RELEASE_GRACE_MS = 86400000;
+  // A measurement no list of this program has marks the log only for a runtime that knows that
+  // no later program is served: the age up to which a reading of the served version (or, in a
+  // build that knows it itself, the last check of the app for a new program) says so.
+  const SERVED_FRESH_MS = 3600000;
+  // The times of the answers of the backend a runtime keeps (one in ANSWER_TIME_STEP_MS).
+  const ANSWER_TIMES = 512;
+  const ANSWER_TIME_STEP_MS = 5000;
   // The reads the operator domain holds back mark the log when this many rounds in a row were
   // blocked and the first of them is this old.
   const LOG_BLOCKED_ROUNDS = 3;
@@ -377,6 +384,7 @@
   const LOG_OBJECTS_PATH = "/api/secure/log/store/objects";
   const GRANTS_PATH = "/api/secure/grants";
   const NODES_PATH = "/api/secure/nodes";
+  const ACCOUNT_PATH = "/api/secure/account";
   const OUTCOMES_PATH = "/api/secure/procedures/outcomes";
   const SYNC_REPORT_PATH = "/api/secure/sync/report";
   const VAULT_PATH = "/api/secure/vault";
@@ -1515,6 +1523,9 @@
   // The time the backend last answered a request of this runtime, with any status (0: never). A
   // round uses it to tell a request the operator domain held back from a device without a network.
   let lastAnswerMs = 0;
+  // The times of such answers, the latest last (noteAnswer): whether the backend answered a
+  // request of this runtime around a time is read from them.
+  const answerTimes = [];
 
   /** One request to a route of the backend (the account credential is carried). The values of
    *  query are strings. Returns {status, json, code}: json is the JSON object of the response body
@@ -1535,6 +1546,7 @@
     const limit = Number.isSafeInteger(limitMs) && limitMs > 0 ? limitMs : API_TIMEOUT_MS;
     const response = await limited(turn, pending, limit, method + " " + path);
     lastAnswerMs = native.nowMs();
+    noteAnswer(lastAnswerMs);
     let json = null;
     try {
       json = JSON.parse(response.body);
@@ -3732,6 +3744,7 @@
    *  kept value is read at the call and written in the same step: a round and a read of the
    *  screen may end in either order. */
   function saveWithheld(run) {
+    if (staleRuntime()) return;
     const kept = loadWithheld();
     const horizon = native.nowMs() - LOG_RETENTION_DAYS * DAY_MS;
     const keys = [];
@@ -4618,6 +4631,205 @@
     }
   }
 
+  // ---- The program the backend serves, and a runtime that is behind it ----
+  //
+  // A node of a release this program does not list may hold the key of the account for no other
+  // reason than that this program is no longer the one served: a later program lists that
+  // release, and this runtime has not loaded it. So a runtime that knows a later program is
+  // served judges nothing (a stale runtime: staleRuntime), and a measurement no list of this
+  // program has marks the log only for a runtime that knows no later program is served
+  // (releaseConfirmed).
+  //
+  // What the backend serves: the integer served_program_version of an answer of the account
+  // query. Every runtime learns it anew and keeps it in memory alone (servedProgram: {version,
+  // read_ms, claimed_ms}; null while no answer named a version, and after an answer that named
+  // none). claimed_ms is the time of the first of the answers in a row that named a version
+  // above VERSION (0 when the last answer did not).
+  //
+  // What the app knows itself, in a build with the bridge primitive programDelivery (a
+  // synchronous call): {verified, settled_ms, failed_ms, failed_status}, the highest version
+  // among the programs this installation verified, the time the last check of the app for a new
+  // program ended with an answer it processed, and the time and the HTTP status (0: no
+  // response) of the last check that ended without one. Such a build does not judge by the word
+  // of the backend: that word counts only until the check of the app that follows it has ended.
+  let servedProgram = null;
+  // Whether this runtime reported that it is stale (once for a runtime).
+  let staleTold = false;
+  // The nodes of a later release a stale runtime met in its grant step (kept for the runtime: a
+  // stale runtime writes none of what the rounds judge by).
+  const staleLater = new Set();
+
+  /** Notes the time of an answer of the backend (one in ANSWER_TIME_STEP_MS, the latest
+   *  ANSWER_TIMES of them). */
+  function noteAnswer(now) {
+    const last = answerTimes.length === 0 ? 0 : answerTimes[answerTimes.length - 1];
+    if (now < last) answerTimes.length = 0;
+    else if (answerTimes.length > 0 && now - last < ANSWER_TIME_STEP_MS) return;
+    answerTimes.push(now);
+    if (answerTimes.length > ANSWER_TIMES) answerTimes.shift();
+  }
+
+  /** Whether the backend answered a request of this runtime within LOG_REACH_MS of the time ms
+   *  (to within ANSWER_TIME_STEP_MS). */
+  function answeredAround(ms) {
+    return answerTimes.some(function (time) { return Math.abs(time - ms) <= LOG_REACH_MS; });
+  }
+
+  /** Reads what an answer of the account query says of the served program (body: the answer of
+   *  this account). An answer that names no integer leaves the served program unknown. */
+  function learnServed(body) {
+    if (body === null || typeof body !== "object") return;
+    if (typeof body.user_id === "string" && body.user_id !== "" && body.user_id !== userId()) return;
+    const version = body.served_program_version;
+    if (!Number.isSafeInteger(version) || version < 0) {
+      servedProgram = null;
+      return;
+    }
+    const now = native.nowMs();
+    const running = servedProgram !== null && servedProgram.claimed_ms > 0 && servedProgram.claimed_ms <= now;
+    servedProgram = {
+      version: version, read_ms: now, claimed_ms: version > VERSION ? (running ? servedProgram.claimed_ms : now) : 0,
+    };
+    if (staleRuntime()) tellStale();
+  }
+
+  /** What the app knows of the delivery of the program itself: {verified, settled_ms, failed_ms,
+   *  failed_status}, each a whole number (a value that is none counts as 0: nothing verified,
+   *  no check). null in a build without the bridge primitive programDelivery. */
+  function programDelivery() {
+    if (typeof native.programDelivery !== "function") return null;
+    let given = null;
+    try {
+      given = native.programDelivery();
+    } catch (error) {
+      if (failureCode(error) === "cancelled") throw error;
+      given = null;
+    }
+    const value = given !== null && typeof given === "object" ? given : {};
+    return {
+      verified: whole(value.verified), settled_ms: whole(value.settled_ms), failed_ms: whole(value.failed_ms),
+      failed_status: whole(value.failed_status),
+    };
+  }
+
+  /** Whether the last check of the app for a new program ended without an answer it processed,
+   *  for a reason on the side of the server: it ended after the last check that did end with
+   *  one, with a status of 400 or above, or without a response while the backend answered
+   *  another request of this runtime around that time. A check that failed with the network of
+   *  the device is none. */
+  function deliveryRefused(info) {
+    return info.failed_ms > info.settled_ms &&
+      (info.failed_status >= 400 || (info.failed_status === 0 && answeredAround(info.failed_ms)));
+  }
+
+  /** Whether this runtime knows that a later program than this one is served (a stale runtime).
+   *  In a build without programDelivery: the last answer of the account query named a version
+   *  above VERSION. In a build with it: this installation verified a later program, or the
+   *  backend names a later version and the check of the app that follows that word has not
+   *  ended. The word counts from the first of the answers in a row that named a later version
+   *  (claimed_ms), and the check that follows it has ended when a check ended with an answer the
+   *  app processed at or after that time (or within LOG_REACH_MS before it: a check that ended
+   *  as the runtime began), or when a check failed after it for a reason on the side of the
+   *  server. So a backend that keeps naming a later version does not keep a runtime from
+   *  judging, and neither does one that also keeps the app from its checks.
+   *
+   *  A stale runtime starts no round (startRound), states nothing of what the device kept
+   *  (judgeKept), writes none of the values the rounds judge by (saveWithheld, saveDenied,
+   *  saveRecovered, renewGrants), and publishes, tells and reports no judgement: what a program
+   *  that is behind reads of the nodes and formats of a later release is nothing the next
+   *  program is to judge by. It goes on handing its grants to the nodes of the releases it
+   *  lists, serving the procedures the user starts, and reading the log for the screen. */
+  function staleRuntime() {
+    const claimed = servedProgram !== null && servedProgram.version > VERSION;
+    const info = programDelivery();
+    if (info === null) return claimed;
+    if (info.verified > VERSION) return true;
+    if (!claimed) return false;
+    if (info.settled_ms + LOG_REACH_MS >= servedProgram.claimed_ms) return false;
+    return !(deliveryRefused(info) && info.failed_ms >= servedProgram.claimed_ms);
+  }
+
+  /** Whether this runtime knows that no later program is served, for a measurement no list of
+   *  this program has that the device first saw at firstMs (A1): only then does such a
+   *  measurement mark the log. In a build without programDelivery: this runtime read the served
+   *  version, it is not above VERSION, the read is not earlier than firstMs and not older than
+   *  SERVED_FRESH_MS. In a build with it: this installation verified no later program, and the
+   *  last check of the app that ended with an answer it processed is not earlier than firstMs
+   *  and not older than SERVED_FRESH_MS. */
+  function releaseConfirmed(firstMs, now) {
+    const info = programDelivery();
+    if (info !== null) {
+      return info.verified <= VERSION && info.settled_ms > 0 && info.settled_ms >= firstMs &&
+        now - info.settled_ms <= SERVED_FRESH_MS;
+    }
+    return servedProgram !== null && servedProgram.version <= VERSION && servedProgram.read_ms >= firstMs &&
+      now - servedProgram.read_ms <= SERVED_FRESH_MS;
+  }
+
+  /** Reports once for a runtime that it is stale (the backend counts the devices that run a
+   *  program behind the served one): a report of a round that is pending, with the first failed
+   *  read program:stale and the version of this program. Nothing waits for the answer. */
+  function tellStale() {
+    if (staleTold || accountClosed) return;
+    staleTold = true;
+    const body = {
+      status: "pending", store: "unreachable", nodes: 0, keys_checked: 0, bodies_fetched: 0, missing: 0, expired: 0,
+      unknown_nodes: 0, newer_release_nodes: 0, elapsed_ms: 0, program_version: VERSION,
+      store_failure: "program:stale", unknown_node_ids: [], unaccepted_releases: [], blocked_attempts: 0,
+      undocumented_nodes: 0, control_keys: 0,
+    };
+    settled(api(freeTurn(), "POST", LOG_REPORT_PATH, body, null, LOG_API_TIMEOUT_MS)).then(function (outcome) {
+      try {
+        if (!outcome.ok) native.log("stale report: " + failureCode(outcome.error));
+      } catch (error) {
+        // The bridge is closed.
+      }
+    });
+  }
+
+  /** The result of a round that did not run, or that did not judge, because the runtime is stale:
+   *  the state the device kept, and what the round read (run and pages; nothing for a round that
+   *  did not run). */
+  function staleRound(run, pages) {
+    tellStale();
+    return {
+      log: keptLogState(), pages: pages, entries: run === undefined ? new Map() : run.entries,
+      junk: run === undefined ? new Set() : run.junk, absent: false, report: noop,
+    };
+  }
+
+  /** The query that tells the backend the version of the program that asks (the backend chooses
+   *  by it the nodes it lists for this device), with the keys of more. */
+  function programQuery(more) {
+    return Object.assign({ program: String(VERSION) }, more === undefined ? {} : more);
+  }
+
+  /** The account query. */
+  function accountQuery(turn) {
+    return api(turn, "GET", ACCOUNT_PATH, null, programQuery());
+  }
+
+  /** Asks the account query for what it says of the served program alone (a round that is
+   *  about to judge). A request that fails leaves what the runtime knew. */
+  async function readServed(turn) {
+    try {
+      const answer = await request(turn, "GET", ACCOUNT_PATH, null, programQuery(), LOG_API_TIMEOUT_MS);
+      if (answer.status === 200) learnServed(answer.json);
+    } catch (error) {
+      if (failureCode(error) === "cancelled" || !(turnLeft(turn) > 0)) throw error;
+    }
+  }
+
+  /** Whether the device keeps a measurement no list of this program has that held the key of
+   *  the account and that it first saw LOG_RELEASE_GRACE_MS ago or longer. */
+  function heldPastGrace(unaccepted, now) {
+    return Object.keys(unaccepted).some(function (digest) {
+      const item = unaccepted[digest];
+      return item !== null && typeof item === "object" && item.held === true && buildOfMeasure(digest) === undefined &&
+        now - whole(item.first_ms) >= LOG_RELEASE_GRACE_MS;
+    });
+  }
+
   // ---- The state a round publishes ----
 
   // The state of the log as the last round left it (runtime lifetime; the device keeps it in
@@ -4651,14 +4863,21 @@
   }
 
   /** Judges, without a read, the measurements no list of this program has that this device kept
-   *  (A1): a measurement that held the key of this account and that the device first saw
-   *  LOG_RELEASE_GRACE_MS ago or longer marks the log now, at every event of the app, whatever
-   *  the rounds after it read or fail to read. A measurement a list of this program has is left
-   *  to the rounds, which forget it. (A receiving node whose document the device has not seen is
-   *  no measurement: it waits for its document, and no time marks the log for it.) The kept
-   *  state is published as attention and the app is told, unless the state says so already. */
+   *  (A1): a measurement that held the key of this account, that the device first saw
+   *  LOG_RELEASE_GRACE_MS ago or longer, and for which this runtime knows that no later program
+   *  is served (releaseConfirmed) marks the log now, at every event of the app, whatever the
+   *  rounds after it read or fail to read. So a new runtime states nothing before it has read
+   *  what is served, and a stale runtime states nothing at all. A measurement a list of this
+   *  program has is left to the rounds, which forget it. (A receiving node whose document the
+   *  device has not seen is no measurement: it waits for its document, and no time marks the
+   *  log for it.) The kept state is published as attention and the app is told, unless the
+   *  state says so already. */
   function judgeKept() {
     try {
+      if (staleRuntime()) {
+        tellStale();
+        return;
+      }
       const kept = storedObject(STORE_UNACCEPTED);
       const now = native.nowMs();
       let established = 0;
@@ -4667,7 +4886,7 @@
         if (item === null || typeof item !== "object" || item.held !== true) continue;
         if (buildOfMeasure(digest) !== undefined) continue;
         const first = whole(item.first_ms);
-        if (first > 0 && first <= now && now - first >= LOG_RELEASE_GRACE_MS) established += 1;
+        if (first > 0 && first <= now && now - first >= LOG_RELEASE_GRACE_MS && releaseConfirmed(first, now)) established += 1;
       }
       const before = keptLogState();
       if (established === 0 || before.status === "attention") return;
@@ -4750,7 +4969,8 @@
     if (lastAnswerMs >= startedMs - LOG_REACH_MS) return true;
     if (ask === false) return false;
     try {
-      await request(turn, "GET", "/api/secure/account", null, null, LOG_API_TIMEOUT_MS);
+      const answer = await request(turn, "GET", ACCOUNT_PATH, null, programQuery(), LOG_API_TIMEOUT_MS);
+      if (answer.status === 200) learnServed(answer.json);
       return true;
     } catch (error) {
       if (failureCode(error) === "cancelled" || !(turnLeft(turn) > 0)) throw error;
@@ -5071,6 +5291,21 @@
       }
     }
     const unreachable = !denied && (run.unreachable || run.silent);
+    // A measurement past its grace marks the log only for a runtime that read, not longer than
+    // SERVED_FRESH_MS ago, that no later program is served (releaseConfirmed). A round that
+    // holds such a measurement and no such reading asks for the account once: a round the
+    // screen started long after a synchronization read it.
+    if (!away && programDelivery() === null && heldPastGrace(log.unaccepted, now) &&
+        (servedProgram === null || now - servedProgram.read_ms > SERVED_FRESH_MS)) {
+      try {
+        await readServed(judging);
+      } catch (failure) {
+        ranOut(failure);
+      }
+    }
+    // A runtime that learned during the round that a later program is served judges nothing,
+    // and writes nothing of what the round read.
+    if (staleRuntime()) return staleRound(run, pages);
     // The rounds of a synchronization in a row that left reads undone because there was more to
     // read than a round reads. A round that read everything it had to read ends the row; a round
     // whose reads were held back, or that could not reach the store, leaves it as it is (a round
@@ -5088,9 +5323,12 @@
     const beyond = over && unfinished > LOG_UNFINISHED_ROUNDS;
     const overrun = beyond && first === true;
     if (beyond && run.detail === "") run.detail = "round:unfinished";
-    const blocked = denied || overrun;
+    let blocked = denied || overrun;
     let grace = 0;
     let established = 0;
+    // Whether a measurement past its grace waits because this runtime does not know that no
+    // later program is served.
+    let waiting = false;
     const releases = [];
     const heldNodes = [];
     for (const digest of Object.keys(log.unaccepted)) {
@@ -5111,13 +5349,30 @@
         if (age >= 30 * DAY_MS) delete log.unaccepted[digest];
         continue;
       }
-      if (within) grace += 1;
-      else established += 1;
+      // Past its grace, the measurement marks the log when this runtime knows that no later
+      // program is served. Otherwise it waits as within its grace: the round is not complete.
+      const stands = !within && releaseConfirmed(whole(item.first_ms), now);
+      if (stands) established += 1;
+      else grace += 1;
+      if (!within && !stands) waiting = true;
       const release = typeof item.release === "string" && item.release !== "" ? item.release.slice(0, 64) : "unknown";
       if (releases.indexOf(release) < 0) releases.push(release);
       if (item.held === true && NODE_ID.test(node) && heldNodes.indexOf(node) < 0) heldNodes.push(node);
     }
     const conflicts = Object.keys(log.nodes).filter(function (id) { return log.nodes[id].c !== 0; }).length;
+    // In a build that knows the delivery of the program itself: a measurement past its grace
+    // waits because no check of the app for a new program ended since the device first saw it,
+    // or within SERVED_FRESH_MS, and the last check failed for a reason on the side of the
+    // server (deliveryRefused). The operator domain keeps the app from learning what is served,
+    // and the round is one held back. A check that failed with the network of the device leaves
+    // the round pending.
+    if (waiting) {
+      const info = programDelivery();
+      if (info !== null && info.verified <= VERSION && deliveryRefused(info)) {
+        blocked = true;
+        if (run.detail === "") run.detail = "delivery:" + (info.failed_status === 0 ? "silent" : String(info.failed_status));
+      }
+    }
     if (blocked) {
       if (log.blocked.count === 0 || log.blocked.first_ms === 0 || log.blocked.first_ms > now) log.blocked.first_ms = now;
       log.blocked.count += 1;
@@ -5255,6 +5510,8 @@
    *  background ends (roundTurn); the round then ends within the same step of the runtime, and
    *  its promise gives its result. first and follow: runRound. */
   function startRound(keys, origin, extra, first, follow) {
+    // A stale runtime starts no round.
+    if (staleRuntime()) return Promise.resolve(staleRound(undefined, { c: null, u: null }));
     let settle = null;
     const flight = new Promise(function (resolve, reject) { settle = { resolve: resolve, reject: reject }; });
     const ended = function () {
@@ -6804,6 +7061,7 @@
    *  screen asked for or a listing page leaves, whichever was kept first. Nothing kept: no
    *  value. */
   function saveRecovered(keys, recovered) {
+    if (staleRuntime()) return;
     recovered.pages = recovered.pages.slice(-LOG_RECOVERED_PAGES);
     // The entries kept as parts of listing pages, with each kept page that names them.
     const paged = new Map();
@@ -7036,6 +7294,7 @@
    *  reads do not mark the log leaves before one whose reads do, and among those the chain
    *  whose last read is the oldest. Nothing noted: no value. */
   function saveDenied(denied) {
+    if (staleRuntime()) return;
     const now = native.nowMs();
     const ids = Object.keys(denied.chains);
     const rank = function (id) {
@@ -7691,6 +7950,7 @@
    *  of the chains of format 1 and format 2 that belong on the page and into the window of the
    *  summary. The page and the tally are kept for the next opening. Returns {page, summary, log}. */
   async function readScreen(turn, keys, limit) {
+    if (staleRuntime()) return readStaleScreen(turn, keys, limit);
     const began = native.nowMs();
     const cache = loadCache(keys);
     const since = summarySince(began);
@@ -7878,13 +8138,29 @@
     // of the screen, after this read, which does not wait for it.
     if (screenListings !== null) {
       if (held !== null && held.top === Infinity) keepListed(held);
-      if (loadDenied().pages.length > 0) {
+      if (loadDenied().pages.length > 0 && !staleRuntime()) {
         screenLine.run(freeTurn(), function () {
           return readDownToDenied(newTurn(PROCEDURE_LIMIT_MS, ""), keys);
         }).then(noop, noop);
       }
     }
     return { page: page, summary: summaryResult(tally, since, truncated), log: round.log };
+  }
+
+  /** The first page of the screen in a stale runtime: read as a later page
+   *  is read, without a round (the first pages of the two listings, the entries of the page, the
+   *  chains of format 1 and format 2), with the summary the device kept, marked as not complete.
+   *  Nothing the rounds judge by is written, and the state the device kept is returned as it
+   *  is. Returns {page, summary, log}. */
+  async function readStaleScreen(turn, keys, limit) {
+    tellStale();
+    const cache = loadCache(keys);
+    const since = summarySince(native.nowMs());
+    pruneSummary(cache.tally, since);
+    // The listings are read anew with every opening.
+    screenListings = null;
+    const page = await fillPage(turn, keys, cache, await readPage(turn, keys, cache, Infinity, limit), limit);
+    return { page: page, summary: summaryResult(cache.tally, since, true), log: keptLogState() };
   }
 
   /** The range {lo, hi} of the seqs of a chain whose entries the tally counted, when the tally
@@ -8271,7 +8547,7 @@
    *  runtime.named_secrets true (the screens of the app choose their names by it); any other
    *  response leaves what this runtime published. */
   async function registeredKeyId(turn, fetched) {
-    const body = (await (fetched === undefined ? api(turn, "GET", "/api/secure/account") : fetched)).json;
+    const body = (await (fetched === undefined ? accountQuery(turn) : fetched)).json;
     if (typeof body.user_id === "string" && body.user_id !== "" && body.user_id !== userId()) {
       accountMismatch = true;
       native.publish({
@@ -8281,6 +8557,8 @@
       throw native.error("account_mismatch", "server account differs from bound account");
     }
     accountMismatch = false;
+    // What the backend says of the program it serves (learnServed).
+    learnServed(body);
     // The backend turns the vault items with a name on for an account. The value is what the
     // operator domain says, handed on to the screens as it is: no procedure of this program
     // acts on it.
@@ -8346,7 +8624,7 @@
    *  nodes are there to delegate to; whether a node is handed a key is decided by its attestation
    *  alone (renewGrants), and when a grant was handed and when it ends is what this device kept. */
   async function fetchListed(turn) {
-    const listed = (await api(turn, "GET", GRANTS_PATH)).json.nodes;
+    const listed = (await api(turn, "GET", GRANTS_PATH, null, programQuery())).json.nodes;
     const out = [];
     for (const item of Array.isArray(listed) ? listed : []) {
       if (item === null || typeof item !== "object" || typeof item.node !== "string" || !NODE_ID.test(item.node)) continue;
@@ -8364,14 +8642,14 @@
   async function fetchOffered(turn, ids) {
     const nonce = native.randomBytes(32);
     if (ids === null) {
-      const nodes = (await api(turn, "GET", NODES_PATH, null, { nonce: nonce })).json.nodes;
+      const nodes = (await api(turn, "GET", NODES_PATH, null, programQuery({ nonce: nonce }))).json.nodes;
       return { nonce: nonce, nodes: Array.isArray(nodes) ? nodes : [] };
     }
     const requests = [];
     for (let at = 0; at < ids.length && requests.length < ATTESTATION_REQUESTS; at += ATTESTATION_NODES) {
-      requests.push(api(turn, "GET", NODES_PATH, null, {
+      requests.push(api(turn, "GET", NODES_PATH, null, programQuery({
         nonce: nonce, nodes: ids.slice(at, at + ATTESTATION_NODES).join(","),
-      }));
+      })));
     }
     const nodes = [];
     for (const answer of await Promise.all(requests)) {
@@ -8418,6 +8696,7 @@
     };
     // A node an earlier synchronization of this program found to be of a later release.
     const laterKnown = function (id) {
+      if (staleLater.has(id)) return true;
       const kept = nodes[id];
       return kept !== undefined && kept.p === "nitro" && kept.m !== "" && buildOfMeasure(kept.m) === undefined;
     };
@@ -8465,6 +8744,12 @@
       if (!node.listed) {
         later += 1;
         native.log("attestation of a later release: " + node.release);
+        // A stale runtime keeps the node for its own time only: it writes none of what the
+        // rounds judge by (the time a measurement was first seen among it).
+        if (staleRuntime()) {
+          staleLater.add(node.node);
+          continue;
+        }
         nodes[node.node] = { m: node.measure, p: "nitro", r: node.release, f: now, c: 0 };
         if (unaccepted[node.measure] === undefined) {
           unaccepted[node.measure] = { first_ms: now, release: String(node.release).slice(0, 64), held: false, node: node.node };
@@ -8593,7 +8878,7 @@
    *  program). Returns {keys, ledger, grants}. */
   function withGrants(turn) {
     return grantLock.run(turn, async function () {
-      const account = api(turn, "GET", "/api/secure/account");
+      const account = accountQuery(turn);
       account.then(noop, noop);
       const held = readMasterKey() !== null;
       if (held && delegationOff(loadLedger())) {
@@ -8714,7 +8999,7 @@
   async function runSync(turn, trigger) {
     try {
       const step = await grantLock.run(turn, async function () {
-        const account = api(turn, "GET", "/api/secure/account");
+        const account = accountQuery(turn);
         account.then(noop, noop);
         const held = readMasterKey() !== null;
         const listed = held && !delegationOff(loadLedger()) ? settled(fetchListed(turn)) : null;
