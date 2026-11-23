@@ -9,14 +9,14 @@
 //! | --- | --- |
 //! | `release-key.pem` | the release key of the operator: the public key whose signature over the measurements of a later release a giving node asks for |
 //! | `rekor-key.pem` | the public key of the transparency log Rekor of `rekor.sigstore.dev`, a log of the form Rekor v1 |
-//! | `rekor-log2025-1-key.pem` | the public key of the transparency log `log2025-1.rekor.sigstore.dev`, a log of the form Rekor v2 |
 //! | `predecessors.json` | the releases whose nodes a receiving node takes delegations from, each with its measurement |
 //!
-//! The two log keys are the rows of the table of transparency logs ([`LOGS`]): a giving node
-//! asks for an entry of one of these logs that records the signature of the release key, with
-//! what the log returned to show that it holds the entry. The table is the transparency logs
-//! of the trusted root of the public instance of Sigstore at the time this source was written
-//! (protocol.md 10.3). A release adds the row of a further log.
+//! The log key is the row of the table of transparency logs ([`LOGS`]): a giving node asks
+//! for an entry of a log of the table that records the signature of the release key, with what
+//! the log returned to show that it holds the entry. A log has a row when the trusted root of
+//! the public instance of Sigstore names it and the monitor of this repository reads the
+//! entries of the release key in it (protocol.md 10.3). A release adds the row of a further
+//! log.
 //!
 //! A program whose release key, whose table or whose list of predecessors does not have its
 //! form does not start.
@@ -46,20 +46,14 @@ pub struct LogSource {
     pub key_pem: &'static str,
 }
 
-/// The table of transparency logs of this source: the two logs of the public instance of
-/// Sigstore.
-pub const LOGS: [LogSource; 2] = [
-    LogSource {
-        form: LogForm::RekorV1,
-        origin: "",
-        key_pem: include_str!("../release/rekor-key.pem"),
-    },
-    LogSource {
-        form: LogForm::RekorV2,
-        origin: "log2025-1.rekor.sigstore.dev",
-        key_pem: include_str!("../release/rekor-log2025-1-key.pem"),
-    },
-];
+/// The table of transparency logs of this source: `rekor.sigstore.dev`, the one log of the
+/// trusted root of the public instance of Sigstore whose entries of the release key the
+/// monitor of this repository reads.
+pub const LOGS: [LogSource; 1] = [LogSource {
+    form: LogForm::RekorV1,
+    origin: "",
+    key_pem: include_str!("../release/rekor-key.pem"),
+}];
 
 /// What a node knows about the other releases of its program.
 pub struct Lineage {
@@ -149,6 +143,15 @@ mod tests {
     const TRUSTED_ROOT: &str =
         include_str!("../../protocol/tests/fixtures/sigstore-trusted-root.json");
 
+    /// The log of the form Rekor v2 that the trusted root names, `log2025-1.rekor.sigstore.dev`.
+    /// The table of this source has no row for it: the log offers no search for the entries of
+    /// a key, and the monitor of this repository does not read it.
+    const LOG2025_1: LogSource = LogSource {
+        form: LogForm::RekorV2,
+        origin: "log2025-1.rekor.sigstore.dev",
+        key_pem: include_str!("../../protocol/tests/fixtures/rekor-log2025-1-key.pem"),
+    };
+
     fn refused(result: Result<Lineage, PlatformError>) -> bool {
         result.is_err()
     }
@@ -158,7 +161,7 @@ mod tests {
     }
 
     #[test]
-    fn the_release_key_of_this_source_is_a_p256_key_and_its_logs_are_the_two_of_sigstore() {
+    fn the_release_key_of_this_source_is_a_p256_key_and_its_log_is_rekor_of_sigstore() {
         // The release of this source is the version of the crate: its list of predecessors
         // is valid for that release.
         let release = concat!("v", env!("CARGO_PKG_VERSION"));
@@ -166,9 +169,8 @@ mod tests {
             Lineage::embedded(release).unwrap_or_else(|PlatformError(reason)| panic!("{reason}"));
         assert_eq!(lineage.release_key.len(), 91);
         assert_eq!(lineage.keys().release, &lineage.release_key[..]);
-        // The identifier of each log, as the log itself states it in every entry: the hash of
-        // the key for the form Rekor v1, the key ID of the checkpoint signatures for the form
-        // Rekor v2.
+        // The identifier of the log, as the log itself states it in every entry: the hash of
+        // its key.
         let logs: Vec<(LogForm, Option<&str>, String)> = lineage
             .keys()
             .logs
@@ -177,18 +179,11 @@ mod tests {
             .collect();
         assert_eq!(
             logs,
-            [
-                (
-                    LogForm::RekorV1,
-                    None,
-                    "c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d".to_string()
-                ),
-                (
-                    LogForm::RekorV2,
-                    Some("log2025-1.rekor.sigstore.dev"),
-                    "cf1199155bddd051268d1f16ac5c0c75c009f6fb5a63f4177f8e18d7051e3fa0".to_string()
-                ),
-            ]
+            [(
+                LogForm::RekorV1,
+                None,
+                "c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d".to_string()
+            )]
         );
         for predecessor in &lineage.predecessors {
             assert_ne!(predecessor.release, release);
@@ -245,14 +240,17 @@ mod tests {
     }
 
     #[test]
-    fn the_table_of_logs_is_the_transparency_logs_of_the_trusted_root_of_sigstore() {
-        // Every transparency log the trusted root names has a row with its key, and the
-        // identifier of that row is the log identifier the trusted root states. A trusted root
-        // that names a further log fails this test until the table has its row, and the table
-        // has no row beyond the logs of the trusted root.
+    fn the_table_of_logs_is_the_transparency_logs_of_the_trusted_root_that_the_monitor_reads() {
+        // Every transparency log the trusted root names is a row of the table or the one log
+        // the monitor does not read, with its key, and the identifier of a row of its form is
+        // the log identifier the trusted root states. A trusted root that names a further log
+        // fails this test until the log has a row or is stated here as a log without one, and
+        // the table has no row beyond the logs of the trusted root.
         let root: serde_json::Value = serde_json::from_str(TRUSTED_ROOT).unwrap();
         let tlogs = root["tlogs"].as_array().unwrap();
-        assert_eq!(tlogs.len(), LOGS.len());
+        let known: Vec<&LogSource> = LOGS.iter().chain([&LOG2025_1]).collect();
+        assert_eq!(tlogs.len(), known.len());
+        let mut without_a_row = Vec::new();
         for tlog in tlogs {
             let address = tlog["baseUrl"].as_str().unwrap();
             let key = STANDARD
@@ -261,10 +259,13 @@ mod tests {
             let stated = STANDARD
                 .decode(tlog["logId"]["keyId"].as_str().unwrap())
                 .unwrap();
-            let source = LOGS
+            let source = known
                 .iter()
                 .find(|source| public_key_der(source.key_pem).as_deref() == Some(&key[..]))
-                .unwrap_or_else(|| panic!("{address}: the table has no row with the key"));
+                .unwrap_or_else(|| panic!("{address}: no row and no stated log has the key"));
+            if LOGS.iter().all(|row| row.key_pem != source.key_pem) {
+                without_a_row.push(address);
+            }
             let (form, origin) = match tlog["publicKey"]["keyDetails"].as_str().unwrap() {
                 "PKIX_ECDSA_P256_SHA_256" => (LogForm::RekorV1, ""),
                 // The origin of a log of the form Rekor v2 is its address without the scheme.
@@ -279,6 +280,7 @@ mod tests {
             .unwrap();
             assert_eq!(log.id(), hex(&stated), "{address}");
         }
+        assert_eq!(without_a_row, ["https://log2025-1.rekor.sigstore.dev"]);
     }
 
     #[test]
@@ -295,12 +297,12 @@ mod tests {
             .unwrap_or_else(|PlatformError(reason)| panic!("{reason}"));
         assert_eq!(lineage.predecessors.len(), 1);
         assert_eq!(lineage.predecessors[0].release, "v1.0.0");
-        assert_eq!(lineage.keys().logs.len(), 2);
+        assert_eq!(lineage.keys().logs.len(), 1);
         assert!(!refused(read(RELEASE_KEY_PEM, "[]", "dev")));
 
         // A release key that is not a PEM public key, or not a P-256 key.
-        let [p256, ed25519] = LOGS.map(|source| source.key_pem);
-        let origin = LOGS[1].origin;
+        let [p256] = LOGS.map(|source| source.key_pem);
+        let (origin, ed25519) = (LOG2025_1.origin, LOG2025_1.key_pem);
         for key in ["", "not a key", ed25519] {
             assert!(refused(read(key, "[]", "v1.1.0")), "{key}");
         }

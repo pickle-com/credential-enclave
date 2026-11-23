@@ -1452,14 +1452,21 @@ of the log and what its log identifier is.
 | Rekor v1 | ECDSA P-256, as the DER of its SubjectPublicKeyInfo (91 bytes). The log identifier is the lower-case hexadecimal SHA-256 of that DER | The time at which it took the entry, the index of the entry and the signed entry timestamp: its signature over the entry with that time and that index | A `hashedrekord` of version 0.0.1 |
 | Rekor v2 (a tiled log, c2sp.org/tlog-tiles) | Ed25519, as the DER of its SubjectPublicKeyInfo (44 bytes: 12 bytes in front of the 32 bytes of the key), and the origin of the log: the first line of its checkpoints and the name of its key on them. The log identifier is the lower-case hexadecimal SHA-256 of the UTF-8 bytes of the origin, the byte 0x0A, the byte 0x01 and the 32 bytes of the key: the key ID of the signature of the log on a checkpoint (c2sp.org/signed-note) before it is cut to four bytes | The index of the entry and its inclusion proof: the audit path from the entry to the root of a tree, and a checkpoint, the note of the head of that tree with the signature of the log. The log states no time for the entry and signs no single entry | A `hashedrekord` of version 0.0.2 |
 
-The table of this release has two rows, the transparency logs of the trusted root of the public
-instance of Sigstore (`targets/trusted_root.json` of the repository `sigstore/root-signing`, which
-the TUF repository of Sigstore distributes) as of 2026-11-23:
+A log has a row when the trusted root of the public instance of Sigstore names it
+(`targets/trusted_root.json` of the repository `sigstore/root-signing`, which the TUF repository
+of Sigstore distributes) and the monitor of this repository reads the entries of the release key
+in it (enclave.md 11.2). The table of this release has one row:
 
 | Log | Form | Log identifier |
 | --- | --- | --- |
 | `rekor.sigstore.dev` | Rekor v1 | `c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d` |
-| `log2025-1.rekor.sigstore.dev` (this text is its origin) | Rekor v2 | `cf1199155bddd051268d1f16ac5c0c75c009f6fb5a63f4177f8e18d7051e3fa0` |
+
+As of 2026-11-23 that trusted root names a second log, `log2025-1.rekor.sigstore.dev` (this text
+is its origin), of the form Rekor v2, with the log identifier
+`cf1199155bddd051268d1f16ac5c0c75c009f6fb5a63f4177f8e18d7051e3fa0`. It has no row: the log offers
+no search for the entries of a key, and the monitor does not read it. A node of this release
+refuses an entry of that log at check 2. The tests of this repository verify a real entry of it
+with the code of its form.
 
 A node does not start with a table that has no row, with a row whose key is not a key of the form
 of the row (for the form Rekor v2: also a key that is no point of the curve or a point of small
@@ -1614,13 +1621,14 @@ any other form is not a release tag and has no place in the order.
 - A statement counts only with its entry in a public log of the table. A release that received
   delegations under this section has its statement hash, signed by the release key, in a log from
   which no entry is removed.
-- Who reads the two logs. `rekor.sigstore.dev` answers a search by public key, and the monitor of
-  this repository reads every entry of the release key in it and compares it with the releases
-  (enclave.md 11.2). `log2025-1.rekor.sigstore.dev` has no search: an entry of the release key in
-  it is found by reading the entries of the log from its tiles, and the monitor of this
-  repository does not read that log. What tells an account that its key went to a release it
-  does not accept is its own log (the item on the entry `grant_transferred_out` below), which
-  rests on no monitor.
+- Who reads the log. `rekor.sigstore.dev` answers a search by public key, and the monitor of this
+  repository reads every entry of the release key in it and compares it with the releases
+  (enclave.md 11.2). So every endorsement a node of this release accepts is an entry the monitor
+  reads. A log of the form Rekor v2 has no search: an entry of the release key in it is found by
+  reading the entries of the log from its tiles. Such a log gets a row in a release whose
+  monitor reads it in that way. What tells an account that its key went to a release it does not
+  accept is its own log (the item on the entry `grant_transferred_out` below), which rests on no
+  monitor.
 - A node sends no request to a log. The entry and what the log returned with it are bytes of the
   call, and the verdict depends on them, on the values compiled into the node and, for the time
   of an entry of a log of the form Rekor v1, on the clock of the node.
@@ -1633,16 +1641,16 @@ any other form is not a release tag and has no place in the order.
 - A node verifies an entry of a log of its table and of no other log. An entry that a log holds
   stays valid after the log stopped taking entries, but the endorsement of a release that is
   built later needs a log that still takes entries. So the endorsement of a release is recorded
-  in a log that the table of every release in service has. Sigstore, the operator of the two
-  logs of this table, has stated that it replaces a log of the form Rekor v2 by a log with
-  another key and another origin about every six months, and that it will announce the end of
-  the uploads to `rekor.sigstore.dev` one year ahead (the documentation of Rekor v2 and the
-  announcement of its general availability, as of 2026-11-23). When the trusted root of Sigstore
-  names a log that the tables in service do not have, a release whose table has that log is
-  built and endorsed while a log of the tables in service still takes entries. When no log of
-  the table of a node takes entries any more, that node hands no delegation to a release that is
-  endorsed after that, and the nodes of that release receive their delegations from the apps
-  (10.1).
+  in a log that the table of every release in service has. Sigstore, the operator of
+  `rekor.sigstore.dev`, has stated that it will announce the end of the uploads to that log one
+  year ahead, and that it replaces a log of the form Rekor v2 by a log with another key and
+  another origin about every six months (the announcement of the general availability of Rekor
+  v2 and its documentation, as of 2026-11-23). When Sigstore announces the end of the uploads
+  to a log of the tables in service, a release whose table has a log that goes on taking
+  entries, and whose monitor reads that log, is built and endorsed while a log of the tables in
+  service still takes entries. When no log of the table of a node takes entries any more, that
+  node hands no delegation to a release that is endorsed after that, and the nodes of that
+  release receive their delegations from the apps (10.1).
 - An endorsement is a public value and has no end: a node of an earlier release accepts it for as
   long as that node runs. The age of the entry is looked at in check 5 only.
 - The account sees the transfer on its log: the entry `grant_transferred_out` of the giving node
@@ -1651,9 +1659,9 @@ any other form is not a release tag and has no place in the order.
   measurement on the entry is the one the giving node verified: the values of the statement the
   release key signed, which the attestation document of the receiving node states (check 7). A
   giving node of a release before v2.4.0 names the receiving node only.
-- The releases before v2.4.0 hold one log, `rekor.sigstore.dev`, and read the keys of an entry of
-  the form Rekor v1 alone. The endorsement of a release that such a node hands delegations to is
-  recorded in that log.
+- The releases before v2.4.0 hold the key of `rekor.sigstore.dev` and no table, and read the keys
+  of an entry of the form Rekor v1 alone. The endorsement of a release that such a node hands
+  delegations to is recorded in that log.
 
 ### 10.4 The delegation subset
 

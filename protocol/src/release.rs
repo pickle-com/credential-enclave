@@ -1934,10 +1934,9 @@ mod tests {
         assert_eq!(read_predecessors(twice.as_bytes(), "v1.1.0"), None);
     }
 
-    /// The public key of the transparency log `log2025-1.rekor.sigstore.dev`, as the node
-    /// program holds it.
-    const REKOR_LOG2025_1_KEY_PEM: &str =
-        include_str!("../../enclave/release/rekor-log2025-1-key.pem");
+    /// The public key of the transparency log `log2025-1.rekor.sigstore.dev`, as the trusted
+    /// root of the public instance of Sigstore states it.
+    const REKOR_LOG2025_1_KEY_PEM: &str = include_str!("../tests/fixtures/rekor-log2025-1-key.pem");
     /// The entry of that log with the index 200,000,163, in the form of the `entry` of an
     /// endorsement, with its inclusion proof.
     const REKOR_LOG2025_1_ENTRY: &str =

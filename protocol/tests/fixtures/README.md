@@ -88,10 +88,10 @@ document states, not at the time of the machine.
   release key has) and `inclusion_proof` with `log_index`, `hashes` (the audit path of the
   entry in a tree of 212,315,329 leaves, 28 hashes in lower-case hexadecimal) and `checkpoint`
   (the note of that tree head with the signature of the log and the signatures of four
-  witnesses). The tests verify the checkpoint and the audit path with the key of that log in
-  the node program (`enclave/release/rekor-log2025-1-key.pem`): this fixes, against a real
-  entry, the hash of the leaf of an entry, the bytes the log signs for a tree head, the key ID
-  of its signature and the form of the body.
+  witnesses). The tests verify the checkpoint and the audit path with the key of that log
+  (`rekor-log2025-1-key.pem` below): this fixes, against a real entry, the hash of the leaf
+  of an entry, the bytes the log signs for a tree head, the key ID of its signature and the
+  form of the body.
 - Origin: read from the log on 2026-11-23 by the read addresses of a tiled log
   (c2sp.org/tlog-tiles): `GET https://log2025-1.rekor.sigstore.dev/api/v2/checkpoint` for the
   checkpoint, the entry bundle `api/v2/tile/entries/x781/250` for the body (its entry 163),
@@ -103,6 +103,20 @@ document states, not at the time of the machine.
 - License: the entry is a public record of the log. The file is under the license of this
   repository (Apache License 2.0).
 - SHA-256: `f73aa39da77b5bc1257a0640bf1f2a3abb326a02132c3658763aad73391c81a8`
+
+## `rekor-log2025-1-key.pem`
+
+- What it is: the public key of the transparency log log2025-1.rekor.sigstore.dev (Ed25519, a
+  SubjectPublicKeyInfo in PEM), a log of the form Rekor v2. No program holds it: the table of
+  transparency logs of the node program has no row for that log, which the monitor of this
+  repository does not read (protocol.md 10.3). The tests of the form Rekor v2 verify a real
+  entry of the log with it, and the tests of `enclave/src/lineage.rs` compare it with the
+  trusted root below.
+- Origin: the `publicKey.rawBytes` of the transparency log `https://log2025-1.rekor.sigstore.dev`
+  of `sigstore-trusted-root.json` below, in PEM.
+- License: a public key is a public value. The file is under the license of this repository
+  (Apache License 2.0).
+- SHA-256: `8510d81fd7fc7d8a6dd1f2c6ebeade515b79baa6137aa9c02fc97f8509becd75`
 
 ## `sigstore-trusted-root.json`
 
