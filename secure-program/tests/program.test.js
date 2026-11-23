@@ -3981,6 +3981,70 @@ test("the chain of a node of an earlier release is closed once its grant ran out
   assert.equal(world.state.log.status, "verified");
 });
 
+test("a node the backend lists for its revokes alone is handed no grant and asked for no attestation, changes nothing of the state of the grants, and takes the revoke when the user turns the delegation off or shortens the lifetime of a grant", async () => {
+  const fx = S.fixture(source, { nodes: 1, legacy: 1 });
+  const world = fx.world;
+  const guard = fx.legacy[0];
+  // A node of an earlier release outside the nodes that serve calls. Another device of the
+  // account handed it a grant, and the backend lists it for this account as revoke_only.
+  const hand = () => guard.grants.set(world.userId, {
+    sign_pk: b64u(fx.keys.signPk), log_pk: b64u(fx.keys.logPk), key_id: fx.keys.keyId, custody: "enclave",
+    not_after_ms: world.now + 20 * DAY_MS,
+  });
+  guard.revokeOnly = true;
+  hand();
+  const attested = () => world.sent("GET /api/secure/nodes")
+    .filter((request) => request.query.nodes === undefined || String(request.query.nodes).split(",").indexOf(guard.id) >= 0).length;
+  await S.start(fx);
+  assert.equal(world.state.grant.state, "active");
+  assert.deepEqual(guard.commands, []);
+  assert.equal(attested(), 0);
+  assert.equal(fx.nodes[0].commands.filter((command) => command.type === "grant").length, 1);
+  // The grants are renewed over the weeks, and a push says that a grant is required: nothing
+  // goes to that node, and the ledger of the earlier programs does not name it.
+  for (let week = 0; week < 6; week += 1) {
+    world.advance(7 * DAY_MS);
+    await S.event(fx, "push", { reason: "grant_required" });
+    assert.equal(world.state.grant.state, "active", "week " + week);
+  }
+  assert.deepEqual(guard.commands, []);
+  assert.equal(attested(), 0);
+  assert.equal(JSON.stringify(readLedger(fx)).indexOf(guard.id), -1);
+  assert.equal(world.stored("log.grants")[guard.id], undefined);
+  assert.ok(fx.nodes[0].commands.filter((command) => command.type === "grant").length >= 3);
+  // The user shortens the lifetime: the grant that node holds is of the lifetime before, and
+  // the revoke goes to it (with the attestation a revoke needs). The other node takes a grant of
+  // the new lifetime.
+  const shorter = await S.call(fx, "set_grant_days", { days: 7 });
+  assert.equal(shorter.value.days, 7);
+  assert.deepEqual(guard.commands.map((command) => command.type), ["revoke"]);
+  assert.equal(guard.grants.has(world.userId), false);
+  assert.equal(attested(), 1);
+  assert.equal(world.state.grant.state, "active");
+  // The other device hands that node its grant again. A longer lifetime sends that node nothing.
+  hand();
+  assert.equal((await S.call(fx, "set_grant_days", { days: 14 })).value.days, 14);
+  assert.deepEqual(guard.commands.map((command) => command.type), ["revoke"]);
+  assert.equal(attested(), 1);
+  // A revoke that node does not confirm leaves the lifetime as it was: grant_incomplete.
+  world.fault("POST /api/secure/nodes/" + guard.id + "/messages", { status: 503, body: {} }, 1);
+  assert.deepEqual(await S.call(fx, "set_grant_days", { days: 3 }), { ok: false, code: "grant_incomplete" });
+  assert.equal(world.state.grant_days, 14);
+  assert.equal(guard.grants.has(world.userId), true);
+  // The user turns the delegation off: the revoke goes to every listed node, that one among
+  // them. Turned on again, the node of the pool takes a grant and that node takes nothing.
+  const before = guard.commands.length;
+  assert.equal((await S.call(fx, "set_delegation", { enabled: false })).ok, true);
+  assert.deepEqual(guard.commands.slice(before).map((command) => command.type), ["revoke"]);
+  assert.equal(guard.grants.has(world.userId), false);
+  assert.equal(fx.nodes[0].grants.has(world.userId), false);
+  const revoked = guard.commands.length;
+  assert.equal((await S.call(fx, "set_delegation", { enabled: true })).ok, true);
+  assert.equal(guard.commands.length, revoked);
+  assert.equal(fx.nodes[0].grants.has(world.userId), true);
+  assert.equal(world.state.grant.state, "active");
+});
+
 // ---- The program the backend serves, and a runtime behind it ----
 
 /** What the program store holds of the values the rounds judge by, as stored: every value under

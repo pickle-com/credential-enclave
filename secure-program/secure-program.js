@@ -8619,17 +8619,25 @@
   // ---- The grants: the nodes of the account and the commands ----
 
   /** The nodes the backend lists for this account, each with the expiry of the grant the backend
-   *  recorded for the account on that node: [{node, not_after_ms}] (not_after_ms null when it
-   *  recorded none). One request the backend answers without calling a node. The list says which
-   *  nodes are there to delegate to; whether a node is handed a key is decided by its attestation
-   *  alone (renewGrants), and when a grant was handed and when it ends is what this device kept. */
+   *  recorded for the account on that node: [{node, not_after_ms, revoke_only}] (not_after_ms
+   *  null when it recorded none). One request the backend answers without calling a node. The
+   *  list says which nodes are there to delegate to; whether a node is handed a key is decided by
+   *  its attestation alone (renewGrants), and when a grant was handed and when it ends is what
+   *  this device kept. revoke_only marks a node that is listed for its revokes alone: a node of
+   *  an earlier release outside the nodes that serve the calls of this program, which holds a
+   *  grant another device of the account handed it (a device that runs a program before this
+   *  one). This program hands such a node no grant (an entry of a grant this program made there
+   *  is one the programs before it cannot explain), and sends it the revokes. */
   async function fetchListed(turn) {
     const listed = (await api(turn, "GET", GRANTS_PATH, null, programQuery())).json.nodes;
     const out = [];
     for (const item of Array.isArray(listed) ? listed : []) {
       if (item === null || typeof item !== "object" || typeof item.node !== "string" || !NODE_ID.test(item.node)) continue;
       if (out.some(function (other) { return other.node === item.node; })) continue;
-      out.push({ node: item.node, not_after_ms: Number.isSafeInteger(item.not_after_ms) && item.not_after_ms > 0 ? item.not_after_ms : null });
+      out.push({
+        node: item.node, not_after_ms: Number.isSafeInteger(item.not_after_ms) && item.not_after_ms > 0 ? item.not_after_ms : null,
+        revoke_only: item.revoke_only === true,
+      });
     }
     return out;
   }
@@ -8675,15 +8683,20 @@
    *  before its grant goes out (with the attempt time): a node that takes the grant whose reply
    *  never reaches this program is a node this device handed its key to. A node whose document
    *  verifies with a measurement no list has is a node of a later release: it receives no grant,
-   *  it is kept as such (log.nodes) and not asked again by this program. A backend without the
-   *  route of the list (404) is asked for the attestations of every node it lists, and what this
-   *  device kept decides which of them receives a grant; any other failure of the list is the
-   *  failure of this step. Returns {accepted, rejected, failed, later, granted, ledgerChanged}:
-   *  the Set of the ids of the nodes that hold or were sent a grant, the number of nodes whose
-   *  attestation failed to verify, of nodes that did not take the grant, of nodes of a later
-   *  release, and of nodes that took a grant now. */
+   *  it is kept as such (log.nodes) and not asked again by this program (a stale runtime keeps
+   *  it for its own time only). A node the list marks revoke_only (fetchListed) is none of the
+   *  nodes that are to receive a grant, whatever the options: nothing is asked of it and nothing
+   *  is counted for it. A backend without the route of the list (404) is asked for the
+   *  attestations of every node it lists, and what this device kept decides which of them
+   *  receives a grant; any other failure of the list is the failure of this step. Returns
+   *  {accepted, rejected, failed, later, granted, ledgerChanged, guards}: the Set of the ids of
+   *  the nodes that hold or were sent a grant, the number of nodes whose attestation failed to
+   *  verify, of nodes that did not take the grant, of nodes of a later release, and of nodes
+   *  that took a grant now, whether the ledger of the earlier programs changed, and the ids of
+   *  the nodes listed for their revokes alone. */
   async function renewGrants(turn, keys, ledger, grants, options) {
     const accepted = new Set();
+    const guards = [];
     const nodes = loadNodes();
     const unaccepted = storedObject(STORE_UNACCEPTED);
     let noted = false;
@@ -8709,6 +8722,12 @@
       offered = await fetchOffered(turn, null);
     } else {
       for (const item of sent.value) {
+        // A node listed for its revokes alone is handed no grant and asked for no attestation,
+        // and it counts neither among the nodes that hold a grant nor among the ones that do not.
+        if (item.revoke_only) {
+          guards.push(item.node);
+          continue;
+        }
         const known = grants[item.node];
         if (options.force !== true && laterKnown(item.node)) {
           later += 1;
@@ -8804,7 +8823,7 @@
     }
     return {
       accepted: accepted, rejected: rejected, failed: failed, later: later, granted: granted,
-      ledgerChanged: ledgerChanged,
+      ledgerChanged: ledgerChanged, guards: guards,
     };
   }
 
@@ -8820,7 +8839,13 @@
   async function revokeEverywhere(turn, keys) {
     const listed = await settled(fetchListed(turn));
     if (!listed.ok && failureStatus(listed.error) !== 404) throw listed.error;
-    const ids = listed.ok ? listed.value.map(function (item) { return item.node; }) : null;
+    return revokeNodes(turn, keys, listed.ok ? listed.value.map(function (item) { return item.node; }) : null);
+  }
+
+  /** Sends a revoke to the nodes ids (null: every node the backend lists, for a backend without
+   *  the route of the list), each after its attestation. Returns whether one of them did not
+   *  confirm the revoke. */
+  async function revokeNodes(turn, keys, ids) {
     if (ids !== null && ids.length === 0) return false;
     const offered = await fetchOffered(turn, ids);
     const confirmed = new Set();
@@ -8849,7 +8874,7 @@
   async function grantStep(turn, keys, options) {
     const ledger = loadLedger();
     const grants = loadGrants();
-    let renewed = { accepted: new Set(), rejected: 0, failed: 0, later: 0, granted: 0, ledgerChanged: false };
+    let renewed = { accepted: new Set(), rejected: 0, failed: 0, later: 0, granted: 0, ledgerChanged: false, guards: [] };
     if (!delegationOff(ledger)) {
       renewed = await renewGrants(turn, keys, ledger, grants, options);
     } else {
@@ -10332,10 +10357,13 @@
   /** set_grant_days: the lifetime of a grant, an integer from 1 to 30 (or its decimal string). A
    *  grant of that lifetime is handed again to every listed node (without regard to the renewal
    *  interval: a shortened lifetime applies at once), and when every node took it the value is
-   *  written to the ledger. When any node did not take the grant the lifetime of the ledger is left
-   *  unchanged (the grant times and expiries of the nodes that took it are kept) and the call fails
-   *  with grant_incomplete: that node may still hold a grant of the earlier lifetime. When
-   *  delegation is off only the value is written. */
+   *  written to the ledger. A node listed for its revokes alone (fetchListed) takes no grant:
+   *  when the lifetime was shortened, the revoke is sent to it, so that the grant it holds does
+   *  not outlast a grant of the new lifetime, and a longer lifetime sends it nothing. When any
+   *  node did not take the grant, or such a node did not confirm the revoke, the lifetime of the
+   *  ledger is left unchanged (the grant times and expiries of the nodes that took it are kept)
+   *  and the call fails with grant_incomplete: that node may still hold a grant of the earlier
+   *  lifetime. When delegation is off only the value is written. */
   function setGrantDays(turn, args) {
     const textual = typeof args.days === "string" && /^[0-9]+$/.test(args.days);
     const days = textual ? Number(args.days) : args.days;
@@ -10364,6 +10392,19 @@
         }
         grant = step.grant;
         failed = step.renewed.failed;
+        // A node listed for its revokes alone takes no grant of the new lifetime. When the
+        // lifetime was shortened, the grant it holds may end later than a grant of the new
+        // lifetime: the revoke goes to it. A longer lifetime sends it nothing.
+        if (days < kept.ttl_days && step.renewed.guards.length > 0) {
+          let unconfirmed = true;
+          try {
+            unconfirmed = await revokeNodes(turn, keys, step.renewed.guards);
+          } catch (error) {
+            if (failureCode(error) === "cancelled" || !(turnLeft(turn) > 0)) throw error;
+            native.log("revoke of a node listed for its revokes failed: " + failureCode(error));
+          }
+          if (unconfirmed) failed += 1;
+        }
       }
       const written = loadLedger();
       if (failed > 0) {

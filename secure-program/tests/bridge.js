@@ -893,7 +893,11 @@ class World {
       return json(200, {
         nodes: this.offeredNodes().map((node) => {
           const grant = node.grants.get(this.userId);
-          return { node: node.id, not_after_ms: grant === undefined ? null : grant.not_after_ms };
+          const item = { node: node.id, not_after_ms: grant === undefined ? null : grant.not_after_ms };
+          // A node the backend lists for its revokes alone (node.revokeOnly: a node of an earlier
+          // release outside the nodes that serve calls, which holds a grant of the account).
+          if (node.revokeOnly === true) item.revoke_only = true;
+          return item;
         }),
       });
     }
