@@ -208,6 +208,9 @@ struct Node {
     lineage: Lineage,                // { release_key, log_key: the DER of the two public keys, predecessors: Vec<ReleaseMeasurement> } (5.13)
     started_ms: u64,
     closing: AtomicBool,
+    role: RoleCell,                  // the role of the node, taken once: none yet, the delegation role or the forward role (section 4)
+    used_nonces: Mutex<UsedNonces>,  // on a node of the forward role: the numbers of the envelopes whose request it sent, each kept for 60 seconds, at most 1,048,576 (5.16)
+    forward_nodes: ForwardNodes,     // on a node of the delegation role: the nodes of the forward role it verified, by the SHA-256 of their attestation documents, at most 1,024 (5.9c)
     config: RwLock<Option<Arc<OperatorConfig>>>,
     log_store: LogStore,             // { required, id: OnceLock<LogStoreId>, endpoint: OnceLock<Option<LogStoreEndpoint>>, credentials: RwLock<Option<Arc<Credentials>>>, idle: IdleConnections, document_ms: AtomicU64 (the node time of the latest write of the node document the store confirmed), document_writer } (5.14)
     log_counters: LogCounters,       // { entries, events, writes, write_failures, batch_calls, batch_requests, write_attempt_failures: { connect, tls, closed, timeout, status_4xx, status_5xx }, write_retries, write_ms_buckets: [u64; 8], write_ms_sum, write_count }: the counts of `log` of health (5.1)

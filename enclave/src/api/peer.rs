@@ -53,9 +53,10 @@ fn seq_of(place: &EventPlace) -> Result<u64, ApiError> {
     place.seq().ok_or_else(ApiError::internal)
 }
 
-/// Steps 1 to 3a of protocol.md 10.1 under the rule `accepted`: the attestation response of
+/// Steps 1 to 3b of protocol.md 10.1 under the rule `accepted`: the attestation response of
 /// the peer verifies, the peer runs on the platform of this node and, on nitro, has a
-/// measurement the rule names, and its binding names the log store of this node.
+/// measurement the rule names, and its binding names the log store of this node and a role
+/// under which a node holds delegations.
 fn verified_peer(node: &Node, body: &JsonBody, accepted: Accepted<'_>) -> Result<Peer, ApiError> {
     let response = body.object("peer")?;
     Ok(verify_peer(
@@ -144,7 +145,7 @@ async fn run_export(node: &Node, request: Request) -> Result<Response, ApiError>
     let limit = limit_of(&body, limits::TRANSFER_GRANTS)?;
     let subset = subset_of(&body)?;
 
-    // 1 to 3a
+    // 1 to 3b
     let own = node.platform.measurement();
     let (peer, later) = match body.get("endorsement") {
         None => (

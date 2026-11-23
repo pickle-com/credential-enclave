@@ -181,7 +181,7 @@ impl Accepted<'_> {
 }
 
 /// Verifies the attestation response of a peer for a node that runs on `platform`, accepts
-/// the peers of `accepted` and writes to the log store `log` (protocol.md 10.1, steps 1 to 3a,
+/// the peers of `accepted` and writes to the log store `log` (protocol.md 10.1, steps 1 to 3b,
 /// and 10.3). Every failure is `peer_unverified`.
 ///
 /// | Step | Rule |
