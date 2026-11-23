@@ -14,6 +14,8 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use base64::engine::general_purpose::{STANDARD, URL_SAFE};
+use base64::Engine;
 use credential_enclave_protocol::app::{self, AccountKeys};
 use credential_enclave_protocol::attestation::AWS_NITRO_ROOT_G1;
 use credential_enclave_protocol::encoding::{
@@ -24,8 +26,14 @@ use credential_enclave_protocol::envelope::{
 };
 use credential_enclave_protocol::keys::{self, Custody, LogStoreId, NodeKeys};
 use credential_enclave_protocol::log::{self, EntryKey, EntryKind, EntryParts, Head, Last};
-use credential_enclave_protocol::record::{record_aad, seal_record};
+use credential_enclave_protocol::record::{record_aad, seal_record, Kind};
+use credential_enclave_protocol::released::{released_aad, seal_released, Receiver, SealTo};
 use credential_enclave_protocol::secret::Secret;
+use credential_enclave_protocol::secret_use::{
+    is_placed_in_header, is_site_host, BasicCredentials, BasicPart, Slot, DROPPED_HEADERS,
+    REFUSED_HEADERS, REFUSED_SCHEMES,
+};
+use credential_enclave_protocol::vault_secret::{self, Reach};
 use credential_enclave_protocol::{purpose, statement, totp};
 use ed25519_dalek::SigningKey;
 use serde_json::{json, Map, Value};
@@ -1384,6 +1392,774 @@ fn totp_vectors() -> Value {
     Value::Array(cases)
 }
 
+/// The form of the plaintext of a record of kind `vault_secret` (protocol.md section 6): a
+/// record a device made, and strings and reaches with the verdict of the form rules on each.
+/// The verdicts are written here by hand, and the generator stops when the library gives
+/// another one. The one list that is not written by hand is `reserved_headers`: the header
+/// names no slot names, from the two lists of the library, each with the verdict that the slot
+/// of that header is no slot.
+fn vault_secret_forms() -> Value {
+    let keys = account_keys();
+    let id: [u8; 16] = fixed_prefix("vault secret record id");
+    let nonce: [u8; 12] = fixed_prefix("vault secret record nonce");
+    let plaintext = concat!(
+        r#"{"value":"sk-example-0123456789abcdef","name":"OPENAI_API_KEY","#,
+        r#""sites":["api.openai.com"],"slots":["header:authorization"],"source":"device"}"#
+    )
+    .as_bytes();
+    let key_id = keys.key_id();
+    let kind = Kind::VaultSecret.as_str();
+    let record = seal_record(
+        &keys.user_key,
+        &id,
+        &nonce,
+        USER_ID,
+        &key_id,
+        Custody::Enclave,
+        kind,
+        "vault",
+        plaintext,
+    );
+
+    let verdicts = |cases: &[(&str, bool)], rule: &dyn Fn(&str) -> bool| -> Vec<Value> {
+        let verdict = |(text, valid): &(&str, bool)| {
+            assert_eq!(rule(text), *valid, "the verdict on {text:?}");
+            json!({"text": text, "valid": valid})
+        };
+        cases.iter().map(verdict).collect()
+    };
+    let name_of_64 = format!("A{}", "9".repeat(63));
+    let name_of_65 = format!("A{}", "9".repeat(64));
+    let names = verdicts(
+        &[
+            ("A", true),
+            ("OPENAI_API_KEY", true),
+            ("K2_", true),
+            (&name_of_64, true),
+            ("", false),
+            ("a", false),
+            ("openai_api_key", false),
+            ("Openai", false),
+            ("1KEY", false),
+            ("_KEY", false),
+            ("API-KEY", false),
+            ("API KEY", false),
+            ("ÅPI", false),
+            (&name_of_65, false),
+        ],
+        &vault_secret::is_name,
+    );
+    let label_of_63 = format!("{}.example", "a".repeat(63));
+    let label_of_64 = format!("{}.example", "a".repeat(64));
+    let host_of_253 = [63, 63, 63, 61].map(|length| "h".repeat(length)).join(".");
+    let host_of_254 = [63, 63, 63, 62].map(|length| "h".repeat(length)).join(".");
+    let hosts = verdicts(
+        &[
+            ("api.openai.com", true),
+            ("a.b", true),
+            ("xn--9n2bp8q.example", true),
+            ("my-shop.co.kr", true),
+            ("1.example", true),
+            ("3com.example", true),
+            ("a-b.example", true),
+            ("a--b.example", true),
+            (&label_of_63, true),
+            (&host_of_253, true),
+            ("", false),
+            ("localhost", false),
+            ("Shop.example", false),
+            ("shop.example.", false),
+            (".shop.example", false),
+            ("shop..example", false),
+            ("shop_1.example", false),
+            ("shop.example:443", false),
+            ("shop.example/login", false),
+            ("https://shop.example", false),
+            ("*.example", false),
+            ("상점.example", false),
+            ("10.0.0.1", false),
+            ("example.0x1f", false),
+            ("shop.1example", false),
+            // No label begins or ends with `-`.
+            ("-a.example", false),
+            ("a-.example", false),
+            ("-a-.example", false),
+            ("shop.-example", false),
+            ("shop.example-", false),
+            (&label_of_64, false),
+            (&host_of_254, false),
+        ],
+        &is_site_host,
+    );
+    let header_of_64 = format!("header:{}", "n".repeat(64));
+    let header_of_65 = format!("header:{}", "n".repeat(65));
+    let query_of_64 = format!("query:{}", "q".repeat(64));
+    let query_of_65 = format!("query:{}", "q".repeat(65));
+    let form_of_64 = format!("form:{}", "f".repeat(64));
+    let form_of_65 = format!("form:{}", "f".repeat(65));
+    let json_of_63 = format!("json:{}", "가".repeat(21));
+    let json_of_64 = format!("json:{}a", "가".repeat(21));
+    let json_of_65 = format!("json:{}ab", "가".repeat(21));
+    let json_of_66 = format!("json:{}", "가".repeat(22));
+    let slots = verdicts(
+        &[
+            ("field", true),
+            ("path", true),
+            // The two halves of the credentials of HTTP Basic in the `Authorization` header:
+            // one slot each.
+            ("basic:user", true),
+            ("basic:password", true),
+            ("header:authorization", true),
+            ("header:x-api-key", true),
+            ("query:key", true),
+            ("form:client_secret", true),
+            ("json:apiKey", true),
+            // The name of a JSON slot is object keys joined by `.`.
+            ("json:auth.token", true),
+            ("json:a.b.c", true),
+            // A header no node of the forward role drops or refuses.
+            ("header:cookie", true),
+            ("header:content-type", true),
+            ("header:x-forwarded-for", true),
+            // The name of a query or form slot: the characters a query writes without an
+            // escape.
+            ("query:serviceKey", true),
+            ("query:a-b.c_d~e", true),
+            ("form:API_KEY", true),
+            ("form:0", true),
+            (&header_of_64, true),
+            (&query_of_64, true),
+            (&form_of_64, true),
+            // The name of a JSON slot: a colon, a character outside ASCII, and characters that
+            // are neither control characters nor white space (U+200B, U+FEFF). Its length is
+            // counted in bytes.
+            ("json:a:b", true),
+            ("json:비밀번호", true),
+            (&json_of_63, true),
+            (&json_of_64, true),
+            ("json:a\u{200b}b", true),
+            ("json:a\u{feff}b", true),
+            ("", false),
+            ("Field", false),
+            ("field:", false),
+            ("field:name", false),
+            ("path:/v1", false),
+            // A slot of HTTP Basic names its half with one of two words.
+            ("basic", false),
+            ("Basic", false),
+            ("basic:", false),
+            ("basic:User", false),
+            ("basic:user-id", false),
+            ("basic:username", false),
+            ("basic:pass", false),
+            ("basic:user:password", false),
+            ("Basic:password", false),
+            ("header", false),
+            ("header:", false),
+            ("header:Authorization", false),
+            ("header:x_api_key", false),
+            // A header a node of the forward role drops, and one it refuses (the whole list is
+            // `reserved_headers`).
+            ("header:host", false),
+            ("header:content-length", false),
+            ("header:x-http-method-override", false),
+            ("header:x-forwarded-host", false),
+            // No key of the name of a JSON slot is empty.
+            ("json:a..b", false),
+            ("json:.a", false),
+            ("json:a.", false),
+            ("json:.", false),
+            ("query:", false),
+            ("query:a b", false),
+            ("form:a\tb", false),
+            // A character a query or a form body writes with an escape, or that parts a name
+            // from its value or one pair from the next.
+            ("query:a:b", false),
+            ("query:a%20b", false),
+            ("query:a+b", false),
+            ("query:a&b", false),
+            ("query:a=b", false),
+            ("query:a[0]", false),
+            ("query:키", false),
+            ("query:a\u{200b}b", false),
+            ("form:비밀번호", false),
+            ("form:a:b", false),
+            ("form:a%3Db", false),
+            ("form:a/b", false),
+            ("json:a\u{1f}b", false),
+            ("json:a\u{7f}", false),
+            ("json:a\u{85}", false),
+            ("json:a\u{9f}b", false),
+            ("json:a\u{a0}b", false),
+            ("json:a\u{1680}b", false),
+            ("json:a\u{2000}b", false),
+            ("json:a\u{200a}b", false),
+            ("json:a\u{2028}b", false),
+            ("json:a\u{2029}b", false),
+            ("json:a\u{202f}b", false),
+            ("json:a\u{205f}b", false),
+            ("json:a\u{3000}b", false),
+            ("cookie:session", false),
+            ("body", false),
+            (&header_of_65, false),
+            (&query_of_65, false),
+            (&form_of_65, false),
+            (&json_of_65, false),
+            (&json_of_66, false),
+        ],
+        &|text| Slot::parse(text).is_some(),
+    );
+    let nine_hosts: Vec<String> = (0..9).map(|index| format!("h{index}.example")).collect();
+    let reaches: Vec<Value> = [
+        (
+            json!(["api.openai.com"]),
+            json!(["header:authorization"]),
+            true,
+        ),
+        (
+            json!(["shop.example", "pay.example"]),
+            json!(["field"]),
+            true,
+        ),
+        // A reach names at least one slot.
+        (json!(["shop.example"]), json!([]), false),
+        // The slots of a record are the slot `field` alone, or slots of a request: a value
+        // that is typed into a page is in the hands of whoever fills the page, and a value
+        // that goes into requests leaves a node in no other way.
+        (
+            json!(["shop.example"]),
+            json!(["field", "path", "query:key", "json:key"]),
+            false,
+        ),
+        (json!(["shop.example"]), json!(["field", "path"]), false),
+        (
+            json!(["shop.example"]),
+            json!(["path", "query:key", "json:key", "form:key"]),
+            true,
+        ),
+        (
+            json!(["shop.example"]),
+            json!(["query:key", "query:token"]),
+            true,
+        ),
+        // A list names a host once, and a slot once.
+        (json!(["a.example", "a.example"]), json!(["field"]), false),
+        (json!(["api.example.com"]), json!(["basic:password"]), true),
+        (json!(["api.example.com"]), json!(["basic:user"]), true),
+        // The two halves of the credentials of HTTP Basic are two slots, and a record may
+        // list both.
+        (
+            json!(["api.example.com"]),
+            json!(["basic:user", "basic:password"]),
+            true,
+        ),
+        (
+            json!(["api.example.com"]),
+            json!(["basic:password", "header:authorization"]),
+            true,
+        ),
+        (
+            json!(["api.example.com"]),
+            json!(["basic:password", "basic:password"]),
+            false,
+        ),
+        (json!(["api.example.com"]), json!(["basic"]), false),
+        (json!("any"), json!(["basic:password"]), false),
+        (json!("any"), json!(["field"]), true),
+        (json!([]), json!(["field"]), false),
+        (json!(nine_hosts), json!(["field"]), false),
+        (json!("all"), json!(["field"]), false),
+        (json!(["Shop.example"]), json!(["field"]), false),
+        (json!(["shop.example"]), json!(["field", "field"]), false),
+        (
+            json!(["shop.example"]),
+            json!(["field", "path", "query:a", "form:a", "json:a"]),
+            false,
+        ),
+        (json!(["shop.example"]), json!(["cookie:session"]), false),
+        (json!(["shop.example"]), json!(["json:auth.token"]), true),
+        (json!(["shop.example"]), json!(["json:auth..token"]), false),
+        (json!(["shop.example"]), json!(["header:host"]), false),
+        (
+            json!(["shop.example"]),
+            json!(["field", "header:x-forwarded-host"]),
+            false,
+        ),
+        (json!(["shop-.example"]), json!(["field"]), false),
+        (
+            json!(["shop.example", "-pay.example"]),
+            json!(["field"]),
+            false,
+        ),
+        (json!(["shop.example"]), json!("field"), false),
+        (json!("any"), json!([]), false),
+        (json!("any"), json!(["header:authorization"]), false),
+        (
+            json!("any"),
+            json!(["field", "header:authorization"]),
+            false,
+        ),
+    ]
+    .into_iter()
+    .map(|(sites, slots, valid)| {
+        let read = Reach::from_values(&sites, &slots).is_some();
+        assert_eq!(read, valid, "the verdict on {sites} {slots}");
+        json!({"sites": sites, "slots": slots, "valid": valid})
+    })
+    .collect();
+    let reserved_headers: Vec<Value> = DROPPED_HEADERS
+        .iter()
+        .chain(&REFUSED_HEADERS)
+        .map(|name| {
+            let slot = format!("header:{name}");
+            assert!(Slot::parse(&slot).is_none(), "the verdict on {slot}");
+            json!({"text": slot, "valid": false})
+        })
+        .collect();
+
+    json!({
+        "id": b64u(&id),
+        "nonce": b64u(&nonce),
+        "kind": kind,
+        "provider": "vault",
+        "plaintext_text": text(plaintext),
+        "plaintext": b64u(plaintext),
+        "aad_text": text(&record_aad(
+            &b64u(&id),
+            USER_ID,
+            &key_id,
+            Custody::Enclave.as_str(),
+            kind,
+            "vault",
+        )),
+        "record_key": b64u(keys::record_key(&keys.user_key, &id).as_slice()),
+        "record": record,
+        "names": names,
+        "hosts": hosts,
+        "slots": slots,
+        "reserved_headers": reserved_headers,
+        "reaches": reaches,
+    })
+}
+
+/// The credentials of HTTP Basic of a request whose slot is `basic:user` or `basic:password`
+/// (protocol.md 10.5): values of an `Authorization` header, each with the slot of the half of
+/// the credentials the placeholder stands for, or with none, and for a value that names a
+/// half the header a node writes with the value in the place of the placeholder. A node
+/// sends a request with such a header under the slot of that half, and under no other one.
+/// The verdicts are written here by hand, and the generator stops when the library gives
+/// another one.
+fn basic_credentials() -> Value {
+    const PLACEHOLDER: &str = "PLACEHOLDER_0123456789abcdef";
+    const VALUE: &str = "example-value-0123456789";
+    let text_of = |credentials: &[u8]| STANDARD.encode(credentials);
+    let header = |credentials: &str| format!("Basic {}", text_of(credentials.as_bytes()));
+    let of_user_id = format!("{PLACEHOLDER}:");
+    let of_password = format!("user:{PLACEHOLDER}");
+    // The credentials whose base64 text ends with one padding character and with two, and
+    // credentials whose text holds `+` and `/`.
+    let one_pad = text_of(of_user_id.as_bytes());
+    let two_pads = text_of(format!("us:{PLACEHOLDER}").as_bytes());
+    assert!(one_pad.ends_with('=') && !one_pad.ends_with("=="));
+    assert!(two_pads.ends_with("=="));
+    let signs = format!("???>>>:{PLACEHOLDER}");
+    assert!(header(&signs).contains('+') && header(&signs).contains('/'));
+    // The second character of a last group of one byte holds four bits that are zero: the
+    // character behind it in the alphabet sets the lowest of them.
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let at = two_pads.len() - 3;
+    let index = alphabet
+        .iter()
+        .position(|byte| *byte == two_pads.as_bytes()[at])
+        .expect("a character of the alphabet");
+    let loose = format!("{}{}==", &two_pads[..at], char::from(alphabet[index + 1]));
+    let latin = [b"caf\xe9:".as_slice(), PLACEHOLDER.as_bytes()].concat();
+
+    let user_id = Some(BasicPart::UserId);
+    let password = Some(BasicPart::Password);
+    let cases: Vec<(&str, String, Option<BasicPart>)> = vec![
+        (
+            "the placeholder is the user-id, and the password is empty",
+            header(&of_user_id),
+            user_id,
+        ),
+        (
+            "the placeholder is the user-id",
+            header(&format!("{PLACEHOLDER}:password")),
+            user_id,
+        ),
+        (
+            "the placeholder is the user-id, and the password holds colons",
+            header(&format!("{PLACEHOLDER}:a:b:")),
+            user_id,
+        ),
+        (
+            "the placeholder is the password",
+            header(&of_password),
+            password,
+        ),
+        (
+            "the placeholder is the password, and the user-id is empty",
+            header(&format!(":{PLACEHOLDER}")),
+            password,
+        ),
+        (
+            "the placeholder is the password, and the user-id holds characters outside ASCII",
+            header(&format!("사용자:{PLACEHOLDER}")),
+            password,
+        ),
+        ("the base64 text holds + and /", header(&signs), password),
+        (
+            "the base64 text ends with two padding characters",
+            format!("Basic {two_pads}"),
+            password,
+        ),
+        (
+            "the credentials do not hold the placeholder",
+            header("user:password"),
+            None,
+        ),
+        (
+            "the placeholder is a part of the user-id",
+            header(&format!("x{PLACEHOLDER}:")),
+            None,
+        ),
+        (
+            "the placeholder is a part of the password",
+            header(&format!("user:{PLACEHOLDER}x")),
+            None,
+        ),
+        (
+            "the placeholder is both halves",
+            header(&format!("{PLACEHOLDER}:{PLACEHOLDER}")),
+            None,
+        ),
+        (
+            "the placeholder is the user-id and a part of the password",
+            header(&format!("{PLACEHOLDER}:x{PLACEHOLDER}")),
+            None,
+        ),
+        (
+            "the placeholder stands behind a second colon",
+            header(&format!("user:pass:{PLACEHOLDER}")),
+            None,
+        ),
+        ("the credentials hold no colon", header(PLACEHOLDER), None),
+        (
+            "the credentials are not UTF-8",
+            format!("Basic {}", text_of(&latin)),
+            None,
+        ),
+        ("the scheme in lower case", format!("basic {one_pad}"), None),
+        ("the scheme in upper case", format!("BASIC {one_pad}"), None),
+        (
+            "two spaces behind the scheme",
+            format!("Basic  {one_pad}"),
+            None,
+        ),
+        (
+            "a space behind the base64 text",
+            format!("Basic {one_pad} "),
+            None,
+        ),
+        (
+            "the base64 text without its padding",
+            format!("Basic {}", one_pad.trim_end_matches('=')),
+            None,
+        ),
+        (
+            "base64url in the place of base64",
+            format!("Basic {}", URL_SAFE.encode(signs.as_bytes())),
+            None,
+        ),
+        (
+            "a bit set behind the last byte of the base64 text",
+            format!("Basic {loose}"),
+            None,
+        ),
+        (
+            "a text behind the credentials",
+            format!("Basic {one_pad}, Bearer token"),
+            None,
+        ),
+        ("another scheme", format!("Bearer {one_pad}"), None),
+        ("no scheme", one_pad.clone(), None),
+        (
+            "the placeholder as it stands behind the scheme",
+            format!("Basic {PLACEHOLDER}"),
+            None,
+        ),
+    ];
+    let value = Secret::new(VALUE.to_string());
+    let cases: Vec<Value> = cases
+        .into_iter()
+        .map(|(name, authorization, part)| {
+            let read = BasicCredentials::read(&authorization, PLACEHOLDER);
+            assert_eq!(
+                read.as_ref().map(BasicCredentials::part),
+                part,
+                "the verdict on {name}"
+            );
+            let mut case = Map::new();
+            case.insert("name".into(), json!(name));
+            case.insert("authorization_text".into(), json!(authorization));
+            let slot = part.map(|part| Slot::Basic(part).to_string());
+            if let Some(slot) = &slot {
+                assert!(Slot::parse(slot).is_some(), "the slot of {name}");
+            }
+            case.insert("slot".into(), json!(slot));
+            if let Some(credentials) = read {
+                let written = credentials.written(&value);
+                case.insert("written_text".into(), json!(written.expose_secret()));
+            }
+            Value::Object(case)
+        })
+        .collect();
+    json!({
+        "placeholder_text": PLACEHOLDER,
+        "value_text": VALUE,
+        "cases": cases,
+    })
+}
+
+/// The value of the header of a request whose slot is `header:<name>` (protocol.md 10.5):
+/// header values with a placeholder, each with the verdict on whether a node of the forward
+/// role puts a value in the place of that placeholder. The verdicts are written here by
+/// hand, and the generator stops when the library gives another one.
+fn header_values() -> Value {
+    const PLACEHOLDER: &str = "PLACEHOLDER_0123456789abcdef";
+    let cases: Vec<(&str, &str, &str, bool)> = vec![
+        (
+            "the placeholder is the whole value",
+            "X-Api-Key",
+            "{}",
+            true,
+        ),
+        (
+            "the placeholder behind the scheme Bearer",
+            "Authorization",
+            "Bearer {}",
+            true,
+        ),
+        (
+            "the placeholder behind a scheme of the site",
+            "authorization",
+            "KakaoAK {}",
+            true,
+        ),
+        (
+            "the placeholder as a parameter of a scheme of the site",
+            "Authorization",
+            "Token token=\"{}\"",
+            true,
+        ),
+        (
+            "the placeholder as the value of a cookie",
+            "Cookie",
+            "theme=dark; session={}; lang=ko",
+            true,
+        ),
+        (
+            "the name of a refused scheme behind the placeholder",
+            "Authorization",
+            "Token token=\"{}\", name=\"basic\"",
+            true,
+        ),
+        (
+            "the name of a refused scheme in a header no server reads credentials from",
+            "Cookie",
+            "plan=basic; session={}",
+            true,
+        ),
+        (
+            "a refused scheme in a header no server reads credentials from",
+            "X-Note",
+            "Basic {}",
+            true,
+        ),
+        (
+            "a character outside ASCII in a header no server reads credentials from",
+            "X-Note",
+            "\u{d55c}: {}",
+            true,
+        ),
+        ("no placeholder", "Authorization", "Bearer token", false),
+        ("the placeholder twice", "Authorization", "{} {}", false),
+        (
+            "the placeholder behind a letter",
+            "Authorization",
+            "Bearer{}",
+            false,
+        ),
+        (
+            "the placeholder behind a tab",
+            "Authorization",
+            "Bearer\t{}",
+            false,
+        ),
+        (
+            "the placeholder behind the beginning of a percent escape",
+            "X-Api-Key",
+            "key=%4{}",
+            false,
+        ),
+        (
+            "the placeholder behind the beginning of a code unit escape",
+            "X-Api-Key",
+            "{\"key\":\"\\u004{}\"}",
+            false,
+        ),
+        (
+            "the placeholder behind the scheme Basic",
+            "Authorization",
+            "Basic {}",
+            false,
+        ),
+        (
+            "the scheme Basic in lower case",
+            "authorization",
+            "basic {}",
+            false,
+        ),
+        (
+            "the scheme Basic in upper case, and two spaces",
+            "AUTHORIZATION",
+            "BASIC  {}",
+            false,
+        ),
+        (
+            "a space in front of the scheme Basic",
+            "Authorization",
+            " Basic {}",
+            false,
+        ),
+        (
+            "the scheme Basic and = in front of the placeholder",
+            "Authorization",
+            "Basic={}",
+            false,
+        ),
+        (
+            "a base64 text between the scheme Basic and the placeholder",
+            "Authorization",
+            "Basic dXNlcjo= {}",
+            false,
+        ),
+        (
+            "the scheme Basic behind another scheme",
+            "Authorization",
+            "Bearer token, Basic {}",
+            false,
+        ),
+        (
+            "the name of the scheme Basic as a part of a word",
+            "Authorization",
+            "xBasic {}",
+            false,
+        ),
+        (
+            "the placeholder as the user name of the scheme Digest",
+            "Authorization",
+            "Digest username=\"{}\"",
+            false,
+        ),
+        (
+            "the placeholder behind the scheme Negotiate",
+            "Authorization",
+            "Negotiate {}",
+            false,
+        ),
+        (
+            "the placeholder behind the scheme NTLM",
+            "Authorization",
+            "NTLM {}",
+            false,
+        ),
+        (
+            "the scheme Basic in a header named after Authorization",
+            "X-Authorization",
+            "Basic {}",
+            false,
+        ),
+        (
+            "the scheme Basic in a header named after Authorization, written with _",
+            "X_Forwarded_Authorization",
+            "basic {}",
+            false,
+        ),
+        (
+            "a character outside ASCII in the place of a letter of the scheme Basic",
+            "Authorization",
+            "Ba\u{17f}ic {}",
+            false,
+        ),
+        (
+            "a character outside ASCII in front of a scheme",
+            "Authorization",
+            "\u{a0}Bearer {}",
+            false,
+        ),
+    ];
+    let cases: Vec<Value> = cases
+        .into_iter()
+        .map(|(name, header, value, valid)| {
+            let value = value.replace("{}", PLACEHOLDER);
+            assert_eq!(
+                is_placed_in_header(header, &value, PLACEHOLDER),
+                valid,
+                "the verdict on {name}"
+            );
+            json!({"name": name, "header": header, "value_text": value, "valid": valid})
+        })
+        .collect();
+    json!({
+        "placeholder_text": PLACEHOLDER,
+        "refused_schemes": REFUSED_SCHEMES,
+        "cases": cases,
+    })
+}
+
+/// A vault value that `release` hands out under the seal of a key its caller named
+/// (protocol.md section 6): the key pair of the caller, the call, and the `sealed` object of
+/// the response.
+fn sealed_release() -> Value {
+    let private = fixed("release receiver private key");
+    let receiver = Receiver::from_random(&private);
+    let seal_to = receiver.seal_to();
+    let hpke_seed = fixed("release hpke seed");
+    let record_id = b64u(&fixed_prefix::<16>("released record id"));
+    let (field, origin) = ("value", "https://pay.shop.example");
+    let value = "correct horse battery staple";
+    let to = SealTo::parse(&seal_to).expect("the public key of a key pair is a key to seal to");
+    let sealed = seal_released(
+        &to,
+        USER_ID,
+        &record_id,
+        field,
+        origin,
+        &Secret::new(value.to_string()),
+        &Secret::new(hpke_seed),
+    )
+    .expect("a value seals to a key");
+    let opened = receiver
+        .open(USER_ID, &record_id, field, origin, &sealed)
+        .expect("the receiver opens what was sealed to it");
+    assert_eq!(opened.as_slice(), value.as_bytes());
+    json!({
+        "receiver_private": b64u(&private),
+        "seal_to": seal_to,
+        "hpke_seed": b64u(&hpke_seed),
+        "user_id": USER_ID,
+        "record_id": record_id,
+        "field": field,
+        "origin": origin,
+        "info_text": purpose::RELEASE_SEAL,
+        "aad_text": text(&released_aad(USER_ID, &record_id, field, origin)),
+        "value_text": value,
+        "sealed": sealed,
+    })
+}
+
 fn generate() -> String {
     let document = json!({
         "v": 1,
@@ -1398,7 +2174,26 @@ fn generate() -> String {
             "document of its node, `log_store` the buckets of format 3 of a log store, `log` the ",
             "log of format 2 (the releases from v2.0.0 to v2.3.0: the key carries body_hash and ",
             "entry_hash, and the node signed heads) and `log_v1` the log of format 1 (one entry ",
-            "holds one event)."
+            "holds one event). ",
+            "`vault_secret` holds a record of that kind and the verdicts of the form rules of ",
+            "its plaintext: `valid` says whether a string is a name, a host or a slot, and ",
+            "whether `sites` and `slots` together are a reach. A host and a slot of the request ",
+            "of a secret use have the same form rules. `reserved_headers` lists the slot of ",
+            "every header no slot names. `sealed_release` holds a `release` call that named a ",
+            "key to seal the value to: `receiver_private` is the X25519 private key of the ",
+            "caller, `seal_to` its public key, and `sealed` the object of the response, which ",
+            "opens to `value_text` under the HPKE info `info_text` and the AAD `aad_text`. ",
+            "`basic_credentials` holds values of an ",
+            "`Authorization` header of a request whose slot is one of the two of HTTP Basic: ",
+            "`slot` is the slot of the half of the credentials the placeholder ",
+            "`placeholder_text` stands for (`basic:user` or `basic:password`), the one slot a ",
+            "node of the forward role sends the request under, or is null for a value it sends ",
+            "under neither, and `written_text` is the header that node writes for the value ",
+            "`value_text`. `header_values` holds values of the header of a request whose slot ",
+            "is `header:<name>`, with the placeholder `placeholder_text` in them: `valid` says ",
+            "whether a node of the forward role puts a value in the place of the placeholder, ",
+            "and `refused_schemes` lists the names of the authentication schemes behind which ",
+            "it puts none."
         ),
         "key_derivation": key_derivation(),
         "record": record(),
@@ -1411,6 +2206,10 @@ fn generate() -> String {
         "attestation": attestation(),
         "totp": totp_vectors(),
         "transfer": transfer(),
+        "vault_secret": vault_secret_forms(),
+        "sealed_release": sealed_release(),
+        "basic_credentials": basic_credentials(),
+        "header_values": header_values(),
     });
     let mut output = serde_json::to_string_pretty(&document).expect("vectors serialize");
     output.push('\n');

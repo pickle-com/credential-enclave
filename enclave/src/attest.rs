@@ -1,5 +1,5 @@
-//! Verification of the attestation response of a peer node (protocol.md 10.1, enclave.md
-//! 5.13).
+//! Verification of the attestation response of another node (protocol.md 10.1 and 10.5,
+//! enclave.md 5.13 and 5.9c).
 //!
 //! A node hands delegations to another node, and takes them from one, only after it verified
 //! that node's attestation: the peer runs on the same platform and, on nitro, has a
@@ -9,6 +9,13 @@
 //! receiving node it is also the measurement of a release this program lists as a predecessor
 //! (protocol.md 10.3). The operator domain carries the responses and the envelopes between
 //! the nodes and is not trusted with either.
+//!
+//! A node hands the value of a vault secret, for one request, to a node of the forward role
+//! only after it verified that node's attestation as well ([`ForwardNodes::verify`]): the
+//! same platform, the measurement of this node and no other one, and a binding that names
+//! the forward role. The peer of a delegation transfer is a node that holds delegations (its
+//! binding names no role, or the role `reserve`) and the receiver of a secret use a node of
+//! the forward role, so neither rule accepts a node the other one accepts.
 //!
 //! The documents are read and verified by the attestation module of the protocol crate, the
 //! one reader that every verifier of a node uses. What is decided here is which peer this
@@ -27,10 +34,15 @@ use credential_enclave_protocol::encoding::b64u_decode;
 use credential_enclave_protocol::envelope::{
     open_transfer, seal_transfer, Transfer, TransferEnvelope, TransferGrant,
 };
-use credential_enclave_protocol::keys::{node_id, LogStoreId, NodeKeys};
+use std::collections::HashMap;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
+use credential_enclave_protocol::keys::{node_id, LogStoreId, NodeKeys, Role};
 use credential_enclave_protocol::release::ReleaseMeasurement;
 use credential_enclave_protocol::secret::Secret;
+use credential_enclave_protocol::secret_use::{seal_secret_use, BoundRequest, SecretUseEnvelope};
 use credential_enclave_protocol::ProtocolError;
+use sha2::{Digest, Sha256};
 
 use crate::platform::Measurement;
 
@@ -169,7 +181,7 @@ impl Accepted<'_> {
 }
 
 /// Verifies the attestation response of a peer for a node that runs on `platform`, accepts
-/// the peers of `accepted` and writes to the log store `log` (protocol.md 10.1, steps 1 to 3a,
+/// the peers of `accepted` and writes to the log store `log` (protocol.md 10.1, steps 1 to 3b,
 /// and 10.3). Every failure is `peer_unverified`.
 ///
 /// | Step | Rule |
@@ -178,6 +190,7 @@ impl Accepted<'_> {
 /// | 2 | the platform of the peer is the platform of this node |
 /// | 3 | on nitro, PCR0, PCR1 and PCR2 of the peer are a measurement that `accepted` names, with the release of the binding where the rule names one, and none of them is all zero. On the local platform the rule is [`Accepted::Own`] |
 /// | 3a | the log store the binding of the peer names is the log store of this node: the same bucket and region, or none on both sides |
+/// | 3b | the binding of the peer names no role or the role `reserve`: the peer is a node that holds delegations. A node of the forward role holds no delegation and takes none |
 pub fn verify_peer(
     platform: &str,
     accepted: Accepted<'_>,
@@ -218,6 +231,12 @@ fn read_peer(
     if binding.log.as_ref() != log {
         return None;
     }
+    // And it stays among nodes that hold delegations: a node whose binding names no role, and
+    // a node of the reserve role. A node of the forward role takes none, and a binding that
+    // names any other role is no binding (`read_binding`).
+    if !binding.role.holds_delegations() {
+        return None;
+    }
     Some(Peer {
         sign_public: binding.sign_public,
         seal_public: binding.seal_public,
@@ -249,6 +268,175 @@ fn nitro_binding(
         &binding.release,
     )?;
     Some((binding, program))
+}
+
+/// The keys of a node of the forward role, read from the binding inside its verified
+/// attestation document. Only [`ForwardNodes::verify`] creates one, so a `ForwardNode` is a
+/// node this node accepted as the receiver of a secret use: the same platform, on nitro the
+/// measurement of this node, and a binding that names the forward role.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForwardNode {
+    sign_public: [u8; 32],
+    seal_public: [u8; 32],
+}
+
+impl ForwardNode {
+    /// The node identifier of the node.
+    pub fn node(&self) -> String {
+        node_id(&self.sign_public)
+    }
+
+    /// Hands one use of a vault secret to this node: signs the value and the one request it
+    /// is for, and seals both to the sealing key of the node (sink K8 of the egress policy).
+    /// The value leaves the node that opened its record inside that seal only, and the seal
+    /// is made to a verified node of the forward role only: this is the one call of the node
+    /// to the sealing function.
+    #[allow(clippy::too_many_arguments)]
+    pub fn seal_secret_use(
+        &self,
+        keys: &NodeKeys,
+        time_ms: u64,
+        nonce: &[u8; 16],
+        user_id: &str,
+        record_id: &str,
+        value: &Secret<String>,
+        request: &BoundRequest,
+        hpke_seed: &Secret<[u8; 32]>,
+    ) -> Result<SecretUseEnvelope, ProtocolError> {
+        seal_secret_use(
+            keys,
+            &self.sign_public,
+            &self.seal_public,
+            time_ms,
+            nonce,
+            user_id,
+            record_id,
+            value,
+            request,
+            hpke_seed,
+        )
+    }
+}
+
+/// The attestation document of a response of version 1 that names `platform`, the platform
+/// of this node. `None` for a response of another version, of another platform, or without a
+/// document.
+fn forward_document(platform: &str, response: &serde_json::Value) -> Option<Vec<u8>> {
+    if response.get("v")?.as_u64()? != 1 {
+        return None;
+    }
+    // A node of another platform holds user keys of another custody: no value of an account
+    // of this node goes there.
+    if response.get("platform")?.as_str()? != platform {
+        return None;
+    }
+    b64u_decode(response.get("document")?.as_str()?).ok()
+}
+
+/// The node of the forward role whose attestation document `document` is, for a node that
+/// runs on `platform` with `measurement` (protocol.md 10.5):
+///
+/// | Step | Rule |
+/// | --- | --- |
+/// | 1 | the document verifies: platform `nitro` by protocol.md 4.3 without the nonce check, against the AWS Nitro Enclaves Root-G1 compiled into the binary, platform `local` by reading the binding of the local document |
+/// | 2 | on nitro, PCR0, PCR1 and PCR2 of the document are those of this node, and none of them is all zero: the node runs the program of this node. No other measurement is accepted, neither that of a later release nor that of a predecessor: what a node of the forward role does with a value is what this source says |
+/// | 3 | the binding of the document names the role `forward`: the node holds no user key and takes none, and it sends the request of an envelope it opens. A value sealed to a node of the delegation role would be readable in a node that sends no request for it |
+///
+/// The verdict depends on the bytes of the document, on the platform and on the measurement,
+/// and on nothing else: the verification reads neither a clock nor a nonce.
+fn forward_node_of(
+    platform: &str,
+    measurement: Option<&Measurement>,
+    document: &[u8],
+) -> Option<ForwardNode> {
+    // The rule that takes a node of the program of this node and of no other release.
+    let same_program = Accepted::Own {
+        measurement,
+        predecessors: &[],
+    };
+    let binding = match platform {
+        "nitro" => match nitro_binding(
+            same_program,
+            verify_nitro_document(document, AWS_NITRO_ROOT_G1, None).ok()?,
+        )? {
+            (binding, Program::Same) => binding,
+            // The rule names no other release, and a node of one is not taken either way.
+            (_, Program::Release(_)) => return None,
+        },
+        "local" => read_binding(&read_local_document(document).ok()?.binding).ok()?,
+        _ => return None,
+    };
+    (binding.role == Role::Forward).then_some(ForwardNode {
+        sign_public: binding.sign_public,
+        seal_public: binding.seal_public,
+    })
+}
+
+/// The verifier of the nodes of the forward role for one node, with the nodes it verified:
+/// each under the SHA-256 of its attestation document.
+///
+/// Whether a document is that of a node of the forward role this node accepts depends on the
+/// bytes of the document, on the platform of this node and on its measurement
+/// ([`forward_node_of`]). The platform and the measurement of a node do not change while it
+/// lives: a store is made for one node and holds both. The verification reads no clock and no
+/// nonce. So a document that verified once verifies whenever it is presented again, and a
+/// node reads the keys of such a document from what it kept: the verification of a Nitro
+/// document is a certificate chain and a signature of P-384, and a caller presents the
+/// document of the same node with every use it hands over.
+///
+/// A document that does not verify is not kept. The store holds [`ForwardNodes::KEPT`]
+/// documents: a further one empties it first, and a document in use is then verified once
+/// more.
+pub struct ForwardNodes {
+    /// The platform of the node this store belongs to.
+    platform: &'static str,
+    /// The measurement of that node, `None` on the local platform.
+    measurement: Option<Measurement>,
+    verified: Mutex<HashMap<[u8; 32], ForwardNode>>,
+}
+
+impl ForwardNodes {
+    /// The documents the store keeps at the same time.
+    pub const KEPT: usize = 1_024;
+
+    /// The verifier of a node that runs on `platform` with `measurement`.
+    pub fn of(platform: &'static str, measurement: Option<Measurement>) -> ForwardNodes {
+        ForwardNodes {
+            platform,
+            measurement,
+            verified: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Verifies the attestation response of the node a secret use is handed to. The response
+    /// is one of version 1 that names the platform of this node, and its document passes the
+    /// three steps of [`forward_node_of`]. Every failure is `peer_unverified`.
+    pub fn verify(&self, response: &serde_json::Value) -> Result<ForwardNode, ProtocolError> {
+        let document =
+            forward_document(self.platform, response).ok_or(ProtocolError::PeerUnverified)?;
+        let digest: [u8; 32] = Sha256::digest(&document).into();
+        if let Some(known) = self.kept().get(&digest) {
+            return Ok(known.clone());
+        }
+        let node = forward_node_of(self.platform, self.measurement.as_ref(), &document)
+            .ok_or(ProtocolError::PeerUnverified)?;
+        let mut kept = self.kept();
+        if kept.len() >= ForwardNodes::KEPT {
+            kept.clear();
+        }
+        kept.insert(digest, node.clone());
+        Ok(node)
+    }
+
+    fn kept(&self) -> MutexGuard<'_, HashMap<[u8; 32], ForwardNode>> {
+        self.verified.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The documents the store keeps at this moment.
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.kept().len()
+    }
 }
 
 #[cfg(test)]
@@ -850,6 +1038,22 @@ mod tests {
         };
         assert!(!refused(binding_with(|_| {})));
         assert!(refused(binding_with(|binding| binding["v"] = json!(2))));
+        // A delegation goes to a node that holds delegations: one whose binding names no
+        // role, and one of the reserve role. It goes to no node of the forward role, and a
+        // binding that names any other role is no binding.
+        assert!(!refused(binding_with(
+            |binding| binding["role"] = json!("reserve")
+        )));
+        for role in ["forward", "delegation", "Reserve", "witness", ""] {
+            let keys = NodeKeys::from_random(&[0x11; 32], &[0x22; 32]);
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&binding(&keys, "v1.0.0", None)).unwrap();
+            value["role"] = json!(role);
+            assert!(
+                refused(response("local", &local_document(&to_json(&value)))),
+                "{role:?}"
+            );
+        }
         assert!(refused(binding_with(
             |binding| binding["seal"] = json!(b64u(&[0u8; 32]))
         )));

@@ -23,10 +23,11 @@ use axum::http::HeaderValue;
 use axum::response::Response;
 use credential_enclave_protocol::record::Record;
 use credential_enclave_protocol::secret::Secret;
+use credential_enclave_protocol::secret_use::{header_key, names_no_other_charset};
 use credential_enclave_protocol::ProtocolError;
 use hyper::body::Bytes;
 use serde_json::Value;
-use tokio::sync::{OwnedSemaphorePermit, SemaphorePermit};
+use tokio::sync::OwnedSemaphorePermit;
 
 use super::responses::{forward_frame, forward_stream, LogRef, StreamElement, StreamEnd};
 use super::{invalid, read_body, record_of, respond, ApiError, JsonBody};
@@ -108,24 +109,6 @@ pub async fn forward(State(node): State<Arc<Node>>, request: Request) -> Respons
     respond(run(&node, request).await)
 }
 
-/// One of the places of the forward calls of the node, held by a call whose response is a
-/// stream until the task that reads the provider ends. Dropping it frees the place.
-struct StreamPlace(Arc<Node>);
-
-impl StreamPlace {
-    /// Keeps the place `slot` of a call of `node` for as long as the value lives.
-    fn keep(node: &Arc<Node>, slot: SemaphorePermit<'_>) -> StreamPlace {
-        slot.forget();
-        StreamPlace(node.clone())
-    }
-}
-
-impl Drop for StreamPlace {
-    fn drop(&mut self) {
-        self.0.forward_slots.add_permits(1);
-    }
-}
-
 /// The admission of a call that takes one of the places of the forward calls of the node
 /// (`forward`, `forward/batch`): its place, and the share of the body budget its request frame
 /// occupies. A call waits for the two together for at most [`ADMISSION_WAIT`], counted from
@@ -149,8 +132,8 @@ impl Admission {
     }
 
     /// One of the places of the forward calls of the node, held until it is dropped.
-    pub(super) async fn slot<'a>(&self, node: &'a Node) -> Result<SemaphorePermit<'a>, ApiError> {
-        let slot = node.forward_slots.acquire();
+    pub(super) async fn slot(&self, node: &Node) -> Result<OwnedSemaphorePermit, ApiError> {
+        let slot = node.forward_slots.clone().acquire_owned();
         match tokio::time::timeout_at(self.until, slot).await {
             Ok(Ok(slot)) => Ok(slot),
             Ok(Err(_)) => Err(ApiError::internal()),
@@ -159,7 +142,11 @@ impl Admission {
     }
 
     /// `bytes` of the body budget of the node, for the request frame of the call.
-    async fn budget(&self, node: &Node, bytes: usize) -> Result<OwnedSemaphorePermit, ApiError> {
+    pub(super) async fn budget(
+        &self,
+        node: &Node,
+        bytes: usize,
+    ) -> Result<OwnedSemaphorePermit, ApiError> {
         match tokio::time::timeout_at(self.until, reserve(node, bytes)).await {
             Ok(reserved) => reserved,
             Err(_) => Err(ProtocolError::CapacityUnavailable.into()),
@@ -213,47 +200,13 @@ fn failure_of(error: EgressError) -> ProtocolError {
     }
 }
 
-/// The form a header name is compared in: lower case, with `-` for every `_`. Some servers
-/// read the two characters as one, so `X_HTTP_Method_Override` is the header that overrides
-/// the method for them, and `Content_Length` a second length of the body.
-fn header_key(name: &str) -> String {
-    name.to_ascii_lowercase().replace('_', "-")
-}
-
-/// True when the value of an `Accept` header names no character encoding but UTF-8: every
-/// place of the word `charset` in it (in any case of its letters) is followed by `=` and
-/// `utf-8` or `utf8`, with or without quotes and blanks.
-fn names_no_other_charset(value: &str) -> bool {
-    let value = value.to_ascii_lowercase();
-    let mut rest = value.as_str();
-    while let Some(at) = rest.find("charset") {
-        let after = rest.get(at + "charset".len()..).unwrap_or_default();
-        let named = after
-            .trim_start()
-            .strip_prefix('=')
-            .map(|named| named.trim_start().trim_start_matches('"'));
-        let utf8 = named.and_then(|named| {
-            named
-                .strip_prefix("utf-8")
-                .or_else(|| named.strip_prefix("utf8"))
-        });
-        match utf8 {
-            // The name ends there: `utf-80` is another name.
-            Some(end)
-                if !end.starts_with(|next: char| next.is_ascii_alphanumeric() || next == '-') => {}
-            _ => return false,
-        }
-        rest = after;
-    }
-    true
-}
-
 /// Reads the request headers of a request object: an array of `[name, value]` pairs under
 /// `headers`. A name that is not a token and a value with CR, LF or another control
 /// character are `invalid_request`. A header of [`REFUSED_HEADERS`] is `not_allowed`, and
 /// so is an `Accept` header that names another character encoding than UTF-8. The headers
 /// of [`DROPPED_HEADERS`] and the header the definition injects are dropped. A name is
-/// compared in the form of [`header_key`].
+/// compared in the form of [`header_key`], and the two rules are those of the request of a
+/// vault secret (`credential_enclave_protocol::secret_use`).
 fn caller_headers(
     request: &Value,
     definition: &Definition,
@@ -451,7 +404,7 @@ pub(super) async fn execute(
 }
 
 /// The end record of a body that was cut with the failure `error`.
-fn cut(error: ProtocolError) -> StreamEnd {
+pub(super) fn cut(error: ProtocolError) -> StreamEnd {
     let failure = ApiError::from(error);
     StreamEnd::cut(failure.code, failure.message)
 }
@@ -477,7 +430,7 @@ async fn stream(
     timeout: Duration,
     log: LogRef,
     request_budget: OwnedSemaphorePermit,
-    place: StreamPlace,
+    place: OwnedSemaphorePermit,
 ) -> Result<Response, ApiError> {
     let Prepared {
         outbound, token, ..
@@ -506,15 +459,25 @@ async fn stream(
     // under a content coding, is not handed on. Nothing of it has left.
     let check = StreamCheck::begin(&token, &mut headers).map_err(ProtocolError::from)?;
     drop(token);
+    let (body, late) = hand_on_body(exchange, check, deadline, place);
+    Ok(forward_stream(status, headers, Some(log), body, late))
+}
+
+/// Starts the task of a stream (the stream form of `forward`, `vault/send`), which hands the
+/// body of `exchange` on until `deadline`, each part after the search of `check`. Returns
+/// what the response body of the call reads the elements of the stream from, and the end
+/// record of a call whose task ended without one. `held` is what the call holds until its
+/// body has ended (its place among the forward calls of the node, and the shares of the body
+/// budget it keeps): the task drops it.
+pub(super) fn hand_on_body<Held: Send + 'static>(
+    exchange: Exchange,
+    check: StreamCheck,
+    deadline: tokio::time::Instant,
+    held: Held,
+) -> (tokio::sync::mpsc::Receiver<StreamElement>, StreamEnd) {
     let (elements, body) = tokio::sync::mpsc::channel(STREAM_ELEMENTS);
-    tokio::spawn(hand_on_until(exchange, check, elements, deadline, place));
-    Ok(forward_stream(
-        status,
-        headers,
-        Some(log),
-        body,
-        cut(ProtocolError::Timeout),
-    ))
+    tokio::spawn(hand_on_until(exchange, check, elements, deadline, held));
+    (body, cut(ProtocolError::Timeout))
 }
 
 /// The task of a stream: hands the body of the provider on until it ends, is cut, the time
@@ -522,12 +485,12 @@ async fn stream(
 /// connection to the provider, the place among the forward calls) before the end record waits
 /// for the caller. The task does not depend on the caller reading the response: a caller that
 /// reads slowly, or not at all, holds the call for the time limit at the longest.
-async fn hand_on_until(
+async fn hand_on_until<Held>(
     mut exchange: Exchange,
     mut check: StreamCheck,
     elements: tokio::sync::mpsc::Sender<StreamElement>,
     deadline: tokio::time::Instant,
-    place: StreamPlace,
+    held: Held,
 ) {
     let end = tokio::select! {
         end = tokio::time::timeout_at(deadline, hand_on(&mut exchange, &mut check, &elements)) => end,
@@ -536,7 +499,7 @@ async fn hand_on_until(
     };
     drop(exchange);
     drop(check);
-    drop(place);
+    drop(held);
     let record = match end {
         Ok(Some(record)) => record,
         Ok(None) => return,
@@ -688,8 +651,7 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
     // wire (`execute`).
     let timeout = Duration::from_millis(timeout_ms);
     if streamed {
-        let place = StreamPlace::keep(node, slot);
-        return stream(node, user_id, prepared, timeout, log, request_budget, place).await;
+        return stream(node, user_id, prepared, timeout, log, request_budget, slot).await;
     }
     let Prepared {
         outbound, token, ..

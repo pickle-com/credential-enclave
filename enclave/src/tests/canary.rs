@@ -11,6 +11,11 @@
 //!   connections to the hosts of the definitions and to the host of its log store only. A
 //!   credential occurs only in requests to the addresses that the definition of its provider
 //!   names for that use, and a write to the log store carries no secret of an account.
+//! - C5, the connections of a node of the forward role. Such a node asks for connections to
+//!   the site of the vault secret whose use it was handed, and to no other host. The value of
+//!   that secret occurs in the request to that site, and in no response of the node. That
+//!   holds for a value a node of the delegation role read from a record and handed over
+//!   (`vault/handoff`) as well: it occurs in no response of that node either.
 //!
 //! The tests reach a node through its router only. Every call goes through the fixture, which
 //! keeps every response for the verdict on C1: the node under test is a private field of the
@@ -25,7 +30,9 @@ use credential_enclave_protocol::keys::NodeKeys;
 use credential_enclave_protocol::totp::totp;
 use serde_json::{json, Value};
 
-use self::fixture::{at, field, node_keys, Canary, Role, LOG_STORE, NODES};
+use self::fixture::{
+    at, field, node_keys, Canary, Role, FORWARD, FORWARD_NODE, LOG_STORE, NODES, SITE,
+};
 use crate::testing::{Forwarded, Reply, Seen};
 
 /// The routes of the router, as method and path: the list the router itself is built from, so
@@ -497,10 +504,41 @@ mod scan {
         }
     }
 
+    /// The three things a `vault/send` stream holds (enclave.md 5.16), when `bytes` are such a
+    /// stream as a whole: its meta, the bytes of its parts one after another, and its end
+    /// record. A marker that lies across two parts is in neither of them, and it is in the
+    /// bytes of the parts together.
+    fn stream(bytes: &[u8]) -> Option<[Vec<u8>; 3]> {
+        let length = |at: usize| {
+            let prefix: [u8; 4] = bytes.get(at..at + 4)?.try_into().ok()?;
+            Some(u32::from_be_bytes(prefix) as usize)
+        };
+        let meta_length = length(0)?;
+        let meta = bytes.get(4..4 + meta_length)?;
+        serde_json::from_slice::<Value>(meta)
+            .ok()
+            .filter(Value::is_object)?;
+        let mut at = 4 + meta_length;
+        let mut body = Vec::new();
+        loop {
+            let part_length = length(at)?;
+            at += 4;
+            if part_length == 0 {
+                let end = bytes.get(at..)?;
+                let record = serde_json::from_slice::<Value>(end).ok()?;
+                record.get("complete")?.as_bool()?;
+                return Some([meta.to_vec(), body, end.to_vec()]);
+            }
+            body.extend_from_slice(bytes.get(at..at + part_length)?);
+            at += part_length;
+        }
+    }
+
     /// Every byte string the scan searches for the bytes it was given: the bytes themselves
     /// and, again and again, what is under an encoding that wraps them: percent escapes, the
-    /// strings and byte arrays of JSON, the two parts of a `forward` frame, and base64 or
-    /// base64url text. Each layer names the encodings above it.
+    /// strings and byte arrays of JSON, the two parts of a `forward` frame, the meta, the body
+    /// and the end record of a `vault/send` stream, and base64 or base64url text. Each layer
+    /// names the encodings above it.
     ///
     /// A node signs and seals JSON whose fields are base64url, and carries the result as
     /// base64url again. A key written into such a field is base64url two or three levels deep,
@@ -527,6 +565,9 @@ mod scan {
             if let Ok((meta, payload)) = frame::decode(&Bytes::copy_from_slice(&layer)) {
                 waiting.push((under("frame"), to_json(&meta)));
                 waiting.push((under("frame"), payload.to_vec()));
+            }
+            if let Some(held) = stream(&layer) {
+                waiting.extend(held.map(|bytes| (under("stream"), bytes)));
             }
             for run in base64_runs(&layer) {
                 for engine in [&STANDARD_NO_PAD, &URL_SAFE_NO_PAD] {
@@ -781,9 +822,13 @@ mod fixture {
     use std::sync::{Arc, Mutex};
 
     use axum::http::Method;
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
     use credential_enclave_protocol::encoding::{b64u, b64u_decode, to_json};
-    use credential_enclave_protocol::keys::{record_key, Binding};
+    use credential_enclave_protocol::keys::{record_key, Binding, NodeKeys};
     use credential_enclave_protocol::record::Record;
+    use credential_enclave_protocol::secret::Secret as Sealed;
+    use credential_enclave_protocol::secret_use::{seal_secret_use, BoundRequest};
     use credential_enclave_protocol::{limits, purpose};
     use hyper::body::Bytes;
     use serde_json::{json, Value};
@@ -794,8 +839,8 @@ mod fixture {
     use crate::frame;
     use crate::providers::{endpoint, ClientKind, Definitions};
     use crate::testing::{
-        decode_batch, Answer, App, Attested, BatchOutcome, Forwarded, Harness, Provider, Reply,
-        Seen, LOG_BUCKET, LOG_HOST, LOG_REGION,
+        decode_batch, read_stream, Answer, App, Attested, BatchOutcome, Forwarded, Harness,
+        Provider, Reply, Seen, Streamed, LOG_BUCKET, LOG_HOST, LOG_REGION,
     };
     use crate::tests::{provider_and_log_store, provider_hosts};
 
@@ -810,10 +855,19 @@ mod fixture {
         Api,
         /// The log store of the node: the object of a log entry.
         LogStore,
+        /// The site of a vault secret: the host a use of the secret names (`vault/send`).
+        Site,
     }
 
     /// The name the place of the log store carries where a place names a provider.
     pub const LOG_STORE: &str = "the log store";
+
+    /// The host of the site of the vault secret of a fixture. No provider definition names
+    /// it. The place of the site carries this name where a place names a provider.
+    pub const SITE: &str = "api.vault-site.example";
+
+    /// The text that stands in a request of a test where the value of the vault secret goes.
+    pub const PLACEHOLDER: &str = "CANARY_PLACEHOLDER_0123456789";
 
     /// The addresses of one role of one provider.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -938,8 +992,18 @@ mod fixture {
         }
     }
 
-    /// The names of the two nodes of a fixture.
+    /// The names of the two nodes of the delegation role of a fixture.
     pub const NODES: [&str; 2] = ["node", "peer node"];
+
+    /// The name of the node of the forward role of a fixture, and the number the calls of a
+    /// test name it by: the number behind those of the two nodes of the delegation role.
+    pub const FORWARD_NODE: &str = "forward node";
+    pub const FORWARD: usize = NODES.len();
+
+    /// The name of a node by its number.
+    fn name_of(node: usize) -> &'static str {
+        NODES.get(node).copied().unwrap_or(FORWARD_NODE)
+    }
 
     /// Plants the two private keys of a node and returns them: the signing seed and the
     /// sealing private key.
@@ -994,6 +1058,11 @@ mod fixture {
         /// of its suffixes with at least one segment in front (enclave.md section 7).
         pub fn places(&self, server_name: &str, target: &str) -> Vec<Place> {
             let path = target.split('?').next().unwrap_or_default();
+            // Every address of the site of the vault secret: the record of a secret names a
+            // host, and a use names its path.
+            if server_name == SITE {
+                return vec![at(Role::Site, SITE)];
+            }
             // The objects of the log store: the keys of protocol.md 7.6 and 7.7, each after the
             // bucket that is the first part of the path.
             if server_name == LOG_HOST {
@@ -1178,6 +1247,7 @@ mod fixture {
                 (None, Role::Api) => Reply::json(200, &json!({"ok": true})),
                 // The log store confirms every write.
                 (None, Role::LogStore) => Reply::with_body(200, &[], b""),
+                (None, Role::Site) => Reply::json(200, &json!({"ok": true})),
             }
         }
     }
@@ -1196,13 +1266,19 @@ mod fixture {
     }
 
     /// The fixture: a node whose private keys are planted, a second node for the delegation
-    /// transfer, the app of one account and the provider stand-in.
+    /// transfer, a node of the forward role with the site of one vault secret, the app of one
+    /// account and the provider stand-in.
     pub struct Canary {
         pub secrets: Arc<Secrets>,
         pub stand_in: Arc<StandIn>,
         pub app: App,
         provider: Provider,
         nodes: [Harness; 2],
+        /// The stand-in for the site of the vault secret: the one host the node of the
+        /// forward role reaches.
+        site: Provider,
+        /// The node of the forward role. Its platform reaches the site and no provider.
+        forward: Harness,
         calls: Mutex<Vec<Call>>,
         /// The S256 challenge of every authorization a test began, with its provider.
         challenges: Mutex<Vec<(String, String)>>,
@@ -1239,6 +1315,10 @@ mod fixture {
                 let (sign_seed, seal_private) = node_keys(&secrets, node);
                 Harness::with_draws(&provider, &[&sign_seed, &seal_private])
             });
+            let siting = stand_in.clone();
+            let site = Provider::start(&[SITE], move |seen| siting.answer(seen)).await;
+            let (sign_seed, seal_private) = node_keys(&secrets, FORWARD_NODE);
+            let forward = Harness::with_draws(&site, &[&sign_seed, &seal_private]);
             let app = App::new("canary-user", 0xc5);
             let user_key = app.keys.user_key_of(app.custody);
             secrets.add("user key", user_key.as_slice(), &[]);
@@ -1248,6 +1328,8 @@ mod fixture {
                 app,
                 provider,
                 nodes,
+                site,
+                forward,
                 calls: Mutex::default(),
                 challenges: Mutex::default(),
                 codes: Mutex::default(),
@@ -1262,6 +1344,12 @@ mod fixture {
             canary
         }
 
+        /// A node by its number: one of the two nodes of the delegation role, or the node
+        /// of the forward role.
+        fn node(&self, node: usize) -> &Harness {
+            self.nodes.get(node).unwrap_or(&self.forward)
+        }
+
         /// The one way to a node: sends a request to its router and keeps the answer.
         async fn exchange(
             &self,
@@ -1272,7 +1360,7 @@ mod fixture {
             body: Vec<u8>,
         ) -> Answer {
             let sent = Method::from_bytes(method.as_bytes()).unwrap();
-            let answer = self.nodes[node].call(sent, path, body).await;
+            let answer = self.node(node).call(sent, path, body).await;
             self.calls.lock().unwrap().push(Call {
                 node,
                 method: method.to_string(),
@@ -1308,7 +1396,7 @@ mod fixture {
             json_of(self.exchange(0, false, method, path, to_json(&body)).await)
         }
 
-        /// `GET /v1/health` of one of the two nodes.
+        /// `GET /v1/health` of one of the nodes.
         pub async fn health(&self, node: usize) -> Value {
             let health = self.exchange(node, true, "GET", "/v1/health", Vec::new());
             let (status, health) = json_of(health.await);
@@ -1352,6 +1440,25 @@ mod fixture {
             self.forward(record, "GET", address, json!([]), b"").await
         }
 
+        /// A `forward` call of the first node with the method GET that asks for its response
+        /// as a stream. `Err` carries the status and the failure body of a call that handed
+        /// no response of the provider on.
+        pub async fn get_stream(
+            &self,
+            record: &Value,
+            address: &str,
+        ) -> Result<Streamed, (u16, Value)> {
+            let request = frame::encode_head(&json!({
+                "user_id": self.app.user_id, "record": record, "method": "GET", "url": address,
+                "headers": [], "context": "canary", "timeout_ms": 5000, "stream": true,
+            }));
+            let answer = self.exchange(0, true, "POST", "/v1/forward", request).await;
+            match answer.status {
+                200 => Ok(read_stream(&answer.body)),
+                _ => Err(json_of(answer)),
+            }
+        }
+
         /// A `forward/batch` call of the first node: one GET request without a body per
         /// address. `Err` carries the status and the failure body.
         pub async fn forward_batch(
@@ -1379,7 +1486,137 @@ mod fixture {
             Ok(decode_batch(&meta, &body))
         }
 
-        /// The attestation response of one of the two nodes.
+        /// Gives the node of the forward role its role: the operator configuration that
+        /// names it.
+        pub async fn take_the_forward_role(&self) {
+            let outcome = self
+                .post_on(FORWARD, "/v1/config", json!({"role": "forward"}))
+                .await;
+            // A node of the forward role has no log store, and no node document in one.
+            assert_eq!(
+                outcome,
+                (200, json!({"configured": true, "node_document_ms": 0}))
+            );
+        }
+
+        /// The envelope of one use of a vault secret of the account, sealed to the node of
+        /// the forward role: `value` for a `GET` request to `path` of the site with the query
+        /// `query`, the value inside the header `Authorization`. The keys that sign it stand
+        /// for a node of the delegation role, which seals a use after its log entry.
+        pub fn secret_use(&self, path: &str, query: &str, value: &str, nonce: u8) -> Value {
+            self.secret_use_at("header:authorization", path, query, value, nonce)
+        }
+
+        /// [`Canary::secret_use`] for the slot `slot`: the header `Authorization`, or one
+        /// half of the credentials of HTTP Basic inside it (`basic:user`, `basic:password`).
+        pub fn secret_use_at(
+            &self,
+            slot: &str,
+            path: &str,
+            query: &str,
+            value: &str,
+            nonce: u8,
+        ) -> Value {
+            let request = json!({
+                "method": "GET", "host": SITE, "path": path, "query": query,
+                "slot": slot, "placeholder": PLACEHOLDER,
+                "body_bytes": 0, "body_sha256": "",
+            });
+            let giving = NodeKeys::from_random(&[0x67; 32], &[0x68; 32]);
+            let keys = &self.forward.node.keys;
+            let envelope = seal_secret_use(
+                &giving,
+                &keys.sign_public(),
+                &keys.seal_public(),
+                self.forward.node.now_ms(),
+                &[nonce; 16],
+                &self.app.user_id,
+                &b64u(&[0x31; 16]),
+                &Sealed::new(value.to_string()),
+                &BoundRequest::from_value(&request).unwrap(),
+                &Sealed::new([nonce; 32]),
+            )
+            .unwrap();
+            serde_json::to_value(envelope).unwrap()
+        }
+
+        /// A `vault/handoff` call of the first node: the value of `record` for a `GET`
+        /// request to `path` of the site with the query `query`, the value inside the header
+        /// `Authorization`, handed to the node of the forward role under its attestation.
+        pub async fn handoff(&self, record: &Value, path: &str, query: &str) -> (u16, Value) {
+            self.handoff_at(record, "header:authorization", path, query)
+                .await
+        }
+
+        /// [`Canary::handoff`] for the slot `slot`.
+        pub async fn handoff_at(
+            &self,
+            record: &Value,
+            slot: &str,
+            path: &str,
+            query: &str,
+        ) -> (u16, Value) {
+            let request = json!({
+                "method": "GET", "host": SITE, "path": path, "query": query,
+                "slot": slot, "placeholder": PLACEHOLDER,
+                "body_bytes": 0, "body_sha256": "",
+            });
+            let peer = self.attestation(FORWARD).await;
+            let body = json!({
+                "user_id": self.app.user_id, "record": record, "peer": peer,
+                "request": request, "context": "canary",
+            });
+            self.post("/v1/vault/handoff", body).await
+        }
+
+        /// A `vault/send` call of one of the nodes with an envelope of
+        /// [`Canary::secret_use`] or of [`Canary::handoff`]. `Err` carries the status and the
+        /// failure body of a call that handed no response of the site on.
+        pub async fn vault_send(
+            &self,
+            node: usize,
+            envelope: &Value,
+        ) -> Result<Streamed, (u16, Value)> {
+            self.vault_send_with(node, envelope, &format!("Bearer {PLACEHOLDER}"))
+                .await
+        }
+
+        /// [`Canary::vault_send`] with `authorization` as the `Authorization` header of the
+        /// caller: the placeholder behind a scheme, or credentials of HTTP Basic that hold
+        /// it ([`Canary::basic`]).
+        pub async fn vault_send_with(
+            &self,
+            node: usize,
+            envelope: &Value,
+            authorization: &str,
+        ) -> Result<Streamed, (u16, Value)> {
+            let request = frame::encode_head(&json!({
+                "envelope": envelope, "timeout_ms": 5000,
+                "headers": [["Authorization", authorization]],
+            }));
+            let answer = self
+                .exchange(node, true, "POST", "/v1/vault/send", request)
+                .await;
+            match answer.status {
+                200 => Ok(read_stream(&answer.body)),
+                _ => Err(json_of(answer)),
+            }
+        }
+
+        /// The value of an `Authorization` header with `user_id` as the user-id of
+        /// credentials of HTTP Basic and an empty password: `Basic`, a space, and the base64
+        /// text of `user_id:`.
+        pub fn basic(user_id: &str) -> String {
+            format!("Basic {}", STANDARD.encode(format!("{user_id}:")))
+        }
+
+        /// That header as a caller of `vault/send` writes it: with the placeholder for the
+        /// user-id.
+        pub fn basic_with_the_placeholder() -> String {
+            Canary::basic(PLACEHOLDER)
+        }
+
+        /// The attestation response of one of the nodes.
         pub async fn attestation(&self, node: usize) -> Value {
             let nonce = json!({"nonce": b64u(&[0x5a; 32])});
             let (status, response) = self.post_on(node, "/v1/attestation", nonce).await;
@@ -1642,6 +1879,27 @@ mod fixture {
             outcome
         }
 
+        /// A `vault/store` call of the first node for a value under `name`. The record key
+        /// of a record the call returns is planted: it is derived from the user key like the
+        /// key of a record the app made.
+        pub async fn store(
+            &self,
+            name: &str,
+            sites: Value,
+            slots: Value,
+            value: &str,
+        ) -> (u16, Value) {
+            let body = json!({
+                "user_id": self.app.user_id, "name": name, "sites": sites, "slots": slots,
+                "value": value, "context": "canary",
+            });
+            let outcome = self.post("/v1/vault/store", body).await;
+            if outcome.0 == 200 {
+                self.plant_record_key(&outcome.1["record"]);
+            }
+            outcome
+        }
+
         /// The event a `log` object names on one of the two nodes, read from the object the
         /// log store stand-in received: the node signature verifies and the log key of the
         /// account opens it. Its kind is a kind that this release writes.
@@ -1674,10 +1932,15 @@ mod fixture {
             (kinds, node.last_seq(&self.app.user_id))
         }
 
-        /// The requests the stand-in received so far: those of the providers and the writes to
-        /// the log store.
+        /// The requests the stand-ins received so far: those of the providers, the writes to
+        /// the log store, and those of the site of the vault secret.
         pub fn seen(&self) -> Vec<Seen> {
-            self.provider.seen()
+            [self.provider.seen(), self.site.seen()].concat()
+        }
+
+        /// The requests the site of the vault secret received so far.
+        pub fn site_requests(&self) -> Vec<Seen> {
+            self.site.seen()
         }
 
         /// The requests of the providers the stand-in received so far.
@@ -1746,8 +2009,12 @@ mod fixture {
             let mut leaks = Vec::new();
             for call in self.calls.lock().unwrap().iter() {
                 let answer = &call.answer;
-                let call_of_node =
-                    format!("{} {} of the {}", call.method, call.path, NODES[call.node]);
+                let call_of_node = format!(
+                    "{} {} of the {}",
+                    call.method,
+                    call.path,
+                    name_of(call.node)
+                );
                 if answer.status != 200 && !Canary::is_a_failure_body(&answer.body) {
                     let status = answer.status;
                     leaks.push(format!(
@@ -1782,12 +2049,14 @@ mod fixture {
             assert!(leaks.is_empty(), "markers on C1:\n{}", leaks.join("\n"));
         }
 
-        /// The verdict on C2: every connection a node asked its platform for went to port 443
-        /// of a host of the definitions or of the log store, and carried one request that the
-        /// stand-in received. Every request went to an address that a definition names or to
-        /// an object of the log store, under the TLS server name of its `Host` header, and a
-        /// secret occurs only in requests to the places within its reach. Returns the secrets
-        /// that were seen, each with the place of the request that carried it.
+        /// The verdict on C2: every connection a node of the delegation role asked its
+        /// platform for went to port 443 of a host of the definitions or of the log store,
+        /// every connection the node of the forward role asked for went to port 443 of the
+        /// site of the vault secret, and each carried one request that a stand-in received.
+        /// Every request went to an address that a definition names, to an object of the log
+        /// store or to the site, under the TLS server name of its `Host` header, and a secret
+        /// occurs only in requests to the places within its reach. Returns the secrets that
+        /// were seen, each with the place of the request that carried it.
         pub fn verdict_c2(&self) -> Vec<(String, Place)> {
             let secrets = self.every_secret();
             let scanner = Canary::scanner(&secrets);
@@ -1798,12 +2067,24 @@ mod fixture {
                 .nodes
                 .iter()
                 .flat_map(|node| node.platform.connections());
-            let connections: Vec<(String, u16)> = connections.collect();
+            let mut connections: Vec<(String, u16)> = connections.collect();
             for (host, port) in &connections {
                 // Whoever carries the bytes of a node sees the destination of a connection.
                 if *port != 443 || !(hosts.contains(host) || host == LOG_HOST) {
                     leaks.push(format!("{host}:{port} is the host of no definition"));
                 }
+            }
+            // A node of the forward role holds no credential of a provider and writes no
+            // entry: the one host it reaches is the site of the use it was handed.
+            for (host, port) in self.forward.platform.connections() {
+                if port != 443 || host != SITE {
+                    leaks.push(format!(
+                        "{host}:{port} is not the site of the vault secret, and the {FORWARD_NODE} asked for it"
+                    ));
+                }
+                connections.push((host, port));
+            }
+            for (host, _) in &connections {
                 for (marker, form) in scanner.find(host.as_bytes()) {
                     leaks.push(format!(
                         "the host name {host} carried the {marker} ({form})"
@@ -1863,6 +2144,11 @@ struct Vault {
     card_number: String,
     card_cvc: String,
     card_record: Value,
+    /// A named value for a field of a page of the origin the walk asks for.
+    named_value: String,
+    named_record: Value,
+    /// A named value for a request: its record has no slot `field`, so no call hands it out.
+    request_record: Value,
 }
 
 impl Vault {
@@ -1872,14 +2158,29 @@ impl Vault {
         let card_number = canary.secrets.digits("card number", 19);
         let card_cvc = canary.secrets.text("card verification code", &[]);
         let card = json!({"number": card_number, "cvc": card_cvc});
+        let named_value = canary.secrets.text("named value", &[]);
+        let request_value = canary
+            .secrets
+            .text("named value without the slot field", &[]);
+        let named = json!({
+            "value": named_value, "name": "PAYMENT_PIN", "sites": ["shop.example"],
+            "slots": ["field"], "source": "device",
+        });
+        let request = json!({
+            "value": request_value, "name": "OPENAI_API_KEY", "sites": ["shop.example"],
+            "slots": ["header:authorization"], "source": "device",
+        });
         Vault {
             password_record: canary.record("vault_password", "vault", &json!({"value": password})),
             totp_record: canary.record("vault_totp", "vault", &json!({"value": totp_seed})),
             card_record: canary.record("vault_card", "vault", &card),
+            named_record: canary.record("vault_secret", "vault", &named),
+            request_record: canary.record("vault_secret", "vault", &request),
             password,
             totp_seed,
             card_number,
             card_cvc,
+            named_value,
         }
     }
 }
@@ -1891,6 +2192,7 @@ async fn release_the_vault(canary: &Canary, node: usize, vault: &Vault) {
         (&vault.password_record, "password", &vault.password),
         (&vault.card_record, "card_number", &vault.card_number),
         (&vault.card_record, "card_cvc", &vault.card_cvc),
+        (&vault.named_record, "value", &vault.named_value),
     ] {
         let carries = Some(value.as_str());
         let (status, released) = canary.release(node, record, field, carries).await;
@@ -1918,6 +2220,11 @@ async fn release_the_vault(canary: &Canary, node: usize, vault: &Vault) {
         (&vault.password_record, "card_cvc"),
         (&vault.card_record, "password"),
         (&vault.card_record, "totp"),
+        (&vault.named_record, "password"),
+        // A named value whose record has no slot `field` is handed out by no call, also not
+        // for a host of its sites.
+        (&vault.request_record, "value"),
+        (&vault.request_record, "header:authorization"),
     ] {
         let outcome = canary.release(node, record, field, None).await;
         assert_eq!(code(&outcome), (403, "not_allowed"), "{field}");
@@ -2037,6 +2344,18 @@ async fn walk() -> Canary {
             outcomes.iter().all(|outcome| outcome.status == Some(200)),
             "{provider}: {outcomes:?}"
         );
+        // One of them again, with its response as a stream: the head, the body in parts and
+        // the end record are a response of the node like the frame.
+        let address = stand_in.api_address(&provider);
+        let streamed = canary
+            .get_stream(&connected["record"], &address)
+            .await
+            .unwrap_or_else(|failure| panic!("{provider}: {failure:?}"));
+        assert_eq!(
+            (streamed.status, &streamed.end),
+            (200, &json!({"complete": true})),
+            "{provider}"
+        );
 
         let tokens = stand_in.token_response(&provider);
         stand_in.next_tokens(&tokens);
@@ -2117,12 +2436,170 @@ async fn walk() -> Canary {
     let outcome = canary.post("/v1/release", no_https).await;
     assert_eq!(code(&outcome), (400, "invalid_request"));
 
+    // A value the operator domain gives to the node comes back as a record, and no response
+    // carries it in the clear before `release` hands it out for a field. A value for a
+    // request comes back as a record that no call hands out.
+    let given = canary.secrets.text("value given to vault/store", &[]);
+    let field = (json!(["shop.example"]), json!(["field"]));
+    let (status, stored) = canary
+        .store("SIGNUP_PASSWORD", field.0.clone(), field.1.clone(), &given)
+        .await;
+    assert_eq!(status, 200, "{stored}");
+    let logged = canary.logged(0, &stored["log"]);
+    assert_eq!(
+        (&logged["t"], &logged["provider"], &logged["kind"]),
+        (
+            &json!("connection_created"),
+            &json!("vault"),
+            &json!("vault_secret")
+        )
+    );
+    let carries = Some(given.as_str());
+    let (status, released) = canary.release(0, &stored["record"], "value", carries).await;
+    assert_eq!((status, released["value"].as_str()), (200, carries));
+    let for_a_request = canary
+        .secrets
+        .text("value given to vault/store for a request", &[]);
+    let header = json!(["header:authorization"]);
+    let (status, stored) = canary
+        .store("OPENAI_API_KEY", field.0.clone(), header, &for_a_request)
+        .await;
+    assert_eq!(status, 200, "{stored}");
+    let outcome = canary.release(0, &stored["record"], "value", None).await;
+    assert_eq!(code(&outcome), (403, "not_allowed"));
+    let outcome = canary
+        .store("signup_password", field.0.clone(), field.1.clone(), &given)
+        .await;
+    assert_eq!(code(&outcome), (400, "invalid_request"));
+
     // The two calls of the releases before v2.0.0 that handed the log of an account out do
     // not exist: the log store is the one place an entry is read from.
     for path in ["/v1/log/entries", "/v1/log/ack"] {
         let outcome = canary.probe("POST", path, json!({"user_id": user})).await;
         assert_eq!(code(&outcome), (404, "invalid_request"), "{path}");
     }
+
+    // One use of a vault secret in a request to its site. The node of the forward role sends
+    // the request of an envelope once. It answers no call of the delegation role, and a node
+    // of the delegation role sends nothing.
+    canary.take_the_forward_role().await;
+    let secret = canary
+        .secrets
+        .text("vault secret value", &[at(Role::Site, SITE)]);
+    let used = canary.secret_use("/v1/models", "page=1", &secret, 1);
+    let sent = canary
+        .vault_send(FORWARD, &used)
+        .await
+        .unwrap_or_else(|failure| panic!("{failure:?}"));
+    assert_eq!((sent.status, &sent.end), (200, &json!({"complete": true})));
+    let received = canary.site_requests().pop().unwrap();
+    let carried = format!("Bearer {secret}");
+    assert_eq!(received.target, "/v1/models?page=1");
+    assert_eq!(received.header("authorization"), Some(carried.as_str()));
+    let again = canary.vault_send(FORWARD, &used).await.unwrap_err();
+    assert_eq!(code(&again), (400, "bad_challenge"));
+    let outcome = canary.vault_send(0, &used).await.unwrap_err();
+    assert_eq!(code(&outcome), (403, "not_allowed"));
+    let nonce = json!({"user_id": user, "nonce": b64u(b"canary")});
+    let outcome = canary.post_on(FORWARD, "/v1/status", nonce).await;
+    assert_eq!(code(&outcome), (403, "not_allowed"));
+    let released = json!({
+        "user_id": user, "record": vault.password_record, "field": "password",
+        "origin": "https://shop.example", "context": "canary",
+    });
+    let outcome = canary.post_on(FORWARD, "/v1/release", released).await;
+    assert_eq!(code(&outcome), (403, "not_allowed"));
+    assert_eq!(canary.site_requests().len(), 1);
+
+    // The same use with both nodes: the first node opens a record the device made for the
+    // site, records the use, and hands the value to the node of the forward role inside a
+    // seal. That node sends the request. The record has no slot `field`: its value is in the
+    // request to the site, and in no response of either node.
+    let handed_value = canary
+        .secrets
+        .text("vault secret value of a record", &[at(Role::Site, SITE)]);
+    let for_the_site = json!({
+        "value": handed_value, "name": "SITE_API_KEY", "sites": [SITE],
+        "slots": ["header:authorization"], "source": "device",
+    });
+    let for_the_site = canary.record("vault_secret", "vault", &for_the_site);
+    let (status, handed) = canary.handoff(&for_the_site, "/v1/models", "page=3").await;
+    assert_eq!(status, 200, "{handed}");
+    let logged = canary.logged(0, &handed["log"]);
+    assert_eq!(
+        (&logged["t"], &logged["provider"], &logged["to"]),
+        (
+            &json!("provider_request"),
+            &json!("vault"),
+            &handed["envelope"]["to"]
+        )
+    );
+    let sent = canary
+        .vault_send(FORWARD, &handed["envelope"])
+        .await
+        .unwrap_or_else(|failure| panic!("{failure:?}"));
+    assert_eq!((sent.status, &sent.end), (200, &json!({"complete": true})));
+    let received = canary.site_requests().pop().unwrap();
+    let carried = format!("Bearer {handed_value}");
+    assert_eq!(received.target, "/v1/models?page=3");
+    assert_eq!(received.header("authorization"), Some(carried.as_str()));
+    // A record whose sites do not hold the site is handed to no request to it, and the
+    // value of the record for the site is handed out by no call.
+    let outcome = canary
+        .handoff(&vault.request_record, "/v1/models", "")
+        .await;
+    assert_eq!(code(&outcome), (403, "not_allowed"));
+    let outcome = canary.release(0, &for_the_site, "value", None).await;
+    assert_eq!(code(&outcome), (403, "not_allowed"));
+    assert_eq!(canary.site_requests().len(), 2);
+
+    // A value that is one half of the credentials of HTTP Basic: the user-id, as its record
+    // says. The caller writes the credentials with the placeholder for the user-id, and the
+    // node of the forward role writes the header anew with the value: the value reaches the
+    // site inside the base64 text of that header, and is in no response of either node. A
+    // record of the header itself is handed to no use in the credentials, and a record of
+    // one half of them to no use as the other half.
+    let basic_value = canary
+        .secrets
+        .text("vault secret value of HTTP Basic", &[at(Role::Site, SITE)]);
+    let for_basic = json!({
+        "value": basic_value, "name": "SITE_BASIC_KEY", "sites": [SITE],
+        "slots": ["basic:user"], "source": "device",
+    });
+    let for_basic = canary.record("vault_secret", "vault", &for_basic);
+    let outcome = canary
+        .handoff_at(&for_basic, "basic:password", "/v1/charges", "limit=1")
+        .await;
+    assert_eq!(code(&outcome), (403, "not_allowed"));
+    let (status, handed) = canary
+        .handoff_at(&for_basic, "basic:user", "/v1/charges", "limit=1")
+        .await;
+    assert_eq!(status, 200, "{handed}");
+    assert_eq!(canary.logged(0, &handed["log"])["slot"], "basic:user");
+    let sent = canary
+        .vault_send_with(
+            FORWARD,
+            &handed["envelope"],
+            &Canary::basic_with_the_placeholder(),
+        )
+        .await
+        .unwrap_or_else(|failure| panic!("{failure:?}"));
+    assert_eq!((sent.status, &sent.end), (200, &json!({"complete": true})));
+    let received = canary.site_requests().pop().unwrap();
+    assert_eq!(received.target, "/v1/charges?limit=1");
+    assert_eq!(
+        received.header("authorization"),
+        Some(Canary::basic(&basic_value).as_str())
+    );
+    for half in ["basic:user", "basic:password"] {
+        let outcome = canary
+            .handoff_at(&for_the_site, half, "/v1/charges", "")
+            .await;
+        assert_eq!(code(&outcome), (403, "not_allowed"), "{half}");
+    }
+    let outcome = canary.release(0, &for_basic, "value", None).await;
+    assert_eq!(code(&outcome), (403, "not_allowed"));
+    assert_eq!(canary.site_requests().len(), 3);
 
     // The delegation moves to the second node and that node uses it. A node hands nothing to
     // itself and takes no transfer that was sealed for another node.
@@ -2206,6 +2683,14 @@ async fn walk() -> Canary {
                 .release(0, &vault.password_record, "password", None)
                 .await;
             assert_eq!(code(&released), expected, "release");
+            let stored = canary
+                .store("PAYMENT_PIN", json!("any"), json!(["field"]), "493817")
+                .await;
+            assert_eq!(code(&stored), expected, "vault/store");
+            let handed = canary
+                .handoff(&vault.request_record, "/v1/models", "")
+                .await;
+            assert_eq!(code(&handed), expected, "vault/handoff");
         }
     };
 
@@ -2224,13 +2709,23 @@ async fn walk() -> Canary {
     let outcome = canary.post("/v1/peer/import", returned).await;
     assert_eq!(code(&outcome), (503, "closing"));
     canary.health(0).await;
+
+    // The node of the forward role closes as well: it sends nothing for an envelope that
+    // reaches it afterwards, and its answer holds nothing of the envelope.
+    let sent_before = canary.site_requests().len();
+    assert_eq!(canary.post_on(FORWARD, "/v1/close", json!({})).await.0, 200);
+    let unused = canary.secret_use("/v1/models", "page=2", &secret, 2);
+    let outcome = canary.vault_send(FORWARD, &unused).await.unwrap_err();
+    assert_eq!(code(&outcome), (503, "closing"));
+    assert_eq!(canary.site_requests().len(), sent_before);
+    canary.health(FORWARD).await;
     canary
 }
 
 #[tokio::test]
 async fn the_private_keys_of_a_node_are_the_planted_markers() {
     let canary = Canary::start().await;
-    for (node, name) in NODES.iter().enumerate() {
+    for (node, name) in NODES.iter().chain([&FORWARD_NODE]).enumerate() {
         // The same names give the same values as the ones the fixture planted.
         let (sign_seed, seal_private) = node_keys(&canary.secrets, name);
         let keys = NodeKeys::from_random(&sign_seed, &seal_private);
@@ -2255,7 +2750,7 @@ async fn the_walk_calls_every_route_in_a_success_case_and_in_a_failure_case() {
         routes.iter().map(owned).collect()
     };
     let routes = routes();
-    assert_eq!(routes.len(), 21);
+    assert_eq!(routes.len(), 24);
     let (mail_success, mail_failure) = super::mail::canary_routes().await;
     let mut called = canary.routes_called(|_| true);
     called.extend(mail_success.clone());
@@ -2308,6 +2803,24 @@ async fn a_credential_reaches_only_the_addresses_of_its_own_provider() {
     assert!(saw("client secret", Role::Token, "google_workspace"));
     assert!(saw("client secret", Role::Token, "x"));
     assert!(saw("PKCE verifier", Role::Token, "google_workspace"));
+    // The three values of the vault secrets reached their site, each in the one request of
+    // its use: the value of an envelope the test sealed, the value the first node read from
+    // a record and sealed for the node of the forward role, and the value that node sealed
+    // for the credentials of HTTP Basic, which the site received as base64 text.
+    let site = at(Role::Site, SITE);
+    let to_the_site: Vec<&String> = carried
+        .iter()
+        .filter(|(_, place)| *place == site)
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(
+        to_the_site,
+        [
+            "vault secret value",
+            "vault secret value of a record",
+            "vault secret value of HTTP Basic"
+        ]
+    );
     // The log store received the session token of the operator with the entries of both
     // nodes, and nothing else that is a secret: not the secret access key that signed the
     // writes, and no secret of the account.
@@ -2341,10 +2854,10 @@ async fn a_release_carries_the_one_value_it_was_asked_for_and_never_a_totp_seed(
 
     // One event per value that left, and none for a refusal.
     let (kinds, _) = canary.logged_kinds();
-    let released = ["secret_released"; 3];
+    let released = ["secret_released"; 4];
     assert_eq!(kinds[..1], ["grant_accepted"]);
-    assert_eq!(kinds[1..4], released);
-    assert_eq!(kinds[4..], ["totp_issued"]);
+    assert_eq!(kinds[1..5], released);
+    assert_eq!(kinds[5..], ["totp_issued"]);
     assert!(
         canary.requests().is_empty(),
         "no provider received a request"
@@ -2928,8 +3441,10 @@ type Echo = fn(&str) -> String;
 ///
 /// Encoders do not agree on the bytes they escape: one escapes every byte outside the
 /// unreserved characters, one leaves `/` as it is, and nothing keeps one from escaping every
-/// byte. Each of these is the percent-encoding of the same value.
-const ECHOES: [(&str, Echo); 14] = [
+/// byte. Each of these is the percent-encoding of the same value. Writers of JSON do not
+/// agree either: one writes `/` behind a backslash, another a character of markup as its code
+/// unit.
+const ECHOES: [(&str, Echo); 16] = [
     ("as it is", |value| value.to_string()),
     ("percent, every byte, upper case", |value| {
         percent_encoded(value.as_bytes(), true, true)
@@ -2967,6 +3482,15 @@ const ECHOES: [(&str, Echo); 14] = [
     }),
     ("upper case hex", |value| {
         String::from_utf8(scan::hex(value.as_bytes(), true)).unwrap()
+    }),
+    // Inside a JSON string, as two writers of JSON escape it.
+    ("JSON, the slash escaped", |value| value.replace('/', "\\/")),
+    ("JSON, code units", |value| {
+        let unit = |character: char| match character {
+            '/' | '+' | '=' | ' ' => format!("{}u{:04x}", '\\', u32::from(character)),
+            other => other.to_string(),
+        };
+        value.chars().map(unit).collect()
     }),
 ];
 
@@ -3035,6 +3559,240 @@ async fn a_provider_response_that_reflects_the_injected_credential_is_withheld()
     let (kinds, _) = canary.logged_kinds();
     let recorded = kinds.iter().filter(|kind| *kind == "provider_request");
     assert_eq!(recorded.count(), requests);
+    canary.verdict();
+}
+
+#[tokio::test]
+async fn a_streamed_provider_response_that_reflects_the_injected_credential_is_cut() {
+    let canary = Canary::ready().await;
+    let (_, connected) = canary.connect("google_workspace").await;
+    let record = &connected["record"];
+    let address = canary.stand_in.api_address("google_workspace");
+    let sent = |seen: &Seen| seen.header("authorization").unwrap_or_default().to_string();
+
+    // A response that reflects nothing comes back whole, as a stream.
+    let plain = canary
+        .get_stream(record, &address)
+        .await
+        .unwrap_or_else(|failure| panic!("{failure:?}"));
+    assert_eq!(
+        (plain.status, &plain.end),
+        (200, &json!({"complete": true}))
+    );
+    assert_eq!(plain.log["created"], true);
+    let mut requests = 1;
+
+    // The value of the `Authorization` header of the request in a header of the response, in
+    // every form: the call fails, and no part of the response is handed on.
+    for (form, echo) in ECHOES {
+        canary.stand_in.next(Role::Api, move |seen| {
+            let echoed = echo(&sent(seen));
+            Reply::with_body(200, &[("x-request-echo", echoed.as_str())], b"{}")
+        });
+        requests += 1;
+        let numbered = format!("{address}?request={requests}");
+        let failure = canary.get_stream(record, &numbered).await.expect_err(form);
+        assert_withheld(&failure, form);
+    }
+    // The same in the body, behind bytes that hold nothing of the credential, more of them
+    // than the search holds back: the head is handed on, and the body is cut in front of the
+    // credential.
+    let lead = "0123456789".repeat(4_000);
+    for (form, echo) in ECHOES {
+        let front = lead.clone();
+        canary.stand_in.next(Role::Api, move |seen| {
+            let body = format!("{front}{} and more", echo(&sent(seen)));
+            Reply::with_body(200, &[], body.as_bytes())
+        });
+        requests += 1;
+        let numbered = format!("{address}?request={requests}");
+        let cut = canary
+            .get_stream(record, &numbered)
+            .await
+            .unwrap_or_else(|failure| panic!("{form}: {failure:?}"));
+        assert_eq!(cut.status, 200, "{form}");
+        assert_eq!(cut.end["complete"], false, "{form}");
+        assert_eq!(cut.end["code"], "response_withheld", "{form}");
+        assert!(lead.as_bytes().starts_with(&cut.body()), "{form}");
+    }
+    // The value in two chunks of a chunked body that arrive apart: the search reads the body
+    // across its pieces, and what was handed on before the second chunk came holds no part
+    // of the credential.
+    let lead_bytes = lead.clone();
+    canary.stand_in.next(Role::Api, move |seen| {
+        let value = sent(seen);
+        let (head, tail) = value.split_at(value.len() / 2);
+        let first = format!("{lead_bytes}{head}");
+        let pause = std::time::Duration::from_millis(50);
+        Reply::chunked(200, &[], &[first.as_bytes(), tail.as_bytes()], pause)
+    });
+    requests += 1;
+    let numbered = format!("{address}?request={requests}");
+    let cut = canary.get_stream(record, &numbered).await.unwrap();
+    assert_eq!(cut.end["code"], "response_withheld");
+    assert!(!cut.body().is_empty());
+    assert!(lead.as_bytes().starts_with(&cut.body()));
+
+    // Each request went out, so each is on the log, although its response was cut or
+    // withheld.
+    assert_eq!(canary.requests().len(), 1 + requests);
+    let (kinds, _) = canary.logged_kinds();
+    let recorded = kinds.iter().filter(|kind| *kind == "provider_request");
+    assert_eq!(recorded.count(), requests);
+    canary.verdict();
+}
+
+#[tokio::test]
+async fn a_site_response_that_reflects_the_value_of_a_vault_secret_is_not_handed_on() {
+    let canary = Canary::start().await;
+    canary.take_the_forward_role().await;
+    let secret = canary
+        .secrets
+        .text("vault secret value", &[at(Role::Site, SITE)]);
+    let sent = |seen: &Seen| seen.header("authorization").unwrap_or_default().to_string();
+    let mut uses = 0u8;
+    let mut used = || {
+        uses += 1;
+        let envelope = canary.secret_use("/v1/echo", &format!("use={uses}"), &secret, uses);
+        let canary = &canary;
+        async move { canary.vault_send(FORWARD, &envelope).await }
+    };
+    let withheld = |outcome: Result<crate::testing::Streamed, (u16, Value)>, case: &str| {
+        let failure = outcome.expect_err(case);
+        assert_eq!(code(&failure), (502, "response_withheld"), "{case}");
+    };
+
+    // A response that reflects nothing comes back whole.
+    let plain = used().await.unwrap();
+    assert_eq!(
+        (plain.status, &plain.end),
+        (200, &json!({"complete": true}))
+    );
+    assert_eq!(plain.body(), b"{\"ok\":true}");
+
+    // The value of the `Authorization` header of the request in a header of the response, in
+    // every form: no part of the response is handed on.
+    for (form, echo) in ECHOES {
+        canary.stand_in.next(Role::Site, move |seen| {
+            let echoed = echo(&sent(seen));
+            Reply::with_body(200, &[("x-request-echo", echoed.as_str())], b"{}")
+        });
+        withheld(used().await, form);
+    }
+    // The same in the body, behind bytes that hold nothing of the value, more of them than
+    // the search holds back: the head is handed on, and the body is cut in front of the
+    // value.
+    let lead = "0123456789".repeat(4_000);
+    for (form, echo) in ECHOES {
+        let front = lead.clone();
+        canary.stand_in.next(Role::Site, move |seen| {
+            let body = format!("{front}{} and more", echo(&sent(seen)));
+            Reply::with_body(200, &[], body.as_bytes())
+        });
+        let cut = used()
+            .await
+            .unwrap_or_else(|failure| panic!("{form}: {failure:?}"));
+        assert_eq!(cut.status, 200, "{form}");
+        assert_eq!(cut.end["complete"], false, "{form}");
+        assert_eq!(cut.end["code"], "response_withheld", "{form}");
+        assert!(lead.as_bytes().starts_with(&cut.body()), "{form}");
+    }
+
+    // The value in two chunks of a chunked body that arrive apart: the search reads the
+    // body across its pieces, and what was handed on before the second chunk came holds no
+    // part of the value.
+    let lead_bytes = lead.clone();
+    canary.stand_in.next(Role::Site, move |seen| {
+        let value = sent(seen);
+        let (head, tail) = value.split_at(value.len() / 2);
+        let first = format!("{lead_bytes}{head}");
+        let pause = std::time::Duration::from_millis(50);
+        Reply::chunked(200, &[], &[first.as_bytes(), tail.as_bytes()], pause)
+    });
+    let cut = used().await.unwrap();
+    assert_eq!(cut.end["code"], "response_withheld");
+    assert!(!cut.body().is_empty());
+    assert!(lead.as_bytes().starts_with(&cut.body()));
+
+    // A redirect whose address carries the value, and the answers a node does not search: a
+    // content coding, and a transfer coding it does not remove.
+    canary.stand_in.next(Role::Site, move |seen| {
+        let echoed = percent_encoded(sent(seen).as_bytes(), false, true);
+        let location = format!("https://collector.example/?authorization={echoed}");
+        Reply::with_body(302, &[("location", location.as_str())], b"")
+    });
+    withheld(
+        used().await,
+        "a redirect to an address that carries the value",
+    );
+    for (name, value) in [
+        ("content-encoding", "gzip"),
+        ("transfer-encoding", "gzip, chunked"),
+    ] {
+        canary.stand_in.next(Role::Site, move |_| {
+            Reply::with_body(200, &[(name, value)], b"\x1f\x8b coded")
+        });
+        withheld(used().await, name);
+    }
+
+    // A redirect to another host comes back as it is, and the node follows none: it asked
+    // its platform for the site alone. A cookie of the site is not handed on.
+    canary.stand_in.next(Role::Site, |_| {
+        let headers = [
+            ("location", "https://collector.example/next"),
+            ("set-cookie", "session=canary"),
+        ];
+        Reply::with_body(302, &headers, b"")
+    });
+    let redirect = used().await.unwrap();
+    assert_eq!(redirect.status, 302);
+    assert_eq!(
+        redirect.header("location"),
+        Some("https://collector.example/next")
+    );
+    assert_eq!(redirect.header("set-cookie"), None);
+
+    // Every request of these uses reached the site, with the value in its header.
+    let received = canary.site_requests();
+    assert_eq!(received.len(), usize::from(uses));
+    let carried = format!("Bearer {secret}");
+    assert!(received
+        .iter()
+        .all(|request| request.header("authorization") == Some(carried.as_str())));
+
+    // The value as one half of the credentials of HTTP Basic. The site sends back the
+    // header it received, the base64 text of the credentials with the value in it, in a
+    // header and in its body: neither is handed on.
+    let basic_use = |nonce: u8| {
+        let query = format!("use={nonce}");
+        canary.secret_use_at("basic:user", "/v1/echo", &query, &secret, nonce)
+    };
+    let authorization = Canary::basic_with_the_placeholder();
+    canary.stand_in.next(Role::Site, move |seen| {
+        Reply::with_body(401, &[("x-request-echo", sent(seen).as_str())], b"{}")
+    });
+    let outcome = canary
+        .vault_send_with(FORWARD, &basic_use(200), &authorization)
+        .await;
+    withheld(outcome, "the credentials of HTTP Basic in a header");
+    let front = lead.clone();
+    canary.stand_in.next(Role::Site, move |seen| {
+        let body = format!("{front}{} and more", sent(seen));
+        Reply::with_body(401, &[], body.as_bytes())
+    });
+    let cut = canary
+        .vault_send_with(FORWARD, &basic_use(201), &authorization)
+        .await
+        .unwrap_or_else(|failure| panic!("{failure:?}"));
+    assert_eq!(cut.end["code"], "response_withheld");
+    assert!(lead.as_bytes().starts_with(&cut.body()));
+    // Both requests reached the site, with the value in the credentials of their header.
+    let received = canary.site_requests();
+    assert_eq!(received.len(), usize::from(uses) + 2);
+    let carried = Canary::basic(&secret);
+    assert!(received[usize::from(uses)..]
+        .iter()
+        .all(|request| request.header("authorization") == Some(carried.as_str())));
     canary.verdict();
 }
 

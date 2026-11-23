@@ -35,6 +35,7 @@
 
 mod api;
 mod attest;
+mod bound;
 mod clock;
 mod descriptors;
 mod egress;
@@ -60,6 +61,7 @@ mod oauth;
 mod platform;
 mod provider_response;
 mod providers;
+mod role;
 // The rule on input that ends the program is not in force in this module.
 #[cfg_attr(
     not(test),

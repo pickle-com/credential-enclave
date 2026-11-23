@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
 use std::time::Duration;
 
 use credential_enclave_protocol::encoding::{b64u, b64u_decode, to_json, Signed};
-use credential_enclave_protocol::keys::{binding, shard_hash, Custody, LogStoreId, NodeKeys};
+use credential_enclave_protocol::keys::{
+    binding, role_binding, shard_hash, Custody, LogStoreId, NodeKeys, Role,
+};
 use credential_enclave_protocol::log::{self, EntryKind, Last};
 use credential_enclave_protocol::record::{self, Kind, Record};
 use credential_enclave_protocol::release::ReleaseMeasurement;
@@ -21,6 +23,7 @@ use tokio::sync::{Notify, Semaphore};
 
 use crate::api::responses::Refreshed;
 use crate::api::ApiError;
+use crate::attest::ForwardNodes;
 use crate::clock::Clock;
 use crate::egress::Egress;
 use crate::lineage::Lineage;
@@ -28,6 +31,7 @@ use crate::log_store::{LogStore, WriteFailure};
 use crate::oauth::PkceVerifier;
 use crate::platform::{PlatformError, SharedPlatform};
 use crate::providers::Definitions;
+use crate::role::{RoleCell, UsedNonces};
 
 /// How long a node keeps the response of a successful `refresh` for a repeated call with the
 /// same record: 3,600 seconds.
@@ -1040,6 +1044,8 @@ pub struct Node {
     pub lineage: Lineage,
     pub started_ms: u64,
     pub closing: AtomicBool,
+    /// The role of this node, taken once (protocol.md 4.1).
+    pub role: RoleCell,
     pub config: RwLock<Option<Arc<OperatorConfig>>>,
     /// The log store of this node and the credentials for it (`crate::log_store`).
     pub log_store: LogStore,
@@ -1063,8 +1069,15 @@ pub struct Node {
     pub definitions: Definitions,
     pub egress: Egress,
     pub limits: Limits,
-    pub forward_slots: Semaphore,
+    pub forward_slots: Arc<Semaphore>,
     pub body_budget: Arc<Semaphore>,
+    /// The numbers of the secret uses this node sent (`vault/send`): a node of the forward
+    /// role sends the request of one number once.
+    pub used_nonces: Mutex<UsedNonces>,
+    /// The verifier of the nodes of the forward role for this node, with the nodes it
+    /// verified (`crate::attest`): a node of the delegation role seals a secret use to one of
+    /// them (`vault/handoff`).
+    pub forward_nodes: ForwardNodes,
     /// The places of the token address calls of `refresh` that the node continues after their
     /// time limit (enclave.md 5.7): `limits.refresh_late_tasks` of them.
     pub late_refreshes: Arc<Semaphore>,
@@ -1140,6 +1153,7 @@ impl Node {
         }
         let custody = Custody::parse(platform.custody())
             .ok_or(PlatformError("the platform names an unknown custody"))?;
+        let forward_nodes = ForwardNodes::of(platform.name(), platform.measurement());
         Ok(Node {
             node: keys.node(),
             keys,
@@ -1148,6 +1162,7 @@ impl Node {
             lineage,
             started_ms: clock.now_ms(),
             closing: AtomicBool::new(false),
+            role: RoleCell::default(),
             config: RwLock::new(None),
             // A node of the nitro platform does not act without a log store.
             log_store: LogStore::new(platform.name() == "nitro"),
@@ -1161,8 +1176,10 @@ impl Node {
             clock,
             definitions,
             egress,
-            forward_slots: Semaphore::new(limits.forward_concurrency),
+            forward_slots: Arc::new(Semaphore::new(limits.forward_concurrency)),
             body_budget: Arc::new(Semaphore::new(limits.body_budget_bytes)),
+            used_nonces: Mutex::new(UsedNonces::default()),
+            forward_nodes,
             late_refreshes: Arc::new(Semaphore::new(limits.refresh_late_tasks)),
             limits,
             log_counters: LogCounters::default(),
@@ -1300,10 +1317,17 @@ impl Node {
         self.chains.load(Ordering::SeqCst)
     }
 
-    /// The binding of this node (protocol.md 4.1): its two public keys, its release and, when
-    /// it has one, its log store.
+    /// The binding of this node (protocol.md 4.1): its two public keys, its release, its log
+    /// store when it has one, and its role when that is one a binding names. A node of the
+    /// forward role has no log store. A node that has taken no role yet states none, as a
+    /// node of the delegation role does: it is one with the first call of that role.
     pub fn binding(&self) -> Vec<u8> {
-        binding(&self.keys, self.release, self.log_store.id())
+        let role = self.role.get().unwrap_or(Role::Delegation);
+        let log = match role {
+            Role::Forward => None,
+            Role::Delegation | Role::Reserve => self.log_store.id(),
+        };
+        role_binding(&self.keys, self.release, log, role)
     }
 
     /// The age of the oldest pending entry in milliseconds of node time, as the last sweep of

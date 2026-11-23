@@ -815,11 +815,12 @@ async fn a_grant_of_the_key_of_the_grant_in_force_renews_it_without_an_entry() {
     assert_eq!(release(&harness, &app, &password(&app)).await.0, 200);
     assert_eq!(harness.last_seq("user-1"), 2);
 
-    // A renewal that asks for an earlier end leaves the later one in force. The account ends
-    // a delegation with a revoke.
-    let (shorter, _, _) = grant_for(5).await;
-    assert_eq!(reply(&harness, &shorter)["not_after_ms"], later_end);
-    assert_eq!(shorter["grant"]["not_after_ms"], later_end);
+    // A renewal that asks for an earlier end shortens the grant: the end in force is the end
+    // of the last grant command the node accepted.
+    let (shorter, earlier_end, _) = grant_for(5).await;
+    assert_eq!(reply(&harness, &shorter)["not_after_ms"], earlier_end);
+    assert_eq!(shorter["grant"]["not_after_ms"], earlier_end);
+    assert!(earlier_end < later_end);
     assert_eq!(harness.last_seq("user-1"), 2);
 
     // A node that cannot write to its log store takes no grant command, a renewal included.
@@ -832,7 +833,7 @@ async fn a_grant_of_the_key_of_the_grant_in_force_renews_it_without_an_entry() {
     );
     let (refused, _, envelope) = grant_for(25).await;
     assert_eq!(reply(&harness, &refused)["code"], "log_store_unavailable");
-    assert_eq!(refused["grant"]["not_after_ms"], later_end);
+    assert_eq!(refused["grant"]["not_after_ms"], earlier_end);
     harness.use_log_store().await;
     let again = app.send(&harness, envelope).await;
     assert_eq!(reply(&harness, &again)["ok"], true);

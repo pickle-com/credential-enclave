@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use axum::response::Response;
+use credential_enclave_protocol::keys::Role;
 
 use super::json_ok;
 use super::responses::{
@@ -16,7 +17,8 @@ use crate::descriptors;
 use crate::load;
 use crate::state::Node;
 
-/// The diagnostic values of a node. `accounts` counts the accounts that have a chain on this
+/// The diagnostic values of a node. `role` is `forward` on a node of the forward role and null
+/// on every other node. `accounts` counts the accounts that have a chain on this
 /// node and `grants` the accounts that have a grant within its time (the operator domain reads
 /// it to see that a delegation transfer arrived). `log_store` is null on a node without a log
 /// store. Otherwise it names the bucket and its region, the end of the credentials the node
@@ -54,6 +56,7 @@ pub async fn health(State(node): State<Arc<Node>>) -> Response {
         release: node.release,
         platform: node.platform.name(),
         custody: node.custody.as_str(),
+        role: node.role.get().and_then(Role::binding_value),
         started_ms: node.started_ms,
         time_ms: node.now_ms(),
         configured: node.is_configured(),

@@ -83,7 +83,11 @@ impl TokenKind {
         match kind {
             Kind::Oauth => Some(TokenKind::Issued),
             Kind::OauthImported => Some(TokenKind::Imported),
-            Kind::VaultPassword | Kind::VaultTotp | Kind::VaultCard | Kind::AppPassword => None,
+            Kind::VaultPassword
+            | Kind::VaultTotp
+            | Kind::VaultCard
+            | Kind::VaultSecret
+            | Kind::AppPassword => None,
         }
     }
 
@@ -2202,7 +2206,12 @@ pub mod tests {
             (token.expose_secret().as_str(), hint),
             ("ya29.only-access", "access_token")
         );
-        for kind in [Kind::VaultPassword, Kind::VaultTotp, Kind::VaultCard] {
+        for kind in [
+            Kind::VaultPassword,
+            Kind::VaultTotp,
+            Kind::VaultCard,
+            Kind::VaultSecret,
+        ] {
             assert_eq!(TokenKind::of(kind), None);
         }
     }
