@@ -126,6 +126,9 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
         let user_id = user_id.to_string();
         let provider = record.provider.clone();
         let id = record.id_bytes()?;
+        // The random value of the new record is drawn before the token address is called: a
+        // failure of the random source ends the call with `internal` and nothing changed.
+        let nonce = node.random_public::<12>()?;
         async move {
             let definition = node
                 .definitions
@@ -143,7 +146,6 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
             let now_ms = node.now_ms();
             let renewed = old.refreshed(&response, &definition.token_container, now_ms);
             let public = renewed.public_fields(definition, Some(&response))?;
-            let nonce = node.random_public::<12>()?;
             let refreshed = Refreshed {
                 record: renewed.seal(&grant, &id, &nonce, &user_id, &provider),
                 public,
