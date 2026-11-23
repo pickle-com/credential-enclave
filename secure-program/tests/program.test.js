@@ -321,12 +321,17 @@ test("the program answers the objects the vectors refuse as the reference does: 
   assert.equal(other.world.state.log.unverified_nodes, 0);
 
   // signature: the body its key names, and a signature that is not one of the node of the key.
-  // The node passed its document, so the object contradicts it (A2).
+  // The node passed its document, so the object contradicts it (A2) once the answers of two
+  // rounds carried it: the first leaves the round pending, and the entry is shown as not verified.
   const forged = vectorFixture("dev");
   const signature = byName("the_signature_of_another_node");
   assert.equal(signature.result, "signature");
   handOut(forged, signature.key, signature.entry);
   await S.start(forged);
+  const doubted = await S.call(forged, "read_log", { limit: 100 });
+  assert.equal(forged.world.state.log.unverified_nodes, 0);
+  assert.equal(forged.world.state.log.status, "pending");
+  assert.equal(shownGroups(doubted.value).filter((group) => group.verified !== true).length, 1);
   const marked = await S.call(forged, "read_log", { limit: 100 });
   assert.equal(forged.world.state.log.unverified_nodes, 1);
   assert.equal(forged.world.state.log.status, "attention");
@@ -858,28 +863,109 @@ test("a transfer between nodes of an earlier release is followed: the chain of t
   assert.equal(followed[third.id].seq, 1);
 });
 
-test("A2: a body its key names without a signature of the accepted node of that key, and two bodies an accepted node signed for one seq", async () => {
-  const forged = S.fixture(source, { device: { securityStatus: true } });
-  await S.start(forged);
-  forged.nodes[0].record("c", [{ t: "connection_removed", time_ms: forged.world.now, record_id: "r", provider: "slack", provider_revoke: false }], {
-    signSeed: crypto.randomBytes(32),
-  });
-  await nextDay(forged);
-  assert.equal(forged.world.state.log.status, "attention");
-  assert.equal(forged.world.state.log.unverified_nodes, 1);
-  assert.deepEqual(forged.world.securityStatuses.slice(-1)[0].reasons, ["conflicting_signatures"]);
-  // The mark stays with the node: a round that reads nothing new keeps it.
-  await nextDay(forged);
-  assert.equal(forged.world.state.log.status, "attention");
+test("A2: the signatures of an accepted node contradict each other when the answers of two rounds carried no signature that verifies for a body its key names, and until an answer carries one that does: one such answer leaves the round pending, an object that carries no signature of its node marks the log for good, and two bodies a node signed for one seq mark it at once", async () => {
+  // Has the route of the bodies hand out another signature with the body of key, in the next
+  // answers that name it (times of them).
+  const otherSignature = (fx, key, times) => fx.world.fault("POST /api/secure/log/bodies", (request) => {
+    if (JSON.parse(request.body).keys.indexOf(key) < 0) return undefined;
+    const answer = JSON.parse(fx.world.api("POST", "/api/secure/log/bodies", null, request.body).body);
+    for (const entry of answer.entries) {
+      if (entry.key === key) entry.sig = b64u(crypto.randomBytes(64));
+    }
+    return { status: 200, body: answer };
+  }, times);
+  const removed = (world) => [{ t: "connection_removed", time_ms: world.now, record_id: "r", provider: "slack", provider_revoke: false }];
+  // A synchronization two minutes later: its round reads the keys the one before left.
+  const again = async (fx) => {
+    fx.world.advance(2 * 60000);
+    await S.event(fx, "foreground");
+  };
 
-  const twice = S.fixture(source);
+  // One answer with another signature, and the right one after it: the round of that answer is
+  // pending, the next one verifies, and nothing was told or reported but ok and pending.
+  const once = S.fixture(source, { device: { securityStatus: true } });
+  await S.start(once);
+  const entry = once.nodes[0].record("c", removed(once.world));
+  otherSignature(once, entry.key, 1);
+  await nextDay(once);
+  assert.equal(once.world.state.log.status, "pending");
+  assert.equal(once.world.state.log.unverified_nodes, 0);
+  assert.deepEqual(Object.keys(once.world.stored("log.doubted")), [entry.key]);
+  assert.deepEqual(heldReads(once.world).keys, [entry.key]);
+  await again(once);
+  assert.equal(once.world.state.log.status, "verified");
+  assert.equal(once.world.stored("log.doubted"), undefined);
+  assert.equal(heldReads(once.world), undefined);
+  assert.ok(once.world.securityStatuses.every((told) => told.status !== "attention"));
+  assert.ok(once.world.reports.every((report) => report.status !== "attention"));
+
+  // The answers of two rounds: the log is marked. The right signature then takes the mark back.
+  const twice = S.fixture(source, { device: { securityStatus: true } });
   await S.start(twice);
-  const event = (provider) => [{ t: "connection_created", time_ms: twice.world.now, record_id: "r", provider: provider, scope: "" }];
-  twice.nodes[0].record("c", event("slack"), { seq: 7 });
-  twice.nodes[0].record("c", event("notion"), { seq: 7 });
+  const doubted = twice.nodes[0].record("c", removed(twice.world));
+  otherSignature(twice, doubted.key, 2);
   await nextDay(twice);
+  assert.equal(twice.world.state.log.status, "pending");
+  await again(twice);
   assert.equal(twice.world.state.log.status, "attention");
   assert.equal(twice.world.state.log.unverified_nodes, 1);
+  assert.deepEqual(twice.world.securityStatuses.slice(-1)[0].reasons, ["conflicting_signatures"]);
+  await again(twice);
+  assert.equal(twice.world.state.log.status, "verified");
+  assert.equal(twice.world.state.log.unverified_nodes, 0);
+  assert.equal(twice.world.securityStatuses.slice(-1)[0].status, "ok");
+  assert.equal(twice.world.stored("log.doubted"), undefined);
+
+  // An object that carries no signature of its node: every answer hands out what the store
+  // holds. The second round marks the log, and the mark stays.
+  const forged = S.fixture(source, { device: { securityStatus: true } });
+  await S.start(forged);
+  forged.nodes[0].record("c", removed(forged.world), { signSeed: crypto.randomBytes(32) });
+  await nextDay(forged);
+  assert.equal(forged.world.state.log.status, "pending");
+  const states = [];
+  for (let day = 0; day < 4; day += 1) {
+    await nextDay(forged);
+    states.push(forged.world.state.log.status + ":" + forged.world.state.log.unverified_nodes);
+  }
+  assert.deepEqual(states, ["attention:1", "attention:1", "attention:1", "attention:1"]);
+  assert.deepEqual(forged.world.securityStatuses.slice(-1)[0].reasons, ["conflicting_signatures"]);
+
+  // A backend that hands the body of such a key out no more holds the read back: the key is the
+  // first the rounds ask for, and each round it is kept from is counted (A3).
+  const hidden = S.fixture(source, { device: { securityStatus: true } });
+  await S.start(hidden);
+  const kept = hidden.nodes[0].record("c", removed(hidden.world), { signSeed: crypto.randomBytes(32) });
+  await nextDay(hidden);
+  assert.equal(hidden.world.state.log.status, "pending");
+  hidden.world.fault("POST /api/secure/log/bodies", (request) => {
+    if (JSON.parse(request.body).keys.indexOf(kept.key) < 0) return undefined;
+    const answer = JSON.parse(hidden.world.api("POST", "/api/secure/log/bodies", null, request.body).body);
+    return {
+      status: 200,
+      body: { entries: answer.entries.filter((item) => item.key !== kept.key), missing: answer.missing.concat([kept.key]) },
+    };
+  });
+  const counted = [];
+  for (let day = 0; day < 4; day += 1) {
+    await nextDay(hidden);
+    counted.push(hidden.world.state.log.status + ":" + hidden.world.state.log.store + ":" + hidden.world.stored("log.blocked").count);
+  }
+  assert.deepEqual(counted, ["pending:blocked:1", "pending:blocked:2", "pending:blocked:3", "attention:blocked:4"]);
+  assert.deepEqual(hidden.world.securityStatuses.slice(-1)[0].reasons, ["verification_blocked"]);
+
+  // Two bodies a node signed for one seq: no answer can make that up, and the log is marked at
+  // once and for good.
+  const two = S.fixture(source);
+  await S.start(two);
+  const event = (provider) => [{ t: "connection_created", time_ms: two.world.now, record_id: "r", provider: provider, scope: "" }];
+  two.nodes[0].record("c", event("slack"), { seq: 7 });
+  two.nodes[0].record("c", event("notion"), { seq: 7 });
+  await nextDay(two);
+  assert.equal(two.world.state.log.status, "attention");
+  assert.equal(two.world.state.log.unverified_nodes, 1);
+  await nextDay(two);
+  assert.equal(two.world.state.log.status, "attention");
 });
 
 test("A3: reads the backend holds back mark the log after three days and three rounds, and one round that reads the store clears the count", async () => {
@@ -1672,12 +1758,19 @@ test("A4: an entry this device verified that left the listing within its retenti
   const world = fx.world;
   const seen = fx.nodes[0].chains.get(world.userId)[0].key;
   assert.equal(world.stored("log.sample").length, 1);
+  const object = world.entries3.get(seen);
   world.entries3.delete(seen);
   const before = world.sent("POST /api/secure/log/read").length;
   await nextDay(fx);
   assert.equal(world.sent("POST /api/secure/log/read").length, before + 2);
   assert.equal(world.state.log.status, "attention");
   assert.equal(world.state.log.missing, 1);
+  // The listing names the key again: the mark is taken back.
+  world.entries3.set(seen, object);
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(world.state.log.missing, 0);
+  assert.deepEqual(world.stored("log.missing"), []);
   // An entry older than the retention of the store is expected by nobody.
   const aged = S.fixture(source);
   await S.start(aged);
@@ -2829,9 +2922,13 @@ test("that the store holds no document of a node id is judged for the keys liste
   const shown = await S.call(fx, "read_log", { limit: 50 });
   const groups = shownGroups(shown.value);
   assert.deepEqual(groups.filter((group) => group.verified === true).map((group) => group.kind), ["request", "connected", "grant_renewed"]);
-  // The object that was there before the document is one the node did not sign: under a node
-  // that passed attestation, it contradicts the node (A2).
+  // The object that was there before the document is one the node did not sign: it is shown as
+  // not verified, and under a node that passed attestation it contradicts the node (A2) once
+  // two rounds read it so.
   assert.equal(groups.filter((group) => group.verified !== true).length, 1);
+  assert.equal(world.state.log.unverified_nodes, 0);
+  const again = await S.call(fx, "read_log", { limit: 50 });
+  assert.equal(shownGroups(again.value).filter((group) => group.verified !== true).length, 1);
   assert.equal(world.state.log.unverified_nodes, 1);
   assert.equal(world.state.log.status, "attention");
 });
@@ -4622,6 +4719,8 @@ test("the app is told ok, pending and attention, and an attention is not covered
   fx.nodes[0].record("c", [{ t: "connection_removed", time_ms: world.now, record_id: "r", provider: "slack", provider_revoke: false }], {
     signSeed: crypto.randomBytes(32),
   });
+  await nextDay(fx);
+  assert.equal(world.securityStatuses.slice(-1)[0].status, "pending");
   await nextDay(fx);
   assert.equal(world.securityStatuses.slice(-1)[0].status, "attention");
   const told = world.securityStatuses.length;

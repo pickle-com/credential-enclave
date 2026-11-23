@@ -146,6 +146,10 @@
   const STORE_SAMPLE = "log.sample";
   const STORE_SEEN = "log.seen";
   const STORE_MISSING = "log.missing";
+  // The keys of format 3 whose body an answer handed out with a signature that does not verify
+  // under the accepted node of the key: {key: {n, t, id}} (the rounds whose answers did, the time
+  // of the first, the node id).
+  const STORE_DOUBTED = "log.doubted";
   const STORE_WITHHELD = "log.withheld";
   const STORE_RECOVERED = "log.recovered";
   const STORE_DENIED = "log.denied";
@@ -243,6 +247,10 @@
   const LOG_SEEN_KEYS = (LOG_SEEN_PARTS - 1) * LOG_SEEN_PART;
   const SEEN_DIGEST_CHARS = 12;
   const LOG_MISSING_KEYS = 16;
+  // The rounds whose answers carried no signature that verifies for a key before the signatures
+  // of its node count as contradicting each other (A2). The signature of an object reaches the
+  // device through the backend, so one answer proves nothing of the node.
+  const LOG_DOUBT_ROUNDS = 2;
   const LOG_NODES_KEPT = 256;
   // The reads that were held back that the device keeps for the rounds to make again: the keys
   // of entries, and the listing pages of the screen. As many new control keys that a round
@@ -3500,6 +3508,36 @@
     return RTIME_MAX - Number(String(tail).slice(0, 13));
   }
 
+  /** The keys whose signature did not verify in an answer (log.doubted), LOG_WITHHELD_KEYS at
+   *  most. A key older than the retention of the store is left out. */
+  function loadDoubted() {
+    const kept = storedObject(STORE_DOUBTED);
+    const horizon = native.nowMs() - LOG_RETENTION_DAYS * DAY_MS;
+    const doubted = Object.create(null);
+    for (const key of Object.keys(kept).slice(0, LOG_WITHHELD_KEYS)) {
+      const item = kept[key];
+      const parsed = parseAccountKey(key);
+      if (parsed === null || parsed.time_ms < horizon || item === null || typeof item !== "object" ||
+          typeof item.id !== "string" || !NODE_ID.test(item.id)) continue;
+      doubted[key] = { n: Math.max(1, whole(item.n)), t: whole(item.t), id: item.id };
+    }
+    return doubted;
+  }
+
+  /** Notes that an answer of this round handed out the body a key names with a signature that
+   *  does not verify under the accepted node of that key (once for a round: run.doubted). */
+  function doubtKey(log, run, parsed) {
+    if (run.doubted === undefined) run.doubted = new Set();
+    if (run.doubted.has(parsed.key)) return;
+    run.doubted.add(parsed.key);
+    const kept = log.doubted[parsed.key];
+    if (kept !== undefined) {
+      kept.n = Math.min(kept.n + 1, LOG_DOUBT_ROUNDS);
+    } else if (Object.keys(log.doubted).length < LOG_WITHHELD_KEYS) {
+      log.doubted[parsed.key] = { n: 1, t: native.nowMs(), id: parsed.node };
+    }
+  }
+
   /** Everything this device keeps of the log of the account, read from the program store. */
   function loadLog() {
     const strings = function (key, limit) {
@@ -3519,6 +3557,7 @@
       missing: (Array.isArray(missing) ? missing : []).filter(function (item) {
         return item !== null && typeof item === "object" && typeof item.key === "string";
       }).slice(0, LOG_MISSING_KEYS),
+      doubted: loadDoubted(),
       legacy: loadLegacy(), round: storedObject(STORE_ROUND), cursor: cursor === null ? "" : cursor,
       resume: resume !== null && typeof resume === "object" && typeof resume.key_marker === "string" ? {
         key_marker: resume.key_marker,
@@ -4174,15 +4213,30 @@
         hold(parsed.key);
         continue;
       }
+      if (checked.failure === "signature" && verdict.state === "accepted") {
+        // The body is the one the key names, and the signature the answer carries does not
+        // verify under the accepted node of the key. The signature reaches the device through
+        // the backend, so one answer proves nothing of the node: the key is not judged. Every
+        // round reads it again (log.withheld), and this read is not complete. When the answers
+        // of LOG_DOUBT_ROUNDS rounds carried no signature that verifies for it, the signatures
+        // of the node contradict each other (A2), until an answer carries one that does. A
+        // round the key is held back from is a round held back.
+        doubtKey(log, run, parsed);
+        hold(parsed.key);
+        run.cut = true;
+        continue;
+      }
+      // (A key whose signature verifies now: what an earlier answer left noted of it ends.)
+      if (checked.failure !== "signature" && log.doubted[parsed.key] !== undefined) delete log.doubted[parsed.key];
       const record = { parsed: parsed, state: "ok", verdict: verdict, ours: false, events: null };
       run.entries.set(parsed.key, record);
       run.settled.add(parsed.key);
       if (item.keep === true) run.kept.add(parsed.key);
       if (item.fresh) markSeen(log, digest);
       if (checked.failure === "signature") {
-        // The body is the one the key names and the signature of the node does not verify over it.
+        // The body is the one the key names and no signature of its node verifies over it: the
+        // node is of no accepted measurement, and the object is shown as not verified.
         record.state = "signature";
-        if (verdict.state === "accepted") noteConflict(log, parsed.node, verdict);
         continue;
       }
       if (checked.failure === "fields") {
@@ -4316,6 +4370,7 @@
       noteFailure(turn, run, heldBack(failure));
       return;
     }
+    log.missing = log.missing.filter(function (item) { return !again.tails.has(item.key); });
     gone = gone.filter(function (tail) { return !again.tails.has(tail); });
     for (const tail of gone) {
       const known = log.missing.some(function (item) { return item.key === tail; });
@@ -5107,6 +5162,15 @@
           keep: asked, shown: asked,
         });
       }
+      // The keys whose signature an answer did not carry (log.doubted) are read with them,
+      // whether or not the device keeps them among the keys held back.
+      for (const key of Object.keys(log.doubted)) {
+        const parsed = withheld.keys.indexOf(key) >= 0 ? null : parseAccountKey(key);
+        if (parsed === null) continue;
+        left.push({
+          parsed: parsed, fresh: parsed.letter === "c" && !log.seen.set.has(keyDigest(parsed.key)), held: true,
+        });
+      }
       for (const key of withheld.unjudged) {
         const parsed = parseEntryKey(key, "c");
         // (A key that was judged since: the runtime of that round went down before it wrote
@@ -5190,6 +5254,8 @@
           }
         }
         await readEntries(turn, keys, log, run, items, budget);
+        // (A4) A key noted as missing that a listing names again is missing no more.
+        log.missing = log.missing.filter(function (item) { return !control.tails.has(item.key); });
         if (place.key_marker === "") await judgeSample(turn, log, run, control);
         const met = place.until !== "" && control.keys.some(function (parsed) { return parsed.tail >= place.until; });
         if (met || !control.truncated) {
@@ -5383,7 +5449,14 @@
       if (releases.indexOf(release) < 0) releases.push(release);
       if (item.held === true && NODE_ID.test(node) && heldNodes.indexOf(node) < 0) heldNodes.push(node);
     }
-    const conflicts = Object.keys(log.nodes).filter(function (id) { return log.nodes[id].c !== 0; }).length;
+    // The nodes whose signatures contradict each other (A2): a node with that mark (two bodies
+    // it signed for one seq, an entry of this key it signed that does not open), and the node of
+    // a key for which the answers of LOG_DOUBT_ROUNDS rounds carried no signature that verifies.
+    const conflicting = new Set(Object.keys(log.nodes).filter(function (id) { return log.nodes[id].c !== 0; }));
+    for (const key of Object.keys(log.doubted)) {
+      if (log.doubted[key].n >= LOG_DOUBT_ROUNDS) conflicting.add(log.doubted[key].id);
+    }
+    const conflicts = conflicting.size;
     // In a build that knows the delivery of the program itself: a measurement past its grace
     // waits because no check of the app for a new program ended since the device first saw it,
     // or within SERVED_FRESH_MS, and the last check failed for a reason on the side of the
@@ -5487,6 +5560,7 @@
     storeJson(STORE_SAMPLE, log.sample);
     saveSeen(log.seen);
     storeJson(STORE_MISSING, log.missing);
+    storeJson(STORE_DOUBTED, Object.keys(log.doubted).length === 0 ? null : log.doubted);
     saveWithheld(run);
     saveLegacy(log.legacy);
     native.storeSet(STORE_CURSOR, log.cursor === "" ? null : log.cursor);
@@ -7587,9 +7661,10 @@
       });
     }
     const entry = { id: "3:" + parsed.tail, time_ms: parsed.time_ms, count: parsed.count, items: items };
-    // An entry whose object was not read (the answer of the bodies ended before it, or its read
-    // failed) is shown as not verified in this answer and is not kept: the next read asks for it.
-    if (record === undefined) entry.unread = true;
+    // An entry whose object was not read (the answer of the bodies ended before it, its read
+    // failed, or the answer carried no signature that verifies for it) is shown as not verified
+    // in this answer and is not kept: the next read asks for it again.
+    if (record === undefined || record.state === "signature") entry.unread = true;
     return entry;
   }
 
@@ -9221,7 +9296,7 @@
   function clearLog() {
     forgetSeen();
     for (const key of [STORE_GRANTS, STORE_CURSOR, STORE_RESUME, STORE_NODES, STORE_UNACCEPTED, STORE_BLOCKED,
-      STORE_SAMPLE, STORE_MISSING, STORE_WITHHELD, STORE_RECOVERED, STORE_DENIED, STORE_LEGACY,
+      STORE_SAMPLE, STORE_MISSING, STORE_DOUBTED, STORE_WITHHELD, STORE_RECOVERED, STORE_DENIED, STORE_LEGACY,
       STORE_ROUND, STORE_CACHE]) {
       native.storeSet(key, null);
     }
@@ -10526,7 +10601,7 @@
     forgetSeen();
     for (const key of [LEDGER_STORE_KEY, LEDGER_SHARE_STORE_KEY, SEALING_CHECK_STORE_KEY, STORE_GRANTS,
       STORE_CURSOR, STORE_RESUME, STORE_NODES, STORE_UNACCEPTED, STORE_BLOCKED, STORE_SAMPLE,
-      STORE_MISSING, STORE_WITHHELD, STORE_RECOVERED, STORE_DENIED, STORE_LEGACY, STORE_ROUND, STORE_CACHE,
+      STORE_MISSING, STORE_DOUBTED, STORE_WITHHELD, STORE_RECOVERED, STORE_DENIED, STORE_LEGACY, STORE_ROUND, STORE_CACHE,
       STORE_MIGRATED, STORE_OUTCOMES, STORE_VAULT_MADE, STORE_VAULT_NAMED].concat(RETIRED_STORE_KEYS)) {
       native.storeSet(key, null);
     }
