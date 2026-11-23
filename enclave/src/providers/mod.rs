@@ -965,7 +965,7 @@ mod tests {
             .collect()
     }
 
-    const ROWS: [Row; 9] = [
+    const ROWS: [Row; 11] = [
         Row {
             name: "google_workspace",
             client: ClientKind::Static,
@@ -1255,6 +1255,60 @@ mod tests {
             ],
             id_token_claims: &[],
         },
+        Row {
+            name: "paysign",
+            client: ClientKind::Static,
+            authorize_url: "https://new.paysign.co.kr/oauth/authorize.php",
+            authorize_fixed: &[("resource", "https://new.paysign.co.kr/mcp")],
+            allowed: &["scope"],
+            key_param: "",
+            scope_param: "scope",
+            scope_delimiter: " ",
+            pkce: Pkce::S256,
+            token_url: "https://new.paysign.co.kr/oauth/token.php",
+            client_auth: ClientAuth::Basic,
+            body: BodyFormat::Form,
+            token_headers: &[],
+            token_bearer: "",
+            token_fixed: &[("resource", "https://new.paysign.co.kr/mcp")],
+            ok_field: "",
+            token_container: "",
+            revoke: Some((
+                "https://new.paysign.co.kr/oauth/revoke.php",
+                ClientAuth::Basic,
+                "",
+            )),
+            inject: BEARER,
+            public: COMMON,
+            id_token_claims: &[],
+        },
+        Row {
+            name: "paysign_test",
+            client: ClientKind::Static,
+            authorize_url: "https://newdev.paysign.co.kr/oauth/authorize.php",
+            authorize_fixed: &[("resource", "https://newdev.paysign.co.kr/mcp")],
+            allowed: &["scope"],
+            key_param: "",
+            scope_param: "scope",
+            scope_delimiter: " ",
+            pkce: Pkce::S256,
+            token_url: "https://newdev.paysign.co.kr/oauth/token.php",
+            client_auth: ClientAuth::Basic,
+            body: BodyFormat::Form,
+            token_headers: &[],
+            token_bearer: "",
+            token_fixed: &[("resource", "https://newdev.paysign.co.kr/mcp")],
+            ok_field: "",
+            token_container: "",
+            revoke: Some((
+                "https://newdev.paysign.co.kr/oauth/revoke.php",
+                ClientAuth::Basic,
+                "",
+            )),
+            inject: BEARER,
+            public: COMMON,
+            id_token_claims: &[],
+        },
     ];
 
     #[test]
@@ -1318,7 +1372,7 @@ mod tests {
         &["/info/refs", "/git-upload-pack", "/git-receive-pack"],
     )];
 
-    const ADDRESSES: [(&str, &str, &[&str], &[&str]); 19] = [
+    const ADDRESSES: [(&str, &str, &[&str], &[&str]); 21] = [
         (
             "google_workspace",
             "gmail.googleapis.com",
@@ -1428,6 +1482,8 @@ mod tests {
         ),
         ("github", "uploads.github.com", &["/repos/"], &[]),
         ("github", "github.com", &[], &[]),
+        ("paysign", "new.paysign.co.kr", &[], &["/mcp"]),
+        ("paysign_test", "newdev.paysign.co.kr", &[], &["/mcp"]),
     ];
 
     #[test]
@@ -1832,6 +1888,8 @@ mod tests {
                 "https://github.com/pickle-com/interactive-character.git/info/refs?service=git-upload-pack",
             ),
             ("github", "https://github.com/pickle-com/interactive-character/git-receive-pack"),
+            ("paysign", "https://new.paysign.co.kr/mcp"),
+            ("paysign_test", "https://newdev.paysign.co.kr/mcp"),
         ];
         for (provider, address) in samples {
             for name in definitions.names() {
@@ -1865,6 +1923,23 @@ mod tests {
             ("github", "https://api.github.com/gists"),
             ("github", "https://uploads.github.com/user"),
             ("github", "https://api.github.com/graphql/more"),
+            ("paysign", "https://new.paysign.co.kr/mcp/other"),
+            ("paysign", "https://new.paysign.co.kr/oauth/token.php"),
+            ("paysign", "https://new.paysign.co.kr/oauth/revoke.php"),
+            ("paysign", "https://new.paysign.co.kr/oauth/authorize.php"),
+            ("paysign_test", "https://newdev.paysign.co.kr/mcp/other"),
+            (
+                "paysign_test",
+                "https://newdev.paysign.co.kr/oauth/token.php",
+            ),
+            (
+                "paysign_test",
+                "https://newdev.paysign.co.kr/oauth/revoke.php",
+            ),
+            (
+                "paysign_test",
+                "https://newdev.paysign.co.kr/oauth/authorize.php",
+            ),
             ("microsoft", "https://graph.microsoft.com/beta/me"),
             (
                 "microsoft",

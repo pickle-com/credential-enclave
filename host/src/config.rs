@@ -4,6 +4,9 @@
 //! sends them to the node with `POST /v1/config`, once, as soon as the `health` call of the
 //! node succeeds. The configuration names every provider of the definitions: the callback
 //! address is always set, and a value without an environment variable is the empty string.
+//! The callback address of a provider carries its own name, unless its row of the variable
+//! table names another: the definition of a test server of a service is reached through the
+//! callback address of that service.
 //!
 //! The configuration also names the log store of the node, when the environment names one:
 //! the bucket the node writes its log entries to, and the region of that bucket.
@@ -21,7 +24,8 @@ use crate::http;
 use crate::relay::NodeConnector;
 
 /// The variable with the front of the callback addresses: the callback address of a provider is
-/// `{value}/api/integrations/{provider}/oauth/callback`.
+/// `{value}/api/integrations/{callback name}/oauth/callback`, and the callback name is the name of
+/// the provider or the `callback` of its row of the variable table.
 pub const BASE_URL_VARIABLE: &str = "CHARACTER_API_BASE_URL";
 
 /// The variable with the bucket of the log store of the node.
@@ -93,52 +97,77 @@ struct ClientVariables {
     client_id: &'static str,
     client_secret: &'static str,
     publishable_key: Option<&'static str>,
+    /// The name in the callback address, when it is not the name of the provider.
+    callback: Option<&'static str>,
 }
 
 /// The variables the host program reads, per provider of the definitions. A provider without a
 /// row has no client values of the operator (its clients are registered dynamically).
-const CLIENT_VARIABLES: [ClientVariables; 7] = [
+const CLIENT_VARIABLES: [ClientVariables; 9] = [
     ClientVariables {
         provider: "google_workspace",
         client_id: "GOOGLE_CLIENT_ID",
         client_secret: "GOOGLE_CLIENT_SECRET",
         publishable_key: None,
+        callback: None,
     },
     ClientVariables {
         provider: "microsoft",
         client_id: "OUTLOOK_CLIENT_ID",
         client_secret: "OUTLOOK_CLIENT_SECRET",
         publishable_key: None,
+        callback: None,
     },
     ClientVariables {
         provider: "slack",
         client_id: "SLACK_CLIENT_ID",
         client_secret: "SLACK_CLIENT_SECRET",
         publishable_key: None,
+        callback: None,
     },
     ClientVariables {
         provider: "notion",
         client_id: "NOTION_CLIENT_ID",
         client_secret: "NOTION_CLIENT_SECRET",
         publishable_key: None,
+        callback: None,
     },
     ClientVariables {
         provider: "x",
         client_id: "X_CLIENT_ID",
         client_secret: "X_CLIENT_SECRET",
         publishable_key: None,
+        callback: None,
     },
     ClientVariables {
         provider: "link",
         client_id: "LINK_CLIENT_ID",
         client_secret: "LINK_CLIENT_SECRET",
         publishable_key: Some("STRIPE_PUBLISHABLE_KEY"),
+        callback: None,
     },
     ClientVariables {
         provider: "github",
         client_id: "GITHUB_CLIENT_ID",
         client_secret: "GITHUB_CLIENT_SECRET",
         publishable_key: None,
+        callback: None,
+    },
+    ClientVariables {
+        provider: "paysign",
+        client_id: "PAYSIGN_CLIENT_ID",
+        client_secret: "PAYSIGN_CLIENT_SECRET",
+        publishable_key: None,
+        callback: None,
+    },
+    // The test server of PaySign. The backend has one callback route for PaySign, and the
+    // client of the test server is registered with that address.
+    ClientVariables {
+        provider: "paysign_test",
+        client_id: "PAYSIGN_TEST_CLIENT_ID",
+        client_secret: "PAYSIGN_TEST_CLIENT_SECRET",
+        publishable_key: None,
+        callback: Some("paysign"),
     },
 ];
 
@@ -185,12 +214,15 @@ pub fn operator_config(
         let variables = CLIENT_VARIABLES
             .iter()
             .find(|variables| variables.provider == provider);
+        let callback = variables
+            .and_then(|variables| variables.callback)
+            .unwrap_or(provider.as_str());
         entries.insert(
             provider.clone(),
             json!({
                 "client_id": read(variables.map(|variables| variables.client_id)),
                 "client_secret": read(variables.map(|variables| variables.client_secret)),
-                "redirect_uri": format!("{base}/api/integrations/{provider}/oauth/callback"),
+                "redirect_uri": format!("{base}/api/integrations/{callback}/oauth/callback"),
                 "publishable_key": read(variables.and_then(|variables| variables.publishable_key)),
             }),
         );
@@ -343,7 +375,9 @@ mod tests {
                 "link",
                 "granola",
                 "mercury",
-                "github"
+                "github",
+                "paysign",
+                "paysign_test"
             ])
         );
         assert!(provider_names("[]").is_err());
@@ -372,6 +406,10 @@ mod tests {
             ("LINK_CLIENT_ID", "link-id"),
             ("LINK_CLIENT_SECRET", "link-secret"),
             ("STRIPE_PUBLISHABLE_KEY", "pk_test_1"),
+            ("PAYSIGN_CLIENT_ID", "paysign-id"),
+            ("PAYSIGN_CLIENT_SECRET", "paysign-secret"),
+            ("PAYSIGN_TEST_CLIENT_ID", "paysign-test-id"),
+            ("PAYSIGN_TEST_CLIENT_SECRET", "paysign-test-secret"),
         ]);
         let providers = provider_names(crate::DEFINITIONS).unwrap();
         let body = operator_config(&providers, &variable, None).unwrap();
@@ -429,6 +467,18 @@ mod tests {
                     "client_id": "",
                     "client_secret": "",
                     "redirect_uri": "https://api.example.test/api/integrations/github/oauth/callback",
+                    "publishable_key": "",
+                },
+                "paysign": {
+                    "client_id": "paysign-id",
+                    "client_secret": "paysign-secret",
+                    "redirect_uri": "https://api.example.test/api/integrations/paysign/oauth/callback",
+                    "publishable_key": "",
+                },
+                "paysign_test": {
+                    "client_id": "paysign-test-id",
+                    "client_secret": "paysign-test-secret",
+                    "redirect_uri": "https://api.example.test/api/integrations/paysign/oauth/callback",
                     "publishable_key": "",
                 },
             }
@@ -581,7 +631,8 @@ mod tests {
         assert_eq!(
             line,
             "operator configuration: client id set for google_workspace, link; \
-             not set for microsoft, slack, notion, x, granola, mercury, github"
+             not set for microsoft, slack, notion, x, granola, mercury, github, paysign, \
+             paysign_test"
         );
         assert_eq!(
             summary(&names(&["slack"]), &environment(&[])),

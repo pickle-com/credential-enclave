@@ -127,7 +127,7 @@ const GITHUB_LEAVES: Leaves = &[
 /// The public fields of every provider (egress-policy.md section 4): the leaves of the token
 /// object by their paths, then the claims of the `id_token`. Nothing else of a token response
 /// leaves a node.
-const PUBLIC: [(&str, Leaves, Leaves); 9] = [
+const PUBLIC: [(&str, Leaves, Leaves); 11] = [
     (
         "google_workspace",
         OAUTH_LEAVES,
@@ -192,6 +192,8 @@ const PUBLIC: [(&str, Leaves, Leaves); 9] = [
     ("granola", OAUTH_LEAVES, &[]),
     ("mercury", OAUTH_LEAVES, &[]),
     ("github", GITHUB_LEAVES, &[]),
+    ("paysign", OAUTH_LEAVES, &[]),
+    ("paysign_test", OAUTH_LEAVES, &[]),
 ];
 
 impl Leaf {
