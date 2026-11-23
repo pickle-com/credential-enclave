@@ -1933,6 +1933,54 @@ async fn every_request_goes_over_a_connection_of_its_own() {
 }
 
 #[tokio::test]
+async fn a_value_reaches_no_server_without_a_certificate_for_the_host_of_its_envelope() {
+    // The bytes of a node are carried by the host program, which belongs to the operator
+    // domain: whoever carries them can lead the connection for the site of a value to
+    // another server. The node asks for the host of the envelope by its name and verifies
+    // the certificate of the server for that name, so such a server receives no request.
+    let request = request_of("GET", "/v1/me", "", "header:authorization", b"");
+    let headers = json!([["authorization", format!("Bearer {PLACEHOLDER}")]]);
+
+    // A server with a certificate for the host of the envelope from an authority the node
+    // does not trust.
+    let trusted = quiet_site().await;
+    let stranger = quiet_site().await;
+    let forward = forward_node(&trusted).await;
+    forward.platform.route(SITE, stranger.address);
+    let meta = json!({
+        "envelope": envelope(&forward, &request, VALUE, 1),
+        "headers": headers,
+    });
+    let outcome = forward.vault_send(meta, b"").await;
+    assert_eq!(code(&outcome), (502, "provider_unreachable".to_string()));
+    assert_eq!(stranger.seen().len(), 0);
+    assert_eq!(trusted.seen().len(), 0);
+
+    // A server with a certificate of the authority the node trusts, for another host than
+    // the host of the envelope.
+    let other = Provider::start(&["files.site.example"], |_| {
+        Reply::json(200, &json!({"ok": true}))
+    })
+    .await;
+    let forward = forward_node(&other).await;
+    forward.platform.route(SITE, other.address);
+    let meta = json!({
+        "envelope": envelope(&forward, &request, VALUE, 2),
+        "headers": headers,
+    });
+    let outcome = forward.vault_send(meta, b"").await;
+    assert_eq!(code(&outcome), (502, "provider_unreachable".to_string()));
+    assert_eq!(other.seen().len(), 0);
+    // The node asked for the host of the envelope, and for no other one.
+    assert!(forward
+        .platform
+        .connections()
+        .iter()
+        .all(|(host, port)| host == SITE && *port == 443));
+    assert!(!forward.platform.connections().is_empty());
+}
+
+#[tokio::test]
 async fn the_shares_of_a_request_are_held_until_its_response_has_ended() {
     // The site answers with the head and a part of the body, and then stays silent.
     let provider = site(|_| {
