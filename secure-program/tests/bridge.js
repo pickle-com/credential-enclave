@@ -940,7 +940,11 @@ class World {
     }
     if (method === "POST" && /^\/api\/secure\/log\/(read|bodies|documents)$/.test(path)) {
       if (this.routes.log === "absent") return absent();
-      if (this.routes.log === "disabled") return json(409, { detail: "log_store_disabled" });
+      // A backend that holds the store of format 3 closed answers the listings and the bodies
+      // with log_store_disabled. It answers the node documents all the same, from the node
+      // registry alone: it reads no store and gives no listing address.
+      const closed = this.routes.log === "disabled";
+      if (closed && !path.endsWith("/documents")) return json(409, { detail: "log_store_disabled" });
       if (path.endsWith("/read")) {
         const valid = Array.isArray(body.pages) && body.pages.length >= 1 && body.pages.length <= 8 &&
           body.pages.every((page) => page.prefix === "c" || page.prefix === "u");
@@ -980,7 +984,7 @@ class World {
       const documents = [];
       const missing = [];
       for (const id of body.nodes) {
-        const versions = this.objectsOf(shardBucket(this.serverTarget, id)).get("n3/" + id) || [];
+        const versions = closed ? [] : this.objectsOf(shardBucket(this.serverTarget, id)).get("n3/" + id) || [];
         const written = versions.map((version) => {
           try {
             const value = version.deleteMarker === true ? null : JSON.parse(version.body);
@@ -995,7 +999,7 @@ class World {
       }
       return json(200, {
         documents: documents, missing: missing, unread: [],
-        listings: body.nodes.map((id) => ({ node: id, url: this.documentUrl(id) })),
+        listings: closed ? [] : body.nodes.map((id) => ({ node: id, url: this.documentUrl(id) })),
         expires_ms: this.now + 300000,
       });
     }

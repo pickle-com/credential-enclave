@@ -1757,7 +1757,7 @@ test("a transfer a node of an earlier release made to a node the backend hands o
   assert.equal(world.stored("log.nodes")[first.id].r, fx.latest.release);
 });
 
-test("a transfer a node of an earlier release made on or after 2026-11-23 to a node whose document states a measurement no list has marks the log (A1), and one in an environment without the routes of format 3 is followed", async () => {
+test("a transfer a node of an earlier release made on or after 2026-11-23 to a node whose document states a measurement no list has marks the log (A1), and a backend that holds the store of format 3 closed, or has no route of the node documents, judges the receiving node no other way", async () => {
   // The backend hands out the document it kept: the receiving node is of a measurement no list
   // of the program has.
   const moved = S.fixture(source, { nodes: 0, legacy: 1 });
@@ -1772,20 +1772,57 @@ test("a transfer a node of an earlier release made on or after 2026-11-23 to a n
   await nextDay(moved);
   assert.equal(moved.world.state.log.status, "attention");
   assert.equal(moved.world.state.log.unknown_nodes, 1);
-  // A backend that states it has no store of format 3, on a device that knows of none: no route
-  // hands a document out, and no receiving node is judged.
+  // A backend that holds the store of format 3 closed, on a device that knows of no such store:
+  // the route of the node documents answers all the same, with what the node registry kept. The
+  // receiving node is judged by that document, as in any other environment.
   const closed = S.fixture(source, { nodes: 0, legacy: 1 });
   closed.world.now = TRANSFER_DOCUMENTS_FROM_MS + DAY_MS;
   closed.world.routes.log = "disabled";
   await S.start(closed);
   const receiver = closed.world.addNode({ release: closed.latest.release, measurement: closed.latest, offered: false });
+  closed.world.keptDocuments.set(receiver.id, registryDocument(receiver));
   closed.legacy[0].record("c", [{ t: "grant_transferred_out", time_ms: closed.world.now, to: receiver.id }]);
   for (let day = 0; day < 4; day += 1) {
     await nextDay(closed);
     assert.equal(closed.world.state.log.status, "verified", "day " + day);
   }
   assert.deepEqual(Object.keys(closed.world.stored("log.legacy").nodes).sort(), [closed.legacy[0].id, receiver.id].sort());
+  assert.equal(closed.world.stored("log.nodes")[receiver.id].r, closed.latest.release);
   assert.deepEqual(closed.world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  assert.equal(documentListings(closed.world).length, 0);
+  // The same backend, and a receiving node of a measurement no list has: A1, as above.
+  const unlisted = S.fixture(source, { nodes: 0, legacy: 1 });
+  unlisted.world.now = TRANSFER_DOCUMENTS_FROM_MS + DAY_MS;
+  unlisted.world.routes.log = "disabled";
+  await S.start(unlisted);
+  const other = unlisted.world.addNode({ release: "v2.3.9", measurement: bridge.randomMeasurement(), format: 2, offered: false });
+  unlisted.world.keptDocuments.set(other.id, registryDocument(other));
+  unlisted.legacy[0].record("c", [{ t: "grant_transferred_out", time_ms: unlisted.world.now, to: other.id }]);
+  await nextDay(unlisted);
+  await nextDay(unlisted);
+  assert.equal(unlisted.world.state.log.status, "attention");
+  assert.equal(unlisted.world.state.log.unknown_nodes, 1);
+  // The same backend hands out no document for the receiving node, and a backend answers that
+  // it has no route of the node documents: the device knows of no store of format 3 in either
+  // case, and the read is held back all the same. Nothing but a document that verifies says of
+  // which release the receiving node is.
+  for (const [routes, failure] of [["disabled", "receiver:missing"], ["absent", "documents:Not Found"]]) {
+    const held = S.fixture(source, { nodes: 0, legacy: 1 });
+    held.world.now = TRANSFER_DOCUMENTS_FROM_MS + DAY_MS;
+    held.world.routes.log = routes;
+    await S.start(held);
+    const hidden = held.world.addNode({ release: held.latest.release, measurement: held.latest, offered: false });
+    held.legacy[0].record("c", [{ t: "grant_transferred_out", time_ms: held.world.now, to: hidden.id }]);
+    const states = [];
+    for (let day = 0; day < 4; day += 1) {
+      await nextDay(held);
+      states.push(held.world.state.log.status + ":" + held.world.state.log.store + ":" + held.world.reports.slice(-1)[0].blocked_attempts);
+    }
+    assert.deepEqual(states, ["pending:blocked:1", "pending:blocked:2", "pending:blocked:3", "attention:blocked:4"], routes);
+    assert.equal(held.world.state.log.store_failure, failure, routes);
+    assert.deepEqual(Object.keys(held.world.stored("log.legacy").waiting), [hidden.id], routes);
+    assert.equal(held.world.stored("log.legacy").nodes[hidden.id], undefined, routes);
+  }
   // A device that reads such a transfer when its event is older than the retention of the store:
   // the backend keeps the document of a node no longer than that, so nothing is held back.
   const aged = S.fixture(source, { nodes: 0, legacy: 1 });

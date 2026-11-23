@@ -3494,18 +3494,20 @@
    *              node or one that is not the address of that listing, or the store refuses the
    *              address. detail names the read that is held back
    *    failed    the backend refused the request or did not answer it (the failure is noted on run)
-   *    unasked   the budget was spent, or the device or the store could not be reached (the
-   *              failure is noted on run)
-   *    unserved  (chain) the backend states that it has no such route, and this device knows of
-   *              no store of format 3 in its environment (run.store3)
-   *  A request the backend answers with that statement for nodes of the other kinds holds their
-   *  documents back: a listing of the store named them. */
+   *    unasked   the budget was spent (run.over), or the device or the store could not be
+   *              reached (the failure is noted on run)
+   *  A request the backend answers with the statement that it has no such route or no such store
+   *  holds the documents back, for nodes of every kind: a listing of the store named the keys of
+   *  a node, and the route hands out what the node registry of the backend kept of a receiving
+   *  node whether or not the backend reads the store of format 3. */
   async function learnNodes(turn, log, run, ids, budget, kind) {
     const left = new Map();
     const requests = [];
     for (let at = 0; at < ids.length; at += LOG_DOCUMENT_NODES) {
       const batch = ids.slice(at, at + LOG_DOCUMENT_NODES);
       if (budget.documents <= 0) {
+        // More nodes without a judgement than the document requests of this read name.
+        run.over = true;
         for (const id of batch) left.set(id, { state: "unasked", detail: "" });
         continue;
       }
@@ -3517,10 +3519,9 @@
     for (const item of requests) {
       const outcome = await item.sent;
       if (!outcome.ok) {
-        const refused = kind === "chain" && run.store3 !== true ? outcome.error : heldBack(outcome.error);
+        const refused = heldBack(outcome.error);
         noteFailure(turn, run, refused);
-        const state = refused.kind === "absent" ? "unserved"
-          : refused.kind === "blocked" || refused.kind === "silent" ? "failed" : "unasked";
+        const state = refused.kind === "blocked" || refused.kind === "silent" ? "failed" : "unasked";
         for (const id of item.ids) left.set(id, { state: state, detail: "" });
         continue;
       }
@@ -3872,11 +3873,9 @@
    *    the giving node;
    *    a receiving node whose document could not be asked for waits as well, and the round is
    *    not complete.
-   *  A backend that states it has no route of the node documents, in an environment this device
-   *  knows no store of format 3 of, judges no receiving node: each is followed as a node of the
-   *  release of the giving node. A chain is closed by the first reading that reached its end
-   *  after the grant of its node ran out (LEGACY_CLOSE_SLACK_MS later): a node holds no key
-   *  after that. The keys read are handed to the log screen (rememberKeys). */
+   *  A chain is closed by the first reading that reached its end after the grant of its node ran
+   *  out (LEGACY_CLOSE_SLACK_MS later): a node holds no key after that. The keys read are handed
+   *  to the log screen (rememberKeys). */
   async function followLegacy(turn, keys, log, run) {
     const legacy = log.legacy;
     const now = native.nowMs();
@@ -4049,7 +4048,7 @@
           }
           const kept = receiver.time_ms >= LEGACY_TRANSFER_DOCUMENTS_FROM_MS &&
             now - receiver.time_ms < LOG_RETENTION_DAYS * DAY_MS;
-          if (state !== "unserved" && kept) {
+          if (kept) {
             // The backend keeps the document of every node that took a transfer from that time
             // on, for longer than the store keeps the entry of the transfer, and hands none out
             // that verifies for this one.
