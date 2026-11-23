@@ -564,8 +564,8 @@ struct Write {
 
 /// The entries of one account that a call writes: the entries the call names and the pending
 /// entries of the account. While the claim lives, no other call takes the pending ones along.
-/// When it is dropped, the entries the store confirmed leave the account, and the others
-/// become pending entries: also when the call ends before its writes do.
+/// When it is dropped, the entries the store confirmed leave the account, and the others are
+/// no longer written by this call: also when the call ends before its writes do.
 struct Claim<'a> {
     account: &'a Mutex<Account>,
     writes: Vec<Write>,
@@ -578,8 +578,8 @@ impl<'a> Claim<'a> {
             let required = seqs.contains(&entry.seq);
             // An entry another call writes is left to that call, unless an act of this call
             // waits for it: then both write it, and the store keeps two versions of it.
-            if required || !entry.writing {
-                entry.writing = true;
+            if required || entry.writers == 0 {
+                entry.writers += 1;
                 writes.push(Write {
                     seq: entry.seq,
                     object: StoreObject {
@@ -609,7 +609,9 @@ impl Drop for Claim<'_> {
                 .unconfirmed_mut()
                 .find(|entry| entry.seq == write.seq)
             {
-                entry.writing = false;
+                // This call no longer writes the entry. It is a pending entry once no other
+                // call writes it either.
+                entry.writers = entry.writers.saturating_sub(1);
             }
         }
     }

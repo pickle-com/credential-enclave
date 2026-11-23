@@ -208,3 +208,40 @@ async fn a_call_that_waited_for_an_entry_the_store_never_confirmed_hands_no_valu
         .iter()
         .any(|seen| is_write_of(seen, "user-1", 3)));
 }
+
+#[tokio::test]
+async fn an_entry_two_calls_write_is_pending_only_when_both_ended() {
+    let (provider, store) = refusing_store().await;
+    let (harness, app) = node_with_log_store(&provider).await;
+    lock(&store).status = 403;
+    assert_eq!(release(&harness, &app).await.0, 503);
+    let account = harness.node.account("user-1").unwrap();
+    assert_eq!(lock(&account).pending_entries(), 1);
+
+    // Two calls take the same entry: the first as a pending entry it takes along, the second
+    // because its act waits for it. The entry is written by both, and it is a pending entry
+    // again only when the second of them ended.
+    let seq = lock(&account).last.seq;
+    let awaited = [seq];
+    lock(&store).hang = true;
+    let sweep = crate::log_store::confirm(&harness.node, &account, &[]);
+    let waiting = crate::log_store::confirm(&harness.node, &account, &awaited);
+    let watch = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let guard = lock(&account);
+        (guard.unconfirmed()[0].writers, guard.pending_entries())
+    };
+    let (swept, waited, (writers, pending)) = tokio::join!(sweep, waiting, watch);
+    assert_eq!((writers, pending), (2, 0));
+    // The call that named no entry does not fail for a pending entry, and the call whose act
+    // waits for the entry does.
+    assert_eq!(swept, Ok(()));
+    assert_eq!(
+        waited,
+        Err(credential_enclave_protocol::ProtocolError::LogStoreUnavailable)
+    );
+    let account = lock(&account);
+    assert_eq!(account.unconfirmed()[0].writers, 0);
+    assert_eq!(account.pending_entries(), 1);
+    assert!(!account.is_confirmed(seq));
+}

@@ -278,10 +278,11 @@ pub struct Unconfirmed {
     /// hash of the `user_id` of the account (protocol.md 7.6).
     pub shard: u16,
     pub entry: Signed,
-    /// True while a call writes the entry: the call that created it, or a later call that
-    /// took it along. An entry no call writes is a pending entry: the next write of the
-    /// account takes it along.
-    pub writing: bool,
+    /// The calls that write the entry at this moment: the call that created it, and every
+    /// call that took it along. An entry no call writes (the count is 0) is a pending entry:
+    /// the next write of the account takes it along. The count is kept per call, so the end
+    /// of one call does not say that an entry which another call still writes is pending.
+    pub writers: u32,
     /// The node time at which the entry was created: the time since which the store has not
     /// confirmed it. The sweep writes the pending entries of an account only after a part of
     /// its interval passed since this time, and `pending_oldest_ms` of health is the age of the
@@ -814,7 +815,7 @@ impl Account {
     pub fn pending_entries(&self) -> usize {
         self.unconfirmed
             .iter()
-            .filter(|entry| !entry.writing)
+            .filter(|entry| entry.writers == 0)
             .count()
     }
 
@@ -822,7 +823,7 @@ impl Account {
     pub fn oldest_pending_since_ms(&self) -> Option<u64> {
         self.unconfirmed
             .iter()
-            .filter(|entry| !entry.writing)
+            .filter(|entry| entry.writers == 0)
             .map(|entry| entry.pending_since_ms)
             .min()
     }
@@ -1552,7 +1553,7 @@ impl Node {
                 key: log::object_key_v3(user_id, &key),
                 shard: shard_hash(user_id),
                 entry: signed,
-                writing: false,
+                writers: 0,
                 pending_since_ms: time_ms,
             });
         }
