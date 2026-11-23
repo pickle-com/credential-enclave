@@ -1138,6 +1138,90 @@ test("a device without a network, and a store that fails, leave the log pending 
   assert.deepEqual(failing.world.stored("log.blocked"), { first_ms: 0, count: 0 });
 });
 
+test("a read that ends because the app was suspended counts nothing: a round whose request fails when the runtime runs again is pending, however often in a row, and a later page of the screen that fails that way is not noted", async () => {
+  const fx = S.fixture(source, { device: { securityStatus: true } });
+  await S.start(fx);
+  const world = fx.world;
+  for (let i = 0; i < 6; i += 1) {
+    world.advance(HOUR_MS);
+    fx.nodes[0].record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/messages/" + i, "POST")]);
+  }
+  const listed = () => world.sent("POST /api/secure/log/read").length;
+  // Starts work and lets it go on until it sent its request for listing addresses.
+  const untilListed = async (work) => {
+    const before = listed();
+    const running = Promise.resolve(work());
+    running.then(() => {}, () => {});
+    for (let turn = 0; turn < 50 && listed() === before; turn += 1) await world.settle(0);
+    assert.equal(listed(), before + 1);
+    return { running: running };
+  };
+  // Lets the work end (a synchronization may end with the time of its round) and what it left
+  // behind go on.
+  const ended = async (work) => {
+    let failure = null;
+    try {
+      await world.run(work.running);
+    } catch (error) {
+      failure = error;
+    }
+    await world.settle(30000);
+    return failure;
+  };
+  world.advance(25 * HOUR_MS);
+  const states = [];
+  for (let at = 0; at < 15; at += 1) {
+    world.advance(9 * HOUR_MS);
+    if (at % 3 === 0) {
+      // The user leaves the app while the first request of the round is on its way. The app
+      // tells the program, and the request fails five seconds later, when the runtime runs again.
+      world.fault("POST /api/secure/log/read", { delay_ms: 5000, fail: "transport" }, 1);
+      const sync = await untilListed(() => fx.program.onEvent("foreground", {}));
+      fx.program.onEvent("background", {});
+      await ended(sync);
+    } else {
+      // The runtime stops without a word and runs again later: after thirty seconds (the request
+      // that was not answered ends long after its limit, within the time of the round), or
+      // after ten minutes (it ends after the time of the round).
+      world.fault("POST /api/secure/log/read", "hang", 1);
+      const sync = await untilListed(() => fx.program.onEvent("foreground", {}));
+      world.advance(at % 3 === 1 ? 30000 : 10 * 60000);
+      await ended(sync);
+    }
+    states.push(world.state.log.status + ":" + world.state.log.store + ":" + world.state.log.store_failure);
+    assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 }, "round " + at);
+    assert.equal(world.stored("log.round").unfinished, 0, "round " + at);
+  }
+  const three = ["pending:unreachable:read:suspended", "pending:unreachable:read:suspended", "pending:unreachable:round:suspended"];
+  assert.deepEqual(states, three.concat(three, three, three, three));
+  assert.ok(world.securityStatuses.every((told) => told.status !== "attention"));
+  // A round the runtime runs to its end verifies.
+  world.advance(2 * 60000);
+  await S.event(fx, "foreground");
+  assert.equal(world.state.log.status, "verified");
+
+  // A later page of the screen: the request for its listings fails the same way. Nothing is
+  // noted as held back from the screen, and nothing goes to the rounds.
+  world.pageSize = 2;
+  await S.start(fx);
+  const first = await S.call(fx, "read_log", { limit: 2 });
+  assert.equal(first.value.has_more, true);
+  const before = world.runtime.log_pages[0].before_ms;
+  world.fault("POST /api/secure/log/read", { delay_ms: 5000, fail: "transport" }, 1);
+  const page = await untilListed(() => fx.program.procedures.read_log_page({ before_ms: before }));
+  fx.program.onEvent("background", {});
+  assert.equal((await ended(page)).code, "log_store_unreachable");
+  assert.equal(world.stored("log.denied"), undefined);
+  assert.equal(heldReads(world), undefined);
+  // The same failure with the app in the foreground is a read held back: the backend answered
+  // another request of the runtime a moment before.
+  await S.event(fx, "foreground");
+  world.fault("POST /api/secure/log/read", { delay_ms: 5000, fail: "transport" }, 1);
+  const again = await untilListed(() => fx.program.procedures.read_log_page({ before_ms: before }));
+  assert.equal((await ended(again)).code, "log_store_unreachable");
+  assert.equal(world.stored("log.denied").pages.length, 1);
+});
+
 test("A4: an entry this device verified that left the listing within its retention marks the log, after the listing was read a second time", async () => {
   const fx = S.fixture(source);
   await S.start(fx);

@@ -56,6 +56,9 @@
   // The time a turn waits in an operation that waits for the user is not counted into it. A wait
   // of a turn outlasts this many such operations of the runtime, and ends with the next.
   const WAIT_INTERACTIVE_PASSES = 64;
+  // A wait of a running runtime ends at its limit. A wait that ends later than its own limit by
+  // more than this ended in a runtime that did not run for a part of it (the app was suspended).
+  const WAIT_LATE_MS = 2000;
 
   // ---- Grants ----
   // The lifetime of a grant is a number of days the user chooses (an integer from 1 to 30, 30 by
@@ -1262,6 +1265,14 @@
     return native.error("timeout", what);
   }
 
+  // The time the app last went to the background (the event background; 0: not in this
+  // runtime). A runtime does not run while its app is suspended there, and the requests it had
+  // sent fail when it runs again. A wait that was open when the app went to the background, or
+  // that ends later than its own limit by more than WAIT_LATE_MS, may have failed for that
+  // reason alone: its failure carries the mark frozen (limited), and a read of the log that
+  // fails with that mark failed with the device, whatever the backend did (backendFailure).
+  let appBackgroundMs = 0;
+
   /** Waits for ms milliseconds in sleeps of SLEEP_STEP_MS at most (the bridge cuts a longer
    *  sleep), and ends early once stop.done is set. The number of sleeps is bounded by the time. */
   async function pause(ms, stop) {
@@ -1313,10 +1324,22 @@
       return Promise.reject(timeoutError(what));
     }
     const stop = { done: false };
+    const began = native.nowMs();
+    // The failure of the wait, marked frozen when the runtime may not have run for a part of
+    // the wait (appBackgroundMs).
+    const marked = function (error) {
+      try {
+        const late = limitMs !== Infinity && native.nowMs() - began - limitMs > WAIT_LATE_MS;
+        if ((late || appBackgroundMs >= began) && error !== null && typeof error === "object") error.frozen = true;
+      } catch (failure) {
+        // The bridge is closed, or the failure takes no mark.
+      }
+      return error;
+    };
     const guarded = promise.then(
       function (value) { stop.done = true; return value; },
-      function (error) { stop.done = true; throw error; });
-    const timer = expire(turn, limitMs, stop).then(function () { throw timeoutError(what); });
+      function (error) { stop.done = true; throw marked(error); });
+    const timer = expire(turn, limitMs, stop).then(function () { throw marked(timeoutError(what)); });
     guarded.then(noop, noop);
     timer.then(noop, noop);
     return Promise.race([guarded, timer]);
@@ -2371,7 +2394,12 @@
     const code = failureCode(error);
     if (routeAbsent(error)) return storeFailure("absent", name + ":" + code);
     if (failureStatus(error) !== 0) return storeFailure("blocked", name + ":" + failureStatus(error));
-    if (code === "timeout" || code === "transport") return storeFailure("silent", name + ":" + code);
+    if (code === "timeout" || code === "transport") {
+      // A request that failed in a runtime that may not have run for a part of its wait (the
+      // app was suspended) says nothing of the backend.
+      if (error.frozen === true) return storeFailure("unreachable", name + ":suspended");
+      return storeFailure("silent", name + ":" + code);
+    }
     if (code === "invalid_response") return storeFailure("blocked", name + ":invalid");
     return error;
   }
@@ -3425,8 +3453,8 @@
 
   /** Notes a failed read of a round: what the failure means for the round, and the detail of the
    *  first one for the report. A failure that is not one of the log (the bridge closed, a defect)
-   *  is thrown, and so is every failure once the time of the turn has passed: a round that ran out
-   *  of time judges nothing. */
+   *  is thrown, and so is every failure once the time of the turn has passed: a failure that
+   *  arrives then says nothing of the backend (a round ends its reading there: runRound). */
   function noteFailure(turn, run, failure) {
     if (!isStoreFailure(failure) || !(turnLeft(turn) > 0)) throw failure;
     // A backend without the store that was asked for holds nothing back.
@@ -4476,9 +4504,14 @@
     const ranOut = function (failure) {
       if (failureCode(failure) === "cancelled" || turnLeft(turn) > 0) throw failure;
       expired = true;
-      run.over = true;
       run.cut = true;
-      if (run.detail === "") run.detail = "round:time";
+      // Time that passed while the runtime did not run (the app went to the background during
+      // the round, or the time of the round passed later than a running runtime lets it) is not
+      // time the round had: it could not read, and has not more to read than a round reads.
+      const away = appBackgroundMs >= started || turnSpent(turn) - turn.limitMs > WAIT_LATE_MS;
+      if (away) run.unreachable = true;
+      else run.over = true;
+      if (run.detail === "") run.detail = away ? "round:suspended" : "round:time";
     };
     try {
       for (let page = 0; page < pageLimit && !complete; page += 1) {
@@ -9328,6 +9361,7 @@
         return eventSync(null, true);
       }
       if (name === "background") {
+        appBackgroundMs = native.nowMs();
         noteBackground(true);
         return undefined;
       }

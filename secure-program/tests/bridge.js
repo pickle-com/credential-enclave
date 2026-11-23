@@ -798,7 +798,9 @@ class World {
    *  ("POST /api/secure/log/read", or "S3 " + host for a request to the store), or a function of
    *  the request; respond is {status, body}, "hang" (the request is never answered), "transport"
    *  (the request fails on the device), or a function of the request that returns one of these
-   *  (undefined: no fault). times bounds how often the fault applies. Returns the fault. */
+   *  (undefined: no fault). With delay_ms the answer comes that long after the request ({delay_ms}
+   *  alone delays the answer of the model, and with fail "transport" the request fails on the
+   *  device then). times bounds how often the fault applies. Returns the fault. */
   fault(match, respond, times) {
     const fault = { match: match, respond: respond, times: times === undefined ? Infinity : times, hits: 0 };
     this.faults.push(fault);
@@ -1190,7 +1192,10 @@ class World {
     if (fault === "hang") return new Promise(() => {});
     if (fault === "transport") return Promise.reject(new SecureError("transport", line));
     if (fault !== undefined && typeof fault.delay_ms === "number") {
-      return this.sleep(fault.delay_ms).then(() => this.answer(method, request, fault));
+      return this.sleep(fault.delay_ms).then(() => {
+        if (fault.fail === "transport") throw new SecureError("transport", line);
+        return this.answer(method, request, fault);
+      });
     }
     return Promise.resolve(this.answer(method, request, fault));
   }
