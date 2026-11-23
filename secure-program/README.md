@@ -24,7 +24,15 @@ the program reads no head, verifies no chain equation and traces no transfer fro
 round reads the control entries; the log screen reads the entries it shows and counts the summary
 of the last seven days from the use entries of that window (each counted once per device and kept,
 sealed with a key derived from the master key, with the first page of the screen). A read that was
-held back, whoever made it, is made again by every round until it is not. The
+held back, whoever made it, is made again by every round until it is not, and what a round reads
+of a read of the log screen is kept on the device for the screen (sealed the same way): the entry
+under a key the screen asked for, the listing pages, the entries and the node prefixes of the
+chains of formats 1 and 2. The screen takes an entry from there before it asks for it, and a
+listing page when its own read is held back again, so an answer the backend gives a round is an
+answer the user sees. The reads of the screen that cannot be kept in a form that answers every
+later read (a later listing page, the listing of a chain of formats 1 and 2) are counted by the
+screen itself when they are held back, and rounds that keep ending with more to read than a round
+reads count as rounds held back. The
 entries of the nodes of the releases before v2.4.0 (formats 1 and 2) are read from the bucket
 their bindings name, for display and to follow a transfer of the delegation a node of such a
 release made. The storage of the operator holds no entry. An entry older than 365 days (the
@@ -70,8 +78,8 @@ no request, of no published value and of no value of the program store (`native.
 the user asks to see a value, the program opens the record on the device and hands the value to
 the protected sheet of the app (`native.presentSecret`); in a build without that sheet the value
 is the result of the procedure, which the user interface definition shows. The first page of the
-log screen, which names services and addresses, is kept in the program store sealed with a key
-derived from the master key.
+log screen and what the rounds read for the screen, which name services and addresses, are kept in
+the program store sealed with a key derived from the master key.
 
 What the program reports to the backend about itself names no secret and nothing of the content of
 an account: the result of a round (the status, counts, the names of releases, node ids), the
@@ -80,7 +88,8 @@ synchronization a push started (the key state, the state of the grants, counts, 
 
 A reader checks this in the file. The search terms: `keychainSet` and `keychainGet` (where the
 master key is stored and read), `hpkeSeal` (what is sealed to a node), `aeadSeal` (what is
-encrypted as a record, what the transfer seals, and the kept screen), `native.http(` (every
+encrypted as a record, what the transfer seals, the kept screen and what the rounds keep for the
+screen), `native.http(` (every
 request the program sends: `request` builds the requests to the backend and `fetchStore` the
 requests to the log store), `native.publish(` (every value the program hands to the user
 interface), `native.storeSet(` (every value the program keeps on the device outside the key
@@ -156,7 +165,8 @@ store, the published state, the build of the app with or without the bridge prim
 build), the backend of the operator and the buckets of the log store as the program reaches them
 over `native.http` (the listings of object versions with their delete markers, and the route of
 the node documents with the origin of a document and the addresses of the listings of the node
-document keys), and enclave nodes with their keys, attestation documents, node documents,
+document keys, which answers from the node registry alone while the backend holds the store of
+format 3 closed), and enclave nodes with their keys, attestation documents, node documents,
 commands and log entries of formats 2 and 3 (`docs/protocol.md` sections 4, 5 and 7). The time of
 the model moves only when nothing else can happen, so a test runs a wait of minutes at once. The
 certificate chain of a nitro document is modelled (one leaf of the model stands for the
