@@ -143,10 +143,88 @@ impl LogStoreId {
         &self.region
     }
 
-    /// The host a node writes to: `{bucket}.s3.{region}.amazonaws.com`.
+    /// The host of the bucket that the binding names: `{bucket}.s3.{region}.amazonaws.com`. The
+    /// entries of format 1 and of format 2 are in that bucket, and a reader lists them there.
     pub fn host(&self) -> String {
         format!("{}.s3.{}.amazonaws.com", self.bucket, self.region)
     }
+
+    /// The host a node of format 3 connects to: the endpoint of Amazon S3 in the region of the
+    /// log store, `s3.{region}.amazonaws.com`. Every bucket of the log store is written over
+    /// connections to this one host, with the bucket as the first part of the path.
+    pub fn regional_host(&self) -> String {
+        format!("s3.{}.amazonaws.com", self.region)
+    }
+
+    /// The number of buckets that hold the entries of format 3 of this log store (protocol.md
+    /// 7.6). It is a constant of the name of the log store: a reader computes the bucket of an
+    /// account from the name its program holds, and a node from the name of its binding.
+    pub fn shards(&self) -> u16 {
+        LOG_STORE_SHARDS
+            .iter()
+            .find(|(bucket, _)| *bucket == self.bucket)
+            .map_or(LOG_STORE_SHARDS_DEFAULT, |(_, shards)| *shards)
+    }
+
+    /// The bucket that holds the objects of format 3 of the owner with the hash `owner`
+    /// ([`shard_hash`] of a `user_id` for the entries of an account, of a node identifier for a
+    /// node document): bucket number `owner mod shards`.
+    ///
+    /// `None` when the name of the log store is too long for the names of its buckets to be
+    /// bucket names (more than [`LOG_STORE_NAME_CHARS`] characters): such a log store has no
+    /// bucket of format 3, and a node does not take it.
+    pub fn shard_of(&self, owner: u16) -> Option<String> {
+        self.shard_bucket(owner % self.shards())
+    }
+
+    /// The name of bucket number `index` of this log store (protocol.md 7.6):
+    /// `{h8}-{bucket}-{index}`, where `index` is written as four decimal digits and `h8` is the
+    /// first 8 characters of the lower-case hexadecimal SHA-256 of `{bucket}-{index}`. The
+    /// hash in front spreads the names of the buckets of one log store over the name space of
+    /// the store. `None` for an index at or above [`LogStoreId::shards`] and for a log store
+    /// whose name is longer than [`LOG_STORE_NAME_CHARS`] characters.
+    pub fn shard_bucket(&self, index: u16) -> Option<String> {
+        if index >= self.shards() || self.bucket.len() > LOG_STORE_NAME_CHARS {
+            return None;
+        }
+        let tail = format!("{}-{index:04}", self.bucket);
+        let digest = Sha256::digest(tail.as_bytes());
+        let mut name = String::with_capacity(9 + tail.len());
+        for byte in digest.iter().take(4) {
+            for half in [byte >> 4, byte & 0x0f] {
+                name.extend(char::from_digit(u32::from(half), 16));
+            }
+        }
+        name.push('-');
+        name.push_str(&tail);
+        Some(name)
+    }
+}
+
+/// The log stores whose number of buckets of format 3 is not the default, by the bucket name of
+/// their binding (protocol.md 7.6). Every number is a power of two.
+const LOG_STORE_SHARDS: [(&str, u16); 2] = [
+    ("character-credential-log-prod-1", 1024),
+    ("character-credential-log-local-1", 4),
+];
+
+/// The number of buckets of format 3 of every other log store.
+const LOG_STORE_SHARDS_DEFAULT: u16 = 32;
+
+/// Longest bucket name of a binding whose buckets of format 3 have bucket names: the 63
+/// characters of a bucket name without the hash, the two `-` and the four digits around it.
+pub const LOG_STORE_NAME_CHARS: usize = 49;
+
+/// The hash that places the objects of an owner in a bucket of a log store (protocol.md 7.6):
+/// the first two bytes of `SHA-256(UTF-8(owner))` as a big-endian unsigned integer. `owner` is
+/// the `user_id` of an account or the identifier of a node.
+pub fn shard_hash(owner: &str) -> u16 {
+    let digest = Sha256::digest(owner.as_bytes());
+    let mut first = [0u8; 2];
+    for (byte, digest_byte) in first.iter_mut().zip(digest.iter()) {
+        *byte = *digest_byte;
+    }
+    u16::from_be_bytes(first)
 }
 
 /// The binding document of protocol.md section 4.1.
@@ -334,5 +412,64 @@ mod tests {
                 "{bucket} {region}"
             );
         }
+    }
+
+    #[test]
+    fn a_log_store_has_its_buckets_of_format_3() {
+        let store = |bucket: &str| LogStoreId::parse(bucket, "us-west-2").unwrap();
+        let prod = store("character-credential-log-prod-1");
+        assert_eq!(
+            prod.host(),
+            "character-credential-log-prod-1.s3.us-west-2.amazonaws.com"
+        );
+        assert_eq!(prod.regional_host(), "s3.us-west-2.amazonaws.com");
+        // The number of buckets is a constant of the name: a power of two.
+        assert_eq!(prod.shards(), 1024);
+        assert_eq!(store("character-credential-log-local-1").shards(), 4);
+        for other in [
+            "character-credential-log-dev-1",
+            "character-credential-log-alpha-1",
+            "character-credential-log-yolo-3",
+            "character-credential-log-prod-2",
+            "another-bucket",
+        ] {
+            assert_eq!(store(other).shards(), 32, "{other}");
+        }
+        // The name of a bucket: the first 8 hexadecimal characters of the SHA-256 of the name
+        // of the log store and the number, in front of them.
+        let name = prod.shard_bucket(7).unwrap();
+        let tail = "character-credential-log-prod-1-0007";
+        let digest = Sha256::digest(tail.as_bytes());
+        let hash: String = digest[..4]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(name, format!("{hash}-{tail}"));
+        assert_eq!(prod.shard_bucket(1023).unwrap().len(), 8 + 1 + tail.len());
+        assert_eq!(prod.shard_bucket(1024), None);
+        // The names of the buckets of one store start apart, and two stores share no bucket.
+        let starts: std::collections::BTreeSet<String> = (0..1024)
+            .map(|index| prod.shard_bucket(index).unwrap()[..4].to_string())
+            .collect();
+        assert!(starts.len() > 900, "{}", starts.len());
+        let dev = store("character-credential-log-dev-1");
+        assert_ne!(prod.shard_bucket(0), dev.shard_bucket(0));
+
+        // The bucket of an owner: the first two bytes of the SHA-256 of its name, modulo the
+        // number of buckets.
+        let digest = Sha256::digest("user-1".as_bytes());
+        let hash = u16::from_be_bytes([digest[0], digest[1]]);
+        assert_eq!(shard_hash("user-1"), hash);
+        assert_eq!(prod.shard_of(hash), prod.shard_bucket(hash % 1024));
+        assert_eq!(dev.shard_of(hash), dev.shard_bucket(hash % 32));
+        // A log store whose name leaves no room for the hash and the number has no bucket.
+        assert!(store(&"b".repeat(LOG_STORE_NAME_CHARS))
+            .shard_bucket(0)
+            .is_some());
+        assert_eq!(
+            store(&"b".repeat(LOG_STORE_NAME_CHARS + 1)).shard_bucket(0),
+            None
+        );
+        assert_eq!(store(&"b".repeat(63)).shard_of(hash), None);
     }
 }

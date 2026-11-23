@@ -37,16 +37,46 @@ use crate::platform::Measurement;
 /// The keys of a peer, read from the binding inside its verified attestation document. Only
 /// [`verify_peer`] creates one, so a `Peer` is a node this node accepted: the same platform
 /// and, on nitro, a measurement that the rule of the call ([`Accepted`]) names.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Peer {
     sign_public: [u8; 32],
     seal_public: [u8; 32],
+    program: Program,
+}
+
+/// The program an accepted peer runs, as the rule of the call found it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Program {
+    /// The program of this node: on nitro the measurement of the peer is the measurement of
+    /// this node, and on the local platform, which has no measurement, the peer is a local
+    /// node. A transfer between two such nodes moves a user key between two instances of one
+    /// source, and neither of them creates an entry for it (protocol.md 10.1).
+    Same,
+    /// The program of another release: a later release under an endorsement, or a listed
+    /// predecessor. The text is the release that the binding of the peer names.
+    Release(String),
 }
 
 impl Peer {
     /// The node identifier of the peer.
     pub fn node(&self) -> String {
         node_id(&self.sign_public)
+    }
+
+    /// The program the peer runs.
+    pub fn program(&self) -> &Program {
+        &self.program
+    }
+
+    /// A peer with the keys of `keys` that runs `program`, for the tests of what a node does
+    /// with an accepted peer: no attestation response was verified to make it.
+    #[cfg(test)]
+    pub fn accepted_for_tests(keys: &NodeKeys, program: Program) -> Peer {
+        Peer {
+            sign_public: keys.sign_public(),
+            seal_public: keys.seal_public(),
+            program,
+        }
     }
 
     /// The signing public key of the peer.
@@ -110,20 +140,25 @@ pub enum Accepted<'a> {
 }
 
 impl Accepted<'_> {
-    /// True when the rule accepts a nitro peer with the measurement `pcrs` whose binding
-    /// names the release `release`.
-    fn takes_nitro(&self, pcrs: &[[u8; 48]; 3], release: &str) -> bool {
+    /// The program of a nitro peer with the measurement `pcrs` whose binding names the release
+    /// `release`, when the rule accepts that peer, and `None` when it does not.
+    fn takes_nitro(&self, pcrs: &[[u8; 48]; 3], release: &str) -> Option<Program> {
+        let other = || Program::Release(release.to_string());
         match self {
             Accepted::Own {
                 measurement,
                 predecessors,
-            } => measurement.is_some_and(|own| {
-                own.pcrs == *pcrs
-                    || predecessors
-                        .iter()
-                        .any(|earlier| earlier.pcrs == *pcrs && earlier.release == release)
-            }),
-            Accepted::Later(later) => later.pcrs == *pcrs && later.release == release,
+            } => {
+                let own = (*measurement)?;
+                if own.pcrs == *pcrs {
+                    return Some(Program::Same);
+                }
+                predecessors
+                    .iter()
+                    .any(|earlier| earlier.pcrs == *pcrs && earlier.release == release)
+                    .then(other)
+            }
+            Accepted::Later(later) => (later.pcrs == *pcrs && later.release == release).then(other),
         }
     }
 
@@ -166,15 +201,16 @@ fn read_peer(
         return None;
     }
     let document = b64u_decode(response.get("document")?.as_str()?).ok()?;
-    let binding = match platform {
+    let (binding, program) = match platform {
         "nitro" => nitro_binding(
             accepted,
             verify_nitro_document(&document, AWS_NITRO_ROOT_G1, None).ok()?,
         )?,
         // A local document states no measurement: it is not the node of a release statement.
-        "local" if accepted.takes_local() => {
-            read_binding(&read_local_document(&document).ok()?.binding).ok()?
-        }
+        "local" if accepted.takes_local() => (
+            read_binding(&read_local_document(&document).ok()?.binding).ok()?,
+            Program::Same,
+        ),
         _ => return None,
     };
     // A delegation stays among nodes that write to the same log store: the entries of the
@@ -185,6 +221,7 @@ fn read_peer(
     Some(Peer {
         sign_public: binding.sign_public,
         seal_public: binding.seal_public,
+        program,
     })
 }
 
@@ -198,18 +235,20 @@ fn read_peer(
 ///   time) is not the attestation of a peer.
 /// - the user data is a binding, and `accepted` names the measurement of the document with
 ///   the release of that binding.
-fn nitro_binding(accepted: Accepted<'_>, document: NitroDocument) -> Option<NodeBinding> {
+fn nitro_binding(
+    accepted: Accepted<'_>,
+    document: NitroDocument,
+) -> Option<(NodeBinding, Program)> {
     if document.is_debug_mode() {
         return None;
     }
     document.nonce.as_ref()?;
     let binding = read_binding(document.user_data.as_deref()?).ok()?;
-    accepted
-        .takes_nitro(
-            &[document.pcr0, document.pcr1, document.pcr2],
-            &binding.release,
-        )
-        .then_some(binding)
+    let program = accepted.takes_nitro(
+        &[document.pcr0, document.pcr1, document.pcr2],
+        &binding.release,
+    )?;
+    Some((binding, program))
 }
 
 #[cfg(test)]
@@ -311,6 +350,8 @@ mod tests {
                     .unwrap(),
                 seal_public: b64u_decode_array("2iI8u-awqrbr0Wt2kz4rzQ3-FHkGxVv8IjicSsHqUl4")
                     .unwrap(),
+                // The measurement of the peer is the measurement of this node.
+                program: Program::Same,
             }
         );
         assert_eq!(peer.node(), "QkJRkEKP6EwK2iiQQnQaoqfydMV9RvHVsA3t2zJEkHo");
@@ -436,10 +477,11 @@ mod tests {
             user_data: Some(binding(&keys, "v1.1.0", None)),
             nonce: Some(vec![0x5a; 32]),
         };
-        let accepted = nitro_binding(own(Some(&own_measurement)), document()).unwrap();
+        let (accepted, program) = nitro_binding(own(Some(&own_measurement)), document()).unwrap();
         assert_eq!(accepted.sign_public, keys.sign_public());
         assert_eq!(accepted.seal_public, keys.seal_public());
         assert_eq!(accepted.release, "v1.1.0");
+        assert_eq!(program, Program::Same);
 
         // Another value in one of the three PCRs.
         let changes: [fn(&mut NitroDocument); 3] = [

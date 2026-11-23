@@ -69,7 +69,7 @@ async fn prune_drops_the_grants_outside_the_subset_page_by_page() {
     assert_eq!(harness.health().await["grants"], 8);
     let heads_before: Vec<u64> = holders
         .iter()
-        .map(|user_id| harness.head_seq(user_id))
+        .map(|user_id| harness.last_seq(user_id))
         .collect();
 
     // The node is pod 1 of 3 with 2 copies per account: the accounts whose two nodes do not
@@ -127,7 +127,7 @@ async fn prune_drops_the_grants_outside_the_subset_page_by_page() {
     assert_eq!(
         holders
             .iter()
-            .map(|user_id| harness.head_seq(user_id))
+            .map(|user_id| harness.last_seq(user_id))
             .collect::<Vec<u64>>(),
         heads_before
     );
@@ -206,7 +206,7 @@ fn scan(node: &Node) -> [usize; 7] {
     let mut counts = [0usize; 7];
     for (_, account) in node.accounts_after("") {
         let account = lock(&account);
-        counts[0] += usize::from(account.head.seq > 0);
+        counts[0] += usize::from(account.last.seq > 0);
         counts[1] += usize::from(matches!(account.grant(), GrantState::Active(_)));
         counts[2] += usize::from(!account.unconfirmed().is_empty());
         counts[3] += account.unconfirmed().len();
@@ -248,6 +248,21 @@ async fn the_counts_of_health_equal_a_scan_of_the_accounts_after_every_change() 
         async move {
             let health = harness.health().await;
             assert_eq!(counts_of_health(&health), scan(&harness.node), "{step}");
+            // The state of an account lives as long as the node: an account holds memory for
+            // the merge keys, the kept responses and the unconfirmed entries it has, and none
+            // for those it no longer has.
+            for (user_id, account) in harness.node.accounts_after("") {
+                let account = lock(&account);
+                let has = [
+                    account.merge_key_count(),
+                    account.kept_refresh_count(),
+                    account.unconfirmed().len(),
+                ];
+                let (keys, kept, entries) = account.rooms();
+                for (count, room) in has.into_iter().zip([keys, kept, entries]) {
+                    assert!(count > 0 || room == 0, "{step}: {user_id} {has:?}");
+                }
+            }
             health
         }
     };
@@ -333,8 +348,8 @@ async fn the_counts_of_health_equal_a_scan_of_the_accounts_after_every_change() 
     let health = check("expiry and revoke").await;
     assert_eq!(health["grants"], 3);
 
-    // An import from another node puts a grant in place with a pending entry (the store
-    // refuses the round of the import).
+    // An import from another node of this program puts a grant in place, without an entry:
+    // the store, which refuses, is not asked.
     let newcomer = App::new("f", 10);
     newcomer.grant(&old).await;
     let to = harness
@@ -358,7 +373,7 @@ async fn the_counts_of_health_equal_a_scan_of_the_accounts_after_every_change() 
     assert_eq!((status, imported["imported"].as_u64()), (200, Some(1)));
     let health = check("import").await;
     assert_eq!(health["grants"], 4);
-    assert_eq!(health["log_store"]["pending"], 3);
+    assert_eq!(health["log_store"]["pending"], 2);
 
     // A prune drops the grants outside the share of the node.
     let (status, pruned) = prune(
@@ -386,15 +401,7 @@ async fn the_counts_of_health_equal_a_scan_of_the_accounts_after_every_change() 
     assert_eq!(health["state"]["kept_refreshes"], 0);
     assert_eq!(health["state"]["merge_keys"], 0);
 
-    // The shutdown: the final heads of every account, none pending.
+    // The shutdown changes none of the counts.
     assert_eq!(harness.post("/v1/close", json!({})).await.0, 200);
-    let (status, heads) = harness
-        .post("/v1/close/heads", json!({"cursor": "", "limit": 1000}))
-        .await;
-    assert_eq!(status, 200);
-    assert_eq!(
-        (&heads["truncated"], &heads["skipped"]),
-        (&json!(0), &json!(0))
-    );
     check("closed").await;
 }

@@ -3,12 +3,14 @@
 
 use std::process::Command;
 
-use credential_enclave_protocol::app::{self, ChainError, IndexError};
-use credential_enclave_protocol::attestation::{read_binding, read_local_document, NodeBinding};
+use credential_enclave_protocol::app::{self, ChainError, EntryError, IndexError};
+use credential_enclave_protocol::attestation::{
+    read_binding, read_local_document, NodeBinding, AWS_NITRO_ROOT_G1,
+};
 use credential_enclave_protocol::encoding::{b64u, b64u_decode, verify, Signed};
 use credential_enclave_protocol::envelope::{self, Envelope, TransferEnvelope, TransferGrant};
-use credential_enclave_protocol::keys::{self, Custody, NodeKeys};
-use credential_enclave_protocol::log::{self, EntryKind, EntryParts, Head, ParsedKey};
+use credential_enclave_protocol::keys::{self, Custody, LogStoreId, NodeKeys};
+use credential_enclave_protocol::log::{self, EntryKind, EntryParts, Head, Last, ParsedKey};
 use credential_enclave_protocol::purpose;
 use credential_enclave_protocol::record::{open_record, record_aad, seal_record, Record};
 use credential_enclave_protocol::secret::Secret;
@@ -537,6 +539,175 @@ fn log_chain_of_format_1() {
 }
 
 #[test]
+fn log_of_format_3() {
+    let vector = &vectors()["log_v3"];
+    let log_private = StaticSecret::from(array::<32>(vector, "log_private"));
+    let user_id = text(vector, "user_id");
+    assert_eq!(text(vector, "hpke_info_text"), purpose::LOG_ENTRY_SEAL_V3);
+    assert_eq!(
+        text(vector, "signature_context_text"),
+        purpose::LOG_ENTRY_V3
+    );
+    assert_eq!(
+        text(vector, "control_prefix"),
+        log::entry_prefix_v3(user_id, EntryKind::Control)
+    );
+    assert_eq!(
+        text(vector, "use_prefix"),
+        log::entry_prefix_v3(user_id, EntryKind::Use)
+    );
+    let entries = vector["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 4);
+    assert_eq!(vector["verifies"], true);
+
+    // Every object verifies against the parts of its key, which its key gives back, and opens
+    // to its events. The body of an entry carries the hash of the body before it.
+    let mut prev = b64u(&[0u8; 32]);
+    let mut listed: Vec<Vec<String>> = vec![Vec::new(), Vec::new()];
+    for entry in entries {
+        let key = log::parse_object_key_v3(text(entry, "key"), user_id).expect("a key");
+        assert_eq!(log::object_key_v3(user_id, &key), text(entry, "key"));
+        assert_eq!(key.node, text(vector, "node"));
+        assert_eq!(key.key_id, text(vector, "key_id"));
+        assert_eq!(key.seq, entry["seq"].as_u64().unwrap());
+        assert_eq!(key.time_ms, entry["time_ms"].as_u64().unwrap());
+        assert_eq!(key.kind().letter().to_string(), text(entry, "kind"));
+        assert_eq!(u64::from(key.count()), entry["count"].as_u64().unwrap());
+        assert_eq!(b64u(&key.body_hash), text(entry, "body_hash"));
+        let (body, body_bytes) =
+            app::verify_entry_v3(user_id, &key, &signed(&entry["entry"])).unwrap();
+        assert_eq!(body_bytes, text(entry, "body_text").as_bytes());
+        assert_eq!((body.v, &body.prev), (3, &prev));
+        let events = app::open_entry_v3(&log_private, &body_bytes).unwrap();
+        let expected: Vec<Value> = serde_json::from_str(text(entry, "events_text")).unwrap();
+        assert_eq!(events, expected);
+        // The event name of a control key is the `t` of its one event.
+        if let log::EntryLabel::Control(event) = &key.label {
+            assert_eq!(events[0]["t"], event.as_str());
+        }
+        prev = b64u(&key.body_hash);
+        listed[usize::from(key.kind() == EntryKind::Use)].push(text(entry, "key").to_string());
+    }
+    // A listing returns the keys of a prefix in the order of their bytes: the latest first.
+    for (keys, name) in listed.iter_mut().zip(["control_listing", "use_listing"]) {
+        keys.sort();
+        let expected: Vec<&str> = vector[name]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|key| key.as_str().unwrap())
+            .collect();
+        assert_eq!(keys, &expected);
+        let times: Vec<u64> = keys
+            .iter()
+            .map(|key| log::parse_object_key_v3(key, user_id).unwrap().time_ms)
+            .collect();
+        assert!(times.windows(2).all(|pair| pair[0] > pair[1]), "{times:?}");
+    }
+
+    // An object that is not the entry of its key.
+    let rejected = vector["rejected"].as_array().unwrap();
+    assert_eq!(rejected.len(), 3);
+    for case in rejected {
+        let key = log::parse_object_key_v3(text(case, "key"), user_id).expect("a key");
+        let outcome = match app::verify_entry_v3(user_id, &key, &signed(&case["entry"])) {
+            Ok(_) => "ok",
+            Err(EntryError::Body) => "body",
+            Err(EntryError::Signature) => "signature",
+            Err(EntryError::Fields) => "fields",
+        };
+        assert_eq!(outcome, text(case, "result"), "{}", text(case, "name"));
+        assert_ne!(outcome, "ok");
+    }
+    // Strings that are not keys of the account.
+    assert_eq!(vector["a_key_of_not_keys_parses"], false);
+    for key in vector["not_keys"].as_array().unwrap() {
+        let key = key.as_str().unwrap();
+        assert!(log::parse_object_key_v3(key, user_id).is_none(), "{key}");
+    }
+
+    // The node document: its key, its bucket, its nonce, and what a reader accepts.
+    let document = &vector["node_document"];
+    let node = text(vector, "node");
+    let node_public: [u8; 32] = array(vector, "node_sign_pk");
+    assert_eq!(text(document, "key"), log::node_document_key(node));
+    assert_eq!(text(document, "nonce_prefix_text"), purpose::NODE_DOCUMENT);
+    assert_eq!(
+        array::<32>(document, "nonce"),
+        log::node_document_nonce(&node_public)
+    );
+    let facts = app::read_node_document(
+        text(document, "object_text").as_bytes(),
+        node,
+        AWS_NITRO_ROOT_G1,
+    )
+    .unwrap();
+    assert_eq!(document["accepted"], true);
+    assert_eq!((facts.platform.as_str(), facts.pcrs), ("local", None));
+    assert_eq!(facts.binding.sign_public, node_public);
+    let store = facts.binding.log.expect("the binding names the log store");
+    assert_eq!(
+        store.shard_of(keys::shard_hash(node)).as_deref(),
+        Some(text(document, "bucket"))
+    );
+    for case in document["rejected"].as_array().unwrap() {
+        let accepted = app::read_node_document(
+            text(case, "object_text").as_bytes(),
+            text(case, "node"),
+            AWS_NITRO_ROOT_G1,
+        )
+        .is_ok();
+        assert!(!accepted, "{}", text(case, "name"));
+        assert_eq!(case["accepted"], false);
+    }
+}
+
+#[test]
+fn log_store_buckets() {
+    let vector = &vectors()["log_store"];
+    let stores = vector["stores"].as_array().unwrap();
+    assert_eq!(stores.len(), 5);
+    let mut counts = Vec::new();
+    for case in stores {
+        let store = LogStoreId::parse(text(case, "bucket"), text(case, "region")).unwrap();
+        let shards = store.shards();
+        assert_eq!(u64::from(shards), case["shards"].as_u64().unwrap());
+        assert!(shards.is_power_of_two());
+        assert_eq!(store.regional_host(), text(case, "host"));
+        assert_eq!(
+            store.shard_bucket(0).as_deref(),
+            Some(text(case, "first_bucket"))
+        );
+        assert_eq!(
+            store.shard_bucket(shards - 1).as_deref(),
+            Some(text(case, "last_bucket"))
+        );
+        assert_eq!(store.shard_bucket(shards), None);
+        for owner in case["owners"].as_array().unwrap() {
+            let hash = keys::shard_hash(text(owner, "owner"));
+            assert_eq!(u64::from(hash), owner["hash"].as_u64().unwrap());
+            assert_eq!(u64::from(hash % shards), owner["index"].as_u64().unwrap());
+            assert_eq!(store.shard_of(hash).as_deref(), Some(text(owner, "bucket")));
+        }
+        // Every bucket of a store has a bucket name of its own.
+        let names: std::collections::BTreeSet<String> = (0..shards)
+            .map(|index| store.shard_bucket(index).unwrap())
+            .collect();
+        assert_eq!(names.len(), usize::from(shards));
+        assert!(names
+            .iter()
+            .all(|name| LogStoreId::parse(name, "us-west-2").is_some()));
+        counts.push(shards);
+    }
+    assert_eq!(counts, [1024, 32, 32, 4, 32]);
+    // The longest name of a log store that has buckets, and a name one character longer.
+    let longest = &vector["longest_name"];
+    assert_eq!(text(longest, "bucket").len(), keys::LOG_STORE_NAME_CHARS);
+    assert_eq!(text(longest, "first_bucket").len(), 63);
+    assert_eq!(vector["name_without_buckets"]["first_bucket"], Value::Null);
+}
+
+#[test]
 fn log_entries_are_reproducible_from_their_seeds() {
     let all = vectors();
     let command = &all["command"];
@@ -544,6 +715,34 @@ fn log_entries_are_reproducible_from_their_seeds() {
         &array(command, "node_sign_seed"),
         &array(command, "node_seal_private"),
     );
+
+    // Format 3: the entry and its key follow from the events, the seed and the entry before.
+    let vector = &all["log_v3"];
+    assert_eq!(text(vector, "node"), node.node());
+    let mut last = Last::NONE;
+    for entry in vector["entries"].as_array().unwrap() {
+        let events: Vec<Value> = serde_json::from_str(text(entry, "events_text")).unwrap();
+        let kind = EntryKind::parse(text(entry, "kind").chars().next().unwrap()).unwrap();
+        let (created, next, key) = log::append_v3(
+            &node,
+            &last,
+            text(vector, "user_id"),
+            text(vector, "key_id"),
+            &array(vector, "log_pk"),
+            entry["time_ms"].as_u64().unwrap(),
+            kind,
+            &events,
+            &Secret::new(array(entry, "hpke_seed")),
+        )
+        .unwrap();
+        assert_eq!(created, signed(&entry["entry"]));
+        assert_eq!(next.seq, entry["seq"].as_u64().unwrap());
+        assert_eq!(
+            log::object_key_v3(text(vector, "user_id"), &key),
+            text(entry, "key")
+        );
+        last = next;
+    }
 
     // Format 2: the entry and its key follow from the events, the seed and the chain before.
     let vector = &all["log"];

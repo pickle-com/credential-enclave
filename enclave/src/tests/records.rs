@@ -134,7 +134,7 @@ async fn a_record_of_another_custody_does_not_open() {
         (422, "record_invalid")
     );
     // Only the grant left an entry.
-    assert_eq!(harness.head_seq("user-1"), 1);
+    assert_eq!(harness.last_seq("user-1"), 1);
 }
 
 #[tokio::test]
@@ -214,7 +214,7 @@ async fn every_tampered_field_of_a_record_fails_to_open() {
         (422, "record_invalid")
     );
     // No refused call left an entry behind: grant and the one successful release.
-    assert_eq!(harness.head_seq("user-1"), 2);
+    assert_eq!(harness.last_seq("user-1"), 2);
 }
 
 #[tokio::test]
@@ -283,7 +283,7 @@ async fn the_kind_of_a_record_decides_the_fields_it_releases() {
     assert_eq!(event["kind"], "vault_card");
 
     // Every other pair of kind and field is refused, and nothing is recorded for it.
-    let seq = harness.head_seq("user-1");
+    let seq = harness.last_seq("user-1");
     for (record, field) in [
         (&password, "totp"),
         (&password, "card_number"),
@@ -299,7 +299,7 @@ async fn the_kind_of_a_record_decides_the_fields_it_releases() {
             "{field}"
         );
     }
-    assert_eq!(harness.head_seq("user-1"), seq);
+    assert_eq!(harness.last_seq("user-1"), seq);
 
     // A plaintext that lacks the value, and a seed that is not base32.
     let empty = app.record("vault_password", "vault", &json!({"other": "x"}));
@@ -312,7 +312,7 @@ async fn the_kind_of_a_record_decides_the_fields_it_releases() {
         code(&release(&harness, "user-1", &broken, "totp").await),
         (422, "record_invalid")
     );
-    assert_eq!(harness.head_seq("user-1"), seq);
+    assert_eq!(harness.last_seq("user-1"), seq);
 }
 
 #[tokio::test]

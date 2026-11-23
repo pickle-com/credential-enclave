@@ -10,7 +10,8 @@
 //!   instead of the public roots.
 //!
 //! The same stand-in plays the log store when a test gives it a certificate for [`LOG_HOST`]:
-//! a node of these tests reaches Amazon S3 as it reaches a provider.
+//! a node of these tests reaches Amazon S3 as it reaches a provider. Every bucket of a log
+//! store is written through that one host, with the bucket as the first part of the path.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -24,7 +25,7 @@ use axum::Router;
 use credential_enclave_protocol::app::{self, AccountKeys};
 use credential_enclave_protocol::encoding::{b64u, b64u_decode, to_json, verify, Signed};
 use credential_enclave_protocol::keys::{Binding, Custody};
-use credential_enclave_protocol::log::{chain_prefix, parse_object_key, EntryParts, ParsedKey};
+use credential_enclave_protocol::log::{parse_object_key_v3, EntryKey};
 use credential_enclave_protocol::record::{open_record, seal_record, Record};
 use credential_enclave_protocol::{limits, purpose};
 use hyper::body::Bytes;
@@ -317,38 +318,47 @@ struct InFlight {
     most: AtomicUsize,
 }
 
-/// One write the log store stand-in received: an object of the store, read back from the
-/// request target and the request body.
+/// One write of an entry the log store stand-in received: an object of the store, read back
+/// from the request target and the request body.
 #[derive(Clone, Debug)]
 pub struct Stored {
-    /// The `user_id` of the chain.
+    /// The bucket the object was written to: the first part of the path.
+    pub bucket: String,
+    /// The `user_id` of the account.
     pub user_id: String,
-    /// The node of the chain.
+    /// The node that created the entry.
     pub node: String,
     /// The key of the object (protocol.md 7.6).
     pub key: String,
     /// The key read by its shape.
-    pub parsed: ParsedKey,
+    pub parsed: EntryKey,
     /// The object: the signed entry.
     pub entry: Value,
 }
 
 impl Stored {
-    /// The parts of a key of format 2.
-    pub fn parts(&self) -> &EntryParts {
-        match &self.parsed {
-            ParsedKey::V2(parts) => parts,
-            ParsedKey::V1 { .. } => panic!("a key of format 1 in the store of a node under test"),
-        }
+    /// The parts of the key.
+    pub fn parts(&self) -> &EntryKey {
+        &self.parsed
     }
 
     /// The `seq` of the entry.
     pub fn seq(&self) -> u64 {
-        match &self.parsed {
-            ParsedKey::V2(parts) => parts.seq,
-            ParsedKey::V1 { seq, .. } => *seq,
-        }
+        self.parsed.seq
     }
+}
+
+/// One write of a node document the log store stand-in received.
+#[derive(Clone, Debug)]
+pub struct StoredDocument {
+    /// The bucket the object was written to.
+    pub bucket: String,
+    /// The node of the key `n3/{node}`.
+    pub node: String,
+    /// The object.
+    pub document: Value,
+    /// The value of `x-amz-object-lock-retain-until-date` of the write.
+    pub retain_until: String,
 }
 
 /// A provider stand-in: a TLS server on the loopback interface with a certificate for the
@@ -458,13 +468,20 @@ impl Provider {
         self.in_flight.most.load(Ordering::SeqCst)
     }
 
-    /// The writes to the log store received so far, in the order they arrived: every `PUT`
-    /// whose target names an object under `v1/accounts/`, read back as an object of the store.
+    /// The writes of entries to the log store received so far, in the order they arrived:
+    /// every `PUT` whose target names an object under `a3/`, read back as an object of the
+    /// store.
     pub fn stored(&self) -> Vec<Stored> {
         stored_of(&self.seen())
     }
 
-    /// Waits until the log store received `count` writes.
+    /// The writes of node documents to the log store received so far, in the order they
+    /// arrived: every `PUT` whose target names an object under `n3/`.
+    pub fn documents(&self) -> Vec<StoredDocument> {
+        documents_of(&self.seen())
+    }
+
+    /// Waits until the log store received `count` writes of entries.
     pub async fn until_written(&self, count: usize) {
         for _ in 0..1000 {
             if self.stored().len() >= count {
@@ -475,8 +492,8 @@ impl Provider {
         panic!("the log store did not receive {count} writes");
     }
 
-    /// The objects of the chain of `user_id` on `node`, one per `seq` (the last write of a
-    /// `seq` when it was written more than once), in the order of `seq`.
+    /// The entries of `user_id` that `node` wrote, one per `seq` (the last write of a `seq`
+    /// when it was written more than once), in the order of `seq`.
     pub fn chain(&self, user_id: &str, node: &str) -> Vec<Stored> {
         let mut by_seq: std::collections::BTreeMap<u64, Stored> = Default::default();
         for stored in self.stored() {
@@ -502,24 +519,48 @@ impl Provider {
     }
 }
 
-/// The objects of the store among `seen`: every `PUT` whose target names an object under
-/// `v1/accounts/`.
+/// The bucket and the key of a write to the log store: the target `/{bucket}/{key}` of a `PUT`
+/// whose key starts with `prefix`. The `user_id` of the tests holds no character a path
+/// encodes, so the key is the text of the target.
+fn object_of<'a>(seen: &'a Seen, prefix: &str) -> Option<(&'a str, &'a str)> {
+    if seen.method != "PUT" {
+        return None;
+    }
+    let (bucket, key) = seen.target.strip_prefix('/')?.split_once('/')?;
+    key.starts_with(prefix).then_some((bucket, key))
+}
+
+/// The entries among `seen`: every `PUT` whose target names an object under `a3/`.
 fn stored_of(seen: &[Seen]) -> Vec<Stored> {
     seen.iter()
-        .filter(|seen| seen.method == "PUT")
         .filter_map(|seen| {
-            let at = seen.target.find("v1/accounts/")?;
-            let key = seen.target[at..].to_string();
-            let mut names = key["v1/accounts/".len()..].splitn(3, '/');
-            let user_id = names.next()?.to_string();
-            let node = names.next()?.to_string();
-            let parsed = parse_object_key(&key, &chain_prefix(&user_id, &node))?;
+            let (bucket, key) = object_of(seen, "a3/")?;
+            let user_id = key.strip_prefix("a3/")?.split('/').next()?;
+            let parsed = parse_object_key_v3(key, user_id)?;
             Some(Stored {
-                user_id,
-                node,
-                key,
+                bucket: bucket.to_string(),
+                user_id: user_id.to_string(),
+                node: parsed.node.clone(),
+                key: key.to_string(),
                 parsed,
                 entry: serde_json::from_slice(&seen.body).ok()?,
+            })
+        })
+        .collect()
+}
+
+/// The node documents among `seen`: every `PUT` whose target names an object under `n3/`.
+fn documents_of(seen: &[Seen]) -> Vec<StoredDocument> {
+    seen.iter()
+        .filter_map(|seen| {
+            let (bucket, key) = object_of(seen, "n3/")?;
+            Some(StoredDocument {
+                bucket: bucket.to_string(),
+                node: key.strip_prefix("n3/")?.to_string(),
+                document: serde_json::from_slice(&seen.body).ok()?,
+                retain_until: seen
+                    .header("x-amz-object-lock-retain-until-date")?
+                    .to_string(),
             })
         })
         .collect()
@@ -562,9 +603,14 @@ impl PlainStore {
         lock(&self.seen).clone()
     }
 
-    /// The writes received so far, read back as objects of the store.
+    /// The writes of entries received so far, read back as objects of the store.
     pub fn stored(&self) -> Vec<Stored> {
         stored_of(&self.seen())
+    }
+
+    /// The writes of node documents received so far.
+    pub fn documents(&self) -> Vec<StoredDocument> {
+        documents_of(&self.seen())
     }
 }
 
@@ -683,8 +729,8 @@ async fn serve_stream<IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
 pub const LOG_BUCKET: &str = "credential-log-test-1";
 /// The region of that bucket.
 pub const LOG_REGION: &str = "us-west-2";
-/// The host a node with that log store writes to.
-pub const LOG_HOST: &str = "credential-log-test-1.s3.us-west-2.amazonaws.com";
+/// The host a node with that log store writes to: the endpoint of Amazon S3 in the region.
+pub const LOG_HOST: &str = "s3.us-west-2.amazonaws.com";
 /// The session token of the credentials the tests give a node for its log store.
 pub const LOG_SESSION_TOKEN: &str = "test/session+token/of+the/log/store==";
 /// The secret access key of those credentials.
@@ -947,7 +993,8 @@ impl Harness {
     }
 
     /// Gives the node the operator configuration with the log store of the tests, and
-    /// credentials for it that end in 12 hours.
+    /// credentials for it that end in 12 hours. The call that gives the credentials writes the
+    /// node document: with a store that confirms it, the node takes grants from here on.
     pub async fn use_log_store(&self) {
         self.use_log_store_with(json!({"bucket": LOG_BUCKET, "region": LOG_REGION}))
             .await;
@@ -1080,11 +1127,11 @@ impl Harness {
         serde_json::from_slice(&body).unwrap()
     }
 
-    /// The `seq` of the end of the chain of an account.
-    pub fn head_seq(&self, user_id: &str) -> u64 {
+    /// The `seq` of the last entry the node created for an account, 0 when it created none.
+    pub fn last_seq(&self, user_id: &str) -> u64 {
         self.node
             .account(user_id)
-            .map_or(0, |account| lock(&account).head.seq)
+            .map_or(0, |account| lock(&account).last.seq)
     }
 }
 
@@ -1307,12 +1354,12 @@ impl App {
         serde_json::from_slice(&plaintext).unwrap()
     }
 
-    /// Verifies the node signature of an entry of format 2 and opens its events with the log
+    /// Verifies the node signature of an entry of format 3 and opens its events with the log
     /// key, in the order of their creation.
     pub fn events(&self, harness: &Harness, entry: &Value) -> Vec<Value> {
         let signed: Signed = serde_json::from_value(entry.clone()).unwrap();
-        let body = verify(&harness.node_public(), purpose::LOG_ENTRY_V2, &signed).unwrap();
-        app::open_entry_v2(&self.keys.log, &body).unwrap()
+        let body = verify(&harness.node_public(), purpose::LOG_ENTRY_V3, &signed).unwrap();
+        app::open_entry_v3(&self.keys.log, &body).unwrap()
     }
 
     /// The one event of an entry that holds one event.
@@ -1322,9 +1369,9 @@ impl App {
         events.pop().unwrap()
     }
 
-    /// The body of an entry of format 2.
+    /// The body of an entry of format 3.
     pub fn entry_body(&self, harness: &Harness, entry: &Value) -> Value {
-        harness.verified(purpose::LOG_ENTRY_V2, entry)
+        harness.verified(purpose::LOG_ENTRY_V3, entry)
     }
 
     /// The event a `log` object of a response names, read from the log store stand-in: the
@@ -1342,9 +1389,9 @@ impl App {
         self.events(harness, &stored.entry).remove(index)
     }
 
-    /// The events of the chain of this account on the node of `harness`, as the log store
-    /// stand-in received them: one row per entry in the order of `seq`, each row the events
-    /// of that entry in order.
+    /// The events of the entries of this account that the node of `harness` wrote, as the log
+    /// store stand-in received them: one row per entry in the order of `seq`, each row the
+    /// events of that entry in order.
     pub fn stored_events(&self, harness: &Harness, provider: &Provider) -> Vec<Vec<Value>> {
         provider
             .chain(&self.user_id, &harness.node.node)

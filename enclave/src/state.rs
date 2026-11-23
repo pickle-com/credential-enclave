@@ -8,9 +8,10 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
 use std::time::Duration;
 
 use credential_enclave_protocol::encoding::{b64u, b64u_decode, to_json, Signed};
-use credential_enclave_protocol::keys::{binding, Custody, LogStoreId, NodeKeys};
-use credential_enclave_protocol::log::{self, signed_head, EntryKind, Head};
+use credential_enclave_protocol::keys::{binding, shard_hash, Custody, LogStoreId, NodeKeys};
+use credential_enclave_protocol::log::{self, EntryKind, Last};
 use credential_enclave_protocol::record::{self, Kind, Record};
+use credential_enclave_protocol::release::ReleaseMeasurement;
 use credential_enclave_protocol::secret::Secret;
 use credential_enclave_protocol::{limits, ProtocolError};
 use serde::Serialize;
@@ -90,6 +91,10 @@ pub struct Limits {
     /// before the first request, and the idle time between two requests of a connection the
     /// caller keeps open (enclave.md section 8). A connection that passes it is closed.
     pub inbound_idle: Duration,
+    /// Events of GET requests without a body the node remembers for one account at one time
+    /// (protocol.md 7.2). A request beyond it has an event of its own that no later request
+    /// shares, so the table of one account has a bounded size whatever the account sends.
+    pub merge_keys: usize,
 }
 
 /// The connections from the backend the node holds open at the same time.
@@ -113,6 +118,7 @@ impl Default for Limits {
             sweep_write_rate: crate::log_store::SWEEP_WRITE_RATE,
             inbound_connections: INBOUND_CONNECTIONS,
             inbound_idle: INBOUND_IDLE,
+            merge_keys: limits::MERGE_KEYS,
         }
     }
 }
@@ -191,15 +197,17 @@ pub struct ActiveGrant {
     pub custody: Custody,
     pub user_key: Secret<[u8; 32]>,
     pub not_after_ms: u64,
-    /// The nodes this grant was handed to (`peer/export`), at most 64. The entry
-    /// `grant_transferred_out` that names a node of this list is on the chain, so a repeated
-    /// transfer to it creates none. A grant command, a revoke, the end of the grant and a
-    /// transfer this node takes put a new state in place, and a new grant state starts with
-    /// an empty list (protocol.md 10.1).
+    /// The nodes of a later release this grant was handed to (`peer/export` with an
+    /// endorsement), at most 64. The node created the entry `grant_transferred_out` that names
+    /// a node of this list, so a repeated transfer to it creates none. A grant command that
+    /// puts a grant in place where none of that key was in force, a revoke, the end of the
+    /// grant and a transfer this node takes put a new state in place, and a new grant state
+    /// starts with an empty list (protocol.md 10.1). A transfer to a node of the measurement
+    /// of this node creates no entry and is not on the list.
     pub exported_to: Vec<Handover>,
 }
 
-/// One node a grant was handed to, and the entry that says so.
+/// One node of a later release a grant was handed to, and the entry that says so.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Handover {
     /// The signing public key of the receiving node.
@@ -210,7 +218,8 @@ pub struct Handover {
 }
 
 impl ActiveGrant {
-    /// The entry that says that this grant was handed to `peer`, when it was.
+    /// The entry that says that this grant was handed to the node `peer` of a later release,
+    /// when it was.
     pub fn handed_to(&self, peer: &[u8; 32]) -> Option<u64> {
         self.exported_to
             .iter()
@@ -270,26 +279,20 @@ pub struct Unconfirmed {
     pub seq: u64,
     /// The key of the object of the entry in the log store (protocol.md 7.6).
     pub key: String,
+    /// The hash that names the bucket of the object among the buckets of the log store: the
+    /// hash of the `user_id` of the account (protocol.md 7.6).
+    pub shard: u16,
     pub entry: Signed,
-    /// The `prev` of the body of the entry: the hash of the end of the chain before it. The
-    /// orderly shutdown ends a chain whose last entries the store never confirmed at this
-    /// point (enclave.md 5.11).
-    pub prev_hash: [u8; 32],
-    /// True while a call writes the entry: the call that created it, or a later call that
-    /// took it along. An entry no call writes is a pending entry: the next write of the
-    /// account takes it along.
-    pub writing: bool,
+    /// The calls that write the entry at this moment: the call that created it, and every
+    /// call that took it along. An entry no call writes (the count is 0) is a pending entry:
+    /// the next write of the account takes it along. The count is kept per call, so the end
+    /// of one call does not say that an entry which another call still writes is pending.
+    pub writers: u32,
     /// The node time at which the entry was created: the time since which the store has not
     /// confirmed it. The sweep writes the pending entries of an account only after a part of
     /// its interval passed since this time, and `pending_oldest_ms` of health is the age of the
     /// oldest pending entry (enclave.md 5.1).
     pub pending_since_ms: u64,
-    /// True once an attempt to write the entry may have reached the store without a
-    /// confirmation (the connection closed without a response, or the attempt passed its time
-    /// limit after the request may have been sent): the store may hold the object, so the
-    /// orderly shutdown does not drop the entry (enclave.md 5.11). It never goes back to false
-    /// while the entry is unconfirmed.
-    pub outcome_unknown: bool,
 }
 
 /// The `seq` of the entry an open batch became, set when the batch is closed. Every call
@@ -510,8 +513,9 @@ pub fn refresh_key(record: &Record) -> [u8; 32] {
 pub struct Account {
     /// The delegation state. Changed through [`Account::set_grant`] and [`Account::expire`].
     grant: GrantState,
-    /// The end of the (node, account) chain.
-    pub head: Head,
+    /// The last entry this node created for the account: its `seq` and the hash of its body,
+    /// which the next entry carries as `prev`.
+    pub last: Last,
     /// The use events whose entry does not exist yet. Its events are added and taken by
     /// [`Node::create_event_seeded`] and [`Node::close_batch`].
     pub open: OpenBatch,
@@ -522,15 +526,18 @@ pub struct Account {
     /// again.
     pub notify: Arc<Notify>,
     /// Entries the log store has not confirmed, in the order of their `seq`. Empty on a node
-    /// that runs without a log store.
+    /// that runs without a log store. An entry leaves this list in one way: the store answered
+    /// a write of it with the status 200 ([`Account::store_confirmed`]). The list holds memory
+    /// for the entries it has.
     unconfirmed: Vec<Unconfirmed>,
     /// Merge key to its event: identical GET requests of `forward` that have no body. Kept
-    /// for 300 seconds.
+    /// for 300 seconds, at most `Limits::merge_keys` at one time. The table holds memory for
+    /// the keys it has: it gives back the memory of the keys it drops
+    /// ([`Account::prune_recent`], [`Account::clear_recent`]).
     recent: HashMap<[u8; 32], Recent>,
-    /// The `final` head, once the orderly shutdown created it.
-    pub final_head: Option<Signed>,
     /// The responses of the successful `refresh` calls of the last 3,600 seconds, at most 16.
-    /// A revoke, an expiry and a grant of another key drop them.
+    /// A revoke, an expiry and a grant of another key drop them, and the queue holds no memory
+    /// once the last of them left.
     kept_refreshes: VecDeque<KeptRefresh>,
     /// The counts of the node this account is part of.
     counters: Arc<StateCounters>,
@@ -557,13 +564,12 @@ impl Account {
     fn new(counters: Arc<StateCounters>) -> Account {
         Account {
             grant: GrantState::None,
-            head: Head::EMPTY,
+            last: Last::NONE,
             open: OpenBatch::new(),
             writer: false,
             notify: Arc::new(Notify::new()),
             unconfirmed: Vec::new(),
             recent: HashMap::new(),
-            final_head: None,
             kept_refreshes: VecDeque::new(),
             counters,
             last_entry_ms: 0,
@@ -647,6 +653,11 @@ impl Account {
         let before = self.kept_refreshes.len();
         self.kept_refreshes
             .retain(|kept| now_ms < kept.kept_ms.saturating_add(REFRESH_KEPT_MS));
+        if self.kept_refreshes.is_empty() && before > 0 {
+            // The queue of an account lives as long as the node: without a response it holds
+            // no memory.
+            self.kept_refreshes = VecDeque::new();
+        }
         adjust(
             &self.counters.kept_refreshes,
             before,
@@ -693,10 +704,11 @@ impl Account {
         true
     }
 
-    /// Drops the kept `refresh` responses: the delegation they were made under ended.
+    /// Drops the kept `refresh` responses, and the memory of their queue: the delegation they
+    /// were made under ended.
     pub fn forget_refreshes(&mut self) {
         let before = self.kept_refreshes.len();
-        self.kept_refreshes.clear();
+        self.kept_refreshes = VecDeque::new();
         adjust(&self.counters.kept_refreshes, before, 0);
     }
 
@@ -706,6 +718,13 @@ impl Account {
         self.recent.get(key).cloned()
     }
 
+    /// True when the account remembers fewer than `bound` events of GET requests: the event of
+    /// a further request is remembered, so that an identical request shares it. At the bound a
+    /// request has an event of its own that no later request shares (protocol.md 7.2).
+    pub fn remembers_more(&self, bound: usize) -> bool {
+        self.recent.len() < bound
+    }
+
     /// Remembers the event of a GET request under its merge key for the next 300 seconds.
     pub fn remember_event(&mut self, key: [u8; 32], recent: Recent) {
         let before = self.recent.len();
@@ -713,15 +732,16 @@ impl Account {
         adjust(&self.counters.merge_keys, before, self.recent.len());
     }
 
-    /// Drops every merge key: the grant the events were made under ended, or another one took
-    /// its place.
+    /// Drops every merge key, and the memory of the table with them: the grant the events
+    /// were made under ended, or another one took its place.
     pub fn clear_recent(&mut self) {
         let before = self.recent.len();
-        self.recent.clear();
+        self.recent = HashMap::new();
         adjust(&self.counters.merge_keys, before, 0);
     }
 
     /// The entries the log store has not confirmed, in the order of their `seq`.
+    #[cfg(test)]
     pub fn unconfirmed(&self) -> &[Unconfirmed] {
         &self.unconfirmed
     }
@@ -731,7 +751,7 @@ impl Account {
         self.unconfirmed.iter_mut()
     }
 
-    /// Adds the entry the chain just gained to the entries the store has not confirmed.
+    /// Adds the entry the node just created to the entries the store has not confirmed.
     fn push_unconfirmed(&mut self, entry: Unconfirmed) {
         if self.unconfirmed.is_empty() {
             self.counters
@@ -744,11 +764,19 @@ impl Account {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Takes the entry `seq` out of the entries the store has not confirmed: the store
-    /// confirmed it.
-    pub fn confirm_entry(&mut self, seq: u64) {
+    /// Records that the log store answered a write of the entry `seq` with the status 200: the
+    /// entry leaves the entries the store has not confirmed. This is the one place an entry
+    /// leaves that list, and its one caller is the end of the write that received that status
+    /// (`crate::log_store`). So "the store confirmed the entry" is said by an answer of the
+    /// store and by nothing else.
+    pub fn store_confirmed(&mut self, seq: u64) {
         let before = self.unconfirmed.len();
         self.unconfirmed.retain(|entry| entry.seq != seq);
+        if self.unconfirmed.is_empty() && before > 0 {
+            // The list of an account lives as long as the node: without an entry it holds no
+            // memory.
+            self.unconfirmed = Vec::new();
+        }
         self.unconfirmed_changed(before);
     }
 
@@ -782,10 +810,13 @@ impl Account {
         }
     }
 
-    /// True when the log store confirmed the entry `seq`. On a node that runs without a log
-    /// store every entry counts as confirmed: such a node keeps no account of it.
+    /// True when the log store confirmed the entry `seq`: the node created an entry of that
+    /// `seq` for the account, and the entry left the unconfirmed entries, which it does by an
+    /// answer of the store alone ([`Account::store_confirmed`]). A `seq` the node never
+    /// created is not confirmed. On a node that runs without a log store every entry it
+    /// created counts as confirmed: such a node keeps no account of it.
     pub fn is_confirmed(&self, seq: u64) -> bool {
-        !self.unconfirmed.iter().any(|entry| entry.seq == seq)
+        (1..=self.last.seq).contains(&seq) && !self.unconfirmed.iter().any(|entry| entry.seq == seq)
     }
 
     /// True when the open batch holds events.
@@ -793,15 +824,28 @@ impl Account {
         !self.open.events.is_empty()
     }
 
-    /// Drops the merge keys whose window of 300 seconds passed (protocol.md 7.2). A call that
-    /// creates events drops them on its way, and the sweep of the node drops them for an
-    /// account that makes no call, so an idle account holds the keys of its last 300 seconds at
-    /// most.
+    /// Drops the merge keys whose window of 300 seconds passed (protocol.md 7.2), and the
+    /// memory the table held for them. A call that creates events drops them on its way, and
+    /// the sweep of the node drops them for an account that makes no call, so an idle account
+    /// holds the keys of its last 300 seconds at most, and no memory of a table once they are
+    /// gone.
+    ///
+    /// The state of an account lives as long as the node, and a table keeps the room of the
+    /// largest number of keys it ever held unless it is asked to give it back. So when keys
+    /// leave, a table without a key is replaced by one without memory, and a table with more
+    /// room than twice its keys need shrinks to that room: the room that is left keeps the
+    /// keys of an account that come and go around one number from resizing the table at every
+    /// change.
     pub fn prune_recent(&mut self, now_ms: u64) {
         let window_ms = limits::MERGE_WINDOW_S * 1000;
         let before = self.recent.len();
         self.recent
             .retain(|_, recent| now_ms < recent.entry_ms.saturating_add(window_ms));
+        match self.recent.len() {
+            keys if keys == before => {}
+            0 => self.recent = HashMap::new(),
+            keys => self.recent.shrink_to(2 * keys),
+        }
         adjust(&self.counters.merge_keys, before, self.recent.len());
     }
 
@@ -810,7 +854,7 @@ impl Account {
     pub fn pending_entries(&self) -> usize {
         self.unconfirmed
             .iter()
-            .filter(|entry| !entry.writing)
+            .filter(|entry| entry.writers == 0)
             .count()
     }
 
@@ -818,7 +862,7 @@ impl Account {
     pub fn oldest_pending_since_ms(&self) -> Option<u64> {
         self.unconfirmed
             .iter()
-            .filter(|entry| !entry.writing)
+            .filter(|entry| entry.writers == 0)
             .map(|entry| entry.pending_since_ms)
             .min()
     }
@@ -869,6 +913,17 @@ impl Account {
     #[cfg(test)]
     pub fn merge_key_count(&self) -> usize {
         self.recent.len()
+    }
+
+    /// The numbers of merge keys, of kept `refresh` responses and of unconfirmed entries the
+    /// account holds memory for, for the tests of that memory.
+    #[cfg(test)]
+    pub fn rooms(&self) -> (usize, usize, usize) {
+        (
+            self.recent.capacity(),
+            self.kept_refreshes.capacity(),
+            self.unconfirmed.capacity(),
+        )
     }
 }
 
@@ -1024,8 +1079,8 @@ pub struct Node {
 
 /// The accounts of a node whose `user_id` sorts after a value, in `user_id` order, read from
 /// the sorted index in chunks of [`WALK_CHUNK`] accounts: the index is locked for one chunk at
-/// a time, so a walk over every account of the node (the sweep, a page of `close/heads`, of
-/// `peer/export` or of `grants/prune`) never holds the index for long.
+/// a time, so a walk over every account of the node (the sweep, a page of `peer/export` or of
+/// `grants/prune`) never holds the index for long.
 pub struct AccountWalk<'a> {
     node: &'a Node,
     /// The `user_id` the next chunk starts after.
@@ -1053,19 +1108,6 @@ impl Iterator for AccountWalk<'_> {
         }
         self.chunk.pop_front()
     }
-}
-
-/// What `close/heads` did for one account of its page (enclave.md 5.11).
-pub enum FinalHead {
-    /// The final head of the account: the one signed in this call at the head of the chain,
-    /// or the one signed before.
-    Signed(Signed),
-    /// The final head was signed at the last entry the store confirmed: the pending entries
-    /// above it were a tail of the chain and were dropped.
-    Truncated(Signed),
-    /// No final head in this call: an entry the store confirmed lies above a pending entry,
-    /// or a call writes an entry of the account at this moment.
-    Skipped,
 }
 
 /// Locks a mutex. A poisoned lock is used as it is: the release build aborts on a panic, so a
@@ -1278,56 +1320,6 @@ impl Node {
         }
     }
 
-    /// The final head of an account in the orderly shutdown (enclave.md 5.11), after the write
-    /// round of its page. The caller holds the account lock.
-    ///
-    /// An account whose final head was signed before gets that head again. An account without
-    /// an unconfirmed entry gets a final head at the end of its chain. An account whose
-    /// unconfirmed entries are the last entries of its chain (every `seq` from the first
-    /// unconfirmed one to the head) gets a final head at the entry before them: those entries
-    /// are dropped from the chain and from the entries the store has not confirmed, so no
-    /// sweep writes them again; their acts never took place, because an act follows the
-    /// confirmation of its entry. An account with a confirmed entry above an unconfirmed one,
-    /// an account with an entry that a call writes at this moment, and an account with an
-    /// unconfirmed entry whose write may have reached the store (`outcome_unknown`: the store
-    /// may hold the object, and a reader would find it above the final head) gets no final
-    /// head in this call: a later call looks again.
-    pub fn final_head_of(&self, user_id: &str, account: &mut Account, now_ms: u64) -> FinalHead {
-        if let Some(signed) = &account.final_head {
-            return FinalHead::Signed(signed.clone());
-        }
-        let Some(first) = account.unconfirmed.first() else {
-            let signed = signed_head(&self.keys, user_id, &account.head, "", now_ms, true);
-            account.final_head = Some(signed.clone());
-            return FinalHead::Signed(signed);
-        };
-        if account
-            .unconfirmed
-            .iter()
-            .any(|entry| entry.writing || entry.outcome_unknown)
-        {
-            return FinalHead::Skipped;
-        }
-        let tail = account.unconfirmed.len() as u64 == account.head.seq - first.seq + 1;
-        if !tail {
-            return FinalHead::Skipped;
-        }
-        let head = Head {
-            seq: first.seq - 1,
-            hash: first.prev_hash,
-        };
-        let before = account.unconfirmed.len();
-        account.unconfirmed.clear();
-        account.unconfirmed_changed(before);
-        if head.seq == 0 {
-            self.chains.fetch_sub(1, Ordering::SeqCst);
-        }
-        account.head = head;
-        let signed = signed_head(&self.keys, user_id, &head, "", now_ms, true);
-        account.final_head = Some(signed.clone());
-        FinalHead::Truncated(signed)
-    }
-
     /// The next serial of this node. Every call returns a larger value than the calls before
     /// it, starting at 1. A challenge gets one when it is issued, and an account gets one
     /// when this node accepts a revoke command of it.
@@ -1372,9 +1364,10 @@ impl Node {
         lock(&self.pending).take(node_state, now_ms)
     }
 
-    /// Creates an event on the chain of an account (protocol.md 7.1) and returns where it is.
-    /// The caller holds the account lock, so one chain never forks. `key_id` and `log_pk` are
-    /// those of the grant in force at this moment, `now_ms` the node time the caller read.
+    /// Creates an event of an account (protocol.md 7.1) and returns where it is. The caller
+    /// holds the account lock, so the entries of one account are created one after the other.
+    /// `key_id` and `log_pk` are those of the grant in force at this moment, `now_ms` the node
+    /// time the caller read.
     ///
     /// A use event goes into the open batch of the account; when the batch is full for it, or
     /// was opened under another key, the batch is closed into an entry first. A control event
@@ -1385,7 +1378,11 @@ impl Node {
     ///
     /// The `time_ms` of the event is `now_ms`, or the time of the event before it when that
     /// one is later: a caller may have read the node time before it took the account lock,
-    /// and the times of one chain do not decrease with (seq, index).
+    /// and the times of the events of one node for one account do not decrease with
+    /// (seq, index).
+    ///
+    /// An event whose JSON alone is longer than the plaintext of an entry may be is refused
+    /// with `too_large` before anything changes: no entry could hold it.
     #[allow(clippy::too_many_arguments)]
     pub fn create_event(
         &self,
@@ -1419,8 +1416,13 @@ impl Node {
         seed: &Secret<[u8; 32]>,
     ) -> Result<EventPlace, ApiError> {
         let time_ms = now_ms.max(account.last_event_ms);
-        account.last_event_ms = time_ms;
         event["time_ms"] = Value::from(time_ms);
+        // The array of one event is the event and its two brackets.
+        let event_bytes = to_json(&event).len();
+        if event_bytes + 2 > limits::ENTRY_PLAINTEXT_BYTES {
+            return Err(ProtocolError::TooLarge.into());
+        }
+        account.last_event_ms = time_ms;
         match kind {
             EntryKind::Control => {
                 if account.has_open_events() {
@@ -1435,14 +1437,13 @@ impl Node {
                     kind,
                     vec![event],
                     seed,
-                );
+                )?;
                 Ok(EventPlace::Entry { seq, index: 0 })
             }
             EntryKind::Use => {
-                let event_bytes = to_json(&event).len();
                 let other_key = account.has_open_events() && account.open.key_id != key_id;
                 if other_key || account.open.full_for(event_bytes) {
-                    self.close_batch_seeded(account, user_id, time_ms, seed);
+                    self.close_batch_seeded(account, user_id, time_ms, seed)?;
                 }
                 if account.open.events.is_empty() {
                     account.open.key_id = key_id.to_string();
@@ -1467,6 +1468,12 @@ impl Node {
     /// A request that matches an event of the open batch or of an entry created less than
     /// 300 seconds before shares that event (protocol.md 7.2), also inside the batch. Returns
     /// where every event is and whether this call created it.
+    ///
+    /// The node remembers at most `Limits::merge_keys` events of one account at one time. A
+    /// GET request without a body that finds no event to share while its account has that
+    /// many has an event of its own that the node does not remember: no later request shares
+    /// it, and the event carries no `window_s`, the key that says that the same request may
+    /// have happened again in the 300 seconds after it.
     pub fn create_events(
         &self,
         account: &mut Account,
@@ -1478,10 +1485,16 @@ impl Node {
     ) -> Result<Vec<(EventPlace, bool)>, ApiError> {
         account.prune_recent(now_ms);
         let mut places = Vec::with_capacity(events.len());
-        for (merge_key, event) in events {
+        for (merge_key, mut event) in events {
             if let Some(shared) = merge_key.and_then(|key| account.shared_event(&key)) {
                 places.push((shared.target, false));
                 continue;
+            }
+            let remembered = merge_key.filter(|_| account.remembers_more(self.limits.merge_keys));
+            if merge_key.is_some() && remembered.is_none() {
+                if let Some(keys) = event.as_object_mut() {
+                    keys.shift_remove("window_s");
+                }
             }
             let place = self.create_event(
                 account,
@@ -1492,7 +1505,7 @@ impl Node {
                 EntryKind::Use,
                 event,
             )?;
-            if let Some(key) = merge_key {
+            if let Some(key) = remembered {
                 account.remember_event(
                     key,
                     Recent {
@@ -1520,7 +1533,7 @@ impl Node {
         }
         let seed = self.random_secret::<32>()?;
         Ok(Some(
-            self.close_batch_seeded(account, user_id, now_ms, &seed),
+            self.close_batch_seeded(account, user_id, now_ms, &seed)?,
         ))
     }
 
@@ -1531,13 +1544,13 @@ impl Node {
         user_id: &str,
         now_ms: u64,
         seed: &Secret<[u8; 32]>,
-    ) -> u64 {
+    ) -> Result<u64, ApiError> {
         let events = std::mem::take(&mut account.open.events);
         let (key_id, log_pk) = (account.open.key_id.clone(), account.open.log_pk);
         let batch = std::mem::replace(&mut account.open.seq, Arc::new(OnceLock::new()));
         account.open.bytes = 2;
         self.counters.open_batches.fetch_sub(1, Ordering::Relaxed);
-        let seq = self.append_closed(
+        let appended = self.append_closed(
             account,
             user_id,
             &key_id,
@@ -1548,15 +1561,21 @@ impl Node {
             seed,
         );
         // Every call whose event joined the batch, and every `recent` that points into it,
-        // now finds the entry through the cell.
-        let _ = batch.set(seq);
-        seq
+        // now finds the entry through the cell. When no entry could be made of the batch, the
+        // cell receives 0, the `seq` of no entry: no entry of that `seq` is ever confirmed, so
+        // the acts of those calls do not take place.
+        let _ = batch.set(*appended.as_ref().unwrap_or(&0));
+        appended
     }
 
-    /// Creates the next entry of the chain from `events` and raises the end of the chain. The
-    /// `time_ms` of the entry is `now_ms`, or the time of the entry before it, or the time of
-    /// the latest event, whichever is largest: the times of a chain do not decrease, and no
-    /// event is dated after its entry.
+    /// Creates the next entry of the node for the account from `events`. The `time_ms` of the
+    /// entry is `now_ms`, or the time of the entry before it, or the time of the latest event,
+    /// whichever is largest: the times of the entries of one node for one account do not
+    /// decrease, and no event is dated after its entry.
+    ///
+    /// When no entry can be made of the events (`log::append_v3` names the cases, none of
+    /// which a batch the node filled reaches), the call ends with an internal failure and the
+    /// account keeps the entry it had as its last one.
     #[allow(clippy::too_many_arguments)]
     fn append_closed(
         &self,
@@ -1568,13 +1587,12 @@ impl Node {
         kind: EntryKind,
         events: Vec<Value>,
         seed: &Secret<[u8; 32]>,
-    ) -> u64 {
+    ) -> Result<u64, ApiError> {
         let time_ms = now_ms.max(account.last_entry_ms).max(account.last_event_ms);
-        account.last_entry_ms = time_ms;
         let count = events.len() as u64;
-        let (signed, head, parts) = log::append_batch(
+        let (signed, last, key) = log::append_v3(
             &self.keys,
-            &account.head,
+            &account.last,
             user_id,
             key_id,
             log_pk,
@@ -1582,26 +1600,26 @@ impl Node {
             kind,
             &events,
             seed,
-        );
-        if account.head.seq == 0 {
+        )
+        .ok_or_else(ApiError::internal)?;
+        account.last_entry_ms = time_ms;
+        if account.last.seq == 0 {
             self.chains.fetch_add(1, Ordering::SeqCst);
         }
-        let prev_hash = account.head.hash;
-        account.head = head;
+        account.last = last;
         self.log_counters.entries.fetch_add(1, Ordering::Relaxed);
         self.log_counters.events.fetch_add(count, Ordering::Relaxed);
         if self.log_store.tracks() {
             account.push_unconfirmed(Unconfirmed {
-                seq: head.seq,
-                key: log::object_key_v2(user_id, &self.node, &parts),
+                seq: last.seq,
+                key: log::object_key_v3(user_id, &key),
+                shard: shard_hash(user_id),
                 entry: signed,
-                writing: false,
+                writers: 0,
                 pending_since_ms: time_ms,
-                prev_hash,
-                outcome_unknown: false,
             });
         }
-        head.seq
+        Ok(last.seq)
     }
 }
 
@@ -1655,7 +1673,7 @@ pub fn merge_key(record_id: &[u8; 16], host: &str, path: &str, query: &str) -> [
 /// and the context string of the caller, and a scope string that passed the public field rule.
 /// No function here takes a secret type.
 pub mod events {
-    use super::{b64u, limits, Custody, Digest, Sha256};
+    use super::{b64u, limits, Custody, Digest, ReleaseMeasurement, Sha256};
     use serde_json::{json, Value};
 
     /// The `time_ms` key every event carries after `t`. [`super::Node::create_event`] writes
@@ -1722,23 +1740,52 @@ pub mod events {
         })
     }
 
-    /// `to` is the node the delegation was sealed for. A node identifier is that node's
-    /// signing public key, so the account can verify the entries of the receiving node with
-    /// this value.
-    pub fn grant_transferred_out(to: &str) -> Value {
-        json!({"t": "grant_transferred_out", "time_ms": TIME_MS, "to": to})
+    /// The event of a transfer to a node of a later release (protocol.md 10.3). `to` is the
+    /// node the delegation was sealed for, and `later` the release and the measurement of
+    /// that node: the statement the release key signed, which the attestation document of the
+    /// node carries. With them the account reads from its log which program received its key.
+    /// A transfer to a node of the measurement of this node creates no event.
+    pub fn grant_transferred_out(to: &str, later: &ReleaseMeasurement) -> Value {
+        let [pcr0, pcr1, pcr2] = later.pcrs.map(|pcr| hex(&pcr));
+        json!({
+            "t": "grant_transferred_out",
+            "time_ms": TIME_MS,
+            "to": to,
+            "release": later.release,
+            "pcr0": pcr0,
+            "pcr1": pcr1,
+            "pcr2": pcr2,
+        })
     }
 
-    /// `from` is the node that gave the delegation. `not_after_ms` is the end the receiving
-    /// node accepted.
-    pub fn grant_transferred_in(from: &str, not_after_ms: u64, custody: Custody) -> Value {
+    /// The event of a transfer this node took from a node of an earlier release (protocol.md
+    /// 10.3). `from` is the node that gave the delegation and `release` the release of that
+    /// node, as its binding names it. `not_after_ms` is the end the receiving node accepted.
+    pub fn grant_transferred_in(
+        from: &str,
+        release: &str,
+        not_after_ms: u64,
+        custody: Custody,
+    ) -> Value {
         json!({
             "t": "grant_transferred_in",
             "time_ms": TIME_MS,
             "from": from,
+            "release": release,
             "not_after_ms": not_after_ms,
             "custody": custody.as_str(),
         })
+    }
+
+    /// Lower-case hexadecimal.
+    fn hex(bytes: &[u8]) -> String {
+        let mut text = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            for half in [byte >> 4, byte & 0x0f] {
+                text.extend(char::from_digit(u32::from(half), 16));
+            }
+        }
+        text
     }
 
     /// The event of a mail call: `operation` is `verify`, `read` or `submit` and `request` the
@@ -1882,13 +1929,33 @@ pub mod events {
                 text(&totp_issued("r", "https://a.example", "browser:fill")),
                 r#"{"t":"totp_issued","time_ms":0,"record_id":"r","origin":"https://a.example","context":"browser:fill"}"#
             );
+            let later = ReleaseMeasurement {
+                release: "v9.0.0".to_string(),
+                pcrs: [[0x0a; 48], [0x1b; 48], [0xf2; 48]],
+            };
             assert_eq!(
-                text(&grant_transferred_out("NODE-B")),
-                r#"{"t":"grant_transferred_out","time_ms":0,"to":"NODE-B"}"#
+                text(&grant_transferred_out("NODE-B", &later)),
+                format!(
+                    concat!(
+                        r#"{{"t":"grant_transferred_out","time_ms":0,"to":"NODE-B","#,
+                        r#""release":"v9.0.0","pcr0":"{}","pcr1":"{}","pcr2":"{}"}}"#
+                    ),
+                    "0a".repeat(48),
+                    "1b".repeat(48),
+                    "f2".repeat(48)
+                )
             );
             assert_eq!(
-                text(&grant_transferred_in("NODE-A", 9, Custody::Enclave)),
-                r#"{"t":"grant_transferred_in","time_ms":0,"from":"NODE-A","not_after_ms":9,"custody":"enclave"}"#
+                text(&grant_transferred_in(
+                    "NODE-A",
+                    "v2.3.0",
+                    9,
+                    Custody::Enclave
+                )),
+                concat!(
+                    r#"{"t":"grant_transferred_in","time_ms":0,"from":"NODE-A","#,
+                    r#""release":"v2.3.0","not_after_ms":9,"custody":"enclave"}"#
+                )
             );
             assert_eq!(
                 text(&mail_request(
@@ -2189,6 +2256,70 @@ mod tests {
         account.prune_recent(200_000 + limits::MERGE_WINDOW_S * 1000);
         assert!(account.shared_event(&[2u8; 32]).is_none());
         assert_eq!(account.merge_key_count(), 0);
+        assert_eq!(counters.merge_keys.load(Ordering::Relaxed), 0);
+    }
+
+    /// Remembers the merge key number `index`, of an event created at `entry_ms`.
+    fn remember(account: &mut Account, index: u32, entry_ms: u64) -> [u8; 32] {
+        let mut key = [0u8; 32];
+        key[..4].copy_from_slice(&index.to_le_bytes());
+        account.remember_event(
+            key,
+            Recent {
+                entry_ms,
+                target: EventPlace::Entry { seq: 1, index },
+            },
+        );
+        key
+    }
+
+    #[test]
+    fn the_merge_key_table_gives_back_the_memory_of_the_keys_it_drops() {
+        let window_ms = limits::MERGE_WINDOW_S * 1000;
+        let counters = Arc::new(StateCounters::default());
+        let mut account = Account::new(counters.clone());
+        let room = |account: &Account| account.rooms().0;
+        // An account without a merge key holds no table.
+        assert_eq!(room(&account), 0);
+
+        // 4,096 keys of one moment, and eight keys one second later.
+        for index in 0..4_096 {
+            remember(&mut account, index, 1_000);
+        }
+        let late: Vec<[u8; 32]> = (4_096..4_104)
+            .map(|index| remember(&mut account, index, 2_000))
+            .collect();
+        let grown = room(&account);
+        assert!(grown >= 4_104, "{grown}");
+        assert!(account.remembers_more(4_105) && !account.remembers_more(4_104));
+        // A look that drops no key moves no memory.
+        account.prune_recent(1_000 + window_ms - 1);
+        assert_eq!((account.merge_key_count(), room(&account)), (4_104, grown));
+
+        // The window of the 4,096 keys passed: the table keeps the eight others, and shrinks
+        // to room for twice their number and for little more. Before this rule the table kept
+        // the room of the 4,104 keys for as long as the node lived.
+        account.prune_recent(1_000 + window_ms);
+        assert_eq!(account.merge_key_count(), 8);
+        let kept = room(&account);
+        assert!((16..=64).contains(&kept), "{kept}");
+        for key in &late {
+            assert!(account.shared_event(key).is_some());
+        }
+        assert_eq!(counters.merge_keys.load(Ordering::Relaxed), 8);
+
+        // The window of the last keys passed: the table holds no memory.
+        account.prune_recent(2_000 + window_ms);
+        assert_eq!((account.merge_key_count(), room(&account)), (0, 0));
+        assert_eq!(counters.merge_keys.load(Ordering::Relaxed), 0);
+
+        // The keys of a grant that ended go with their memory, before their window passed.
+        for index in 0..4_096 {
+            remember(&mut account, index, 3_000);
+        }
+        assert!(room(&account) >= 4_096);
+        account.clear_recent();
+        assert_eq!((account.merge_key_count(), room(&account)), (0, 0));
         assert_eq!(counters.merge_keys.load(Ordering::Relaxed), 0);
     }
 

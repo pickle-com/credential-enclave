@@ -81,9 +81,12 @@ impl LogStore {
         Ok(Some(LogStore { bucket, region }))
     }
 
-    /// The host the node writes to: `{bucket}.s3.{region}.amazonaws.com`.
+    /// The host the node writes to: the endpoint of Amazon S3 in the region of the log store,
+    /// `s3.{region}.amazonaws.com`. A node writes every bucket of its log store over
+    /// connections to this one host, with the bucket as the first part of the path
+    /// (protocol.md 7.6), so the name of the bucket is no part of the host.
     pub fn host(&self) -> String {
-        format!("{}.s3.{}.amazonaws.com", self.bucket, self.region)
+        format!("s3.{}.amazonaws.com", self.region)
     }
 }
 
@@ -476,10 +479,7 @@ mod tests {
             ("CREDENTIAL_ENCLAVE_LOG_REGION", "us-west-2"),
         ]);
         let log_store = LogStore::from_variables(&variable).unwrap().unwrap();
-        assert_eq!(
-            log_store.host(),
-            "character-credential-log-dev-1.s3.us-west-2.amazonaws.com"
-        );
+        assert_eq!(log_store.host(), "s3.us-west-2.amazonaws.com");
         let body = operator_config(&names(&["slack"]), &variable, Some(&log_store)).unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(

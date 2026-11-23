@@ -15,14 +15,15 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use credential_enclave_protocol::app::{self, AccountKeys};
+use credential_enclave_protocol::attestation::AWS_NITRO_ROOT_G1;
 use credential_enclave_protocol::encoding::{
     b64u, b64u_decode, to_json, verify, verify_detached, Signed,
 };
 use credential_enclave_protocol::envelope::{
-    self, Envelope, ReplyBody, ReplyHead, TransferEnvelope, TransferGrant,
+    self, Envelope, ReplyBody, TransferEnvelope, TransferGrant,
 };
-use credential_enclave_protocol::keys::{self, Custody, NodeKeys};
-use credential_enclave_protocol::log::{self, EntryKind, EntryParts, Head};
+use credential_enclave_protocol::keys::{self, Custody, LogStoreId, NodeKeys};
+use credential_enclave_protocol::log::{self, EntryKey, EntryKind, EntryParts, Head, Last};
 use credential_enclave_protocol::record::{record_aad, seal_record};
 use credential_enclave_protocol::secret::Secret;
 use credential_enclave_protocol::{purpose, statement, totp};
@@ -422,7 +423,6 @@ fn signed() -> Value {
         challenge: challenge.clone(),
         key_id: key_id.clone(),
         not_after_ms,
-        head: ReplyHead::from(&head),
         time_ms: TIME_MS,
     };
     let grant_reply = envelope::reply(
@@ -669,6 +669,319 @@ fn log_chain() -> Value {
             "forged_key_object_verifies": app::verify_entry_v2(
                 &public, USER_ID, &forged, Some(&cursor), &signed_entries[1]
             ).is_ok(),
+        },
+    })
+}
+
+/// The log store of the vectors `log_v3` and `log_store`.
+fn log_store_id() -> LogStoreId {
+    LogStoreId::parse("character-credential-log-dev-1", "us-west-2").expect("a log store name")
+}
+
+/// The vector `log_v3`: four entries of format 3 (protocol.md 7.1) of one node for one account,
+/// the keys of their objects, the outcome of the verification of every object against its key,
+/// objects that are not the entry of their key, strings that are not keys, and the node
+/// document of the node.
+fn log_v3() -> Value {
+    let node = node_keys();
+    let other = NodeKeys::from_random(
+        &fixed("another node sign seed"),
+        &fixed("another node seal private"),
+    );
+    let account = account_keys();
+    let key_id = account.key_id();
+    let record_id = b64u(&fixed_prefix::<16>("record id"));
+    let batches: [(EntryKind, Vec<Value>); 4] = [
+        (
+            EntryKind::Control,
+            vec![json!({
+                "t": "grant_accepted",
+                "time_ms": TIME_MS + 1_000,
+                "not_after_ms": TIME_MS + 2_592_000_000,
+                "custody": Custody::Enclave.as_str(),
+            })],
+        ),
+        (
+            EntryKind::Use,
+            (0..3u64)
+                .map(|index| {
+                    json!({
+                        "t": "provider_request",
+                        "time_ms": TIME_MS + 1_900 + index,
+                        "record_id": record_id,
+                        "provider": "google_workspace",
+                        "method": "GET",
+                        "host": "gmail.googleapis.com",
+                        "path": format!("/gmail/v1/users/me/threads/thread-{index}"),
+                        "query": "format=metadata",
+                        "body_bytes": 0,
+                        "body_sha256": "",
+                        "context": "cli:gog",
+                        "window_s": 300,
+                    })
+                })
+                .collect(),
+        ),
+        (
+            EntryKind::Use,
+            vec![json!({
+                "t": "secret_released",
+                "time_ms": TIME_MS + 3_000,
+                "record_id": record_id,
+                "kind": "vault_card",
+                "field": "card_number",
+                "origin": "https://shop.example",
+                "context": "browser:fill",
+            })],
+        ),
+        (
+            EntryKind::Control,
+            vec![json!({
+                "t": "grant_transferred_out",
+                "time_ms": TIME_MS + 4_000,
+                "to": other.node(),
+                "release": "v9.0.0",
+                "pcr0": "11".repeat(48),
+                "pcr1": "22".repeat(48),
+                "pcr2": "33".repeat(48),
+            })],
+        ),
+    ];
+    let mut last = Last::NONE;
+    let mut entries = Vec::new();
+    let mut signed_entries = Vec::new();
+    let mut keys: Vec<EntryKey> = Vec::new();
+    let mut verifies = true;
+    for (index, (kind, events)) in batches.iter().enumerate() {
+        let seed = fixed(&format!("log v3 entry {} hpke seed", index + 1));
+        let time_ms = TIME_MS + 1_000 * (index as u64 + 1);
+        let (entry, next, key) = log::append_v3(
+            &node,
+            &last,
+            USER_ID,
+            &key_id,
+            &account.log_pk(),
+            time_ms,
+            *kind,
+            events,
+            &Secret::new(seed),
+        )
+        .expect("an entry of the vector");
+        let object_key = log::object_key_v3(USER_ID, &key);
+        verifies &= log::parse_object_key_v3(&object_key, USER_ID).as_ref() == Some(&key)
+            && match app::verify_entry_v3(USER_ID, &key, &entry) {
+                Ok((_, body)) => {
+                    app::open_entry_v3(&account.log, &body).as_deref() == Ok(events.as_slice())
+                }
+                Err(_) => false,
+            };
+        entries.push(json!({
+            "seq": next.seq,
+            "hpke_seed": b64u(&seed),
+            "time_ms": time_ms,
+            "kind": kind.letter().to_string(),
+            "count": events.len(),
+            "events_text": text(&to_json(&Value::Array(events.clone()))),
+            "entry": signed_value(&entry),
+            "body_text": text(&b64u_decode(&entry.body).expect("entry body")),
+            "body_hash": b64u(&key.body_hash),
+            "key": object_key,
+        }));
+        signed_entries.push(entry);
+        keys.push(key);
+        last = next;
+    }
+    // The keys of each prefix in the order a listing returns them: the order of their bytes,
+    // which is the latest entry first.
+    let listing = |kind: EntryKind| -> Vec<Value> {
+        let mut listed: Vec<String> = keys
+            .iter()
+            .filter(|key| key.kind() == kind)
+            .map(|key| log::object_key_v3(USER_ID, key))
+            .collect();
+        listed.sort();
+        listed.into_iter().map(Value::String).collect()
+    };
+    let outcome = |key: &EntryKey, entry: &Signed| match app::verify_entry_v3(USER_ID, key, entry) {
+        Ok(_) => "ok",
+        Err(app::EntryError::Body) => "body",
+        Err(app::EntryError::Signature) => "signature",
+        Err(app::EntryError::Fields) => "fields",
+    };
+    // The body of entry 3 under the key of entry 2: not the body that key names.
+    let other_body = (keys[1].clone(), signed_entries[2].clone());
+    // The body of entry 2 with the signature of another node over it.
+    let second_body = b64u_decode(&signed_entries[1].body).expect("entry body");
+    let other_signature = (
+        keys[1].clone(),
+        Signed {
+            body: signed_entries[1].body.clone(),
+            sig: other.sign(purpose::LOG_ENTRY_V3, &second_body).sig,
+        },
+    );
+    // The object of entry 2 under a key that names another `seq` beside the same hash.
+    let mut another_seq = keys[1].clone();
+    another_seq.seq = 7;
+    let other_seq = (another_seq, signed_entries[1].clone());
+    let rejected: Vec<Value> = [
+        ("the_body_of_another_entry", &other_body),
+        ("the_signature_of_another_node", &other_signature),
+        ("a_key_of_another_seq", &other_seq),
+    ]
+    .iter()
+    .map(|(name, (key, entry))| {
+        json!({
+            "name": name,
+            "key": log::object_key_v3(USER_ID, key),
+            "entry": signed_value(entry),
+            "result": outcome(key, entry),
+        })
+    })
+    .collect();
+    let genuine = log::object_key_v3(USER_ID, &keys[0]);
+    let not_keys: Vec<String> = vec![
+        // The key of another account.
+        genuine.replacen(USER_ID, "user-0000", 1),
+        // A `seq` with a zero in front.
+        genuine.replacen(".1.grant_accepted.", ".01.grant_accepted.", 1),
+        // A use entry of 129 events.
+        log::object_key_v3(USER_ID, &keys[2]).replacen(".3.1.", ".3.129.", 1),
+        // An event name with an upper-case letter.
+        genuine.replacen("grant_accepted", "Grant_accepted", 1),
+        // A key of format 2.
+        log::object_key_v2(
+            USER_ID,
+            &node.node(),
+            &EntryParts {
+                seq: 1,
+                time_ms: TIME_MS,
+                kind: EntryKind::Control,
+                count: 1,
+                key_id: key_id.clone(),
+                body_hash: keys[0].body_hash,
+                entry_hash: keys[0].body_hash,
+            },
+        ),
+    ];
+    let a_key_parses = not_keys
+        .iter()
+        .any(|key| log::parse_object_key_v3(key, USER_ID).is_some());
+
+    // The node document of the node, on the local platform: the vectors hold no Nitro document.
+    let store = log_store_id();
+    let binding = keys::binding(&node, RELEASE, Some(&store));
+    let nonce = log::node_document_nonce(&node.sign_public());
+    let document = local_document(&binding, &nonce, TIME_MS);
+    let object = log::node_document("local", &document, &node.node(), RELEASE);
+    let reads = |object: &[u8], of: &NodeKeys| {
+        app::read_node_document(object, &of.node(), AWS_NITRO_ROOT_G1).is_ok()
+    };
+    let with_another_nonce = log::node_document(
+        "local",
+        &local_document(&binding, &fixed("attestation nonce"), TIME_MS),
+        &node.node(),
+        RELEASE,
+    );
+    let with_another_release = log::node_document("local", &document, &node.node(), "v9.0.0");
+    json!({
+        "node_sign_pk": b64u(&node.sign_public()),
+        "node": node.node(),
+        "user_id": USER_ID,
+        "key_id": key_id,
+        "log_private": b64u(&account.log.to_bytes()),
+        "log_pk": b64u(&account.log_pk()),
+        "hpke_info_text": purpose::LOG_ENTRY_SEAL_V3,
+        "signature_context_text": purpose::LOG_ENTRY_V3,
+        "control_prefix": log::entry_prefix_v3(USER_ID, EntryKind::Control),
+        "use_prefix": log::entry_prefix_v3(USER_ID, EntryKind::Use),
+        "entries": entries,
+        "control_listing": listing(EntryKind::Control),
+        "use_listing": listing(EntryKind::Use),
+        "verifies": verifies,
+        "rejected": rejected,
+        "not_keys": not_keys,
+        "a_key_of_not_keys_parses": a_key_parses,
+        "node_document": {
+            "key": log::node_document_key(&node.node()),
+            "bucket": store.shard_of(keys::shard_hash(&node.node())).expect("a bucket"),
+            "nonce_prefix_text": purpose::NODE_DOCUMENT,
+            "nonce": b64u(&nonce),
+            "binding_text": text(&binding),
+            "document_text": text(&document),
+            "object_text": text(&object),
+            "accepted": reads(&object, &node),
+            "rejected": [
+                {"name": "another_nonce", "node": node.node(),
+                 "object_text": text(&with_another_nonce),
+                 "accepted": reads(&with_another_nonce, &node)},
+                {"name": "another_release", "node": node.node(),
+                 "object_text": text(&with_another_release),
+                 "accepted": reads(&with_another_release, &node)},
+                {"name": "the_document_of_another_node", "node": other.node(),
+                 "object_text": text(&object),
+                 "accepted": reads(&object, &other)},
+            ],
+        },
+    })
+}
+
+/// The vector `log_store`: the buckets of format 3 of five log stores (protocol.md 7.6), and the
+/// bucket of four owners in each of them.
+fn log_store() -> Value {
+    let node = node_keys();
+    let owners = [
+        USER_ID.to_string(),
+        "00000000-0000-4000-8000-000000000007".to_string(),
+        "사용자 1".to_string(),
+        node.node(),
+    ];
+    let stores: Vec<Value> = [
+        "character-credential-log-prod-1",
+        "character-credential-log-dev-1",
+        "character-credential-log-alpha-1",
+        "character-credential-log-local-1",
+        "character-credential-log-yolo-3",
+    ]
+    .iter()
+    .map(|bucket| {
+        let store = LogStoreId::parse(bucket, "us-west-2").expect("a log store name");
+        let shards = store.shards();
+        let placed: Vec<Value> = owners
+            .iter()
+            .map(|owner| {
+                let hash = keys::shard_hash(owner);
+                json!({
+                    "owner": owner,
+                    "hash": hash,
+                    "index": hash % shards,
+                    "bucket": store.shard_of(hash).expect("a bucket"),
+                })
+            })
+            .collect();
+        json!({
+            "bucket": bucket,
+            "region": store.region(),
+            "host": store.regional_host(),
+            "shards": shards,
+            "first_bucket": store.shard_bucket(0).expect("a bucket"),
+            "last_bucket": store.shard_bucket(shards - 1).expect("a bucket"),
+            "owners": placed,
+        })
+    })
+    .collect();
+    let longest = LogStoreId::parse(&"b".repeat(keys::LOG_STORE_NAME_CHARS), "us-west-2")
+        .expect("a log store name");
+    let too_long = LogStoreId::parse(&"b".repeat(keys::LOG_STORE_NAME_CHARS + 1), "us-west-2")
+        .expect("a log store name");
+    json!({
+        "stores": stores,
+        "longest_name": {
+            "bucket": longest.bucket(),
+            "first_bucket": longest.shard_bucket(0),
+        },
+        "name_without_buckets": {
+            "bucket": too_long.bucket(),
+            "first_bucket": too_long.shard_bucket(0),
         },
     })
 }
@@ -1080,14 +1393,19 @@ fn generate() -> String {
             "Byte values are base64url without padding. A key ending in `_text` holds the same ",
             "bytes as UTF-8 text. An `hpke_seed` is the input keying material of the HPKE ",
             "ephemeral key pair: the pair is DeriveKeyPair(hpke_seed) of RFC 9180 section 7.1.3. ",
-            "`log` is the credential log of format 2 (the releases from v2.0.0 on: one entry ",
-            "holds the events of one account, the key of its object carries body_hash and ",
-            "entry_hash) and `log_v1` the log of format 1 (one entry holds one event)."
+            "`log_v3` is the credential log of format 3 (the releases from v2.4.0 on: the key of ",
+            "an object carries the time, the node and the body_hash of its entry) with the node ",
+            "document of its node, `log_store` the buckets of format 3 of a log store, `log` the ",
+            "log of format 2 (the releases from v2.0.0 to v2.3.0: the key carries body_hash and ",
+            "entry_hash, and the node signed heads) and `log_v1` the log of format 1 (one entry ",
+            "holds one event)."
         ),
         "key_derivation": key_derivation(),
         "record": record(),
         "command": command(),
         "signed": signed(),
+        "log_v3": log_v3(),
+        "log_store": log_store(),
         "log": log_chain(),
         "log_v1": log_chain_v1(),
         "attestation": attestation(),

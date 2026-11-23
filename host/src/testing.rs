@@ -135,7 +135,7 @@ pub fn health_body_with_limit(configured: bool, accounts: u64, started_ms: u64) 
 }
 
 /// The `log_store` object of [`health_body_with_egress_and_refresh`].
-pub const LOG_STORE_OBJECT: &str = r#"{"bucket":"character-credential-log-dev-1","region":"us-west-2","credentials_expires_ms":1790000900000,"pending":6,"pending_oldest_ms":12345}"#;
+pub const LOG_STORE_OBJECT: &str = r#"{"bucket":"character-credential-log-dev-1","region":"us-west-2","shards":32,"credentials_expires_ms":1790000900000,"node_document_ms":1790000100250,"pending":6,"pending_oldest_ms":12345}"#;
 
 /// The write counts of the `log` object of [`health_body_with_egress_and_refresh`]: the keys
 /// of release v2.1.0 after the seven counts.

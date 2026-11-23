@@ -185,7 +185,10 @@ async fn the_operator_configuration_is_validated_and_replaced_as_a_whole() {
             }}),
         )
         .await;
-    assert_eq!((status, configured), (200, json!({"configured": true})));
+    assert_eq!(
+        (status, configured),
+        (200, json!({"configured": true, "node_document_ms": 0}))
+    );
 
     // A second configuration replaces the first one as a whole.
     let app = App::new("user-1", 1);
@@ -447,7 +450,6 @@ async fn the_router_serves_the_calls_of_the_route_list_and_no_other() {
             "POST /v1/mail/submit",
             "POST /v1/release",
             "POST /v1/close",
-            "POST /v1/close/heads",
             "POST /v1/peer/export",
             "POST /v1/peer/import",
             "POST /v1/grants/prune",
@@ -556,31 +558,38 @@ async fn failures_of_the_surface_have_a_code_and_a_message() {
         failure(status.as_u16(), &bytes),
         (413, "too_large".to_string())
     );
-    // A status nonce that is not base64url, or empty.
-    for nonce in ["", "not base64url!"] {
-        let (status, body) = harness
-            .post("/v1/status", json!({"user_id": "user-1", "nonce": nonce}))
+    // A status call names its account.
+    let (status, body) = harness.post("/v1/status", json!({})).await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (400, Some("invalid_request"))
+    );
+    // An account the node does not know has no grant. The call answers with the grant alone:
+    // a node of this release signs no head, and a `nonce`, which a caller sent to a node of
+    // an earlier release for the head, is not read, whatever its form.
+    for nonce in [
+        json!("bm9uY2U"),
+        json!(""),
+        json!("not base64url!"),
+        Value::Null,
+    ] {
+        let (status, state) = harness
+            .post("/v1/status", json!({"user_id": "nobody", "nonce": nonce}))
             .await;
+        assert_eq!(status, 200);
         assert_eq!(
-            (status, body["code"].as_str()),
-            (400, Some("invalid_request"))
+            state,
+            json!({"grant": {"state": "none", "key_id": "", "custody": "", "not_after_ms": 0}})
         );
     }
-    // An account the node does not know has an empty chain and no grant.
-    let (status, state) = harness
-        .post(
-            "/v1/status",
-            json!({"user_id": "nobody", "nonce": "bm9uY2U"}),
-        )
+    // The calls of the shutdown of an earlier release that this release does not have.
+    let (status, body) = harness
+        .post("/v1/close/heads", json!({"cursor": "", "limit": 1000}))
         .await;
-    assert_eq!(status, 200);
     assert_eq!(
-        state["grant"],
-        json!({"state": "none", "key_id": "", "custody": "", "not_after_ms": 0})
+        (status, body["code"].as_str()),
+        (404, Some("invalid_request"))
     );
-    let head = harness.verified(credential_enclave_protocol::purpose::HEAD, &state["head"]);
-    assert_eq!(head["seq"], 0);
-    assert_eq!(head["hash"], b64u(&[0u8; 32]));
 }
 
 async fn exchange(stream: &mut TcpStream, request: &str) -> (u16, Value) {

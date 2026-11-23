@@ -1,17 +1,24 @@
-//! Delegation transfer between two nodes (enclave.md 5.13, protocol.md 10.1): `peer/export`
-//! on the node that holds the delegations and `peer/import` on the node that takes them. Both
-//! nodes of these tests run on the local platform, so their custody is `operator`.
+//! Delegation transfer between two nodes (enclave.md 5.13, protocol.md 10.1 and 10.3):
+//! `peer/export` on the node that holds the delegations and `peer/import` on the node that
+//! takes them. Both nodes of these tests run on the local platform, so their custody is
+//! `operator`, and two of them are two nodes of one program: a transfer between them creates
+//! no entry. What a node does with a peer of another release (the entries of the transfer, the
+//! list of the peers a grant was handed to) is tested with a peer the test states as accepted:
+//! which peer a node accepts is tested with the attestation documents (`crate::attest`).
 
-use credential_enclave_protocol::encoding::{b64u, b64u_decode, to_json, verify, Signed};
+use credential_enclave_protocol::encoding::{b64u, b64u_decode, to_json};
 use credential_enclave_protocol::envelope::{
     hpke_seal, sign_transfer, transfer_aad, transfer_payload, TransferGrant,
 };
-use credential_enclave_protocol::keys::{key_id, Custody};
+use credential_enclave_protocol::keys::{key_id, Custody, NodeKeys};
+use credential_enclave_protocol::release::ReleaseMeasurement;
 use credential_enclave_protocol::secret::Secret;
 use credential_enclave_protocol::{app, limits, purpose};
 use serde_json::{json, Value};
 
 use super::{quiet_provider, quiet_provider_and_log_store};
+use crate::api::peer::{export_to, import_from};
+use crate::attest::{Peer, Program};
 use crate::state::{lock, ActiveGrant, GrantState};
 use crate::testing::{App, Harness, Provider};
 
@@ -42,43 +49,95 @@ async fn import(receiving: &Harness, peer: &Value, envelope: &Value) -> (u16, Va
         .await
 }
 
-/// Moves every delegation of `giving` to `receiving`, page by page, and returns the `logs` of
-/// both nodes: the entries the export calls created and the entries the import calls created,
-/// each as its `{"user_id", "seq"}` object.
-async fn transfer(giving: &Harness, receiving: &Harness, limit: u64) -> (Vec<Value>, Vec<Value>) {
+/// The accounts whose grants an import call put in place.
+fn accounts_of(imported: &Value) -> Vec<String> {
+    imported["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|user_id| user_id.as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Moves every delegation of `giving` to `receiving`, page by page, and returns the accounts
+/// whose grants the import calls put in place. The two nodes run one program: neither call
+/// creates an entry.
+async fn transfer(giving: &Harness, receiving: &Harness, limit: u64) -> Vec<String> {
     let to = attestation(receiving).await;
     let from = attestation(giving).await;
-    let mut out = Vec::new();
-    let mut into = Vec::new();
+    let mut taken = Vec::new();
     let mut after = String::new();
     loop {
         let (status, page) = export(giving, &to, &after, limit).await;
         assert_eq!(status, 200, "{page}");
-        out.extend(page["logs"].as_array().unwrap().iter().cloned());
-        if page["envelope"].is_null() {
-            assert!(page["logs"].as_array().unwrap().is_empty());
-        } else {
+        assert_eq!(page["logs"], json!([]));
+        if !page["envelope"].is_null() {
             let (status, imported) = import(receiving, &from, &page["envelope"]).await;
             assert_eq!(status, 200, "{imported}");
+            assert_eq!(imported["logs"], json!([]));
             assert_eq!(
                 imported["imported"].as_u64().unwrap() as usize,
-                imported["logs"].as_array().unwrap().len()
+                accounts_of(&imported).len()
             );
-            into.extend(imported["logs"].as_array().unwrap().iter().cloned());
+            taken.extend(accounts_of(&imported));
         }
         after = page["next"].as_str().unwrap().to_string();
         if after.is_empty() {
-            return (out, into);
+            return taken;
         }
     }
 }
 
+/// The release and the measurement the tests state for a later release.
+fn later_release() -> ReleaseMeasurement {
+    ReleaseMeasurement {
+        release: "v9.0.0".to_string(),
+        pcrs: [[0x11; 48], [0x22; 48], [0x33; 48]],
+    }
+}
+
+/// The node of `harness` as a peer that runs the program of the release `release`.
+fn peer_of(harness: &Harness, release: &str) -> Peer {
+    Peer::accepted_for_tests(&harness.node.keys, Program::Release(release.to_string()))
+}
+
+/// One page of the delegations of `giving` for `peer`, a node of the later release
+/// [`later_release`]: the part of `peer/export` after the peer and its endorsement verified.
+async fn export_later(
+    giving: &Harness,
+    peer: &Peer,
+    after: &str,
+    limit: usize,
+) -> Result<Value, (u16, &'static str)> {
+    export_to(
+        &giving.node,
+        peer,
+        Some(&later_release()),
+        after,
+        limit,
+        None,
+    )
+    .await
+    .map(|exported| serde_json::to_value(&exported).unwrap())
+    .map_err(|error| (error.status.as_u16(), error.code))
+}
+
+/// Takes the transfer `envelope` that `peer`, a node of an earlier release, made for
+/// `receiving`: the part of `peer/import` after the peer verified.
+async fn import_earlier(
+    receiving: &Harness,
+    peer: &Peer,
+    envelope: &Value,
+) -> Result<Value, (u16, &'static str)> {
+    import_from(&receiving.node, peer, envelope, None)
+        .await
+        .map(|imported| serde_json::to_value(&imported).unwrap())
+        .map_err(|error| (error.status.as_u16(), error.code))
+}
+
 async fn grant_state(harness: &Harness, user_id: &str) -> Value {
     harness
-        .post(
-            "/v1/status",
-            json!({"user_id": user_id, "nonce": "bm9uY2U"}),
-        )
+        .post("/v1/status", json!({"user_id": user_id}))
         .await
         .1["grant"]
         .clone()
@@ -114,29 +173,23 @@ fn code(outcome: &(u16, Value)) -> (u16, &str) {
     (outcome.0, outcome.1["code"].as_str().unwrap_or_default())
 }
 
-/// The `user_id` of a `{"user_id", "seq"}` object of `peer/export` or `peer/import`.
-fn log_user(log: &Value) -> String {
-    log["user_id"].as_str().unwrap().to_string()
-}
-
 /// An event without its `time_ms`, the node time of its creation.
 fn without_time(mut event: Value) -> Value {
     assert!(event["time_ms"].as_u64().is_some(), "{event}");
-    event.as_object_mut().unwrap().remove("time_ms");
+    event.as_object_mut().unwrap().shift_remove("time_ms");
     event
 }
 
 /// The one event of the control entry that a `{"user_id", "seq"}` object of `peer/export` or
 /// `peer/import` names on the node of `harness`, read from the log store stand-in and without
-/// its `time_ms`. An entry of an import is in the store only after a later write of the
-/// account on that node took it along.
+/// its `time_ms`.
 fn logged(app: &App, harness: &Harness, provider: &Provider, log: &Value) -> Value {
     assert_eq!(log["user_id"], app.user_id.as_str());
     without_time(app.logged(harness, provider, &json!({"seq": log["seq"], "index": 0})))
 }
 
 #[tokio::test]
-async fn a_delegation_moves_to_a_peer_and_both_nodes_record_it() {
+async fn a_delegation_moves_to_a_node_of_the_same_program_without_an_entry() {
     let provider = quiet_provider_and_log_store().await;
     let old = Harness::new(&provider);
     let new = Harness::new(&provider);
@@ -153,6 +206,7 @@ async fn a_delegation_moves_to_a_peer_and_both_nodes_record_it() {
         (409, "grant_required")
     );
     assert_eq!(new.health().await["grants"], 0);
+    let written = provider.stored().len();
 
     // The node that holds the delegations seals them for the new node.
     let to = attestation(&new).await;
@@ -169,44 +223,21 @@ async fn a_delegation_moves_to_a_peer_and_both_nodes_record_it() {
     for user_key in [&alice.keys.user_key_operator, &bob.keys.user_key_operator] {
         assert!(!exported.to_string().contains(&b64u(user_key.as_slice())));
     }
+    // The two nodes run one program: the transfer has no entry on the giving node.
+    assert_eq!(exported["logs"], json!([]));
+    assert_eq!((old.last_seq("alice"), old.last_seq("bob")), (2, 1));
 
-    // One entry per account, on the chain of the giving node, before the grant left. alice:
-    // grant, release, transfer. bob: grant, transfer.
-    assert_eq!(
-        exported["logs"],
-        json!([{"user_id": "alice", "seq": 3}, {"user_id": "bob", "seq": 2}])
-    );
-    let out = provider.chain("alice", &old.node.node);
-    assert_eq!(out.len(), 3);
-    let body = alice.entry_body(&old, &out[2].entry);
-    assert_eq!(body["seq"], 3);
-    assert_eq!(body["key_id"], alice.keys.key_id().as_str());
-    assert_eq!((&body["kind"], &body["count"]), (&json!("c"), &json!(1)));
-    let event = logged(&alice, &old, &provider, &exported["logs"][0]);
-    assert_eq!(
-        event,
-        json!({"t": "grant_transferred_out", "to": new.node.node})
-    );
-    assert_eq!(
-        logged(&bob, &old, &provider, &exported["logs"][1])["t"],
-        "grant_transferred_out"
-    );
-    assert_eq!(old.head_seq("alice"), 3);
-    assert_eq!(old.head_seq("bob"), 2);
-
-    // The new node takes them after it verified the giving node, and writes the entries of the
-    // import in one round: the store holds the first entry of each account on the new node
-    // before any of them acts there.
+    // The new node takes them after it verified the giving node, names the accounts it took,
+    // and creates no entry either. Neither call wrote to the log store.
     let from = attestation(&old).await;
     let (status, imported) = import(&new, &from, envelope).await;
     assert_eq!(status, 200, "{imported}");
-    assert_eq!(imported["imported"], 2);
     assert_eq!(
-        imported["logs"],
-        json!([{"user_id": "alice", "seq": 1}, {"user_id": "bob", "seq": 1}])
+        imported,
+        json!({"imported": 2, "accounts": ["alice", "bob"], "logs": []})
     );
-    assert_eq!(provider.chain("alice", &new.node.node).len(), 1);
-    assert_eq!(provider.chain("bob", &new.node.node).len(), 1);
+    assert_eq!((new.last_seq("alice"), new.last_seq("bob")), (0, 0));
+    assert_eq!(provider.stored().len(), written);
     assert_eq!(new.health().await["log_store"]["pending"], 0);
 
     // The delegation is in force on the new node, with the key, the custody and the end it
@@ -220,49 +251,122 @@ async fn a_delegation_moves_to_a_peer_and_both_nodes_record_it() {
         })
     );
     assert_eq!(new.health().await["grants"], 2);
-    assert_eq!(new.health().await["accounts"], 2);
+    assert_eq!(new.health().await["accounts"], 0);
     assert_eq!(old.health().await["grants"], 2);
+    // The first entry of the new node for the account is the entry of its first act there.
+    // The store holds the document of the new node, which says which program wrote it.
     let (status, released) = release(&new, &alice, &record).await;
     assert_eq!(status, 200);
     assert_eq!(released["value"], "hunter2");
     assert_eq!(
         released["log"],
-        json!({"seq": 2, "index": 0, "created": true})
+        json!({"seq": 1, "index": 0, "created": true})
     );
+    assert_eq!(new.health().await["accounts"], 1);
+    assert_eq!(provider.chain("alice", &new.node.node).len(), 1);
+    assert!(provider
+        .documents()
+        .iter()
+        .any(|document| document.node == new.node.node));
     assert_eq!(release(&old, &alice, &record).await.0, 200);
-
-    // Entry 1 of alice on the new node holds the event of the transfer, and the release
-    // continued the chain with entry 2.
-    let into = provider.chain("alice", &new.node.node);
-    assert_eq!(into.len(), 2);
-    assert_eq!(
-        logged(&alice, &new, &provider, &imported["logs"][0]),
-        json!({
-            "t": "grant_transferred_in", "from": old.node.node, "not_after_ms": accepted,
-            "custody": "operator",
-        })
-    );
-    let body = alice.entry_body(&new, &into[0].entry);
-    assert_eq!(body["seq"], 1);
-    assert_eq!(body["node"], new.node.node.as_str());
-    assert_eq!(body["user_id"], "alice");
-    assert_eq!(body["key_id"], alice.keys.key_id().as_str());
-    // The `to` of the entry on the old node is the signing key of the new node: the account
-    // verifies the entries of the new node with it, without asking anyone who that node is.
-    let new_public: [u8; 32] = b64u_decode(event["to"].as_str().unwrap())
-        .unwrap()
-        .try_into()
-        .unwrap();
-    let carried: Signed = serde_json::from_value(into[0].entry.clone()).unwrap();
-    assert!(verify(&new_public, purpose::LOG_ENTRY_V2, &carried).is_ok());
 
     // The same envelope again changes nothing: the grants are there.
     let (status, again) = import(&new, &from, envelope).await;
-    assert_eq!((status, again), (200, json!({"imported": 0, "logs": []})));
-    assert_eq!(new.head_seq("alice"), 2);
+    assert_eq!(
+        (status, again),
+        (200, json!({"imported": 0, "accounts": [], "logs": []}))
+    );
+    assert_eq!(new.last_seq("alice"), 1);
 
     // The provider stand-in saw no provider request: a transfer calls no provider.
     assert!(provider.requests().is_empty());
+}
+
+#[tokio::test]
+async fn a_delegation_moves_to_a_later_release_and_both_nodes_record_it() {
+    let provider = quiet_provider_and_log_store().await;
+    let old = Harness::new(&provider);
+    let new = Harness::new(&provider);
+    old.use_log_store().await;
+    new.use_log_store().await;
+    let alice = App::new("alice", 1);
+    let bob = App::new("bob", 2);
+    let granted = alice.grant(&old).await;
+    bob.grant(&old).await;
+    let record = alice.record("vault_password", "vault", &json!({"value": "hunter2"}));
+    assert_eq!(release(&old, &alice, &record).await.0, 200);
+
+    // The giving node hands its delegations to a node of a later release. One entry per
+    // account, in the store before the grant left: alice has grant, release, transfer, and
+    // bob grant, transfer.
+    let exported = export_later(&old, &peer_of(&new, "v9.0.0"), "", 1000)
+        .await
+        .unwrap();
+    assert_eq!(
+        exported["logs"],
+        json!([{"user_id": "alice", "seq": 3}, {"user_id": "bob", "seq": 2}])
+    );
+    let out = provider.chain("alice", &old.node.node);
+    assert_eq!(out.len(), 3);
+    let body = alice.entry_body(&old, &out[2].entry);
+    assert_eq!(body["seq"], 3);
+    assert_eq!(body["key_id"], alice.keys.key_id().as_str());
+    assert_eq!((&body["kind"], &body["count"]), (&json!("c"), &json!(1)));
+    assert!(out[2].key.contains(".3.grant_transferred_out."));
+    // The event names the node the key went to, and the release and the measurement of that
+    // node: the account reads from its own log which program holds its key from here on.
+    assert_eq!(
+        logged(&alice, &old, &provider, &exported["logs"][0]),
+        json!({
+            "t": "grant_transferred_out", "to": new.node.node, "release": "v9.0.0",
+            "pcr0": "11".repeat(48), "pcr1": "22".repeat(48), "pcr2": "33".repeat(48),
+        })
+    );
+    assert_eq!(
+        logged(&bob, &old, &provider, &exported["logs"][1])["t"],
+        "grant_transferred_out"
+    );
+    assert_eq!((old.last_seq("alice"), old.last_seq("bob")), (3, 2));
+
+    // The receiving node takes them from a node of an earlier release, and writes the entries
+    // of the import in one round: the store holds the first entry of each account on the new
+    // node before any of them acts there.
+    let envelope = &exported["envelope"];
+    let imported = import_earlier(&new, &peer_of(&old, "v2.3.0"), envelope)
+        .await
+        .unwrap();
+    assert_eq!(
+        imported,
+        json!({
+            "imported": 2, "accounts": ["alice", "bob"],
+            "logs": [{"user_id": "alice", "seq": 1}, {"user_id": "bob", "seq": 1}],
+        })
+    );
+    assert_eq!(provider.chain("alice", &new.node.node).len(), 1);
+    assert_eq!(provider.chain("bob", &new.node.node).len(), 1);
+    assert_eq!(new.health().await["log_store"]["pending"], 0);
+    let accepted = granted["grant"]["not_after_ms"].as_u64().unwrap();
+    assert_eq!(
+        logged(&alice, &new, &provider, &imported["logs"][0]),
+        json!({
+            "t": "grant_transferred_in", "from": old.node.node, "release": "v2.3.0",
+            "not_after_ms": accepted, "custody": "operator",
+        })
+    );
+    assert_eq!(new.health().await["grants"], 2);
+    let (status, released) = release(&new, &alice, &record).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        released["log"],
+        json!({"seq": 2, "index": 0, "created": true})
+    );
+
+    // The same envelope again changes nothing: the grants are there.
+    let again = import_earlier(&new, &peer_of(&old, "v2.3.0"), envelope)
+        .await
+        .unwrap();
+    assert_eq!(again, json!({"imported": 0, "accounts": [], "logs": []}));
+    assert_eq!(new.last_seq("alice"), 2);
 }
 
 #[tokio::test]
@@ -270,7 +374,7 @@ async fn export_pages_through_the_accounts_that_have_a_grant() {
     let provider = quiet_provider().await;
     let old = Harness::new(&provider);
     let new = Harness::new(&provider);
-    // a, c, e and f hold a grant. b revoked, d expired, g only revoked and has no chain.
+    // a, c, e and f hold a grant. b revoked, d expired, g only revoked and has no entry.
     for (index, user_id) in ["a", "b", "c", "e", "f"].iter().enumerate() {
         App::new(user_id, index as u8 + 1).grant(&old).await;
     }
@@ -284,44 +388,43 @@ async fn export_pages_through_the_accounts_that_have_a_grant() {
     assert_eq!(old.health().await["grants"], 4);
 
     let to = attestation(&new).await;
-    let users = |page: &Value| -> Vec<String> {
-        page["logs"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(log_user)
-            .collect()
-    };
-    // A page holds `limit` grants. `next` is the last account the page looked at.
+    let from = attestation(&old).await;
+    // A page holds `limit` grants. `next` is the last account the page looked at. The
+    // receiving node names the accounts of the page it took.
     let (_, first) = export(&old, &to, "", 2).await;
-    assert_eq!(users(&first), ["a", "c"]);
     assert_eq!(first["next"], "c");
+    let (_, taken) = import(&new, &from, &first["envelope"]).await;
+    assert_eq!(accounts_of(&taken), ["a", "c"]);
     let (_, second) = export(&old, &to, "c", 2).await;
-    assert_eq!(users(&second), ["e", "f"]);
     // g follows f: the listing goes on, and its last page is empty.
     assert_eq!(second["next"], "f");
+    let (_, taken) = import(&new, &from, &second["envelope"]).await;
+    assert_eq!(accounts_of(&taken), ["e", "f"]);
     let (status, third) = export(&old, &to, "f", 2).await;
     assert_eq!(
         (status, third),
         (200, json!({"envelope": null, "logs": [], "next": ""}))
     );
-    // Accounts without a grant got no entry: b has grant and revoke, d has its grant.
-    assert_eq!(old.head_seq("b"), 2);
-    assert_eq!(old.head_seq("d"), 1);
-    assert_eq!(old.head_seq("g"), 0);
+    // No export created an entry: a and c have their grant, b has grant and revoke, d has
+    // its grant.
+    assert_eq!(
+        ["a", "b", "c", "d", "g"].map(|user_id| old.last_seq(user_id)),
+        [1, 2, 1, 1, 0]
+    );
 
     // A limit above 1,000 is read as 1,000, and an absent limit and `after` are the defaults.
-    // Each of the two listings goes to a node that was handed nothing yet, so the `logs` name
-    // the accounts of the page.
-    let to_second = attestation(&Harness::new(&provider)).await;
-    let (status, all) = export(&old, &to_second, "", 5000).await;
+    let second_node = Harness::new(&provider);
+    let (status, all) = export(&old, &attestation(&second_node).await, "", 5000).await;
     assert_eq!(status, 200);
-    assert_eq!(users(&all), ["a", "c", "e", "f"]);
     assert_eq!(all["next"], "");
-    let to_third = attestation(&Harness::new(&provider)).await;
+    let (_, taken) = import(&second_node, &from, &all["envelope"]).await;
+    assert_eq!(accounts_of(&taken), ["a", "c", "e", "f"]);
+    let third_node = Harness::new(&provider);
+    let to_third = attestation(&third_node).await;
     let (status, defaults) = old.post("/v1/peer/export", json!({"peer": to_third})).await;
     assert_eq!(status, 200);
-    assert_eq!(users(&defaults), ["a", "c", "e", "f"]);
+    let (_, taken) = import(&third_node, &from, &defaults["envelope"]).await;
+    assert_eq!(accounts_of(&taken), ["a", "c", "e", "f"]);
     for limit in [json!(0), json!(-1), json!("many"), json!(1.5)] {
         let outcome = old
             .post("/v1/peer/export", json!({"peer": to, "limit": limit}))
@@ -329,25 +432,9 @@ async fn export_pages_through_the_accounts_that_have_a_grant() {
         assert_eq!(code(&outcome), (400, "invalid_request"), "{limit}");
     }
 
-    // The whole listing arrives on the new node, page by page. The envelopes of the first
-    // pages above were never delivered, so the transfer to the new node is made again: the
-    // grants are carried again, and the chains of the old node, which hold the entry of that
-    // transfer already, get no further one.
-    let seq: Vec<u64> = ["a", "c", "e", "f"]
-        .iter()
-        .map(|user_id| old.head_seq(user_id))
-        .collect();
-    assert_eq!(seq, [4, 4, 4, 4]);
-    let (out, into) = transfer(&old, &new, 3).await;
-    assert!(out.is_empty());
-    assert_eq!(
-        ["a", "c", "e", "f"].map(|user_id| old.head_seq(user_id)),
-        [4, 4, 4, 4]
-    );
-    assert_eq!(
-        into.iter().map(log_user).collect::<Vec<String>>(),
-        ["a", "c", "e", "f"]
-    );
+    // The whole listing once more to the node that holds every grant already: the grants are
+    // carried again, and the receiving node puts none in place.
+    assert!(transfer(&old, &new, 3).await.is_empty());
     assert_eq!(new.health().await["grants"], 4);
     for user_id in ["b", "d", "g"] {
         assert_eq!(
@@ -392,23 +479,17 @@ async fn an_import_never_replaces_what_the_app_of_the_account_put_in_place() {
     assert_eq!(grant_state(&new, "expired").await["state"], "expired");
     let seq_before: Vec<u64> = ["revoked", "rekeyed", "shorter", "longer", "expired"]
         .iter()
-        .map(|user_id| new.head_seq(user_id))
+        .map(|user_id| new.last_seq(user_id))
         .collect();
 
-    let (out, into) = transfer(&old, &new, 1000).await;
-    assert_eq!(out.len(), 6);
-    // Only the accounts without a grant in force and without a marker got an entry.
-    assert_eq!(
-        into.iter().map(log_user).collect::<Vec<String>>(),
-        ["expired", "fresh"]
-    );
+    // Only the accounts without a grant in force and without a marker were taken.
+    assert_eq!(transfer(&old, &new, 1000).await, ["expired", "fresh"]);
 
     // No grant here: taken.
     assert_eq!(grant_state(&new, "fresh").await["state"], "active");
     assert_eq!(end_of(&new, "fresh").await, end_of(&old, "fresh").await);
-    // An expired grant is no grant: taken, with an entry after the entry of the old grant.
+    // An expired grant is no grant: taken.
     assert_eq!(grant_state(&new, "expired").await["state"], "active");
-    assert_eq!(into[0], json!({"user_id": "expired", "seq": 2}));
     // A revocation marker stays.
     assert_eq!(
         grant_state(&new, "revoked").await,
@@ -426,63 +507,51 @@ async fn an_import_never_replaces_what_the_app_of_the_account_put_in_place() {
         code(&release(&new, &rekeyed_old, &old_record).await),
         (409, "key_mismatch")
     );
-    // The same signing key: the later end stays, without an entry.
+    // The same signing key: the later end stays.
     assert_eq!(end_of(&new, "shorter").await, end_of(&old, "shorter").await);
     assert_eq!(end_of(&new, "longer").await, longer_end);
     let seq_after: Vec<u64> = ["revoked", "rekeyed", "shorter", "longer", "expired"]
         .iter()
-        .map(|user_id| new.head_seq(user_id))
+        .map(|user_id| new.last_seq(user_id))
         .collect();
-    // One release for `rekeyed`, one entry for `expired`, nothing else.
+    // One release for `rekeyed`, and nothing else: the transfer created no entry.
     assert_eq!(
         seq_after
             .iter()
             .zip(&seq_before)
             .map(|(after, before)| after - before)
             .collect::<Vec<u64>>(),
-        [0, 1, 0, 0, 1]
+        [0, 1, 0, 0, 0]
     );
 }
 
 #[tokio::test]
 async fn an_import_reads_the_end_of_a_grant_against_its_own_clock() {
-    let provider = quiet_provider_and_log_store().await;
+    let provider = quiet_provider().await;
 
     // The clock of the giving node is 10 days ahead: the end it accepted lies 40 days from the
-    // time of the receiving node, which takes it with the end at its own 30 days. Both nodes
-    // write to the log store of the tests, so the event of the import can be read.
+    // time of the receiving node, which takes it with the end at its own 30 days.
     let old = Harness::new(&provider);
     let new = Harness::new(&provider);
     old.node.clock.advance(10 * 86_400_000);
-    old.use_log_store().await;
-    new.use_log_store().await;
     let app = App::new("user-1", 1);
     let granted = app.grant(&old).await;
     let given_end = granted["grant"]["not_after_ms"].as_u64().unwrap();
     let before = new.node.now_ms();
-    let (_, into) = transfer(&old, &new, 1000).await;
+    assert_eq!(transfer(&old, &new, 1000).await, ["user-1"]);
     let after = new.node.now_ms();
-    assert_eq!(into, [json!({"user_id": "user-1", "seq": 1})]);
     assert_eq!(grant_state(&new, "user-1").await["state"], "active");
-    // The entry of the import waits on the receiving node until a write of the account takes
-    // it along: a release does. Its event names the end the receiving node accepted.
-    let record = app.record("vault_password", "vault", &json!({"value": "hunter2"}));
-    assert_eq!(release(&new, &app, &record).await.0, 200);
-    let taken_end = logged(&app, &new, &provider, &into[0])["not_after_ms"]
-        .as_u64()
-        .unwrap();
+    let taken_end = end_of(&new, "user-1").await;
     assert!(taken_end < given_end);
     assert!((before + limits::GRANT_MAX_MS..=after + limits::GRANT_MAX_MS).contains(&taken_end));
-    assert_eq!(grant_state(&new, "user-1").await["not_after_ms"], taken_end);
 
     // The clock of the receiving node is ahead of the end of a grant: that grant is over
-    // there and is not taken. Neither node of this pair has a log store.
+    // there and is not taken.
     let old = Harness::new(&provider);
     let new = Harness::new(&provider);
     grant_until(&app, &old, old.node.now_ms() + 3_600_000).await;
     new.node.clock.advance(2 * 3_600_000);
-    let (out, into) = transfer(&old, &new, 1000).await;
-    assert_eq!((out.len(), into.len()), (1, 0));
+    assert!(transfer(&old, &new, 1000).await.is_empty());
     assert_eq!(grant_state(&new, "user-1").await["state"], "none");
     assert!(new.node.account("user-1").is_none());
 }
@@ -570,12 +639,11 @@ async fn a_transfer_is_bound_to_the_two_nodes_that_verified_each_other() {
         ),
         (400, "invalid_request")
     );
-    // No refused export left an entry.
-    assert_eq!(old.head_seq("user-1"), 1);
 
     let (_, exported) = export(&old, &new_response, "", 1000).await;
     let envelope = exported["envelope"].clone();
-    assert_eq!(old.head_seq("user-1"), 2);
+    // Neither a refused export nor the one that was made left an entry.
+    assert_eq!(old.last_seq("user-1"), 1);
 
     // The envelope was made for `new`: another node does not take it.
     assert_eq!(
@@ -680,8 +748,9 @@ async fn a_revoke_on_a_node_is_not_undone_by_a_transfer() {
         code(&release(&new, &app, &record).await),
         (409, "grant_revoked")
     );
+    let nothing = json!({"imported": 0, "accounts": [], "logs": []});
     let (status, again) = import(&new, &from, &envelope).await;
-    assert_eq!((status, again), (200, json!({"imported": 0, "logs": []})));
+    assert_eq!((status, &again), (200, &nothing));
     assert_eq!(grant_state(&new, "user-1").await["state"], "revoked");
 
     // A grant of a foreign key for the same user id replaces the revocation marker (a node
@@ -696,14 +765,11 @@ async fn a_revoke_on_a_node_is_not_undone_by_a_transfer() {
     assert_eq!(grant_state(&new, "user-1").await["state"], "expired");
     // The marker is gone, and the account still revoked here: neither the kept envelope nor
     // a new transfer from the old node, which still holds the delegation, is taken.
-    let seq = new.head_seq("user-1");
+    let seq = new.last_seq("user-1");
     let (status, again) = import(&new, &from, &envelope).await;
-    assert_eq!((status, again), (200, json!({"imported": 0, "logs": []})));
-    // The old node hands the grant to the new node once more. Its chain holds the entry of
-    // that transfer already, and the new node takes nothing.
-    let (out, into) = transfer(&old, &new, 1000).await;
-    assert_eq!((out.len(), into.len()), (0, 0));
-    assert_eq!(new.head_seq("user-1"), seq);
+    assert_eq!((status, &again), (200, &nothing));
+    assert!(transfer(&old, &new, 1000).await.is_empty());
+    assert_eq!(new.last_seq("user-1"), seq);
     assert_eq!(
         code(&release(&new, &app, &record).await),
         (409, "grant_expired")
@@ -715,7 +781,7 @@ async fn a_revoke_on_a_node_is_not_undone_by_a_transfer() {
 }
 
 #[tokio::test]
-async fn a_repeated_export_to_the_same_peer_carries_the_grant_again_without_an_entry() {
+async fn a_repeated_export_to_a_later_release_carries_the_grant_again_without_an_entry() {
     let provider = quiet_provider_and_log_store().await;
     let old = Harness::new(&provider);
     let new = Harness::new(&provider);
@@ -726,97 +792,105 @@ async fn a_repeated_export_to_the_same_peer_carries_the_grant_again_without_an_e
     let alice = App::new("alice", 1);
     let bob = App::new("bob", 2);
     alice.grant(&old).await;
-    let to = attestation(&new).await;
-    let from = attestation(&old).await;
+    let to = peer_of(&new, "v9.0.0");
+    let from = peer_of(&old, "v2.3.0");
 
-    // The first transfer of the grant to the new node: one entry.
-    let (status, first) = export(&old, &to, "", 1000).await;
-    assert_eq!(status, 200);
+    // The first transfer of the grant to the node of the later release: one entry.
+    let first = export_later(&old, &to, "", 1000).await.unwrap();
     assert_eq!(first["logs"], json!([{"user_id": "alice", "seq": 2}]));
     assert_eq!(
-        logged(&alice, &old, &provider, &first["logs"][0]),
-        json!({"t": "grant_transferred_out", "to": new.node.node})
+        logged(&alice, &old, &provider, &first["logs"][0])["to"],
+        new.node.node
     );
-    assert_eq!(old.head_seq("alice"), 2);
+    assert_eq!(old.last_seq("alice"), 2);
 
     // The same call again, as often as the caller likes: the envelope carries the grant
-    // again, and the chain does not grow. The response has the same shape.
+    // again, and the node creates no entry. The response has the same shape.
     for _ in 0..5 {
-        let (status, again) = export(&old, &to, "", 1000).await;
-        assert_eq!(status, 200);
+        let again = export_later(&old, &to, "", 1000).await.unwrap();
         let keys: Vec<&String> = again.as_object().unwrap().keys().collect();
         assert_eq!(keys, ["envelope", "logs", "next"]);
         assert!(again["envelope"].is_object());
         assert_eq!(again["logs"], json!([]));
         assert_eq!(again["next"], "");
     }
-    assert_eq!(old.head_seq("alice"), 2);
+    assert_eq!(old.last_seq("alice"), 2);
     assert_eq!(provider.chain("alice", &old.node.node).len(), 2);
 
     // A transfer whose envelope was lost is made again: the envelope of a later call arrives.
-    let (_, retried) = export(&old, &to, "", 1000).await;
-    let (status, imported) = import(&new, &from, &retried["envelope"]).await;
-    assert_eq!((status, imported["imported"].as_u64()), (200, Some(1)));
+    let retried = export_later(&old, &to, "", 1000).await.unwrap();
+    let imported = import_earlier(&new, &from, &retried["envelope"])
+        .await
+        .unwrap();
+    assert_eq!(imported["imported"], 1);
     assert_eq!(grant_state(&new, "alice").await["state"], "active");
 
     // An account that was not handed to this peer yet gets its entry, in the same call that
     // carries the other grant again.
     bob.grant(&old).await;
-    let (_, mixed) = export(&old, &to, "", 1000).await;
+    let mixed = export_later(&old, &to, "", 1000).await.unwrap();
     assert_eq!(mixed["logs"], json!([{"user_id": "bob", "seq": 2}]));
-    let (_, imported) = import(&new, &from, &mixed["envelope"]).await;
-    assert_eq!(imported["imported"], 1);
+    let imported = import_earlier(&new, &from, &mixed["envelope"])
+        .await
+        .unwrap();
+    assert_eq!(accounts_of(&imported), ["bob"]);
     assert_eq!(new.health().await["grants"], 2);
-    // A grant that a node took from a transfer was handed on by that node to no one yet: the
-    // node that took the two grants hands them on with entries on its own chains, after the
-    // entries of the import.
-    let to_third = attestation(&third).await;
-    let (_, onward) = export(&new, &to_third, "", 1000).await;
-    assert_eq!(
-        onward["logs"],
-        json!([{"user_id": "alice", "seq": 2}, {"user_id": "bob", "seq": 2}])
-    );
-    let (_, onward) = export(&new, &to_third, "", 1000).await;
-    assert_eq!(onward["logs"], json!([]));
     // The pages count grants, whether a grant gets an entry or not.
-    let (_, page) = export(&old, &to, "", 1).await;
+    let page = export_later(&old, &to, "", 1).await.unwrap();
     assert!(page["envelope"].is_object());
     assert_eq!(
         (&page["logs"], &page["next"]),
         (&json!([]), &json!("alice"))
     );
-    let (_, page) = export(&old, &to, "alice", 1).await;
+    let page = export_later(&old, &to, "alice", 1).await.unwrap();
     assert!(page["envelope"].is_object());
     assert_eq!((&page["logs"], &page["next"]), (&json!([]), &json!("")));
 
-    // Another peer is another transfer: one entry that names it.
-    let (_, other) = export(&old, &to_third, "", 1000).await;
+    // Another peer of the later release is another transfer: one entry that names it.
+    let other = export_later(&old, &peer_of(&third, "v9.0.0"), "", 1000)
+        .await
+        .unwrap();
     assert_eq!(
         other["logs"],
         json!([{"user_id": "alice", "seq": 3}, {"user_id": "bob", "seq": 3}])
     );
     assert_eq!(
-        logged(&alice, &old, &provider, &other["logs"][0]),
-        json!({"t": "grant_transferred_out", "to": third.node.node})
+        logged(&alice, &old, &provider, &other["logs"][0])["to"],
+        third.node.node
     );
-    assert_eq!(old.head_seq("alice"), 3);
-    let (_, again) = export(&old, &to_third, "", 1000).await;
+    assert_eq!(old.last_seq("alice"), 3);
+
+    // A grant command of the app for the grant in force renews it and keeps what the node
+    // knows of it: the peers it was handed to. A transfer to one of them has no further entry.
+    alice.grant(&old).await;
+    assert_eq!(old.last_seq("alice"), 3);
+    let again = export_later(&old, &to, "", 1000).await.unwrap();
     assert_eq!(again["logs"], json!([]));
 
-    // A new grant command of the app puts a new grant in place, which was handed to no node:
-    // its transfer to the same peer has its entry again.
+    // A grant that follows a revoke is a new grant, which was handed to no node: its transfer
+    // to the same peer has its entry again. Grant, two transfers, revoke, grant, transfer.
+    alice.revoke(&old).await;
     alice.grant(&old).await;
-    assert_eq!(old.head_seq("alice"), 4);
-    let (_, renewed) = export(&old, &to, "", 1000).await;
-    assert_eq!(renewed["logs"], json!([{"user_id": "alice", "seq": 5}]));
-    assert_eq!(old.head_seq("alice"), 5);
-    let (_, again) = export(&old, &to, "", 1000).await;
+    assert_eq!(old.last_seq("alice"), 5);
+    let renewed = export_later(&old, &to, "", 1000).await.unwrap();
+    assert_eq!(renewed["logs"], json!([{"user_id": "alice", "seq": 6}]));
+    let again = export_later(&old, &to, "", 1000).await.unwrap();
     assert_eq!(again["logs"], json!([]));
-    assert_eq!(old.head_seq("alice"), 5);
+    assert_eq!(old.last_seq("alice"), 6);
+
+    // A transfer to a node of the same program creates no entry, however often it is made.
+    let same = attestation(&third).await;
+    for _ in 0..2 {
+        let (status, page) = export(&old, &same, "", 1000).await;
+        assert_eq!(status, 200);
+        assert!(page["envelope"].is_object());
+        assert_eq!(page["logs"], json!([]));
+    }
+    assert_eq!((old.last_seq("alice"), old.last_seq("bob")), (6, 3));
 }
 
 #[tokio::test]
-async fn a_grant_is_handed_to_at_most_64_peers() {
+async fn a_grant_is_handed_to_at_most_64_peers_of_a_later_release() {
     let provider = quiet_provider_and_log_store().await;
     let old = Harness::new(&provider);
     old.use_log_store().await;
@@ -824,72 +898,65 @@ async fn a_grant_is_handed_to_at_most_64_peers() {
     let bob = App::new("bob", 2);
     alice.grant(&old).await;
     assert_eq!(limits::TRANSFER_PEERS, 64);
+    let later = |index: u8| {
+        Peer::accepted_for_tests(
+            &NodeKeys::from_random(&[index; 32], &[index.wrapping_add(100); 32]),
+            Program::Release("v9.0.0".to_string()),
+        )
+    };
 
-    // 64 peers: each gets the grant, with one entry on the chain of the giving node.
-    let mut peers = Vec::new();
-    for index in 0..64u64 {
-        let peer = Harness::new(&provider);
-        peer.use_log_store().await;
-        let to = attestation(&peer).await;
-        let (status, exported) = export(&old, &to, "", 1000).await;
-        assert_eq!(status, 200);
+    // 64 peers: each gets the grant, with one entry of the giving node.
+    for index in 0..64u8 {
+        let exported = export_later(&old, &later(index), "", 1000).await.unwrap();
         assert!(exported["envelope"].is_object(), "{index}");
         assert_eq!(
             exported["logs"],
-            json!([{"user_id": "alice", "seq": 2 + index}]),
+            json!([{"user_id": "alice", "seq": 2 + u64::from(index)}]),
             "{index}"
         );
-        assert_eq!(old.head_seq("alice"), 2 + index);
-        peers.push(to);
     }
-    assert_eq!(old.head_seq("alice"), 65);
+    assert_eq!(old.last_seq("alice"), 65);
 
     // A 65th peer gets nothing of this grant: the account is left out, and no entry is made.
-    let late = Harness::new(&provider);
-    late.use_log_store().await;
-    let to_late = attestation(&late).await;
+    let late = later(64);
     for _ in 0..3 {
-        let (status, exported) = export(&old, &to_late, "", 1000).await;
-        assert_eq!(
-            (status, exported),
-            (200, json!({"envelope": null, "logs": [], "next": ""}))
-        );
+        let exported = export_later(&old, &late, "", 1000).await.unwrap();
+        assert_eq!(exported, json!({"envelope": null, "logs": [], "next": ""}));
     }
-    assert_eq!(old.head_seq("alice"), 65);
+    assert_eq!(old.last_seq("alice"), 65);
     // The peers of the list still get it again, without an entry.
-    for to in [&peers[0], &peers[63]] {
-        let (_, again) = export(&old, to, "", 1000).await;
+    for index in [0, 63] {
+        let again = export_later(&old, &later(index), "", 1000).await.unwrap();
         assert!(again["envelope"].is_object());
         assert_eq!(again["logs"], json!([]));
     }
-    assert_eq!(old.head_seq("alice"), 65);
+    assert_eq!(old.last_seq("alice"), 65);
 
     // An account that is left out does not fill a page: the page of one grant holds the
     // grant of the next account.
     bob.grant(&old).await;
-    let (_, page) = export(&old, &to_late, "", 1).await;
+    let page = export_later(&old, &late, "", 1).await.unwrap();
     assert_eq!(page["logs"], json!([{"user_id": "bob", "seq": 2}]));
     assert_eq!(page["next"], "");
-    let from = attestation(&old).await;
-    let (_, imported) = import(&late, &from, &page["envelope"]).await;
-    assert_eq!(imported["imported"], 1);
-    assert_eq!(grant_state(&late, "alice").await["state"], "none");
-    assert_eq!(grant_state(&late, "bob").await["state"], "active");
 
-    // A new grant command of the app starts a new list: the 65th peer gets the new grant,
-    // with an entry that names it. 1 grant, 64 transfers, 1 grant, 1 transfer.
+    // The list counts the entries of a grant, so it does not stop a transfer that has none:
+    // a node of the same program takes the grant of both accounts.
+    let same = Harness::new(&provider);
+    same.use_log_store().await;
+    assert_eq!(transfer(&old, &same, 1000).await, ["alice", "bob"]);
+    assert_eq!(old.last_seq("alice"), 65);
+
+    // A grant that follows a revoke starts a new list: the 65th peer gets the new grant, with
+    // an entry that names it. 1 grant, 64 transfers, 1 revoke, 1 grant, 1 transfer.
+    alice.revoke(&old).await;
     alice.grant(&old).await;
-    let (_, exported) = export(&old, &to_late, "", 1000).await;
-    assert_eq!(exported["logs"], json!([{"user_id": "alice", "seq": 67}]));
-    assert_eq!(
-        logged(&alice, &old, &provider, &exported["logs"][0]),
-        json!({"t": "grant_transferred_out", "to": late.node.node})
-    );
-    assert_eq!(old.head_seq("alice"), 67);
+    let exported = export_later(&old, &late, "", 1000).await.unwrap();
+    assert_eq!(exported["logs"], json!([{"user_id": "alice", "seq": 68}]));
+    assert_eq!(old.last_seq("alice"), 68);
 }
 
 #[tokio::test]
-async fn a_closing_node_exports_until_its_final_heads_and_imports_nothing() {
+async fn a_closing_node_exports_and_imports_nothing() {
     let provider = quiet_provider().await;
     let old = Harness::new(&provider);
     let new = Harness::new(&provider);
@@ -900,56 +967,35 @@ async fn a_closing_node_exports_until_its_final_heads_and_imports_nothing() {
     let to = attestation(&new).await;
     let from = attestation(&old).await;
 
-    // The orderly shutdown: close, then hand the delegations on.
+    // The orderly shutdown: close, then hand the delegations on, page by page.
     assert_eq!(old.post("/v1/close", json!({})).await.0, 200);
     let (status, exported) = export(&old, &to, "", 1).await;
     assert_eq!(status, 200, "{exported}");
     assert_eq!(exported["next"], "alice");
-    assert_eq!(exported["logs"], json!([{"user_id": "alice", "seq": 2}]));
     let (status, imported) = import(&new, &from, &exported["envelope"]).await;
-    assert_eq!((status, imported["imported"].as_u64()), (200, Some(1)));
-
-    // The final heads are signed: no entry follows them, so the accounts that were not yet
-    // handed on stay where they are. Their apps delegate again at their next sync.
-    let (status, heads) = old
-        .post("/v1/close/heads", json!({"cursor": "", "limit": 1000}))
-        .await;
-    assert_eq!(status, 200);
-    let finals: Vec<Value> = heads["heads"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|head| old.verified(purpose::HEAD, head))
-        .collect();
     assert_eq!(
-        finals
-            .iter()
-            .map(|head| (
-                head["user_id"].as_str().unwrap(),
-                head["seq"].as_u64().unwrap()
-            ))
-            .collect::<Vec<(&str, u64)>>(),
-        [("alice", 2), ("bob", 1)]
+        (status, accounts_of(&imported)),
+        (200, vec!["alice".to_string()])
     );
-    let (status, late) = export(&old, &to, "alice", 1).await;
-    assert_eq!(
-        (status, late),
-        (200, json!({"envelope": null, "logs": [], "next": ""}))
-    );
-    assert_eq!(old.head_seq("bob"), 1);
-    assert_eq!(old.head_seq("alice"), 2);
+    let (status, exported) = export(&old, &to, "alice", 1).await;
+    assert_eq!((status, &exported["next"]), (200, &json!("")));
+    let (_, imported) = import(&new, &from, &exported["envelope"]).await;
+    assert_eq!(accounts_of(&imported), ["bob"]);
+    // The closing node created no entry and signed nothing.
+    assert_eq!((old.last_seq("alice"), old.last_seq("bob")), (1, 1));
 
     // A closing node takes no delegation.
     assert_eq!(new.post("/v1/close", json!({})).await.0, 200);
     let other = Harness::new(&provider);
-    bob.grant(&other).await;
+    let carol = App::new("carol", 3);
+    carol.grant(&other).await;
     let (_, exported) = export(&other, &to, "", 1000).await;
     let other_response = attestation(&other).await;
     assert_eq!(
         code(&import(&new, &other_response, &exported["envelope"]).await),
         (503, "closing")
     );
-    assert_eq!(grant_state(&new, "bob").await["state"], "none");
+    assert_eq!(grant_state(&new, "carol").await["state"], "none");
 }
 
 #[tokio::test]
@@ -981,7 +1027,6 @@ async fn a_full_page_of_1000_grants_fits_one_import_call() {
     // A limit above 1,000 is read as 1,000.
     let (status, first) = export(&old, &to, "", 5000).await;
     assert_eq!(status, 200);
-    assert_eq!(first["logs"].as_array().unwrap().len(), 1000);
     assert_eq!(first["next"], "00000000-0000-4000-8000-000000000999");
     // The import call carries the envelope and the attestation response in a JSON body of at
     // most 1 MiB.
@@ -989,9 +1034,9 @@ async fn a_full_page_of_1000_grants_fits_one_import_call() {
     assert!(body.len() < 1024 * 1024, "{}", body.len());
     let (status, imported) = import(&new, &from, &first["envelope"]).await;
     assert_eq!((status, imported["imported"].as_u64()), (200, Some(1000)));
+    assert_eq!(accounts_of(&imported).len(), 1000);
 
     let (_, second) = export(&old, &to, first["next"].as_str().unwrap(), 5000).await;
-    assert_eq!(second["logs"].as_array().unwrap().len(), 5);
     assert_eq!(second["next"], "");
     let (_, imported) = import(&new, &from, &second["envelope"]).await;
     assert_eq!(imported["imported"], 5);
@@ -1015,17 +1060,9 @@ async fn an_export_with_a_subset_hands_over_the_share_of_the_peer_and_an_import_
     for (index, user_id) in holders.iter().enumerate() {
         App::new(user_id, index as u8 + 1).grant(&old).await;
     }
-    let users = |page: &Value| -> Vec<String> {
-        page["logs"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(log_user)
-            .collect()
-    };
 
     // The peer is pod 1 of 3 nodes with 2 copies per account: the page holds the accounts of
-    // its share alone, with an entry for each, and nothing else enters the envelope.
+    // its share alone, and nothing else enters the envelope.
     let new = Harness::new(&provider);
     let to = attestation(&new).await;
     let from = attestation(&old).await;
@@ -1042,28 +1079,15 @@ async fn an_export_with_a_subset_hands_over_the_share_of_the_peer_and_an_import_
         )
         .await;
     assert_eq!(status, 200, "{exported}");
-    assert_eq!(users(&exported), expected);
     assert_eq!(exported["next"], "");
     let (status, imported) = import(&new, &from, &exported["envelope"]).await;
     assert_eq!(status, 200, "{imported}");
-    assert_eq!(
-        imported["imported"].as_u64().unwrap() as usize,
-        expected.len()
-    );
+    assert_eq!(accounts_of(&imported), expected);
     for user_id in holders {
         let in_share = expected.iter().any(|share| share == user_id);
         assert_eq!(
             grant_state(&new, user_id).await["state"],
             if in_share { "active" } else { "none" },
-            "{user_id}"
-        );
-    }
-    // The accounts outside the share got no entry on the giving node.
-    for user_id in holders {
-        let in_share = expected.iter().any(|share| share == user_id);
-        assert_eq!(
-            old.head_seq(user_id),
-            if in_share { 2 } else { 1 },
             "{user_id}"
         );
     }
@@ -1077,22 +1101,23 @@ async fn an_export_with_a_subset_hands_over_the_share_of_the_peer_and_an_import_
             json!({"peer": to_third, "after": "", "limit": 1, "subset": subset}),
         )
         .await;
-    assert_eq!(users(&first), expected[..1]);
     assert_eq!(first["next"], expected[0]);
+    let (_, taken) = import(&third, &from, &first["envelope"]).await;
+    assert_eq!(accounts_of(&taken), expected[..1]);
     let (_, rest) = old
         .post(
             "/v1/peer/export",
             json!({"peer": to_third, "after": expected[0], "limit": 1000, "subset": subset}),
         )
         .await;
-    assert_eq!(users(&rest), expected[1..]);
+    let (_, taken) = import(&third, &from, &rest["envelope"]).await;
+    assert_eq!(accounts_of(&taken), expected[1..]);
 
     // A giving node without the subset rule hands every account over: the receiving node keeps
-    // its own share and leaves the rest out, with no entry and no count for them.
+    // its own share and leaves the rest out, with no count for them.
     let fourth = Harness::new(&provider);
     let to_fourth = attestation(&fourth).await;
     let (_, everything) = export(&old, &to_fourth, "", 1000).await;
-    assert_eq!(users(&everything).len(), holders.len());
     let own = json!({"pods": 3, "pod": 2, "copies": 2});
     let expected = share(&holders, 3, 2, 2);
     let (status, imported) = fourth
@@ -1102,28 +1127,12 @@ async fn an_export_with_a_subset_hands_over_the_share_of_the_peer_and_an_import_
         )
         .await;
     assert_eq!(status, 200, "{imported}");
-    assert_eq!(
-        imported["logs"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(log_user)
-            .collect::<Vec<String>>(),
-        expected
-    );
+    assert_eq!(accounts_of(&imported), expected);
     assert_eq!(
         imported["imported"].as_u64().unwrap() as usize,
         expected.len()
     );
     assert_eq!(fourth.health().await["grants"], expected.len());
-    for user_id in holders {
-        let in_share = expected.iter().any(|share| share == user_id);
-        assert_eq!(
-            fourth.head_seq(user_id),
-            if in_share { 1 } else { 0 },
-            "{user_id}"
-        );
-    }
     // The same envelope again without a subset takes the rest.
     let (_, imported) = import(&fourth, &from, &everything["envelope"]).await;
     assert_eq!(
@@ -1141,14 +1150,20 @@ async fn an_export_with_a_subset_hands_over_the_share_of_the_peer_and_an_import_
             json!({"peer": to_fifth, "subset": {"pods": 2, "pod": 0, "copies": 2}}),
         )
         .await;
-    assert_eq!(users(&all).len(), holders.len());
+    let (_, taken) = import(&fifth, &from, &all["envelope"]).await;
+    assert_eq!(accounts_of(&taken).len(), holders.len());
     let (status, none) = old
         .post("/v1/peer/export", json!({"peer": to_fifth, "subset": null}))
         .await;
     assert_eq!(status, 200);
     assert!(none["envelope"].is_object());
+    // No transfer of this test created an entry: every account has its grant alone.
+    assert!(holders.iter().all(|user_id| old.last_seq(user_id) == 1));
+    assert!(holders.iter().all(|user_id| fourth.last_seq(user_id) == 0));
 
     // A subset outside its bounds is refused by both calls, and nothing changes.
+    let sixth = Harness::new(&provider);
+    let to_sixth = attestation(&sixth).await;
     for subset in [
         json!({"pods": 0, "pod": 0, "copies": 1}),
         json!({"pods": 3, "pod": 3, "copies": 1}),
@@ -1159,11 +1174,11 @@ async fn an_export_with_a_subset_hands_over_the_share_of_the_peer_and_an_import_
         let outcome = old
             .post(
                 "/v1/peer/export",
-                json!({"peer": to_fifth, "subset": subset}),
+                json!({"peer": to_sixth, "subset": subset}),
             )
             .await;
         assert_eq!(code(&outcome), (400, "invalid_request"), "{subset}");
-        let outcome = fifth
+        let outcome = sixth
             .post(
                 "/v1/peer/import",
                 json!({"peer": from, "envelope": everything["envelope"], "subset": subset}),
@@ -1171,7 +1186,7 @@ async fn an_export_with_a_subset_hands_over_the_share_of_the_peer_and_an_import_
             .await;
         assert_eq!(code(&outcome), (400, "invalid_request"), "{subset}");
     }
-    assert_eq!(fifth.health().await["grants"], 0);
+    assert_eq!(sixth.health().await["grants"], 0);
 }
 
 /// The entry of the transparency log Rekor with the index 150,000,000, in the form of the
@@ -1253,13 +1268,15 @@ async fn an_export_with_an_endorsement_hands_nothing_over_unless_the_endorsement
         );
     }
     // No refused export left an entry.
-    assert_eq!(old.head_seq("user-1"), 1);
+    assert_eq!(old.last_seq("user-1"), 1);
 
-    // `null` in the place of the endorsement is a call without one.
+    // `null` in the place of the endorsement is a call without one: a transfer to a node of
+    // the same program, which has no entry.
     let (status, page) = old
         .post("/v1/peer/export", json!({"peer": to, "endorsement": null}))
         .await;
     assert_eq!(status, 200, "{page}");
     assert!(!page["envelope"].is_null());
-    assert_eq!(page["logs"], json!([{"user_id": "user-1", "seq": 2}]));
+    assert_eq!(page["logs"], json!([]));
+    assert_eq!(old.last_seq("user-1"), 1);
 }

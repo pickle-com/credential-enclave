@@ -257,7 +257,7 @@ async fn every_method_of_the_list_is_sent_and_no_other() {
         assert_eq!(seen.header("content-length"), expected, "{method}");
     }
     let sent = provider.requests().len();
-    let seq = harness.head_seq("user-1");
+    let seq = harness.last_seq("user-1");
     for method in ["HEAD", "OPTIONS", "CONNECT", "TRACE", "get", "QUERY"] {
         assert_eq!(
             failure(
@@ -270,7 +270,7 @@ async fn every_method_of_the_list_is_sent_and_no_other() {
         );
     }
     assert_eq!(provider.requests().len(), sent);
-    assert_eq!(harness.head_seq("user-1"), seq);
+    assert_eq!(harness.last_seq("user-1"), seq);
 }
 
 #[tokio::test]
@@ -327,7 +327,7 @@ async fn an_address_outside_the_definition_is_refused_before_anything_is_recorde
         (403, "not_allowed".to_string())
     );
     assert!(provider.requests().is_empty());
-    assert_eq!(harness.head_seq("user-1"), 1);
+    assert_eq!(harness.last_seq("user-1"), 1);
     assert_budget_is_free(&harness);
 }
 
@@ -383,7 +383,7 @@ async fn malformed_headers_and_arguments_are_refused() {
         "invalid_request"
     );
     assert!(provider.requests().is_empty());
-    assert_eq!(harness.head_seq("user-1"), 1);
+    assert_eq!(harness.last_seq("user-1"), 1);
 
     // The time limit is optional and the bounds are inclusive.
     for timeout_ms in [Value::Null, json!(1000), json!(120_000)] {
@@ -455,7 +455,7 @@ async fn a_header_that_overrides_the_method_is_refused() {
     }
     // Nothing was sent and no entry was created.
     assert!(provider.requests().is_empty());
-    assert_eq!(harness.head_seq("user-1"), 1);
+    assert_eq!(harness.last_seq("user-1"), 1);
     assert_budget_is_free(&harness);
 
     // An `Accept` header that names UTF-8, in any spelling, is sent as it is.
@@ -530,7 +530,7 @@ async fn the_batch_address_of_microsoft_graph_is_refused() {
         );
     }
     assert!(provider.requests().is_empty());
-    assert_eq!(harness.head_seq("user-1"), 1);
+    assert_eq!(harness.last_seq("user-1"), 1);
     assert_budget_is_free(&harness);
 
     // The same request on its own address is sent, and its event names it.
@@ -601,7 +601,7 @@ async fn a_get_request_with_a_body_always_has_its_own_event() {
         b64u(&Sha256::digest(other))
     );
     // The grant, the first GET and the three requests with a body.
-    assert_eq!(harness.head_seq("user-1"), 5);
+    assert_eq!(harness.last_seq("user-1"), 5);
 
     // A GET without a body still shares the event of the first one, and a request with a
     // body opened no window for it.
@@ -609,7 +609,7 @@ async fn a_get_request_with_a_body_always_has_its_own_event() {
         get(b"").await.log,
         json!({"seq": 2, "index": 0, "created": false})
     );
-    assert_eq!(harness.head_seq("user-1"), 5);
+    assert_eq!(harness.last_seq("user-1"), 5);
     assert_eq!(provider.requests().len(), 5);
     let fresh = format!("{PROFILE}?fields=messagesTotal");
     let request = meta(&app, &record, "GET", &fresh, json!([]));
@@ -684,7 +684,7 @@ async fn an_event_carries_the_whole_path_and_the_whole_query() {
         (403, "not_allowed".to_string())
     );
     assert_eq!(provider.requests().len(), 2);
-    assert_eq!(harness.head_seq("user-1"), 3);
+    assert_eq!(harness.last_seq("user-1"), 3);
 }
 
 #[tokio::test]
@@ -769,7 +769,7 @@ async fn provider_answers_come_back_as_they_are() {
 
     // A compressed body is one the node cannot search: nothing of it is handed on. The
     // request went to the provider, and its entry is on the chain.
-    let before = harness.head_seq("user-1");
+    let before = harness.last_seq("user-1");
     let withheld = harness
         .forward(
             meta(&app, &record, "GET", &format!("{PROFILE}?n=2"), json!([])),
@@ -781,7 +781,7 @@ async fn provider_answers_come_back_as_they_are() {
     assert_eq!(withheld.0, 502);
     assert_eq!(withheld.1["code"], "response_withheld");
     assert!(withheld.1.get("log").is_none());
-    assert_eq!(harness.head_seq("user-1"), before + 1);
+    assert_eq!(harness.last_seq("user-1"), before + 1);
     assert_budget_is_free(&harness);
 
     // An authentication failure is the provider's answer, not a failure of the call.
@@ -870,13 +870,13 @@ async fn bodies_above_the_limit_are_too_large() {
     assert_eq!(forwarded.status, 200);
     assert_eq!(provider.requests().last().unwrap().body.len(), SMALL);
     let sent = provider.requests().len();
-    let seq = harness.head_seq("user-1");
+    let seq = harness.last_seq("user-1");
     assert_eq!(
         failure(harness.forward(post("n=5"), &vec![b'c'; SMALL + 1]).await),
         (413, "too_large".to_string())
     );
     assert_eq!(provider.requests().len(), sent);
-    assert_eq!(harness.head_seq("user-1"), seq);
+    assert_eq!(harness.last_seq("user-1"), seq);
     assert_budget_is_free(&harness);
 }
 
@@ -899,7 +899,7 @@ async fn a_provider_that_does_not_answer_ends_in_a_timeout() {
 
     // The request left the node, so its entry is on the chain and in the store.
     assert_eq!(provider.requests().len(), 1);
-    assert_eq!(harness.head_seq("user-1"), 2);
+    assert_eq!(harness.last_seq("user-1"), 2);
     let events = app.stored_events(&harness, &provider);
     assert_eq!(events.len(), 2);
     assert_eq!(events[1][0]["t"], "provider_request");
@@ -1098,7 +1098,7 @@ async fn a_response_that_reflects_the_credential_is_withheld() {
         .into_iter()
         .enumerate()
     {
-        let before = harness.head_seq("user-1");
+        let before = harness.last_seq("user-1");
         let outcome = harness
             .forward(
                 meta(
@@ -1123,7 +1123,7 @@ async fn a_response_that_reflects_the_credential_is_withheld() {
         );
         // The request went out, and its entry is on the chain.
         assert_eq!(provider.requests().len(), index + 1);
-        assert_eq!(harness.head_seq("user-1"), before + 1);
+        assert_eq!(harness.last_seq("user-1"), before + 1);
     }
     // A response without the credential comes back.
     let forwarded = harness
@@ -1423,7 +1423,7 @@ async fn a_get_over_an_idle_connection_that_ends_without_a_response_is_sent_once
     assert_eq!(provider.requests().len(), 3);
     // Both tries are the same request, which one event names.
     assert_eq!(forwarded.log["created"], true);
-    assert_eq!(harness.head_seq("user-1"), 3);
+    assert_eq!(harness.last_seq("user-1"), 3);
 
     // A POST over an idle connection that ends without a response is not sent again: whether
     // the provider received it is unknown.
@@ -1434,7 +1434,7 @@ async fn a_get_over_an_idle_connection_that_ends_without_a_response_is_sent_once
     );
     assert_eq!(gmail_connections(&harness), 2);
     assert_eq!(provider.requests().len(), 4);
-    assert_eq!(harness.head_seq("user-1"), 4);
+    assert_eq!(harness.last_seq("user-1"), 4);
     assert_budget_is_free(&harness);
 }
 

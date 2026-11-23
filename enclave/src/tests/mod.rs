@@ -61,6 +61,16 @@ fn provider_hosts() -> Vec<String> {
     hosts.into_iter().collect()
 }
 
+/// True for the write of the entry `seq` of `user_id` to the log store.
+fn is_write_of(seen: &Seen, user_id: &str, seq: u64) -> bool {
+    seen.server_name == LOG_HOST
+        && seen.method == "PUT"
+        && seen.target.split_once("/a3/").is_some_and(|(_, rest)| {
+            credential_enclave_protocol::log::parse_object_key_v3(&format!("a3/{rest}"), user_id)
+                .is_some_and(|key| key.seq == seq)
+        })
+}
+
 /// A stand-in for every provider host that answers with `handler`.
 async fn provider(handler: impl Fn(&Seen) -> Reply + Send + Sync + 'static) -> Provider {
     let hosts = provider_hosts();

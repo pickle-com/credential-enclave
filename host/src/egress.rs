@@ -115,8 +115,9 @@ impl Allowlist {
         Ok(Allowlist { hosts })
     }
 
-    /// The list with the host of the log store of the node added:
-    /// `{bucket}.s3.{region}.amazonaws.com`.
+    /// The list with the host of the log store of the node added: the endpoint of Amazon S3 in
+    /// the region of the store, `s3.{region}.amazonaws.com`, which the node writes every
+    /// bucket of its log store through.
     pub fn with_log_store(mut self, host: String) -> Allowlist {
         self.hosts.insert(host);
         self
@@ -552,19 +553,19 @@ mod tests {
 
     #[test]
     fn the_host_of_the_log_store_is_added_to_the_list() {
-        let host = "character-credential-log-dev-1.s3.us-west-2.amazonaws.com";
+        let host = "s3.us-west-2.amazonaws.com";
         assert!(!allowlist().allows(host, 443));
         let list = allowlist().with_log_store(host.to_string());
         assert_eq!(list.len(), 7);
         assert!(list.allows(host, 443));
         assert!(list.allows("api.first.example", 443));
-        // That host only: no other bucket, no other region, no other port.
-        assert!(!list.allows("another-bucket.s3.us-west-2.amazonaws.com", 443));
+        // That host only: no host of one bucket, no other region, no other port.
         assert!(!list.allows(
-            "character-credential-log-dev-1.s3.eu-west-1.amazonaws.com",
+            "character-credential-log-dev-1.s3.us-west-2.amazonaws.com",
             443
         ));
-        assert!(!list.allows("s3.us-west-2.amazonaws.com", 443));
+        assert!(!list.allows("s3.eu-west-1.amazonaws.com", 443));
+        assert!(!list.allows("s3.amazonaws.com", 443));
         assert!(!list.allows(host, 80));
     }
 

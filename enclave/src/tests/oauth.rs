@@ -500,7 +500,7 @@ async fn a_refused_exchange_returns_only_the_status_and_the_error_code() {
     assert_eq!(failure["provider_error"], "");
 
     // A refused exchange leaves no record and no entry: only the grant is on the chain.
-    assert_eq!(harness.head_seq("user-1"), 1);
+    assert_eq!(harness.last_seq("user-1"), 1);
 }
 
 #[tokio::test]
@@ -611,7 +611,7 @@ async fn a_refresh_merges_the_response_into_the_same_record() {
     );
 
     // A refused refresh: only the status and the error code come back, and the entry stays.
-    let before = harness.head_seq("user-1");
+    let before = harness.last_seq("user-1");
     let (status, failure) = harness
         .post(
             "/v1/refresh",
@@ -626,7 +626,7 @@ async fn a_refresh_merges_the_response_into_the_same_record() {
             "provider_status": 400, "provider_error": "invalid_grant",
         })
     );
-    assert_eq!(harness.head_seq("user-1"), before + 1);
+    assert_eq!(harness.last_seq("user-1"), before + 1);
 }
 
 #[tokio::test]
@@ -665,7 +665,7 @@ async fn a_refresh_needs_an_oauth_record_with_a_refresh_token() {
     assert_eq!(code(&refresh(shapeless).await), (422, "record_invalid"));
 
     // None of these created an entry or reached a provider.
-    assert_eq!(harness.head_seq("user-1"), 1);
+    assert_eq!(harness.last_seq("user-1"), 1);
     assert!(provider.requests().is_empty());
 }
 
@@ -1130,7 +1130,7 @@ async fn a_reconnect_without_a_refresh_token_keeps_the_previous_one() {
         })
     );
     assert!(merged.get("log").is_none());
-    assert_eq!(harness.head_seq("user-1"), 1);
+    assert_eq!(harness.last_seq("user-1"), 1);
     assert!(provider.requests().is_empty());
 
     // A new record with its own refresh token keeps it.
@@ -1388,7 +1388,7 @@ async fn a_refresh_whose_response_arrives_late_keeps_it_for_the_next_call() {
         waited >= Duration::from_millis(300) && waited < Duration::from_millis(800),
         "{waited:?}"
     );
-    let seq = harness.head_seq("user-1");
+    let seq = harness.last_seq("user-1");
     assert_eq!(
         late_counts(&harness).await,
         (
@@ -1418,7 +1418,7 @@ async fn a_refresh_whose_response_arrives_late_keeps_it_for_the_next_call() {
         json!({"seq": seq, "index": 0, "created": true})
     );
     assert_eq!(provider.requests().len(), 2);
-    assert_eq!(harness.head_seq("user-1"), seq);
+    assert_eq!(harness.last_seq("user-1"), seq);
 }
 
 #[tokio::test]
@@ -1650,7 +1650,7 @@ async fn a_repeated_refresh_of_the_same_record_gets_the_kept_response() {
         app.open(&first["record"])["token"]["refresh_token"],
         "1//rotated-refresh-1"
     );
-    let seq = harness.head_seq("user-1");
+    let seq = harness.last_seq("user-1");
 
     // The response did not reach its caller, and the caller sends the same record again: the
     // node answers with the response it kept. No provider call, no new entry.
@@ -1660,7 +1660,7 @@ async fn a_repeated_refresh_of_the_same_record_gets_the_kept_response() {
         assert_eq!(again, first);
     }
     assert_eq!(provider.requests().len(), 2);
-    assert_eq!(harness.head_seq("user-1"), seq);
+    assert_eq!(harness.last_seq("user-1"), seq);
 
     // The kept response belongs to the account: another account does not get it, and the
     // record of this account does not open for it.
@@ -1882,7 +1882,7 @@ async fn a_token_response_with_a_token_in_a_public_field_is_withheld() {
     // Nothing of the two responses leaves: no record, no public field, no entry.
     for leaked in ["ya29.leaked-access-token", "1//leaked-refresh"] {
         let state = start().await;
-        let before = harness.head_seq("user-1");
+        let before = harness.last_seq("user-1");
         let (status, failure) = complete(&harness, "user-1", &state).await;
         assert_eq!(status, 502);
         assert_eq!(
@@ -1893,7 +1893,7 @@ async fn a_token_response_with_a_token_in_a_public_field_is_withheld() {
             })
         );
         assert!(!failure.to_string().contains(leaked));
-        assert_eq!(harness.head_seq("user-1"), before);
+        assert_eq!(harness.last_seq("user-1"), before);
         // The authorization was used: the same state completes nothing.
         assert_eq!(
             code(&complete(&harness, "user-1", &state).await),
@@ -1905,13 +1905,13 @@ async fn a_token_response_with_a_token_in_a_public_field_is_withheld() {
     // nothing is kept for a repeated call.
     let state = start().await;
     let record = complete(&harness, "user-1", &state).await.1["record"].clone();
-    let before = harness.head_seq("user-1");
+    let before = harness.last_seq("user-1");
     let (status, failure) = refresh(&harness, "user-1", &record).await;
     assert_eq!(
         (status, failure["code"].as_str()),
         (502, Some("response_withheld"))
     );
     assert!(!failure.to_string().contains("1//rotated-leaked"));
-    assert_eq!(harness.head_seq("user-1"), before + 1);
+    assert_eq!(harness.last_seq("user-1"), before + 1);
     assert_eq!(provider.requests().len(), 4);
 }

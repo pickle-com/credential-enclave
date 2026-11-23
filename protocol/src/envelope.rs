@@ -18,7 +18,6 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::encoding::{b64u, b64u_decode, b64u_decode_array, to_json, verify_detached};
 use crate::encoding::{wipe_json, Signed};
 use crate::keys::{node_id, Custody, NodeKeys};
-use crate::log::Head;
 use crate::secret::Secret;
 use crate::{is_valid_name, limits, purpose, ProtocolError};
 
@@ -241,22 +240,6 @@ fn text_field<'a>(value: &'a serde_json::Value, key: &str) -> Result<&'a str, Pr
         .ok_or(ProtocolError::InvalidRequest)
 }
 
-/// The `{seq, hash}` pair a reply carries: the end of the (node, account) chain at reply time.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReplyHead {
-    pub seq: u64,
-    pub hash: String,
-}
-
-impl From<&Head> for ReplyHead {
-    fn from(head: &Head) -> Self {
-        ReplyHead {
-            seq: head.seq,
-            hash: b64u(&head.hash),
-        }
-    }
-}
-
 /// The body of a command reply (5.5). `kind` is `grant_reply` or `revoke_reply`. A failure has
 /// `ok` false and the failure code in `code`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -271,7 +254,6 @@ pub struct ReplyBody {
     pub challenge: String,
     pub key_id: String,
     pub not_after_ms: u64,
-    pub head: ReplyHead,
     pub time_ms: u64,
 }
 
@@ -1588,10 +1570,6 @@ mod tests {
             challenge: "C".to_string(),
             key_id: "K".to_string(),
             not_after_ms: 5,
-            head: ReplyHead::from(&Head {
-                seq: 1,
-                hash: [0u8; 32],
-            }),
             time_ms: 7,
         };
         let signed = reply(&fixture.node, &body);
@@ -1599,13 +1577,10 @@ mod tests {
             crate::encoding::verify(&fixture.node.sign_public(), purpose::REPLY, &signed).unwrap();
         assert_eq!(
             String::from_utf8(bytes).unwrap(),
-            format!(
-                concat!(
-                    "{{\"v\":1,\"type\":\"grant_reply\",\"ok\":true,\"code\":\"\",\"node\":\"N\",",
-                    "\"user_id\":\"U\",\"challenge\":\"C\",\"key_id\":\"K\",\"not_after_ms\":5,",
-                    "\"head\":{{\"seq\":1,\"hash\":\"{}\"}},\"time_ms\":7}}"
-                ),
-                b64u(&[0u8; 32])
+            concat!(
+                "{\"v\":1,\"type\":\"grant_reply\",\"ok\":true,\"code\":\"\",\"node\":\"N\",",
+                "\"user_id\":\"U\",\"challenge\":\"C\",\"key_id\":\"K\",\"not_after_ms\":5,",
+                "\"time_ms\":7}"
             )
         );
     }
