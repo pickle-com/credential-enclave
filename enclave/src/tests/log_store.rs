@@ -1356,9 +1356,14 @@ async fn a_node_of_the_nitro_platform_does_not_act_without_its_log_store() {
     refused(&app.send(&harness, envelope.clone()).await);
     assert!(writes(&provider).is_empty());
     assert_eq!(harness.last_seq("user-1"), 0);
+    // A node whose clock is at or past the end of its credentials holds none: its health
+    // says so, as before it received any.
+    let held = || async { harness.health().await["log_store"]["credentials_expires_ms"].clone() };
+    assert_eq!(held().await, 0);
 
     // With credentials within their time the same command passes.
     credentials(now_ms + 60_000).await;
+    assert_eq!(held().await, now_ms + 60_000);
     let response = app.send(&harness, envelope).await;
     let reply = harness.verified(purpose::REPLY, &response["reply"]);
     assert_eq!(reply["ok"], true, "{reply}");
@@ -1373,8 +1378,9 @@ async fn a_node_of_the_nitro_platform_does_not_act_without_its_log_store() {
     assert_eq!(release(&harness, &app, &vault).await.0, 200);
 
     // When the credentials end, every act of the node ends with them, before an entry is
-    // created and before a provider is called.
+    // created and before a provider is called, and the node holds no credentials.
     harness.node.clock.advance(60_000);
+    assert_eq!(held().await, 0);
     let seq = harness.last_seq("user-1");
     let outcome = harness.forward(get(&app, &record, MESSAGES), b"").await;
     unavailable(&outcome.err().unwrap());

@@ -24,7 +24,8 @@ use crate::state::Node;
 /// node and `grants` the accounts that have a grant within its time (the operator domain reads
 /// it to see that a delegation transfer arrived). `log_store` is null on a node without a log
 /// store. Otherwise it names the bucket and its region, the end of the credentials the node
-/// holds (0 when it holds none), the number of accounts that have an entry the store has not
+/// holds (0 when it holds none: it never received credentials, or its clock is at or past the
+/// end of the ones it received), the number of accounts that have an entry the store has not
 /// confirmed and the age of the oldest pending entry as the last sweep of the node found it.
 /// `log` counts the entries, events, write attempts (confirmed, failed by cause, repeated, and
 /// the time to confirmation of the confirmed ones) and batch calls since the node started.
@@ -55,6 +56,7 @@ pub async fn health(State(node): State<Arc<Node>>) -> Response {
     let read = |counter: &std::sync::atomic::AtomicU64| counter.load(Ordering::Relaxed);
     let count = |counter: &std::sync::atomic::AtomicUsize| counter.load(Ordering::Relaxed);
     let buckets = &counters.write_ms_buckets;
+    let now_ms = node.now_ms();
     json_ok(&Health {
         node: &node.node,
         release: node.release,
@@ -62,7 +64,7 @@ pub async fn health(State(node): State<Arc<Node>>) -> Response {
         custody: node.custody.as_str(),
         role: node.role.get().and_then(Role::binding_value),
         started_ms: node.started_ms,
-        time_ms: node.now_ms(),
+        time_ms: now_ms,
         configured: node.is_configured(),
         closing: node.closing.load(Ordering::SeqCst),
         accounts: node.account_count(),
@@ -72,7 +74,7 @@ pub async fn health(State(node): State<Arc<Node>>) -> Response {
             bucket: id.bucket(),
             region: id.region(),
             shards: id.shards(),
-            credentials_expires_ms: node.log_store.credentials_expires_ms(),
+            credentials_expires_ms: node.log_store.credentials_expires_ms(now_ms),
             node_document_ms: node.log_store.document_ms(),
             pending: count(&state.pending_accounts),
             pending_oldest_ms: node.pending_oldest_ms(),

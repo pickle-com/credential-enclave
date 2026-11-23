@@ -503,12 +503,16 @@ impl LogStore {
         *self.credentials.write() = Some(Arc::new(credentials));
     }
 
-    /// The end of the credentials the node holds, 0 when it holds none.
-    pub fn credentials_expires_ms(&self) -> u64 {
+    /// The end of the credentials the node holds at `now_ms`, 0 when it holds none. A node
+    /// holds credentials while its clock is before their end: credentials whose time passed
+    /// sign no write ([`LogStore::target`]), and the node holds none from then on.
+    pub fn credentials_expires_ms(&self, now_ms: u64) -> u64 {
         self.credentials
             .read()
             .as_ref()
-            .map_or(0, |credentials| credentials.expires_ms)
+            .map(|credentials| credentials.expires_ms)
+            .filter(|expires_ms| now_ms < *expires_ms)
+            .unwrap_or(0)
     }
 
     /// True when the node keeps account of which entries the log store confirmed: it has a log
@@ -2029,13 +2033,17 @@ mod tests {
         assert!(optional.set_id(first.clone()));
         assert!(optional.tracks());
         assert_eq!(optional.id(), Some(&first));
-        assert_eq!(optional.credentials_expires_ms(), 0);
+        assert_eq!(optional.credentials_expires_ms(5), 0);
         assert_eq!(
             optional.ensure_ready(5),
             Err(ProtocolError::LogStoreUnavailable)
         );
         optional.set_credentials(Credentials::new("ASIAEXAMPLE", "secret", "token", 10).unwrap());
-        assert_eq!(optional.credentials_expires_ms(), 10);
+        // The node holds the credentials while its clock is before their end, and none from
+        // their end on.
+        assert_eq!(optional.credentials_expires_ms(9), 10);
+        assert_eq!(optional.credentials_expires_ms(10), 0);
+        assert_eq!(optional.credentials_expires_ms(11), 0);
         // The node can sign a write, and writes no entry before its node document.
         assert!(optional.target(9).unwrap().is_some());
         assert_eq!(
