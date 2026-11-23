@@ -10,13 +10,14 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 
+use super::faults;
 use super::mail::{frame_of, request, PASSWORD};
 use super::mail_stand_in::{fetch_literal, mailbox, until, Act, Answer, ImapServer, MESSAGE};
 use super::provider_and_log_store;
 use crate::mail;
 use crate::state::{lock, Limits};
 use crate::subset::assign;
-use crate::testing::{Harness, Provider, Reply};
+use crate::testing::{quiet_panics, Harness, Provider, Reply};
 
 /// A message of `bytes` bytes.
 fn message_of(bytes: usize) -> Vec<u8> {
@@ -1197,4 +1198,174 @@ async fn no_read_goes_over_a_session_after_its_grant_was_pruned() {
     app.grant(&harness).await;
     list_folders(&harness, &record).await;
     assert_eq!(server.logins.load(Ordering::SeqCst), 2);
+}
+
+/// A read that panics ends alone (enclave.md 3.1): its connection ends without a response,
+/// the session it went over ends with it and is not kept, nothing of the body budget and no
+/// forward place stays held, the account is not halted, and the next read of the record logs
+/// in and is answered.
+///
+/// The panic is scripted on the test platform, at a place of the read behind its entry: the
+/// session the read took had ended, the read starts once more, the open of its new connection
+/// is refused once, and the draw of the wait before the next attempt panics. It is the third
+/// draw of the call: the first two are the seeds of its event and of its entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_that_panics_leaves_no_session_and_holds_nothing() {
+    quiet_panics();
+    // The server ends the first connection when the second read sends its command.
+    let server = ImapServer::start(|command| match (command.connection, command.number) {
+        (0, 2) => Answer {
+            acts: vec![Act::Close],
+            completion: String::new(),
+        },
+        _ => mailbox(command),
+    })
+    .await;
+    // The store keeps its connections: the write of an entry opens no connection, so the
+    // one refused open below is the open of the mail connection.
+    let (store, _, _) = scripted_store().await;
+    let (harness, _app, record) = server.harness_over(&store, Limits::default()).await;
+    let node = faults::serve(&harness).await;
+    let before = faults::health(node).await;
+    list_folders(&harness, &record).await;
+    assert_eq!(sessions_of(&harness).await, (0, 1));
+    let entries = harness.last_seq("mail-user");
+
+    harness.platform.refuse_connections(1);
+    harness.platform.fault_at_draw(2);
+    let frame = frame_of(&record, &json!({"action":"folders"}), b"");
+    assert_eq!(
+        faults::call(node, "POST", "/v1/mail/read", &frame).await,
+        None
+    );
+
+    // The read had its entry, took the session and panicked: the panic is counted, and
+    // nothing of the read is held.
+    let after = faults::health(node).await;
+    let counted = |health: &Value| health["load"]["contained_panics"].as_u64().unwrap();
+    assert!(counted(&after) > counted(&before), "{after}");
+    assert_eq!(harness.last_seq("mail-user"), entries + 1);
+    assert_eq!(after["load"]["forward_calls"], 0);
+    assert_eq!(after["load"]["inbound_connections"], 1);
+    assert_eq!(after["load"]["halted_accounts"], 0);
+    assert_eq!(after["state"]["idle_connections"]["mail"], 0);
+    assert_eq!(after["egress"]["idle_reuses"]["mail"], 0);
+    assert_eq!(
+        harness.node.body_budget.available_permits(),
+        harness.node.limits.body_budget_bytes
+    );
+    assert_eq!(server.logins.load(Ordering::SeqCst), 1);
+
+    // The node serves the account on: the next read logs in and is answered, over the
+    // listener as over the router.
+    let (status, _) = faults::call(node, "POST", "/v1/mail/read", &frame)
+        .await
+        .expect("the read after the panic is answered");
+    assert_eq!(status, 200);
+    assert_eq!(server.logins.load(Ordering::SeqCst), 2);
+    assert_eq!(sessions_of(&harness).await, (0, 1));
+}
+
+/// No read goes over a session after the node halted the account of the session (enclave.md
+/// 3.1). A read that was in progress when the account was halted had its entry before: it
+/// runs to its end and is answered, and its session is not kept. Every mail call of the
+/// account after it ends with `internal` before it comes to a session, to the server or to an
+/// entry, so the session the node kept for a record of the account is handed to no read.
+///
+/// The panic is scripted on the test platform: the first draw of a call that creates an event
+/// is the seed of its entry, drawn inside the lock of its account.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_read_goes_over_a_session_after_its_account_was_halted() {
+    quiet_panics();
+    let gate = Arc::new(Semaphore::new(0));
+    // The read on the second connection waits in front of the completion of its `LIST`.
+    let server = {
+        let gate = gate.clone();
+        ImapServer::start(move |command| {
+            match command.connection == 1 && command.text.starts_with("LIST ") {
+                true => Answer::after(vec![
+                    Act::Send(b"* LIST () \"/\" \"INBOX\"\r\n".to_vec()),
+                    Act::Wait(gate.clone()),
+                ]),
+                false => mailbox(command),
+            }
+        })
+        .await
+    };
+    let (harness, app, record) = server.harness(Limits::default()).await;
+    let harness = Arc::new(harness);
+    let node = faults::serve(&harness).await;
+
+    // A second record of the mailbox keeps a session, and a read of the first record is in
+    // progress on a connection of its own.
+    let kept = app.record(
+        "app_password",
+        "naver_mail",
+        &json!({"username":"tester@naver.com","password":PASSWORD}),
+    );
+    list_folders(&harness, &kept).await;
+    assert_eq!(sessions_of(&harness).await, (0, 1));
+    let call = {
+        let (harness, record) = (harness.clone(), record.clone());
+        tokio::spawn(async move { list_folders(&harness, &record).await })
+    };
+    until("the read in progress waits on its connection", || {
+        server.waiting.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert_eq!(server.logins.load(Ordering::SeqCst), 2);
+
+    // A further read of the account panics inside the lock of the account, before its event:
+    // it ends without a response.
+    let frame = frame_of(&kept, &json!({"action":"folders"}), b"");
+    harness.platform.fault_at_draw(0);
+    assert_eq!(
+        faults::call(node, "POST", "/v1/mail/read", &frame).await,
+        None
+    );
+
+    // The read in progress is answered. It is the first to ask for the lock of the account:
+    // the node halts the account there, and the session of the read ends with the read.
+    gate.add_permits(1);
+    call.await.unwrap();
+    until("the session of the read in progress ended", || {
+        server.ended.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert_eq!(faults::health(node).await["load"]["halted_accounts"], 1);
+    assert_eq!(sessions_of(&harness).await, (0, 1));
+
+    // From here on a mail call of the account ends with `internal`, whichever record it
+    // names: it sends nothing to the server, opens no connection and creates no entry.
+    let (commands, entries) = (server.texts().len(), harness.last_seq("mail-user"));
+    for (record, operation, params, payload) in [
+        (&kept, "read", json!({"action":"folders"}), &b""[..]),
+        (&record, "read", json!({"action":"search"}), &b""[..]),
+        (&kept, "verify", json!({}), &b""[..]),
+        (
+            &kept,
+            "submit",
+            json!({"recipients":["friend@example.com"]}),
+            MESSAGE,
+        ),
+    ] {
+        let (status, meta, _) = request(&harness, record, operation, params, payload).await;
+        assert_eq!(
+            (status, meta["code"].as_str()),
+            (500, Some("internal")),
+            "{operation}"
+        );
+    }
+    assert_eq!(server.texts().len(), commands);
+    assert_eq!(server.connections.load(Ordering::SeqCst), 2);
+    assert_eq!(harness.last_seq("mail-user"), entries);
+
+    // The session the node kept for the account was handed to none of them: it carried no
+    // read since, and its connection is the one that is still open.
+    assert_eq!(sessions_of(&harness).await, (0, 1));
+    assert_eq!(server.ended.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        harness.node.body_budget.available_permits(),
+        harness.node.limits.body_budget_bytes
+    );
 }

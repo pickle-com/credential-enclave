@@ -76,7 +76,7 @@ async fn node_with_log_store(provider: &Provider) -> Harness {
 }
 
 /// Serves the calls of the node on a listener of its platform and returns its address.
-async fn serve(harness: &Harness) -> SocketAddr {
+pub(super) async fn serve(harness: &Harness) -> SocketAddr {
     let listener = Platform::listen(harness.platform.as_ref(), 64)
         .await
         .unwrap();
@@ -91,7 +91,12 @@ async fn serve(harness: &Harness) -> SocketAddr {
 
 /// One call over a connection of its own: the status and the body of the response, or `None`
 /// when the node ended the connection without a response.
-async fn call(node: SocketAddr, method: &str, path: &str, body: &[u8]) -> Option<(u16, Vec<u8>)> {
+pub(super) async fn call(
+    node: SocketAddr,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> Option<(u16, Vec<u8>)> {
     let mut stream = TcpStream::connect(node).await.unwrap();
     let head = format!(
         "{method} {path} HTTP/1.1\r\nHost: node\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
@@ -119,7 +124,7 @@ async fn post(node: SocketAddr, path: &str, body: &Value) -> Option<(u16, Value)
 /// `GET /v1/health` over a connection of its own, once the node holds no other connection:
 /// the node gives the place of a connection back when the task of that connection ended,
 /// which is a moment after its peer read the end of its bytes.
-async fn health(node: SocketAddr) -> Value {
+pub(super) async fn health(node: SocketAddr) -> Value {
     let mut health = Value::Null;
     for _ in 0..200 {
         let (status, body) = call(node, "GET", "/v1/health", b"").await.unwrap();
