@@ -1579,7 +1579,7 @@ async fn a_stream_hands_on_a_body_above_the_body_limit_in_parts() {
         assert_eq!(streamed.log["created"], true);
     }
     // The entry of the request was in the store before the request left.
-    assert_eq!(harness.head_seq("user-1"), 3);
+    assert_eq!(harness.last_seq("user-1"), 3);
 
     // The same response without `stream` is a frame, and above the body limit.
     assert_eq!(
@@ -1666,7 +1666,7 @@ async fn a_stream_that_reflects_the_credential_is_cut_in_front_of_it() {
         );
     }
     // The entries of the four requests are on the chain: the requests went to the provider.
-    assert_eq!(harness.head_seq("user-1"), 5);
+    assert_eq!(harness.last_seq("user-1"), 5);
     assert_eq!(provider.requests().len(), 4);
 
     let streamed = harness.forward_stream(call("n=5"), b"{}").await.unwrap();
