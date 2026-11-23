@@ -46,9 +46,13 @@ pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(100);
 /// page, and a page whose transfer has entries (a handover to a later release) waits for the
 /// log store as well.
 pub const RESPONSE_TIMEOUT_PER_PAGE: Duration = Duration::from_secs(4);
-/// The longest wait. The `terminationGracePeriodSeconds` of the pod covers this wait twice
-/// (the subcommand of the pre-stop hook and the signal path) with a margin.
+/// The longest wait. The `terminationGracePeriodSeconds` of the pod covers this wait of the
+/// subcommand of the pre-stop hook and, after the termination signal, the wait for the calls
+/// in progress of the node, in which the call of the signal path runs (`calls`), with a
+/// margin. The call of the signal path ends before the limit of that wait: this wait is
+/// shorter than `calls::CALLS_WAIT`.
 pub const RESPONSE_TIMEOUT_MAX: Duration = Duration::from_secs(600);
+const _: () = assert!(RESPONSE_TIMEOUT_MAX.as_secs() < crate::calls::CALLS_WAIT.as_secs());
 /// Longest response body the host program reads.
 const REPLY_LIMIT_BYTES: usize = 1024 * 1024;
 

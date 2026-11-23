@@ -22,11 +22,12 @@
 //!    the enclave ended on its own, it asks the backend to collect what is left, ends the
 //!    enclave and exits with a status that is not 0, so that the container runtime starts it
 //!    again with a new enclave;
-//! 7. on SIGTERM logs the enclaves `nitro-cli` describes and lets the node hand on what must
-//!    not end with it, then ends the enclave (`launch`). In a pod of the delegation role it
+//! 7. on SIGTERM logs the enclaves `nitro-cli` describes and lets the node hand on and finish
+//!    what must not end with it, then ends the enclave (`launch`). It closes the node, so that
+//!    the node begins no further use of a credential. In a pod of the delegation role it then
 //!    asks the backend to collect the state of the node and waits for a time that grows with
-//!    the delegations of the node (`drain`). In a pod of the forward role it closes the node
-//!    and waits for the sends in progress (`sends`).
+//!    the delegations of the node (`drain`). In a pod of either role it waits for the calls
+//!    the node is in the middle of and for the connections of their callers (`calls`).
 //!
 //! With the argument `drain` it makes the shutdown collection call of step 7 alone, logs its
 //! outcome and ends with the status 0 whatever the outcome: the pre-stop hook of the pod runs
@@ -67,6 +68,7 @@
     )
 )]
 
+mod calls;
 mod config;
 mod descriptors;
 mod drain;
@@ -77,7 +79,6 @@ mod http;
 mod launch;
 mod memory;
 mod relay;
-mod sends;
 #[cfg(test)]
 mod testing;
 mod watch;
@@ -238,6 +239,39 @@ async fn collect(drain: Option<Drain>, node: &dyn NodeConnector) {
     }
 }
 
+/// What happens to the node between the termination signal and the end of its enclave: what
+/// must not end with the node is handed on, and what the node is in the middle of ends.
+///
+/// The node is closed first (`calls`), so that it begins no further use of a credential and
+/// its calls in progress end within a time that counts from here. In a pod of the delegation
+/// role the backend then collects the state of the node, and moves its delegations while its
+/// calls in progress end. A node of the forward role holds nothing to collect. Then the calls
+/// the node is in the middle of, and the connections of their callers, are waited for.
+///
+/// With `enclave_ended` the watch confirmed that the enclave ended on its own: the node is
+/// gone and holds no call, so it is not closed and not waited for, and the collection tells
+/// the backend that the node of the pod is gone.
+async fn hand_on_and_finish(
+    role: Role,
+    drain: Option<Drain>,
+    node: &dyn NodeConnector,
+    callers: &relay::Pipes,
+    watch: &EnclaveWatch,
+    enclave_ended: bool,
+) {
+    let wait = match enclave_ended {
+        true => None,
+        false => Some(calls::Wait::begin(node, callers).await),
+    };
+    match role {
+        Role::Delegation => collect(drain, node).await,
+        Role::Forward => {}
+    }
+    if let Some(wait) = wait {
+        log(&wait.finish_unless_ended(watch).await.line());
+    }
+}
+
 /// What the subcommand `drain` adds to the wait of the shutdown collection call for its own
 /// start and its health call.
 const DRAIN_SUBCOMMAND_MARGIN: Duration = Duration::from_secs(10);
@@ -349,7 +383,7 @@ fn delegation_setup() -> Result<Setup, String> {
 /// at a public address, the configuration names the role and nothing else, and there is no
 /// shutdown collection call. A node of the forward role holds no client value, has no log
 /// store and holds no delegation: the variables of those are not read. What its shutdown
-/// waits for is its sends in progress (`sends`).
+/// waits for is its calls in progress, the sends of the node (`calls`).
 fn forward_setup() -> Setup {
     log("role: forward, the node sends the requests of secret uses");
     log("egress: port 443 of any host at a public address");
@@ -358,7 +392,7 @@ fn forward_setup() -> Setup {
     log(&format!(
         "shutdown: no collection, a node of the forward role holds no delegation; the sends \
          in progress have {} s to end",
-        sends::WAIT_LONGEST.as_secs()
+        calls::WAIT_LONGEST.as_secs()
     ));
     (Reach::PublicHosts, Ok(config::forward_config()), None)
 }
@@ -506,17 +540,15 @@ async fn run() -> Result<(), String> {
         Ok(Err(reason)) => log(&format!("enclave: describe-enclaves failed, {reason}")),
         Err(_) => log("enclave: describe-enclaves did not complete"),
     }
-    match role {
-        Role::Delegation => collect(drain, node.as_ref()).await,
-        // An enclave that ended on its own sends nothing more.
-        Role::Forward if enclave_ended => {}
-        // The sends in progress end before the enclave does.
-        Role::Forward => {
-            let outcome =
-                sends::finish_unless_ended(node.as_ref(), inbound_counters.pipes(), &watch).await;
-            log(&outcome.line());
-        }
-    }
+    hand_on_and_finish(
+        role,
+        drain,
+        node.as_ref(),
+        inbound_counters.pipes(),
+        &watch,
+        enclave_ended,
+    )
+    .await;
     log("enclave: ending");
     match tokio::task::spawn_blocking(launch::terminate_enclave).await {
         Ok(Ok(())) => log("enclave: ended"),
@@ -579,6 +611,160 @@ fn main() -> ExitCode {
             eprintln!("credential-enclave-host: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use super::{hand_on_and_finish, Drain, EnclaveWatch, Role};
+    use crate::relay::Pipes;
+    use crate::testing::{health_body_with_limit, Behavior, Call, FakeNode};
+
+    /// A node that answers `close` with 200 and whose `health` says that `calls` forward calls
+    /// hold a place.
+    fn node_with(calls: Arc<AtomicU64>) -> Arc<FakeNode> {
+        FakeNode::new(Behavior::Answer(Arc::new(move |call: &Call| {
+            match call.path.as_str() {
+                "/v1/close" => (200, r#"{"accounts":0}"#.to_string()),
+                "/v1/health" => {
+                    let health = health_body_with_limit(true, 0, 1).replace(
+                        r#""forward_calls":5"#,
+                        &format!(r#""forward_calls":{}"#, calls.load(Ordering::SeqCst)),
+                    );
+                    (200, health)
+                }
+                _ => (404, "{}".to_string()),
+            }
+        })))
+    }
+
+    /// The shutdown collection call of a pod whose backend listens on `port`.
+    fn drain_to(port: u16) -> Drain {
+        let address = format!("http://127.0.0.1:{port}/api/credential-enclave/drain");
+        let variable = move |name: &str| match name {
+            crate::drain::URL_VARIABLE => Some(address.clone()),
+            crate::drain::TOKEN_VARIABLE => Some("0123abcd".to_string()),
+            crate::drain::POD_VARIABLE => Some("credential-enclave-1".to_string()),
+            _ => None,
+        };
+        Drain::from_variables(&variable).unwrap().unwrap()
+    }
+
+    /// A backend that takes one collection call, reads its head, and answers it with 200.
+    /// Returns the paths of the calls the node had received when the call arrived.
+    async fn backend(listener: TcpListener, node: Arc<FakeNode>) -> Vec<String> {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(stream.read_u8().await.unwrap());
+        }
+        let received = node.calls().into_iter().map(|call| call.path).collect();
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 17\r\n\r\n{\"complete\":true}")
+            .await
+            .unwrap();
+        received
+    }
+
+    #[tokio::test]
+    async fn a_pod_of_the_delegation_role_closes_its_node_collects_and_lets_its_calls_end() {
+        let calls = Arc::new(AtomicU64::new(1));
+        let node = node_with(calls.clone());
+        let callers = Pipes::new(16);
+        // The connection of the caller of the call in progress.
+        let caller = callers.admit().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let drain = drain_to(listener.local_addr().unwrap().port());
+        let backend = tokio::spawn(backend(listener, node.clone()));
+        let shutdown = {
+            let (node, callers) = (node.clone(), callers.clone());
+            tokio::spawn(async move {
+                let watch = EnclaveWatch::new();
+                hand_on_and_finish(
+                    Role::Delegation,
+                    Some(drain),
+                    node.as_ref(),
+                    &callers,
+                    &watch,
+                    false,
+                )
+                .await;
+            })
+        };
+
+        // The node was closed before the backend was asked to collect: from the close on, the
+        // node begins no use of a credential. The call after it read the delegations of the
+        // node for the wait of the collection.
+        let received = backend.await.unwrap();
+        assert_eq!(received, ["/v1/close", "/v1/health"]);
+
+        // The collection is done and a call is still in progress: the enclave does not end.
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert!(!shutdown.is_finished());
+        // The call ended. The connection of its caller is still open.
+        calls.store(0, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert!(!shutdown.is_finished());
+        drop(caller);
+        tokio::time::timeout(Duration::from_secs(5), shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The node was closed once, and every call after the collection read its health.
+        let paths: Vec<String> = node.calls().into_iter().map(|call| call.path).collect();
+        assert_eq!(paths[..2], ["/v1/close", "/v1/health"]);
+        assert!(paths.len() > 3 && paths[2..].iter().all(|path| path == "/v1/health"));
+    }
+
+    #[tokio::test]
+    async fn a_pod_without_a_collection_call_lets_its_calls_end_all_the_same() {
+        // The variables of the collection are not set, and a pod of the forward role has no
+        // collection: the node is closed and its calls are waited for.
+        for role in [Role::Delegation, Role::Forward] {
+            let node = node_with(Arc::new(AtomicU64::new(0)));
+            let callers = Pipes::new(16);
+            let watch = EnclaveWatch::new();
+            hand_on_and_finish(role, None, node.as_ref(), &callers, &watch, false).await;
+            let paths: Vec<String> = node.calls().into_iter().map(|call| call.path).collect();
+            assert_eq!(paths, ["/v1/close", "/v1/health"], "{role:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_enclave_that_ended_on_its_own_is_collected_and_not_waited_for() {
+        // The node is gone: nothing answers its calls.
+        let node = FakeNode::new(Behavior::Unreachable);
+        let callers = Pipes::new(16);
+        let _caller = callers.admit().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let drain = drain_to(listener.local_addr().unwrap().port());
+        let backend = tokio::spawn(backend(listener, node.clone()));
+        let watch = EnclaveWatch::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            hand_on_and_finish(
+                Role::Delegation,
+                Some(drain),
+                node.as_ref(),
+                &callers,
+                &watch,
+                true,
+            ),
+        )
+        .await
+        .unwrap();
+        // The backend was told, and the connection of a caller that is still open held
+        // nothing up.
+        assert!(backend.await.unwrap().is_empty());
+        assert_eq!(callers.held(), 1);
     }
 }
 
