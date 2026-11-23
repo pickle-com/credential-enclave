@@ -954,6 +954,20 @@ test("A2: the signatures of an accepted node contradict each other when the answ
   assert.deepEqual(counted, ["pending:blocked:1", "pending:blocked:2", "pending:blocked:3", "attention:blocked:4"]);
   assert.deepEqual(hidden.world.securityStatuses.slice(-1)[0].reasons, ["verification_blocked"]);
 
+  // An entry of a node of no accepted measurement whose signature an answer did not carry marks
+  // nothing for its signature. It is shown as not verified in that answer and is not kept with
+  // the first page: the next read of the screen asks for it again and shows what the node wrote.
+  const outside = S.fixture(source);
+  await S.start(outside);
+  const later = outside.world.addNode({ release: "v9.0.0", measurement: bridge.randomMeasurement(), offered: false });
+  outside.world.advance(1000);
+  const used = later.record("u", [S.providerRequest(outside.world.now, "/gmail/v1/users/me/messages/1", "POST")]);
+  otherSignature(outside, used.key, 1);
+  const kinds = (result) => shownGroups(result.value).map((group) => group.kind);
+  assert.equal(kinds(await S.call(outside, "read_log", { limit: 10 })).indexOf("request"), -1);
+  assert.ok(kinds(await S.call(outside, "read_log", { limit: 10 })).indexOf("request") >= 0);
+  assert.equal(outside.world.state.log.unverified_nodes, 0);
+
   // Two bodies a node signed for one seq: no answer can make that up, and the log is marked at
   // once and for good.
   const two = S.fixture(source);
@@ -4650,6 +4664,27 @@ test("the transfer of the master key goes on through answers of the backend that
   assert.equal(taking.world.state.key_state, "present");
   const item = "com.pickle.client.secure.master-key\n" + taking.world.userId;
   assert.equal(taking.world.keychain.get(item).value, giving.world.keychain.get(item).value);
+});
+
+test("the first page of the screen shows the entries of a node its round judges, however many entries of other nodes the summary asks for: one request for bodies is left to them", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  // 850 use entries of the node of the device within the window of the summary, and after them
+  // three of a node of the accepted measurement that this runtime has no judgement of.
+  for (let i = 0; i < 850; i += 1) {
+    world.advance(1000);
+    fx.nodes[0].record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/messages/a" + i, "GET")]);
+  }
+  const other = world.addNode({ release: "v2.4.0", measurement: fx.measurement, offered: false });
+  for (let i = 0; i < 3; i += 1) {
+    world.advance(1000);
+    other.record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/messages/b" + i, "POST")]);
+  }
+  const shown = await S.call(fx, "read_log", { limit: 3 });
+  const groups = shownGroups(shown.value);
+  assert.ok(groups.every((group) => group.verified === true));
+  assert.equal(groups.filter((group) => group.kind === "request").reduce((sum, group) => sum + group.count, 0), 3);
 });
 
 test("an entry of a node the runtime has no judgement of is read with the page that shows it: the first read of a later page shows it verified", async () => {

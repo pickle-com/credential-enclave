@@ -112,7 +112,10 @@
   //   log.seen        the digests of the control keys judged: the index {v, parts: [n]} and one
   //                   value log.seen.{n} for each part (LOG_SEEN_PARTS parts of LOG_SEEN_PART
   //                   digests; the oldest part leaves when one more begins)
-  //   log.missing     the keys of log.sample that left the listing within their retention
+  //   log.missing     the keys of log.sample that left the listing within their retention, until
+  //                   a listing names them again
+  //   log.doubted     the keys whose body an answer handed out with a signature that does not
+  //                   verify under the accepted node of the key: {key: {n, t, id}}
   //   log.withheld    the reads that were held back and are made again by every round: {keys:
   //                   [key], shown: [key], pages: [before_ms], watch_ms, objects, chains, nodes}
   //                   (the keys of entries of format 3, those of them a read of the log screen
@@ -127,11 +130,13 @@
   //                   prefixes of the bucket of format 1 and format 2
   //   log.denied      the reads held back from the log screen that the screen notes itself and
   //                   has not read since: {pages: [{t, before_ms, limit}], chains: {node:
-  //                   [{t, after, deep}]}} (the later pages of format 3, and the listings of
-  //                   the chains of format 1 and format 2, one read for each day)
+  //                   [{t, after}]}, filled: [{t}]} (the later pages of format 3, the listings
+  //                   of the chains of format 1 and format 2, and the pages that held no entry
+  //                   because every key they took was no entry, one read for each day)
   //   log.legacy      the chains of format 1 and format 2: {nodes: {node: {seq, time_ms, until_ms,
-  //                   closed, read_ms}}, waiting: {node: {until_ms, time_ms}}} (waiting: the receiving
-  //                   nodes of transfers whose documents this device has still to judge)
+  //                   closed, read_ms}}, waiting: {node: {until_ms, time_ms, strict}}} (waiting:
+  //                   the receiving nodes of transfers whose documents this device has still to
+  //                   judge; strict: nothing but a document judges the node)
   //   log.round       the last round: {v, done_ms, tried_ms, last, told, state, unfinished}
   //                   (unfinished: the rounds in a row that had more to read than they read)
   //   log.cache       the kept screen, sealed (the first page, the time the screen last read
@@ -311,7 +316,7 @@
   // summary, the most entries one opening counts into it, the body requests one opening of the
   // screen sends (for its page, its round and its summary together), the time a call of read_log
   // waits for the read of the store before it answers from what the device kept, and the bodies
-  // one read of a later page asks for at most.
+  // a round asks for of one listing page it reads again for the screen.
   const LOG_SCREEN_EVENTS = 50;
   const LOG_KEEP_EVENTS = 50;
   const LOG_SUMMARY_DAYS = 7;
