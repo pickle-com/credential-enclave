@@ -4901,7 +4901,8 @@
 
   /** The items of one entry of format 3 the screen read (record: what readEntries left for its
    *  key, undefined when the entry was not read): {id, time_ms, count, items}. An entry that was
-   *  not read, or whose object is not the entry its key names, is one item that is not verified;
+   *  not read, or whose object is not the entry its key names, is one item that is not verified
+   *  (an entry that was not read is marked unread: the kept screen leaves it out);
    *  an entry of another key_id (the delegation of another key) is one item that is not opened. */
   function entryOfRecord(parsed, record) {
     const base = parsed.node + ":" + parsed.seq;
@@ -4916,7 +4917,11 @@
         return eventItem(base + ":" + index, time === 0 ? parsed.time_ms : time, event);
       });
     }
-    return { id: "3:" + parsed.tail, time_ms: parsed.time_ms, count: parsed.count, items: items };
+    const entry = { id: "3:" + parsed.tail, time_ms: parsed.time_ms, count: parsed.count, items: items };
+    // An entry whose object was not read (the answer of the bodies ended before it, or its read
+    // failed) is shown as not verified in this answer and is not kept: the next read asks for it.
+    if (record === undefined) entry.unread = true;
+    return entry;
   }
 
   /** The keys of format 3 before beforeMs that the two listing pages name, the latest first, until
@@ -5126,6 +5131,7 @@
     let keptEvents = 0;
     for (const entry of page.entries) {
       if (keptEvents >= LOG_KEEP_EVENTS) break;
+      if (entry.unread === true) continue;
       kept.push(entry);
       keptEvents += entry.items.length;
     }

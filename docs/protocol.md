@@ -1611,7 +1611,9 @@ control prefix and of the use prefix together, takes the keys later than the one
 asks for their bodies with the bodies of the round. An entry is shown as verified when its object
 verifies (7.4) under a node the device accepts, and it is opened when its `key_id` is the device's
 own. An entry whose node the device cannot judge, or whose object does not verify, is shown as not
-verified. The summary counts the use entries of the last seven days, each once per device, the
+verified. An entry whose object was not read is shown as not verified in that answer and is not
+kept: the next read asks for it again. The summary counts the use entries of the last seven days,
+each once per device, the
 1,000 latest at most (a count that is not complete is marked as such). `read_log_page` reads one
 later page (50 events before `before_ms`) from the listings below that time, and the entries of
 formats 1 and 2 are merged in by their times. `read_security_record` returns the same entries as

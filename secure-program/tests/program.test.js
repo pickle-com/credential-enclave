@@ -1601,3 +1601,27 @@ test("A3: an answer of the bodies that ends early is asked on, and an answer tha
   assert.equal(world.state.log.status, "verified");
   assert.equal(world.stored("log.blocked").count, 0);
 });
+
+// ---- An entry of the screen whose object was not read ----
+
+test("an entry the screen could not read once is not kept as not verified: the next opening reads it", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  world.advance(HOUR_MS);
+  fx.nodes[0].record("u", [S.providerRequest(world.now)]);
+  // The first opening: the backend does not answer the bodies. The screen shows the entry as not
+  // verified, and the round counts a read held back.
+  world.fault("POST /api/secure/log/bodies", "hang", 1);
+  const first = await S.call(fx, "read_log", { limit: 50 });
+  assert.equal(first.ok, true);
+  await world.settle(60000);
+  const waited = await S.call(fx, "read_log", { limit: 50, kept: true });
+  assert.ok(shownGroups(waited.value).every((group) => group.kind !== "unverified"));
+  // The next opening reads the entry and shows it as verified.
+  world.advance(HOUR_MS);
+  const second = await S.call(fx, "read_log", { limit: 50 });
+  const groups = shownGroups(second.value);
+  assert.deepEqual(groups.map((group) => group.kind), ["request", "grant_renewed"]);
+  assert.ok(groups.every((group) => group.verified === true));
+});
