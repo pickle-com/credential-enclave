@@ -9,7 +9,7 @@ use std::{
     fmt, io,
     pin::Pin,
     sync::atomic::Ordering,
-    sync::{Arc, Mutex},
+    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
@@ -31,7 +31,7 @@ use zeroize::Zeroizing;
 use crate::imap::{self, Code, Condition, Fetched, Response, Status, Step};
 use crate::platform::Stream;
 use crate::provider_response::{self, CheckedResponse};
-use crate::state::{lock, open_for, GrantView, Limits, Node};
+use crate::state::{open_for, GrantView, Limits, Node};
 
 /// Protocol input the IMAP connection of a folder listing or of a search accepts: 4 MiB. A
 /// UID set or headers above it end the connection; the search must be narrowed.
@@ -108,29 +108,26 @@ pub(crate) const RESPONSE_TEXT_BYTES: usize = LISTING_INPUT_BYTES;
 /// counted as.
 pub(crate) const LITERAL_INPUT_BYTES: usize = 96;
 
-/// The share of the body budget of the node that one mail call holds (the budget of
-/// `Limits::body_budget_bytes`, which `forward` reserves its bodies from).
+/// The part of the share of the body budget of the node that one mail call holds for itself
+/// (the budget of `Limits::body_budget_bytes`, which `forward` reserves its bodies from).
 ///
-/// A call takes its share without waiting, in two parts. The first is taken before the call
-/// reads its request frame: the frame, [`CALL_BYTES`], and the input bound of every connection
-/// whose input the call does not follow ([`LOGIN_INPUT_BYTES`], [`SMTP_INPUT_BYTES`]). The
-/// second follows the protocol input of a read ([`Allowance`]): for every byte the call takes
-/// from its IMAP connection, and for every octet of a literal the server declares, the share
-/// grows by what the call holds per byte of input, before the reader of the responses takes
-/// the byte. So the share of a call is what the call read, and the shares of the calls of a
-/// node add up to the mail the node holds, not to the largest mail each call could have read.
-/// When the budget has no room for a step, the input of the call ends there
-/// ([`MailError::Capacity`]).
+/// A call takes its share without waiting, in two parts. The first is this value. It is taken
+/// before the call reads its request frame: the frame, [`CALL_BYTES`], and the input bound of
+/// every connection whose input the call does not follow ([`LOGIN_INPUT_BYTES`],
+/// [`SMTP_INPUT_BYTES`]). The second follows the protocol input of a read ([`InputShare`]): the
+/// allowance of the connection that carries the read holds it while the read takes its input,
+/// and the call takes it into this value when the read ends ([`Share::take_in`]), so the
+/// response frame of the call is made under the whole share. So the share of a call is what
+/// the call read, and the shares of the calls of a node add up to the mail the node holds, not
+/// to the largest mail each call could have read.
+///
+/// Each part is held by the one value that uses it, and both are given back when they are
+/// dropped: a call that ends in any way, a panic included, holds nothing of the budget
+/// afterwards, and no lock stands around either part.
 pub(crate) struct Share {
     budget: Arc<Semaphore>,
-    held: Mutex<Held>,
-}
-
-struct Held {
-    /// The bytes of the budget the call holds. `None` once its response frame took them.
-    permit: Option<OwnedSemaphorePermit>,
-    /// The part of the share that does not follow the input.
-    base: usize,
+    /// The bytes of the budget the call holds.
+    permit: OwnedSemaphorePermit,
 }
 
 /// Takes `bytes` of the budget without waiting. `None` when they are not free.
@@ -142,67 +139,95 @@ fn take_bytes(budget: &Arc<Semaphore>, bytes: usize) -> Option<OwnedSemaphorePer
 impl Share {
     /// The share of a call that starts: `bytes` of the budget, taken without waiting. `None`
     /// when they are not free.
-    pub(crate) fn admit(budget: &Arc<Semaphore>, bytes: usize) -> Option<Arc<Share>> {
-        let permit = take_bytes(budget, bytes)?;
-        Some(Arc::new(Share {
+    pub(crate) fn admit(budget: &Arc<Semaphore>, bytes: usize) -> Option<Share> {
+        Some(Share {
             budget: budget.clone(),
-            held: Mutex::new(Held {
-                permit: Some(permit),
-                base: bytes,
-            }),
-        }))
+            permit: take_bytes(budget, bytes)?,
+        })
     }
 
     /// Makes the share `bytes`: more is taken without waiting, less is given back. False
-    /// when the budget has no room for more, and for a share its response frame took.
-    fn resize(&self, held: &mut Held, bytes: usize) -> bool {
-        let Some(permit) = held.permit.as_mut() else {
-            return false;
-        };
-        let now = permit.num_permits();
+    /// when the budget has no room for more. The call knows the length of its request frame
+    /// when it calls this.
+    pub(crate) fn resize(&mut self, bytes: usize) -> bool {
+        let now = self.permit.num_permits();
         if bytes > now {
             match take_bytes(&self.budget, bytes.saturating_sub(now)) {
-                Some(more) => permit.merge(more),
+                Some(more) => self.permit.merge(more),
                 None => return false,
             }
-        } else if let Some(freed) = permit.split(now.saturating_sub(bytes)) {
+        } else if let Some(freed) = self.permit.split(now.saturating_sub(bytes)) {
             drop(freed);
         }
         true
     }
 
-    /// Makes `bytes` the part of the share that does not follow the input, and the share
-    /// that size: the call knows the length of its request frame now.
-    pub(crate) fn rebase(&self, bytes: usize) -> bool {
-        let mut held = lock(&self.held);
-        held.base = bytes;
-        self.resize(&mut held, bytes)
-    }
-
-    /// Raises the share to its base plus `input_share` bytes, in whole steps of
-    /// [`SHARE_STEP_BYTES`]. A share that is that large already stays as it is. False when
-    /// the budget has no room.
-    fn cover(&self, input_share: usize) -> bool {
-        let mut held = lock(&self.held);
-        let steps = input_share.div_ceil(SHARE_STEP_BYTES);
-        let needed = held
-            .base
-            .saturating_add(steps.saturating_mul(SHARE_STEP_BYTES));
-        let covered = held
-            .permit
-            .as_ref()
-            .is_some_and(|permit| permit.num_permits() >= needed);
-        covered || self.resize(&mut held, needed)
+    /// Takes the part of the share that followed the input of a read into this value: the
+    /// read ended, and what it answers with is held by the call from here on.
+    pub(crate) fn take_in(&mut self, input: InputShare) {
+        if let Some(permit) = input.permit {
+            self.permit.merge(permit);
+        }
     }
 
     /// Ends the share at what the response frame of the call holds, `bytes` at the most,
-    /// and hands the permit to that frame: a share is never raised here. `None` for a share
-    /// that was handed over before.
-    pub(crate) fn settle(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
-        let mut held = lock(&self.held);
-        let now = held.permit.as_ref()?.num_permits();
-        self.resize(&mut held, bytes.min(now));
-        held.permit.take()
+    /// and hands the permit to that frame: a share is never raised here.
+    pub(crate) fn settle(mut self, bytes: usize) -> OwnedSemaphorePermit {
+        let now = self.permit.num_permits();
+        self.resize(bytes.min(now));
+        self.permit
+    }
+}
+
+/// The part of the share of a read that follows its protocol input ([`Allowance`]): for
+/// every byte the read takes from its IMAP connection, for every octet of a literal the
+/// server declares and for every declaration, this part grows by what the read holds per
+/// byte of input, in whole steps of [`SHARE_STEP_BYTES`], before the reader of the responses
+/// takes the byte. When the budget has no room for a step, the input of the read ends there
+/// ([`MailError::Capacity`]).
+pub(crate) struct InputShare {
+    budget: Arc<Semaphore>,
+    /// What the read holds at once per byte of its input.
+    held_per_byte: usize,
+    /// The steps taken so far. `None` before the first one.
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl InputShare {
+    /// The part of a read that holds `held_per_byte` bytes at once per byte of its input. It
+    /// holds nothing before the read takes input.
+    pub(crate) fn new(budget: &Arc<Semaphore>, held_per_byte: usize) -> InputShare {
+        InputShare {
+            budget: budget.clone(),
+            held_per_byte,
+            permit: None,
+        }
+    }
+
+    /// Raises the part to what the read holds of `accounted` bytes of input, in whole steps.
+    /// A part that is that large already stays as it is. False when the budget has no room.
+    fn cover(&mut self, accounted: usize) -> bool {
+        let needed = accounted
+            .saturating_mul(self.held_per_byte)
+            .div_ceil(SHARE_STEP_BYTES)
+            .saturating_mul(SHARE_STEP_BYTES);
+        let now = self
+            .permit
+            .as_ref()
+            .map_or(0, OwnedSemaphorePermit::num_permits);
+        if now >= needed {
+            return true;
+        }
+        match take_bytes(&self.budget, needed.saturating_sub(now)) {
+            Some(more) => {
+                match self.permit.as_mut() {
+                    Some(permit) => permit.merge(more),
+                    None => self.permit = Some(more),
+                }
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -407,7 +432,9 @@ impl AppPassword {
     }
 
     /// Reads mail for one call, and returns the session of the call when it can carry the
-    /// next one. The share of the call follows the input of its connection (`share`).
+    /// next one. The share of the call follows the input of its connection: the part that
+    /// follows the input is held by the connection while the call reads, and is taken into
+    /// `share` when the read ends.
     ///
     /// `kept` is the session the node kept for this record from an earlier call, when it
     /// kept one (`crate::mail_sessions`). The call goes over it and neither opens a
@@ -427,27 +454,24 @@ impl AppPassword {
         node: &Node,
         request: &ReadMail,
         kept: Option<ImapSession>,
-        share: &Arc<Share>,
+        share: &mut Share,
     ) -> (Result<MailData, MailError>, Option<ImapSession>) {
         if let Err(error) = request.validate() {
             return (Err(error), kept);
         }
         // A UID search can expand into a large set before pagination. Bound listing and
         // header input separately from a raw message, whose content has the frame limit.
-        let allowance = || match request.action.as_str() {
-            "read" => Allowance::charged(
-                message_input_bytes(&node.limits),
-                MESSAGE_HELD_PER_BYTE,
-                share,
-            ),
-            _ => Allowance::charged(LISTING_INPUT_BYTES, LISTING_HELD_PER_BYTE, share),
+        let (bound, held_per_byte) = match request.action.as_str() {
+            "read" => (message_input_bytes(&node.limits), MESSAGE_HELD_PER_BYTE),
+            _ => (LISTING_INPUT_BYTES, LISTING_HELD_PER_BYTE),
         };
+        let input = InputShare::new(&node.body_budget, held_per_byte);
         let (mut session, mut reused) = match kept {
             Some(mut session) => {
-                session.serve(allowance());
+                session.serve(Allowance::charged(bound, input));
                 (session, true)
             }
-            None => match self.imap(node, allowance()).await {
+            None => match self.imap(node, Allowance::charged(bound, input)).await {
                 Ok(session) => (session, false),
                 Err(error) => return (Err(error), None),
             },
@@ -455,7 +479,11 @@ impl AppPassword {
         let mut data = session.read(request, &node.limits).await;
         if reused && session.ended_unanswered() {
             reused = false;
-            session = match self.imap(node, allowance()).await {
+            // The second start goes on under what the first one took of the budget.
+            let input = session
+                .release()
+                .unwrap_or_else(|| InputShare::new(&node.body_budget, held_per_byte));
+            session = match self.imap(node, Allowance::charged(bound, input)).await {
                 Ok(session) => session,
                 Err(error) => return (Err(error), None),
             };
@@ -467,6 +495,11 @@ impl AppPassword {
                 .idle_reuses
                 .mail
                 .fetch_add(1, Ordering::Relaxed);
+        }
+        // The read ended: what it answers with is held by the call, under the share its
+        // input took.
+        if let Some(input) = session.release() {
+            share.take_in(input);
         }
         let session = session.rest().then_some(session);
         (data, session)
@@ -686,9 +719,15 @@ impl ImapSession {
         self.connection.serve(allowance);
     }
 
-    /// Takes the session from its call, and with it the hold of the call on its share of the
-    /// body budget. True when the session can carry a further call: it is in step with the
-    /// server, its connection has not ended, and its reader stands between two responses.
+    /// Takes the allowance of the call from the session, and returns the part of the share
+    /// of the call that followed its input. The session takes no further input for the call.
+    fn release(&mut self) -> Option<InputShare> {
+        self.connection.release()
+    }
+
+    /// Takes the session from its call. True when the session can carry a further call: it
+    /// is in step with the server, its connection has not ended, and its reader stands
+    /// between two responses.
     fn rest(&mut self) -> bool {
         let at_rest = self.connection.rest();
         self.in_step && at_rest
@@ -1095,10 +1134,10 @@ impl Smtp {
 /// declaration above what is left of the input bound ends the input: its octets could not
 /// arrive under the bound. Every declaration takes [`LITERAL_INPUT_BYTES`] of the input bound,
 /// so the literals of a connection are bounded like its bytes. And the share of the call is
-/// raised to `accounted` times what the call holds per byte ([`Share`]) before the buffer of
-/// a literal is made and before a byte that was taken is read. So what a connection holds of
-/// its input never exceeds its input bound, whatever a server declares, and the call holds a
-/// share of the body budget for all of it.
+/// raised to `accounted` times what the call holds per byte ([`InputShare`]) before the buffer
+/// of a literal is made and before a byte that was taken is read. So what a connection holds
+/// of its input never exceeds its input bound, whatever a server declares, and the call holds
+/// a share of the body budget for all of it.
 pub(crate) struct Allowance {
     /// Bytes the call may still take from the connection, and bytes its declarations may
     /// still count as.
@@ -1108,21 +1147,22 @@ pub(crate) struct Allowance {
     accounted: usize,
     /// The octets of declared literals that are accounted and were not taken yet.
     outstanding: usize,
-    /// What the call holds at once per byte of `accounted`, and the share that covers it.
+    /// The part of the share of the call that covers what the call holds of `accounted`.
     /// `None` for a connection whose whole input bound the call reserved before it opened
     /// the connection.
-    charge: Option<(usize, Arc<Share>)>,
+    charge: Option<InputShare>,
 }
 
 impl Allowance {
-    /// `bound` bytes of input, for each of which the call holds `held_per_byte` bytes at once
-    /// and takes them into its share as the input arrives.
-    pub(crate) fn charged(bound: usize, held_per_byte: usize, share: &Arc<Share>) -> Allowance {
+    /// `bound` bytes of input, which the call takes into `share` as the input arrives. A
+    /// share that holds steps already (the share of a read that starts once more) covers the
+    /// input up to them.
+    pub(crate) fn charged(bound: usize, share: InputShare) -> Allowance {
         Allowance {
             left: bound,
             accounted: 0,
             outstanding: 0,
-            charge: Some((held_per_byte, share.clone())),
+            charge: Some(share),
         }
     }
 
@@ -1137,15 +1177,21 @@ impl Allowance {
     }
 
     /// Raises the share of the call to what it holds of its input now.
-    fn cover(&self) -> Result<(), MailError> {
-        match &self.charge {
-            Some((held_per_byte, share))
-                if !share.cover(self.accounted.saturating_mul(*held_per_byte)) =>
-            {
-                Err(MailError::Capacity)
-            }
-            _ => Ok(()),
+    fn cover(&mut self) -> Result<(), MailError> {
+        let covered = match self.charge.as_mut() {
+            Some(share) => share.cover(self.accounted),
+            None => true,
+        };
+        match covered {
+            true => Ok(()),
+            false => Err(MailError::Capacity),
         }
+    }
+
+    /// Ends the allowance and returns the part of the share of the call that followed its
+    /// input, when the call takes that part as its input arrives.
+    pub(crate) fn into_share(self) -> Option<InputShare> {
+        self.charge
     }
 
     /// Counts `bytes` bytes the connection just delivered. The octets of a declared literal
@@ -1223,12 +1269,19 @@ impl ImapConnection {
         self.allowance = Some(allowance);
     }
 
-    /// Takes the connection from its call, with the hold of the call on its share of the
-    /// body budget, and gives back the room of its buffer. True when the connection can
-    /// carry a further call: its stream has not ended, and the reader stands between two
-    /// responses. Bytes the stream delivered behind the last response the call read (a
-    /// server may send a response nobody asked for at any time) stay for the next call, which
-    /// reads them first: they are less than one read of the connection.
+    /// Takes the allowance of the call from the connection, and returns the part of the
+    /// share of the call that followed its input. Without an allowance the connection takes
+    /// no input.
+    fn release(&mut self) -> Option<InputShare> {
+        self.allowance.take().and_then(Allowance::into_share)
+    }
+
+    /// Takes the connection from its call, with the allowance of the call when it still has
+    /// it, and gives back the room of its buffer. True when the connection can carry a
+    /// further call: its stream has not ended, and the reader stands between two responses.
+    /// Bytes the stream delivered behind the last response the call read (a server may send a
+    /// response nobody asked for at any time) stay for the next call, which reads them first:
+    /// they are less than one read of the connection.
     fn rest(&mut self) -> bool {
         self.allowance = None;
         let taken = self.taken.min(self.buffer.len());
@@ -1519,8 +1572,7 @@ mod tests {
         let step = SHARE_STEP_BYTES;
         let budget = Arc::new(Semaphore::new(8 * step));
         let held = |budget: &Arc<Semaphore>| 8 * step - budget.available_permits();
-        let share = Share::admit(&budget, 0).unwrap();
-        let mut allowance = Allowance::charged(1 << 20, 2, &share);
+        let mut allowance = Allowance::charged(1 << 20, InputShare::new(&budget, 2));
         for _ in 0..step / (4 + declaration) {
             assert!(allowance.take(4).is_ok());
             assert!(allowance.declare(0).is_ok());
@@ -1536,9 +1588,9 @@ mod tests {
         let step = SHARE_STEP_BYTES;
         let budget = Arc::new(Semaphore::new(4 * step));
         let held = |budget: &Arc<Semaphore>| 4 * step - budget.available_permits();
-        let share = Share::admit(&budget, 1_000).unwrap();
+        let mut share = Share::admit(&budget, 1_000).unwrap();
         assert_eq!(held(&budget), 1_000);
-        let mut allowance = Allowance::charged(1 << 20, 2, &share);
+        let mut allowance = Allowance::charged(1 << 20, InputShare::new(&budget, 2));
 
         // Ten bytes of text, of which the call holds twenty: one step.
         assert!(allowance.take(10).is_ok());
@@ -1560,22 +1612,32 @@ mod tests {
         ));
         assert_eq!(held(&budget), 1_000 + 3 * step);
 
-        // The response frame takes the share of what it holds and gives it back with
-        // itself. It never takes more than the call held.
-        let frame = share.settle(500).unwrap();
+        // The read ends: the call takes the part that followed its input. The response frame
+        // then takes the share of what it holds and gives it back with itself. It never
+        // takes more than the call held.
+        share.take_in(allowance.into_share().unwrap());
+        assert_eq!(held(&budget), 1_000 + 3 * step);
+        let frame = share.settle(500);
         assert_eq!(held(&budget), 500);
-        assert!(share.settle(500).is_none());
         drop(frame);
         assert_eq!(held(&budget), 0);
         let share = Share::admit(&budget, 100).unwrap();
-        let frame = share.settle(4 * step).unwrap();
+        let frame = share.settle(4 * step);
         assert_eq!(held(&budget), 100);
         drop(frame);
 
+        // A read that ends without its answer gives back the part that followed its input
+        // with its connection: the allowance holds it, and nothing else does.
+        let mut allowance = Allowance::charged(1 << 20, InputShare::new(&budget, 2));
+        assert!(allowance.take(10).is_ok());
+        assert_eq!(held(&budget), step);
+        drop(allowance);
+        assert_eq!(held(&budget), 0);
+
         // A share is taken without waiting: none when the bytes are not free.
-        let all = Share::admit(&budget, 4 * step).unwrap();
+        let mut all = Share::admit(&budget, 4 * step).unwrap();
         assert!(Share::admit(&budget, 1).is_none());
-        assert!(all.rebase(step));
+        assert!(all.resize(step));
         assert_eq!(held(&budget), step);
     }
 }

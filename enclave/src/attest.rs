@@ -35,7 +35,7 @@ use credential_enclave_protocol::envelope::{
     open_transfer, seal_transfer, Transfer, TransferEnvelope, TransferGrant,
 };
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::MutexGuard;
 
 use credential_enclave_protocol::keys::{node_id, LogStoreId, NodeKeys, Role};
 use credential_enclave_protocol::release::ReleaseMeasurement;
@@ -44,6 +44,7 @@ use credential_enclave_protocol::secret_use::{seal_secret_use, BoundRequest, Sec
 use credential_enclave_protocol::ProtocolError;
 use sha2::{Digest, Sha256};
 
+use crate::faults::{lock, NodeLock};
 use crate::platform::Measurement;
 
 /// The keys of a peer, read from the binding inside its verified attestation document. Only
@@ -392,7 +393,7 @@ pub struct ForwardNodes {
     platform: &'static str,
     /// The measurement of that node, `None` on the local platform.
     measurement: Option<Measurement>,
-    verified: Mutex<HashMap<[u8; 32], ForwardNode>>,
+    verified: NodeLock<HashMap<[u8; 32], ForwardNode>>,
 }
 
 impl ForwardNodes {
@@ -404,7 +405,7 @@ impl ForwardNodes {
         ForwardNodes {
             platform,
             measurement,
-            verified: Mutex::new(HashMap::new()),
+            verified: NodeLock::new(HashMap::new()),
         }
     }
 
@@ -429,7 +430,7 @@ impl ForwardNodes {
     }
 
     fn kept(&self) -> MutexGuard<'_, HashMap<[u8; 32], ForwardNode>> {
-        self.verified.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.verified)
     }
 
     /// The documents the store keeps at this moment.

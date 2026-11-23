@@ -36,27 +36,7 @@ pub mod app;
 pub mod attestation;
 pub mod encoding;
 pub mod envelope;
-// The rule on input that ends the program is not in force in this module.
-#[cfg_attr(
-    not(test),
-    allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::indexing_slicing,
-        clippy::string_slice
-    )
-)]
 pub mod keys;
-// The rule on input that ends the program is not in force in this module.
-#[cfg_attr(
-    not(test),
-    allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::indexing_slicing,
-        clippy::string_slice
-    )
-)]
 pub mod log;
 pub mod record;
 pub mod release;

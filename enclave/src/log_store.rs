@@ -37,7 +37,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
+use std::sync::{Arc, OnceLock};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -58,8 +58,9 @@ use zeroize::Zeroizing;
 
 use crate::api::responses::LogRef;
 use crate::egress::{full_jitter, OnceBody, OpenError};
+use crate::faults::{NodeLock, NodeRwLock};
 use crate::platform::DynPlatform;
-use crate::state::{lock, Account, EventPlace, Node};
+use crate::state::{lock, Account, AccountLock, EventPlace, Node};
 
 /// Writes of one call that run at the same time.
 const WRITE_CONCURRENCY: usize = 32;
@@ -191,7 +192,8 @@ impl Credentials {
         canonical.push('\n');
         canonical.push_str(payload_sha256);
 
-        let date = &amz_date[..amz_date.len().min(8)];
+        // The date of the scope: the first eight characters of `amz_date`, `YYYYMMDD`.
+        let date = amz_date.get(..8).unwrap_or(amz_date);
         let scope = format!("{date}/{region}/s3/aws4_request");
         let to_sign = format!(
             "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
@@ -219,6 +221,11 @@ impl Credentials {
 /// The name of the header that carries the session token.
 const SECURITY_TOKEN: &str = "x-amz-security-token";
 
+#[expect(
+    clippy::expect_used,
+    reason = "HMAC-SHA256 takes a key of any length (a key longer than a block is hashed \
+              first): no key is refused"
+)]
 fn hmac_sha256(key: &[u8], message: &[u8]) -> Zeroizing<[u8; 32]> {
     let mut mac =
         Hmac::<Sha256>::new_from_slice(key).expect("HMAC-SHA256 takes a key of any length");
@@ -230,8 +237,9 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> Zeroizing<[u8; 32]> {
 fn hex(bytes: &[u8]) -> String {
     let mut text = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        text.push(char::from_digit(u32::from(byte >> 4), 16).expect("nibble"));
-        text.push(char::from_digit(u32::from(byte & 0x0f), 16).expect("nibble"));
+        for half in [byte >> 4, byte & 0x0f] {
+            text.extend(char::from_digit(u32::from(half), 16));
+        }
     }
     text
 }
@@ -282,8 +290,8 @@ fn object_path(key: &str) -> String {
         } else {
             path.push('%');
             for nibble in [byte >> 4, byte & 0x0f] {
-                let digit = char::from_digit(u32::from(nibble), 16).expect("nibble");
-                path.push(digit.to_ascii_uppercase());
+                let digit = char::from_digit(u32::from(nibble), 16);
+                path.extend(digit.map(|digit| digit.to_ascii_uppercase()));
             }
         }
     }
@@ -353,7 +361,7 @@ pub struct LogStore {
     id: OnceLock<LogStoreId>,
     /// The endpoint of a node of the local platform, set once with the log store.
     endpoint: OnceLock<Option<LogStoreEndpoint>>,
-    credentials: RwLock<Option<Arc<Credentials>>>,
+    credentials: NodeRwLock<Option<Arc<Credentials>>>,
     idle: IdleConnections,
     /// The node time of the latest write of the node document that the store confirmed, 0
     /// while it confirmed none (protocol.md 7.7). It only grows.
@@ -365,7 +373,7 @@ pub struct LogStore {
 /// The open HTTP/1.1 connections to the log store that carry no write, the most recently used
 /// last.
 #[derive(Default)]
-struct IdleConnections(Mutex<Vec<SendRequest<OnceBody>>>);
+struct IdleConnections(NodeLock<Vec<SendRequest<OnceBody>>>);
 
 impl IdleConnections {
     /// The most recently used connection that is still open, once it is ready for a request.
@@ -397,7 +405,7 @@ impl LogStore {
             required,
             id: OnceLock::new(),
             endpoint: OnceLock::new(),
-            credentials: RwLock::new(None),
+            credentials: NodeRwLock::new(None),
             idle: IdleConnections::default(),
             document_ms: AtomicU64::new(0),
             document_writer: tokio::sync::Mutex::new(()),
@@ -451,17 +459,13 @@ impl LogStore {
 
     /// Replaces the credentials.
     pub fn set_credentials(&self, credentials: Credentials) {
-        *self
-            .credentials
-            .write()
-            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(credentials));
+        *self.credentials.write() = Some(Arc::new(credentials));
     }
 
     /// The end of the credentials the node holds, 0 when it holds none.
     pub fn credentials_expires_ms(&self) -> u64 {
         self.credentials
             .read()
-            .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
             .map_or(0, |credentials| credentials.expires_ms)
     }
@@ -485,7 +489,6 @@ impl LogStore {
         let credentials = self
             .credentials
             .read()
-            .unwrap_or_else(PoisonError::into_inner)
             .clone()
             .filter(|credentials| now_ms < credentials.expires_ms)
             .ok_or(ProtocolError::LogStoreUnavailable)?;
@@ -565,14 +568,15 @@ struct Write {
 /// The entries of one account that a call writes: the entries the call names and the pending
 /// entries of the account. While the claim lives, no other call takes the pending ones along.
 /// When it is dropped, the entries the store confirmed leave the account, and the others are
-/// no longer written by this call: also when the call ends before its writes do.
+/// no longer written by this call: also when the call ends before its writes do, because its
+/// caller went away or because it panicked.
 struct Claim<'a> {
-    account: &'a Mutex<Account>,
+    account: &'a AccountLock,
     writes: Vec<Write>,
 }
 
 impl<'a> Claim<'a> {
-    fn take(account: &'a Mutex<Account>, seqs: &[u64]) -> Claim<'a> {
+    fn take(account: &'a AccountLock, seqs: &[u64]) -> Claim<'a> {
         let mut writes = Vec::new();
         for entry in lock(account).unconfirmed_mut() {
             let required = seqs.contains(&entry.seq);
@@ -638,10 +642,8 @@ pub(crate) async fn join_all<F: Future>(futures: impl Iterator<Item = F>) -> Vec
         }
     })
     .await;
-    outputs
-        .into_iter()
-        .map(|output| output.expect("every future ended"))
-        .collect()
+    // Every future ended: each has its output.
+    outputs.into_iter().flatten().collect()
 }
 
 /// Writes the entries of the claims: the entries an act waits for first, at most 32 writes at
@@ -999,13 +1001,19 @@ pub async fn write_node_document(node: &Node) -> u64 {
 /// an account that makes no further call would leave a gap in the store for as long as it is
 /// idle, and a reader of the store would take that gap for an omission. The task ends when the
 /// orderly shutdown of the node starts.
+///
+/// The node cannot do without this task (`crate::faults::vital`). Each sweep runs on a task of
+/// its own: a panic inside one ends that sweep, as a panic inside a call ends that call, and
+/// the next sweep starts at its time. What the sweep that panicked did not reach waits for the
+/// next one, and an account under whose lock it panicked is halted.
 pub async fn keep_sweeping(node: Arc<Node>) {
     loop {
         tokio::time::sleep(SWEEP_INTERVAL).await;
         if node.ensure_open().is_err() {
             return;
         }
-        sweep(&node).await;
+        let swept = node.clone();
+        let _ = tokio::spawn(async move { sweep(&swept).await }).await;
     }
 }
 
@@ -1040,7 +1048,7 @@ pub async fn sweep(node: &Node) {
     let now_ms = node.now_ms();
     let platform = node.platform.as_ref();
     let mut random = RandomDraws::new(platform);
-    let mut pending_accounts: Vec<(String, Arc<Mutex<Account>>)> = Vec::new();
+    let mut pending_accounts: Vec<(String, Arc<AccountLock>)> = Vec::new();
     for (user_id, account) in node.accounts_after("") {
         let mut guard = lock(&account);
         guard.expire(now_ms);
@@ -1113,8 +1121,10 @@ impl<'a> RandomDraws<'a> {
             }
             self.at = 0;
         }
-        let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&self.buffer[self.at..self.at + 8]);
+        let next = self.buffer.get(self.at..self.at + 8);
+        let Some(bytes) = next.and_then(|bytes| <[u8; 8]>::try_from(bytes).ok()) else {
+            return 0;
+        };
         self.at += 8;
         u64::from_le_bytes(bytes)
     }
@@ -1186,7 +1196,7 @@ impl TokenBucket {
 /// the store confirmed some of them. The call writes the pending entries again here. When
 /// they still wait after that, it ends with `log_store_unavailable` and creates no entry: an
 /// account does not collect entries of acts that never took place without a bound.
-pub async fn admit(node: &Node, account: &Mutex<Account>) -> Result<(), ProtocolError> {
+pub async fn admit(node: &Node, account: &AccountLock) -> Result<(), ProtocolError> {
     node.log_store.ensure_ready(node.now_ms())?;
     if lock(account).pending_entries() < PENDING_ENTRIES {
         return Ok(());
@@ -1215,7 +1225,7 @@ pub async fn admit(node: &Node, account: &Mutex<Account>) -> Result<(), Protocol
 /// a log store nothing is written and the answer is `Ok`.
 pub async fn confirm(
     node: &Node,
-    account: &Mutex<Account>,
+    account: &AccountLock,
     seqs: &[u64],
 ) -> Result<(), ProtocolError> {
     if !node.log_store.tracks() {
@@ -1242,7 +1252,7 @@ pub async fn confirm(
 /// the waiting calls of these accounts look at their entries again when the round ends.
 pub async fn confirm_each(
     node: &Node,
-    entries: &[(&Mutex<Account>, u64)],
+    entries: &[(&AccountLock, u64)],
 ) -> Result<(), ProtocolError> {
     if !node.log_store.tracks() {
         return Ok(());
@@ -1279,18 +1289,21 @@ pub async fn confirm_each(
 /// account is in progress the call waits for its end and looks again. `Err(log_store_unavailable)`
 /// when a write of an entry of the call was not confirmed or when the call waited for
 /// twice the time of a write; `Err(closing)` when the node started its orderly shutdown while
-/// the call waited.
+/// the call waited; `Err(internal)` when the account was halted while the call wrote or
+/// waited (`Account::halt`): no entry of a halted account counts as confirmed, so the act of
+/// the call does not take place.
 ///
 /// On a node that runs without a log store the open batch is closed and every entry counts as
 /// confirmed.
 pub async fn commit(
     node: &Node,
     user_id: &str,
-    account: &Arc<Mutex<Account>>,
+    account: &Arc<AccountLock>,
     places: &[(EventPlace, bool)],
 ) -> Result<Vec<LogRef>, ProtocolError> {
     if !node.log_store.tracks() {
         let mut account = lock(account);
+        account.ensure_usable()?;
         node.close_batch(&mut account, user_id, node.now_ms())
             .map_err(|_| ProtocolError::Internal)?;
         return resolved(&account, places).ok_or(ProtocolError::Internal);
@@ -1308,6 +1321,7 @@ pub async fn commit(
         let notified = notify.notified();
         let role = {
             let mut account = lock(account);
+            account.ensure_usable()?;
             if let Some(refs) = resolved(&account, places) {
                 Role::Done(refs)
             } else if account.writer {
@@ -1338,7 +1352,7 @@ pub async fn commit(
                 };
                 let outcome = confirm(node, account, &seqs).await;
                 guard.armed = false;
-                let refs = end_write(node, user_id, account, places);
+                let refs = end_write(node, user_id, account, places)?;
                 outcome?;
                 return refs.ok_or(ProtocolError::LogStoreUnavailable);
             }
@@ -1370,39 +1384,43 @@ fn resolved(account: &Account, places: &[(EventPlace, bool)]) -> Option<Vec<LogR
 
 /// Ends the write of the writer of an account: the account has no writer, the events that
 /// arrived while the write ran form the next entry (which the next writer writes), and the
-/// waiting calls look at their entries again. Returns [`resolved`] for `places`.
+/// waiting calls look at their entries again. Returns [`resolved`] for `places`, and
+/// `Err(internal)` for an account that was halted while the write ran: the waiting calls are
+/// woken all the same and find the account halted.
 fn end_write(
     node: &Node,
     user_id: &str,
-    account: &Mutex<Account>,
+    account: &AccountLock,
     places: &[(EventPlace, bool)],
-) -> Option<Vec<LogRef>> {
+) -> Result<Option<Vec<LogRef>>, ProtocolError> {
     let (notify, refs) = {
         let mut account = lock(account);
         account.writer = false;
         if account.has_open_events() {
             let _ = node.close_batch(&mut account, user_id, node.now_ms());
         }
-        (account.notify.clone(), resolved(&account, places))
+        let refs = account.ensure_usable().map(|()| resolved(&account, places));
+        (account.notify.clone(), refs)
     };
     notify.notify_waiters();
     refs
 }
 
 /// Ends the write of a call whose future is dropped before its write ended (its caller went
-/// away): without it the account would keep a writer that never ends, and every later call of
-/// the account would wait for it. The entries of the write stay pending (`Claim`).
+/// away, or the call panicked): without it the account would keep a writer that never ends,
+/// and every later call of the account would wait for it. The entries of the write stay
+/// pending (`Claim`).
 struct WriterGuard<'a> {
     node: &'a Node,
     user_id: &'a str,
-    account: &'a Mutex<Account>,
+    account: &'a AccountLock,
     armed: bool,
 }
 
 impl Drop for WriterGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            end_write(self.node, self.user_id, self.account, &[]);
+            let _ = end_write(self.node, self.user_id, self.account, &[]);
         }
     }
 }

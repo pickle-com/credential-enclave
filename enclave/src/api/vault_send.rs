@@ -38,6 +38,7 @@ use super::responses::send_stream;
 use super::{invalid, respond, ApiError, JsonBody};
 use crate::bound;
 use crate::egress::EgressError;
+use crate::faults::joined;
 use crate::oauth::Withheld;
 use crate::provider_response::StreamCheck;
 use crate::role::{NonceRefusal, UsedNonces};
@@ -108,13 +109,12 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
     // The request of the caller is the request of the envelope, and the value goes to its
     // slot. A request that fails here leaves the envelope unused. The check reads the whole
     // body (its hash, the search for the placeholder), so it runs off the threads that serve
-    // the calls.
-    let (secret_use, bound) = tokio::task::spawn_blocking(move || {
+    // the calls. A panic of the check is a panic of this call (`joined`).
+    let mut check = tokio::task::spawn_blocking(move || {
         let bound = bound::prepare(&secret_use, meta.get("headers"), &payload);
         (secret_use, bound)
-    })
-    .await
-    .map_err(|_| ApiError::internal())?;
+    });
+    let (secret_use, bound) = joined(&mut check).await.ok_or_else(ApiError::internal)?;
     let bound = bound?;
 
     // One envelope, one request: the number is marked before the request leaves, also when

@@ -317,6 +317,12 @@ pub struct Load {
     /// P: a count, the connections the node closed before their peer had reported its end,
     /// since the node started. Null in the same way.
     pub lingering_cut: Option<u64>,
+    /// P: a count, the panics of the node program since it started: each ended a call or a
+    /// task, or halted an account, and none ended the node.
+    pub contained_panics: u64,
+    /// P: a count, the accounts the node halted since it started: a panic began while the
+    /// lock of their state was held.
+    pub halted_accounts: usize,
 }
 
 /// `GET /v1/health`.

@@ -87,7 +87,7 @@ where
 
 #[cfg(target_os = "linux")]
 mod enclave {
-    use std::sync::Mutex;
+    use std::sync::{Mutex, PoisonError};
 
     use aws_nitro_enclaves_nsm_api::api::{Request, Response};
     use aws_nitro_enclaves_nsm_api::driver::{nsm_exit, nsm_init, nsm_process_request};
@@ -147,6 +147,9 @@ mod enclave {
     /// the measurement of the enclave it runs in, and the vsock connections the node is done
     /// with that wait for the end of their peer (`crate::platform::Lingering`): the
     /// connections it accepted and the connections it opened to the egress relay.
+    ///
+    /// The lock around the descriptor makes the requests to the device take turns. It guards
+    /// no state a request changes: the descriptor is the same before and after a request.
     pub struct NitroPlatform {
         nsm: Mutex<Nsm>,
         measurement: Measurement,
@@ -184,9 +187,14 @@ mod enclave {
             user_data: Option<&[u8]>,
             nonce: Option<&[u8]>,
         ) -> Result<Vec<u8>, PlatformError> {
+            // A panic inside one request to the device (the encoding of the request, the
+            // reading of its answer) leaves the descriptor as it was, so the lock is used
+            // as it is after one: the next request is made, the clock is corrected and the
+            // node attests. This is the one lock of the program that is no lock of state
+            // (`crate::faults::Lock`).
             self.nsm
                 .lock()
-                .map_err(|_| PlatformError("the NSM descriptor lock is poisoned"))?
+                .unwrap_or_else(PoisonError::into_inner)
                 .document(user_data, nonce)
         }
     }

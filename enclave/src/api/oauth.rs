@@ -183,6 +183,11 @@ async fn run_complete(node: &Node, request: Request) -> Result<Response, ApiErro
         }
     }
 
+    // The random values of the record are drawn before the code is spent: a failure of the
+    // random source ends the call with `internal` and nothing changed.
+    let id = node.random_public::<16>()?;
+    let nonce = node.random_public::<12>()?;
+
     // 3: the exchange runs outside the account lock.
     let request = token_request(
         definition,
@@ -217,8 +222,6 @@ async fn run_complete(node: &Node, request: Request) -> Result<Response, ApiErro
         (definition.client == ClientKind::Dynamic).then_some(pending.client_id.as_str());
     let plaintext = response.into_plaintext(now_ms, dynamic_client);
     let public = plaintext.public_fields(definition, None)?;
-    let id = node.random_public::<16>()?;
-    let nonce = node.random_public::<12>()?;
     // The record and its event are created under the account lock.
     let (record, place) = {
         let mut account = lock(&account);

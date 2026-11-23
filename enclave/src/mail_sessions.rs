@@ -23,21 +23,28 @@
 //! - A session that carries no call ends [`SESSION_IDLE_MS`] after its last call, and
 //!   [`SESSION_LOGIN_MS`] after its login at the latest, whether a call asks for it or not:
 //!   a task of its own ends it. So a session of an account whose grant ended, which revoked,
-//!   or whose node is closing, is held for the idle time at the longest and is used by no
-//!   call in it.
+//!   which the node halted, or whose node is closing, is held for the idle time at the
+//!   longest and is used by no call in it.
 //!
 //! No session is taken before the log store confirmed the entry of the call that takes it:
 //! the handover is a step of the act of that call (`api::mail`).
+//!
+//! What a panic ends here (enclave.md 3.1, `crate::faults`). A session that carries a call
+//! is held by that call and is not in the table: a call that panics drops it, and its
+//! connection ends with the call. The table is state of the whole node, so a panic while its
+//! lock is held ends the process. An account the node halted has no grant: the delegation of
+//! no call of it is in force, so none of its calls takes or keeps a session.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use credential_enclave_protocol::record::Record;
 use sha2::{Digest, Sha256};
 
 use crate::api::responses::LogRef;
+use crate::faults::NodeLock;
 use crate::mail::ImapSession;
 use crate::state::{lock, GrantView};
 
@@ -110,8 +117,12 @@ struct Kept {
 }
 
 /// The sessions a node keeps, by the record of each. A record has at most one kept session.
+///
+/// The table is state of the whole node, behind a lock of that kind (`crate::faults`): the
+/// lock is held around a change of the table and around nothing else. A session that leaves
+/// the table is dropped after the lock is free, and no byte of a server is read under it.
 pub(crate) struct MailSessions {
-    kept: Mutex<HashMap<SessionKey, Kept>>,
+    kept: NodeLock<HashMap<SessionKey, Kept>>,
     ids: AtomicU64,
     /// [`SESSION_IDLE_MS`] and [`SESSION_LOGIN_MS`]. A test shortens them.
     idle_limit_ms: AtomicU64,
@@ -121,7 +132,7 @@ pub(crate) struct MailSessions {
 impl Default for MailSessions {
     fn default() -> MailSessions {
         MailSessions {
-            kept: Mutex::default(),
+            kept: NodeLock::default(),
             ids: AtomicU64::new(1),
             idle_limit_ms: AtomicU64::new(SESSION_IDLE_MS),
             login_limit_ms: AtomicU64::new(SESSION_LOGIN_MS),
@@ -162,7 +173,9 @@ impl MailSessions {
     /// time) stays when its login is the later one; otherwise it ends for the one that comes.
     ///
     /// The session ends without a further call when its idle time passed or its login became
-    /// too old: a task started here ends this stay then.
+    /// too old: a task started here ends this stay then. The node can do without one such
+    /// task: it takes the session out of the table before it drops it, so a panic of the
+    /// task leaves no session in the table that a call could be handed.
     pub(crate) fn keep(
         self: &Arc<Self>,
         key: SessionKey,

@@ -9,11 +9,11 @@
 //! standard output.
 
 #![forbid(unsafe_code)]
-// A node is built to abort on a panic (the release profile), and a node that ends takes the
-// delegations it holds with it. So:
-// No input ends the program. Its code (not the code of its tests) holds no `unwrap`, no
-// `expect`, no `panic!`, and no index or slice expression that can fail. A place that keeps
-// one of them says, where it stands, why no input reaches its failure
+// A node that ends takes the delegations it holds with it, and a panic ends a call, halts an
+// account or ends the node (`faults`). So:
+// No input makes the program panic. Its code (not the code of its tests) holds no `unwrap`,
+// no `expect`, no `panic!`, and no index or slice expression that can fail. A place that
+// keeps one of them says, where it stands, why no input reaches its failure
 // (`#[expect(clippy::.., reason = "..")]`).
 #![cfg_attr(
     not(test),
@@ -39,21 +39,12 @@ mod bound;
 mod clock;
 mod descriptors;
 mod egress;
+mod faults;
 mod frame;
 mod imap;
 mod inbound;
 mod lineage;
 mod load;
-// The rule on input that ends the program is not in force in this module.
-#[cfg_attr(
-    not(test),
-    allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::indexing_slicing,
-        clippy::string_slice
-    )
-)]
 mod log_store;
 mod mail;
 mod mail_sessions;
@@ -62,16 +53,6 @@ mod platform;
 mod provider_response;
 mod providers;
 mod role;
-// The rule on input that ends the program is not in force in this module.
-#[cfg_attr(
-    not(test),
-    allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::indexing_slicing,
-        clippy::string_slice
-    )
-)]
 mod state;
 mod subset;
 #[cfg(test)]
@@ -85,6 +66,7 @@ use std::sync::Arc;
 
 use clock::{Clock, CALIBRATION_INTERVAL};
 use egress::Egress;
+use faults::vital;
 use lineage::Lineage;
 use platform::{PlatformError, SharedPlatform};
 use providers::Definitions;
@@ -115,7 +97,9 @@ fn platform_argument(mut arguments: impl Iterator<Item = String>) -> Option<Stri
     Some(name)
 }
 
-/// Takes a new clock correction every 60 seconds. A failed read keeps the last correction.
+/// Takes a new clock correction every 60 seconds. A failed read keeps the last correction,
+/// and so does a read that panicked: each correction runs on a thread of its own, and the
+/// clock takes a correction in one step, at its end.
 async fn keep_calibrating(platform: SharedPlatform, clock: Arc<Clock>) {
     loop {
         tokio::time::sleep(CALIBRATION_INTERVAL).await;
@@ -141,6 +125,9 @@ async fn terminated() {
     }
 }
 
+/// Starts the node and serves its calls until the process is asked to end. The node cannot
+/// do without this task, nor without the two tasks it starts: the correction of the clock and
+/// the sweep (`faults::vital`).
 async fn run(platform_name: &str) -> Result<(), PlatformError> {
     // The limit of open descriptors is raised before any connection exists (enclave.md
     // section 8). The outcome is not logged (rule E5): `health` reports the limit in force.
@@ -165,8 +152,8 @@ async fn run(platform_name: &str) -> Result<(), PlatformError> {
         limits,
     )?);
     let listener = platform.listen(node.limits.inbound_connections).await?;
-    tokio::spawn(keep_calibrating(platform, clock));
-    tokio::spawn(log_store::keep_sweeping(node.clone()));
+    tokio::spawn(vital(keep_calibrating(platform, clock)));
+    tokio::spawn(vital(log_store::keep_sweeping(node.clone())));
     tokio::select! {
         _ = api::serve(listener, api::router(node.clone()), node) => {}
         _ = terminated() => {}
@@ -183,6 +170,8 @@ fn diagnostic(text: &'static str) {
 }
 
 fn main() -> ExitCode {
+    // No panic of the node writes anything (rule E5): from here on a panic is counted.
+    faults::silence();
     let Some(platform_name) = platform_argument(std::env::args().skip(1)) else {
         diagnostic(USAGE);
         return ExitCode::from(2);
@@ -197,12 +186,123 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(run(&platform_name)) {
+    match runtime.block_on(vital(run(&platform_name))) {
         Ok(()) => ExitCode::SUCCESS,
         Err(PlatformError(reason)) => {
             diagnostic(reason);
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod calibration_tests {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::{keep_calibrating, CALIBRATION_INTERVAL};
+    use crate::clock::Clock;
+    use crate::faults;
+    use crate::platform::{
+        ConnectError, Listener, Measurement, Platform, PlatformError, SharedPlatform, Stream,
+    };
+    use crate::testing::{quiet_panics, ScriptedFault};
+
+    /// A platform whose trusted time is a value of the test, and whose read of that time
+    /// panics while the test says so.
+    struct Timed {
+        trusted_ms: AtomicU64,
+        faulty: AtomicBool,
+    }
+
+    impl Platform for Timed {
+        fn name(&self) -> &'static str {
+            "local"
+        }
+
+        fn custody(&self) -> &'static str {
+            "operator"
+        }
+
+        fn measurement(&self) -> Option<Measurement> {
+            None
+        }
+
+        fn attestation(&self, _: &[u8], _: &[u8]) -> Result<Vec<u8>, PlatformError> {
+            Err(PlatformError("unused"))
+        }
+
+        fn fill_random(&self, _: &mut [u8]) -> Result<(), PlatformError> {
+            Err(PlatformError("unused"))
+        }
+
+        fn trusted_time_ms(&self) -> Result<u64, PlatformError> {
+            if self.faulty.load(Ordering::SeqCst) {
+                std::panic::panic_any(ScriptedFault);
+            }
+            Ok(self.trusted_ms.load(Ordering::SeqCst))
+        }
+
+        async fn listen(&self, _: usize) -> Result<Listener, PlatformError> {
+            Err(PlatformError("unused"))
+        }
+
+        async fn connect(&self, _: &str, _: u16) -> Result<Stream, ConnectError> {
+            Err(ConnectError::Transport("unused"))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_correction_that_panicked_is_followed_by_the_next_correction() {
+        quiet_panics();
+        const START_MS: u64 = 1_790_000_000_000;
+        const HOUR_MS: u64 = 3_600_000;
+        let platform = Arc::new(Timed {
+            trusted_ms: AtomicU64::new(START_MS),
+            faulty: AtomicBool::new(false),
+        });
+        let clock = Arc::new(Clock::start(platform.as_ref()).unwrap());
+        // The task of the corrections, as a running node starts it. A correction starts every
+        // 60 seconds: once the task waits for its next one, the clock of the runtime is moved
+        // past that time by hand.
+        let shared: SharedPlatform = platform.clone();
+        let correcting = tokio::spawn(keep_calibrating(shared, clock.clone()));
+        let next_correction = || async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::pause();
+            tokio::time::advance(CALIBRATION_INTERVAL + Duration::from_millis(1)).await;
+            tokio::time::resume();
+        };
+
+        // The trusted time is an hour further, and the read of it panics: that correction
+        // ends, and the clock keeps the correction before it.
+        platform
+            .trusted_ms
+            .store(START_MS + HOUR_MS, Ordering::SeqCst);
+        platform.faulty.store(true, Ordering::SeqCst);
+        let panics = faults::panics();
+        next_correction().await;
+        for _ in 0..1000 {
+            if faults::panics() > panics {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(faults::panics() > panics);
+        assert!(clock.now_ms() < START_MS + HOUR_MS);
+
+        // The task goes on: the next correction takes the trusted time.
+        platform.faulty.store(false, Ordering::SeqCst);
+        next_correction().await;
+        for _ in 0..1000 {
+            if clock.now_ms() >= START_MS + HOUR_MS {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(clock.now_ms() >= START_MS + HOUR_MS);
+        assert!(!correcting.is_finished());
     }
 }
 

@@ -15,8 +15,8 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -41,12 +41,85 @@ use tokio_rustls::TlsAcceptor;
 use crate::api;
 use crate::clock::Clock;
 use crate::egress::Egress;
+use crate::faults::{self, Lock};
 use crate::frame;
 use crate::lineage::{Lineage, LOG_KEY_PEM, RELEASE_KEY_PEM};
 use crate::platform::local::{kernel_random, local_document, system_time_ms};
 use crate::platform::{ConnectError, Listener, Measurement, Platform, PlatformError, Stream};
 use crate::providers::Definitions;
 use crate::state::{lock, Limits, Node};
+
+/// A lock of a test: the state of a stand-in or of a test platform, behind a plain mutex. A
+/// test whose thread panicked under one goes on reading what the lock guards. The node program
+/// has no lock of this kind: its locks are those of `crate::faults::Lock`.
+impl<T> Lock for Mutex<T> {
+    type State = T;
+
+    fn acquire(&self) -> MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// What a test panics with on purpose, inside the node: the test platform raises it at the
+/// place a test asked for ([`TestPlatform::fault_at_draw`], [`TestPlatform::fault_attestation`]).
+pub struct ScriptedFault;
+
+/// Makes this test process count its panics as a node does (`faults::count_panic`), and keeps
+/// the faults the tests script out of the test output. Every other panic is reported as
+/// before: the failure of a test still says where it failed.
+pub fn quiet_panics() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let report = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic| {
+            faults::count_panic();
+            if !panic.payload().is::<ScriptedFault>() {
+                report(panic);
+            }
+        }));
+    });
+}
+
+/// The environment variable that tells a test that it runs in a process of its own
+/// ([`in_own_process`]), and which part of the test that process is to run.
+pub const OWN_PROCESS: &str = "CREDENTIAL_ENCLAVE_TEST_OWN_PROCESS";
+
+/// How a process ended.
+#[derive(Debug)]
+pub struct Ended {
+    /// The exit status of a process that returned one.
+    pub code: Option<i32>,
+    /// The signal that ended a process that returned none.
+    pub signal: Option<i32>,
+    /// What the process wrote to its standard error.
+    pub stderr: String,
+}
+
+impl Ended {
+    /// True for a process that ended itself without unwinding: `abort` raises `SIGABRT`,
+    /// signal 6.
+    pub fn aborted(&self) -> bool {
+        self.signal == Some(6)
+    }
+}
+
+/// Runs the test `test` of this test program alone, in a process of its own, with
+/// [`OWN_PROCESS`] set to `part`, and returns how that process ended. A test that ends the
+/// process it runs in (as a node ends on a fault it cannot contain) calls itself this way: the
+/// part that ends runs in the other process, and the test judges how it ended.
+pub fn in_own_process(test: &str, part: &str) -> Ended {
+    use std::os::unix::process::ExitStatusExt;
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([test, "--exact", "--nocapture", "--test-threads=1"])
+        .env(OWN_PROCESS, part)
+        .output()
+        .unwrap();
+    Ended {
+        code: output.status.code(),
+        signal: output.status.signal(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
 
 /// A platform for tests: the local attestation document, and provider connections that end at
 /// the stand-in registered for the host.
@@ -71,9 +144,29 @@ pub struct TestPlatform {
     refusals: Mutex<usize>,
     /// A pause before every connection is opened or refused.
     connect_pause: Mutex<Duration>,
+    /// The draws of the random source that pass before one panics: with `Some(0)` the next
+    /// draw panics. `None` when no draw is to panic.
+    fault_at_draw: Mutex<Option<usize>>,
+    /// True while the attestation device panics.
+    fault_attestation: AtomicBool,
 }
 
 impl TestPlatform {
+    /// Makes the random source panic once: the draw after the next `passing` draws panics
+    /// with [`ScriptedFault`], and the draws after it are answered again. The node draws
+    /// randomness at known places of a call, so a test puts a panic at one of them: the first
+    /// draw of `attestation` (the challenge) is outside every lock, and the first draw of a
+    /// call that creates an event (the seed of its entry) is inside the lock of its account.
+    pub fn fault_at_draw(&self, passing: usize) {
+        *lock(&self.fault_at_draw) = Some(passing);
+    }
+
+    /// Makes the attestation device panic with [`ScriptedFault`] at every request, or answer
+    /// again.
+    pub fn fault_attestation(&self, faulty: bool) {
+        self.fault_attestation.store(faulty, Ordering::SeqCst);
+    }
+
     /// A platform that reports the name `nitro`, the custody `enclave` and `measurement`.
     pub fn measured(measurement: Measurement) -> TestPlatform {
         TestPlatform {
@@ -142,10 +235,22 @@ impl Platform for TestPlatform {
     }
 
     fn attestation(&self, user_data: &[u8], nonce: &[u8]) -> Result<Vec<u8>, PlatformError> {
+        if self.fault_attestation.load(Ordering::SeqCst) {
+            std::panic::panic_any(ScriptedFault);
+        }
         Ok(local_document(user_data, nonce, system_time_ms()?))
     }
 
     fn fill_random(&self, out: &mut [u8]) -> Result<(), PlatformError> {
+        let fault = {
+            let mut at = lock(&self.fault_at_draw);
+            let fault = *at == Some(0);
+            *at = at.and_then(|passing| passing.checked_sub(1));
+            fault
+        };
+        if fault {
+            std::panic::panic_any(ScriptedFault);
+        }
         if let Some(draw) = lock(&self.draws).pop_front() {
             if draw.len() != out.len() {
                 return Err(PlatformError("a scripted draw has another length"));

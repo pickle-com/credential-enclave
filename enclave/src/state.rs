@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use credential_enclave_protocol::encoding::{b64u, b64u_decode, to_json, Signed};
@@ -26,6 +26,8 @@ use crate::api::ApiError;
 use crate::attest::ForwardNodes;
 use crate::clock::Clock;
 use crate::egress::Egress;
+pub use crate::faults::lock;
+use crate::faults::{Lock, NodeLock, NodeRwLock};
 use crate::lineage::Lineage;
 use crate::log_store::{LogStore, WriteFailure};
 use crate::oauth::PkceVerifier;
@@ -483,6 +485,8 @@ pub struct StateCounters {
     /// when it found none ([`crate::log_store::sweep`]). The age it gives is at most one sweep
     /// interval behind the state of the accounts.
     pub pending_oldest_since_ms: AtomicU64,
+    /// Accounts the node halted ([`Account::halt`]), since it started.
+    pub halted: AtomicUsize,
 }
 
 /// Moves a count from `before` to `after`.
@@ -492,6 +496,14 @@ fn adjust(counter: &AtomicUsize, before: usize, after: usize) {
     } else if before > after {
         counter.fetch_sub(before - after, Ordering::Relaxed);
     }
+}
+
+/// Takes `count` off a count, down to zero at the lowest: the count of a state that a panic
+/// may have left half changed ([`Account::halt`]).
+fn lower(counter: &AtomicUsize, count: usize) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_sub(count))
+    });
 }
 
 /// The response of a successful `refresh`, kept for a repeated call with the same record. It
@@ -514,6 +526,9 @@ pub fn refresh_key(record: &Record) -> [u8; 32] {
 /// The delegation state, the unconfirmed entries, the merge keys, the kept `refresh` responses
 /// and the open batch are changed through the methods of this type, which keep the counts of
 /// [`StateCounters`] of the node in step with them.
+///
+/// The state is reached through its lock ([`AccountLock`]). A panic while that lock was held
+/// halts the account on this node ([`Account::halt`]).
 pub struct Account {
     /// The delegation state. Changed through [`Account::set_grant`] and [`Account::expire`].
     grant: GrantState,
@@ -562,6 +577,9 @@ pub struct Account {
     /// has a smaller serial was issued before that revoke and is refused (protocol.md 5.3
     /// step 12): a carrier that kept a sealed grant cannot deliver it after the revoke.
     pub revoke_serial: u64,
+    /// True once the node halted the account ([`Account::halt`]). It stays true for as long as
+    /// the node lives.
+    halted: bool,
 }
 
 impl Account {
@@ -580,6 +598,78 @@ impl Account {
             last_event_ms: 0,
             revoked_here: false,
             revoke_serial: 0,
+            halted: false,
+        }
+    }
+
+    /// Halts the account on this node (enclave.md 3.1). A panic began while the lock of
+    /// this state was held, so the state may be half changed: the step that panicked may have
+    /// left an entry counted as written that the store never confirmed, or a grant in place
+    /// that a command was taking away. The node does not judge which. It gives the state up:
+    ///
+    /// - the grant goes, and its user key is overwritten with zeros;
+    /// - the unconfirmed entries, the events of the open batch, the merge keys and the kept
+    ///   `refresh` responses go. An entry the store did not confirm is gone as it is gone with
+    ///   a node that ends: its act did not take place (protocol.md 7.6). The cell of the open
+    ///   batch receives 0, the `seq` of no entry, so the calls whose events were in it find no
+    ///   entry;
+    /// - from here on the account takes no grant ([`Account::set_grant`]), the node creates no
+    ///   entry for it ([`Node::create_event`]), none of its entries counts as confirmed
+    ///   ([`Account::is_confirmed`]), and a call that needs its state ends with `internal`
+    ///   ([`Account::ensure_usable`]). So no act follows on this state.
+    ///
+    /// The other nodes that hold the delegation of the account serve it. This node holds it
+    /// again only as another node: after its enclave was replaced.
+    ///
+    /// What the account knows of its chain (the last entry, the times) stays as it is: the
+    /// node reads none of it again. The calls that wait for a write of the account are woken
+    /// and find the account halted. The counts of the node follow, each down to zero at the
+    /// lowest.
+    fn halt(&mut self) {
+        if self.halted {
+            return;
+        }
+        self.halted = true;
+        let granted = usize::from(matches!(self.grant, GrantState::Active(_)));
+        self.grant = GrantState::None;
+        lower(&self.counters.grants, granted);
+        let entries = std::mem::take(&mut self.unconfirmed).len();
+        lower(&self.counters.pending_entries, entries);
+        lower(&self.counters.pending_accounts, usize::from(entries > 0));
+        let open = std::mem::replace(&mut self.open, OpenBatch::new());
+        lower(
+            &self.counters.open_batches,
+            usize::from(!open.events.is_empty()),
+        );
+        let _ = open.seq.set(0);
+        lower(
+            &self.counters.merge_keys,
+            std::mem::take(&mut self.recent).len(),
+        );
+        lower(
+            &self.counters.kept_refreshes,
+            std::mem::take(&mut self.kept_refreshes).len(),
+        );
+        self.writer = false;
+        self.counters.halted.fetch_add(1, Ordering::Relaxed);
+        self.notify.notify_waiters();
+    }
+
+    /// True once the node halted the account ([`Account::halt`]).
+    pub fn is_halted(&self) -> bool {
+        self.halted
+    }
+
+    /// `internal` for a halted account: the node performs no act for the account, and the
+    /// call that reads this has changed nothing. A call that needs the grant of the account
+    /// passes this check in [`Account::active`]; a call that reads or changes the state
+    /// without the grant (a grant command, `status`) makes the check itself. The one call the
+    /// node answers for a halted account is a revoke command, which asks for what halting
+    /// did: the node holds no user key of the account (`crate::api::messages`).
+    pub fn ensure_usable(&self) -> Result<(), ProtocolError> {
+        match self.halted {
+            true => Err(ProtocolError::Internal),
+            false => Ok(()),
         }
     }
 
@@ -595,8 +685,12 @@ impl Account {
     }
 
     /// Puts a delegation state in place. Dropping an `Active` state overwrites its user key
-    /// with zeros. The count of the accounts with a grant within its time follows.
+    /// with zeros. The count of the accounts with a grant within its time follows. A halted
+    /// account takes no state: the value is dropped, and a grant in it loses its user key.
     pub fn set_grant(&mut self, grant: GrantState) {
+        if self.halted {
+            return;
+        }
         let before = usize::from(matches!(self.grant, GrantState::Active(_)));
         let after = usize::from(matches!(grant, GrantState::Active(_)));
         self.grant = grant;
@@ -729,8 +823,12 @@ impl Account {
         self.recent.len() < bound
     }
 
-    /// Remembers the event of a GET request under its merge key for the next 300 seconds.
+    /// Remembers the event of a GET request under its merge key for the next 300 seconds. A
+    /// halted account remembers none.
     pub fn remember_event(&mut self, key: [u8; 32], recent: Recent) {
+        if self.halted {
+            return;
+        }
         let before = self.recent.len();
         self.recent.insert(key, recent);
         adjust(&self.counters.merge_keys, before, self.recent.len());
@@ -796,8 +894,10 @@ impl Account {
         );
     }
 
-    /// Step 4 of the common front: the grant is active and within its time.
+    /// Step 4 of the common front: the grant is active and within its time. A halted account
+    /// is `internal` ([`Account::ensure_usable`]).
     pub fn active(&mut self, now_ms: u64) -> Result<GrantView, ProtocolError> {
+        self.ensure_usable()?;
         self.expire(now_ms);
         match &self.grant {
             GrantState::None => Err(ProtocolError::GrantRequired),
@@ -818,9 +918,12 @@ impl Account {
     /// `seq` for the account, and the entry left the unconfirmed entries, which it does by an
     /// answer of the store alone ([`Account::store_confirmed`]). A `seq` the node never
     /// created is not confirmed. On a node that runs without a log store every entry it
-    /// created counts as confirmed: such a node keeps no account of it.
+    /// created counts as confirmed: such a node keeps no account of it. No entry of a halted
+    /// account counts as confirmed: the node gave up what it knew of them ([`Account::halt`]).
     pub fn is_confirmed(&self, seq: u64) -> bool {
-        (1..=self.last.seq).contains(&seq) && !self.unconfirmed.iter().any(|entry| entry.seq == seq)
+        !self.halted
+            && (1..=self.last.seq).contains(&seq)
+            && !self.unconfirmed.iter().any(|entry| entry.seq == seq)
     }
 
     /// True when the open batch holds events.
@@ -1046,20 +1149,20 @@ pub struct Node {
     pub closing: AtomicBool,
     /// The role of this node, taken once (protocol.md 4.1).
     pub role: RoleCell,
-    pub config: RwLock<Option<Arc<OperatorConfig>>>,
+    pub config: NodeRwLock<Option<Arc<OperatorConfig>>>,
     /// The log store of this node and the credentials for it (`crate::log_store`).
     pub log_store: LogStore,
     /// The challenges this node issued, each with the serial it was issued under. Removed
     /// after 300 seconds or on use.
-    challenges: Mutex<Expiring<[u8; 16], u64>>,
+    challenges: NodeLock<Expiring<[u8; 16], u64>>,
     /// The next serial of this node: one count, starting at 1, for the challenges the node
     /// issues and the revoke commands it accepts. It says which of the two came first.
     serials: AtomicU64,
     /// `user_id` to account state, in the order of `user_id`: a page of accounts after a
     /// `user_id` is a range of this map. Each account has its own lock.
-    accounts: RwLock<BTreeMap<String, Arc<Mutex<Account>>>>,
+    accounts: NodeRwLock<BTreeMap<String, Arc<AccountLock>>>,
     /// `node_state` to the authorization in progress. Removed after 600 seconds or on use.
-    pending: Mutex<Expiring<String, PendingAuth>>,
+    pending: NodeLock<Expiring<String, PendingAuth>>,
     /// The number of accounts that have a chain.
     chains: AtomicUsize,
     /// The counts of the state of the accounts, kept by the methods of [`Account`].
@@ -1073,7 +1176,7 @@ pub struct Node {
     pub body_budget: Arc<Semaphore>,
     /// The numbers of the secret uses this node sent (`vault/send`): a node of the forward
     /// role sends the request of one number once.
-    pub used_nonces: Mutex<UsedNonces>,
+    pub used_nonces: NodeLock<UsedNonces>,
     /// The verifier of the nodes of the forward role for this node, with the nodes it
     /// verified (`crate::attest`): a node of the delegation role seals a secret use to one of
     /// them (`vault/handoff`).
@@ -1098,7 +1201,7 @@ pub struct AccountWalk<'a> {
     node: &'a Node,
     /// The `user_id` the next chunk starts after.
     after: String,
-    chunk: std::collections::VecDeque<(String, Arc<Mutex<Account>>)>,
+    chunk: std::collections::VecDeque<(String, Arc<AccountLock>)>,
     /// True once a chunk came back shorter than [`WALK_CHUNK`]: the index has no further
     /// account.
     exhausted: bool,
@@ -1108,7 +1211,7 @@ pub struct AccountWalk<'a> {
 pub const WALK_CHUNK: usize = 1_000;
 
 impl Iterator for AccountWalk<'_> {
-    type Item = (String, Arc<Mutex<Account>>);
+    type Item = (String, Arc<AccountLock>);
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.chunk.is_empty() && !self.exhausted {
@@ -1123,10 +1226,35 @@ impl Iterator for AccountWalk<'_> {
     }
 }
 
-/// Locks a mutex. A poisoned lock is used as it is: the release build aborts on a panic, so a
-/// poisoned lock exists in tests only.
-pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+/// The state of one account behind its lock: `lock(&account)` waits for the lock and returns
+/// the state.
+///
+/// A panic that began while the lock was held leaves the lock poisoned. The next call that
+/// asks for the lock, of the account or of the sweep of the node (within 30 seconds), finds it
+/// so and halts the account before it reads anything of the state ([`Account::halt`]). The
+/// lock of one account is never held across a wait, and no lock of another account is taken
+/// under it, so a panic under it leaves the state of no other account in doubt.
+pub struct AccountLock(Mutex<Account>);
+
+impl AccountLock {
+    fn new(account: Account) -> AccountLock {
+        AccountLock(Mutex::new(account))
+    }
+}
+
+impl Lock for AccountLock {
+    type State = Account;
+
+    fn acquire(&self) -> MutexGuard<'_, Account> {
+        match self.0.lock() {
+            Ok(account) => account,
+            Err(poisoned) => {
+                let mut account = poisoned.into_inner();
+                account.halt();
+                account
+            }
+        }
+    }
 }
 
 impl Node {
@@ -1163,13 +1291,13 @@ impl Node {
             started_ms: clock.now_ms(),
             closing: AtomicBool::new(false),
             role: RoleCell::default(),
-            config: RwLock::new(None),
+            config: NodeRwLock::new(None),
             // A node of the nitro platform does not act without a log store.
             log_store: LogStore::new(platform.name() == "nitro"),
-            challenges: Mutex::new(Expiring::new()),
+            challenges: NodeLock::new(Expiring::new()),
             serials: AtomicU64::new(1),
-            accounts: RwLock::new(BTreeMap::new()),
-            pending: Mutex::new(Expiring::new()),
+            accounts: NodeRwLock::new(BTreeMap::new()),
+            pending: NodeLock::new(Expiring::new()),
             chains: AtomicUsize::new(0),
             counters: Arc::new(StateCounters::default()),
             platform,
@@ -1178,7 +1306,7 @@ impl Node {
             egress,
             forward_slots: Arc::new(Semaphore::new(limits.forward_concurrency)),
             body_budget: Arc::new(Semaphore::new(limits.body_budget_bytes)),
-            used_nonces: Mutex::new(UsedNonces::default()),
+            used_nonces: NodeLock::new(UsedNonces::default()),
             forward_nodes,
             late_refreshes: Arc::new(Semaphore::new(limits.refresh_late_tasks)),
             limits,
@@ -1239,22 +1367,18 @@ impl Node {
     pub fn operator_config(&self) -> Result<Arc<OperatorConfig>, ProtocolError> {
         self.config
             .read()
-            .unwrap_or_else(PoisonError::into_inner)
             .clone()
             .ok_or(ProtocolError::NotConfigured)
     }
 
     /// True when the operator configuration is present.
     pub fn is_configured(&self) -> bool {
-        self.config
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_some()
+        self.config.read().is_some()
     }
 
     /// Replaces the operator configuration.
     pub fn set_config(&self, config: OperatorConfig) {
-        *self.config.write().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(config));
+        *self.config.write() = Some(Arc::new(config));
     }
 
     /// True when the platform accepts a callback address on `http://localhost` (enclave.md
@@ -1264,37 +1388,31 @@ impl Node {
     }
 
     /// The state of an account, when it has one.
-    pub fn account(&self, user_id: &str) -> Option<Arc<Mutex<Account>>> {
-        self.accounts
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(user_id)
-            .cloned()
+    pub fn account(&self, user_id: &str) -> Option<Arc<AccountLock>> {
+        self.accounts.read().get(user_id).cloned()
     }
 
     /// The state of an account, created when it has none.
-    pub fn account_or_create(&self, user_id: &str) -> Arc<Mutex<Account>> {
+    pub fn account_or_create(&self, user_id: &str) -> Arc<AccountLock> {
         if let Some(account) = self.account(user_id) {
             return account;
         }
         self.accounts
             .write()
-            .unwrap_or_else(PoisonError::into_inner)
             .entry(user_id.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(Account::new(self.counters.clone()))))
+            .or_insert_with(|| Arc::new(AccountLock::new(Account::new(self.counters.clone()))))
             .clone()
     }
 
     /// The first `count` accounts whose `user_id` sorts after `after`, in `user_id` order: one
     /// range read of the sorted index. An empty `after` starts at the first account.
-    pub fn accounts_from(&self, after: &str, count: usize) -> Vec<(String, Arc<Mutex<Account>>)> {
+    pub fn accounts_from(&self, after: &str, count: usize) -> Vec<(String, Arc<AccountLock>)> {
         let start = match after.is_empty() {
             true => Bound::Unbounded,
             false => Bound::Excluded(after.to_string()),
         };
         self.accounts
             .read()
-            .unwrap_or_else(PoisonError::into_inner)
             .range((start, Bound::Unbounded))
             .take(count)
             .map(|(user_id, account)| (user_id.clone(), account.clone()))
@@ -1315,6 +1433,12 @@ impl Node {
     /// The number of accounts that have a chain.
     pub fn account_count(&self) -> usize {
         self.chains.load(Ordering::SeqCst)
+    }
+
+    /// The number of accounts this node halted since it started (`halted_accounts` of `load`
+    /// of health): an account stays halted for as long as the node lives.
+    pub fn halted_accounts(&self) -> usize {
+        self.counters.halted.load(Ordering::Relaxed)
     }
 
     /// The binding of this node (protocol.md 4.1): its two public keys, its release, its log
@@ -1439,8 +1563,15 @@ impl Node {
         mut event: Value,
         seed: &Secret<[u8; 32]>,
     ) -> Result<EventPlace, ApiError> {
+        // The node creates no event for a halted account.
+        account.ensure_usable()?;
         let time_ms = now_ms.max(account.last_event_ms);
-        event["time_ms"] = Value::from(time_ms);
+        // An event is a JSON object (`events`): its `time_ms` key takes the time. A value of
+        // another form is no event.
+        let Some(keys) = event.as_object_mut() else {
+            return Err(ApiError::internal());
+        };
+        keys.insert("time_ms".to_string(), Value::from(time_ms));
         // The array of one event is the event and its two brackets.
         let event_bytes = to_json(&event).len();
         if event_bytes + 2 > limits::ENTRY_PLAINTEXT_BYTES {
@@ -1612,6 +1743,8 @@ impl Node {
         events: Vec<Value>,
         seed: &Secret<[u8; 32]>,
     ) -> Result<u64, ApiError> {
+        // The one place the chain of an account grows: it does not grow for a halted account.
+        account.ensure_usable()?;
         let time_ms = now_ms.max(account.last_entry_ms).max(account.last_event_ms);
         let count = events.len() as u64;
         let (signed, last, key) = log::append_v3(
@@ -1715,7 +1848,7 @@ pub mod events {
         while !text.is_char_boundary(end) {
             end -= 1;
         }
-        format!("{}\u{2026}", &text[..end])
+        format!("{}\u{2026}", text.get(..end).unwrap_or_default())
     }
 
     /// `not_after_ms` is the expiry the node accepted, which can be earlier than the one the
@@ -1867,8 +2000,8 @@ pub mod events {
             "body_sha256": body_sha256,
             "context": context,
         });
-        if mergeable {
-            event["window_s"] = json!(limits::MERGE_WINDOW_S);
+        if let (true, Some(keys)) = (mergeable, event.as_object_mut()) {
+            keys.insert("window_s".to_string(), json!(limits::MERGE_WINDOW_S));
         }
         event
     }
@@ -2363,5 +2496,124 @@ mod tests {
             merge_key(&id, "h", "/a", "b"),
             merge_key(&id, "h", "/a", "b")
         );
+    }
+
+    #[test]
+    fn a_panic_under_the_lock_of_an_account_halts_it_at_the_next_lock() {
+        use crate::testing::{quiet_panics, ScriptedFault};
+        quiet_panics();
+        let grant = || {
+            GrantState::Active(ActiveGrant {
+                key_id: "0123456789abcdef".to_string(),
+                sign_pk: [1; 32],
+                log_pk: [2; 32],
+                custody: Custody::Operator,
+                user_key: Secret::new([3; 32]),
+                not_after_ms: 10_000,
+                exported_to: Vec::new(),
+            })
+        };
+        let counters = Arc::new(StateCounters::default());
+        let account = Arc::new(AccountLock::new(Account::new(counters.clone())));
+        // An account with everything a call leaves in its state: a grant, an entry the store
+        // has not confirmed, an event in the open batch, a merge key.
+        let batch = {
+            let mut state = lock(&account);
+            state.set_grant(grant());
+            state.last = Last {
+                seq: 2,
+                body_hash: [7; 32],
+            };
+            state.push_unconfirmed(Unconfirmed {
+                seq: 2,
+                key: "a3/user-1/u/key".to_string(),
+                shard: 0,
+                entry: Signed {
+                    body: String::new(),
+                    sig: String::new(),
+                },
+                writers: 0,
+                pending_since_ms: 5,
+            });
+            state
+                .open
+                .events
+                .push(serde_json::json!({"t": "provider_request"}));
+            counters.open_batches.fetch_add(1, Ordering::Relaxed);
+            state.remember_event(
+                [4; 32],
+                Recent {
+                    entry_ms: 5,
+                    target: EventPlace::Entry { seq: 2, index: 0 },
+                },
+            );
+            state.writer = true;
+            assert!(state.is_confirmed(1) && !state.is_confirmed(2));
+            assert_eq!(state.active(9).map(|_| ()), Ok(()));
+            state.open.seq.clone()
+        };
+        let count = |counter: &AtomicUsize| counter.load(Ordering::Relaxed);
+        assert_eq!(
+            [
+                &counters.grants,
+                &counters.pending_accounts,
+                &counters.pending_entries,
+                &counters.open_batches,
+                &counters.merge_keys,
+                &counters.halted,
+            ]
+            .map(count),
+            [1, 1, 1, 1, 1, 0]
+        );
+
+        // A thread panics while it holds the lock of the account.
+        let held = account.clone();
+        let panicked = std::thread::spawn(move || {
+            let _state = lock(&held);
+            std::panic::panic_any(ScriptedFault);
+        })
+        .join();
+        assert!(panicked.is_err());
+
+        // The next lock finds the account halted: the grant and its key are gone, no entry
+        // counts as confirmed, the batch of the events that waited names no entry, and the
+        // counts of the node follow.
+        let mut state = lock(&account);
+        assert!(state.is_halted());
+        assert!(matches!(state.grant(), GrantState::None));
+        assert_eq!(
+            [1, 2, 3].map(|seq| state.is_confirmed(seq)),
+            [false, false, false]
+        );
+        assert_eq!(batch.get(), Some(&0));
+        assert!(!state.writer && !state.has_open_events());
+        assert_eq!((state.pending_entries(), state.merge_key_count()), (0, 0));
+        assert_eq!(
+            [
+                &counters.grants,
+                &counters.pending_accounts,
+                &counters.pending_entries,
+                &counters.open_batches,
+                &counters.merge_keys,
+                &counters.halted,
+            ]
+            .map(count),
+            [0, 0, 0, 0, 0, 1]
+        );
+        // What the node created for the account stays as it was: the node reads none of it.
+        assert_eq!(state.last.seq, 2);
+
+        // A call that needs the state ends with `internal`, and the account takes no grant.
+        assert_eq!(state.ensure_usable(), Err(ProtocolError::Internal));
+        assert_eq!(state.active(9).map(|_| ()), Err(ProtocolError::Internal));
+        state.set_grant(grant());
+        assert!(matches!(state.grant(), GrantState::None));
+        assert!(!state.has_grant(9));
+        assert_eq!(state.status(9), GrantStatus::none());
+        assert_eq!(count(&counters.grants), 0);
+        drop(state);
+        // An account is halted once.
+        assert!(lock(&account).is_halted());
+        assert_eq!(count(&counters.halted), 1);
     }
 }

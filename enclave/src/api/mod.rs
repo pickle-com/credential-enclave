@@ -349,7 +349,7 @@ fn message_of(error: ProtocolError) -> &'static str {
         UnsupportedPolicy => "the policy is not empty",
         CustodyMismatch => "the custody of the grant is not the custody of this node",
         PeerUnverified => "the attestation of the peer does not verify against this node",
-        Internal => "the platform failed",
+        Internal => "the platform failed, or the account is halted on this node",
         NotConfigured => "the operator configuration is missing",
         Closing => "the node is closing",
         GrantRequired => "the account has no grant on this node",
@@ -396,8 +396,9 @@ impl From<Withheld> for ApiError {
 }
 
 impl ApiError {
-    /// A failure of the platform under the node (random source, attestation device): the
-    /// code `internal`.
+    /// A failure of the platform under the node (random source, attestation device), and a
+    /// call for an account the node halted (`crate::state::Account::halt`): the code
+    /// `internal`. The call that ends with it has performed no act.
     pub fn internal() -> ApiError {
         ApiError::from(ProtocolError::Internal)
     }

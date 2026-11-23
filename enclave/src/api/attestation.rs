@@ -9,6 +9,7 @@ use credential_enclave_protocol::statement;
 
 use super::responses::Attestation;
 use super::{invalid, json_ok, respond, ApiError, JsonBody};
+use crate::faults::joined;
 use crate::state::Node;
 
 pub async fn attestation(State(node): State<Arc<Node>>, request: Request) -> Response {
@@ -33,9 +34,8 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
     let user_data = node.binding();
     let platform = node.platform.clone();
     // The attestation device is a blocking call.
-    let document = tokio::task::spawn_blocking(move || platform.attestation(&user_data, &nonce))
-        .await
-        .map_err(|_| ApiError::internal())??;
+    let mut device = tokio::task::spawn_blocking(move || platform.attestation(&user_data, &nonce));
+    let document = joined(&mut device).await.ok_or_else(ApiError::internal)??;
     Ok(json_ok(&Attestation {
         v: 1,
         platform: node.platform.name(),

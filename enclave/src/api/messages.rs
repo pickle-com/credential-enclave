@@ -74,7 +74,14 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
         Envelope::from_value(envelope).and_then(|envelope| open_command(&node.keys, &envelope));
     let outcome = match command {
         Err(failure) => Outcome::unopened(failure),
-        Ok(Command::Grant(grant)) => accept_grant(node, user_id, grant, now_ms).await?,
+        Ok(Command::Grant(grant)) => {
+            // The node takes no grant for an account it halted: the call ends with `internal`
+            // before the challenge of the command is used.
+            if let Some(account) = node.account(user_id) {
+                lock(&account).ensure_usable()?;
+            }
+            accept_grant(node, user_id, grant, now_ms).await?
+        }
         Ok(Command::Revoke(revoke)) => accept_revoke(node, user_id, revoke, now_ms).await?,
     };
 
@@ -163,6 +170,7 @@ async fn accept_grant(
     let account = node.account_or_create(user_id);
     let (place, not_after_ms) = {
         let mut account = lock(&account);
+        account.ensure_usable()?;
         // 12, for a grant: the challenge was issued after the last revoke of the account that
         // this node accepted. A sealed grant is a value its carrier can keep: one that was
         // made before a revoke does not bring the user key back after it. The challenge
@@ -208,11 +216,15 @@ async fn accept_grant(
     // does not, the entry is a pending entry and the node holds no key of this grant.
     let log = match log_store::commit(node, user_id, &account, &[(place, true)]).await {
         Ok(refs) => refs.into_iter().next().ok_or_else(ApiError::internal)?,
+        Err(ProtocolError::Internal) => return Err(ApiError::internal()),
         Err(_) => return Ok(failed(ProtocolError::LogStoreUnavailable)),
     };
     let mut account = lock(&account);
-    // The account was free while the entry was written. A revoke the node accepted in that
-    // time stands: the challenge of this grant was issued before it (step 12).
+    // The account was free while the entry was written. An account the node halted in that
+    // time takes no key.
+    account.ensure_usable()?;
+    // A revoke the node accepted in that time stands: the challenge of this grant was issued
+    // before it (step 12).
     if issued < account.revoke_serial {
         return Ok(failed(ProtocolError::BadChallenge));
     }
@@ -250,6 +262,13 @@ async fn accept_grant(
 /// account, whatever the store answers afterwards. The node then tries to write the entry
 /// `grant_revoked`. When the store does not confirm it, the entry is a pending entry and the
 /// reply is the same.
+///
+/// The revoke of an account the node halted (`Account::halt`) is answered as the revoke of an
+/// account without a grant is: the node holds no user key of the account and takes none for
+/// as long as it lives, which is what a revoke asks of a node. The node reads and changes
+/// nothing of the state it gave up, and creates no entry. Without this answer the app of the
+/// account could not complete a revoke while this node lives: it counts a delegation as
+/// withdrawn when every living node answered the revoke with its signed reply.
 async fn accept_revoke(
     node: &Node,
     user_id: &str,
@@ -276,6 +295,9 @@ async fn accept_revoke(
     let place = {
         let mut account = lock(&account);
         node.ensure_open()?;
+        if account.is_halted() {
+            return Ok(outcome(None, None));
+        }
         // A grant whose time passed is no grant.
         account.expire(now_ms);
         // A revoke of an account without a grant passes without a check and creates no entry.

@@ -2,7 +2,7 @@
 //! used after the log store confirmed the entry of the call.
 
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::extract::{Request, State};
 use axum::http::header::CONTENT_LENGTH;
@@ -20,7 +20,7 @@ use crate::frame::{self, META_LIMIT_BYTES};
 use crate::log_store;
 use crate::mail::{self, MailData, MailError, ReadMail, Share};
 use crate::mail_sessions::{Delegation, SessionKey};
-use crate::state::{events, lock, Account, GrantState, Node};
+use crate::state::{events, lock, AccountLock, GrantState, Node};
 
 pub async fn verify(State(node): State<Arc<Node>>, request: Request) -> Response {
     call(node, request, "verify").await
@@ -85,8 +85,10 @@ fn no_room_for_the_input() -> ApiError {
 /// moment: the node is not closing, the grant of the account is within its time and is the
 /// grant of the signing public key the call ran under, and the account accepted no revoke
 /// since the call created its event. A kept session is taken, and a session is kept, only
-/// while this holds (`crate::mail_sessions`).
-fn in_force(node: &Node, account: &Mutex<Account>, delegation: &Delegation) -> bool {
+/// while this holds (`crate::mail_sessions`). It does not hold for an account the node
+/// halted (`Account::halt`), which has no grant: a call that asks for the lock here after a
+/// panic under it halts the account before it reads the state.
+fn in_force(node: &Node, account: &AccountLock, delegation: &Delegation) -> bool {
     if node.closing.load(Ordering::SeqCst) {
         return false;
     }
@@ -113,14 +115,14 @@ async fn run(node: &Node, request: Request, operation: &str) -> Result<Response,
     // The same budget also admits HTTP forwarding; no separate unbounded mail pool exists.
     // The call takes the share of its frame and its fixed share without waiting.
     let fixed = fixed_share(operation);
-    let share = Share::admit(
+    let mut share = Share::admit(
         &node.body_budget,
         declared.unwrap_or(frame_limit).saturating_add(fixed),
     )
     .ok_or(ProtocolError::CapacityUnavailable)?;
     let frame_bytes = Bytes::from(read_body(request, frame_limit).await?);
     // The frame is in memory: its share is its length.
-    if !share.rebase(frame_bytes.len().saturating_add(fixed)) {
+    if !share.resize(frame_bytes.len().saturating_add(fixed)) {
         return Err(ProtocolError::CapacityUnavailable.into());
     }
     let (meta_value, payload) = frame::decode(&frame_bytes)?;
@@ -245,7 +247,7 @@ async fn run(node: &Node, request: Request, operation: &str) -> Result<Response,
                     None
                 }
             };
-            let (data, session) = credentials.read(node, read, kept, &share).await;
+            let (data, session) = credentials.read(node, read, kept, &mut share).await;
             // The session of a call that ended in step is kept for the next call of the
             // record, while the delegation is in force.
             if let Some(session) = session {
@@ -301,8 +303,6 @@ async fn run(node: &Node, request: Request, operation: &str) -> Result<Response,
         vec![("content-type".into(), content_type.into())],
         body,
     )?;
-    let budget = share
-        .settle(response.body_len().saturating_add(mail::CALL_BYTES))
-        .ok_or_else(ApiError::internal)?;
+    let budget = share.settle(response.body_len().saturating_add(mail::CALL_BYTES));
     Ok(forward_frame(response, Some(log), budget))
 }

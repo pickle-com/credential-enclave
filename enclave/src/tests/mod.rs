@@ -11,6 +11,7 @@ use crate::testing::{Provider, Reply, Seen, LOG_HOST};
 mod canary;
 mod close;
 mod commands;
+mod faults;
 mod forward;
 mod forward_batch;
 mod grants;

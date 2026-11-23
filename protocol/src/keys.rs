@@ -49,14 +49,20 @@ pub fn node_id(sign_public: &[u8; 32]) -> String {
 pub fn key_id(sign_pk: &[u8; 32]) -> String {
     let digest = Sha256::digest(sign_pk);
     let mut text = String::with_capacity(16);
-    for byte in &digest[..8] {
-        text.push(char::from_digit(u32::from(byte >> 4), 16).expect("nibble"));
-        text.push(char::from_digit(u32::from(byte & 0x0f), 16).expect("nibble"));
+    for byte in digest.iter().take(8) {
+        for half in [byte >> 4, byte & 0x0f] {
+            text.extend(char::from_digit(u32::from(half), 16));
+        }
     }
     text
 }
 
 /// HKDF-SHA256 with a 32-byte output (RFC 5869). An empty `salt` is the zero-length salt.
+#[expect(
+    clippy::expect_used,
+    reason = "HKDF-SHA256 refuses an output of more than 8,160 bytes and nothing else: the \
+              output here is the 32 bytes of the array, whatever the three arguments are"
+)]
 pub fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &str) -> Zeroizing<[u8; 32]> {
     let mut output = Zeroizing::new([0u8; 32]);
     Hkdf::<Sha256>::new(Some(salt), ikm)

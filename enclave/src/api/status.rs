@@ -14,13 +14,18 @@ pub async fn status(State(node): State<Arc<Node>>, request: Request) -> Response
 }
 
 /// Reports the delegation state of `user_id`: `none` for an account the node holds no state
-/// of. The call signs nothing: a node of this release keeps no head of a chain.
+/// of, and `internal` for an account the node halted. The call signs nothing: a node of this
+/// release keeps no head of a chain.
 async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
     let body = JsonBody::read(request).await?;
     let user_id = body.user_id()?;
     let now_ms = node.now_ms();
     let grant = match node.account(user_id) {
-        Some(account) => lock(&account).status(now_ms),
+        Some(account) => {
+            let mut account = lock(&account);
+            account.ensure_usable()?;
+            account.status(now_ms)
+        }
         None => GrantStatus::none(),
     };
     Ok(json_ok(&Status { grant }))

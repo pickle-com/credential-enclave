@@ -32,6 +32,7 @@ use tokio::sync::OwnedSemaphorePermit;
 use super::responses::{forward_frame, forward_stream, LogRef, StreamElement, StreamEnd};
 use super::{invalid, read_body, record_of, respond, ApiError, JsonBody};
 use crate::egress::{self, EgressError, Exchange, OutboundBody, OutboundHeader, OutboundRequest};
+use crate::faults::joined;
 use crate::frame::{self, META_LIMIT_BYTES};
 use crate::log_store;
 use crate::oauth::{self, Withheld};
@@ -393,13 +394,16 @@ pub(super) async fn execute(
     };
     // Rule E4: a response that holds the injected credential, or a body the node cannot
     // search, is not handed on. The entry of the request is already on the chain. The search
-    // reads the whole body, so it runs off the threads that serve the calls.
-    let checked = tokio::task::spawn_blocking(move || {
+    // reads the whole body, so it runs off the threads that serve the calls. A panic of the
+    // search is a panic of this call (`joined`): the request has reached the provider, and a
+    // failure response would say that the call can be made again.
+    let mut search = tokio::task::spawn_blocking(move || {
         provider_response::check(&token, status, headers, body)
-    })
-    .await
-    .map_err(|_| ProtocolError::Internal)?
-    .map_err(ProtocolError::from)?;
+    });
+    let checked = joined(&mut search)
+        .await
+        .ok_or(ProtocolError::ProviderUnreachable)?
+        .map_err(ProtocolError::from)?;
     Ok((checked, budget))
 }
 
