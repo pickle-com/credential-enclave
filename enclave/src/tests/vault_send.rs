@@ -1539,6 +1539,104 @@ async fn a_value_outside_ascii_that_a_site_reads_as_iso_8859_1_is_not_handed_on(
 }
 
 #[tokio::test]
+async fn a_value_a_site_sends_back_under_character_references_is_not_handed_on() {
+    // A value with the characters a writer of HTML or XML writes as character references.
+    // The site answers with a page that shows the value, written as one of several writers
+    // write it: they differ in the characters they escape and in how they write a number.
+    let value = "p&ss<w>or\"d'42/x=y+z";
+    let writers: [&[(char, &str)]; 5] = [
+        // The five characters, the apostrophe as a hexadecimal number.
+        &[
+            ('&', "&amp;"),
+            ('<', "&lt;"),
+            ('>', "&gt;"),
+            ('"', "&quot;"),
+            ('\'', "&#x27;"),
+        ],
+        // The apostrophe as a decimal number with a leading zero.
+        &[
+            ('&', "&amp;"),
+            ('<', "&lt;"),
+            ('>', "&gt;"),
+            ('"', "&quot;"),
+            ('\'', "&#039;"),
+        ],
+        // `/` and `=` as numbers as well.
+        &[
+            ('&', "&amp;"),
+            ('<', "&lt;"),
+            ('>', "&gt;"),
+            ('"', "&quot;"),
+            ('\'', "&#39;"),
+            ('/', "&#x2F;"),
+            ('=', "&#x3D;"),
+        ],
+        // The names of XML, and `+` as a number.
+        &[
+            ('&', "&amp;"),
+            ('<', "&lt;"),
+            ('>', "&gt;"),
+            ('"', "&quot;"),
+            ('\'', "&apos;"),
+            ('+', "&#43;"),
+        ],
+        // Numbers alone.
+        &[
+            ('&', "&#38;"),
+            ('<', "&#60;"),
+            ('>', "&#62;"),
+            ('"', "&#34;"),
+            ('\'', "&#39;"),
+        ],
+    ];
+    fn written(text: &str, writer: &[(char, &str)]) -> String {
+        text.chars()
+            .map(|character| {
+                let reference = writer.iter().find(|(escaped, _)| *escaped == character);
+                reference.map_or(character.to_string(), |(_, reference)| {
+                    reference.to_string()
+                })
+            })
+            .collect()
+    }
+    for writer in writers {
+        // The page as it is, and the page inside a page that shows its source: escaped twice.
+        for twice in [false, true] {
+            let provider = site(move |seen| {
+                let echoed = seen.header("x-passphrase").unwrap_or_default();
+                let mut shown = written(echoed, writer);
+                if twice {
+                    shown = written(&shown, writer);
+                }
+                let page = format!(
+                    "<html><body><p>No account has the passphrase \
+                     <input name=\"passphrase\" value=\"{shown}\"></p></body></html>"
+                );
+                Reply::with_body(
+                    401,
+                    &[("content-type", "text/html; charset=utf-8")],
+                    page.as_bytes(),
+                )
+            })
+            .await;
+            let forward = forward_node(&provider).await;
+            let request = request_of("GET", "/v1/me", "", "header:x-passphrase", b"");
+            let meta = json!({
+                "envelope": envelope(&forward, &request, value, 1),
+                "headers": [["X-Passphrase", PLACEHOLDER]],
+            });
+            let sent = forward.vault_send(meta, b"").await.unwrap();
+            // The site received the value, and no part of the page that shows it is handed
+            // on.
+            assert_eq!(provider.only().header("x-passphrase"), Some(value));
+            let case = format!("{} twice: {twice}", written(value, writer));
+            assert_eq!(sent.end["code"], "response_withheld", "{case}");
+            assert_eq!(sent.body(), b"", "{case}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_value_a_site_sends_back_in_a_header_that_is_not_utf8_is_not_handed_on() {
     // A value with characters outside ASCII. The site sends it back in a header, beside a
     // byte that is no UTF-8: the node hands such a header on with one character per byte,

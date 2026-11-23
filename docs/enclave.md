@@ -861,8 +861,11 @@ which form it holds. The order of the processing:
     fails the check when a header name, a header value or the body holds the injected credential
     (the token without the prefix of the definition). Each of the three is read as it was
     received, with its percent escapes decoded (up to three times, for a value that was
-    encoded more than once) and with its JSON string escapes decoded (up to twice, for a JSON
-    text inside a JSON string), and each reading is searched for the credential as it is, in
+    encoded more than once), with its JSON string escapes decoded (up to twice, for a JSON
+    text inside a JSON string) and with its character references of HTML and XML decoded (up
+    to twice, for a text that was escaped again: the names `&amp;`, `&lt;`, `&gt;`, `&quot;`
+    and `&apos;`, and the number of a character in decimal or in hexadecimal, of at most six
+    bytes for each byte of that character), and each reading is searched for the credential as it is, in
     base64 or base64url (each of the three byte alignments, without padding), in hexadecimal
     (lower or upper case), when it holds a space with `+` in the place of every space, and when
     it holds a character outside ASCII as the text a reader of ISO 8859-1 makes of its bytes. A
@@ -1606,7 +1609,7 @@ The rules:
   in flight and the body budget are). A `forward`, `forward/batch` or `vault/send` call waits
   for its place and for the shares of the body budget it takes before its request leaves (the
   share its request frame occupies, and for `vault/send` the share the search of its response
-  can hold with the forms of the value: about 26 KiB for a value of 30 bytes and 2.6 MiB for
+  can hold with the forms of the value: about 31 KiB for a value of 30 bytes and 2.7 MiB for
   one of 12,000 bytes) for at
   most 30 seconds together (`ADMISSION_WAIT`)
   and ends with `capacity_unavailable` when it has not got them by then: the node reads
