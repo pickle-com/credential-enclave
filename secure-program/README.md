@@ -233,6 +233,13 @@ the program as they are, with the deploy keys of the test and without the elemen
 in the list. The endorsement cases of `protocol/vectors.json` run through the program as well: the
 program reads a release statement and the entry of its record as a node does.
 
+`tests/prove.js` prints what the program makes of release proofs read from a file
+(`node secure-program/tests/prove.js RELEASE_PROOFS_JSON [--target prod|dev|alpha] [--program
+PROGRAM_JS]`): the verdict of the program of this checkout, or of the source `--program` names,
+with its constants as they are and for a build of the server target named. Release proofs are
+public values, so whoever makes or carries them can ask a version of the program for its verdict
+before a node of the release takes a key.
+
 `SECURE_PROGRAM_VECTORS` names the vector files to read instead of `protocol/vectors.json` (paths
 separated by commas). A test of vectors that the files do not hold is skipped.
 
