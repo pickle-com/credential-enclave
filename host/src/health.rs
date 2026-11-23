@@ -262,6 +262,13 @@ pub struct Load {
     pub lingering_connections: Option<u64>,
     #[serde(default)]
     pub lingering_cut: Option<u64>,
+    /// The panics of the node program that did not end it, and the accounts it halted after
+    /// a panic under their lock, since it started. A node of a release before v2.4.0 says
+    /// neither.
+    #[serde(default)]
+    pub contained_panics: Option<u64>,
+    #[serde(default)]
+    pub halted_accounts: Option<u64>,
 }
 
 /// Calls `GET /v1/health` of the node. `None` when the connection, the call or the reading of
@@ -726,6 +733,20 @@ fn load_series(text: &mut String, load: &Load) {
             cut,
         );
     }
+    if let (Some(panics), Some(halted)) = (load.contained_panics, load.halted_accounts) {
+        counter(
+            text,
+            "credential_enclave_contained_panics_total",
+            "Panics of the enclave node program that ended a call or halted an account and did not end the node, since it started.",
+            panics,
+        );
+        gauge(
+            text,
+            "credential_enclave_halted_accounts",
+            "Accounts the enclave node halted after a panic under the lock of their state: an account stays halted for as long as the node lives.",
+            format_args!("{halted}"),
+        );
+    }
 }
 
 /// The series of the `egress` object.
@@ -925,6 +946,12 @@ fn host_series(
         inbound.refused(),
     );
     pipe_series(text, "inbound", "callers", inbound.pipes());
+    counter(
+        text,
+        "credential_enclave_host_contained_panics_total",
+        "Panics of the host program that ended one connection and did not end the program, since it started.",
+        crate::faults::panics(),
+    );
 }
 
 fn respond(status: StatusCode, content_type: &'static str, body: String) -> Response<Full<Bytes>> {
@@ -1057,8 +1084,8 @@ mod tests {
 
     /// The series of the host program before any describe-enclaves answered, without the
     /// gauges of its descriptors (the tests pass none), and before either relay served a
-    /// connection: the gauge of the watch, the eight series of the egress relay and the eight
-    /// series of the inbound relay.
+    /// connection: the gauge of the watch, the eight series of the egress relay, the eight
+    /// series of the inbound relay and the count of the panics of the host program.
     const HOST_SERIES_AT_START: &str =
         "# HELP credential_enclave_host_enclave_running 1 while the last describe-enclaves of the host program listed a running enclave (or none ran yet), 0 when it listed none.\n\
          # TYPE credential_enclave_host_enclave_running gauge\n\
@@ -1122,7 +1149,10 @@ mod tests {
          credential_enclave_host_inbound_relays_ended_total{cause=\"closed\"} 0\n\
          credential_enclave_host_inbound_relays_ended_total{cause=\"failed\"} 0\n\
          credential_enclave_host_inbound_relays_ended_total{cause=\"idle\"} 0\n\
-         credential_enclave_host_inbound_relays_ended_total{cause=\"half_closed\"} 0\n";
+         credential_enclave_host_inbound_relays_ended_total{cause=\"half_closed\"} 0\n\
+         # HELP credential_enclave_host_contained_panics_total Panics of the host program that ended one connection and did not end the program, since it started.\n\
+         # TYPE credential_enclave_host_contained_panics_total counter\n\
+         credential_enclave_host_contained_panics_total 0\n";
 
     /// The names of the series that a node of release v2.1.0 adds, the gauge of `grants`
     /// among them (the value is in the answer of every release, and the gauge follows the
@@ -1483,7 +1513,7 @@ mod tests {
         assert!(text.contains("\ncredential_enclave_accounts 0\n"));
         assert!(text.contains("\ncredential_enclave_started_timestamp_seconds 1.000\n"));
         assert!(!text.contains("credential_enclave_log_"));
-        assert_eq!(text.matches("# TYPE ").count(), 4 + 17);
+        assert_eq!(text.matches("# TYPE ").count(), 4 + 18);
 
         // With the `log` object of a node of release v2.0.0 or later: six counters and one
         // gauge after the four gauges, and none of the series of release v2.1.0.
@@ -1513,7 +1543,7 @@ mod tests {
         assert!(text.contains("\n# TYPE credential_enclave_forward_batch_calls_total counter\ncredential_enclave_forward_batch_calls_total 3\n"));
         assert!(text.contains("\n# TYPE credential_enclave_forward_batch_requests_total counter\ncredential_enclave_forward_batch_requests_total 35\n"));
         assert!(node_part(&text).ends_with("\n# TYPE credential_enclave_log_open_batches gauge\ncredential_enclave_log_open_batches 2\n"));
-        assert_eq!(text.matches("# TYPE ").count(), 11 + 17);
+        assert_eq!(text.matches("# TYPE ").count(), 11 + 18);
         for series in LOAD_SERIES.iter().chain(NEW_SERIES.iter()) {
             assert!(!text.contains(series), "{series}");
         }
@@ -1525,7 +1555,7 @@ mod tests {
             ..with_log.clone()
         };
         let text = metrics(Some(&with_load), &no_counts, &no_inbound, None, None, None);
-        assert_eq!(text.matches("# TYPE ").count(), 18 + 17);
+        assert_eq!(text.matches("# TYPE ").count(), 18 + 18);
         for series in NEW_SERIES {
             assert!(!text.contains(series), "{series}");
         }
@@ -1576,7 +1606,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(text.matches("# TYPE ").count(), 13 + 17);
+        assert_eq!(text.matches("# TYPE ").count(), 13 + 18);
         assert!(node_part(&text).ends_with(
             "\n# TYPE credential_enclave_forward_calls gauge\ncredential_enclave_forward_calls 1\n"
         ));
@@ -1601,7 +1631,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(text.matches("# TYPE ").count(), 18 + 18 + 17);
+        assert_eq!(text.matches("# TYPE ").count(), 18 + 18 + 18);
 
         // The series of the write counts follow the seven series of the log, the two gauges of
         // the log store follow them, and the series of the load come next.
@@ -1927,11 +1957,15 @@ mod tests {
         ] {
             assert!(host_text.contains(line), "{line}: {text}");
         }
-        // The series of the inbound relay come last.
+        // The series of the inbound relay and the count of the panics of the host program
+        // come last.
         assert!(
             text.ends_with(
                 "\ncredential_enclave_host_inbound_relays_ended_total{cause=\"idle\"} 0\n\
-                 credential_enclave_host_inbound_relays_ended_total{cause=\"half_closed\"} 0\n"
+                 credential_enclave_host_inbound_relays_ended_total{cause=\"half_closed\"} 0\n\
+                 # HELP credential_enclave_host_contained_panics_total Panics of the host program that ended one connection and did not end the program, since it started.\n\
+                 # TYPE credential_enclave_host_contained_panics_total counter\n\
+                 credential_enclave_host_contained_panics_total 0\n"
             ),
             "{text}"
         );
@@ -1957,11 +1991,12 @@ mod tests {
             text.contains("\ncredential_enclave_host_inbound_node_connect_failures_total 1\n"),
             "{text}"
         );
-        // The gauge of the node, the gauge of the watch, the eight series of the egress relay
-        // and the eight series of the inbound relay.
+        // The gauge of the node, the gauge of the watch, the eight series of the egress relay,
+        // the eight series of the inbound relay and the count of the panics of the host
+        // program.
         assert_eq!(
             text.matches("# TYPE ").count(),
-            1 + 1 + 8 + 8 + host_descriptor_series
+            1 + 1 + 8 + 8 + 1 + host_descriptor_series
         );
     }
 
@@ -2016,7 +2051,13 @@ mod tests {
              credential_enclave_lingering_connections 3\n\
              # HELP credential_enclave_lingering_cut_total Connections the enclave node closed before their peer had reported the end of its bytes, since it started.\n\
              # TYPE credential_enclave_lingering_cut_total counter\n\
-             credential_enclave_lingering_cut_total 1\n"
+             credential_enclave_lingering_cut_total 1\n\
+             # HELP credential_enclave_contained_panics_total Panics of the enclave node program that ended a call or halted an account and did not end the node, since it started.\n\
+             # TYPE credential_enclave_contained_panics_total counter\n\
+             credential_enclave_contained_panics_total 2\n\
+             # HELP credential_enclave_halted_accounts Accounts the enclave node halted after a panic under the lock of their state: an account stays halted for as long as the node lives.\n\
+             # TYPE credential_enclave_halted_accounts gauge\n\
+             credential_enclave_halted_accounts 1\n"
         ), "{text}");
 
         // A node of an earlier release gives neither the bound nor the two counts.
@@ -2037,6 +2078,15 @@ mod tests {
         );
         assert!(!text.contains("credential_enclave_inbound_limit"), "{text}");
         assert!(!text.contains("credential_enclave_lingering"), "{text}");
+        // Nor the two counts of the faults it contained: such a node ends on a panic.
+        assert!(
+            !text.contains("credential_enclave_contained_panics_total"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("credential_enclave_halted_accounts"),
+            "{text}"
+        );
     }
 
     #[tokio::test]
@@ -2113,7 +2163,7 @@ mod tests {
             ]
             .concat()
         ), "{text}");
-        assert_eq!(text.matches("# TYPE ").count(), 18 + 18 + 4 + 17 + 3);
+        assert_eq!(text.matches("# TYPE ").count(), 18 + 18 + 4 + 18 + 3);
         // A node of a release before v2.2.0 gives none of its four series, and a last
         // describe-enclaves without a running enclave turns the gauge of the watch to 0.
         let earlier = NodeHealth {

@@ -44,10 +44,11 @@
 //! holds nothing a shutdown could collect.
 
 #![forbid(unsafe_code)]
-// The host program is built to abort on a panic, and the enclave ends with it. So:
-// No input ends the program. Its code (not the code of its tests) holds no `unwrap`, no
-// `expect`, no `panic!`, and no index or slice expression that can fail. A place that keeps
-// one of them says, where it stands, why no input reaches its failure
+// The enclave ends with the host program, and a panic ends a connection or the program
+// (`faults`). So:
+// No input makes the program panic. Its code (not the code of its tests) holds no `unwrap`,
+// no `expect`, no `panic!`, and no index or slice expression that can fail. A place that
+// keeps one of them says, where it stands, why no input reaches its failure
 // (`#[expect(clippy::.., reason = "..")]`).
 #![cfg_attr(
     not(test),
@@ -68,6 +69,7 @@ mod config;
 mod descriptors;
 mod drain;
 mod egress;
+mod faults;
 mod health;
 mod http;
 mod launch;
@@ -89,6 +91,7 @@ use tokio::signal::unix::{signal, Signal, SignalKind};
 use config::{ConfigError, Injection, LogStore, Role};
 use drain::Drain;
 use egress::{Allowlist, EgressCounters, Reach, TcpOutbound};
+use faults::vital;
 use relay::{InboundCounters, NodeConnector, VsockListener, VsockNode};
 use watch::EnclaveWatch;
 
@@ -402,19 +405,21 @@ async fn run() -> Result<(), String> {
     let counters = Arc::new(EgressCounters::default());
     let inbound_counters = Arc::new(InboundCounters::default());
     let watch = EnclaveWatch::new();
-    tokio::spawn(health::serve(
+    // The tasks that accept connections serve each connection on a task of its own. The
+    // program cannot do without the tasks that accept (`faults::vital`).
+    tokio::spawn(vital(health::serve(
         status_listener,
         node.clone(),
         counters.clone(),
         inbound_counters.clone(),
         watch.clone(),
-    ));
-    tokio::spawn(egress::serve(
+    )));
+    tokio::spawn(vital(egress::serve(
         egress_listener,
         Arc::new(reach),
         Arc::new(TcpOutbound),
         counters,
-    ));
+    )));
 
     // A termination signal during the start ends the program at once: the node has served no
     // call yet, and the end of the first process of the container ends `nitro-cli` and the
@@ -431,11 +436,11 @@ async fn run() -> Result<(), String> {
     log("enclave: started");
 
     tokio::spawn(report_first_answer(node.clone(), inbound_counters.clone()));
-    tokio::spawn(watch::keep_watching(
+    tokio::spawn(vital(watch::keep_watching(
         watch.clone(),
         launch::describe_enclaves,
         node.clone(),
-    ));
+    )));
     match (role, operator_config) {
         // A node takes its role once, and a call of the delegation role gives a node without
         // a role that role. So the node of this pod takes the forward role before the inbound
@@ -460,18 +465,18 @@ async fn run() -> Result<(), String> {
             }
         }
         (Role::Delegation, Ok(body)) => {
-            tokio::spawn(configure(node.clone(), body));
+            tokio::spawn(vital(configure(node.clone(), body)));
         }
         (_, Err(ConfigError::NoBaseUrl)) => log(&format!(
             "operator configuration: not sent, {} is not set",
             config::BASE_URL_VARIABLE
         )),
     }
-    tokio::spawn(relay::serve(
+    tokio::spawn(vital(relay::serve(
         inbound_listener,
         node.clone(),
         inbound_counters,
-    ));
+    )));
 
     // The host program ends on a termination signal, or when the watch confirmed that the
     // enclave ended on its own: the state of the node is gone then, and the one recovery is
@@ -527,6 +532,8 @@ fn invocation(arguments: impl Iterator<Item = String>) -> Option<Invocation> {
 }
 
 fn main() -> ExitCode {
+    // From here on a panic is counted and logged with its place (`faults`).
+    faults::report();
     let Some(invocation) = invocation(std::env::args().skip(1)) else {
         eprintln!("usage: credential-enclave-host [drain] (see the environment variables)");
         return ExitCode::from(2);
@@ -542,7 +549,7 @@ fn main() -> ExitCode {
         }
     };
     let outcome = match invocation {
-        Invocation::Host => runtime.block_on(run()),
+        Invocation::Host => runtime.block_on(vital(run())),
         Invocation::Drain => {
             runtime.block_on(run_drain());
             Ok(())
