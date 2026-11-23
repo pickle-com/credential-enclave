@@ -808,10 +808,41 @@ mod shutdown_tests {
     }
 
     #[tokio::test]
+    async fn a_pod_of_the_reserve_role_closes_its_node_and_collects() {
+        // A node of the reserve role holds delegations, which the backend collects, and no
+        // call that holds a place: the wait ends at its first look at the node.
+        let node = node_with(Arc::new(AtomicU64::new(0)));
+        let callers = Pipes::new(16);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let drain = drain_to(listener.local_addr().unwrap().port());
+        let backend = tokio::spawn(backend(listener, node.clone()));
+        let watch = EnclaveWatch::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            hand_on_and_finish(
+                Role::Reserve,
+                Some(drain),
+                node.as_ref(),
+                &callers,
+                &watch,
+                false,
+            ),
+        )
+        .await
+        .unwrap();
+        // The backend was asked to collect after the node was closed and its delegations
+        // were read, and the one call after the collection read the places of the node.
+        assert_eq!(backend.await.unwrap(), ["/v1/close", "/v1/health"]);
+        let paths: Vec<String> = node.calls().into_iter().map(|call| call.path).collect();
+        assert_eq!(paths, ["/v1/close", "/v1/health", "/v1/health"]);
+    }
+
+    #[tokio::test]
     async fn a_pod_without_a_collection_call_lets_its_calls_end_all_the_same() {
-        // The variables of the collection are not set, and a pod of the forward role has no
-        // collection: the node is closed and its calls are waited for.
-        for role in [Role::Delegation, Role::Forward] {
+        // The variables of the collection are not set in a pod of the delegation role or of
+        // the reserve role, and a pod of the forward role has no collection: in each of the
+        // three roles the node is closed and its calls are waited for.
+        for role in [Role::Delegation, Role::Reserve, Role::Forward] {
             let node = node_with(Arc::new(AtomicU64::new(0)));
             let callers = Pipes::new(16);
             let watch = EnclaveWatch::new();
