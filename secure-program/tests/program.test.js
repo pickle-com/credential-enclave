@@ -1582,10 +1582,12 @@ test("a round ends its reading when the app goes to the background: it sends not
   assert.equal(judgedKeys(world), judged + 3);
   assert.equal(world.state.log.newer_release_nodes, 0);
   // The third stay: the entry of the other node is read before the listing is asked for. The key
-  // of the account is at a measurement no list has: pending for a day.
+  // of the account is at a measurement no list has: pending for a day. The key of that entry is
+  // not remembered as judged: the rounds read it again, and judge it as the entry of an
+  // accepted node once its measurement is one of an accepted release.
   assert.deepEqual(await stay(), ["bodies", "read"]);
   assert.equal(heldReads(world), undefined);
-  assert.equal(judgedKeys(world), judged + 4);
+  assert.equal(judgedKeys(world), judged + 3);
   assert.equal(world.state.log.status, "pending");
   assert.equal(world.state.log.newer_release_nodes, 1);
   assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
@@ -5594,4 +5596,329 @@ test("an entry the screen could not read once is not kept as not verified: the n
   const groups = shownGroups(second.value);
   assert.deepEqual(groups.map((group) => group.kind), ["request", "grant_renewed"]);
   assert.ok(groups.every((group) => group.verified === true));
+});
+
+// ---- The last list before the tag: the front of a procedure, the ledger of a later program, a stale runtime ----
+
+test("the account query and the list of the nodes are asked once more after an answer that fails for a moment: a 503 or a 429 of either leaves a connection, a vault item and a synchronization to their ends, and two such answers in a row are the failure they name", async () => {
+  const webAuth = (world) => (args) => {
+    const state = new URL(args.url).searchParams.get("state").split(".")[0];
+    world.connections.get(state).completed = true;
+    return "pickle://oauth?oauth_status=connected&oauth_state=" + state;
+  };
+  for (const route of ["GET /api/secure/account", "GET /api/secure/grants"]) {
+    for (const status of [503, 429]) {
+      const label = route + " " + status;
+      const fx = S.fixture(source);
+      await S.start(fx);
+      const world = fx.world;
+      world.device.webAuth = webAuth(world);
+      const refused = { status: status, body: { detail: status === 503 ? "postgresql_unavailable" : "too_many_requests" } };
+      // A connection.
+      let asked = world.sent(route).length;
+      world.fault(route, refused, 1);
+      assert.equal((await S.call(fx, "connect", { target: "github" })).ok, true, label);
+      assert.equal(world.sent(route).length, asked + 2, label);
+      // A synchronization the user asks for.
+      world.advance(2 * 60000);
+      asked = world.sent(route).length;
+      world.fault(route, refused, 1);
+      assert.equal((await S.call(fx, "sync", {})).ok, true, label);
+      assert.equal(world.sent(route).length, asked + 2, label);
+      assert.ok(world.state.error === null || world.state.error === undefined, label);
+      // Two such answers in a row: the failure they name, as before.
+      world.fault(route, refused, 2);
+      asked = world.sent(route).length;
+      assert.deepEqual(await S.call(fx, "connect", { target: "github" }), { ok: false, code: refused.body.detail }, label);
+      assert.equal(world.sent(route).length, asked + 2, label);
+      world.clearFaults();
+    }
+  }
+  // A vault item of a device whose grant ran out: the front of the procedure hands the grant
+  // again, and gets past such an answer of either request.
+  const fx = S.fixture(source);
+  await S.start(fx);
+  fx.world.advance(31 * DAY_MS);
+  fx.world.fault("GET /api/secure/account", { status: 503, body: { detail: "postgresql_unavailable" } }, 1);
+  fx.world.fault("GET /api/secure/grants", { status: 503, body: { detail: "postgresql_unavailable" } }, 1);
+  const stored = await S.call(fx, "store_secret", { label: "key", sites: "api.example.com", slots: "header:authorization", value: "sk-0123456789" });
+  assert.deepEqual(stored.ok ? "ok" : stored.code, "ok");
+  // No other request is sent twice: a report of a round that fails is not sent again.
+  const other = S.fixture(source);
+  await S.start(other);
+  other.world.fault("POST /api/secure/log/verified", { status: 503, body: {} }, 1);
+  const reports = other.world.sent("POST /api/secure/log/verified").length;
+  await nextDay(other);
+  assert.equal(other.world.sent("POST /api/secure/log/verified").length, reports + 1);
+});
+
+test("a shorter lifetime of the grants in a stale runtime is applied to every node that may hold the grant or to none: with a listed node this program sends no grant command to, the call ends with program_stale and no lifetime changes; a runtime that is not stale and a longer lifetime are as before", async () => {
+  const build = async (stale) => {
+    const fx = S.fixture(source);
+    const world = fx.world;
+    // A node of a release this program does not list, which holds the grant of the account with
+    // a lifetime of thirty days (a device that runs a later program handed it).
+    const later = world.addNode({ release: "v9.0.0", measurement: bridge.randomMeasurement() });
+    later.grants.set(world.userId, {
+      sign_pk: b64u(fx.keys.signPk), log_pk: b64u(fx.keys.logPk), key_id: fx.keys.keyId, custody: "enclave",
+      not_after_ms: world.now + 30 * DAY_MS,
+    });
+    await S.start(fx);
+    if (stale) {
+      world.account.servedProgram = fx.version + 1;
+      world.advance(2 * 60000);
+      await S.event(fx, "foreground");
+      assert.equal(world.runtime.program_stale, true);
+    }
+    return { fx: fx, world: world, later: later };
+  };
+  const grantsOf = (node) => node.commands.filter((command) => command.type === "grant").length;
+
+  // A stale runtime, a shorter lifetime.
+  const stale = await build(true);
+  const kept = stale.fx.nodes[0].grants.get(stale.world.userId).not_after_ms;
+  const sent = grantsOf(stale.fx.nodes[0]);
+  assert.deepEqual(await S.call(stale.fx, "set_grant_days", { days: 1 }), { ok: false, code: "program_stale" });
+  assert.equal(stale.world.state.grant_days, 30);
+  assert.equal(readLedger(stale.fx).ttl_days, 30);
+  assert.equal(stale.fx.nodes[0].grants.get(stale.world.userId).not_after_ms, kept);
+  assert.equal(grantsOf(stale.fx.nodes[0]), sent);
+  assert.deepEqual(stale.later.commands, []);
+  assert.equal(stale.later.grants.get(stale.world.userId).not_after_ms > stale.world.now + 29 * DAY_MS, true);
+  // The next synchronization renews the grant with the lifetime that was kept.
+  stale.world.advance(25 * HOUR_MS);
+  await S.event(stale.fx, "foreground");
+  assert.ok(stale.fx.nodes[0].grants.get(stale.world.userId).not_after_ms > stale.world.now + 29 * DAY_MS);
+  // The same lifetime again, and a longer one, in that stale runtime: as before.
+  assert.equal((await S.call(stale.fx, "set_grant_days", { days: 30 })).ok, true);
+
+  // A runtime that is not stale: the lifetime is shortened on the nodes this program hands a
+  // grant to, as before.
+  const fresh = await build(false);
+  const shorter = await S.call(fresh.fx, "set_grant_days", { days: 1 });
+  assert.equal(shorter.ok, true);
+  assert.equal(shorter.value.days, 1);
+  assert.ok(fresh.fx.nodes[0].grants.get(fresh.world.userId).not_after_ms < fresh.world.now + 2 * DAY_MS);
+  // That runtime then learns that it is stale: a longer lifetime is taken as before.
+  fresh.world.account.servedProgram = fresh.fx.version + 1;
+  fresh.world.advance(2 * 60000);
+  await S.event(fresh.fx, "foreground");
+  const longer = await S.call(fresh.fx, "set_grant_days", { days: 14 });
+  assert.equal(longer.ok, true);
+  assert.equal(longer.value.days, 14);
+  assert.ok(fresh.fx.nodes[0].grants.get(fresh.world.userId).not_after_ms > fresh.world.now + 13 * DAY_MS);
+  // A stale runtime without such a node shortens the lifetime.
+  const alone = S.fixture(source);
+  alone.world.account.servedProgram = alone.version + 1;
+  await S.start(alone);
+  assert.equal((await S.call(alone, "set_grant_days", { days: 3 })).value.days, 3);
+});
+
+test("a connection whose node the backend names is one the delegation moved to after this device read the list of the nodes: the step of the grants runs once more, the device verifies that node and hands it a grant, and the connection and the mail password end; a node that fails the verification is no node whose statement is taken", async () => {
+  const webAuth = (world) => (args) => {
+    const state = new URL(args.url).searchParams.get("state").split(".")[0];
+    world.connections.get(state).completed = true;
+    return "pickle://oauth?oauth_status=connected&oauth_state=" + state;
+  };
+  // Moves the delegation of the account from the node of the fixture to a new node, at the
+  // moment the backend takes the request of the route (after the device read the list).
+  const moveAt = (fx, route, options) => {
+    const world = fx.world;
+    const moved = { node: null };
+    world.fault(route, () => {
+      if (moved.node !== null) return undefined;
+      const from = fx.nodes[0];
+      moved.node = world.addNode(options);
+      moved.node.grants.set(world.userId, from.grants.get(world.userId));
+      from.grants.delete(world.userId);
+      from.alive = false;
+      return undefined;
+    });
+    return moved;
+  };
+  // A node of the listed release.
+  const fx = S.fixture(source);
+  await S.start(fx);
+  fx.world.device.webAuth = webAuth(fx.world);
+  const moved = moveAt(fx, "POST /api/secure/connections/begin", { release: "v2.4.0", measurement: fx.measurement });
+  const lists = fx.world.sent("GET /api/secure/grants").length;
+  assert.deepEqual(await S.call(fx, "connect", { target: "github" }),
+    { ok: true, value: { connection_id: "connection-1", provider: "github", reward: 0 } });
+  assert.equal(fx.world.stored("log.grants")[moved.node.id] !== undefined, true);
+  assert.equal(moved.node.commands.filter((command) => command.type === "grant").length, 1);
+  // (The step of the grants ran once more: one more list.)
+  assert.equal(fx.world.sent("GET /api/secure/grants").length, lists + 2);
+
+  // The mail password: the same.
+  const mail = S.fixture(source);
+  await S.start(mail);
+  const other = moveAt(mail, "PUT /api/secure/connections/naver_mail/app-password", { release: "v2.4.0", measurement: mail.measurement });
+  assert.deepEqual(await S.call(mail, "connect_app_password", { username: "user@naver.com", password: "abcd efgh ijkl" }),
+    { ok: true, value: { provider: "naver_mail", connection_id: "connection-mail", identity: "user@naver.com" } });
+  assert.equal(mail.world.stored("log.grants")[other.node.id] !== undefined, true);
+
+  // The node the backend names is of a measurement no list has: the device hands it no grant
+  // and takes no statement of it, as before. In a stale runtime the failure is program_stale.
+  for (const stale of [false, true]) {
+    const bad = S.fixture(source, { nodes: 2 });
+    await S.start(bad);
+    bad.world.device.webAuth = webAuth(bad.world);
+    if (stale) {
+      bad.world.account.servedProgram = bad.version + 1;
+      bad.world.advance(2 * 60000);
+      await S.event(bad, "foreground");
+    }
+    const rogue = bad.world.addNode({ release: "v9.0.0", measurement: bridge.randomMeasurement() });
+    rogue.grants.set(bad.world.userId, bad.nodes[0].grants.get(bad.world.userId));
+    bad.world.namedNode = () => rogue;
+    assert.deepEqual(await S.call(bad, "connect", { target: "github" }),
+      { ok: false, code: stale ? "program_stale" : "unverified_authorization" }, String(stale));
+    assert.deepEqual(rogue.commands, []);
+    assert.deepEqual(await S.call(bad, "connect_app_password", { username: "user@naver.com", password: "abcd efgh ijkl" }),
+      { ok: false, code: stale ? "program_stale" : "unverified_connection" }, String(stale));
+  }
+});
+
+test("a runtime that reads a node ledger of a form it does not know hands no grant, sends no revoke of its own accord, leaves the ledger as it is and says program_stale: what another device wrote there with a later program (a delegation turned off) is not undone", async () => {
+  const item = (world) => world.keychain.get("com.pickle.client.secure.ledger\n" + world.userId);
+  // The numbers of the grant commands and of the revoke commands the nodes of a fixture took.
+  const commands = (fx) => {
+    const types = fx.nodes.concat(fx.legacy).reduce((all, node) => all.concat(node.commands.map((command) => command.type)), []);
+    return { grant: types.filter((type) => type === "grant").length, revoke: types.filter((type) => type === "revoke").length };
+  };
+  for (const shape of ["v2", "text", "no v"]) {
+    const fx = S.fixture(source, { nodes: 1, legacy: 1 });
+    await S.start(fx);
+    const world = fx.world;
+    assert.equal(world.state.grant.state, "active");
+    assert.equal(world.runtime.program_stale, false);
+    // Another device of the account, which runs a later program, turns the delegation off: the
+    // nodes take its revoke, and the ledger item of the account is written in the form of that
+    // program.
+    world.advance(HOUR_MS);
+    for (const node of fx.nodes.concat(fx.legacy)) node.grants.delete(world.userId);
+    const written = shape === "v2" ? JSON.stringify({ v: 2, switches: [{ off_ms: world.now }], lifetime: { days: 7 } })
+      : shape === "text" ? "ledger of a later program" : JSON.stringify({ revoked_ms: world.now, resumed_ms: 0 });
+    world.keychain.set("com.pickle.client.secure.ledger\n" + world.userId, { value: b64u(utf8(written)), synchronizable: true });
+    const kept = item(world).value;
+    const before = commands(fx);
+    const copy = world.store.get("ledger");
+    // Days of synchronizations, pushes that ask for a grant, and new runtimes.
+    for (let day = 0; day < 4; day += 1) {
+      world.advance(25 * HOUR_MS);
+      await S.event(fx, "foreground");
+      await S.event(fx, "push", { reason: "grant_required" });
+      await S.start(fx);
+      assert.equal(world.runtime.program_stale, true, shape + " day " + day);
+    }
+    assert.deepEqual(commands(fx), before, shape);
+    assert.equal(item(world).value, kept, shape);
+    assert.equal(world.store.get("ledger"), copy, shape);
+    for (const node of fx.nodes.concat(fx.legacy)) assert.equal(node.grants.has(world.userId), false, shape);
+    // The procedures that need the delegation, and the settings of the delegation.
+    for (const [name, args] of [
+      ["connect", { target: "github" }],
+      ["store_login", { name: "example.com", username: "u", password: "p" }],
+      ["store_secret", { label: "x", sites: "example.com", slots: "field", value: "v" }],
+      ["set_grant_days", { days: 7 }],
+      ["set_delegation", { enabled: true }],
+    ]) {
+      assert.deepEqual(await S.call(fx, name, args), { ok: false, code: "program_stale" }, shape + " " + name);
+    }
+    assert.deepEqual(commands(fx), before, shape);
+    // The user turns the delegation off on this device: the revoke goes to every listed node,
+    // the ledger item of the later program stays as it is, and the call says program_stale.
+    assert.deepEqual(await S.call(fx, "set_delegation", { enabled: false }), { ok: false, code: "program_stale" }, shape);
+    assert.deepEqual(commands(fx), { grant: before.grant, revoke: before.revoke + 2 }, shape);
+    assert.equal(item(world).value, kept, shape);
+    // (The side of the ledger this program reads keeps the time of that switch.)
+    assert.ok(JSON.parse(world.store.get("ledger")).revoked_ms > 0, shape);
+    // No synchronization after it sends anything to a node.
+    world.advance(25 * HOUR_MS);
+    await S.event(fx, "foreground");
+    assert.deepEqual(commands(fx), { grant: before.grant, revoke: before.revoke + 2 }, shape);
+  }
+  // An account without a ledger value, and a ledger of the form this program reads: as before.
+  const plain = S.fixture(source, { nodes: 1, legacy: 1 });
+  plain.world.keychain.delete("com.pickle.client.secure.ledger\n" + plain.world.userId);
+  await S.start(plain);
+  assert.equal(plain.world.state.grant.state, "active");
+  assert.equal(plain.world.runtime.program_stale, false);
+  assert.equal(readLedger(plain).v, 1);
+  await nextDay(plain);
+  assert.equal(plain.world.state.grant.state, "active");
+  assert.ok(plain.legacy[0].commands.filter((command) => command.type === "grant").length >= 2);
+});
+
+test("a round that is about to mark a log that is not marked asks what is served when its reading of it is older than an hour: a later version ends the round as one of a stale runtime, this version lets the mark stand, and no answer puts off no mark of signatures or of reads held back", async () => {
+  const conflict = (fx) => {
+    const event = (provider) => [{ t: "connection_created", time_ms: fx.world.now, record_id: "r", provider: provider, scope: "" }];
+    fx.nodes[0].record("c", event("slack"), { seq: 7 });
+    fx.nodes[0].record("c", event("notion"), { seq: 7 });
+  };
+  const accounts = (world) => world.sent("GET /api/secure/account").length;
+  // The backend serves a later program by the time the screen starts the round.
+  const later = S.fixture(source, { device: { securityStatus: true } });
+  await S.start(later);
+  // (A round that marks nothing asks nothing, however old its reading is.)
+  later.world.advance(2 * HOUR_MS);
+  let asked = accounts(later.world);
+  assert.equal((await S.call(later, "read_log", { limit: 5 })).value.status, "verified");
+  assert.equal(accounts(later.world), asked);
+  conflict(later);
+  later.world.advance(2 * HOUR_MS);
+  later.world.account.servedProgram = later.version + 1;
+  const kept = judgedStores(later.world);
+  const reports = later.world.reports.length;
+  asked = accounts(later.world);
+  const shown = await S.call(later, "read_log", { limit: 5 });
+  await later.world.settle(1000);
+  assert.equal(shown.value.status, "verified");
+  assert.equal(later.world.state.log.status, "verified");
+  assert.equal(accounts(later.world), asked + 1);
+  assert.deepEqual(judgedStores(later.world), kept);
+  assert.ok(later.world.securityStatuses.every((told) => told.status !== "attention"));
+  assert.deepEqual(later.world.reports.slice(reports).map((report) => report.store_failure), ["program:stale"]);
+  assert.equal(later.world.runtime.program_stale, true);
+
+  // The backend serves this program: the mark stands, and a round of a log that is marked asks
+  // no more.
+  const same = S.fixture(source, { device: { securityStatus: true } });
+  await S.start(same);
+  conflict(same);
+  same.world.advance(2 * HOUR_MS);
+  asked = accounts(same.world);
+  assert.equal((await S.call(same, "read_log", { limit: 5 })).value.status, "attention");
+  assert.equal(accounts(same.world), asked + 1);
+  assert.deepEqual(same.world.securityStatuses.slice(-1)[0].reasons, ["conflicting_signatures"]);
+  same.world.advance(2 * HOUR_MS);
+  assert.equal((await S.call(same, "read_log", { limit: 5 })).value.status, "attention");
+  assert.equal(accounts(same.world), asked + 1);
+
+  // The account query is not answered: the mark of the signatures stands all the same.
+  const silent = S.fixture(source, { device: { securityStatus: true } });
+  await S.start(silent);
+  conflict(silent);
+  silent.world.advance(2 * HOUR_MS);
+  silent.world.fault("GET /api/secure/account", { status: 503, body: {} });
+  assert.equal((await S.call(silent, "read_log", { limit: 5 })).value.status, "attention");
+
+  // Reads held back: the round of the fourth day, started by the screen two hours after the
+  // synchronization of that day, would mark the log. A later version served by then ends it
+  // unmarked; this version marks it.
+  for (const served of ["later", "same"]) {
+    const held = S.fixture(source, { device: { securityStatus: true } });
+    await S.start(held);
+    held.world.fault("POST /api/secure/log/read", { status: 503, body: { detail: "log_store_unreachable" } });
+    for (let day = 0; day < 2; day += 1) await nextDay(held);
+    held.world.advance(2 * DAY_MS);
+    assert.equal(held.world.state.log.status, "pending", served);
+    if (served === "later") held.world.account.servedProgram = held.version + 1;
+    asked = accounts(held.world);
+    const opened = await S.call(held, "read_log", { limit: 5 });
+    await held.world.settle(1000);
+    assert.equal(accounts(held.world), asked + 1, served);
+    assert.equal(held.world.state.log.status, served === "later" ? "pending" : "attention", served);
+    assert.equal(opened.value.status, served === "later" ? "pending" : "attention", served);
+  }
 });

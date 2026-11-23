@@ -44,6 +44,10 @@
   const LOG_API_TIMEOUT_MS = 10000;
   const LOG_STORE_TIMEOUT_MS = 10000;
   const NODE_TIMEOUT_MS = 30000;
+  // The two requests at the front of a synchronization and of a procedure that needs the grants
+  // (the account query and the list of the nodes) are sent once more, this long after an answer
+  // that fails for a moment (frontQuery).
+  const FRONT_RETRY_MS = 500;
   // The longest time one procedure takes, from its call to its end, without the time the device
   // spent in an operation that waits for the user (webAuth, deviceOwnerAuth, promptSecret,
   // presentSecret). The executors end a procedure at 120 seconds from outside the queue of the
@@ -1637,6 +1641,24 @@
     return Promise.all(promises.map(settled));
   }
 
+  /** A request at the front of a synchronization or of a procedure (ask sends it and returns
+   *  its promise: the account query accountQuery, the list of the nodes fetchListed), sent once
+   *  more when it fails for a moment: a failure of the transport and an answer with the status 429 or
+   *  500 to 599 are asked again once, FRONT_RETRY_MS later. A backend that is being deployed
+   *  answers one request with a 503, and a procedure the user started does not end with that
+   *  answer. No other request is sent twice: an outage would double them. */
+  async function frontQuery(turn, ask) {
+    try {
+      return await ask();
+    } catch (error) {
+      const status = failureStatus(error);
+      const moment = failureCode(error) === "transport" || status === 429 || (status >= 500 && status <= 599);
+      if (!moment || !(turnLeft(turn) > FRONT_RETRY_MS)) throw error;
+      await native.sleep(FRONT_RETRY_MS);
+      return ask();
+    }
+  }
+
   /** A gate of limit calls in flight at once: run(work) starts work when a place is free (the
    *  next starts when one ended) and returns its promise. A place is handed to the next waiting
    *  call directly, so never more than limit are in flight. */
@@ -1865,12 +1887,59 @@
     return merged;
   }
 
-  /** Reads the node ledger: the merge of the keychain item and the device copy (when the
-   *  synchronization between devices overwrites one side's write, the other side remains). */
-  function loadLedger() {
+  /** Whether a stored ledger value is one this program does not read: a value that is there and
+   *  is no JSON object whose v is 1. A program after this one wrote it (the keychain item is shared
+   *  by the devices of the account, and the device copy is written by the program this device ran
+   *  last). Such a value may hold what this program must not lose and cannot see: the time the
+   *  user turned the delegation off, a shorter lifetime. A value without content is none. */
+  function ledgerUnknown(json) {
+    if (json === null || json === undefined || json === "") return false;
+    let raw = null;
+    try {
+      raw = JSON.parse(json);
+    } catch (error) {
+      raw = null;
+    }
+    return raw === null || typeof raw !== "object" || Array.isArray(raw) || raw.v !== 1;
+  }
+
+  /** The two stored values of the node ledger as texts, and whether each is one this program
+   *  does not read: {item, copy, itemUnknown, copyUnknown}. A keychain value that is no base64url
+   *  text is one it does not read. */
+  function ledgerSides() {
     const kept = native.keychainGet(ledgerItem());
-    const keychainLedger = parseLedger(kept === null ? null : text(decode(kept)));
-    return mergeLedger(keychainLedger, parseLedger(native.storeGet(LEDGER_STORE_KEY)));
+    let item = null;
+    let undecoded = false;
+    if (kept !== null) {
+      try {
+        item = text(decode(kept));
+      } catch (error) {
+        undecoded = true;
+      }
+    }
+    const copy = native.storeGet(LEDGER_STORE_KEY);
+    return { item: item, copy: copy, itemUnknown: undecoded || ledgerUnknown(item), copyUnknown: ledgerUnknown(copy) };
+  }
+
+  /** Whether the node ledger holds a value this program does not read (ledgerUnknown), on either
+   *  side. A runtime that reads such a ledger does not know whether the delegation is on: it
+   *  hands no grant to any node (a grant it handed would undo a revoke another device of the
+   *  account made with a later program), sends no revoke of its own accord, leaves the value as
+   *  it is (saveLedger), and ends a procedure that needs the delegation with program_stale: the
+   *  program that wrote the value is one that is served to this account, and the app loads it.
+   *  An account without a ledger value (a new account) is not such a runtime. */
+  function ledgerForeign() {
+    const sides = ledgerSides();
+    return sides.itemUnknown || sides.copyUnknown;
+  }
+
+  /** Reads the node ledger: the merge of the keychain item and the device copy (when the
+   *  synchronization between devices overwrites one side's write, the other side remains). A side
+   *  this program does not read (ledgerUnknown) adds nothing to the merge. */
+  function loadLedger() {
+    const sides = ledgerSides();
+    return mergeLedger(
+      parseLedger(sides.itemUnknown ? null : sides.item), parseLedger(sides.copyUnknown ? null : sides.copy));
   }
 
   /** Writes the node ledger to the keychain item and the device copy (a side whose stored value is
@@ -1899,15 +1968,19 @@
         if (utf8(json).length <= LEDGER_LIMIT_BYTES) break;
       }
     }
+    // A side that holds a value this program does not read is left as it is: what a later
+    // program wrote there (a revocation time, a lifetime) is not replaced by a ledger that was
+    // made without it.
+    const sides = ledgerSides();
     const item = ledgerItem();
     const value = encode(utf8(json));
-    if (native.keychainGet(item) !== value) {
+    if (!sides.itemUnknown && native.keychainGet(item) !== value) {
       native.keychainSet({
         service: item.service, account: item.account, value: value,
         synchronizable: true, accessible: "after_first_unlock",
       });
     }
-    if (native.storeGet(LEDGER_STORE_KEY) !== json) native.storeSet(LEDGER_STORE_KEY, json);
+    if (!sides.copyUnknown && sides.copy !== json) native.storeSet(LEDGER_STORE_KEY, json);
   }
 
   // ---- The shared ledger (for the devices of the account that run a program before v43) ----
@@ -2021,7 +2094,10 @@
   /** Starts the exchange of the ledger when this device holds a grant node the last exchange did
    *  not cover, or when force is set (a setting of the delegation changed). Nothing waits for it. */
   function shareLedgerSoon(keys, force) {
-    if (ledgerShareFlight || accountClosed || (force !== true && !ledgerShareDue(loadLedger()))) return;
+    // (A ledger this program does not read in full is not exchanged: the upload replaces the
+    // value of the backend.)
+    if (ledgerShareFlight || accountClosed || ledgerForeign()) return;
+    if (force !== true && !ledgerShareDue(loadLedger())) return;
     ledgerShareFlight = true;
     shareLedger(freeTurn(), keys).then(noop, function (error) {
       try {
@@ -4237,7 +4313,12 @@
       run.entries.set(parsed.key, record);
       run.settled.add(parsed.key);
       if (item.keep === true) run.kept.add(parsed.key);
-      if (item.fresh) markSeen(log, digest);
+      // A key is remembered as judged when its node is an accepted one. What a node of a
+      // measurement no list has wrote is read without the judgement of an accepted node (its
+      // transfers are not followed, and nothing it signed marks the node), so every round reads
+      // its keys again: when release proofs or a later list make the measurement one of an
+      // accepted release, the entries it wrote before are judged as those of an accepted node.
+      if (item.fresh && verdict.state !== "unaccepted") markSeen(log, digest);
       if (checked.failure === "signature") {
         // The body is the one the key names and no signature of its node verifies over it: the
         // node is of no accepted measurement, and the object is shown as not verified.
@@ -4851,9 +4932,14 @@
    *  runtime is stale. */
   function noteStale() {
     const stale = staleRuntime();
-    if (stale !== staleShown) {
-      staleShown = stale;
-      native.publish({ runtime: { program_stale: stale } });
+    // The screens are told the same when the node ledger holds a value this program does not
+    // read (ledgerForeign): a later program wrote it, and the app is to load that program. That
+    // runtime is not stale for the rounds (they judge by what is served), so the value returned
+    // is the one of staleRuntime.
+    const shown = stale || ledgerForeign();
+    if (shown !== staleShown) {
+      staleShown = shown;
+      native.publish({ runtime: { program_stale: shown } });
     }
     if (stale) tellStale();
     return stale;
@@ -4891,9 +4977,9 @@
     };
   }
 
-  /** The account query. */
+  /** The account query, sent once more after an answer that fails for a moment (frontQuery). */
   function accountQuery(turn) {
-    return api(turn, "GET", ACCOUNT_PATH);
+    return frontQuery(turn, function () { return api(turn, "GET", ACCOUNT_PATH); });
   }
 
   /** Asks the account query for what it says of the served program alone (a round that is
@@ -5390,8 +5476,11 @@
     // SERVED_FRESH_MS ago, that no later program is served (releaseConfirmed). A round that
     // holds such a measurement and no such reading asks for the account once: a round the
     // screen started long after a synchronization read it.
+    // Whether this round asked for the account (a round asks once).
+    let askedServed = false;
     if (!away && programDelivery() === null && heldPastGrace(log.unaccepted, now) &&
         (servedProgram === null || now - servedProgram.read_ms > SERVED_FRESH_MS)) {
+      askedServed = true;
       try {
         await readServed(judging);
       } catch (failure) {
@@ -5496,6 +5585,24 @@
     const incomplete = blocked || unreachable || run.truncated || run.cut || grace > 0;
     const status = reasons.length > 0 ? "attention" : incomplete ? "pending" : "verified";
     const before = keptLogState();
+    // A round that is about to mark a log that is not marked judges by what is served now. When
+    // what this runtime read of the served program is none, or older than SERVED_FRESH_MS (a
+    // round the screen started long after a synchronization), the round asks for the account
+    // once before it writes, publishes or tells anything. An answer that names a later version
+    // ends the round as one of a stale runtime: what a later release writes is nothing this
+    // program marks the log by. Without an answer the round stands as it was judged: a backend
+    // that leaves the account query unanswered puts off no mark that way (the mark of a
+    // measurement no list has waits for that answer by itself: releaseConfirmed). A round of a
+    // log that is marked already, and a round that marks nothing, send no such request.
+    if (status === "attention" && before.status !== "attention" && !away && !askedServed &&
+        (servedProgram === null || native.nowMs() - servedProgram.read_ms > SERVED_FRESH_MS)) {
+      try {
+        await readServed(judging);
+      } catch (failure) {
+        if (failureCode(failure) === "cancelled") throw failure;
+      }
+      if (staleRuntime()) return staleRound(run, pages);
+    }
     const state = {
       status: status, verified_ms: status === "pending" ? before.verified_ms : now,
       unverified_nodes: conflicts, missing: log.missing.length, expired: 0, unknown_nodes: established,
@@ -8750,7 +8857,8 @@
    *  one). This program hands such a node no grant (an entry of a grant this program made there
    *  is one the programs before it cannot explain), and sends it the revokes. */
   async function fetchListed(turn) {
-    const listed = (await api(turn, "GET", GRANTS_PATH)).json.nodes;
+    // (Sent once more after an answer that fails for a moment: frontQuery.)
+    const listed = (await frontQuery(turn, function () { return api(turn, "GET", GRANTS_PATH); })).json.nodes;
     const out = [];
     for (const item of Array.isArray(listed) ? listed : []) {
       if (item === null || typeof item !== "object" || typeof item.node !== "string" || !NODE_ID.test(item.node)) continue;
@@ -8798,6 +8906,8 @@
    *    the backend reports no grant row of the account on it, and the last grant this device sent
    *    it is GRANT_REFILL_MS old, or
    *    options.force is set (a new lifetime applies at once).
+   *  With options.whole, no grant goes out when a listed node is one this runtime sends no grant
+   *  command to (a node of a later release, a node whose attestation did not verify).
    *  A synchronization without such a node sends no request that calls a node. A node whose
    *  attestation is requested has it verified and receives a grant with the lifetime the ledger
    *  sets; the grants go out together (one stage). A node is kept among the grants of this device
@@ -8904,6 +9014,16 @@
       saveNodes(nodes);
       storeJson(STORE_UNACCEPTED, unaccepted);
     }
+    // options.whole: the grants go out to every listed node or to none. When a listed node is
+    // one this runtime sends no grant command to (a node of a later release, a node whose
+    // attestation did not verify), no grant goes out: the caller applies a setting to all the
+    // nodes that hold the grant of the account, or does not apply it (setGrantDays).
+    if (options.whole === true && later + rejected > 0) {
+      return {
+        accepted: accepted, rejected: rejected, failed: failed, later: later, granted: 0,
+        ledgerChanged: false, guards: guards,
+      };
+    }
     const sentMs = native.nowMs();
     for (const item of wanted) {
       const node = item.node;
@@ -9000,7 +9120,13 @@
     const ledger = loadLedger();
     const grants = loadGrants();
     let renewed = { accepted: new Set(), rejected: 0, failed: 0, later: 0, granted: 0, ledgerChanged: false, guards: [] };
-    if (!delegationOff(ledger)) {
+    if (ledgerForeign()) {
+      // The ledger holds a value this program does not read: whether the delegation is on is
+      // not known to this runtime. No grant goes out (the renewals and the grants a push asks for
+      // among them), and no revoke of the step's own accord (a later program may have turned the
+      // delegation on again). The screens are told that the program is behind.
+      noteStale();
+    } else if (!delegationOff(ledger)) {
       renewed = await renewGrants(turn, keys, ledger, grants, options);
     } else {
       try {
@@ -9013,27 +9139,43 @@
     saveGrants(grants);
     if (renewed.ledgerChanged) saveLedger(ledger);
     const grant = grantState(ledger, grants, renewed.accepted, native.nowMs());
-    native.publish({
-      state: { grant: grant, grant_days: ledger.ttl_days },
-      runtime: { rejected_nodes: renewed.rejected },
-    });
+    // (A runtime that does not read the ledger publishes no state of the grants: the app keeps
+    // what the last runtime that read it published.)
+    if (!ledgerForeign()) {
+      native.publish({
+        state: { grant: grant, grant_days: ledger.ttl_days },
+        runtime: { rejected_nodes: renewed.rejected },
+      });
+    }
     return { ledger: ledger, grants: grants, renewed: renewed, grant: grant };
   }
 
+  /** The failure of a procedure that needs the delegation in a runtime whose ledger holds a value
+   *  this program does not read (ledgerForeign): program_stale, with the runtime value published
+   *  that tells the screens so. */
+  function ledgerStale() {
+    noteStale();
+    return native.error("program_stale", "the ledger is one of a later program");
+  }
+
   /** The front of a procedure that needs a node holding the grant of this account: under the grant
-   *  lock, the account query and the list of the nodes are sent together, the key is judged, and
-   *  the grants are handed to the nodes that are to receive one. When delegation is off it is
-   *  delegation_off; when no listed node holds a grant it is grant_required (attestation_failed
-   *  when every listed node failed the attestation verification or is of a release later than this
-   *  program). Returns {keys, ledger, grants}. */
+   *  lock, the account query and the list of the nodes are sent together (each once more after an
+   *  answer that fails for a moment: frontQuery), the key is judged, and the grants are handed to
+   *  the nodes that are to receive one. When delegation is off it is delegation_off; when no
+   *  listed node holds a grant it is grant_required (attestation_failed when every listed node
+   *  failed the attestation verification or is of a release later than this program); in a stale
+   *  runtime that no listed node takes a grant of, and in a runtime whose ledger holds a value
+   *  this program does not read, it is program_stale. Returns {keys, ledger, grants}. */
   function withGrants(turn) {
     return grantLock.run(turn, async function () {
       const account = accountQuery(turn);
       account.then(noop, noop);
       const held = readMasterKey() !== null;
-      if (held && delegationOff(loadLedger())) {
+      const foreign = held && ledgerForeign();
+      if (held && (foreign || delegationOff(loadLedger()))) {
         const judged = await judgeKey(turn, account);
         if (judged.keyState !== "present") throw native.error("key_required", judged.keyState);
+        if (foreign) throw ledgerStale();
         throw native.error("delegation_off", "delegation is turned off");
       }
       const listed = held ? settled(fetchListed(turn)) : null;
@@ -9063,6 +9205,9 @@
    *  custody that no node can open). */
   async function recordCustody(turn) {
     let ledger = loadLedger();
+    // (A ledger this program does not read may say that the delegation is off: no record is made
+    // for a node to open on what this device kept alone.)
+    if (ledgerForeign()) throw ledgerStale();
     if (delegationOff(ledger)) throw native.error("delegation_off", "delegation is turned off");
     let custody = heldCustody(ledger, loadGrants(), native.nowMs());
     if (custody === null) {
@@ -9156,10 +9301,13 @@
   async function runSync(turn, trigger) {
     try {
       const step = await grantLock.run(turn, async function () {
+        // (The account query and the list of the nodes are each sent once more after an answer
+        // that fails for a moment: frontQuery.)
         const account = accountQuery(turn);
         account.then(noop, noop);
         const held = readMasterKey() !== null;
-        const listed = held && !delegationOff(loadLedger()) ? settled(fetchListed(turn)) : null;
+        const listed = held && !ledgerForeign() && !delegationOff(loadLedger())
+          ? settled(fetchListed(turn)) : null;
         const judged = await judgeKey(turn, account);
         if (judged.keyState !== "present") return { judged: judged, grants: null };
         return { judged: judged, grants: await grantStep(turn, judged.keys, { listed: listed, refill: trigger.refill === true }) };
@@ -9381,6 +9529,31 @@
     }
   }
 
+  /** The grants of this device for the statement of the node the backend named (node). When that
+   *  node is none this device handed a grant to, the step of the grants runs once more
+   *  (withGrants): the delegation of the account may have moved to a node the list did not name
+   *  when the procedure read it, and the backend named that node. The device then verifies the
+   *  attestation of that node and hands it a grant, as it does for every listed node, and its
+   *  statement is judged as before. A node this device still did not verify and hand a grant to
+   *  makes no statement it accepts: the caller fails as before, and in a stale runtime the
+   *  failure is program_stale. The step runs once. Returns the grants. */
+  async function grantsNaming(turn, grants, node) {
+    if (typeof node !== "string" || !NODE_ID.test(node) || grants[node] !== undefined) return grants;
+    let held = null;
+    try {
+      held = await withGrants(turn);
+    } catch (error) {
+      const code = failureCode(error);
+      if (code === "cancelled" || code === "program_stale" || !(turnLeft(turn) > 0)) throw error;
+      native.log("grant step for the named node: " + code);
+      return grants;
+    }
+    if (held.grants[node] === undefined && noteStale()) {
+      throw native.error("program_stale", "the backend named a node this program hands no grant to");
+    }
+    return held.grants;
+  }
+
   /** A connection: opens the authorization address a node made in the web authentication session
    *  and, after the callback, checks the completion statement of the node. The authorization address
    *  is opened only after a statement of a node this device handed a grant to verified over its
@@ -9403,7 +9576,10 @@
     }
     const begin = (await api(turn, "POST", "/api/secure/connections/begin", sent)).json;
     const user = userId();
-    const opening = nodeStatement(held.grants, begin.node, begin.statement);
+    // (The node the backend named may be one the delegation moved to since the list was read:
+    // grantsNaming.)
+    const grants = await grantsNaming(turn, held.grants, begin.node);
+    const opening = nodeStatement(grants, begin.node, begin.statement);
     const authorized = opening !== null && opening.type === "oauth_begin" && opening.node === begin.node &&
       opening.user_id === user && sameBytes(opening.sign_pk, keys.signPk) &&
       typeof begin.state === "string" && opening.state === begin.state &&
@@ -9439,7 +9615,7 @@
     if (!query.oauth_state) throw native.error("unverified_connection", "callback state");
     const completion = (await api(
       turn, "GET", "/api/secure/connections/completion", null, { state: query.oauth_state })).json;
-    const closing = nodeStatement(held.grants, begin.node, completion.statement);
+    const closing = nodeStatement(grants, begin.node, completion.statement);
     const completed = closing !== null && closing.type === "oauth_complete" && closing.node === begin.node &&
       closing.user_id === user && sameBytes(closing.sign_pk, keys.signPk) && closing.state === begin.state;
     if (!completed) throw native.error("unverified_connection", "completion statement");
@@ -9516,7 +9692,7 @@
     if (typeof args.request_id === "string") body.request_id = args.request_id;
     if (typeof args.setup_id === "string") body.setup_id = args.setup_id;
     const saved = (await api(turn, "PUT", "/api/secure/connections/naver_mail/app-password", body)).json;
-    const statement = nodeStatement(grants, saved.node, saved.statement);
+    const statement = nodeStatement(await grantsNaming(turn, grants, saved.node), saved.node, saved.statement);
     const verified = statement !== null && statement.type === "app_password_verified" &&
       statement.node === saved.node && statement.user_id === userId() &&
       sameBytes(statement.sign_pk, keys.signPk) && statement.provider === "naver_mail" &&
@@ -10504,6 +10680,8 @@
     }
     return grantLock.run(turn, async function () {
       const keys = await presentKeys(turn);
+      // (A ledger this program does not read takes no setting of this program.)
+      if (ledgerForeign()) throw ledgerStale();
       const ledger = loadLedger();
       const kept = { ttl_days: ledger.ttl_days, ttl_set_ms: ledger.ttl_set_ms };
       ledger.ttl_days = days;
@@ -10511,10 +10689,19 @@
       saveLedger(ledger);
       let grant = grantState(ledger, loadGrants(), new Set(), native.nowMs());
       let failed = 0;
+      // A shorter lifetime in a stale runtime: a listed node this runtime sends no grant command
+      // to (a node of a release this program does not list, a node whose attestation it does not
+      // verify) may hold the grant of the account with the lifetime before. The step then sends
+      // no grant at all (whole), and the call ends with program_stale and the lifetime as it
+      // was: the setting is not applied to a part of the nodes without a word. No revoke goes to
+      // such a node (the work the account has that node do would stop until the app has loaded
+      // the program that is served).
+      const whole = days < kept.ttl_days && staleRuntime();
+      let behind = false;
       if (!delegationOff(ledger)) {
         let step = null;
         try {
-          step = await grantStep(turn, keys, { force: true });
+          step = await grantStep(turn, keys, { force: true, whole: whole });
         } catch (error) {
           const back = loadLedger();
           back.ttl_days = kept.ttl_days;
@@ -10524,10 +10711,11 @@
         }
         grant = step.grant;
         failed = step.renewed.failed;
+        behind = whole && step.renewed.later + step.renewed.rejected > 0;
         // A node listed for its revokes alone takes no grant of the new lifetime. When the
         // lifetime was shortened, the grant it holds may end later than a grant of the new
         // lifetime: the revoke goes to it. A longer lifetime sends it nothing.
-        if (days < kept.ttl_days && step.renewed.guards.length > 0) {
+        if (!behind && days < kept.ttl_days && step.renewed.guards.length > 0) {
           let unconfirmed = true;
           try {
             unconfirmed = await revokeNodes(turn, keys, step.renewed.guards);
@@ -10539,13 +10727,17 @@
         }
       }
       const written = loadLedger();
-      if (failed > 0) {
+      if (failed > 0 || behind) {
         written.ttl_days = kept.ttl_days;
         written.ttl_set_ms = kept.ttl_set_ms;
         saveLedger(written);
       }
       native.publish({ state: { grant: grant, grant_days: written.ttl_days } });
       shareLedgerSoon(keys, true);
+      if (behind) {
+        noteStale();
+        throw native.error("program_stale", "a listed node takes no grant command of this program");
+      }
       if (failed > 0) throw native.error("grant_incomplete", "a listed node did not take the grant");
       return { grant: grant, days: written.ttl_days };
     });
@@ -10561,6 +10753,15 @@
     const done = await grantLock.run(turn, async function () {
       const keys = await presentKeys(turn);
       const ledger = loadLedger();
+      // A ledger that holds a value this program does not read (ledgerForeign) takes no setting
+      // of this program. Turning the delegation on hands no grant and ends with program_stale.
+      // Turning it off sends the revoke to every listed node, as the user asked (a revoke hands
+      // no key over), writes the revocation time to the side of the ledger this program reads
+      // (the later program reads it from there when this device runs it), and ends with
+      // program_stale as well: the devices that run the later program do not learn of it from
+      // this one, and may hand their grants again.
+      const foreign = ledgerForeign();
+      if (foreign && args.enabled) throw ledgerStale();
       // The resumption time is not before the revocation time and the revocation time is after the
       // resumption time: the last operation decides the state of the switch even when the device
       // clock runs backwards or the clock of another device runs ahead.
@@ -10583,6 +10784,7 @@
       written.revoked_ms = revoked;
       saveLedger(written);
       const grant = grantState(written, grants, new Set(), revoked);
+      if (foreign) throw ledgerStale();
       native.publish({ state: { grant: grant } });
       shareLedgerSoon(keys, true);
       if (incomplete) throw native.error("revoke_incomplete", "a listed node did not confirm");
