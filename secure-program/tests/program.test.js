@@ -1764,7 +1764,7 @@ test("a later page of the screen that fails for the network of the device, or on
   }
 });
 
-test("A3: a later page that is held back from the screen and then given ends what was noted for it and nothing noted for a page below it: the page that stays held back marks the log, however many pages above it are held back and given in between", async () => {
+test("A3: a later page that is held back from the screen and then given ends what was noted for it and nothing noted for a page below it: the page that stays held back marks the log, however many pages above it are held back and given in between, and the mark ends when the screen made no such read for thirty days", async () => {
   const fx = S.fixture(source, { device: { securityStatus: true } });
   await S.start(fx);
   const world = fx.world;
@@ -1826,17 +1826,16 @@ test("A3: a later page that is held back from the screen and then given ends wha
   assert.equal(world.state.log.status, "attention");
   assert.equal(world.state.log.store_failure, "screen:held");
   assert.deepEqual(world.securityStatuses.slice(-1)[0].reasons, ["verification_blocked"]);
-  // Reads that mark the log stay, however long the screen does not ask again.
-  world.advance(40 * DAY_MS);
+  // Reads that mark the log stay while the last of them is less than thirty days old.
+  world.advance(20 * DAY_MS);
   await S.event(fx, "foreground");
   assert.equal(world.state.log.status, "attention");
   assert.equal(world.stored("log.denied").pages.length, 3);
-  // The screen reads the lowest of those pages: every read noted ends, and a round clears the mark.
-  const served = await S.call(fx, "read_log_page", { before_ms: noted[0] });
-  assert.equal(served.ok, true);
-  await world.settle(1000);
-  assert.equal(world.stored("log.denied"), undefined);
+  // The screen makes no such read for thirty days: the mark ends with the round after that.
+  world.advance(11 * DAY_MS);
+  await S.event(fx, "foreground");
   assert.equal(world.state.log.status, "verified");
+  assert.equal(world.securityStatuses.slice(-1)[0].status, "ok");
 });
 
 test("a later page that was held back from the screen is ended by listings the screen reads itself that name its keys: the first listings of the next opening end it without a scroll, and a read the screen does not make again ends thirty days after it was noted", async () => {

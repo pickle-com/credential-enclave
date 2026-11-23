@@ -241,7 +241,8 @@
   // LOG_DENIED_INTERVAL_MS old (20 hours: the reads of one day are one, and the reads of two
   // days in a row are two, whatever the hours of the day), and a read noted that is not among
   // reads that mark the log ends LOG_DENIED_KEPT_MS after it was noted: the reads that mark the
-  // log are reads held back on three days within that time.
+  // log are reads held back on three days within that time. Reads that mark the log end
+  // together when the last of them is that old.
   const LOG_DENIED_CHAINS = 8;
   const LOG_DENIED_READS = 8;
   const LOG_DENIED_INTERVAL_MS = 20 * 3600000;
@@ -6028,15 +6029,18 @@
   // old. A read noted that is not among reads that mark the log ends LOG_DENIED_KEPT_MS after it
   // was noted: the reads that mark the log are reads held back on three days within that time,
   // none of which the screen has read since. Reads that mark the log stay until the screen
-  // reads what was held back, within the retention of the store.
+  // reads what was held back, or until the last of them is LOG_DENIED_KEPT_MS old: the screen
+  // then made no such read for that long, and a mark that nothing confirms any more ends.
 
   /** The reads held back from the screen that the screen has not read since: {pages, chains}.
    *  pages are the later pages, the earliest first: [{t, before_ms, limit}] (the time the read
    *  was noted, the lowest time a page held back on its day begins below, the most events such
    *  a page was asked for). chains maps a node id to the listings of its chain, the earliest
    *  first: [{t, after, deep}] (the lowest seq a listing held back on its day began after, and
-   *  whether one of them was a listing below the keys the screen knew). A time that lies after
-   *  now is the clock of the device having run backwards: it counts as now. */
+   *  whether one of them was a listing below the keys the screen knew). A read noted that is
+   *  LOG_DENIED_KEPT_MS old is left out, unless it is among reads that mark the log and the
+   *  last of those is younger than that. A time that lies after now is the clock of the device
+   *  having run backwards: it counts as now. */
   function loadDenied() {
     const kept = storedObject(STORE_DENIED);
     const now = native.nowMs();
@@ -6051,8 +6055,10 @@
       }
       list.sort(function (a, b) { return a.t - b.t; });
       const all = list.slice(0, LOG_DENIED_READS);
-      const age = heldLong(all, now) ? LOG_RETENTION_DAYS * DAY_MS : LOG_DENIED_KEPT_MS;
-      return all.filter(function (read) { return now - read.t < age; });
+      // Reads that mark the log stay together while the last of them is young enough; any
+      // other read ends by its own age.
+      if (heldLong(all, now)) return now - all[all.length - 1].t < LOG_DENIED_KEPT_MS ? all : [];
+      return all.filter(function (read) { return now - read.t < LOG_DENIED_KEPT_MS; });
     };
     const denied = {
       pages: reads(kept.pages, function (item) {
