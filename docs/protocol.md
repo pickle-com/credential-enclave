@@ -1281,7 +1281,7 @@ Test vectors of the assignment; the backend of the operator computes the same fu
 | Name | Value |
 | --- | --- |
 | Longest time of a grant | 30 days (of node time. A node accepts a larger value and shortens it) |
-| Interval at which the app renews a grant | 24 hours |
+| Interval at which the app renews a grant | The smaller of 24 hours and half of the lifetime of the grant |
 | Lifetime of a challenge | 300 seconds |
 | Lifetime of a pending authorization | 600 seconds |
 | Merge window of identical GET requests | 300 seconds |
@@ -1308,19 +1308,22 @@ Test vectors of the assignment; the backend of the operator computes the same fu
 | Pending entries of an account at which a call that uses a credential creates no entry (`PENDING_ENTRIES`) | 64 |
 | Interval of the sweep of a node, which writes the pending entries of every account again (`SWEEP_INTERVAL`) | 30 seconds |
 | Retention of an object of the log store (Object Lock), expiry of the bucket lifecycle (`LOG_RETENTION_DAYS`, `LOG_EXPIRY_DAYS`) | 365 days from the node time of the write, 400 days |
-| `LOG_VERIFY_KEYS` (the app) | 8,000: the keys one index verification run walks (a run that spends them is cut short, as a run that reaches its time budget: 7.4) |
-| `LOG_VERIFY_BODIES` (the app) | 2,000: the entry bodies one run reads (a run that spends them is cut short, as above) |
-| `LOG_VERIFY_TIME_MS`, `LOG_VERIFY_LEAST_STEPS` (the app) | 10,000 and 8: the time from the start of one index verification run after which the run stops walking (the chains not walked and the rest of the chain being walked stay pending at their verification points, and the next synchronization of the runtime walks on), once the run has made at least that many steps (keys walked or bodies read); a run cut short makes no mark unless `LOG_STORE_STALE_MS` has passed since the entry it would mark for was first verified (7.4) |
-| `LOG_EXPIRES_DAYS` (the app) | 365: the age at which a reader treats the absence of an entry as expired, the retention of its lock (7.4) |
-| `LOG_GAP_GRACE_MS` (the app) | 3,600,000: a gap whose first key after it is younger than this leaves the chain pending, not attention (7.4) |
-| `LOG_SCREEN_EVENTS` (the app) | 50: the events of one further page of the log screen (the first page reads the events its definition asks for) |
-| `LOG_SUMMARY_DAYS`, `LOG_SUMMARY_STEP`, `LOG_SUMMARY_ENTRIES` (the app) | 7, 100, 1,000: the days of the summary of the log screen (the reads, sends and changes of the events of the entries of that window, counted once per device from their bodies and kept on the device as the summary tally), the entries one read of the screen counts before answering and each later step counts, and the most entries of the window the tally counts (the screen shows the counts with a plus while entries of the window are not counted) |
-| `LOG_STORE_STALE_MS` (the app) | 3 days: reads of the store that have been failing for this long mark the log (a node discovery listing beyond `LOG_STORE_PAGES` pages is a failing read); the first run that read the store (verified, or truncated by the node discovery window) clears the mark, pending at its walk or not. The same time bounds a node found in the store only that holds an entry sealed to the key of this account: once it has passed since the entry was first verified, a run cut short by one of its budgets (time, keys, bodies, or the listing pages of one chain) marks the node too (7.4) |
-| `LOG_STORE_NODES` (the app) | 16: the nodes of the listing the list of nodes does not know that one verification run examines, beginning after the discovery cursor of the list of nodes (the node the last run examined last) and wrapping to the start of the listing; the nodes beyond them are examined by the next synchronizations, and a node under examination stays in the list of nodes with its verification point until its chain is walked to the head (7.4) |
-| Listing pages one verification run reads per node (the app) | 8 pages of 1,000 keys |
-| Object versions one verification run fetches at a time (the app) | 8 |
-| `LOG_RUN_STALE_MS` (the app) | 600,000: a run whose judgement took longer than this is judged again on fresh reads (7.4) |
-| `LOG_STORE_ATTEMPTS`, `LOG_STORE_RETRY_MS` (the app) | 3 attempts of one request to the store, pauses of 500 and 1,500 milliseconds between them: a transport failure, a 429 and a 5xx status are tried again |
+| `API_TIMEOUT_MS`, `LOG_API_TIMEOUT_MS`, `LOG_STORE_TIMEOUT_MS`, `NODE_TIMEOUT_MS` (the app) | 30,000, 10,000, 10,000 and 30,000: the time limit of a request to the backend, of a request of a round or of the log screen to the backend, of one attempt of a request to the log store, and of a command to a node through the relay route ("The program of the app") |
+| `PROCEDURE_LIMIT_MS`, `LOG_ROUND_LIMIT_MS` (the app) | 100,000 and 60,000: the longest time of one procedure, without the time the device waits for the user, and of one round |
+| `GRANT_REFILL_MS`, `ATTESTATION_NODES` (the app) | 60,000: the age of the last grant the device sent a node from which a synchronization of the push reason `grant_required` hands that node a grant again when the backend reports none for it. 32: the nodes one attestation request names |
+| `LOG_ROUND_INTERVAL_MS`, `LOG_ROUND_RETRY_MS` (the app) | 24 hours and 60,000: a synchronization runs a round when the last completed one is this old, and tries a round that did not complete again not sooner than this after it |
+| `LOG_CONTROL_PAGES` (the app) | 4: the listing pages of the control prefix one round reads (1,000 object versions each); a longer listing is read on by the next round |
+| `LOG_DOCUMENT_NODES`, `LOG_DOCUMENT_REQUESTS`, `LOG_BODY_KEYS`, `LOG_ROUND_BODY_REQUESTS` (the app) | 64 and 2: the nodes one request for node documents names, and such requests per round. 200 and 4: the keys one request for bodies names, and such requests per round |
+| `LOG_RELEASE_GRACE_MS` (the app) | 24 hours: the time a measurement no list of the program has may hold the key of the account before it marks the log (A1) |
+| `LOG_BLOCKED_ROUNDS`, `LOG_BLOCKED_MS`, `LOG_REACH_MS`, `LOG_URL_FRESH_MS` (the app) | 3 and 3 days: the rounds in a row whose reads were held back, and the age of the first of them, at which the log is marked (A3). 60,000: a request that was not answered counts as held back when the backend answered another request of the runtime within this time. 240,000: the age of a signed address from which a refusal of the store is the age of the address |
+| `LOG_RETENTION_DAYS` (the app) | 365: a key older than this is expected by no reader (the retention of its lock), and a key is expected in the listing while it is a day younger (A4) |
+| `LOG_SAMPLE_KEYS`, `LOG_SEEN_KEYS`, `LOG_NODES_KEPT` (the app) | 64, 4,096 and 256: the control keys of the sample of A4, the digests of the control keys the device judged, and the nodes whose judgement the device keeps |
+| `LOG_SCREEN_EVENTS`, `LOG_KEEP_EVENTS`, `LOG_SCREEN_WAIT_MS` (the app) | 50, 50 and 3,000: the events of one further page of the log screen, the events of the first page the device keeps, and the time `read_log` waits for the read of the store before it answers from what the device kept |
+| `LOG_SUMMARY_DAYS`, `LOG_SUMMARY_ENTRIES`, `LOG_SUMMARY_REQUESTS` (the app) | 7, 1,000 and 5: the days of the summary of the log screen, the most entries one opening counts into it, and the requests for bodies one opening of the screen sends |
+| `LEGACY_NODES`, `LEGACY_ROUND_PASSES`, `LEGACY_ROUND_BODIES`, `LEGACY_CLOSE_SLACK_MS` (the app) | 64, 4, 64 and 1 day: the chains of formats 1 and 2 one round follows, the passes of listings and the entry bodies it spends on them, and the time after the end of a grant at which the chain of its node is read for the last time |
+| `LOG_STORE_CONCURRENCY`, `LOG_STORE_OBJECTS` (the app) | 8 and 100: the reads of the bucket of formats 1 and 2 in flight at once, and the object versions one address request names |
+| `LOG_STORE_ATTEMPTS`, `LOG_STORE_RETRY_MS` (the app) | 2 attempts of one request to the store, a pause of 500 milliseconds between them: a transport failure, a 429 and a 5xx status are tried again |
+| `OUTCOME_BOUNDS_MS`, `OUTCOME_EVENTS`, `OUTCOME_SLOW_MS` (the app) | 250, 1,000, 3,000, 10,000 and 30,000: the upper bounds of the classes a time of a procedure is counted into. 32: the calls a report carries one by one. 10,000: the time from which a call is reported one by one |
 | Body limit | 64 MiB (67,108,864 bytes) |
 | Longest `context` | 256 characters |
 
@@ -1367,6 +1370,312 @@ against its attested grant ledger and every binding against the record it create
 `record_id`, `provider`, `operation`, typed `request`, `body_bytes`, `body_sha256` and `context`.
 The act starts only after the log store confirmed it. This is an attempted act, not a delivery
 receipt. Message content and application passwords are not in the event.
+
+## The program of the app
+
+This section states what the secure program of this repository (`secure-program/secure-program.js`,
+from version 43 on) does on a device: the order of its work and its time limits, the
+synchronization that hands the grants, how it reads and judges the log, what it shows on the log
+screen, what it reports, and the procedures of the vault secrets. "The app" of sections 3 to 7 and
+10 is this program. The formats, the commands and the verifications it applies are those of the
+sections named in each part. Every number of this section is a constant of the program.
+
+### The lines, the locks and the time limits
+
+The work of the program runs on three lines. A line runs one piece of work at a time, in the order
+of the calls, and the lines do not wait for one another.
+
+| Line | What runs on it |
+| --- | --- |
+| The procedures a user starts | `create_key`, `reset_key`, `connect`, `set_connection_writes`, `manage_repositories`, `connect_app_password`, `begin_app_password_setup`, `cancel_app_password_setup`, `store_login`, `store_card`, `store_secret`, `reveal_secret`, `update_secret`, `delete_secret`, `reveal_login_password`, `set_grant_days`, `set_delegation`, the five procedures of the master key transfer and the steps of its polling |
+| The synchronizations | The procedure `sync` and the synchronization an event starts. One runs and at most one waits: a trigger that arrives while one waits is served by the one that waits |
+| The reads of the log screen | The read of the first page that `read_log` starts, `read_log_page` and `read_security_record` |
+
+Two locks protect what two lines could change at once. The lock of the grants holds from the
+judgement of the key to the record of the replies of the grant commands: a synchronization, and a
+procedure that makes sure a node holds the grant before it connects or stores, do not overlap in
+that span. The lock of the round holds one round of the log. Whoever holds a lock waits only for
+requests, and every request has a time limit.
+
+| Limit | Value |
+| --- | --- |
+| A request to the backend of a round or of the log screen | 10 s |
+| A request to the log store (two attempts: a transport failure, a 429 and a 5xx status are tried once more after 0.5 s) | 10 s per attempt |
+| Any other request to the backend, and a command to a node through the relay route | 30 s |
+| One procedure, from its call to its end | 100 s |
+| One round, from its start | 60 s |
+
+A request that is not answered within its limit fails with the code `timeout`; an answer that
+arrives later is dropped. A procedure whose time is used up fails with `timeout` and its line goes
+on to the next call. The time the runtime spends in an operation that waits for the user (`webAuth`,
+`deviceOwnerAuth`, `promptSecret`, `presentSecret`) is not counted into the time of any procedure,
+as the executors of the apps do not count it into their own limit of 120 s. Every loop of the
+program has a bound on its turns (pages of a listing, requests, polls); the polling of a master
+key transfer ends with the expiry of the transfer.
+
+### The events
+
+| Event | What the program does |
+| --- | --- |
+| `session_ready` | Clears the state of a master key transfer (a runtime does not take over the transfer of the runtime before it), publishes whether the build has the protected sheets, counts the calls the runtime before left open as interrupted, and starts a synchronization |
+| `foreground` | Starts a synchronization |
+| `background` | Notes the time for the calls that are open (the report of the outcomes) |
+| `push` | With the reason `transfer_request`: reads the pending requests of a master key transfer. With any other reason: starts a synchronization and, when it ended, sends the report of the synchronization. A synchronization of the reason `grant_required` hands a grant again to a node the backend reports no grant for (below) |
+| `account_end` | With the reasons `account_deleted` and `dev_reset`: deletes the master key item, the node ledger and the reception key of a mail setup from the key store, and everything the program store holds of the account. Work that is still running writes nothing of the account after that |
+
+A synchronization the app itself triggers (`session_ready`, `foreground`) within 5 s of the start
+of the one that runs is served by that one.
+
+### The synchronization
+
+1. `GET /api/secure/account` and, when the device holds a master key and delegation is on,
+   `GET /api/secure/grants`, sent together. The second lists the nodes of the account without
+   calling a node: `{"nodes":[{"node","not_after_ms"}]}`, where `not_after_ms` is the end of the
+   grant the backend recorded for the account on that node, or null.
+2. The judgement of the key: the master key of the key store against the `key_id` registered on
+   the account (`absent`, `waiting`, `present`, `mismatch`, `account_mismatch`). A device with a
+   master key registers its public keys when the account has none.
+3. With the key `present` and delegation on, a listed node receives a grant when one of these
+   holds: the device keeps no grant of it; the last grant the device handed it is the renewal
+   interval old (the smaller of 24 hours and half of the lifetime of a grant); or the
+   synchronization was started by a push of the reason `grant_required`, the backend reports no
+   grant for the node (`not_after_ms` null), and the last grant the device sent it is 60 s old.
+   What the backend reports decides nothing else: when a grant was handed and when it ends is what
+   the device kept.
+4. When a node is to receive a grant, the program requests the attestation of those nodes only
+   (`GET /api/secure/nodes` with `nonce` and `nodes`, the ids joined by commas, 32 per request),
+   verifies each (4.3 and the next part), and sends the grant commands together (5.2). A
+   synchronization without such a node sends no request that calls a node. A backend that has no
+   route `GET /api/secure/grants` (status 404) is asked for the attestation of every node of the
+   account instead, and what the device kept decides which of them receives a grant. Any other
+   failure of the list fails the synchronization: a failed answer is never read as a list of nodes
+   without grants.
+5. With delegation off, the revoke is sent again to every listed node (5.4).
+6. The state of the grants is published (`state.grant`: `active`, `partial`, `none`, `off`, with
+   the earliest end), and `runtime.ready`.
+7. While delegation is on, the sealing of values stored before the switch to device-side
+   sealing (`GET` and `PUT /api/secure/sealing`, until a query found none) and the completion
+   of a mail setup; then a round of the log when one is due.
+8. The catch-up of a master key transfer.
+
+A procedure that needs a node holding the grant (a connection, the storing of a value) runs steps
+1 to 4 once under the lock of the grants. With delegation off it fails with `delegation_off`; when
+no listed node holds a grant, with `grant_required`, or with `attestation_failed` when every listed
+node failed the verification or is of a release the program does not list. The statements a node
+signs for a connection (8.2) are verified under the node id of a node the device handed a grant to.
+
+### The nodes that receive a grant
+
+A node receives a grant when its attestation verifies (4.3) and:
+
+- its measurement (PCR0, PCR1, PCR2) equals an element of the list of accepted releases of the
+  program (4.5). A document that verifies with a measurement no list has is the document of a
+  release later than the program: the node receives no grant and is not asked again by that
+  program;
+- its binding names the log store of the server target (4.3 step 10, a node of platform
+  `nitro`);
+- its binding has no `role`, or the role `reserve` (a node that holds delegations and takes no
+  call that uses a credential). A node whose binding has the role `forward` (a node that holds no
+  delegation) or any other role receives no grant.
+
+A node of platform `local` (4.4) is taken when the server target is one of the operator custody
+targets, in a debug build, and in a build made for the local stack (`deviceInfo().local_stack_build`).
+
+### What the device keeps
+
+The program store holds, per account, what the device knows of its grants and of the log. None of
+it is a secret; what names services and addresses is sealed with a key derived from the master key
+(HKDF-SHA256, info `pickle.secure.v1.log-cache`).
+
+| Key | Content |
+| --- | --- |
+| `log.grants` | The nodes this device handed a grant to: the time of the grant, its end, the release and platform of the node, the time of the last attempt. A node is written before its grant goes out |
+| `log.nodes` | What the node documents said: per node id the digest of the measurement, the platform, the release, the time first seen, and the time a contradiction of its signatures was found |
+| `log.unaccepted` | The measurements no list of the program has, each with the time it was first seen and whether the key of the account went to a node of it |
+| `log.blocked` | The rounds in a row whose reads were held back: the time of the first and their number |
+| `log.sample` | The 64 latest control keys the device verified |
+| `log.seen` | The digests of the control keys the device judged (4,096 at most) |
+| `log.missing` | The keys of the sample that left the listing within their retention |
+| `log.cursor`, `log.resume` | The latest control key of the last round that covered the whole listing, and where a round that its page limit cut short goes on |
+| `log.legacy` | The chains of formats 1 and 2 the device follows: per node the `seq` up to which the control entries were read and the latest end of a grant |
+| `log.round` | The last round: when it ran, how it ended, the published state, and what the app was told |
+| `log.cache` | The first page of the log screen and the summary tally, sealed |
+| `outcomes` | The outcomes of the procedures that are not reported yet |
+| `ledger`, `ledger_shared`, `log.migrated`, `sealing_checked` | The device copy of the node ledger, the node ids its last exchange with the backend covered, the mark that the ledger was carried over, and the mark that the sealing check is done |
+
+The settings of the delegation (the time of the last revocation and resumption, the lifetime of a
+grant) are shared by the devices of an account in a synchronized key store item, the node ledger of
+the programs before version 43. The program judges nothing by the nodes of that ledger. On its
+first run on an installation it carries the ledger over once: a node with a grant time becomes a
+grant of the device, and the verified point of every node the ledger explains becomes the point
+from which the chain of that node is read (`log.legacy`); the marks of the earlier program are not
+carried over. A device of the account that still runs an earlier program counts a chain of a node
+no ledger explains as a delegation the app did not make, so the program writes every node of a
+release before v2.4.0 that it hands a grant to into the ledger, in the form of those programs,
+and exchanges the sealed ledger with the backend by their rule (`GET` and `PUT
+/api/secure/ledger`: the value is read and merged before it is uploaded, because an upload
+replaces it). A node of a release from v2.4.0 on is not written to the ledger.
+
+### The round
+
+A round is one reading and judging of the log of the account (7.4). A synchronization runs a round
+when the last completed round is 24 hours old, when this program has completed none on the
+installation, and when the last round did not complete (then not sooner than 60 s after it). The
+log screen runs a round with its first page. One round runs at a time.
+
+1. The listing addresses from the backend (`POST /api/secure/log/read`). The program calls an
+   address only when its host is the host of the bucket the program computed from its own
+   `user_id` (7.6), its path is `/`, its query has `versions`, the prefix `a3/{user_id}/c/` or
+   `a3/{user_id}/u/` of its own account, `max-keys` 1000, the markers it asked for and no others,
+   `encoding-type` `url` when given, and no other key besides the keys of the signature
+   (`X-Amz-...`).
+2. The listing of the control prefix, from Amazon S3. A round reads the listing from its start: an
+   entry a node wrote late lies below the entries the device saw before, so the round judges every
+   key it has not judged wherever it lies. A round reads four pages at most; a longer listing is
+   read on by the next round. A key older than 365 days is left out.
+3. The node documents of the nodes the device has no judgement of (`POST
+   /api/secure/log/documents`, verified by 7.7), and
+4. the bodies of the keys it has not judged (`POST /api/secure/log/bodies`), in the same stage.
+   Each object is verified by 7.4: the SHA-256 of the body against the `body_hash` of the key, the
+   signature under the node id of the key, and the fields of the body against the key and the
+   account. The events of an entry of the device's own `key_id` are opened.
+5. The chains of formats 1 and 2 the device follows (the last part of this section).
+6. The judgement, the published state, and the report (`POST /api/secure/log/verified`).
+
+The bodies and the node documents reach the device through the backend. A body cannot be replaced
+(the key of the listing carries its hash) and a node document proves itself, but both can be
+withheld, and the signature of an object reaches the device the same way. So a key of the listing
+is never set aside for what the backend hands out or does not hand out: a key whose body the
+backend does not hand out, and a key whose node has no document that verifies, are reads held back
+(A3 below). Only an object whose body is the one its key names and whose fields are not those of
+the key, under a signature of the node of the key, is no entry.
+
+The result of a round is `verified`, `pending` or `attention`. It is `attention` when one of four
+conditions holds, and each holds only in a situation that is a problem:
+
+| | Condition | When it holds |
+| --- | --- | --- |
+| A1 | The key of the account went to a node of a release the program does not accept | A node of an accepted measurement wrote `grant_transferred_out` under the device's own `key_id` naming a measurement no list of the program has, or a node whose document states such a measurement wrote an entry under that `key_id`, and 24 hours have passed since the device first saw that measurement. Within the 24 hours the round is pending: a program that lists a new release is served before a node of that release takes a grant, and a runtime loads the served program at its next start or return to the foreground. The program that lists the release clears the condition |
+| A2 | The signatures of a node that passed attestation contradict each other | Under a key of a node of an accepted measurement: the body the key names with a signature that does not verify, an entry of the device's own `key_id` that does not open, or two different bodies of one `seq` that both verify |
+| A3 | The operator domain has held the reads back for three days | Three rounds in a row or more were held back and the first of them is three days old. A round is held back when a route of the reads answers with an error status, or does not answer within its limit while the backend answered another request of the runtime within 60 s; when an address is not the one of the request; when the store answers an address not older than 240 s with a status other than 200, 429 and 5xx; when the backend hands out no body, or another body, for a key of the listing; and when it hands out no verifying document for the node of a key of the listing. A round that read the store clears the count |
+| A4 | An entry the device saw left the listing within its retention | A key of the sample that is younger than 364 days and lies in the range the listing covered is in neither of two readings of the listing |
+
+A device without a network, a store that answers 5xx or 429, and an address that aged while the
+app was suspended leave the round pending and count nothing. These mark nothing: a `seq` of a node
+that no key carries (an entry the store did not confirm: its act did not take place), a node whose
+entries end (with or without its orderly shutdown), and an entry of another `key_id` (the screen
+shows it as part of a delegation of another key).
+
+The program publishes the result as `state.log`:
+
+| Key | Value |
+| --- | --- |
+| `status` | `verified`, `pending`, `attention` |
+| `verified_ms` | The time of the last round that ended `verified` or `attention` |
+| `newer_release_nodes` | The measurements within the 24 hours of A1 |
+| `unknown_nodes` | The measurements for which A1 holds |
+| `unverified_nodes` | The nodes for which A2 holds |
+| `missing` | The keys for which A4 holds |
+| `expired` | 0 |
+| `store` | `verified`, `unreachable` (the device or the store failed), `blocked` (a read was held back), `truncated` (the control listing goes on beyond the pages of the round) |
+| `store_failure` | The first failed read of the round, as `{request}:{status or code}` |
+| `store_failing_ms` | The time of the first of the rounds held back in a row |
+| `program_version` | The version of the program |
+
+In a build of the app that has the bridge primitive `securityStatus`, the program tells the app
+the result of every round: `ok` for `verified`; `attention` with one reason per condition that
+holds (`unlisted_release`, `conflicting_signatures`, `verification_blocked`, `missing_entries`);
+and `pending`, unless the value it told last is `attention`. The app binary shows that value
+outside the user interface definitions the backend serves.
+
+The report of a round carries its status and store state, the numbers of nodes, of keys checked,
+of bodies read, of control keys and of node ids without a verifying document, the names of the
+releases of A1, the node ids the key went to, the number of rounds held back in a row, the first
+failed read, the time the round took, the version of the program and, for a round of the log
+screen, the times of the steps of the screen.
+
+### The log screen
+
+`read_log` returns the first page of the screen and the summary of the last seven days. The device
+keeps the first page it showed last (50 events) and the summary tally, sealed. A call starts a
+read of the store on the line of the screen (or joins the one in flight) and waits for it for 3 s;
+when the read has not ended by then, or failed, the call answers from what the device kept, with
+`cached` true and the status `pending`, and the read goes on. With the argument `kept` true the
+call answers from what the device kept at once.
+
+The read of the first page is a round started by the screen: it reads the first page of the
+control prefix and of the use prefix together, takes the keys later than the ones it kept, and
+asks for their bodies with the bodies of the round. An entry is shown as verified when its object
+verifies (7.4) under a node the device accepts, and it is opened when its `key_id` is the device's
+own. An entry whose node the device cannot judge, or whose object does not verify, is shown as not
+verified. The summary counts the use entries of the last seven days, each once per device, the
+1,000 latest at most (a count that is not complete is marked as such). `read_log_page` reads one
+later page (50 events before `before_ms`) from the listings below that time, and the entries of
+formats 1 and 2 are merged in by their times. `read_security_record` returns the same entries as
+`{items: [{id, time_ms, kind, subject, detail, count}], next_before_ms}` for the security record
+screen the app binary draws.
+
+### The reports of the program
+
+The program counts how its procedures end: per name the calls, the failures, the time a call
+waited for its line and the time it took (without the time the device waited for the user), in
+six classes of duration. A call that failed or took 10 s or longer is also kept one by one with
+its failure code, 32 at most. A call that has not ended is kept as open, and a runtime counts the
+calls it finds open at its start as interrupted, each with the time the app had gone to the
+background while it was open. The failure `cancelled` (the runtime went down, or the user closed
+the web session or the sheet the procedure waited in) is not counted as a failure. The names are
+the names of the procedures, `event_sync` for a synchronization an event started and `log_screen`
+for a read of the first page of the screen. The program sends the counts with `POST
+/api/secure/procedures/outcomes` 5 s after a call failed or was slow, and at the end of a
+synchronization when the last report is 24 hours old; what the backend accepted leaves the device.
+The report names procedures, failure codes and times, and nothing of the arguments or the results
+of a call.
+
+After a synchronization a push started, the program sends `POST /api/secure/sync/report`: the
+reason of the push, the key state, the state of the grants, the numbers of nodes that took a grant
+and that failed the verification, and the time it took. Nothing waits for the answer of a report.
+
+### The vault secrets
+
+A vault secret is a record of kind `vault_secret` (section 6): a value with its name, the hosts it
+may go to and the places it may be put, all inside the plaintext the device seals.
+
+| Procedure | What it does | The device owner authentication |
+| --- | --- | --- |
+| `store_secret` | Seals the value the user entered into a record and uploads it. The name, the hosts and the places of the item come from the backend and are checked against the form of section 6 before they enter the plaintext; an item of another form fails the call. The plaintext is padded to the shortest of the lengths 256, 512, 1,024, 2,048, 4,096, 8,192 and 12,272 bytes it fits | None |
+| `reveal_secret` | Opens the record on the device and shows the value to the user. It opens a record of kind `vault_secret` only, and a plaintext that names another name than the one asked for is `record_invalid` | Before the query |
+| `update_secret` | Changes the hosts and the places of an item: the record is opened and sealed again under the same id with the new ones | Before the query |
+| `delete_secret` | Removes an item | Before the request |
+| `reveal_login_password` | Shows a password a node made for a login. It opens a record of kind `vault_password` only, and a plaintext whose `source` is not `operator` is `record_invalid`: a password the user typed is not shown | Before the query |
+
+In a build of the app that has the protected sheets (`promptSecret` and `presentSecret`),
+`store_secret` takes no value as an argument: it asks for the value in the input sheet, with one
+line per host that says where the value can go, made from the hosts and places that are sealed
+into the record. `reveal_secret` and `reveal_login_password` hand the value to the display sheet
+and return no value. In a build without the sheets the value is the argument of `store_secret` and
+part of the result of the two procedures. The program publishes which of the two a build is
+(`runtime.protected_sheets`). In no build is the value part of a request, of a published value or
+of the program store.
+
+### Formats 1 and 2
+
+The entries of the nodes of the releases before v2.4.0 stay in the bucket their bindings name
+until their retention ends. The program reads them for two things.
+
+The log screen shows them: below the entries of format 3 and merged with them by time, from the
+chains the device follows and the node prefixes the listing of the account prefix names. An entry
+is shown as verified when the signature of the node id of its prefix verifies over its body, its
+key and body agree (for format 2: `seq`, `time_ms`, `kind`, `count`, `key_id` and the hash of the
+body), and it opens with the key of the account.
+
+A round follows the delegation: for every node of such a release that the device handed a grant
+to, it lists the chain from the `seq` up to which it read, reads the control entries, and follows
+`grant_transferred_out` of the device's own `key_id`. A receiving node whose document states a
+measurement no list has counts for A1; a receiving node of a release that writes format 3 has its
+entries in the listing of format 3; any other receiving node is a node of the release of the
+giving node, whose chain is followed in turn. A chain is read for the last time one day after the
+grant of its node ended. The program reads no head, verifies no chain equation, and judges neither
+an empty `seq` nor a node no grant explains.
 
 ## The secure program release
 

@@ -7,23 +7,27 @@ in JavaScriptCore, the Android app in QuickJS. It is the program that [docs/prot
 calls "the app": the device side of the credential protocol. It creates the master key and derives
 the account keys from it (protocol.md section 3), verifies the attestation of enclave nodes
 (section 4), seals grants and revokes to a verified node (section 5), encrypts credential records
-(section 6), verifies and decrypts the credential log (section 7), keeps the ledger of the nodes
-that hold a grant, and transfers the master key between the devices of one account. The program
-reads the log store directly (protocol.md 7.4): it verifies the log from the keys of the object
-version listing of the account's prefix up to the head a node signed (the index verification),
-reads the control entries and the entries it shows, and counts the summary of the last seven days
-of the log screen from the entries of that window (each read once per device and kept as the
-summary tally). The storage of the operator holds no entry. The absence of an entry older than 365
-days (the retention of its Object Lock) is expired, not an omission (protocol.md 7.4), and the
-lifecycle rule of the bucket removes entries at 400 days (7.6). The program sends the requests of one
-procedure that do not depend on each other together (the account query with the node list, the grants
-to every node, the reads of one verification run in four stages: heads and listing addresses,
-listings, object addresses, objects) and judges the results in the order protocol.md 7.4 gives. A
-run that finds a node in the store only, with an entry sealed to the key of the account that no
-traced transfer explains, reads the heads of the nodes of its ledger once more and walks those
-chains on before it counts the node (the second look of protocol.md 7.4 step 5: a transfer of the
-delegation that landed between the heads and the listing of the run is traced there); a run without
-such a node reads nothing twice.
+(section 6) and vault secrets, reads and judges the credential log (section 7), keeps the grants it
+handed to nodes, and transfers the master key between the devices of one account. What the program
+does, in which order and under which limits, is specified in protocol.md, "The program of the
+app".
+
+The program lists the log store itself (protocol.md 7.4): the listing of the two prefixes of its
+account, read from Amazon S3 through addresses it checks, names every act that took place with the
+key of the account. It judges the log by that listing and by the node documents of the nodes that
+wrote the entries. For the entries of format 3 it reads no head, verifies no chain equation and
+traces no transfer from node to node. A round reads the control entries; the log screen reads the entries it shows and counts the
+summary of the last seven days from the use entries of that window (each counted once per device
+and kept, sealed with a key derived from the master key, with the first page of the screen). The
+entries of the nodes of the releases before v2.4.0 (formats 1 and 2) are read from the bucket
+their bindings name, for display and to follow a transfer of the delegation a node of such a
+release made. The storage of the operator holds no entry. An entry older than 365 days (the
+retention of its Object Lock) is expected by nobody, and the lifecycle rule of a bucket removes
+entries at 400 days (7.6).
+
+The work of the program runs on three lines that do not wait for one another (the procedures a
+user starts, the synchronizations, the reads of the log screen), every request has a time limit,
+and a procedure ends itself before the executor gives it up.
 
 This file is the source of truth of the program. The repository `pickle-com/interactive-character`
 (the backend of the operator) vendors a byte-identical copy at `backend/assets/ui/secure-program.js`
@@ -55,10 +59,26 @@ same account, the master key sealed with the session key that the two devices de
 are never part of a request (`native.http`) or of a published value (`native.publish`) in any
 other form.
 
+The value of a vault secret goes into the record the device seals, and nowhere else: it is part of
+no request, of no published value and of no value of the program store (`native.storeSet`). When
+the user asks to see a value, the program opens the record on the device and hands the value to
+the protected sheet of the app (`native.presentSecret`); in a build without that sheet the value
+is the result of the procedure, which the user interface definition shows. The first page of the
+log screen, which names services and addresses, is kept in the program store sealed with a key
+derived from the master key.
+
+What the program reports to the backend about itself names no secret and nothing of the content of
+an account: the result of a round (the status, counts, the names of releases, node ids), the
+outcomes of its procedures (the names of procedures, failure codes, times) and the result of a
+synchronization a push started (the key state, the state of the grants, counts, a time).
+
 A reader checks this in the file. The search terms: `keychainSet` and `keychainGet` (where the
 master key is stored and read), `hpkeSeal` (what is sealed to a node), `aeadSeal` (what is
-encrypted as a record, and what the transfer seals), `native.http(` (every request the program
-sends, with its body), `native.publish(` (every value the program hands to the user interface).
+encrypted as a record, what the transfer seals, and the kept screen), `native.http(` (every
+request the program sends: `request` builds the requests to the backend and `fetchStore` the
+requests to the log store), `native.publish(` (every value the program hands to the user
+interface), `native.storeSet(` (every value the program keeps on the device outside the key
+store), `presentSecret` and `promptSecret` (where a vault value passes the app).
 
 ## How a release is made
 
@@ -126,16 +146,24 @@ node --test secure-program/tests/program.test.js
 
 `tests/bridge.js` is the model: the global `native` on the crypto module of Node (HKDF, Ed25519,
 X25519, HPKE of RFC 9180, ChaCha20-Poly1305, ECDSA P-384), a device (the key store, the program
-store, the published state), the backend of the operator and the log store as the program reaches
-them over `native.http`, and enclave nodes with their keys, attestation documents, commands, heads
-and log chains (`docs/protocol.md` sections 4, 5 and 7). The certificate chain of a nitro document
-is modelled (one leaf of the model stands for the certificate); the signature of the document is a
-real ECDSA signature over the Sig_structure the program encodes. The loader evaluates the program
-the way the executors do: a fresh context whose globals are `native`, `SecureError` and `console`,
-the top level evaluated with the bridge closed. The first tests check the model against
-`protocol/vectors.json`, the reference the apps test their bridges against. `tests/scenarios.js`
-holds the scenarios (worlds and runs) and returns plain results; `tests/program.test.js` fixes the
-expected results of the current program.
+store, the published state, the build of the app with or without the bridge primitives of a later
+build), the backend of the operator and the buckets of the log store as the program reaches them
+over `native.http`, and enclave nodes with their keys, attestation documents, node documents,
+commands and log entries of formats 2 and 3 (`docs/protocol.md` sections 4, 5 and 7). The time of
+the model moves only when nothing else can happen, so a test runs a wait of minutes at once. The
+certificate chain of a nitro document is modelled (one leaf of the model stands for the
+certificate); the signature of the document is a real ECDSA signature over the Sig_structure the
+program encodes. The loader evaluates the program the way the executors do: a fresh context whose
+globals are `native`, `SecureError` and `console`, the top level evaluated with the bridge closed.
+The first tests check the model against `protocol/vectors.json`, the reference the apps test their
+bridges against, and run the program on the entries, the keys, the node document and the buckets
+of the vectors `log_v3` and `log_store` and on the forms of the vectors `vault_secret`: the program
+gives the answers of the reference reader (`protocol/src/app.rs`). `tests/scenarios.js` holds the
+scenarios (worlds and runs) and returns plain results; `tests/program.test.js` fixes the expected
+results of the current program.
+
+`SECURE_PROGRAM_VECTORS` names the vector files to read instead of `protocol/vectors.json` (paths
+separated by commas). A test of vectors that the files do not hold is skipped.
 
 `node secure-program/tests/compare.js <program-a.js> <program-b.js>` runs the scenarios on two
 versions of the program and prints what changed between them (the file of a tag is
