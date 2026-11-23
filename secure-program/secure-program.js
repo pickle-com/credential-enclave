@@ -6852,10 +6852,11 @@
     let grace = 0;
     let established = 0;
     // Whether a measurement past its grace waits because this runtime does not know that no
-    // later program is served, and the name of the failure of the request for the release
-    // proofs of a measurement past its grace that does not mark the log, when that request
-    // failed on the side of the server.
+    // later program is served; whether one waits for the answer to the request for its release
+    // proofs (the backend has not answered that it hands out none); and the name of the failure
+    // of that request, when it failed on the side of the server.
     let waiting = false;
+    let unanswered = false;
     let unproved = "";
     const releases = [];
     const heldNodes = [];
@@ -6881,11 +6882,15 @@
       // program is served and that the backend hands out no release proofs that show the
       // measurement. Otherwise it waits as within its grace: the round is not complete.
       const confirmed = !within && releaseConfirmed(whole(item.first_ms), now);
-      const stands = confirmed && proofsDenied(digest, whole(item.first_ms), now);
+      const denied = !within && proofsDenied(digest, whole(item.first_ms), now);
+      const stands = confirmed && denied;
       if (stands) established += 1;
       else grace += 1;
       if (!within && !confirmed) waiting = true;
-      if (!within && !stands && unproved === "") unproved = proofsRefused(digest);
+      if (!within && !denied) {
+        unanswered = true;
+        if (unproved === "") unproved = proofsRefused(digest);
+      }
       const release = typeof item.release === "string" && item.release !== "" ? item.release.slice(0, 64) : "unknown";
       if (releases.indexOf(release) < 0) releases.push(release);
       if (item.held === true && NODE_ID.test(node) && heldNodes.indexOf(node) < 0) heldNodes.push(node);
@@ -6911,12 +6916,13 @@
         if (run.detail === "") run.detail = "delivery:" + (info.failed_status === 0 ? "silent" : String(info.failed_status));
       }
     }
-    // A measurement past its grace does not mark the log, and the request for its release
-    // proofs failed for a reason on the side of the server: the operator domain keeps the
-    // device from learning whether the release has proofs, and the round is one held back,
-    // whether or not the runtime knows what program is served (every round asks, so the rounds
-    // of a backend that goes on failing that request are counted one after the other). A
-    // request that failed with the network of the device leaves the round pending.
+    // A measurement past its grace waits for the answer to the request for its release proofs,
+    // and that request failed for a reason on the side of the server: the operator domain keeps
+    // the device from learning whether the release has proofs, and the round is one held back,
+    // whether or not the runtime knows what program is served. A request that failed with the
+    // network of the device leaves the round pending. While such a measurement waits, a round
+    // that is not held back does not end the count of the rounds held back (below): the count
+    // of a backend that goes on failing that request ends when the request is answered.
     if (unproved !== "") {
       blocked = true;
       if (run.detail === "") run.detail = unproved.slice(0, 64);
@@ -6924,7 +6930,7 @@
     if (blocked) {
       if (log.blocked.count === 0 || log.blocked.first_ms === 0 || log.blocked.first_ms > now) log.blocked.first_ms = now;
       log.blocked.count += 1;
-    } else if (!unreachable && !beyond) {
+    } else if (!unreachable && !beyond && !unanswered) {
       log.blocked = { first_ms: 0, count: 0 };
     }
     // The reads held back from the screen that the reads of the screen count themselves.
