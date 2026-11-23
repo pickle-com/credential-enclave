@@ -300,6 +300,9 @@
   const LEGACY_ROUND_PASSES = 4;
   const LEGACY_ROUND_BODIES = 64;
   const LEGACY_SEQ_READS = 8;
+  // The seqs at the end of a listing page of a chain that a round reads to see how far the node
+  // wrote, when their keys name no control entry.
+  const LEGACY_PROBE_SEQS = 2;
   const LEGACY_SEQ_VERSIONS = 5;
   const LEGACY_DISCOVERY_PAGES = 2;
   const LEGACY_CLOSE_SLACK_MS = DAY_MS;
@@ -3285,13 +3288,11 @@
     return out;
   }
 
-  /** Checks one signed object version of a chain of format 1 or format 2 against the parts of its
-   *  key: the signature of the node id of its prefix, the account and the seq, and, for format 2,
-   *  the key_id, count, kind and time_ms of the key and the body hash of the key. The plaintext is
-   *  opened when the key_id is ours: one control event for a control entry, use events for a use
-   *  entry. Returns {format, seq, body, time_ms, ours, events} (events null when the key_id is not
-   *  ours) or null for an object that is not that entry. */
-  function checkLegacyEntry(signed, id, parts, keys) {
+  /** The body of one signed object version of a chain of format 1 or format 2 when the node whose
+   *  id its prefix names signed it for the seq of its key: the signature of that node id, the
+   *  account and the seq, and, for format 2, the key_id, count, kind and time_ms of the key and
+   *  the body hash of the key. null for an object that node did not write under that key. */
+  function legacyBody(signed, id, parts) {
     let body = null;
     try {
       body = parts.format === 2
@@ -3313,6 +3314,16 @@
         return null;
       }
     }
+    return body;
+  }
+
+  /** Checks one signed object version of a chain of format 1 or format 2 against the parts of its
+   *  key (legacyBody). The plaintext is opened when the key_id is ours: one control event for a
+   *  control entry, use events for a use entry. Returns {format, seq, body, time_ms, ours, events}
+   *  (events null when the key_id is not ours) or null for an object that is not that entry. */
+  function checkLegacyEntry(signed, id, parts, keys) {
+    const body = legacyBody(signed, id, parts);
+    if (body === null) return null;
     const ours = body.key_id === keys.keyId;
     let events = null;
     if (ours) {
@@ -3555,8 +3566,15 @@
       const versions = (Array.isArray(group) ? group : []).filter(function (version) {
         return Array.isArray(version) && typeof version[0] === "string" && version[0].slice(0, prefix.length) === prefix &&
           typeof version[1] === "string";
-      }).slice(0, 2);
+      }).slice(0, LEGACY_SEQ_READS);
       if (versions.length > 0 && objects.length < LOG_WITHHELD_OBJECTS) objects.push(versions);
+    }
+    const crowded = [];
+    for (const place of Array.isArray(kept.crowded) ? kept.crowded : []) {
+      const shaped = Array.isArray(place) && typeof place[0] === "string" && NODE_ID.test(place[0]) &&
+        Number.isSafeInteger(place[1]) && place[1] > 0;
+      const known = crowded.some(function (other) { return shaped && other[0] === place[0] && other[1] === place[1]; });
+      if (shaped && !known && crowded.length < LOG_WITHHELD_OBJECTS) crowded.push([place[0], place[1]]);
     }
     return {
       keys: keys,
@@ -3571,7 +3589,7 @@
       }).slice(0, LOG_WITHHELD_CHAINS),
       nodes: kept.nodes === true,
       watch_ms: whole(kept.watch_ms) > native.nowMs() ? whole(kept.watch_ms) : 0,
-      unjudged: unjudged,
+      unjudged: unjudged, crowded: crowded,
     };
   }
 
@@ -3596,7 +3614,7 @@
    *  none: it is read when a round runs). */
   function withheldDue(held) {
     return held.keys.length > 0 || held.pages.length > 0 || held.objects.length > 0 || held.chains.length > 0 || held.nodes ||
-      held.unjudged.length > 0;
+      held.unjudged.length > 0 || held.crowded.length > 0;
   }
 
   /** The name of an entry of a chain whose object versions were held back: the node id and the
@@ -3651,7 +3669,16 @@
       if (name === "" || named.has(name) || objects.length >= LOG_WITHHELD_OBJECTS) continue;
       if (run.objectsRead !== undefined && run.objectsRead.has(name)) continue;
       named.add(name);
-      objects.push(versions.slice(0, 2));
+      objects.push(versions.slice(0, LEGACY_SEQ_READS));
+    }
+    // The seqs of chains under which more objects lie than the screen reads, none of the ones
+    // read the entry of the node.
+    const crowded = [];
+    for (const place of kept.crowded.concat(run.crowdedHeld === undefined ? [] : run.crowdedHeld)) {
+      const name = place[0] + ":" + place[1];
+      if (run.crowdedRead !== undefined && run.crowdedRead.has(name)) continue;
+      if (crowded.length >= LOG_WITHHELD_OBJECTS || crowded.some(function (other) { return other[0] + ":" + other[1] === name; })) continue;
+      crowded.push([place[0], place[1]]);
     }
     const chains = [];
     const listed = new Set();
@@ -3675,15 +3702,16 @@
       if (held.nodes) stored.nodes = true;
       if (held.watch_ms > 0) stored.watch_ms = held.watch_ms;
       if (held.unjudged.length > 0) stored.unjudged = held.unjudged;
+      if (held.crowded.length > 0) stored.crowded = held.crowded;
       return stored;
     };
     const next = value({
       keys: keys, shown: shown, pages: pages, objects: objects, chains: chains, nodes: nodes, watch_ms: watch,
-      unjudged: unjudged,
+      unjudged: unjudged, crowded: crowded,
     });
     if (JSON.stringify(next) === JSON.stringify(value(kept))) return;
     const empty = keys.length === 0 && pages.length === 0 && objects.length === 0 && chains.length === 0 && !nodes &&
-      watch === 0 && unjudged.length === 0;
+      watch === 0 && unjudged.length === 0 && crowded.length === 0;
     storeJson(STORE_WITHHELD, empty ? null : next);
   }
 
@@ -4193,6 +4221,11 @@
    *    the giving node;
    *    a receiving node whose document could not be asked for waits as well, and the round is
    *    not complete.
+   *  The seq up to which a chain is read moves on only to a seq under which the node is seen to
+   *  have written (an object it signed for that seq, among the control entries read and the
+   *  last LEGACY_PROBE_SEQS seqs of the page): an object someone else wrote under a seq the node
+   *  has not reached moves nothing, so the entry the node writes there later is read. A listing
+   *  page that goes on and shows the node writing nowhere holds the read back.
    *  A chain is closed by the first reading that reached its end after the grant of its node ran
    *  out (LEGACY_CLOSE_SLACK_MS later): a node holds no key after that. The keys read are handed
    *  to the log screen (rememberKeys). */
@@ -4265,14 +4298,18 @@
         // page after it: it is read with that page, from the seq before it.
         if (more) seqs.pop();
         if (more && versions > LEGACY_SEQ_VERSIONS * Math.max(1, seqs.length)) thin = true;
-        const plan = { id: id, seqs: seqs, entries: entries, reads: new Map(), crowded: new Set(), stop: 0, more: more };
+        const plan = {
+          id: id, seqs: seqs, entries: entries, reads: new Map(), crowded: new Set(), stop: 0, more: more,
+          probes: new Map(), unprobed: false,
+        };
+        const latestFirst = function (a, b) { return (b.isLatest ? 1 : 0) - (a.isLatest ? 1 : 0); };
         for (const seq of seqs) {
           // The object versions whose keys name a control entry, the latest first, up to
           // LEGACY_SEQ_READS of them: an object someone else wrote under the seq of a control
           // entry does not take the place of the entry of the node.
           const shaped = entries.get(seq).filter(function (candidate) {
             return candidate.parts.format === 1 || candidate.parts.kind === "c";
-          }).sort(function (a, b) { return (b.isLatest ? 1 : 0) - (a.isLatest ? 1 : 0); });
+          }).sort(latestFirst);
           if (shaped.length === 0) continue;
           const candidates = shaped.slice(0, LEGACY_SEQ_READS);
           if (bodiesLeft < candidates.length) {
@@ -4285,6 +4322,24 @@
           bodiesLeft -= candidates.length;
           plan.reads.set(seq, candidates);
           if (shaped.length > candidates.length) plan.crowded.add(seq);
+          for (const candidate of candidates) wanted.push(candidate);
+        }
+        // The place up to which a chain is read moves on to a seq only when the node is seen to
+        // have written there (an object it signed for that seq): whoever else writes an object
+        // under a seq the node has not reached moves nothing, and the entry the node writes
+        // there later is read. The last LEGACY_PROBE_SEQS seqs of the page whose keys name no
+        // control entry are read for that alone (probes), so a chain is read on over its use
+        // entries.
+        for (let back = seqs.length - 1; back >= 0 && back >= seqs.length - LEGACY_PROBE_SEQS && plan.stop === 0; back -= 1) {
+          const seq = seqs[back];
+          if (plan.reads.has(seq)) continue;
+          const candidates = entries.get(seq).slice().sort(latestFirst).slice(0, LEGACY_SEQ_READS);
+          if (bodiesLeft < candidates.length) {
+            plan.unprobed = true;
+            break;
+          }
+          bodiesLeft -= candidates.length;
+          plan.probes.set(seq, candidates);
           for (const candidate of candidates) wanted.push(candidate);
         }
         plans.push(plan);
@@ -4309,6 +4364,7 @@
       }
       for (const plan of plans) {
         const chain = legacy.nodes[plan.id];
+        const from = chain.seq;
         let reached = chain.seq;
         let reachedMs = chain.time_ms;
         let held = false;
@@ -4317,54 +4373,72 @@
             held = true;
             break;
           }
-          const candidates = plan.reads.get(seq);
-          if (candidates !== undefined) {
-            if (objects === null) {
-              held = true;
-              break;
-            }
-            let found = false;
-            for (const candidate of candidates) {
-              const signed = objects.get(candidate.key + "\n" + candidate.versionId);
-              const entry = signed === undefined || signed === null
-                ? null : checkLegacyEntry(signed, plan.id, candidate.parts, keys);
-              run.bodies += 1;
-              if (entry === null) continue;
-              found = true;
-              run.checked += 1;
-              if (entry.events !== null) {
-                for (const event of entry.events) {
-                  if (event.t === "grant_transferred_out" && typeof event.to === "string" && NODE_ID.test(event.to)) {
-                    // The time of the event, or of its entry for an event that names none.
-                    const eventMs = whole(event.time_ms) > 0 ? event.time_ms : entry.time_ms;
-                    const before = receivers.get(event.to) || { until_ms: 0, time_ms: 0 };
-                    receivers.set(event.to, {
-                      until_ms: Math.max(before.until_ms, chain.until_ms), time_ms: Math.max(before.time_ms, eventMs),
-                    });
-                  }
+          const control = plan.reads.get(seq);
+          const candidates = control !== undefined ? control : plan.probes.get(seq);
+          // A seq whose keys name no control entry and that is no probe is not read.
+          if (candidates === undefined) continue;
+          if (objects === null) {
+            held = true;
+            break;
+          }
+          let written = false;
+          for (const candidate of candidates) {
+            const signed = objects.get(candidate.key + "\n" + candidate.versionId);
+            const body = signed === undefined || signed === null ? null : legacyBody(signed, plan.id, candidate.parts);
+            run.bodies += 1;
+            if (body === null) continue;
+            // The node signed this object for this seq: it wrote up to here.
+            written = true;
+            if (whole(body.time_ms) > 0) reachedMs = body.time_ms;
+            const entry = control === undefined ? null : checkLegacyEntry(signed, plan.id, candidate.parts, keys);
+            if (entry === null) break;
+            run.checked += 1;
+            if (entry.events !== null) {
+              for (const event of entry.events) {
+                if (event.t === "grant_transferred_out" && typeof event.to === "string" && NODE_ID.test(event.to)) {
+                  // The time of the event, or of its entry for an event that names none.
+                  const eventMs = whole(event.time_ms) > 0 ? event.time_ms : entry.time_ms;
+                  const before = receivers.get(event.to) || { until_ms: 0, time_ms: 0 };
+                  receivers.set(event.to, {
+                    until_ms: Math.max(before.until_ms, chain.until_ms), time_ms: Math.max(before.time_ms, eventMs),
+                  });
                 }
               }
-              break;
             }
-            if (!found && plan.crowded.has(seq)) {
-              // More object versions under this seq name a control entry than the round reads,
-              // and none of the ones read is the entry of the node: the entry, if the node
-              // wrote one, is held back behind objects someone else wrote there.
-              run.blocked = true;
-              if (run.detail === "") run.detail = "chain:keys";
-              held = true;
-              break;
-            }
+            break;
           }
-          reached = seq;
-          const first = plan.entries.get(seq)[0].parts;
-          reachedMs = first.format === 2 ? first.time_ms : reachedMs;
+          if (!written && control !== undefined && plan.crowded.has(seq)) {
+            // More object versions under this seq name a control entry than the round reads,
+            // and none of the ones read is the entry of the node: the entry, if the node
+            // wrote one, is held back behind objects someone else wrote there.
+            run.blocked = true;
+            if (run.detail === "") run.detail = "chain:keys";
+            held = true;
+            break;
+          }
+          // (A seq under which the node wrote nothing is passed when a later seq shows that the
+          // node wrote beyond it.)
+          if (written) reached = seq;
         }
         chain.seq = reached;
         chain.time_ms = reachedMs;
         if (held) continue;
         if (plan.more) {
-          next.push(plan.id);
+          if (reached > from) {
+            next.push(plan.id);
+            continue;
+          }
+          // The listing goes on and the node is seen to have written nowhere on this page: the
+          // chain cannot be read on. With the entries of this round spent the next round reads
+          // on; otherwise the last seqs of the page hold no object of the node, which a page a
+          // node wrote always does: the read is held back.
+          run.cut = true;
+          if (plan.unprobed) {
+            run.over = true;
+          } else {
+            run.blocked = true;
+            if (run.detail === "") run.detail = "chain:keys";
+          }
           continue;
         }
         if (now > chain.until_ms + LEGACY_CLOSE_SLACK_MS) chain.closed = true;
@@ -4619,7 +4693,7 @@
       verified: [], entries: new Map(), junk: new Set(), screenMs: null, withheld: new Set(),
       shown: new Set(), kept: new Set(), settled: new Set(), pagesHeld: new Set(), pagesRead: new Set(),
       pagesKept: new Map(), pageOf: new Map(), store3: known, objectsRead: new Set(), chainsRead: new Set(),
-      nodesRead: false, chainKept: [], found: null, listed: [],
+      crowdedRead: new Set(), nodesRead: false, chainKept: [], found: null, listed: [],
     };
     // What the rounds kept for the screen before this round: an entry kept there is not read
     // again.
@@ -5420,10 +5494,19 @@
   }
 
   /** Puts the candidates of a listing (a table from seq to candidates) into the keys the screen
-   *  knows of node id. The candidates of a seq already known are replaced. */
+   *  knows of node id. The candidates of a seq already known are replaced, and when they are
+   *  other object versions than before, the entry the screen opened under that seq is dropped
+   *  (it is opened again from the object versions the store now names). */
   function rememberKeys(id, entries) {
     const node = displayNode(id);
     entries.forEach(function (candidates, seq) {
+      const before = node.candidates.get(seq);
+      if (before !== undefined) {
+        const same = before.length === candidates.length && before.every(function (kept, at) {
+          return kept.key === candidates[at].key && kept.versionId === candidates[at].versionId;
+        });
+        if (!same) displayEntries.delete(id + ":" + seq);
+      }
       node.candidates.set(seq, candidates);
       if (node.floor === 0 || seq < node.floor) node.floor = seq;
     });
@@ -5438,20 +5521,59 @@
     return node.sorted;
   }
 
-  /** The candidates of seq among the keys the screen knows, the latest version first, two at
-   *  most (a write a node repeated adds a version of the same object). */
+  /** The candidates of seq among the keys the screen knows that the screen reads: the latest
+   *  version of each object first, LEGACY_SEQ_READS at most. A node writes one object under a
+   *  seq (and a version more when it repeats a write), so an object someone else wrote there does
+   *  not take the place of the entry of the node while fewer than that many lie in front of it. */
   function orderedCandidates(node, seq) {
     return (node.candidates.get(seq) || []).slice().sort(function (a, b) {
       return (b.isLatest ? 1 : 0) - (a.isLatest ? 1 : 0);
-    }).slice(0, 2);
+    }).slice(0, LEGACY_SEQ_READS);
   }
 
-  /** The time and the number of events the key of seq names: {time_ms, count} for a key of format
-   *  2, null for a key of format 1 (the entry carries the time). */
+  /** What the keys of format 2 under seq name: {time_ms, count, settled}, the latest time and the
+   *  largest number of events among them, and whether every key under the seq names that one
+   *  time (the keys of the one object a node wrote: the screen places such a seq before it reads
+   *  it). null when no key of format 2 lies under the seq (a key of format 1 names no time: the
+   *  entry carries it). */
   function keyFacts(node, seq) {
-    const candidates = orderedCandidates(node, seq);
-    if (candidates.length === 0 || candidates[0].parts.format !== 2) return null;
-    return { time_ms: candidates[0].parts.time_ms, count: candidates[0].parts.count };
+    let facts = null;
+    let settled = true;
+    for (const candidate of node.candidates.get(seq) || []) {
+      const parts = candidate.parts;
+      if (parts.format !== 2) {
+        settled = false;
+        continue;
+      }
+      if (facts === null) {
+        facts = { time_ms: parts.time_ms, count: parts.count };
+        continue;
+      }
+      if (parts.time_ms !== facts.time_ms) settled = false;
+      facts.time_ms = Math.max(facts.time_ms, parts.time_ms);
+      facts.count = Math.max(facts.count, parts.count);
+    }
+    if (facts === null) return null;
+    facts.settled = settled;
+    return facts;
+  }
+
+  /** Whether an entry of a chain the screen opened is the one line of a seq under which no
+   *  object read is the entry of the node. */
+  function unverifiedEntry(entry) {
+    return entry.items.length === 1 && entry.items[0].kind === "unverified";
+  }
+
+  /** The latest time the keys of the last seqs the screen knows of a chain name (the last
+   *  LEGACY_SEQ_READS seqs: one object someone wrote at the end of a chain with an earlier time
+   *  does not make the chain an older one); 0 when they name none. */
+  function topTime(node) {
+    let latest = 0;
+    for (const seq of sortedSeqs(node).slice(0, LEGACY_SEQ_READS)) {
+      const facts = keyFacts(node, seq);
+      if (facts !== null && facts.time_ms > latest) latest = facts.time_ms;
+    }
+    return latest;
   }
 
   /** What a read of the log screen collects of its reads of the bucket of format 1 and format 2:
@@ -5469,6 +5591,7 @@
     const now = native.nowMs();
     return {
       objectsHeld: [], objectsRead: new Set(), chainsHeld: [], chainsRead: new Set(), judge: false, reached: null,
+      crowdedHeld: [], crowdedRead: new Set(),
       live: function (id) {
         if (cache.found.indexOf(id) >= 0) return true;
         const followed = legacy.nodes[id];
@@ -5576,19 +5699,23 @@
 
   /** The entry of seq of a chain as the screen shows it: {id, time_ms, count, items}, from the
    *  signed values of its candidate object versions (objects: a table from key and version to the
-   *  signed value). The first candidate that verifies is the entry; when none does, the entry is
-   *  one item that is not verified. null when no candidate was read. The entries the screen opened
-   *  are kept for the runtime. */
-  function legacyEntry(keys, id, seq, objects) {
+   *  signed value). The first candidate that verifies is the entry, at its own time; when none
+   *  does, the entry is one item that is not verified, at the latest time the keys under the
+   *  seq name (a key someone wrote there with an earlier time moves the line no further down the
+   *  list). null when no candidate was read. The entries the screen opened are kept for the
+   *  runtime. With reads (chainReads): when no candidate read verifies and more object versions
+   *  lie under the seq than the screen reads, the entry of the node, if it wrote one, is held
+   *  back behind them, and the read goes to the rounds, which count it (crowdedHeld). */
+  function legacyEntry(keys, id, seq, objects, reads) {
     const name = id + ":" + seq;
     const kept = displayEntries.get(name);
     if (kept !== undefined) return kept;
     const node = displayNode(id);
+    const facts = keyFacts(node, seq);
+    const keyTime = facts === null ? 0 : facts.time_ms;
     let verified = null;
-    let keyTime = 0;
     let read = false;
     for (const candidate of orderedCandidates(node, seq)) {
-      if (candidate.parts.format === 2 && keyTime === 0) keyTime = candidate.parts.time_ms;
       const signed = objects.get(candidate.key + "\n" + candidate.versionId);
       if (signed === undefined) continue;
       read = true;
@@ -5605,7 +5732,22 @@
       displayEntries.delete(displayEntries.keys().next().value);
     }
     displayEntries.set(name, entry);
+    if (reads !== undefined) {
+      if (verified === null && (node.candidates.get(seq) || []).length > LEGACY_SEQ_READS) reads.crowdedHeld.push([id, seq]);
+      else reads.crowdedRead.add(name);
+    }
     return entry;
+  }
+
+  /** An entry of a chain as a page shows it at the time the page placed it: the entry itself, or,
+   *  for the line of a seq that is not verified and was placed below the time its keys name, that
+   *  line at the time it was placed. */
+  function placedEntry(entry, time) {
+    if (entry.time_ms === time || !unverifiedEntry(entry)) return entry;
+    return {
+      id: entry.id, time_ms: time, count: entry.count,
+      items: entry.items.map(function (item) { return Object.assign({}, item, { time_ms: time }); }),
+    };
   }
 
   /** The object versions of the candidates of the seqs given ([{id, seq}]) that the screen has
@@ -5664,11 +5806,13 @@
    *  the listings held back of a chain began or ceased to mark the log, a round judges and
    *  publishes that now. */
   function saveChainReads(keys, reads, nodesHeld, nodesRead) {
-    if (reads.objectsHeld.length > 0 || reads.chainsHeld.length > 0 || nodesHeld || native.storeGet(STORE_WITHHELD) !== null) {
+    if (reads.objectsHeld.length > 0 || reads.chainsHeld.length > 0 || reads.crowdedHeld.length > 0 || nodesHeld ||
+        native.storeGet(STORE_WITHHELD) !== null) {
       saveWithheld({
         withheld: new Set(), shown: new Set(), settled: new Set(), pagesHeld: new Set(), pagesRead: new Set(),
         objectsHeld: reads.objectsHeld, objectsRead: reads.objectsRead, chainsHeld: reads.chainsHeld,
         chainsRead: reads.chainsRead, nodesHeld: nodesHeld, nodesRead: nodesRead,
+        crowdedHeld: reads.crowdedHeld, crowdedRead: reads.crowdedRead,
       });
     }
     if (reads.judge) requestRound(freeTurn(), keys, "sync").then(noop, noop);
@@ -5701,41 +5845,116 @@
         else run.chainsRead.add(withheld.chains[at].join(":"));
       }
     }
-    if (withheld.objects.length === 0) return;
-    const wanted = [];
-    for (const versions of withheld.objects) {
-      for (const version of versions) wanted.push({ key: version[0], versionId: version[1] });
-    }
-    let objects = null;
-    try {
-      objects = await legacyObjects(turn, wanted.slice(0, LOG_STORE_OBJECTS));
-    } catch (failure) {
-      noteFailure(turn, run, heldBack(failure));
-      return;
-    }
-    for (const versions of withheld.objects) {
-      const name = objectName(versions);
-      if (name === "") continue;
-      const id = name.slice(0, 43);
-      const seq = Number(name.slice(44));
+    // The object versions of batches of LOG_STORE_OBJECTS; null when a read failed (noted).
+    const readVersions = async function (wanted) {
+      const objects = new Map();
+      try {
+        for (let at = 0; at < wanted.length; at += LOG_STORE_OBJECTS) {
+          const batch = await legacyObjects(turn, wanted.slice(at, at + LOG_STORE_OBJECTS));
+          batch.forEach(function (value, name) { objects.set(name, value); });
+        }
+      } catch (failure) {
+        noteFailure(turn, run, heldBack(failure));
+        return null;
+      }
+      return objects;
+    };
+    // The entry of a seq from the candidates read, as the screen opens it (legacyEntry).
+    const opened = function (id, seq, candidates, keyTime, objects) {
       let verified = null;
-      let keyTime = 0;
-      for (const version of versions) {
-        const parts = parseStoreKey(version[0], accountPrefix() + id + "/");
-        if (parts === null) continue;
-        if (parts.format === 2 && keyTime === 0) keyTime = parts.time_ms;
-        const signed = objects.get(version[0] + "\n" + version[1]);
+      for (const candidate of candidates) {
+        const signed = objects.get(candidate.key + "\n" + candidate.versionId);
         if (signed === undefined || signed === null) continue;
-        verified = checkLegacyEntry(signed, id, parts, keys);
+        verified = checkLegacyEntry(signed, id, candidate.parts, keys);
         if (verified !== null) break;
       }
       const items = openEntryItems(id, seq, verified, keyTime);
-      const entry = {
-        id: "2:" + name, time_ms: verified !== null ? verified.time_ms : keyTime, count: items.length, items: items,
+      return {
+        verified: verified !== null,
+        entry: { id: "2:" + id + ":" + seq, time_ms: verified !== null ? verified.time_ms : keyTime, count: items.length, items: items },
       };
-      run.chainKept.push({ name: name, entry: entry });
-      run.objectsRead.add(name);
-      displayEntries.set(name, entry);
+    };
+    if (withheld.objects.length > 0) {
+      const groups = [];
+      const wanted = [];
+      for (const versions of withheld.objects) {
+        const name = objectName(versions);
+        if (name === "") continue;
+        const id = name.slice(0, 43);
+        const group = { name: name, id: id, seq: Number(name.slice(44)), candidates: [], keyTime: 0 };
+        for (const version of versions) {
+          const parts = parseStoreKey(version[0], accountPrefix() + id + "/");
+          if (parts === null) continue;
+          if (parts.format === 2) group.keyTime = Math.max(group.keyTime, parts.time_ms);
+          group.candidates.push({ key: version[0], versionId: version[1], parts: parts });
+          wanted.push({ key: version[0], versionId: version[1] });
+        }
+        groups.push(group);
+      }
+      const objects = await readVersions(wanted);
+      for (const group of objects === null ? [] : groups) {
+        const read = opened(group.id, group.seq, group.candidates, group.keyTime, objects);
+        run.chainKept.push({ name: group.name, entry: read.entry });
+        run.objectsRead.add(group.name);
+        displayEntries.set(group.name, read.entry);
+      }
+    }
+    // The seqs under which the screen found more objects than it reads, none of the ones it read
+    // the entry of the node: the objects under each are listed again and the latest
+    // LEGACY_SEQ_READS of them read. While none of them is the entry of the node and more lie
+    // under the seq, the entry of the node, if it wrote one, is held back behind them: the round
+    // is one held back, and the seq stays with the rounds. A seq the store names no object of
+    // any more, or whose objects are all read, is settled.
+    if (withheld.crowded.length === 0) return;
+    const listings = await legacyListings(turn, withheld.crowded.map(function (place) {
+      return { node: place[0], key_marker: listingMarker(place[0], place[1] - 1), version_id_marker: null };
+    }));
+    const plans = [];
+    const wanted = [];
+    for (let at = 0; at < withheld.crowded.length; at += 1) {
+      const id = withheld.crowded[at][0];
+      const seq = withheld.crowded[at][1];
+      const outcome = listings[at];
+      if (!outcome.ok) {
+        noteFailure(turn, run, heldBack(outcome.error));
+        continue;
+      }
+      const prefix = accountPrefix() + id + "/";
+      const all = [];
+      let keyTime = 0;
+      let beyond = false;
+      for (const version of outcome.value.versions) {
+        const parts = parseStoreKey(version.key, prefix);
+        if (parts === null || parts.seq < seq) continue;
+        if (parts.seq > seq) {
+          beyond = true;
+          continue;
+        }
+        if (parts.format === 2) keyTime = Math.max(keyTime, parts.time_ms);
+        all.push({ key: version.key, versionId: version.versionId, isLatest: version.isLatest, parts: parts });
+      }
+      const candidates = all.slice().sort(function (a, b) { return (b.isLatest ? 1 : 0) - (a.isLatest ? 1 : 0); })
+        .slice(0, LEGACY_SEQ_READS);
+      // More object versions lie under the seq than are read: more than LEGACY_SEQ_READS on
+      // this page, or a page that goes on before it names a later seq.
+      const more = all.length > candidates.length ||
+        (outcome.value.truncated && outcome.value.nextKeyMarker !== null && !beyond);
+      plans.push({ name: id + ":" + seq, id: id, seq: seq, candidates: candidates, keyTime: keyTime, more: more });
+      for (const candidate of candidates) wanted.push(candidate);
+    }
+    const objects = await readVersions(wanted);
+    for (const plan of objects === null ? [] : plans) {
+      const read = opened(plan.id, plan.seq, plan.candidates, plan.keyTime, objects);
+      if (!read.verified && plan.more) {
+        run.blocked = true;
+        if (run.detail === "") run.detail = "chain:keys";
+        continue;
+      }
+      run.crowdedRead.add(plan.name);
+      if (plan.candidates.length > 0) {
+        run.chainKept.push({ name: plan.name, entry: read.entry });
+        displayEntries.set(plan.name, read.entry);
+      }
     }
   }
 
@@ -5782,24 +6001,41 @@
     }
     const seqs = sortedSeqs(node);
     let lowest = Infinity;
+    // The time the seq above the one looked at was placed at.
+    let above = Infinity;
     const unopened = [];
     for (const seq of seqs) {
-      if (seq >= pointer) continue;
+      // The time and the number of events the seq is placed with: what its keys name when they
+      // all name one time, otherwise what the entry the screen opened says. An opened line
+      // that is not verified is placed no later than the seq above it, so the time its keys
+      // name moves it neither down the list nor out of the order of its chain. A seq whose
+      // keys name several times, or none, is opened before it is placed.
       const facts = keyFacts(node, seq);
-      if (facts !== null) {
-        lowest = facts.time_ms;
-        if (facts.time_ms < beforeMs) return { id: id, step: "entry", seq: seq, time: facts.time_ms, count: facts.count };
+      let time = null;
+      let count = 1;
+      if (facts !== null && facts.settled) {
+        time = facts.time_ms;
+        count = facts.count;
+      } else {
+        const opened = displayEntries.get(id + ":" + seq);
+        if (opened !== undefined) {
+          time = unverifiedEntry(opened) ? Math.min(opened.time_ms, above) : opened.time_ms;
+          count = opened.items.length;
+        }
+      }
+      if (seq >= pointer) {
+        if (time !== null) above = time;
         continue;
       }
-      const opened = displayEntries.get(id + ":" + seq);
-      if (opened === undefined) {
+      if (time === null) {
         unopened.push(seq);
         if (unopened.length >= LOG_SCREEN_EVENTS) break;
         continue;
       }
       if (unopened.length > 0) break;
-      lowest = opened.time_ms;
-      if (opened.time_ms < beforeMs) return { id: id, step: "entry", seq: seq, time: opened.time_ms, count: 1 };
+      above = time;
+      lowest = time;
+      if (time < beforeMs) return { id: id, step: "entry", seq: seq, time: time, count: count };
     }
     if (unopened.length > 0) {
       const hint = cache.tops[id];
@@ -5870,7 +6106,7 @@
         const objects = await readChainObjects(
           turn, best.seqs.map(function (seq) { return { id: best.id, seq: seq }; }), budget.reads);
         for (const seq of best.seqs) {
-          if (legacyEntry(keys, best.id, seq, objects) === null) {
+          if (legacyEntry(keys, best.id, seq, objects, budget.reads) === null) {
             displayEntries.set(best.id + ":" + seq, {
               id: "2:" + best.id + ":" + seq, time_ms: 0, count: 1, items: openEntryItems(best.id, seq, null, 0),
             });
@@ -5910,16 +6146,16 @@
       }
       const seqs = sortedSeqs(node);
       if (seqs.length > 0) {
-        const facts = keyFacts(node, seqs[0]);
-        if (facts !== null) cache.tops[best.id] = { seq: seqs[0], time_ms: facts.time_ms };
+        const latest = topTime(node);
+        if (latest > 0) cache.tops[best.id] = { seq: seqs[0], time_ms: latest };
       }
     }
     if (round >= turns) more = true;
     const objects = await readChainObjects(turn, chosen, budget.reads);
     const entries = [];
     for (const item of chosen) {
-      const entry = legacyEntry(keys, item.id, item.seq, objects);
-      if (entry !== null) entries.push(entry);
+      const entry = legacyEntry(keys, item.id, item.seq, objects, budget.reads);
+      if (entry !== null) entries.push(placedEntry(entry, item.time));
     }
     return { entries: entries, more: more };
   }
@@ -7069,7 +7305,7 @@
     for (const plan of plans) {
       let range = countedRange(tally, plan.id);
       const count = function (seq) {
-        const entry = legacyEntry(keys, plan.id, seq, objects);
+        const entry = legacyEntry(keys, plan.id, seq, objects, budget.reads);
         if (entry === null) return false;
         if (entry.time_ms >= since) countEntryInto(tally, entry);
         if (range === null) {

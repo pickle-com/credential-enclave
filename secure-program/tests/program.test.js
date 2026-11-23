@@ -2463,12 +2463,15 @@ test("an entry of a chain of format 2 whose object the backend gives the rounds 
   world.fault("POST /api/secure/log/store/objects", { status: 503, body: { detail: "log_store_unreachable" } });
   await S.call(fx, "read_log", { limit: 50 });
   assert.equal(heldReads(world).objects.length, 1);
+  // (The round the screen started read the object of the last seq of the chain as well, to see
+  // how far the node wrote: it is the first round held back.)
+  assert.equal(world.stored("log.blocked").count, 1);
   const states = [];
   for (let day = 0; day < 4; day += 1) {
     await nextDay(fx);
     states.push(world.state.log.status + ":" + world.state.log.store + ":" + world.reports.slice(-1)[0].blocked_attempts);
   }
-  assert.deepEqual(states, ["pending:blocked:1", "pending:blocked:2", "pending:blocked:3", "attention:blocked:4"]);
+  assert.deepEqual(states, ["pending:blocked:2", "pending:blocked:3", "attention:blocked:4", "attention:blocked:5"]);
   assert.equal(world.state.log.store_failure, "objects:503");
   assert.deepEqual(world.securityStatuses.slice(-1)[0].reasons, ["verification_blocked"]);
   world.clearFaults();
@@ -3361,15 +3364,15 @@ test("A3: a chain of format 2 whose listing goes on over pages that hold many ob
   }
   assert.ok(moved.seq > before.seq);
   const states = [];
-  for (let day = 0; day < 5; day += 1) {
+  for (let day = 0; day < 4; day += 1) {
     await nextDay(fx);
     await world.settle(1000);
     states.push(world.state.log.status + ":" + world.state.log.store + ":" + world.reports.slice(-1)[0].blocked_attempts);
   }
-  // The eight rounds of the first synchronization count nothing. The first round of each
-  // synchronization after it counts, and the fifth is three days after the second.
-  assert.deepEqual(states, ["pending:verified:0", "pending:blocked:1", "pending:blocked:2", "pending:blocked:3", "attention:blocked:4"]);
-  assert.equal(world.state.log.store_failure, "round:unfinished");
+  // The listing page goes on and shows the node writing nowhere beyond the seq the chain was
+  // read to: every round is held back, and no round follows a round held back.
+  assert.deepEqual(states, ["pending:blocked:1", "pending:blocked:2", "pending:blocked:3", "attention:blocked:4"]);
+  assert.equal(world.state.log.store_failure, "chain:keys");
   assert.equal(world.state.log.newer_release_nodes, 0);
 
   // 9,000 entries a node wrote, one object under each seq, in listing pages of 1,000: a round
@@ -3388,6 +3391,130 @@ test("A3: a chain of format 2 whose listing goes on over pages that hold many ob
     assert.equal(long.world.stored("log.blocked").count, 0, "day " + day);
   }
   assert.deepEqual(walked, ["pending", "pending", "verified"]);
+});
+
+/** Writes an object no node signed under the seq of a chain of format 2 (chain: the prefix of the
+ *  chain, ending in "/"), with a key that names the time and the kind given. */
+function strayObject(fx, chain, seq, timeMs, kind, mark) {
+  const filler = String(mark === undefined ? "" : mark).padEnd(43, "A");
+  fx.world.putObject(fx.world.bucket, chain + String(seq).padStart(20, "0") + "-" + String(timeMs).padStart(13, "0") + "-" +
+    (kind || "u") + "-001-" + fx.keys.keyId + "-" + filler + "-" + filler, "x");
+}
+
+test("A1: the seq up to which a round read a chain of format 2 moves on only where the node wrote: an object someone else wrote far beyond the end of the chain, or under a seq the node has not reached, hides no transfer the node writes after it", async () => {
+  for (const where of ["far", "ahead"]) {
+    const fx = S.fixture(source, { nodes: 0, legacy: 1, device: { securityStatus: true } });
+    fx.world.now = TRANSFER_DOCUMENTS_FROM_MS + DAY_MS;
+    await S.start(fx);
+    const world = fx.world;
+    const node = fx.legacy[0];
+    const top = () => node.chains.get(world.userId).slice(-1)[0].seq;
+    world.advance(HOUR_MS);
+    const used = node.record("u", [S.providerRequest(world.now)]);
+    const chain = used.key.slice(0, used.key.lastIndexOf("/") + 1);
+    // The object lies two seqs beyond the end of the chain (the node writes one entry with the
+    // next synchronization, and the transfer under that seq after it), or far beyond it.
+    const stray = where === "far" ? top() + 100000 : top() + 2;
+    strayObject(fx, chain, stray, world.now, "u");
+    await nextDay(fx);
+    assert.equal(world.state.log.status, "verified", where);
+    assert.equal(world.stored("log.legacy").nodes[node.id].seq, top(), where);
+    assert.ok(top() < stray, where);
+    // The node hands the delegation on to a node of a measurement no list has.
+    const rogue = world.addNode({ release: "v2.3.9", measurement: bridge.randomMeasurement(), format: 2, offered: false });
+    world.keptDocuments.set(rogue.id, registryDocument(rogue));
+    const moved = node.record("c", [{ t: "grant_transferred_out", time_ms: world.now, to: rogue.id }]);
+    if (where === "ahead") assert.equal(moved.seq, stray);
+    await nextDay(fx);
+    assert.equal(world.state.log.status, "pending", where);
+    assert.equal(world.state.log.newer_release_nodes, 1, where);
+    await nextDay(fx);
+    assert.equal(world.state.log.status, "attention", where);
+    assert.equal(world.state.log.unknown_nodes, 1, where);
+    assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 }, where);
+  }
+});
+
+test("A3: objects someone else wrote under every seq of a long chain of format 2 keep the rounds from its end: the rounds read on a few seqs each, have more to read than they read, and mark the log three days after the second synchronization", async () => {
+  // 300 use entries and then a transfer to a node of a measurement no list has. Six objects
+  // someone else wrote lie under every seq, and a listing page holds ten object versions: a page
+  // holds the objects of one seq, and a round reads the chain on by four seqs.
+  const fx = S.fixture(source, { nodes: 0, legacy: 1, device: { securityStatus: true } });
+  fx.world.now = TRANSFER_DOCUMENTS_FROM_MS + DAY_MS;
+  await S.start(fx);
+  const world = fx.world;
+  const node = fx.legacy[0];
+  const rogue = world.addNode({ release: "v2.3.9", measurement: bridge.randomMeasurement(), format: 2, offered: false });
+  world.keptDocuments.set(rogue.id, registryDocument(rogue));
+  world.advance(HOUR_MS);
+  let chain = "";
+  for (let i = 0; i < 300; i += 1) {
+    world.advance(1000);
+    const used = node.record("u", [S.providerRequest(world.now)]);
+    chain = used.key.slice(0, used.key.lastIndexOf("/") + 1);
+    for (let j = 0; j < 6; j += 1) strayObject(fx, chain, used.seq, 1, "u", String(j));
+  }
+  node.record("c", [{ t: "grant_transferred_out", time_ms: world.now, to: rogue.id }]);
+  world.pageSize = 10;
+  const from = world.stored("log.legacy").nodes[node.id].seq;
+  const states = [];
+  for (let day = 0; day < 5; day += 1) {
+    await nextDay(fx);
+    await world.settle(1000);
+    states.push(world.state.log.status + ":" + world.state.log.store + ":" + world.reports.slice(-1)[0].blocked_attempts);
+  }
+  // The eight rounds of the first synchronization count nothing. The first round of each
+  // synchronization after it counts, and the fifth is three days after the second.
+  assert.deepEqual(states, ["pending:verified:0", "pending:blocked:1", "pending:blocked:2", "pending:blocked:3", "attention:blocked:4"]);
+  assert.equal(world.state.log.store_failure, "round:unfinished");
+  assert.equal(world.state.log.newer_release_nodes, 0);
+  // The chain was read on: by the seqs of 160 listing pages, one seq a page.
+  assert.equal(world.stored("log.legacy").nodes[node.id].seq, from + 160);
+});
+
+test("the log screen reads eight objects under a seq of a chain of format 2: objects someone else wrote there do not take the place of the entry of the node, a key with an earlier time moves its line no further down, and more of them than the screen reads go to the rounds, which count the read as held back", async () => {
+  const fx = S.fixture(source, { nodes: 0, legacy: 1, device: { securityStatus: true } });
+  await S.start(fx);
+  const world = fx.world;
+  const node = fx.legacy[0];
+  const used = [];
+  for (let i = 0; i < 4; i += 1) {
+    world.advance(DAY_MS);
+    used.push(node.record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/messages/" + i, "POST")]));
+  }
+  const chain = used[0].key.slice(0, used[0].key.lastIndexOf("/") + 1);
+  // The lines of the requests and of the seqs that are not verified, in the order of the screen:
+  // the last character of the address of a request, "?" for a line that is not verified.
+  const lines = (result) => shownGroups(result.value).filter((group) => group.kind === "request" || group.kind === "unverified")
+    .map((group) => (group.kind === "unverified" ? "?" : group.requests.map((row) => row.target.slice(-1)).join(""))).join("");
+  // Seven objects under the seq of the latest entry, with keys that name the first millisecond
+  // (they sort in front of the key of the node, and name a time years before it).
+  for (let j = 0; j < 7; j += 1) strayObject(fx, chain, used[3].seq, 1, "u", String(j));
+  await S.start(fx);
+  const shown = await S.call(fx, "read_log", { limit: 50 });
+  // The entry of the node is the first of those lines, verified.
+  assert.equal(lines(shown), "3210");
+  assert.equal(heldReads(world), undefined);
+  // Nine such objects under the seq of the entry before it: none of the eight the screen reads
+  // is the entry of the node. Its line is not verified, it stands where the latest key under the
+  // seq places it (below the entry after it and above the entry before it), and the read goes to
+  // the rounds.
+  for (let j = 0; j < 9; j += 1) strayObject(fx, chain, used[2].seq, 1, "u", String(j));
+  await S.start(fx);
+  const again = await S.call(fx, "read_log", { limit: 50 });
+  assert.equal(lines(again), "3?10");
+  assert.deepEqual(heldReads(world).crowded, [[node.id, used[2].seq]]);
+  // Every round reads the objects under that seq again and is held back while none of the
+  // eight it reads is the entry of the node.
+  const states = [];
+  for (let day = 0; day < 4; day += 1) {
+    await nextDay(fx);
+    states.push(world.state.log.status + ":" + world.state.log.store + ":" + world.reports.slice(-1)[0].blocked_attempts);
+  }
+  assert.deepEqual(states, ["pending:blocked:1", "pending:blocked:2", "pending:blocked:3", "attention:blocked:4"]);
+  assert.equal(world.state.log.store_failure, "chain:keys");
+  assert.deepEqual(world.securityStatuses.slice(-1)[0].reasons, ["verification_blocked"]);
+  assert.deepEqual(heldReads(world).crowded, [[node.id, used[2].seq]]);
 });
 
 test("more open chains of format 2 than a round follows are all read within the rounds that follow: the chains listed longest ago come first", async () => {
