@@ -152,6 +152,12 @@
   const STORE_CACHE = "log.cache";
   const STORE_MIGRATED = "log.migrated";
   const STORE_OUTCOMES = "outcomes";
+  // The names of the vault items a call of store_secret made and has not filled yet (a name is
+  // no secret: the backend holds it in the clear). A runtime that ends between the request that
+  // makes an item and the request that stores its value leaves the name here, and the next
+  // runtime removes the item while it holds no value (removeMadeSecrets).
+  const STORE_VAULT_MADE = "vault.made";
+  const VAULT_MADE_NAMES = 8;
   // The key of the device store that marks the sealing check as done for this device and account: a
   // query of the pending values (GET /api/secure/sealing) that found none, or an upload that left none.
   // Writing a master key (a new key, a replaced key, a transferred key) clears it.
@@ -3373,6 +3379,7 @@
       const value = waiting[id];
       if (!NODE_ID.test(id) || value === null || typeof value !== "object") continue;
       legacy.waiting[id] = { until_ms: whole(value.until_ms), time_ms: whole(value.time_ms) };
+      if (value.strict === true) legacy.waiting[id].strict = true;
     }
     return legacy;
   }
@@ -3482,9 +3489,9 @@
     if (log.seen.list.length > LOG_SEEN_KEYS) log.seen.set.delete(log.seen.list.shift());
   }
 
-  /** Notes a measurement no list of this program has (digest: the digest of the measurement, or
-   *  "node:" and a node id when only the node is known). held says that the key of this account
-   *  went to a node of it. The time it was first seen is kept. */
+  /** Notes a measurement no list of this program has (digest: the digest of the measurement).
+   *  held says that the key of this account went to a node of it. The time it was first seen is
+   *  kept. */
   function noteUnaccepted(log, digest, release, node, held) {
     let item = log.unaccepted[digest];
     if (item === null || typeof item !== "object") {
@@ -4089,7 +4096,7 @@
           noteUnaccepted(log, verdict.measure, verdict.release, parsed.node, true);
         } else if (parsed.letter === "c" && parsed.event === "grant_transferred_out") {
           const receiver = judgeTransfer(log, record.events[0]);
-          if (receiver !== null) transfers.push({ to: receiver, event: record.events[0] });
+          if (receiver !== null) transfers.push({ to: receiver, event: record.events[0], time_ms: parsed.time_ms });
         }
       }
       if (parsed.letter === "c") {
@@ -4108,25 +4115,42 @@
     });
     for (const parsed of unanswered) hold(parsed.key);
     // The receiving nodes of transfers whose events name no measurement: their documents. A
-    // receiving node that got no judgement is noted whatever kept its document from this read
-    // (the entry of the transfer is judged and is not read again).
+    // receiving node that got no judgement waits (log.legacy, waiting), whatever kept its
+    // document from this read: the entry of the transfer is judged and is not read again, and
+    // every round asks for the document of a node that waits (followLegacy). No time alone marks
+    // the log for such a node. A request for its document that was answered without one that
+    // verifies is a read held back; a document that states a measurement no list has makes that
+    // measurement one that held the key, first seen then.
     if (transfers.length > 0) {
       const ids = [];
       for (const transfer of transfers) {
         if (ids.indexOf(transfer.to) < 0) ids.push(transfer.to);
       }
+      let got = new Map();
       if (ended === null) {
         try {
-          await learnNodes(turn, log, run, ids, budget, "receiver");
+          got = await learnNodes(turn, log, run, ids, budget, "receiver");
         } catch (thrown) {
           endedBy(thrown);
         }
       }
       for (const transfer of transfers) {
         const verdict = nodeVerdict(log.grants, log.nodes, transfer.to);
-        if (verdict === null) noteUnaccepted(log, "node:" + transfer.to, transfer.event.release, transfer.to, true);
-        else if (verdict.state === "unaccepted") {
-          noteUnaccepted(log, verdict.measure, verdict.release, transfer.to, true);
+        if (verdict !== null) {
+          if (verdict.state === "unaccepted") noteUnaccepted(log, verdict.measure, verdict.release, transfer.to, true);
+          continue;
+        }
+        const eventMs = whole(transfer.event.time_ms) > 0 ? transfer.event.time_ms : transfer.time_ms;
+        const before = log.legacy.waiting[transfer.to] || { until_ms: 0, time_ms: 0 };
+        // (strict: an entry of format 3 names the node, so nothing but a document judges it.)
+        log.legacy.waiting[transfer.to] = {
+          until_ms: Math.max(before.until_ms, eventMs + GRANT_DAYS_MAX * DAY_MS), time_ms: Math.max(before.time_ms, eventMs),
+          strict: true,
+        };
+        const why = got.get(transfer.to);
+        if (why !== undefined && (why.state === "missing" || why.state === "rejected")) {
+          run.blocked = true;
+          if (run.detail === "") run.detail = "receiver:" + why.state;
         }
       }
     }
@@ -4401,9 +4425,11 @@
                   // The time of the event, or of its entry for an event that names none.
                   const eventMs = whole(event.time_ms) > 0 ? event.time_ms : entry.time_ms;
                   const before = receivers.get(event.to) || { until_ms: 0, time_ms: 0 };
-                  receivers.set(event.to, {
+                  const named = {
                     until_ms: Math.max(before.until_ms, chain.until_ms), time_ms: Math.max(before.time_ms, eventMs),
-                  });
+                  };
+                  if (before.strict === true) named.strict = true;
+                  receivers.set(event.to, named);
                 }
               }
             }
@@ -4446,9 +4472,13 @@
         if (now > chain.until_ms + LEGACY_CLOSE_SLACK_MS) chain.closed = true;
       }
       // The receiving nodes this device has no judgement of: their documents.
+      // A receiving node without a judgement waits from here on, whatever becomes of the request
+      // for its document: the entry that names it is read, and the chain is not read there again.
       const unknown = [];
       receivers.forEach(function (receiver, id) {
-        if (nodeVerdict(log.grants, log.nodes, id) === null) unknown.push(id);
+        if (nodeVerdict(log.grants, log.nodes, id) !== null) return;
+        unknown.push(id);
+        legacy.waiting[id] = receiver;
       });
       const left = unknown.length === 0 ? new Map()
         : await learnNodes(turn, log, run, unknown.slice(0, LOG_DOCUMENT_NODES), { documents: 1 }, "chain");
@@ -4472,8 +4502,11 @@
             if (why === undefined) run.over = true;
             return;
           }
-          const kept = receiver.time_ms >= LEGACY_TRANSFER_DOCUMENTS_FROM_MS &&
-            now - receiver.time_ms < LOG_RETENTION_DAYS * DAY_MS;
+          // A node an entry of format 3 names (strict) is judged by a document at whatever time
+          // the event is; a node only a chain of format 2 names, from the time the backend
+          // keeps the documents of receiving nodes.
+          const kept = now - receiver.time_ms < LOG_RETENTION_DAYS * DAY_MS &&
+            (receiver.strict === true || receiver.time_ms >= LEGACY_TRANSFER_DOCUMENTS_FROM_MS);
           if (kept) {
             // The backend keeps the document of every node that took a transfer from that time
             // on, for longer than the store keeps the entry of the transfer, and hands none out
@@ -4484,6 +4517,7 @@
             return;
           }
           delete legacy.waiting[id];
+          if (receiver.strict === true) return;
         }
         const known = legacy.nodes[id] !== undefined;
         followChain(log, id, receiver.until_ms);
@@ -4537,9 +4571,9 @@
    *  (A1): a measurement that held the key of this account and that the device first saw
    *  LOG_RELEASE_GRACE_MS ago or longer marks the log now, at every event of the app, whatever
    *  the rounds after it read or fail to read. A measurement a list of this program has is left
-   *  to the rounds, which forget it, and so is a node whose document the device has not seen (a
-   *  round that reads the document judges it). The kept state is published as attention and the
-   *  app is told, unless the state says so already. */
+   *  to the rounds, which forget it. (A receiving node whose document the device has not seen is
+   *  no measurement: it waits for its document, and no time marks the log for it.) The kept
+   *  state is published as attention and the app is told, unless the state says so already. */
   function judgeKept() {
     try {
       const kept = storedObject(STORE_UNACCEPTED);
@@ -4547,7 +4581,7 @@
       let established = 0;
       for (const digest of Object.keys(kept)) {
         const item = kept[digest];
-        if (item === null || typeof item !== "object" || item.held !== true || digest.slice(0, 5) === "node:") continue;
+        if (item === null || typeof item !== "object" || item.held !== true) continue;
         if (buildOfMeasure(digest) !== undefined) continue;
         const first = whole(item.first_ms);
         if (first > 0 && first <= now && now - first >= LOG_RELEASE_GRACE_MS) established += 1;
@@ -4979,13 +5013,7 @@
     for (const digest of Object.keys(log.unaccepted)) {
       const item = log.unaccepted[digest];
       const node = item !== null && typeof item === "object" && typeof item.node === "string" ? item.node : "";
-      const listed = item === null || typeof item !== "object" ? true
-        : digest.slice(0, 5) === "node:"
-          ? (function () {
-            const verdict = nodeVerdict(log.grants, log.nodes, digest.slice(5));
-            return verdict !== null && verdict.state === "accepted";
-          })()
-          : buildOfMeasure(digest) !== undefined;
+      const listed = item === null || typeof item !== "object" ? true : buildOfMeasure(digest) !== undefined;
       if (listed) {
         delete log.unaccepted[digest];
         continue;
@@ -8738,23 +8766,26 @@
     return false;
   }
 
-  /** Reads the reach of a vault secret: sites is the string "any" or 1 to VAULT_SITES_MAX hosts,
-   *  no host twice; slots is 1 to VAULT_SLOTS_MAX slots, no slot twice, and either the one slot
-   *  field or slots of a request; a secret whose sites is "any" has the one slot field. Returns
-   *  {sites, slots} or null for any other form. */
-  function readReach(sites, slots) {
-    let hosts = null;
-    if (sites === "any") {
-      hosts = "any";
-    } else if (Array.isArray(sites) && sites.length >= 1 && sites.length <= VAULT_SITES_MAX) {
-      hosts = [];
-      for (const host of sites) {
-        if (!isSiteHost(host) || hosts.indexOf(host) >= 0) return null;
-        hosts.push(host);
-      }
-    } else {
-      return null;
+  /** Reads the hosts of the reach of a vault secret: the string "any", or 1 to VAULT_SITES_MAX
+   *  hosts, no host twice. Returns "any", the hosts, or null for any other form. */
+  function readHosts(sites) {
+    if (sites === "any") return "any";
+    if (!Array.isArray(sites) || sites.length < 1 || sites.length > VAULT_SITES_MAX) return null;
+    const hosts = [];
+    for (const host of sites) {
+      if (!isSiteHost(host) || hosts.indexOf(host) >= 0) return null;
+      hosts.push(host);
     }
+    return hosts;
+  }
+
+  /** Reads the reach of a vault secret: sites is the hosts (readHosts); slots is 1 to
+   *  VAULT_SLOTS_MAX slots, no slot twice, and either the one slot field or slots of a request; a
+   *  secret whose sites is "any" has the one slot field. Returns {sites, slots} or null for any
+   *  other form. */
+  function readReach(sites, slots) {
+    const hosts = readHosts(sites);
+    if (hosts === null) return null;
     if (!Array.isArray(slots) || slots.length < 1 || slots.length > VAULT_SLOTS_MAX) return null;
     const places = [];
     for (const slot of slots) {
@@ -8863,7 +8894,15 @@
     const hosts = reach.sites === "any" ? [words.any] : reach.sites.map(function (host) {
       return typed ? host + words.below : host;
     });
-    return hosts.map(function (host) { return (host + " · " + places).slice(0, 200); });
+    return hosts.map(function (host) { return clipText(host + " · " + places, 200); });
+  }
+
+  /** The beginning of a text that fits units UTF-16 code units, cut between characters: a
+   *  character of two code units is kept whole or left out. */
+  function clipText(text, units) {
+    if (text.length <= units) return text;
+    const last = text.charCodeAt(units - 1);
+    return text.slice(0, last >= 0xd800 && last <= 0xdbff ? units - 1 : units);
   }
 
   const OWNER_AUTH_REASONS = {
@@ -8896,7 +8935,7 @@
   /** The title a protected sheet shows: the label of the item, or its name. */
   function sheetTitle(label, name) {
     const title = typeof label === "string" && label.trim() !== "" ? label.trim() : name;
-    return title.slice(0, 120);
+    return clipText(title, 120);
   }
 
   /** The value of a secret from the user: in a build with the protected sheets it is asked for in
@@ -8921,11 +8960,14 @@
    *  that is sealed.
    *  Without a name (an item the user adds on the vault screen): storeNewSecret. */
   async function storeSecret(turn, args) {
+    // No name (the argument is absent or empty) is an item to make. A name of white space
+    // alone is no name of an item, and not the absence of one.
+    const given = stringArgument(args.name);
+    const name = given.trim();
+    if (given !== "" && !SECRET_NAME.test(name)) throw native.error("invalid_input", "name");
     const keys = await presentKeys(turn);
     const custody = await recordCustody(turn);
-    const name = stringArgument(args.name).trim();
     if (name === "") return storeNewSecret(turn, args, keys, custody);
-    if (!SECRET_NAME.test(name)) throw native.error("invalid_input", "name");
     const item = (await api(turn, "GET", VAULT_PATH + "/secret/" + name)).json;
     const reach = readReach(item.sites, item.slots);
     if (item.name !== name || reach === null) throw native.error("invalid_response", "secret");
@@ -8965,8 +9007,10 @@
       label: label, sites: wanted.sites, slots: wanted.slots,
     })).json;
     const name = stringArgument(made.name);
+    const named = SECRET_NAME.test(name);
+    if (named) noteMadeSecret(name, true);
     try {
-      if (!SECRET_NAME.test(name)) throw native.error("invalid_response", "name");
+      if (!named) throw native.error("invalid_response", "name");
       const item = (await api(turn, "GET", VAULT_PATH + "/secret/" + name)).json;
       const reach = readReach(item.sites, item.slots);
       if (item.name !== name || reach === null) throw native.error("invalid_response", "secret");
@@ -8977,12 +9021,58 @@
       const saved = (await api(turn, "PUT", VAULT_PATH + "/secret/" + name, {
         record: record, sites: reach.sites, slots: reach.slots,
       })).json;
+      noteMadeSecret(name, false);
       return { name: name, state: typeof saved.state === "string" ? saved.state : "ready" };
     } catch (failure) {
       // The request is one of its own turn: it is sent when the time of the call has passed too.
-      if (SECRET_NAME.test(name)) await settled(api(freeTurn(), "DELETE", VAULT_PATH + "/secret/" + name));
+      // An item the backend could not be asked to remove stays noted for the next runtime.
+      if (named) {
+        const removed = await settled(api(freeTurn(), "DELETE", VAULT_PATH + "/secret/" + name));
+        if (removed.ok || failureStatus(removed.error) === 404) noteMadeSecret(name, false);
+      }
       throw failure;
     }
+  }
+
+  /** The names of the vault items a call made and has not filled (STORE_VAULT_MADE). */
+  function madeSecrets() {
+    const kept = storedJson(STORE_VAULT_MADE, []);
+    return (Array.isArray(kept) ? kept : []).filter(function (name, at, all) {
+      return typeof name === "string" && SECRET_NAME.test(name) && all.indexOf(name) === at;
+    }).slice(-VAULT_MADE_NAMES);
+  }
+
+  /** Notes that a call made the item name and has not filled it (made true), or that the item is
+   *  filled or gone (made false). */
+  function noteMadeSecret(name, made) {
+    const names = madeSecrets().filter(function (kept) { return kept !== name; });
+    if (made) names.push(name);
+    storeJson(STORE_VAULT_MADE, names.length === 0 ? null : names.slice(-VAULT_MADE_NAMES));
+  }
+
+  /** Removes the vault items an earlier runtime made and did not fill, at the start of a
+   *  runtime. An item is removed only while it holds no value: one that holds a value, and one
+   *  the backend has no more, are forgotten. A request that fails leaves the name for the next
+   *  runtime. The work runs on the line of the procedures a user starts, so it meets no call of
+   *  store_secret in progress, and nothing waits for it. An item whose making request was not
+   *  answered before its runtime ended has no name on the device and stays. */
+  function removeMadeSecrets() {
+    if (madeSecrets().length === 0 || accountClosed) return;
+    userLine.run(freeTurn(), async function () {
+      for (const name of madeSecrets()) {
+        const read = await settled(api(freeTurn(), "GET", VAULT_PATH + "/secret/" + name));
+        if (!read.ok) {
+          if (failureStatus(read.error) === 404) noteMadeSecret(name, false);
+          continue;
+        }
+        const item = read.value.json;
+        if (item.record === undefined || item.record === null) {
+          const removed = await settled(api(freeTurn(), "DELETE", VAULT_PATH + "/secret/" + name));
+          if (!removed.ok && failureStatus(removed.error) !== 404) continue;
+        }
+        noteMadeSecret(name, false);
+      }
+    }).then(noop, noop);
   }
 
   /** The plaintext of the record of the item name, opened with the user key of this device:
@@ -9034,6 +9124,8 @@
   async function updateSecret(turn, args) {
     const name = secretName(args);
     const sites = listArgument(args.sites, HOST_SEPARATOR);
+    // The form of the hosts needs no item: it is checked before anything is asked of the user.
+    if (readHosts(sites) === null) throw native.error("invalid_input", "sites");
     const slotsGiven = listGiven(args.slots);
     // The reach the item is to have: the hosts given, and the slots given or those of the item.
     const reachOf = function (item) {
@@ -9106,7 +9198,7 @@
     }
     if (!protectedSheets()) return { site: site, value: plain.value };
     await interactive(turn, function () {
-      return native.presentSecret({ title: site.slice(0, 120), value: plain.value });
+      return native.presentSecret({ title: clipText(site, 120), value: plain.value });
     });
     return { site: site };
   }
@@ -9446,7 +9538,7 @@
     for (const key of [LEDGER_STORE_KEY, LEDGER_SHARE_STORE_KEY, SEALING_CHECK_STORE_KEY, STORE_GRANTS,
       STORE_CURSOR, STORE_RESUME, STORE_NODES, STORE_UNACCEPTED, STORE_BLOCKED, STORE_SAMPLE, STORE_SEEN,
       STORE_MISSING, STORE_WITHHELD, STORE_RECOVERED, STORE_DENIED, STORE_LEGACY, STORE_ROUND, STORE_CACHE,
-      STORE_MIGRATED, STORE_OUTCOMES].concat(RETIRED_STORE_KEYS)) {
+      STORE_MIGRATED, STORE_OUTCOMES, STORE_VAULT_MADE].concat(RETIRED_STORE_KEYS)) {
       native.storeSet(key, null);
     }
     outcomeState = null;
@@ -10031,6 +10123,7 @@
         if (storedObject(STORE_ROUND).v !== VERSION) native.publish({ state: { log: keptLogState() } });
         outcomes();
         judgeKept();
+        removeMadeSecrets();
         return eventSync(null, true);
       }
       if (name === "foreground") {

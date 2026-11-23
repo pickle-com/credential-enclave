@@ -1356,33 +1356,39 @@ test("A1: a measurement that held the key marks the log at the next event of the
   }
 });
 
-test("a receiving node whose document this device has not seen is judged by a round and not at an event of the app: a document a round then reads clears it without a mark", async () => {
+test("a receiving node whose document this device has not seen waits for it: no time marks the log for it, a round whose request for the document is answered without one is a round held back, and a document a round then reads ends the wait", async () => {
   const fx = S.fixture(source, { device: { securityStatus: true } });
   await S.start(fx);
   const world = fx.world;
   // A transfer whose event names no measurement, to a node of the accepted measurement. The
-  // request for the document of that node gets no document once.
+  // backend answers the request for the document of that node without a document.
   const receiver = world.addNode({ release: "v2.4.0", measurement: fx.measurement, offered: false });
   fx.nodes[0].record("c", [{ t: "grant_transferred_out", time_ms: world.now, to: receiver.id, release: "v2.4.0" }]);
   withhold(fx, [receiver.id], "missing");
   await nextDay(fx);
-  assert.equal(world.state.log.status, "pending");
-  assert.equal(world.stored("log.unaccepted")["node:" + receiver.id].held, true);
-  // The device is not used for two days. The receiving node wrote an entry of the account, and
-  // the backend answers after a second.
+  assert.equal(world.state.log.status + ":" + world.state.log.store + ":" + world.state.log.store_failure, "pending:blocked:receiver:missing");
+  assert.equal(world.stored("log.blocked").count, 1);
+  assert.deepEqual(Object.keys(world.stored("log.legacy").waiting), [receiver.id]);
+  assert.deepEqual(world.stored("log.unaccepted"), {});
+  // The device is not used for five days. The round that then asks for the document ends with
+  // the app in the background before it is answered: no time marks the log for a node that waits.
   world.clearFaults();
-  world.advance(1000);
-  receiver.record("c", [{ t: "connection_created", time_ms: world.now, record_id: "r1", provider: "slack", scope: "" }]);
-  world.advance(2 * DAY_MS);
-  world.fault("POST /api/secure/log/read", { delay_ms: 1000 });
-  const event = Promise.resolve(fx.program.onEvent("foreground", {}));
-  event.then(() => {}, () => {});
+  world.advance(5 * DAY_MS);
+  world.fault("POST /api/secure/log/documents", { delay_ms: 9000 });
+  Promise.resolve(fx.program.onEvent("foreground", {})).then(() => {}, () => {});
+  await world.settle(5000);
+  assert.deepEqual(JSON.parse(world.sent("POST /api/secure/log/documents").slice(-1)[0].body).nodes, [receiver.id]);
+  fx.program.onEvent("background", {});
   await world.drain();
-  assert.equal(world.state.log.status, "pending");
-  await world.run(event);
-  await world.settle(1000);
+  assert.equal(world.state.log.status + ":" + world.state.log.store_failure, "pending:round:suspended");
+  assert.equal(world.state.log.newer_release_nodes + world.state.log.unknown_nodes, 0);
+  // The backend hands the document out: the wait ends, and the log verifies.
+  world.clearFaults();
+  world.advance(2 * 60000);
+  await S.event(fx, "foreground");
   assert.equal(world.state.log.status, "verified");
-  assert.equal(world.stored("log.unaccepted")["node:" + receiver.id], undefined);
+  assert.deepEqual(world.stored("log.legacy").waiting, {});
+  assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
   assert.ok(world.securityStatuses.every((told) => told.status !== "attention"));
 });
 
@@ -1496,7 +1502,7 @@ test("the keys a round listed and did not judge are kept for the next round, 32 
   assert.equal(heldReads(world), undefined);
 });
 
-test("the receiving node of a transfer is noted when the reading of the round ends while its document is asked for: the entry of the transfer is judged once, and the node is judged after it", async () => {
+test("the receiving node of a transfer is noted when the reading of the round ends while its document is asked for: the entry of the transfer is judged once, the node waits, and the measurement its document states counts from the time the device read it", async () => {
   const fx = S.fixture(source, { device: { securityStatus: true } });
   await S.start(fx);
   const world = fx.world;
@@ -1511,14 +1517,19 @@ test("the receiving node of a transfer is noted when the reading of the round en
   fx.program.onEvent("background", {});
   await world.drain();
   assert.equal(world.state.log.store_failure, "round:suspended");
-  assert.equal(world.stored("log.unaccepted")["node:" + receiver.id].held, true);
-  assert.equal(world.state.log.newer_release_nodes, 1);
-  // The entry of the transfer is not read again, and a day later the node marks the log.
+  assert.deepEqual(Object.keys(world.stored("log.legacy").waiting), [receiver.id]);
+  assert.equal(world.state.log.newer_release_nodes, 0);
+  // Two days pass without a round: nothing is marked. The next round does not read the entry
+  // of the transfer again and asks for the document of the node that waits: it states a
+  // measurement no list has, which the device sees for the first time now.
   world.clearFaults();
-  world.advance(2 * 60000);
+  world.advance(2 * DAY_MS);
   const bodies = askedBodies(world).filter((key) => key === transfer.key).length;
   await S.event(fx, "foreground");
   assert.equal(askedBodies(world).filter((key) => key === transfer.key).length, bodies);
+  assert.equal(world.state.log.status, "pending");
+  assert.equal(world.state.log.newer_release_nodes, 1);
+  assert.deepEqual(world.stored("log.legacy").waiting, {});
   await nextDay(fx);
   assert.equal(world.state.log.status, "attention");
   assert.equal(world.state.log.unknown_nodes, 1);
@@ -4249,6 +4260,71 @@ test("the runtime publishes whether the backend names vault items for the accoun
   S.load(fx);
   await world.run(Promise.resolve(fx.program.onEvent("session_ready", {})).then(() => {}, () => {}));
   assert.equal(world.runtime.named_secrets, false);
+});
+
+test("an item store_secret made and did not fill before its runtime ended is removed by the next runtime while it holds no value, and an item that holds a value is left", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  const base = { name: "", label: "key", sites: "api.openai.com", slots: "header:authorization", value: "sk-live-0123456789" };
+  // The request that stores the value is never answered, and the runtime ends.
+  world.fault("PUT /api/secure/vault/secret/", "hang");
+  fx.program.procedures.store_secret(base).then(() => {}, () => {});
+  await world.drain();
+  assert.equal(world.vault.secrets.size, 1);
+  assert.deepEqual(world.stored("vault.made"), ["SECRET_1"]);
+  // The next runtime cannot reach the backend: the name stays. The one after it removes the item,
+  // without the device owner being asked.
+  world.clearFaults();
+  world.fault("GET /api/secure/vault/secret/", { status: 503, body: { code: "unavailable" } }, 1);
+  await S.start(fx);
+  await world.settle(0);
+  assert.equal(world.vault.secrets.size, 1);
+  assert.deepEqual(world.stored("vault.made"), ["SECRET_1"]);
+  await S.start(fx);
+  await world.settle(0);
+  assert.equal(world.vault.secrets.size, 0);
+  assert.equal(world.stored("vault.made"), undefined);
+  assert.equal(world.device.ownerAuths.length, 0);
+  // An item that holds its value (the value was stored, and the runtime ended before the device
+  // forgot the name) is not removed, and neither is anything once the name is forgotten.
+  const stored = await S.call(fx, "store_secret", base);
+  assert.equal(stored.ok, true);
+  assert.equal(world.stored("vault.made"), undefined);
+  world.store.set("vault.made", JSON.stringify([stored.value.name, "GONE_ITEM"]));
+  const removed = world.sent("DELETE /api/secure/vault/secret/").length;
+  await S.start(fx);
+  await world.settle(0);
+  assert.equal(world.vault.secrets.has(stored.value.name), true);
+  assert.equal(world.sent("DELETE /api/secure/vault/secret/").length, removed);
+  assert.equal(world.stored("vault.made"), undefined);
+  assert.equal(leaked(world, base.value), false);
+});
+
+test("a name of white space alone is no name of an item, the form of the hosts is checked before the device owner is asked, and a title is cut between characters", async () => {
+  const fx = S.fixture(source, { device: { sheets: true, confirmations: true, promptAnswer: "4821" } });
+  await S.start(fx);
+  const world = fx.world;
+  // A name of white space alone: not an item to make, and nothing is asked of anyone.
+  const requests = world.requests.length;
+  assert.deepEqual(await S.call(fx, "store_secret", { name: "  ", label: "pin", sites: "coupang.com", slots: "field" }), { ok: false, code: "invalid_input" });
+  assert.equal(world.requests.length, requests);
+  assert.equal(world.device.prompts.length, 0);
+  // A label of 80 characters whose 120th code unit is the first half of a character: the title
+  // of the sheet ends with the character before it.
+  const label = "a" + "\u{1F600}".repeat(79);
+  const made = await S.call(fx, "store_secret", { name: "", label: label, sites: "coupang.com", slots: "field" });
+  assert.equal(made.ok, true);
+  assert.equal(world.device.prompts[0].title, "a" + "\u{1F600}".repeat(59));
+  // Hosts of another form: update_secret ends before the confirmation, the device owner
+  // authentication and any request, with the argument slots and without it.
+  for (const args of [{ sites: "Coupang.com", slots: "field" }, { sites: "coupang.com,coupang.com" }, { sites: "" }, {}]) {
+    const before = world.requests.length;
+    assert.deepEqual(await S.call(fx, "update_secret", Object.assign({ name: made.value.name }, args)), { ok: false, code: "invalid_input" }, JSON.stringify(args));
+    assert.equal(world.requests.length, before);
+  }
+  assert.equal(world.device.confirmed.length, 0);
+  assert.equal(world.device.ownerAuths.length, 0);
 });
 
 test("reveal_login_password shows a password a node made and none the user typed", async () => {
