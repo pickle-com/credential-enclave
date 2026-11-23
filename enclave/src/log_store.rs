@@ -759,9 +759,11 @@ pub enum WriteFailure {
     Timeout,
     /// A status other than 200 that is neither 5xx nor 429: a 4xx status (the signature, the
     /// credentials or the configuration of the bucket), and the statuses of the other classes
-    /// that the store does not answer a `PUT` with.
+    /// that the store does not answer a `PUT` with. An attempt with this cause is not
+    /// repeated.
     Status4xx,
-    /// A status 5xx, or 429.
+    /// A status 5xx, or 429: the store failed or asked for fewer requests. An attempt with
+    /// this cause is repeated.
     Status5xx,
 }
 
@@ -769,12 +771,12 @@ pub enum WriteFailure {
 /// connection when the budget of the entry permits.
 type AttemptFailure = (WriteFailure, bool);
 
-/// The failure of a status other than 200: a 5xx status and 429 are repeated, every other
-/// status is not.
+/// The failure of a status other than 200. A 5xx status and 429 are counted under one cause
+/// and repeated; every other status is counted under the other cause and not repeated. So the
+/// cause of a status says whether the node tries the write again.
 fn status_failure(status: StatusCode) -> AttemptFailure {
     match status.as_u16() {
-        429 => (WriteFailure::Status4xx, true),
-        500..=599 => (WriteFailure::Status5xx, true),
+        429 | 500..=599 => (WriteFailure::Status5xx, true),
         _ => (WriteFailure::Status4xx, false),
     }
 }

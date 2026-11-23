@@ -725,7 +725,8 @@ async fn a_write_the_store_refuses_with_a_server_error_is_repeated_within_its_bu
     assert!(log["write_ms_sum"].as_u64().unwrap() < 5000);
     assert_eq!(harness.health().await["log_store"]["pending"], 0);
 
-    // 429 is repeated like a 5xx status.
+    // 429 is repeated like a 5xx status, and counted under the cause of the statuses that
+    // are repeated.
     *lock(&store) = Script {
         refusals: 1,
         refusal_status: 429,
@@ -734,9 +735,11 @@ async fn a_write_the_store_refuses_with_a_server_error_is_repeated_within_its_bu
     assert_eq!(release(&harness, &app, &password(&app)).await.0, 200);
     let log = harness.health().await["log"].clone();
     assert_eq!(log["write_retries"], 3);
-    assert_eq!(log["write_attempt_failures"]["status_4xx"], 1);
+    assert_eq!(log["write_attempt_failures"]["status_5xx"], 3);
+    assert_eq!(log["write_attempt_failures"]["status_4xx"], 0);
 
-    // A 4xx status other than 429 is not repeated: the write fails at once.
+    // A 4xx status other than 429 is not repeated: the write fails at once, under the cause
+    // of the statuses that are not repeated.
     *lock(&store) = Script {
         refusals: 1,
         refusal_status: 403,
@@ -748,7 +751,8 @@ async fn a_write_the_store_refuses_with_a_server_error_is_repeated_within_its_bu
     let log = harness.health().await["log"].clone();
     assert_eq!(log["write_retries"], 3);
     assert_eq!(log["write_failures"], 1);
-    assert_eq!(log["write_attempt_failures"]["status_4xx"], 2);
+    assert_eq!(log["write_attempt_failures"]["status_4xx"], 1);
+    assert_eq!(log["write_attempt_failures"]["status_5xx"], 3);
     assert_eq!(harness.health().await["log_store"]["pending"], 1);
 }
 
