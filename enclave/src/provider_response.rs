@@ -749,7 +749,12 @@ impl Readings {
             let (Some(reading), Some(added)) = (at.first_mut(), added_at.first_mut()) else {
                 return true;
             };
-            added.zeroize();
+            // What the step before added to the reading may hold the credential: it is
+            // overwritten. A buffer that holds no byte was overwritten when it was emptied,
+            // all of its room, and nothing was written to it since.
+            if !added.is_empty() {
+                added.zeroize();
+            }
             let Some((from, escapes)) = reading.origin else {
                 self.same_as.push(index);
                 continue;
