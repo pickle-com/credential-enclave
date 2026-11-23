@@ -1277,6 +1277,18 @@ test("A3: the listing of a node document is read through the address of that lis
   // document the backend did not hand out.
   const called = await held("the address of the listing", () => {}, "documents:missing");
   assert.equal(documentListings(called).length, 1);
+  // The address as the SDK of the backend presigns it for a session of temporary credentials
+  // (list-object-versions with Prefix and MaxKeys: the SDK writes versions= and adds the encoding).
+  const presigned = await held("the address the SDK presigns", (answer, hidden) => {
+    answer.listings = [{
+      node: hidden.id,
+      url: "https://" + bridge.shardBucket("prod", hidden.id) + ".s3.us-west-2.amazonaws.com/?versions=&prefix=n3%2F" + hidden.id +
+        "&max-keys=1000&encoding-type=url&X-Amz-Algorithm=AWS4-HMAC-SHA256" +
+        "&X-Amz-Credential=AKIAEXAMPLEEXAMPLE00%2F20261123%2Fus-west-2%2Fs3%2Faws4_request&X-Amz-Date=20261123T095134Z" +
+        "&X-Amz-Expires=300&X-Amz-SignedHeaders=host&X-Amz-Security-Token=example%2Fsession%2Btoken%3D%3D&X-Amz-Signature=00",
+    }];
+  }, "documents:missing");
+  assert.equal(documentListings(presigned).length, 1);
   const uncalled = async (name, rewrite) => {
     const world = await held(name, (answer, hidden, world) => {
       answer.listings = answer.listings.map((item) => ({ node: item.node, url: rewrite(item.url, hidden, world) }));
