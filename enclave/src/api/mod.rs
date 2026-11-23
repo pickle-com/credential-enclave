@@ -53,7 +53,7 @@ mod vault_handoff;
 mod vault_send;
 
 #[cfg(test)]
-pub(crate) use forward::ADMISSION_WAIT;
+pub(crate) use forward::{credential_share, ADMISSION_WAIT};
 pub use responses::json_ok;
 use responses::{json_error, ErrorBody};
 

@@ -20,7 +20,10 @@ use credential_enclave_protocol::{limits, ProtocolError};
 use hyper::body::Bytes;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use super::forward::{execute, prepare, read_frame, timeout_of, Admission, Prepared};
+use super::forward::{
+    credential_bytes_at_most, credential_share, execute, narrowed, prepare, read_frame,
+    search_turns, timeout_of, Admission, Prepared,
+};
 use super::responses::{forward_batch_frame, BatchResult, LogRef};
 use super::{record_of, respond, ApiError};
 use crate::log_store::{self, join_all};
@@ -92,6 +95,19 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
         .map(|body| request_budget.split(body.len()))
         .collect();
     drop(request_budget);
+    // What the call holds beside its bodies grows with the length of the credential of the
+    // record: the search of a response, and for every request the copies of the token it
+    // carries (`credential_share`). The call takes that share of the body budget before
+    // anything of it is recorded or sent, within the time of its admission: for the longest
+    // credential a record of this size can hold, since the credential is known only once the
+    // record is open, under the account lock, where a call does not wait.
+    let in_flight = requests.len().min(limits::FORWARD_BATCH_CONCURRENCY);
+    let credential_budget = admission
+        .budget(
+            node,
+            credential_share(credential_bytes_at_most(&record), requests.len(), in_flight),
+        )
+        .await?;
 
     // 1: the common front, once for the call.
     node.ensure_open()?;
@@ -134,6 +150,19 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
         (prepared, places)
     };
     drop(bodies);
+    // The call holds no more than the share of the longest token of its requests. The checks
+    // of its responses run one at a time under that share (`SearchTurns`), which is free when
+    // the call has ended and none of them runs.
+    let token_bytes = prepared
+        .iter()
+        .map(|prepared| prepared.token_bytes)
+        .max()
+        .unwrap_or(0);
+    let turns = search_turns(narrowed(
+        credential_budget,
+        credential_share(token_bytes, prepared.len(), in_flight),
+    ));
+    let turns = &turns;
     node.log_counters
         .batch_calls
         .fetch_add(1, Ordering::Relaxed);
@@ -173,6 +202,7 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
                 prepared.token,
                 remaining,
                 share,
+                turns.clone(),
             )
             .await?;
             let mut sum = lock(body_sum);

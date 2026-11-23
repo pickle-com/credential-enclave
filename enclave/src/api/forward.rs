@@ -27,7 +27,7 @@ use credential_enclave_protocol::secret_use::{header_key, names_no_other_charset
 use credential_enclave_protocol::ProtocolError;
 use hyper::body::Bytes;
 use serde_json::Value;
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit};
 
 use super::responses::{forward_frame, forward_stream, LogRef, StreamElement, StreamEnd};
 use super::{invalid, read_body, record_of, respond, ApiError, JsonBody};
@@ -88,8 +88,9 @@ const REFUSED_HEADERS: [&str; 3] = [
 
 pub(super) const TIMEOUT_DEFAULT_MS: u64 = 30_000;
 /// Longest time a `forward` or `forward/batch` call waits to be admitted: for one of the places
-/// of the forward calls of the node and for the share of the body budget its request frame
-/// occupies (enclave.md section 8).
+/// of the forward calls of the node and for the shares of the body budget it takes before
+/// anything of it is recorded or sent, the share its request frame occupies and the share of
+/// what it holds of its credential (enclave.md section 8).
 #[cfg(not(test))]
 pub(crate) const ADMISSION_WAIT: Duration = Duration::from_secs(30);
 /// The tests of the node wait for a shorter time: a test that holds every place does not
@@ -110,11 +111,13 @@ pub async fn forward(State(node): State<Arc<Node>>, request: Request) -> Respons
 }
 
 /// The admission of a call that takes one of the places of the forward calls of the node
-/// (`forward`, `forward/batch`): its place, and the share of the body budget its request frame
-/// occupies. A call waits for the two together for at most [`ADMISSION_WAIT`], counted from
-/// the moment it began, and ends with `capacity_unavailable` when it has not got them by then.
-/// It has read nothing of its frame at that point: the frame enters memory only under its
-/// share of the budget.
+/// (`forward`, `forward/batch`): its place, the share of the body budget its request frame
+/// occupies, and the share of what it holds of its credential ([`credential_share`]). A call
+/// waits for them together for at most [`ADMISSION_WAIT`], counted from the moment it began,
+/// and ends with `capacity_unavailable` when it has not got them by then. It has read nothing
+/// of its frame while it waits for the first two: the frame enters memory only under its
+/// share of the budget. It has created no entry and sent nothing while it waits for the
+/// third.
 ///
 /// The limit is what bounds the time a connection is held by a call that does nothing yet.
 /// The node reads nothing from the connection of a call that waits, so it does not learn
@@ -141,7 +144,8 @@ impl Admission {
         }
     }
 
-    /// `bytes` of the body budget of the node, for the request frame of the call.
+    /// `bytes` of the body budget of the node: for the request frame of the call, or for
+    /// what the call holds of its credential ([`credential_share`]).
     pub(super) async fn budget(
         &self,
         node: &Node,
@@ -348,7 +352,9 @@ pub(super) fn prepare(
 /// node, and the check of the response for the injected credential. `request_budget` is the
 /// share of the budget the request body occupies: it is free as soon as the request is on the
 /// wire, before the response body asks for its own share, so two calls never wait for each
-/// other. The returned permit holds the share the response body occupies.
+/// other. The returned permit holds the share the response body occupies. `turns` holds the
+/// share of the budget the call took for its credential ([`credential_share`]): the check
+/// of the response runs in its turn under it.
 pub(super) async fn execute(
     node: &Node,
     user_id: &str,
@@ -356,6 +362,7 @@ pub(super) async fn execute(
     token: Secret<String>,
     timeout: Duration,
     request_budget: Option<OwnedSemaphorePermit>,
+    turns: SearchTurns,
 ) -> Result<(CheckedResponse, OwnedSemaphorePermit), ProtocolError> {
     let body_limit = node.limits.body_bytes;
     let call = async {
@@ -393,6 +400,13 @@ pub(super) async fn execute(
         Err(_) => return Err(ProtocolError::Timeout),
         Ok(Err(error)) => return Err(failure_of(error)),
         Ok(Ok(outcome)) => outcome,
+    };
+    // The check below waits for its turn among the checks of this call, and the turn goes
+    // into its task with the token: the share of the body budget the call holds for its
+    // credential is held until that task has ended.
+    let token = Searched {
+        token,
+        _turn: turns.lock_owned().await,
     };
     // Rule E4: a response that holds the injected credential, or a body the node cannot
     // search, is not handed on. The entry of the request is already on the chain. The search
@@ -472,15 +486,76 @@ async fn stream(
 /// More bytes than the credential of `record` has: the credential is a part of the plaintext
 /// of the record, and that plaintext is shorter than the ciphertext, which `ct` writes with
 /// four characters for three bytes.
-fn credential_bytes_at_most(record: &Record) -> usize {
+pub(super) fn credential_bytes_at_most(record: &Record) -> usize {
     record.ct.len().div_ceil(4).saturating_mul(3)
 }
 
 /// `budget` without what it holds above `needed` bytes of the body budget: those are free.
-fn narrowed(mut budget: OwnedSemaphorePermit, needed: usize) -> OwnedSemaphorePermit {
+pub(super) fn narrowed(mut budget: OwnedSemaphorePermit, needed: usize) -> OwnedSemaphorePermit {
     let above = budget.num_permits().saturating_sub(needed);
     drop(budget.split(above));
     budget
+}
+
+/// The bytes the header value of a request holds of a token of `token_bytes` bytes, at the
+/// most: the token behind the prefix of its rule, or inside the base64 text of HTTP Basic,
+/// four characters for three bytes. The prefix and the user name of a rule are constants of
+/// the definition: they do not grow with the token.
+const fn header_bytes(token_bytes: usize) -> usize {
+    token_bytes.div_ceil(3).saturating_mul(4).saturating_add(4)
+}
+
+/// The share of the body budget a call that answers with a frame takes for the credential of
+/// its requests (`forward` without `stream`, `forward/batch`): what the node holds for the
+/// call beside its bodies that grows with the length of the token. `token_bytes` is the
+/// length of the token, or more. The call sends `requests` requests, `in_flight` of them at
+/// a time.
+///
+/// - The search of a response (`provider_response::check_memory_bound`). The searches of one
+///   call run one at a time ([`SearchTurns`]), so a call holds the room of one search.
+/// - For every request, from the moment it is prepared: the token its response is searched
+///   for, and the header value that carries the token.
+/// - For every request that is being sent, that header value twice more: in the request of
+///   the HTTP client, and in the head that client writes.
+///
+/// A call that asks for a stream holds the same before the search of its body begins, and
+/// the share of that search is the larger one (`StreamCheck::memory_bound`).
+pub(crate) const fn credential_share(
+    token_bytes: usize,
+    requests: usize,
+    in_flight: usize,
+) -> usize {
+    let header = header_bytes(token_bytes);
+    provider_response::check_memory_bound(token_bytes)
+        .saturating_add(requests.saturating_mul(token_bytes.saturating_add(header)))
+        .saturating_add(in_flight.saturating_mul(header.saturating_mul(2)))
+}
+
+/// The share of the body budget a call holds for its credential ([`credential_share`]), and
+/// the turns of the checks of its responses under it: a check holds the lock while it runs,
+/// so one check of a call runs at a time. The share is free when the call has let go of this
+/// value and no check of the call runs.
+pub(super) type SearchTurns = Arc<Mutex<OwnedSemaphorePermit>>;
+
+/// The turns of the checks of a call that holds `budget` for its credential.
+pub(super) fn search_turns(budget: OwnedSemaphorePermit) -> SearchTurns {
+    Arc::new(Mutex::new(budget))
+}
+
+/// The token of a request with the turn of the check of its response ([`SearchTurns`]). The
+/// check reads the token through this value, which goes into the task of the check: the turn
+/// ends when that task has ended, whether or not the call still waits for it.
+struct Searched {
+    token: Secret<String>,
+    _turn: OwnedMutexGuard<OwnedSemaphorePermit>,
+}
+
+impl std::ops::Deref for Searched {
+    type Target = Secret<String>;
+
+    fn deref(&self) -> &Secret<String> {
+        &self.token
+    }
 }
 
 /// Starts the task of a stream (the stream form of `forward`, `vault/send`), which hands the
@@ -614,20 +689,22 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
         true => timeout_within(&meta, STREAM_TIMEOUT_MAX_MS)?,
         false => timeout_of(&meta)?,
     };
-    // The search of a response that is handed on as a stream lasts as long as the stream, and
-    // what it holds grows with the length of the credential. The call takes the share of the
-    // body budget that search can hold before anything of it is recorded or sent, within the
-    // time of its admission. The credential is known once the record is open, under the
+    // What a call holds beside its bodies grows with the length of its credential: the
+    // search of the response, and the copies of the token its request carries. The call
+    // takes that share of the body budget before anything of it is recorded or sent, within
+    // the time of its admission. The credential is known once the record is open, under the
     // account lock, where a call does not wait. So the share is taken for the longest
     // credential a record of this size can hold, and what the credential does not need is
-    // given back when it is known.
-    let check_budget = match streamed {
-        true => {
-            let bound = StreamCheck::memory_bound(credential_bytes_at_most(&record));
-            Some(admission.budget(node, bound).await?)
-        }
-        false => None,
+    // given back when it is known. The search of a response that is handed on as a stream
+    // lasts as long as the stream and holds a buffer of received bytes as well: the share
+    // of such a call is the bound of that search.
+    let share_of = |token_bytes: usize| match streamed {
+        true => StreamCheck::memory_bound(token_bytes),
+        false => credential_share(token_bytes, 1, 1),
     };
+    let credential_budget = admission
+        .budget(node, share_of(credential_bytes_at_most(&record)))
+        .await?;
 
     // 1: the common front. Everything up to the event happens under the account lock, so a
     // revoke that is answered before this point leaves no request behind it.
@@ -671,9 +748,8 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
         (prepared, place)
     };
     drop(payload);
-    // The search of a stream holds no more than the bound of this credential.
-    let check_budget = check_budget
-        .map(|budget| narrowed(budget, StreamCheck::memory_bound(prepared.token_bytes)));
+    // The call holds no more than the share of this credential.
+    let credential_budget = narrowed(credential_budget, share_of(prepared.token_bytes));
 
     // 5, 6: the request leaves only after the log store confirmed the entry that holds its
     // event (the group commit of protocol.md 7.1).
@@ -687,13 +763,15 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
     // reservation of the request frame goes with it and is free once the request is on the
     // wire (`execute`).
     let timeout = Duration::from_millis(timeout_ms);
-    if let Some(check_budget) = check_budget {
-        let held = (slot, check_budget);
+    if streamed {
+        let held = (slot, credential_budget);
         return stream(node, user_id, prepared, timeout, log, request_budget, held).await;
     }
     let Prepared {
         outbound, token, ..
     } = prepared;
+    // The share of the credential goes with the call into the check of the response and is
+    // free when that check has ended.
     let (checked, budget) = execute(
         node,
         user_id,
@@ -701,6 +779,7 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
         token,
         timeout,
         Some(request_budget),
+        search_turns(credential_budget),
     )
     .await?;
     drop(slot);

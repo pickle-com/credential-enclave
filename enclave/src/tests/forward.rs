@@ -1146,10 +1146,12 @@ async fn a_response_that_reflects_the_credential_is_withheld() {
 /// The connections of the node to the host of `PROFILE`, in the order they were opened.
 #[tokio::test]
 async fn two_calls_whose_responses_have_no_length_do_not_wait_for_each_other() {
-    // Each response declares no length, so each reserves the whole body limit of 1,000 bytes.
-    // The budget holds two request frames and one such response but not two frames and two
-    // responses: a call must give its frame back before its response asks for its share, or
-    // the two calls hold their frames and wait for each other until the time limit.
+    // Each response declares no length, so each reserves the whole body limit. The budget
+    // holds two request frames, what the two calls hold of their credential and one such
+    // response, but not all of that and two responses: a call must give its frame back
+    // before its response asks for its share, or the two calls hold their frames and wait
+    // for each other until the time limit.
+    const LIMIT: usize = 32 * 1024;
     let provider = provider_with_log_store(|_| {
         Reply::Raw(
             b"HTTP/1.1 200 Status\r\ncontent-type: text/plain\r\ntransfer-encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n"
@@ -1169,12 +1171,19 @@ async fn two_calls_whose_responses_have_no_length_do_not_wait_for_each_other() {
         json!([]),
     );
     let frame = crate::frame::encode_head(&first).len();
+    // What a call holds of its credential once it knows the token, and what it takes before:
+    // the share of the longest token the record can hold. The budget has room for both calls
+    // to take that at the same time.
+    let held = crate::api::credential_share("ya29.injected".len(), 1, 1);
+    let longest = record["ct"].as_str().unwrap().len().div_ceil(4) * 3;
+    let taken = crate::api::credential_share(longest, 1, 1);
+    assert!(2 * (taken - held) + 2 <= LIMIT, "{taken} {held}");
     let harness = Harness::with(
         &provider,
         Definitions::embedded(),
         Limits {
-            body_bytes: 1_000,
-            body_budget_bytes: 2 * frame + 1_000 - 1,
+            body_bytes: LIMIT,
+            body_budget_bytes: 2 * frame + 2 * held + LIMIT - 1,
             ..Limits::default()
         },
     );
@@ -1856,6 +1865,171 @@ async fn a_stream_holds_the_share_of_its_search_until_its_body_has_ended() {
     assert_eq!(provider.requests().len(), requests);
     drop(budget);
     assert_budget_is_free(&harness);
+}
+
+#[tokio::test]
+async fn a_frame_holds_the_share_of_its_credential_until_its_response_is_checked() {
+    use crate::frame;
+    use axum::http::Method;
+
+    // The provider answers with the head and a part of the body, and then stays silent.
+    let provider = provider_with_log_store(|_| {
+        let head = b"HTTP/1.1 200 OK\r\ncontent-length: 1000\r\n\r\n".to_vec();
+        let part = b"0123456789".repeat(40);
+        Reply::Pieces(vec![(Duration::ZERO, [head, part].concat())], false)
+    })
+    .await;
+    let (harness, app, record) = ready(&provider).await;
+    let whole = harness.node.limits.body_budget_bytes;
+    let frame_of = |query: &str| {
+        let url = format!("{PROFILE}?{query}");
+        let mut request = meta(&app, &record, "POST", &url, json!([]));
+        request["timeout_ms"] = json!(30000);
+        let mut bytes = frame::encode_head(&request);
+        bytes.extend_from_slice(b"{}");
+        bytes
+    };
+
+    // The body of the response does not end, so the call waits for it. Its request is on the
+    // wire, and the share of the request frame is free. The call holds the share of the
+    // response body, by its declared length, and the share of its credential: what the
+    // search of the response can hold for the token of the record, and the copies of that
+    // token its request carries. What it took for the longest token a record of that size
+    // can hold is free again.
+    let of_the_credential = crate::api::credential_share("ya29.injected".len(), 1, 1);
+    let left = whole - 1_000 - of_the_credential;
+    {
+        let call = harness.respond(Method::POST, "/v1/forward", frame_of("n=1"));
+        tokio::pin!(call);
+        let mut free = whole;
+        for _ in 0..4_000 {
+            tokio::select! {
+                _ = &mut call => panic!("the call ended before its response did"),
+                () = tokio::time::sleep(Duration::from_millis(5)) => {}
+            }
+            free = harness.node.body_budget.available_permits();
+            if free == left {
+                break;
+            }
+        }
+        assert_eq!(free, left);
+        assert_eq!(
+            harness.node.forward_slots.available_permits() + 1,
+            harness.node.limits.forward_concurrency
+        );
+        // The caller goes away here: the call ends and holds nothing.
+    }
+    places_are_free(&harness).await;
+    assert_budget_is_free(&harness);
+
+    // A call that does not get the share of its credential within the time of its admission
+    // ends: it created no entry and sent nothing, and it holds nothing. The body budget has
+    // room for its request frame and for nothing else.
+    let (stored, requests) = (provider.stored().len(), provider.requests().len());
+    let bytes = frame_of("n=2");
+    let taken = u32::try_from(whole - bytes.len()).unwrap();
+    let budget = harness
+        .node
+        .body_budget
+        .clone()
+        .try_acquire_many_owned(taken)
+        .unwrap();
+    let started = Instant::now();
+    let response = harness.respond(Method::POST, "/v1/forward", bytes).await;
+    assert_eq!(response.status().as_u16(), 503);
+    let failure = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let failure: Value = serde_json::from_slice(&failure).unwrap();
+    assert_eq!(failure["code"], "capacity_unavailable");
+    assert!(started.elapsed() >= crate::api::ADMISSION_WAIT);
+    assert_eq!(provider.stored().len(), stored);
+    assert_eq!(provider.requests().len(), requests);
+    drop(budget);
+    assert_budget_is_free(&harness);
+}
+
+#[test]
+fn the_share_of_a_credential_stays_with_the_check_until_it_has_ended() {
+    use crate::frame;
+    use axum::http::Method;
+
+    // A runtime with one thread for the work that runs off the threads that serve the calls.
+    // Of a forward call that work is the check of the response, and nothing else.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        // The response declares no length: its share is the body limit until the body has
+        // been read, and the length of the body from then on.
+        let provider = provider_with_log_store(|_| {
+            Reply::Raw(
+                b"HTTP/1.1 200 Status\r\ncontent-type: text/plain\r\ntransfer-encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n"
+                    .to_vec(),
+            )
+        })
+        .await;
+        let (harness, app, record) = ready(&provider).await;
+        let whole = harness.node.limits.body_budget_bytes;
+        let of_the_credential = crate::api::credential_share("ya29.injected".len(), 1, 1);
+        // The one thread is taken until the test lets go of it: the check of the response
+        // waits for it.
+        let (let_go, taken) = std::sync::mpsc::channel::<()>();
+        let holder = tokio::task::spawn_blocking(move || taken.recv().is_ok());
+        let request = frame::encode_head(&meta(&app, &record, "GET", PROFILE, json!([])));
+        {
+            let call = harness.respond(Method::POST, "/v1/forward", request);
+            tokio::pin!(call);
+            // The body has been read: the call holds the share of its two bytes and the
+            // share of its credential, and waits for the check.
+            let read = whole - 2 - of_the_credential;
+            let mut free = whole;
+            for _ in 0..4_000 {
+                tokio::select! {
+                    _ = &mut call => panic!("the call ended before the check of its response ran"),
+                    () = tokio::time::sleep(Duration::from_millis(5)) => {}
+                }
+                free = harness.node.body_budget.available_permits();
+                if free == read {
+                    break;
+                }
+            }
+            assert_eq!(free, read);
+            // The caller goes away here, and the check has not run.
+        }
+        // The share of the credential is held for the check that is still to run.
+        let held = whole - harness.node.body_budget.available_permits();
+        assert!(held >= of_the_credential, "{held}");
+        // The check runs and ends, and the share is free.
+        let_go.send(()).unwrap();
+        assert!(holder.await.unwrap());
+        for _ in 0..4_000 {
+            if harness.node.body_budget.available_permits() == whole {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_budget_is_free(&harness);
+    });
+}
+
+#[test]
+fn the_share_of_a_stream_is_no_less_than_the_share_of_a_frame() {
+    use crate::provider_response::StreamCheck;
+
+    // Before the search of its body begins, a call that asks for a stream holds what a call
+    // that answers with a frame holds: the search of the head of the response, and the
+    // copies of the token its request carries. Its share, the bound of the search of its
+    // body, covers that for a token of every length.
+    for bytes in [0, 1, 8, 13, 200, 511, 512, 513, 2_000, 12_000, 786_432] {
+        let of_a_frame = crate::api::credential_share(bytes, 1, 1);
+        assert!(of_a_frame <= StreamCheck::memory_bound(bytes), "{bytes}");
+    }
+    // The share of a frame for a token of a common length and for a long one.
+    assert_eq!(crate::api::credential_share(200, 1, 1), 33_208);
+    assert_eq!(crate::api::credential_share(2_000, 1, 1), 210_976);
 }
 
 #[tokio::test]

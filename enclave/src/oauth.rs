@@ -127,8 +127,9 @@ impl Credential {
         (self.header, self.token)
     }
 
-    /// The length of the token in bytes: what the search of a response that is handed on as
-    /// a stream holds depends on it (`StreamCheck::memory_bound`).
+    /// The length of the token in bytes: what a call holds for the credential of a request
+    /// depends on it, the search of the response and the copies of the token the request
+    /// carries (`credential_share` of `api::forward`, `StreamCheck::memory_bound`).
     pub fn token_bytes(&self) -> usize {
         self.token.expose_secret().len()
     }
