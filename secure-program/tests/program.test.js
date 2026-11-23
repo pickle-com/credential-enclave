@@ -773,15 +773,40 @@ test("A4: an entry this device verified that left the listing within its retenti
   assert.equal(aged.world.state.log.missing, 0);
 });
 
-test("what does not mark the log: an object nobody signed under a node id without a document, an empty seq, a node that ended without a shutdown, an entry of another key", async () => {
+test("A3: a key of a node id the backend hands out no document for is a read held back, whatever signature comes with it, and the screen shows it as not verified", async () => {
+  // The signature of an object reaches the device through the backend, as the node document does.
+  // A backend that hands out neither the document of a node nor the signature of its entry would
+  // otherwise make an entry of that node look like an object nobody signed.
+  const fx = S.fixture(source, { device: { securityStatus: true } });
+  await S.start(fx);
+  const world = fx.world;
+  const ghost = new bridge.Node(world, { release: "v2.4.0", measurement: fx.measurement, document: false });
+  ghost.record("c", [{ t: "grant_revoked", time_ms: world.now }], { signSeed: crypto.randomBytes(32) });
+  const states = [];
+  for (let day = 0; day < 4; day += 1) {
+    await nextDay(fx);
+    states.push(world.state.log.status + ":" + world.state.log.store + ":" + world.reports.slice(-1)[0].blocked_attempts);
+  }
+  assert.deepEqual(states, ["pending:blocked:1", "pending:blocked:2", "pending:blocked:3", "attention:blocked:4"]);
+  assert.equal(world.state.log.store_failure, "documents:missing");
+  assert.equal(world.reports.slice(-1)[0].undocumented_nodes, 1);
+  assert.deepEqual(world.securityStatuses.slice(-1)[0].reasons, ["verification_blocked"]);
+  const shown = await S.call(fx, "read_log", { limit: 50 });
+  const groups = shownGroups(shown.value);
+  assert.deepEqual(groups.map((group) => group.kind).sort(), ["grant_renewed", "unverified"]);
+  // The document arrives: the node is one of an accepted measurement, and the object that its
+  // signature does not verify over contradicts it (A2).
+  ghost.writeDocument();
+  await nextDay(fx);
+  assert.equal(world.state.log.store, "verified");
+  assert.deepEqual(world.securityStatuses.slice(-1)[0].reasons, ["conflicting_signatures"]);
+});
+
+test("what does not mark the log: an empty seq, a node that ended without a shutdown, an entry of another key", async () => {
   const fx = S.fixture(source);
   await S.start(fx);
   const world = fx.world;
   const node = fx.nodes[0];
-  // An object under a node id no document exists for, with a body the key names and no signature
-  // of that node id.
-  const ghost = new bridge.Node(world, { release: "v2.4.0", measurement: fx.measurement, document: false });
-  ghost.record("c", [{ t: "grant_revoked", time_ms: world.now }], { signSeed: crypto.randomBytes(32) });
   // A seq the store never confirmed, between two entries.
   node.record("c", [{ t: "connection_created", time_ms: world.now, record_id: "r1", provider: "slack", scope: "" }], { stored: false });
   node.record("c", [{ t: "connection_created", time_ms: world.now, record_id: "r2", provider: "notion", scope: "" }]);
@@ -794,7 +819,7 @@ test("what does not mark the log: an object nobody signed under a node id withou
   await nextDay(fx);
   assert.equal(world.state.log.status, "verified");
   assert.equal(world.state.log.store, "verified");
-  assert.equal(world.reports.slice(-1)[0].undocumented_nodes, 1);
+  assert.equal(world.reports.slice(-1)[0].undocumented_nodes, 0);
   const shown = await S.call(fx, "read_log", { limit: 50 });
   const kinds = shownGroups(shown.value).map((group) => group.kind);
   assert.deepEqual(kinds, ["other_key", "connected", "grant_renewed"]);

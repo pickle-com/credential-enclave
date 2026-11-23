@@ -53,6 +53,9 @@
   // The bridge cuts a sleep at 60 seconds: a wait longer than this is made of sleeps of this
   // length at most.
   const SLEEP_STEP_MS = 30000;
+  // The time a turn waits in an operation that waits for the user is not counted into it. A wait
+  // of a turn outlasts this many such operations of the runtime, and ends with the next.
+  const WAIT_INTERACTIVE_PASSES = 64;
 
   // ---- Grants ----
   // The lifetime of a grant is a number of days the user chooses (an integer from 1 to 30, 30 by
@@ -1122,10 +1125,17 @@
   let interactiveDepth = 0;
   let interactiveSince = 0;
   let interactiveClosedMs = 0;
+  // The waits for the end of the operations that wait for the user (interactiveIdle).
+  let interactiveWaiters = [];
 
   function interactiveMs() {
     const open = interactiveDepth > 0 ? Math.max(0, native.nowMs() - interactiveSince) : 0;
     return interactiveClosedMs + open;
+  }
+
+  /** A promise that resolves when no operation that waits for the user is in progress any more. */
+  function interactiveIdle() {
+    return new Promise(function (resolve) { interactiveWaiters.push(resolve); });
   }
 
   /** A turn: the time one piece of work may take from its call (limitMs, Infinity for work that
@@ -1164,9 +1174,37 @@
     }
   }
 
+  /** Resolves when the wait of a turn is over: limitMs have passed since the call (Infinity: the
+   *  wait has no limit of its own), or the counted time of the turn is used up. The time the
+   *  runtime spends in an operation that waits for the user is not counted into a turn
+   *  (turnSpent), so while such an operation is in progress only limitMs ends the wait: a wait
+   *  without a limit of its own waits for the end of that operation. Ends early once stop.done is
+   *  set. The passes are bounded: a pass sleeps SLEEP_STEP_MS at most or waits for the end of the
+   *  operations that wait for the user, and the wait is over after WAIT_INTERACTIVE_PASSES of the
+   *  latter. */
+  async function expire(turn, limitMs, stop) {
+    const started = native.nowMs();
+    const passes = Math.ceil(Math.min(limitMs, turn.limitMs) / SLEEP_STEP_MS) + 2 * WAIT_INTERACTIVE_PASSES + 2;
+    for (let pass = 0; pass < passes; pass += 1) {
+      if (stop.done) return;
+      const own = limitMs - (native.nowMs() - started);
+      if (!(own > 0)) return;
+      if (interactiveDepth > 0) {
+        if (own === Infinity) await interactiveIdle();
+        else await native.sleep(Math.min(own, SLEEP_STEP_MS));
+        continue;
+      }
+      const left = Math.min(own, turnLeft(turn));
+      if (!(left > 0)) return;
+      await native.sleep(Math.min(left, SLEEP_STEP_MS));
+    }
+  }
+
   /** The value of promise, or the failure timeout when limitMs or the rest of the turn passes
-   *  first (what names the wait). The promise goes on by itself after a timeout and its outcome is
-   *  dropped. A wait without a limit in a turn without a limit is the promise itself. */
+   *  first (what names the wait). The rest of the turn is its counted time: the time the runtime
+   *  spends in an operation that waits for the user ends no wait of a turn (expire). The promise
+   *  goes on by itself after a timeout and its outcome is dropped. A wait without a limit in a
+   *  turn without a limit is the promise itself. */
   function limited(turn, promise, limitMs, what) {
     const left = Math.min(limitMs, turnLeft(turn));
     if (left === Infinity) return promise;
@@ -1178,7 +1216,7 @@
     const guarded = promise.then(
       function (value) { stop.done = true; return value; },
       function (error) { stop.done = true; throw error; });
-    const timer = pause(left, stop).then(function () { throw timeoutError(what); });
+    const timer = expire(turn, limitMs, stop).then(function () { throw timeoutError(what); });
     guarded.then(noop, noop);
     timer.then(noop, noop);
     return Promise.race([guarded, timer]);
@@ -1200,6 +1238,9 @@
         } catch (error) {
           // The bridge is closed: the runtime is going down and counts no time any more.
         }
+        const waiters = interactiveWaiters;
+        interactiveWaiters = [];
+        for (const resolve of waiters) resolve();
       }
     }
   }
@@ -3270,9 +3311,11 @@
    *    a body the backend did not hand out, a body that is not the one the key names, and a key
    *    of a node without a document that verifies are reads the operator domain held back
    *    (run.blocked): a node writes its document before it acts, and the listing named the key.
-   *    An object of a node id without a document whose signature is not one of the key that node
-   *    id is, and a body under a key its node did not write for it, are objects someone else put
-   *    there: they are no entries (run.junk) and mark nothing;
+   *    Whatever signature the backend hands out with such a key, the key is not set aside: only
+   *    the store could show that its node wrote nothing under it.
+   *    A body the node of the key signed under a key that node did not write for it (the fields
+   *    of the body are not the ones the key names) is an object someone else put there: it is no
+   *    entry (run.junk) and marks nothing;
    *    an entry of this key written by a node of a measurement no list has, and a transfer of the
    *    delegation to such a measurement, are noted (A1);
    *    a signature of an accepted node that does not verify over the body its key names, an entry
@@ -3320,16 +3363,13 @@
           continue;
         }
         run.undocumented.add(parsed.node);
-        if (checked.failure === "signature") {
-          // The body its key names, without a signature of the key its node id is: an object
-          // nobody who holds that key wrote. It is no entry, and the screen leaves it out.
-          run.junk.add(parsed.key);
-          if (item.fresh) markSeen(log, digest);
-          continue;
-        }
-        // Whoever holds the key of that node id may have signed this entry, and no document says
-        // what that node is: a node writes its document before it acts, so the document, or the
-        // body that would show the object to be no entry, is held back.
+        // The listing of the store names this key, and the backend hands out no document that
+        // verifies for its node. A node writes its document before it acts and the document
+        // outlives its entries, so either nobody of an attested enclave wrote this object, or the
+        // document of the node is held back. What the backend hands out cannot tell the two
+        // apart: the signature of the object comes from the backend as the document does, so a
+        // signature that does not verify does not show that the node wrote nothing under this
+        // key. The read counts as held back, and the screen shows the entry as not verified.
         run.blocked = true;
         if (run.detail === "") run.detail = "documents:" + why;
         continue;
@@ -3859,8 +3899,11 @@
         delete log.unaccepted[digest];
         continue;
       }
+      // A first time that lies after now is the clock of the device having run backwards: the
+      // grace begins again from now (a clock that was wrong marks nothing at once).
+      if (whole(item.first_ms) > now) item.first_ms = now;
       const age = now - whole(item.first_ms);
-      const within = age >= 0 && age < LOG_RELEASE_GRACE_MS;
+      const within = age < LOG_RELEASE_GRACE_MS;
       if (item.held !== true && !within) {
         // A measurement that was listed to this device and never held its key: nothing to judge.
         if (age >= 30 * DAY_MS) delete log.unaccepted[digest];
@@ -5840,6 +5883,19 @@
     }
   }
 
+  /** What follows the grants while delegation is on (step 7 of a synchronization, and the end of
+   *  the procedures that hand the grants of a new key or turn delegation on again): the sealing
+   *  check, when a node this device handed a grant to holds it and the check is not marked as
+   *  done, and the completion of an application password setup. step is the result of grantStep. */
+  async function afterGrants(turn, keys, step) {
+    if (delegationOff(step.ledger)) return;
+    const custody = heldCustody(step.ledger, step.grants, native.nowMs());
+    if (custody !== null && native.storeGet(SEALING_CHECK_STORE_KEY) === null) {
+      await sealPending(turn, keys, custody);
+    }
+    await finishAppPasswordSetup(turn, keys, step.ledger, step.grants);
+  }
+
   /** One synchronization (docs/protocol.md, "The program of the app"). trigger says what started
    *  it: {refill} (a push with the reason grant_required: a node the backend reports no grant row
    *  for is handed a grant again). The steps:
@@ -5866,6 +5922,9 @@
         return { judged: judged, grants: await grantStep(turn, judged.keys, { listed: listed, refill: trigger.refill === true }) };
       });
       const judged = step.judged;
+      // Step 6: the grant step published the state of the grants; the runtime is ready (the key is
+      // judged and the grants are handed). What follows does not hold the screens back.
+      native.publish({ runtime: { ready: true } });
       let grant = { state: "none", not_after_ms: 0 };
       let granted = 0;
       let rejected = 0;
@@ -5874,14 +5933,7 @@
         grant = step.grants.grant;
         granted = step.grants.renewed.granted;
         rejected = step.grants.renewed.rejected;
-        const ledger = step.grants.ledger;
-        if (!delegationOff(ledger)) {
-          const custody = heldCustody(ledger, step.grants.grants, native.nowMs());
-          if (custody !== null && native.storeGet(SEALING_CHECK_STORE_KEY) === null) {
-            await sealPending(turn, keys, custody);
-          }
-          await finishAppPasswordSetup(turn, keys, ledger, step.grants.grants);
-        }
+        await afterGrants(turn, keys, step.grants);
         if (roundDue()) {
           try {
             await requestRound(turn, keys, "sync");
@@ -5892,7 +5944,7 @@
         }
         shareLedgerSoon(keys);
       }
-      native.publish({ state: { error: null }, runtime: { ready: true } });
+      native.publish({ state: { error: null } });
       // Catching up on the master key transfer: a device with the key reads the pending requests, a
       // device with a transfer in progress advances one step, and the polling loop is started again.
       // The transfer belongs to the line of the procedures a user starts; the synchronization does
@@ -6015,11 +6067,12 @@
   /** Key creation: a new key is made only when the keychain has no master key and the account has
    *  no registered key. The account registration comes first and the keychain is written only after
    *  it succeeded: when two devices create a key at the same time, the one that loses the
-   *  registration does not write to the keychain. The grants follow under the same lock. */
-  function createKey(turn) {
-    return grantLock.run(turn, async function () {
+   *  registration does not write to the keychain. The grants follow under the same lock, and what
+   *  follows the grants (afterGrants) after it. */
+  async function createKey(turn) {
+    const made = await grantLock.run(turn, async function () {
       const judged = await judgeKey(turn);
-      if (judged.keyState !== "absent") return { key_state: judged.keyState, key_id: judged.keyId };
+      if (judged.keyState !== "absent") return { keyState: judged.keyState, keyId: judged.keyId, keys: null, step: null };
       const masterKey = native.randomBytes(32);
       const keys = deriveKeys(masterKey);
       try {
@@ -6027,22 +6080,25 @@
       } catch (error) {
         if (error.code !== "key_exists") throw error;
         const again = await judgeKey(turn);
-        return { key_state: again.keyState, key_id: again.keyId };
+        return { keyState: again.keyState, keyId: again.keyId, keys: null, step: null };
       }
       writeMasterKey(masterKey);
       publishKey("present", keys);
-      await grantStep(turn, keys, {});
-      native.publish({ runtime: { ready: true } });
-      return { key_state: "present", key_id: keys.keyId };
+      return { keyState: "present", keyId: keys.keyId, keys: keys, step: await grantStep(turn, keys, {}) };
     });
+    if (made.step !== null) {
+      await afterGrants(turn, made.keys, made.step);
+      native.publish({ runtime: { ready: true } });
+    }
+    return { key_state: made.keyState, key_id: made.keyId };
   }
 
   /** Key replacement: while waiting for the key of another device, or while another key is
    *  registered, the key of the account is replaced with a new one. The nodes of the old ledger
    *  belong to the records of the old key, so a new node ledger is made and what this device kept
    *  of the log is forgotten. */
-  function resetKey(turn) {
-    return grantLock.run(turn, async function () {
+  async function resetKey(turn) {
+    const made = await grantLock.run(turn, async function () {
       const judged = await judgeKey(turn);
       if (judged.keyState !== "waiting" && judged.keyState !== "mismatch") {
         throw native.error("invalid_state", judged.keyState);
@@ -6055,10 +6111,11 @@
       clearLog();
       native.publish({ state: { log: logState } });
       publishKey("present", keys);
-      await grantStep(turn, keys, {});
-      native.publish({ runtime: { ready: true } });
-      return { key_state: "present", key_id: keys.keyId };
+      return { keys: keys, step: await grantStep(turn, keys, {}) };
     });
+    await afterGrants(turn, made.keys, made.step);
+    native.publish({ runtime: { ready: true } });
+    return { key_state: "present", key_id: made.keys.keyId };
   }
 
   // ---- Connections ----
@@ -7060,9 +7117,9 @@
    *  When a listed node did not confirm the revoke, the revocation time is written and the call
    *  fails with revoke_incomplete (the synchronizations while off send the revoke again). Turning
    *  it on writes the resumption time and hands the grants again. */
-  function setDelegation(turn, args) {
+  async function setDelegation(turn, args) {
     if (typeof args.enabled !== "boolean") throw native.error("invalid_input", "enabled");
-    return grantLock.run(turn, async function () {
+    const done = await grantLock.run(turn, async function () {
       const keys = await presentKeys(turn);
       const ledger = loadLedger();
       // The resumption time is not before the revocation time and the revocation time is after the
@@ -7072,9 +7129,8 @@
         ledger.resumed_ms = Math.max(native.nowMs(), ledger.revoked_ms);
         saveLedger(ledger);
         const step = await grantStep(turn, keys, {});
-        native.publish({ runtime: { ready: true } });
         shareLedgerSoon(keys, true);
-        return { grant: step.grant };
+        return { grant: step.grant, keys: keys, step: step };
       }
       const incomplete = await revokeEverywhere(turn, keys);
       // The revocation time is after the resumption time and not before any grant time this device
@@ -7091,8 +7147,14 @@
       native.publish({ state: { grant: grant } });
       shareLedgerSoon(keys, true);
       if (incomplete) throw native.error("revoke_incomplete", "a listed node did not confirm");
-      return { grant: grant };
+      return { grant: grant, keys: keys, step: null };
     });
+    if (done.step !== null) {
+      // Delegation is on again: what follows the grants (afterGrants), then the runtime is ready.
+      await afterGrants(turn, done.keys, done.step);
+      native.publish({ runtime: { ready: true } });
+    }
+    return { grant: done.grant };
   }
 
   /** An account end that erases the account records: deletes the master key item, the node ledger
