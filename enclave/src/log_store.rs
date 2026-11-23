@@ -191,7 +191,8 @@ impl Credentials {
         canonical.push('\n');
         canonical.push_str(payload_sha256);
 
-        let date = &amz_date[..amz_date.len().min(8)];
+        // The date of the scope: the first eight characters of `amz_date`, `YYYYMMDD`.
+        let date = amz_date.get(..8).unwrap_or(amz_date);
         let scope = format!("{date}/{region}/s3/aws4_request");
         let to_sign = format!(
             "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
@@ -219,6 +220,11 @@ impl Credentials {
 /// The name of the header that carries the session token.
 const SECURITY_TOKEN: &str = "x-amz-security-token";
 
+#[expect(
+    clippy::expect_used,
+    reason = "HMAC-SHA256 takes a key of any length (a key longer than a block is hashed \
+              first): no key is refused"
+)]
 fn hmac_sha256(key: &[u8], message: &[u8]) -> Zeroizing<[u8; 32]> {
     let mut mac =
         Hmac::<Sha256>::new_from_slice(key).expect("HMAC-SHA256 takes a key of any length");
@@ -230,8 +236,9 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> Zeroizing<[u8; 32]> {
 fn hex(bytes: &[u8]) -> String {
     let mut text = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        text.push(char::from_digit(u32::from(byte >> 4), 16).expect("nibble"));
-        text.push(char::from_digit(u32::from(byte & 0x0f), 16).expect("nibble"));
+        for half in [byte >> 4, byte & 0x0f] {
+            text.extend(char::from_digit(u32::from(half), 16));
+        }
     }
     text
 }
@@ -282,8 +289,8 @@ fn object_path(key: &str) -> String {
         } else {
             path.push('%');
             for nibble in [byte >> 4, byte & 0x0f] {
-                let digit = char::from_digit(u32::from(nibble), 16).expect("nibble");
-                path.push(digit.to_ascii_uppercase());
+                let digit = char::from_digit(u32::from(nibble), 16);
+                path.extend(digit.map(|digit| digit.to_ascii_uppercase()));
             }
         }
     }
@@ -638,10 +645,8 @@ pub(crate) async fn join_all<F: Future>(futures: impl Iterator<Item = F>) -> Vec
         }
     })
     .await;
-    outputs
-        .into_iter()
-        .map(|output| output.expect("every future ended"))
-        .collect()
+    // Every future ended: each has its output.
+    outputs.into_iter().flatten().collect()
 }
 
 /// Writes the entries of the claims: the entries an act waits for first, at most 32 writes at
@@ -1113,8 +1118,10 @@ impl<'a> RandomDraws<'a> {
             }
             self.at = 0;
         }
-        let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&self.buffer[self.at..self.at + 8]);
+        let next = self.buffer.get(self.at..self.at + 8);
+        let Some(bytes) = next.and_then(|bytes| <[u8; 8]>::try_from(bytes).ok()) else {
+            return 0;
+        };
         self.at += 8;
         u64::from_le_bytes(bytes)
     }

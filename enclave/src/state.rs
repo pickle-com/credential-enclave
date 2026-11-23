@@ -1440,7 +1440,12 @@ impl Node {
         seed: &Secret<[u8; 32]>,
     ) -> Result<EventPlace, ApiError> {
         let time_ms = now_ms.max(account.last_event_ms);
-        event["time_ms"] = Value::from(time_ms);
+        // An event is a JSON object (`events`): its `time_ms` key takes the time. A value of
+        // another form is no event.
+        let Some(keys) = event.as_object_mut() else {
+            return Err(ApiError::internal());
+        };
+        keys.insert("time_ms".to_string(), Value::from(time_ms));
         // The array of one event is the event and its two brackets.
         let event_bytes = to_json(&event).len();
         if event_bytes + 2 > limits::ENTRY_PLAINTEXT_BYTES {
@@ -1715,7 +1720,7 @@ pub mod events {
         while !text.is_char_boundary(end) {
             end -= 1;
         }
-        format!("{}\u{2026}", &text[..end])
+        format!("{}\u{2026}", text.get(..end).unwrap_or_default())
     }
 
     /// `not_after_ms` is the expiry the node accepted, which can be earlier than the one the
@@ -1867,8 +1872,8 @@ pub mod events {
             "body_sha256": body_sha256,
             "context": context,
         });
-        if mergeable {
-            event["window_s"] = json!(limits::MERGE_WINDOW_S);
+        if let (true, Some(keys)) = (mergeable, event.as_object_mut()) {
+            keys.insert("window_s".to_string(), json!(limits::MERGE_WINDOW_S));
         }
         event
     }

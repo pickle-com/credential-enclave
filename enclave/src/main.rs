@@ -43,16 +43,6 @@ mod frame;
 mod inbound;
 mod lineage;
 mod load;
-// The rule on input that ends the program is not in force in this module.
-#[cfg_attr(
-    not(test),
-    allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::indexing_slicing,
-        clippy::string_slice
-    )
-)]
 mod log_store;
 mod mail;
 mod oauth;
@@ -60,16 +50,6 @@ mod platform;
 mod provider_response;
 mod providers;
 mod role;
-// The rule on input that ends the program is not in force in this module.
-#[cfg_attr(
-    not(test),
-    allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::indexing_slicing,
-        clippy::string_slice
-    )
-)]
 mod state;
 mod subset;
 #[cfg(test)]

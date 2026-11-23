@@ -297,8 +297,8 @@ pub fn parse_object_key(key: &str, prefix: &str) -> Option<ParsedKey> {
     }
     match rest.len() {
         V1_LENGTH => {
-            let (seq, hash) = (&rest[..SEQ_DIGITS], &rest[SEQ_DIGITS + 1..]);
-            if &rest[SEQ_DIGITS..SEQ_DIGITS + 1] != "-" {
+            let (seq, hash) = (rest.get(..SEQ_DIGITS)?, rest.get(SEQ_DIGITS + 1..)?);
+            if rest.get(SEQ_DIGITS..SEQ_DIGITS + 1)? != "-" {
                 return None;
             }
             let seq: u64 = digits(seq)?;
@@ -320,20 +320,23 @@ pub fn parse_object_key(key: &str, prefix: &str) -> Option<ParsedKey> {
                 HASH_CHARS,
                 HASH_CHARS,
             ] {
-                fields.push(&rest[at..at + width]);
+                fields.push(rest.get(at..at + width)?);
                 at += width;
                 if at < rest.len() {
-                    if &rest[at..at + 1] != "-" {
+                    if rest.get(at..at + 1)? != "-" {
                         return None;
                     }
                     at += 1;
                 }
             }
-            let seq: u64 = digits(fields[0])?;
-            let time_ms: u64 = digits(fields[1])?;
-            let kind = EntryKind::parse(fields[2].chars().next()?)?;
-            let count: u32 = digits(fields[3])?;
-            let key_id = fields[4];
+            let [seq, time_ms, kind, count, key_id, body_hash, entry_hash] = fields.as_slice()
+            else {
+                return None;
+            };
+            let seq: u64 = digits(seq)?;
+            let time_ms: u64 = digits(time_ms)?;
+            let kind = EntryKind::parse(kind.chars().next()?)?;
+            let count: u32 = digits(count)?;
             if seq == 0
                 || count == 0
                 || count as usize > limits::ENTRY_EVENTS
@@ -348,9 +351,9 @@ pub fn parse_object_key(key: &str, prefix: &str) -> Option<ParsedKey> {
                 time_ms,
                 kind,
                 count,
-                key_id: key_id.to_string(),
-                body_hash: b64u_decode_array::<32>(fields[5]).ok()?,
-                entry_hash: b64u_decode_array::<32>(fields[6]).ok()?,
+                key_id: (*key_id).to_string(),
+                body_hash: b64u_decode_array::<32>(body_hash).ok()?,
+                entry_hash: b64u_decode_array::<32>(entry_hash).ok()?,
             }))
         }
         _ => None,
@@ -375,6 +378,12 @@ pub fn parse_object_key(key: &str, prefix: &str) -> Option<ParsedKey> {
 /// [`crate::envelope::open_command`] rejects a grant with such a key, so a `log_pk` taken from
 /// an accepted grant never panics here.
 #[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::expect_used,
+    reason = "no call of a node reaches this function: a node writes format 3 (`append_v3`). \
+              The generator of the test vectors and the tests of a reader call it, with a log \
+              public key they made"
+)]
 pub fn append(
     keys: &NodeKeys,
     head: &Head,
@@ -431,6 +440,12 @@ pub fn append(
 /// event, and when HPKE cannot seal to `log_pk`. A node checks the first three before it closes
 /// a batch, and a `log_pk` of an accepted grant can be sealed to.
 #[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::expect_used,
+    reason = "no call of a node reaches this function: a node writes format 3 (`append_v3`). \
+              The generator of the test vectors and the tests of a reader call it, with a log \
+              public key they made"
+)]
 pub fn append_batch(
     keys: &NodeKeys,
     head: &Head,
