@@ -770,6 +770,16 @@ class World {
     objects.set(key, versions);
   }
 
+  /** Puts a delete marker on a key (what a delete request leaves in a bucket with versions: the
+   *  versions under it stay). */
+  putDeleteMarker(bucket, key) {
+    this.versionCounter += 1;
+    const objects = this.objectsOf(bucket);
+    const versions = objects.get(key) || [];
+    versions.unshift({ versionId: "v" + zeros(this.versionCounter, 6), body: "", deleteMarker: true });
+    objects.set(key, versions);
+  }
+
   /** A stored value of the program store as JSON (undefined when there is none). */
   stored(key) {
     const value = this.store.get(key);
@@ -840,6 +850,13 @@ class World {
     query += "&max-keys=1000&encoding-type=url&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=" +
       crypto.randomBytes(8).toString("hex");
     return "https://" + this.shardHost + "/?" + query;
+  }
+
+  /** The presigned address of the listing of the versions of the node document of a node. */
+  documentUrl(node) {
+    return "https://" + shardBucket(this.serverTarget, node) + ".s3." + this.region + ".amazonaws.com/?versions&prefix=" +
+      encodeURIComponent("n3/" + node) + "&max-keys=1000&encoding-type=url&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=" +
+      crypto.randomBytes(8).toString("hex");
   }
 
   api(method, path, query, bodyText) {
@@ -953,19 +970,34 @@ class World {
           if (version === undefined) missing.push(key);
           else entries.push(Object.assign({ key: key }, JSON.parse(version.body)));
         }
-        return json(200, { entries: entries, missing: missing });
+        return json(200, { entries: entries, missing: missing, unread: [] });
       }
-      const valid = Array.isArray(body.nodes) && body.nodes.length >= 1 && body.nodes.length <= 64;
+      const valid = Array.isArray(body.nodes) && body.nodes.length >= 1 && body.nodes.length <= 64 &&
+        body.nodes.every((id) => typeof id === "string" && /^[A-Za-z0-9_-]{43}$/.test(id));
       if (!valid) return json(400, { detail: "invalid_input" });
+      // The document of a node: the latest version of its object in the store that has the form
+      // of a node document, or else the attestation document the node registry kept of it.
       const documents = [];
       const missing = [];
       for (const id of body.nodes) {
-        const versions = this.objectsOf(shardBucket(this.serverTarget, id)).get("n3/" + id);
-        if (versions !== undefined) documents.push({ node: id, document: JSON.parse(versions[0].body) });
-        else if (this.keptDocuments.has(id)) documents.push({ node: id, document: this.keptDocuments.get(id) });
+        const versions = this.objectsOf(shardBucket(this.serverTarget, id)).get("n3/" + id) || [];
+        const written = versions.map((version) => {
+          try {
+            const value = version.deleteMarker === true ? null : JSON.parse(version.body);
+            return value !== null && typeof value === "object" && value.node === id ? value : null;
+          } catch (error) {
+            return null;
+          }
+        }).find((value) => value !== null);
+        if (written !== undefined) documents.push({ node: id, origin: "log_store", document: written });
+        else if (this.keptDocuments.has(id)) documents.push({ node: id, origin: "node_registry", document: this.keptDocuments.get(id) });
         else missing.push(id);
       }
-      return json(200, { documents: documents, missing: missing });
+      return json(200, {
+        documents: documents, missing: missing, unread: [],
+        listings: body.nodes.map((id) => ({ node: id, url: this.documentUrl(id) })),
+        expires_ms: this.now + 300000,
+      });
     }
     if (method === "POST" && path === "/api/secure/log/verified") {
       this.reports.push(body);

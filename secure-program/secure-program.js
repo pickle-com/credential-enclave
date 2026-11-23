@@ -106,8 +106,12 @@
   //   log.sample      the newest control keys the last round verified (LOG_SAMPLE_KEYS at most)
   //   log.seen        the digests of the control keys judged (LOG_SEEN_KEYS at most)
   //   log.missing     the keys of log.sample that left the listing within their retention
+  //   log.withheld    the reads of format 3 that were held back and are made again by every
+  //                   round: {keys: [key], pages: [before_ms]} (the keys of entries, and the
+  //                   listing pages of the screen by the time they begin below, 0 for the first)
   //   log.legacy      the chains of format 1 and format 2: {nodes: {node: {seq, time_ms, until_ms,
-  //                   closed}}, found_ms, found: [node]}
+  //                   closed}}, waiting: {node: {until_ms, time_ms}}} (waiting: the receiving
+  //                   nodes of transfers whose documents this device has still to judge)
   //   log.round       the last round: {v, done_ms, tried_ms, last, told, state}
   //   log.cache       the kept screen, sealed
   //   log.migrated    the mark that the ledger of the program before was carried over
@@ -120,6 +124,7 @@
   const STORE_SAMPLE = "log.sample";
   const STORE_SEEN = "log.seen";
   const STORE_MISSING = "log.missing";
+  const STORE_WITHHELD = "log.withheld";
   const STORE_LEGACY = "log.legacy";
   const STORE_ROUND = "log.round";
   const STORE_CACHE = "log.cache";
@@ -149,7 +154,9 @@
   // The listing pages of the control prefix one round reads (1,000 object versions each).
   const LOG_CONTROL_PAGES = 4;
   // The nodes one document request names and the most such requests one round sends, the keys one
-  // body request names and the most such requests one round sends for its judgement.
+  // body request names and the most such requests one round sends for its judgement. The store is
+  // asked for one listing per node such a request names and hands out no document that verifies
+  // for: the document requests of a read bound its listings of node documents.
   const LOG_DOCUMENT_NODES = 64;
   const LOG_DOCUMENT_REQUESTS = 2;
   const LOG_BODY_KEYS = 200;
@@ -173,6 +180,10 @@
   const LOG_SEEN_KEYS = 4096;
   const LOG_MISSING_KEYS = 16;
   const LOG_NODES_KEPT = 256;
+  // The reads that were held back that the device keeps for the rounds to make again: the keys
+  // of entries, and the listing pages of the screen.
+  const LOG_WITHHELD_KEYS = 32;
+  const LOG_WITHHELD_PAGES = 2;
   // The retention of an object of the store (Object Lock, days). The absence of a key older than
   // this says nothing; a key is expected in the listing while it is a day younger than this.
   const LOG_RETENTION_DAYS = 365;
@@ -217,6 +228,15 @@
   const LEGACY_TOP_STEPS = 48;
   const LEGACY_DISPLAY_ENTRIES = 1000;
   const LEGACY_DISPLAY_LIST = 1000;
+  // 2026-11-23T00:00:00Z. A node of a release before LOG_FORMAT_3_FROM names no measurement in
+  // the event of a transfer of the delegation (grant_transferred_out), so the document of the
+  // receiving node is what says of which release that node is. From this time on the backend
+  // keeps the attestation document of every node that takes a transfer, for longer than the
+  // store keeps the entry of the transfer. For a transfer whose event is of this time or later
+  // and within the retention of the store (LOG_RETENTION_DAYS), the receiving node counts as
+  // judged only by a document that verifies. The receiving node of any other transfer without
+  // such a document is followed as a node of the release of the giving node (followLegacy).
+  const LEGACY_TRANSFER_DOCUMENTS_FROM_MS = 1795392000000;
   // One request to the log store is made up to this many times: a transport failure, a 429 and a
   // 5xx status are tried again after the pauses below (milliseconds, one per further attempt).
   const LOG_STORE_ATTEMPTS = 2;
@@ -970,16 +990,16 @@
 
   /** Verifies the node document of the node id: the object {v, platform, document, node, release}
    *  a node of format 3 wrote to the log store, or the attestation document the backend kept of a
-   *  node of an earlier release, in the same form. It proves that the signing key id was created
-   *  inside an enclave of the measurement the document states: the document is verified like an
-   *  attestation response without a requester (the certificate chain at the time of the document,
-   *  the signature, the measurement, the binding and its log store), the signing key of its
-   *  binding is id, and the nonce of the document is the one of nodeDocumentNonce. With written
-   *  false (the document of a node that a chain of format 2 names: such a node may be of a release
-   *  that wrote no node document, and the backend hands out a document that answered a request)
-   *  the nonce is compared only for a release that writes format 3. Returns {platform, release,
-   *  measure, listed, format} and throws attestation_failed for a document that does not verify. */
-  function verifyNodeDocument(object, id, written) {
+   *  node, in the same form. It proves that the signing key id was created inside an enclave of
+   *  the measurement the document states: the document is verified like an attestation response
+   *  without a requester (the certificate chain at the time of the document, the signature, the
+   *  measurement, the binding and its log store), and the signing key of its binding is id. The
+   *  nonce of an object a node wrote to the store is the one of nodeDocumentNonce. With registry
+   *  true (a document the backend kept: it answered a request of the backend and carries the
+   *  nonce of that request) the nonce is not compared: what the document proves does not depend
+   *  on its nonce. Returns {platform, release, measure, listed, format} and throws
+   *  attestation_failed for a document that does not verify. */
+  function verifyNodeDocument(object, id, registry) {
     try {
       if (object === null || typeof object !== "object" || object.v !== 1) {
         throw attestationFailure("node document shape");
@@ -1002,7 +1022,7 @@
       if (object.release !== binding.release) throw attestationFailure("another release");
       const format = object.platform === "nitro" ? (build === undefined ? 3 : logFormatOf(build.release))
         : logFormatOf(binding.release);
-      if ((written || format === 3) && !equal(verified.nonce, nodeDocumentNonce(binding.signPk))) {
+      if (registry !== true && !equal(verified.nonce, nodeDocumentNonce(binding.signPk))) {
         throw attestationFailure("node document nonce");
       }
       return {
@@ -2471,6 +2491,32 @@
     return true;
   }
 
+  /** The object key of the node document of a node (docs/protocol.md 7.7). */
+  function documentKey(node) {
+    return "n3/" + node;
+  }
+
+  /** Whether the address of the listing of the versions of the node document of node that the
+   *  backend handed out is called: the host of the bucket computed from the node id (the buckets
+   *  of format 3 hold a node document by the rule that holds the entries of an account, with the
+   *  node id in the place of the user_id), the path "/", the query versions, the prefix that is
+   *  the key of that node document, a page size of 1000, the encoding url when given, and no query
+   *  key besides these and the signature. The address carries no marker: the one page that begins
+   *  the listing is read. */
+  function documentUrlAccepted(url, node) {
+    const parts = splitUrl(url, storeUnpinned());
+    if (parts === null) return false;
+    const store = logStore();
+    const pinned = store === undefined ? null : shardBucket(store, node);
+    if (!addressOfBucket(parts, "", pinned, shardBucket(LOG_STORES.local, node))) return false;
+    const query = parts.query;
+    if (!queryKeysAccepted(query, ["versions", "prefix", "max-keys", "encoding-type"])) return false;
+    if (!("versions" in query) || query.prefix !== documentKey(node)) return false;
+    if (query["max-keys"] !== "1000") return false;
+    if ("encoding-type" in query && query["encoding-type"] !== "url") return false;
+    return true;
+  }
+
   /** Whether an object address of the bucket of format 1 and format 2 the backend handed out is
    *  called: the host and path of the store for that key, the query versionId of that version and
    *  no other query key besides the signature. */
@@ -2550,8 +2596,10 @@
    *  the next page, the versions {key, versionId, isLatest} and the common prefixes. When the
    *  document declares the encoding url (the listing was requested with encoding-type url), the
    *  keys, the common prefixes and the next key marker are percent-decoded. Delete markers are not
-   *  read (a delete marker hides no preserved version from a listing of versions). null when the
-   *  document is not a ListVersionsResult or a name does not decode. */
+   *  read (a delete marker hides no preserved version from a listing of versions). complete says
+   *  that the document states that the listing ends with this page, and skipped is the number of
+   *  version elements without a key or a version id (elements the program cannot name). null
+   *  when the document is not a ListVersionsResult or a name does not decode. */
   function parseListVersions(xml) {
     if (typeof xml !== "string" || !/<ListVersionsResult[\s>]/.test(xml)) return null;
     const top = xml.replace(/<(Version|DeleteMarker|CommonPrefixes)(?:\s[^>]*)?>[\s\S]*?<\/\1>/g, "");
@@ -2565,12 +2613,15 @@
       }
     }
     const versions = [];
+    let skipped = 0;
     for (const block of xmlBlocks(xml, "Version")) {
       const key = name(xmlField(block, "Key"));
       const versionId = xmlField(block, "VersionId");
       if (key === undefined) return null;
       if (key !== null && versionId !== null) {
         versions.push({ key: key, versionId: versionId, isLatest: xmlField(block, "IsLatest") === "true" });
+      } else {
+        skipped += 1;
       }
     }
     const prefixes = [];
@@ -2582,13 +2633,27 @@
     const nextKeyMarker = name(xmlField(top, "NextKeyMarker"));
     if (nextKeyMarker === undefined) return null;
     const nextVersionIdMarker = xmlField(top, "NextVersionIdMarker");
+    const truncated = xmlField(top, "IsTruncated");
     return {
-      truncated: xmlField(top, "IsTruncated") === "true",
+      truncated: truncated === "true", complete: truncated === "false",
       nextKeyMarker: nextKeyMarker === null || nextKeyMarker === "" ? null : nextKeyMarker,
       nextVersionIdMarker:
         nextVersionIdMarker === null || nextVersionIdMarker === "" ? null : nextVersionIdMarker,
-      versions: versions, prefixes: prefixes,
+      versions: versions, skipped: skipped, prefixes: prefixes,
     };
+  }
+
+  /** What a listing of the versions under the key of the node document of node says: true when
+   *  the store holds a version of that object or the listing does not show that it holds none
+   *  (it goes on beyond this page, or it has a version element the program cannot name), false
+   *  when the listing ends with this page and names no version of that key (a delete marker is no
+   *  version: nobody wrote a document under the key), null when the document is no listing. */
+  function documentListed(xml, node) {
+    const listing = parseListVersions(xml);
+    if (listing === null) return null;
+    if (!listing.complete || listing.skipped > 0) return true;
+    const key = documentKey(node);
+    return listing.versions.some(function (version) { return version.key === key; });
   }
 
   // ---- Format 3: the keys, the listings, the bodies and the node documents ----
@@ -2749,10 +2814,12 @@
 
   /** The bodies of entries of format 3 from the backend (LOG_BODIES_PATH; LOG_BODY_KEYS keys at
    *  most): a table from key to {body, sig}, or to null for a key the backend reports missing. A
-   *  key the answer does not name is absent from the table (the backend cuts a long answer short).
-   *  The backend reads the objects in the region of the store and hands them on; a body is checked
-   *  against the body_hash of its key and the signature of its node, so the backend cannot hand
-   *  out another one. Throws a store failure. */
+   *  key that is neither among the entries of the answer nor among its missing keys is absent
+   *  from the table, whether the answer reports it as unread or does not name it: the backend
+   *  answers the keys in the order of the request and may end before the last. The backend reads
+   *  the objects in the region of the store and hands them on; a body is checked against the
+   *  body_hash of its key and the signature of its node, so the backend cannot hand out another
+   *  one. Throws a store failure. */
   async function readBodies(turn, keys) {
     let answer = null;
     try {
@@ -2775,9 +2842,15 @@
   }
 
   /** The node documents of nodes from the backend (LOG_DOCUMENTS_PATH; LOG_DOCUMENT_NODES nodes
-   *  at most): a table from node id to the document object, or to null for a node the backend
-   *  reports none for. A node document proves itself (verifyNodeDocument), so the backend may hand
-   *  it on. Throws a store failure. */
+   *  at most): {signedMs, documents, listings}. documents is a table from node id to {document,
+   *  registry} for the nodes the answer hands a document out for (registry: its origin is
+   *  node_registry, a document the backend kept of the node; otherwise it is the object the node
+   *  wrote to the store). A node the answer reports as missing or unread, or does not name, is
+   *  not in that table: the program has no document of it, whatever the answer calls that.
+   *  listings is a table from node id to the address the answer gives for the listing of the
+   *  versions of the node document of that node, signed at signedMs. A node document proves
+   *  itself (verifyNodeDocument), so the backend may hand it on; that a node has none is read from
+   *  the store (learnNodes). Throws a store failure. */
   async function readDocuments(turn, nodes) {
     let answer = null;
     try {
@@ -2786,15 +2859,18 @@
       throw backendFailure(error, "documents");
     }
     const wanted = new Set(nodes);
-    const out = new Map();
+    const out = { signedMs: native.nowMs(), documents: new Map(), listings: new Map() };
     for (const item of Array.isArray(answer.documents) ? answer.documents : []) {
-      if (item !== null && typeof item === "object" && wanted.has(item.node) &&
+      if (item !== null && typeof item === "object" && wanted.has(item.node) && !out.documents.has(item.node) &&
           item.document !== null && typeof item.document === "object") {
-        out.set(item.node, item.document);
+        out.documents.set(item.node, { document: item.document, registry: item.origin === "node_registry" });
       }
     }
-    for (const node of Array.isArray(answer.missing) ? answer.missing : []) {
-      if (wanted.has(node) && !out.has(node)) out.set(node, null);
+    for (const item of Array.isArray(answer.listings) ? answer.listings : []) {
+      if (item !== null && typeof item === "object" && wanted.has(item.node) && !out.listings.has(item.node) &&
+          typeof item.url === "string") {
+        out.listings.set(item.node, item.url);
+      }
     }
     return out;
   }
@@ -3132,13 +3208,16 @@
   // ---- The chains this device follows (log.legacy) ----
 
   /** The kept state of the chains of format 1 and format 2: {nodes: {node: {seq, time_ms,
-   *  until_ms, closed}}}. seq is the seq up to which the control entries of the chain were read
-   *  (the verification point of the program before v43 for a node its ledger held), time_ms the
-   *  time of the entry there (0 when it is not known), until_ms the latest time the node can hold
-   *  a grant this device knows of, and closed whether the chain is read no more. */
+   *  until_ms, closed}}, waiting: {node: {until_ms, time_ms}}}. seq is the seq up to which the
+   *  control entries of the chain were read (the verification point of the program before v43 for
+   *  a node its ledger held), time_ms the time of the entry there (0 when it is not known),
+   *  until_ms the latest time the node can hold a grant this device knows of, and closed whether
+   *  the chain is read no more. waiting holds the receiving nodes of transfers of the delegation
+   *  whose documents this device has still to judge (LEGACY_ROUND_BODIES at most): until_ms as
+   *  for a chain, and time_ms the time of the latest event that names the node. */
   function loadLegacy() {
     const kept = storedObject(STORE_LEGACY);
-    const legacy = { nodes: Object.create(null) };
+    const legacy = { nodes: Object.create(null), waiting: Object.create(null) };
     const nodes = kept.nodes !== null && typeof kept.nodes === "object" ? kept.nodes : {};
     for (const id of Object.keys(nodes)) {
       const value = nodes[id];
@@ -3147,6 +3226,12 @@
         seq: whole(value.seq), time_ms: whole(value.time_ms), until_ms: whole(value.until_ms),
         closed: value.closed === true,
       };
+    }
+    const waiting = kept.waiting !== null && typeof kept.waiting === "object" ? kept.waiting : {};
+    for (const id of Object.keys(waiting).slice(0, LEGACY_ROUND_BODIES)) {
+      const value = waiting[id];
+      if (!NODE_ID.test(id) || value === null || typeof value !== "object") continue;
+      legacy.waiting[id] = { until_ms: whole(value.until_ms), time_ms: whole(value.time_ms) };
     }
     return legacy;
   }
@@ -3178,7 +3263,23 @@
   //   A3  the operator domain has been holding the reads back for LOG_BLOCKED_MS
   //   A4  an entry this device saw left the listing within its retention
   // A round reads the control entries only (grants, revocations, connections, transfers of the
-  // delegation): the use entries are read by the log screen.
+  // delegation): the use entries are read by the log screen. A read that was held back, whoever
+  // made it (a round, the first page of the screen, a later page), is kept (log.withheld: the key
+  // of an entry whose document or body was held back, the listing page of the screen that was
+  // held back) and made again by every round until it is no longer held back. So a round that
+  // reads the control entries alone does not end a count of rounds held back that a read of the
+  // screen began, and A3 holds for what only the screen reads as well.
+  //
+  // What is an entry is decided by the listing and by the node documents. The operator domain can
+  // write objects under any key of the store, so a key of the listing is the key of an entry only
+  // when its node has a node document that verifies. A document proves itself and the backend
+  // hands it on; that a node has none is not something the backend can state, so the program
+  // reads it from the store: the listing of the versions under the key of that node document,
+  // asked for after the listing that named the key. A node writes its document before it takes a
+  // user key and writes no entry without it, so a key the store listed while it held no version
+  // of the document of its node is no entry of a node. That judgement covers the keys the
+  // listings before it named and no key a later listing names: it is made again by every read
+  // and is not kept by node.
 
   /** The digest by which the program remembers that it judged a key: 9 bytes of its SHA-256. */
   function keyDigest(key) {
@@ -3272,6 +3373,82 @@
     return failure;
   }
 
+  /** Reads an object key as the key of an entry of format 3 of this account under either prefix
+   *  (parseEntryKey); null for any other key. */
+  function parseAccountKey(key) {
+    const control = parseEntryKey(key, "c");
+    return control !== null ? control : parseEntryKey(key, "u");
+  }
+
+  /** The reads of format 3 that were held back and that this device keeps for the rounds to make
+   *  again (log.withheld): {keys, pages}. keys are the object keys of entries whose document or
+   *  body was held back (LOG_WITHHELD_KEYS at most); pages are the listing pages of the screen
+   *  that were held back (LOG_WITHHELD_PAGES at most), each the time below which the page of the
+   *  two prefixes was asked for (0: the pages that begin the two listings). */
+  function loadWithheld() {
+    const kept = storedObject(STORE_WITHHELD);
+    return {
+      keys: (Array.isArray(kept.keys) ? kept.keys : []).filter(function (key) {
+        return typeof key === "string" && key !== "";
+      }).slice(0, LOG_WITHHELD_KEYS),
+      pages: (Array.isArray(kept.pages) ? kept.pages : []).filter(function (before) {
+        return Number.isSafeInteger(before) && before >= 0;
+      }).slice(0, LOG_WITHHELD_PAGES),
+    };
+  }
+
+  /** The two listing pages of the screen below the time before (0: from the start of the two
+   *  listings), as a request of readListings. */
+  function screenPages(before) {
+    return ["c", "u"].map(function (letter) {
+      return { prefix: letter, key_marker: before === 0 ? "" : pageMarker(letter, before), version_id_marker: "" };
+    });
+  }
+
+  /** Whether a failed read of the log is one the rounds make again: the backend refused it or did
+   *  not answer it, an address was not the one of the request, or the store refused an address. A
+   *  read that failed with the network of the device or with the store is not kept: the next read
+   *  of the same kind makes it. */
+  function heldKind(failure) {
+    return isStoreFailure(failure) && (failure.kind === "blocked" || failure.kind === "silent");
+  }
+
+  /** Writes the withheld reads after a read (run: withheld and settled, the keys it found held
+   *  back and the keys whose read came to a judgement; pagesHeld and pagesRead, the same for
+   *  listing pages): what the device kept without what that read settled, then what that read
+   *  found held back, up to the limits. A key older than the retention of the store leaves. The
+   *  kept value is read at the call and written in the same step: a round and a read of a later
+   *  page of the screen may end in either order. */
+  function saveWithheld(run) {
+    const kept = loadWithheld();
+    const horizon = native.nowMs() - LOG_RETENTION_DAYS * DAY_MS;
+    const keys = [];
+    for (const key of kept.keys.concat(Array.from(run.withheld))) {
+      if (run.settled.has(key) || keys.indexOf(key) >= 0 || keys.length >= LOG_WITHHELD_KEYS) continue;
+      const parsed = parseAccountKey(key);
+      if (parsed === null || parsed.time_ms < horizon) continue;
+      keys.push(key);
+    }
+    const pages = [];
+    for (const before of kept.pages.concat(Array.from(run.pagesHeld))) {
+      if (run.pagesRead.has(before) || pages.indexOf(before) >= 0 || pages.length >= LOG_WITHHELD_PAGES) continue;
+      pages.push(before);
+    }
+    const same = keys.length === kept.keys.length && pages.length === kept.pages.length &&
+      keys.every(function (key, at) { return key === kept.keys[at]; }) &&
+      pages.every(function (before, at) { return before === kept.pages[at]; });
+    if (same) return;
+    storeJson(STORE_WITHHELD, keys.length === 0 && pages.length === 0 ? null : { keys: keys, pages: pages });
+  }
+
+  /** Whether what this device kept says that its environment has a store of format 3: it handed
+   *  a grant to a node of a release that writes format 3, or it read that store (a listing of it
+   *  named the keys it keeps). A listing page that was held back says nothing of that. */
+  function storeKnown(log, kept) {
+    return log.cursor !== "" || log.seen.list.length > 0 || log.resume !== null || kept.keys.length > 0 ||
+      Object.keys(log.grants).some(function (id) { return logFormatOf(log.grants[id].release) === 3; });
+  }
+
   /** Whether a string is 96 lower-case hexadecimal characters (one PCR). */
   function hex96(value) {
     return typeof value === "string" && /^[0-9a-f]{96}$/.test(value);
@@ -3299,62 +3476,122 @@
   }
 
   /** Asks for the node documents of ids (LOG_DOCUMENT_NODES per request, budget.documents requests
-   *  at most, sent together) and keeps what they say in log.nodes. written says that the nodes
-   *  wrote entries of format 3, and so their node documents (verifyNodeDocument). Returns a table from node id to
-   *  "missing" (the backend has none), "rejected" (the document does not verify) or "unasked" (the
-   *  budget was spent) for the nodes that got no judgement. A failed request is noted on run and
-   *  leaves its nodes unasked. */
-  async function learnNodes(turn, log, run, ids, budget, written) {
+   *  at most, sent together) and keeps what the documents that verify say in log.nodes. kind says
+   *  whose nodes they are:
+   *    key       the nodes of keys a listing of format 3 named, read before this call
+   *    receiver  the receiving nodes of transfers an entry of format 3 names without a measurement
+   *    chain     the receiving nodes of transfers a chain of format 2 names
+   *  Returns a table from node id to {state, detail} for the nodes that got no judgement:
+   *    missing, rejected  the backend handed out no document, or one that does not verify
+   *    absent    (key) the same, and the store holds no version of the node document of the node:
+   *              the listing of the versions under its key, read from the store through the
+   *              address the answer gives for the node (documentUrlAccepted), ends with its first
+   *              page and names none. No node wrote the keys that the listings before this call
+   *              named under that node id
+   *    held      (key) the same, and the store does not show that: it holds a version of that
+   *              object or more than a page under its key, the answer gives no address for the
+   *              node or one that is not the address of that listing, or the store refuses the
+   *              address. detail names the read that is held back
+   *    failed    the backend refused the request or did not answer it (the failure is noted on run)
+   *    unasked   the budget was spent, or the device or the store could not be reached (the
+   *              failure is noted on run)
+   *    unserved  (chain) the backend states that it has no such route, and this device knows of
+   *              no store of format 3 in its environment (run.store3)
+   *  A request the backend answers with that statement for nodes of the other kinds holds their
+   *  documents back: a listing of the store named them. */
+  async function learnNodes(turn, log, run, ids, budget, kind) {
     const left = new Map();
     const requests = [];
     for (let at = 0; at < ids.length; at += LOG_DOCUMENT_NODES) {
       const batch = ids.slice(at, at + LOG_DOCUMENT_NODES);
       if (budget.documents <= 0) {
-        for (const id of batch) left.set(id, "unasked");
+        for (const id of batch) left.set(id, { state: "unasked", detail: "" });
         continue;
       }
       budget.documents -= 1;
       requests.push({ ids: batch, sent: settled(readDocuments(turn, batch)) });
     }
+    // The nodes of listed keys without a document that verifies: {id, why, url, signedMs}.
+    const checks = [];
     for (const item of requests) {
       const outcome = await item.sent;
       if (!outcome.ok) {
-        const refused = written ? heldBack(outcome.error) : outcome.error;
+        const refused = kind === "chain" && run.store3 !== true ? outcome.error : heldBack(outcome.error);
         noteFailure(turn, run, refused);
-        for (const id of item.ids) left.set(id, refused.kind === "absent" ? "absent" : "unasked");
+        const state = refused.kind === "absent" ? "unserved"
+          : refused.kind === "blocked" || refused.kind === "silent" ? "failed" : "unasked";
+        for (const id of item.ids) left.set(id, { state: state, detail: "" });
         continue;
       }
       for (const id of item.ids) {
-        const document = outcome.value.get(id);
-        if (document === undefined || document === null) {
-          left.set(id, "missing");
+        const given = outcome.value.documents.get(id);
+        let why = "missing";
+        if (given !== undefined) {
+          try {
+            const facts = verifyNodeDocument(given.document, id, given.registry);
+            log.nodes[id] = { m: facts.measure, p: facts.platform, r: facts.release, f: native.nowMs(), c: 0 };
+            continue;
+          } catch (error) {
+            if (failureCode(error) !== "attestation_failed") throw error;
+            why = "rejected";
+          }
+        }
+        if (kind !== "key") {
+          left.set(id, { state: why, detail: "" });
           continue;
         }
-        try {
-          const facts = verifyNodeDocument(document, id, written);
-          log.nodes[id] = { m: facts.measure, p: facts.platform, r: facts.release, f: native.nowMs(), c: 0 };
-        } catch (error) {
-          if (failureCode(error) !== "attestation_failed") throw error;
-          left.set(id, "rejected");
-        }
+        checks.push({ id: id, why: why, url: outcome.value.listings.get(id), signedMs: outcome.value.signedMs });
       }
+    }
+    if (checks.length === 0) return left;
+    // Whether the store holds the node document of each of them: one listing per node, from the
+    // store itself, after the listings that named the keys of the node.
+    const listed = await pooled(checks, async function (check) {
+      if (typeof check.url !== "string" || !documentUrlAccepted(check.url, check.id)) {
+        throw storeFailure("blocked", "documents:url");
+      }
+      const response = await fetchStore(turn, check.url, "document");
+      if (response.status !== 200) throw storeRefusal(response.status, "document", check.signedMs);
+      const held = documentListed(response.body, check.id);
+      if (held === null) throw storeFailure("unreachable", "document:body");
+      return held;
+    });
+    for (let at = 0; at < checks.length; at += 1) {
+      const check = checks[at];
+      const outcome = listed[at];
+      if (outcome.ok) {
+        left.set(check.id, outcome.value
+          ? { state: "held", detail: "documents:" + check.why } : { state: "absent", detail: "" });
+        continue;
+      }
+      const failure = outcome.error;
+      if (isStoreFailure(failure) && failure.kind === "blocked" && turnLeft(turn) > 0) {
+        left.set(check.id, { state: "held", detail: failure.detail.slice(0, 64) });
+        continue;
+      }
+      noteFailure(turn, run, failure);
+      left.set(check.id, { state: "unasked", detail: "" });
     }
     return left;
   }
 
   /** Reads and verifies the entries of format 3 that items name ([{parsed, fresh}]: fresh marks a
-   *  control key this device has not judged) and judges them. The documents of the nodes this
-   *  device has no judgement of and the bodies of the entries are requested in one stage
-   *  (budget.documents and budget.bodies requests at most). For every item whose body arrived,
-   *  run.entries receives {parsed, state, verdict, ours, events}: state is ok for a verified entry,
-   *  and signature, fields or open for an object that is not the entry its key names. What the
-   *  judgement finds is written into log:
-   *    a body the backend did not hand out, a body that is not the one the key names, and a key
-   *    of a node without a document that verifies are reads the operator domain held back
-   *    (run.blocked): a node writes its document before it acts, and the listing named the key.
-   *    Whatever signature the backend hands out with such a key, the key is not set aside: only
-   *    the store could show that its node wrote nothing under it.
-   *    A body the node of the key signed under a key that node did not write for it (the fields
+   *  control key this device has not judged) and judges them. Every item was named by a listing
+   *  of the store that was read before this call. The documents of the nodes this device has no
+   *  judgement of are requested together with the bodies of the keys whose nodes it has one of,
+   *  and the bodies of the keys whose nodes those documents judged after them (budget.documents
+   *  and budget.bodies requests at most). No body is asked for under a key whose node has no
+   *  judgement. For every item whose object was judged, run.entries receives {parsed, state,
+   *  verdict, ours, events}: state is ok for a verified entry, and signature, fields, open or
+   *  absent for an object that is not the entry its key names. What the judgement finds:
+   *    a key of a node the store holds no node document of (learnNodes: absent) is no entry of a
+   *    node. It is left out (run.junk), counted (run.undocumented) and marks nothing;
+   *    a key of a node without a document that verifies, when the store does not show that it
+   *    holds no document of that node, a body the backend did not hand out, and a body that is
+   *    not the one the key names are reads the operator domain held back (run.blocked). Whatever
+   *    the backend hands out with such a key, the key is not set aside. It is kept
+   *    (run.withheld) for the rounds to ask for it again;
+   *    a body the node of the key signed under a key that node did not write for it (the fields
    *    of the body are not the ones the key names) is an object someone else put there: it is no
    *    entry (run.junk) and marks nothing;
    *    an entry of this key written by a node of a measurement no list has, and a transfer of the
@@ -3363,7 +3600,8 @@
    *    of this key it signed that does not open, and two bodies it signed for one seq are noted on
    *    the node (A2).
    *  A fresh control key that was judged is remembered (markSeen); one whose read was held back or
-   *  cut short is judged again by the next round. */
+   *  cut short is judged again by the next round. run.settled receives the keys whose read came
+   *  to a judgement. */
   async function readEntries(turn, keys, log, run, items, budget) {
     if (items.length === 0) return;
     const unknown = [];
@@ -3371,51 +3609,66 @@
       const id = item.parsed.node;
       if (nodeVerdict(log.grants, log.nodes, id) === null && unknown.indexOf(id) < 0) unknown.push(id);
     }
-    const learning = learnNodes(turn, log, run, unknown, budget, true);
+    const learning = learnNodes(turn, log, run, unknown, budget, "key");
     // The keys whose bodies are asked for: each key once, in the order of items, as many as the
-    // requests left to this read carry. They are sent with the earliest entry first, so that a
-    // key an answer left out stands at the front of the next read however many later entries
-    // arrive.
+    // requests left to this read carry. A request names its keys with the earliest entry first,
+    // so that a key an answer left out stands at the front of the next read however many later
+    // entries arrive.
     const named = new Set();
-    let wanted = [];
-    for (const item of items) {
-      if (named.has(item.parsed.key) || wanted.length >= budget.bodies * LOG_BODY_KEYS) continue;
-      named.add(item.parsed.key);
-      wanted.push(item.parsed);
-    }
-    wanted.sort(function (a, b) {
-      if (a.time_ms !== b.time_ms) return a.time_ms - b.time_ms;
-      return a.tail < b.tail ? 1 : a.tail > b.tail ? -1 : 0;
-    });
-    wanted = wanted.map(function (parsed) { return parsed.key; });
     const requests = [];
-    for (let at = 0; at < wanted.length && budget.bodies > 0; at += LOG_BODY_KEYS) {
-      budget.bodies -= 1;
-      const batch = wanted.slice(at, at + LOG_BODY_KEYS);
-      requests.push({ keys: batch, sent: settled(readBodies(turn, batch)) });
-    }
+    const ask = function (judged) {
+      let wanted = [];
+      for (const item of items) {
+        const parsed = item.parsed;
+        if (named.has(parsed.key) || wanted.length >= budget.bodies * LOG_BODY_KEYS || !judged(parsed.node)) continue;
+        named.add(parsed.key);
+        wanted.push(parsed);
+      }
+      wanted.sort(function (a, b) {
+        if (a.time_ms !== b.time_ms) return a.time_ms - b.time_ms;
+        return a.tail < b.tail ? 1 : a.tail > b.tail ? -1 : 0;
+      });
+      wanted = wanted.map(function (parsed) { return parsed.key; });
+      for (let at = 0; at < wanted.length && budget.bodies > 0; at += LOG_BODY_KEYS) {
+        budget.bodies -= 1;
+        const batch = wanted.slice(at, at + LOG_BODY_KEYS);
+        requests.push({ keys: batch, sent: settled(readBodies(turn, batch)) });
+      }
+    };
+    // The keys of the nodes this device has a judgement of go out with the request for the
+    // documents; the keys of the nodes those documents judged follow them.
+    ask(function (node) { return unknown.indexOf(node) < 0; });
     const left = await learning;
+    ask(function (node) { return nodeVerdict(log.grants, log.nodes, node) !== null; });
     const bodies = new Map();
     for (const asked of requests) {
       const outcome = await asked.sent;
       if (!outcome.ok) {
-        noteFailure(turn, run, heldBack(outcome.error));
+        // A request the backend refused or did not answer: its keys are asked for again by the
+        // rounds (a request that failed with the network of the device is one they answer then).
+        const failure = heldBack(outcome.error);
+        noteFailure(turn, run, failure);
+        if (failure.kind === "blocked" || failure.kind === "silent") {
+          for (const key of asked.keys) run.withheld.add(key);
+        }
         continue;
       }
-      // An answer may end early (the backend bounds the size of an answer): the keys after the
-      // last key it names are asked for again by the next read. An answer that names none of the
-      // keys, or names a key and not one before it in the request, held a body back.
+      // An answer names the keys in the order of the request and may end early (the backend
+      // bounds the size and the time of an answer): the keys after the last key it names are
+      // asked for again by the next read. An answer that names none of the keys, or names a key
+      // and not one before it in the request, held a body back: the first key of the request, or
+      // the keys it left out before the last one it names.
       let last = -1;
       for (let at = 0; at < asked.keys.length; at += 1) {
         if (outcome.value.has(asked.keys[at])) last = at;
       }
-      let skipped = last < 0;
-      for (let at = 0; at < last; at += 1) {
-        if (!outcome.value.has(asked.keys[at])) skipped = true;
-      }
-      if (skipped) {
+      const skipped = last < 0 ? [asked.keys[0]] : asked.keys.slice(0, last).filter(function (key) {
+        return !outcome.value.has(key);
+      });
+      if (skipped.length > 0) {
         run.blocked = true;
         if (run.detail === "") run.detail = "bodies:skipped";
+        for (const key of skipped) run.withheld.add(key);
       }
       outcome.value.forEach(function (value, key) { bodies.set(key, value); });
     }
@@ -3426,38 +3679,52 @@
       const parsed = item.parsed;
       const digest = item.fresh ? keyDigest(parsed.key) : "";
       const verdict = nodeVerdict(log.grants, log.nodes, parsed.node);
-      const entry = bodies.get(parsed.key);
-      const checked = entry === undefined || entry === null ? { body: null, failure: "body" } : checkEntry(parsed, entry);
       if (verdict === null) {
         const why = left.get(parsed.node);
-        if ((why !== "missing" && why !== "rejected") || entry === undefined) {
+        if (why === undefined || (why.state !== "absent" && why.state !== "held")) {
+          // A request for the document that the backend refused or did not answer: the key is
+          // asked for again by the rounds.
+          if (why !== undefined && why.state === "failed") run.withheld.add(parsed.key);
           run.cut = true;
           continue;
         }
         run.undocumented.add(parsed.node);
-        // The listing of the store names this key, and the backend hands out no document that
-        // verifies for its node. A node writes its document before it acts and the document
-        // outlives its entries, so either nobody of an attested enclave wrote this object, or the
-        // document of the node is held back. What the backend hands out cannot tell the two
-        // apart: the signature of the object comes from the backend as the document does, so a
-        // signature that does not verify does not show that the node wrote nothing under this
-        // key. The read counts as held back, and the screen shows the entry as not verified.
+        if (why.state === "absent") {
+          // The store listed this key and holds no version of the node document of its node. A
+          // node writes its document before it takes a user key and writes no entry without it,
+          // so no act of a node stands behind this object: it is no entry.
+          run.entries.set(parsed.key, { parsed: parsed, state: "absent", verdict: null, ours: false, events: null });
+          run.junk.add(parsed.key);
+          run.settled.add(parsed.key);
+          if (item.fresh) markSeen(log, digest);
+          continue;
+        }
+        // The listing of the store names this key, the backend hands out no document that
+        // verifies for its node, and the store does not show that it holds none. The document of
+        // a node outlives its entries, so the document of the node is held back, or someone
+        // wrote an object under the key of that document. The read counts as held back, and the
+        // screen shows the entry as not verified.
         run.blocked = true;
-        if (run.detail === "") run.detail = "documents:" + why;
+        if (run.detail === "") run.detail = why.detail;
+        run.withheld.add(parsed.key);
         continue;
       }
+      const entry = bodies.get(parsed.key);
       if (entry === undefined) {
         run.cut = true;
         continue;
       }
+      const checked = entry === null ? { body: null, failure: "body" } : checkEntry(parsed, entry);
       run.bodies += 1;
       if (checked.failure === "body") {
         run.blocked = true;
         if (run.detail === "") run.detail = entry === null ? "bodies:missing" : "bodies:hash";
+        run.withheld.add(parsed.key);
         continue;
       }
       const record = { parsed: parsed, state: "ok", verdict: verdict, ours: false, events: null };
       run.entries.set(parsed.key, record);
+      run.settled.add(parsed.key);
       if (item.fresh) markSeen(log, digest);
       if (checked.failure === "signature") {
         // The body is the one the key names and the signature of the node does not verify over it.
@@ -3503,7 +3770,7 @@
       for (const transfer of transfers) {
         if (ids.indexOf(transfer.to) < 0) ids.push(transfer.to);
       }
-      await learnNodes(turn, log, run, ids, budget, true);
+      await learnNodes(turn, log, run, ids, budget, "receiver");
       for (const transfer of transfers) {
         const verdict = nodeVerdict(log.grants, log.nodes, transfer.to);
         if (verdict === null) noteUnaccepted(log, "node:" + transfer.to, transfer.event.release, transfer.to, true);
@@ -3588,15 +3855,27 @@
    *  the nodes such a node handed the delegation on to. Each open chain is listed from the seq up
    *  to which it was read, the control entries of the new keys are read (LEGACY_ROUND_BODIES per
    *  round), and a transfer of the delegation (the event
-   *  grant_transferred_out of this key) is followed: a receiving node whose document verifies with
-   *  a measurement no list has is noted (A1), a receiving node of a release that writes format 3
-   *  has its entries in the listing of format 3, and any other receiving node is a node of the
-   *  release of the giving node (it wrote no node document), whose chain is followed in turn, in
-   *  the same round (LEGACY_ROUND_PASSES passes of listings per round: a pass lists the chains
-   *  whose listing went on and the chains the pass before found). A
-   *  chain is closed by the first reading that reached its end after the grant of its node ran
-   *  out (LEGACY_CLOSE_SLACK_MS later): a node holds no key after that. The keys read are handed
-   *  to the log screen (rememberKeys). */
+   *  grant_transferred_out of this key) is followed. Such an event names the receiving node and
+   *  no measurement, so the document of that node is asked for (one request per pass):
+   *    a receiving node whose document verifies with a measurement no list has is noted (A1);
+   *    a receiving node of a release that writes format 3 has its entries in the listing of
+   *    format 3;
+   *    a receiving node of an accepted release before that has its chain followed in turn, in the
+   *    same round (LEGACY_ROUND_PASSES passes of listings per round: a pass lists the chains
+   *    whose listing went on and the chains the pass before found);
+   *    a receiving node the backend hands out no document that verifies for is judged by the
+   *    time of the event. From LEGACY_TRANSFER_DOCUMENTS_FROM_MS on, and within the retention of
+   *    the store, the read is held back (run.blocked) and the node waits (legacy.waiting): every
+   *    later round asks for its document again, and its chain is not followed before one
+   *    verifies. For an event of another time the node is followed as a node of the release of
+   *    the giving node;
+   *    a receiving node whose document could not be asked for waits as well, and the round is
+   *    not complete.
+   *  A backend that states it has no route of the node documents, in an environment this device
+   *  knows no store of format 3 of, judges no receiving node: each is followed as a node of the
+   *  release of the giving node. A chain is closed by the first reading that reached its end
+   *  after the grant of its node ran out (LEGACY_CLOSE_SLACK_MS later): a node holds no key
+   *  after that. The keys read are handed to the log screen (rememberKeys). */
   async function followLegacy(turn, keys, log, run) {
     const legacy = log.legacy;
     const now = native.nowMs();
@@ -3606,17 +3885,21 @@
       followChain(log, id, record.not_after_ms);
     }
     let open = Object.keys(legacy.nodes).filter(function (id) { return !legacy.nodes[id].closed; });
-    if (open.length === 0) return;
+    const waited = Object.keys(legacy.waiting);
+    if (open.length === 0 && waited.length === 0) return;
     open.sort(function (x, y) { return legacy.nodes[y].until_ms - legacy.nodes[x].until_ms; });
     if (open.length > LEGACY_NODES) {
       open = open.slice(0, LEGACY_NODES);
       run.cut = true;
     }
-    let bodiesLeft = LEGACY_ROUND_BODIES;
-    const asked = { documents: 1, bodies: 0 };
+    // A control entry names one receiving node at most, and the nodes that wait are asked for
+    // with the first pass: the entries of a round and the nodes that wait fit one request.
+    let bodiesLeft = Math.max(0, LEGACY_ROUND_BODIES - waited.length);
     // Each pass lists the chains that have keys left to read: the open chains first, then the
     // chains whose listing went on and the chains of the receiving nodes the pass before found.
-    for (let pass = 0; pass < LEGACY_ROUND_PASSES && open.length > 0; pass += 1) {
+    // The first pass also asks for the documents of the nodes that wait.
+    for (let pass = 0; pass < LEGACY_ROUND_PASSES; pass += 1) {
+      if (open.length === 0 && (pass > 0 || waited.length === 0)) break;
       const targets = open.map(function (id) {
         return { node: id, key_marker: listingMarker(id, legacy.nodes[id].seq), version_id_marker: null };
       });
@@ -3680,7 +3963,13 @@
         objects = null;
       }
       const next = [];
+      // The receiving nodes of the transfers this pass read, and with the first pass the nodes
+      // that wait: {until_ms, time_ms} (the latest time the node can hold the grant, and the time
+      // of the latest event that names it).
       const receivers = new Map();
+      if (pass === 0) {
+        for (const id of waited) receivers.set(id, legacy.waiting[id]);
+      }
       for (const plan of plans) {
         const chain = legacy.nodes[plan.id];
         let reached = chain.seq;
@@ -3707,7 +3996,12 @@
               if (entry.events !== null) {
                 for (const event of entry.events) {
                   if (event.t === "grant_transferred_out" && typeof event.to === "string" && NODE_ID.test(event.to)) {
-                    receivers.set(event.to, Math.max(receivers.get(event.to) || 0, chain.until_ms));
+                    // The time of the event, or of its entry for an event that names none.
+                    const eventMs = whole(event.time_ms) > 0 ? event.time_ms : entry.time_ms;
+                    const before = receivers.get(event.to) || { until_ms: 0, time_ms: 0 };
+                    receivers.set(event.to, {
+                      until_ms: Math.max(before.until_ms, chain.until_ms), time_ms: Math.max(before.time_ms, eventMs),
+                    });
                   }
                 }
               }
@@ -3727,24 +4021,46 @@
         }
         if (now > chain.until_ms + LEGACY_CLOSE_SLACK_MS) chain.closed = true;
       }
-      // The receiving nodes this device has no judgement of: their documents, when the backend
-      // has any. A node without one is a node of the release of the giving node.
+      // The receiving nodes this device has no judgement of: their documents.
       const unknown = [];
-      receivers.forEach(function (untilMs, id) {
+      receivers.forEach(function (receiver, id) {
         if (nodeVerdict(log.grants, log.nodes, id) === null) unknown.push(id);
       });
       const left = unknown.length === 0 ? new Map()
-        : await learnNodes(turn, log, run, unknown.slice(0, LOG_DOCUMENT_NODES), asked, false);
-      receivers.forEach(function (untilMs, id) {
+        : await learnNodes(turn, log, run, unknown.slice(0, LOG_DOCUMENT_NODES), { documents: 1 }, "chain");
+      receivers.forEach(function (receiver, id) {
         const verdict = nodeVerdict(log.grants, log.nodes, id);
-        if (verdict !== null && verdict.state === "unaccepted") {
-          noteUnaccepted(log, verdict.measure, verdict.release, id, true);
-          return;
+        if (verdict !== null) {
+          delete legacy.waiting[id];
+          if (verdict.state === "unaccepted") {
+            noteUnaccepted(log, verdict.measure, verdict.release, id, true);
+            return;
+          }
+          if (verdict.format === 3) return;
+        } else {
+          const why = left.get(id);
+          const state = why === undefined ? "unasked" : why.state;
+          if (state === "unasked" || state === "failed") {
+            // Its document could not be asked for: the next round asks again.
+            legacy.waiting[id] = receiver;
+            run.cut = true;
+            return;
+          }
+          const kept = receiver.time_ms >= LEGACY_TRANSFER_DOCUMENTS_FROM_MS &&
+            now - receiver.time_ms < LOG_RETENTION_DAYS * DAY_MS;
+          if (state !== "unserved" && kept) {
+            // The backend keeps the document of every node that took a transfer from that time
+            // on, for longer than the store keeps the entry of the transfer, and hands none out
+            // that verifies for this one.
+            legacy.waiting[id] = receiver;
+            run.blocked = true;
+            if (run.detail === "") run.detail = "receiver:" + state;
+            return;
+          }
+          delete legacy.waiting[id];
         }
-        if (verdict !== null && verdict.format === 3) return;
-        if (verdict === null && left.get(id) === "unasked") run.cut = true;
         const known = legacy.nodes[id] !== undefined;
-        followChain(log, id, untilMs);
+        followChain(log, id, receiver.until_ms);
         if (!known && next.indexOf(id) < 0) next.push(id);
       });
       open = next.slice(0, LEGACY_NODES);
@@ -3786,14 +4102,15 @@
 
   /** Whether a round is due: this program has ended none on this installation, the last one that
    *  completed is LOG_ROUND_INTERVAL_MS old, or the last one did not complete (it ended pending,
-   *  or it could not read the store while a mark of an earlier round stood; then not sooner than
-   *  LOG_ROUND_RETRY_MS after it). */
+   *  or it could not read the store while a mark of an earlier round stood) or a read of the
+   *  screen found a key held back since (then not sooner than LOG_ROUND_RETRY_MS after it). */
   function roundDue() {
     const round = storedObject(STORE_ROUND);
     const now = native.nowMs();
     if (round.v !== VERSION) return true;
     const tried = whole(round.tried_ms);
-    if (round.open === true || (round.last !== "verified" && round.last !== "attention")) {
+    const nominated = native.storeGet(STORE_WITHHELD) !== null;
+    if (round.open === true || nominated || (round.last !== "verified" && round.last !== "attention")) {
       return now < tried || now - tried >= LOG_ROUND_RETRY_MS;
     }
     const done = whole(round.done_ms);
@@ -3865,8 +4182,12 @@
    *      node wrote late lies below the entries this device saw before, so the round judges every
    *      key it has not judged (log.seen) wherever it lies. A listing longer than the pages of one
    *      round is read on by the next round from where this one stopped (log.resume)
-   *    3 the documents of the nodes this device has no judgement of, and 4 the bodies of the keys
-   *      it has not judged, in one stage (readEntries)
+   *    3 the documents of the nodes this device has no judgement of and, for a node without a
+   *      document that verifies, the listing of the versions of its node document from the store,
+   *      and 4 the bodies of the keys it has not judged whose nodes it has a judgement of
+   *      (readEntries). The keys an earlier read found held back are read with the first page,
+   *      and the listing pages of the screen an earlier read found held back after the listing
+   *      (log.withheld)
    *    5 the chains of format 1 and format 2 this device follows (followLegacy)
    *    6 the judgement, the published state, the report
    *  A backend that states it has no store of format 3 (the route is absent, or it answers
@@ -3879,10 +4200,15 @@
   async function runRound(turn, keys, origin, extra) {
     const started = native.nowMs();
     const log = loadLog();
+    // The reads an earlier read found held back, and whether what this device kept before this
+    // round says that its environment has a store of format 3.
+    const withheld = loadWithheld();
+    const known = storeKnown(log, withheld);
     const run = {
       origin: origin, detail: "", blocked: false, silent: false, unreachable: false, truncated: false,
       cut: false, controlKeys: 0, checked: 0, bodies: 0, nodes: new Set(), undocumented: new Set(),
-      verified: [], entries: new Map(), junk: new Set(), screenMs: null,
+      verified: [], entries: new Map(), junk: new Set(), screenMs: null, withheld: new Set(),
+      settled: new Set(), pagesHeld: new Set(), pagesRead: new Set(), store3: known,
     };
     const budget = { documents: LOG_DOCUMENT_REQUESTS, bodies: origin === "screen" ? LOG_SUMMARY_REQUESTS : LOG_ROUND_BODY_REQUESTS };
     const pages = { c: null, u: null };
@@ -3901,8 +4227,6 @@
         listings = await readListings(turn, wanted);
       } catch (failure) {
         if (isStoreFailure(failure) && failure.kind === "absent" && turnLeft(turn) > 0) {
-          const known = log.cursor !== "" || log.seen.list.length > 0 || log.resume !== null ||
-            Object.keys(log.grants).some(function (id) { return logFormatOf(log.grants[id].release) === 3; });
           if (!known) {
             absent = true;
             complete = true;
@@ -3910,22 +4234,45 @@
           }
           run.blocked = true;
           if (run.detail === "") run.detail = failure.detail.slice(0, 64);
+          if (origin === "screen") run.pagesHeld.add(0);
           break;
         }
         noteFailure(turn, run, failure);
+        // The pages that begin the two listings, which the screen reads and a round of a
+        // synchronization does not: the rounds make that read again.
+        if (origin === "screen" && heldKind(failure)) run.pagesHeld.add(0);
         break;
       }
       const control = listings[0];
+      // The store of format 3 answered: the routes of its bodies and documents exist.
+      run.store3 = true;
+      if (origin === "screen") run.pagesRead.add(0);
       if (place.key_marker === "") {
         pages.c = control;
         if (listings.length > 1) pages.u = listings[1];
         if (place.top === "" && control.keys.length > 0) place.top = control.keys[0].tail;
       }
-      const items = freshControl(log, run, control);
-      if (page === 0 && typeof extra === "function") {
-        const named = new Set(items.map(function (item) { return item.parsed.key; }));
-        for (const item of extra(pages)) {
-          if (!named.has(item.parsed.key)) items.push({ parsed: item.parsed, fresh: false });
+      let items = freshControl(log, run, control);
+      if (page === 0) {
+        // With the first page: the keys whose read an earlier read found held back (the listing
+        // of that read named them), and the entries the screen wants read. The keys held back
+        // stand first, so that no number of new keys takes the requests of the round from them.
+        const fresh = new Map(items.map(function (item) { return [item.parsed.key, item]; }));
+        const named = new Set();
+        const first = [];
+        for (const key of withheld.keys) {
+          const parsed = parseAccountKey(key);
+          if (parsed === null || named.has(parsed.key)) continue;
+          named.add(parsed.key);
+          first.push(fresh.has(parsed.key) ? fresh.get(parsed.key) : { parsed: parsed, fresh: false });
+        }
+        const rest = items.filter(function (item) { return !named.has(item.parsed.key); });
+        for (const item of rest) named.add(item.parsed.key);
+        items = first.concat(rest);
+        for (const item of typeof extra === "function" ? extra(pages) : []) {
+          if (named.has(item.parsed.key)) continue;
+          named.add(item.parsed.key);
+          items.push({ parsed: item.parsed, fresh: false });
         }
       }
       await readEntries(turn, keys, log, run, items, budget);
@@ -3948,6 +4295,23 @@
     }
     const readFailed = run.blocked || run.silent || run.unreachable;
     if (!complete && !readFailed) run.truncated = true;
+    // The listing pages of the screen that an earlier read found held back are read again, each
+    // in the request the screen sends for it. A backend that states it has no store of format 3
+    // holds such a page back on a device that knows of that store, and has no such page on a
+    // device that knows of none.
+    for (const before of withheld.pages) {
+      if (run.pagesRead.has(before) || run.pagesHeld.has(before)) continue;
+      try {
+        await readListings(turn, screenPages(before));
+        run.pagesRead.add(before);
+      } catch (failure) {
+        if (isStoreFailure(failure) && failure.kind === "absent" && !run.store3 && turnLeft(turn) > 0) {
+          run.pagesRead.add(before);
+          continue;
+        }
+        noteFailure(turn, run, heldBack(failure));
+      }
+    }
     try {
       await followLegacy(turn, keys, log, run);
     } catch (failure) {
@@ -4047,6 +4411,7 @@
     storeJson(STORE_SAMPLE, log.sample);
     storeJson(STORE_SEEN, log.seen.list);
     storeJson(STORE_MISSING, log.missing);
+    saveWithheld(run);
     saveLegacy(log.legacy);
     native.storeSet(STORE_CURSOR, log.cursor === "" ? null : log.cursor);
     storeJson(STORE_RESUME, log.resume);
@@ -5024,34 +5389,44 @@
   /** One later page of the screen: the entries before beforeMs, read without a round. The two
    *  listings of format 3 are read from the marker of that time and the entries of the page from
    *  the backend, each verified as a round verifies it; what the page finds changes no kept
-   *  judgement (the rounds judge). The entries of the chains of format 1 and format 2 are merged
-   *  in. Returns the page of mergePage. */
+   *  judgement (the rounds judge). A read the page finds held back (its listings, the document or
+   *  the body of one of its keys) is kept for the rounds, which make it again and count it
+   *  (log.withheld). The entries of the chains of format 1 and format 2 are merged in. Returns
+   *  the page of mergePage. */
   async function readPage(turn, keys, cache, beforeMs, limit) {
     let chosen = { chosen: [], more: false, count: 0 };
     const records = new Map();
     const junk = new Set();
+    const run = {
+      detail: "", blocked: false, silent: false, unreachable: false, cut: false, checked: 0, bodies: 0,
+      nodes: new Set(), undocumented: new Set(), verified: [], entries: records, junk: junk,
+      withheld: new Set(), settled: new Set(), pagesHeld: new Set(), pagesRead: new Set(), store3: true,
+    };
+    const log = loadLog();
     let unread = false;
+    let listed = false;
     try {
-      const listings = await readListings(turn, [
-        { prefix: "c", key_marker: pageMarker("c", beforeMs), version_id_marker: "" },
-        { prefix: "u", key_marker: pageMarker("u", beforeMs), version_id_marker: "" },
-      ]);
+      const listings = await readListings(turn, screenPages(beforeMs));
+      listed = true;
+      run.pagesRead.add(beforeMs);
       chosen = choosePage({ c: listings[0], u: listings[1] }, beforeMs, limit);
-      const log = loadLog();
       for (const id of Object.keys(pageNodes)) {
         if (log.nodes[id] === undefined) log.nodes[id] = pageNodes[id];
       }
-      const run = {
-        detail: "", blocked: false, silent: false, unreachable: false, cut: false, checked: 0, bodies: 0,
-        nodes: new Set(), undocumented: new Set(), verified: [], entries: records, junk: junk,
-      };
       const wanted = chosen.chosen.slice(0, LOG_SCREEN_BODIES).map(function (parsed) { return { parsed: parsed, fresh: false }; });
       await readEntries(turn, keys, log, run, wanted, { documents: 1, bodies: 1 });
       for (const id of Object.keys(log.nodes)) pageNodes[id] = log.nodes[id];
     } catch (failure) {
       if (!isStoreFailure(failure) || !(turnLeft(turn) > 0)) throw failure;
-      if (failure.kind !== "absent") unread = true;
+      // A backend that states it has no store of format 3 is believed by a device that knows of
+      // none; for any other device that answer holds the page back.
+      const absent = failure.kind === "absent" && !storeKnown(log, loadWithheld());
+      if (!listed && !absent && (failure.kind === "absent" || heldKind(failure))) run.pagesHeld.add(beforeMs);
+      if (!absent) unread = true;
     }
+    // A read this page found held back (the page itself, the document or the body of a key) is
+    // handed to the rounds, which make it again and count it.
+    saveWithheld(run);
     if (unread && chosen.chosen.length === 0) throw native.error("log_store_unreachable", "log screen");
     const first = chosen.chosen.filter(function (parsed) { return !junk.has(parsed.key); })
       .map(function (parsed) { return entryOfRecord(parsed, records.get(parsed.key)); });
@@ -5112,14 +5487,15 @@
         tally.floor = "";
         tally.chains = {};
       }
+      // An object that is no entry (round.junk) is passed and not counted.
       for (const parsed of plan.counted.above) {
         if (!round.entries.has(parsed.key)) break;
-        countEntryInto(tally, entryOfRecord(parsed, round.entries.get(parsed.key)));
+        if (!round.junk.has(parsed.key)) countEntryInto(tally, entryOfRecord(parsed, round.entries.get(parsed.key)));
         tally.top = parsed.tail;
       }
       for (const parsed of plan.counted.below) {
         if (!round.entries.has(parsed.key)) break;
-        countEntryInto(tally, entryOfRecord(parsed, round.entries.get(parsed.key)));
+        if (!round.junk.has(parsed.key)) countEntryInto(tally, entryOfRecord(parsed, round.entries.get(parsed.key)));
         if (tally.top === "") tally.top = parsed.tail;
         tally.floor = parsed.tail;
       }
@@ -6136,7 +6512,7 @@
    *  over again. */
   function clearLog() {
     for (const key of [STORE_GRANTS, STORE_CURSOR, STORE_RESUME, STORE_NODES, STORE_UNACCEPTED, STORE_BLOCKED,
-      STORE_SAMPLE, STORE_SEEN, STORE_MISSING, STORE_LEGACY, STORE_ROUND, STORE_CACHE]) {
+      STORE_SAMPLE, STORE_SEEN, STORE_MISSING, STORE_WITHHELD, STORE_LEGACY, STORE_ROUND, STORE_CACHE]) {
       native.storeSet(key, null);
     }
     native.storeSet(STORE_MIGRATED, String(VERSION));
@@ -7248,7 +7624,8 @@
     native.keychainDelete(mailSetupItem());
     for (const key of [LEDGER_STORE_KEY, LEDGER_SHARE_STORE_KEY, SEALING_CHECK_STORE_KEY, STORE_GRANTS,
       STORE_CURSOR, STORE_RESUME, STORE_NODES, STORE_UNACCEPTED, STORE_BLOCKED, STORE_SAMPLE, STORE_SEEN,
-      STORE_MISSING, STORE_LEGACY, STORE_ROUND, STORE_CACHE, STORE_MIGRATED, STORE_OUTCOMES].concat(RETIRED_STORE_KEYS)) {
+      STORE_MISSING, STORE_WITHHELD, STORE_LEGACY, STORE_ROUND, STORE_CACHE, STORE_MIGRATED,
+      STORE_OUTCOMES].concat(RETIRED_STORE_KEYS)) {
       native.storeSet(key, null);
     }
     outcomeState = null;

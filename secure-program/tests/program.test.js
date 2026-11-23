@@ -101,6 +101,54 @@ async function nextDay(fx) {
   await S.event(fx, "foreground");
 }
 
+/** Has the backend of a fixture answer the route of the node documents as its model does, with
+ *  what edit(answer, nodes) changes in that answer. Returns the fault. */
+function documentsAnswer(fx, edit) {
+  return fx.world.fault("POST /api/secure/log/documents", (request) => {
+    const answer = JSON.parse(fx.world.api("POST", "/api/secure/log/documents", null, request.body).body);
+    edit(answer, JSON.parse(request.body).nodes);
+    return { status: 200, body: answer };
+  });
+}
+
+/** Has the backend of a fixture hand out no document for the nodes ids: it reports them under
+ *  field (missing or unread) and answers everything else as its model does. */
+function withhold(fx, ids, field) {
+  return documentsAnswer(fx, (answer, nodes) => {
+    answer.documents = answer.documents.filter((item) => ids.indexOf(item.node) < 0);
+    for (const id of nodes) {
+      if (ids.indexOf(id) >= 0 && answer[field].indexOf(id) < 0) answer[field].push(id);
+    }
+  });
+}
+
+/** The addresses of the listings of node documents the program called at the store. */
+function documentListings(world) {
+  return world.sent("S3 ").map((request) => new URL(request.url))
+    .filter((url) => String(url.searchParams.get("prefix")).startsWith("n3/"));
+}
+
+/** Whether a request of the program is the listing of a node document at the store. */
+function isDocumentListing(line, request) {
+  return typeof request.url === "string" && String(new URL(request.url).searchParams.get("prefix")).startsWith("n3/");
+}
+
+/** The attestation document of a node as the node registry of the backend keeps it: the document
+ *  that answered a request of the backend, with the nonce of that request. */
+function registryDocument(node) {
+  return {
+    v: 1, platform: node.platform, document: b64u(node.platformDocument(crypto.randomBytes(32))), node: node.id,
+    release: node.release,
+  };
+}
+
+/** The keys of the bodies the program asked the backend for, over all its requests. */
+function askedBodies(world) {
+  let keys = [];
+  for (const request of world.sent("POST /api/secure/log/bodies")) keys = keys.concat(JSON.parse(request.body).keys);
+  return keys;
+}
+
 // ---- The model against the vectors ----
 
 test("the model derives the account keys of the vectors", () => {
@@ -912,14 +960,25 @@ test("A3: what counts as a read the operator domain holds back", async () => {
     fx.nodes[0].record("c", [{ t: "connection_created", time_ms: fx.world.now, record_id: "r", provider: "slack", scope: "" }]);
     fx.world.fault("POST /api/secure/log/bodies", "hang");
   }, "bodies:timeout");
-  await blocked("a signed entry of a node without a node document", async (fx) => {
-    const silent = fx.world.addNode({ release: "v2.4.0", measurement: fx.measurement, offered: false, document: false });
-    silent.record("c", [{ t: "connection_created", time_ms: fx.world.now, record_id: "r", provider: "slack", scope: "" }]);
+  await blocked("an entry of a node whose document the store holds and the backend does not hand out", async (fx) => {
+    const hidden = fx.world.addNode({ release: "v2.4.0", measurement: fx.measurement, offered: false });
+    hidden.record("c", [{ t: "connection_created", time_ms: fx.world.now, record_id: "r", provider: "slack", scope: "" }]);
+    withhold(fx, [hidden.id], "missing");
   }, "documents:missing");
-  await blocked("a signed entry of a node whose document does not verify", async (fx) => {
+  await blocked("the same, when the backend reports the document as unread", async (fx) => {
+    const hidden = fx.world.addNode({ release: "v2.4.0", measurement: fx.measurement, offered: false });
+    hidden.record("c", [{ t: "connection_created", time_ms: fx.world.now, record_id: "r", provider: "slack", scope: "" }]);
+    withhold(fx, [hidden.id], "unread");
+  }, "documents:missing");
+  await blocked("an entry of a node whose document does not verify", async (fx) => {
     const broken = fx.world.addNode({ release: "v2.4.0", measurement: fx.measurement, offered: false, brokenSignature: true });
     broken.record("c", [{ t: "connection_created", time_ms: fx.world.now, record_id: "r", provider: "slack", scope: "" }]);
   }, "documents:rejected");
+  await blocked("an entry of a node id under whose document key the store holds an object that is no node document", async (fx) => {
+    const forged = new bridge.Node(fx.world, { release: "v2.4.0", measurement: fx.measurement, document: false });
+    forged.record("c", [{ t: "connection_created", time_ms: fx.world.now, record_id: "r", provider: "slack", scope: "" }]);
+    fx.world.putObject(bridge.shardBucket("prod", forged.id), "n3/" + forged.id, "not a node document");
+  }, "documents:missing");
   await blocked("the route of the bodies answers that it does not exist, for keys the listing of the store named", async (fx) => {
     fx.nodes[0].record("c", [{ t: "connection_created", time_ms: fx.world.now, record_id: "r", provider: "slack", scope: "" }]);
     fx.world.fault("POST /api/secure/log/bodies", { status: 404, body: { detail: "Not Found" } });
@@ -981,15 +1040,17 @@ test("A4: an entry this device verified that left the listing within its retenti
   assert.equal(aged.world.state.log.missing, 0);
 });
 
-test("A3: a key of a node id the backend hands out no document for is a read held back, whatever signature comes with it, and the screen shows it as not verified", async () => {
-  // The signature of an object reaches the device through the backend, as the node document does.
-  // A backend that hands out neither the document of a node nor the signature of its entry would
-  // otherwise make an entry of that node look like an object nobody signed.
+// ---- The node documents: what the backend hands out, and what the store shows ----
+
+test("A3: the control entry of a node whose document the backend withholds is a read held back: the store shows the document, three rounds and three days mark the log, and the document clears it", async () => {
   const fx = S.fixture(source, { device: { securityStatus: true } });
   await S.start(fx);
   const world = fx.world;
-  const ghost = new bridge.Node(world, { release: "v2.4.0", measurement: fx.measurement, document: false });
-  ghost.record("c", [{ t: "grant_revoked", time_ms: world.now }], { signSeed: crypto.randomBytes(32) });
+  // A node of the accepted measurement that this device handed no grant to: it took the
+  // delegation from another node of its measurement, which writes no entry, and then wrote one.
+  const hidden = world.addNode({ release: "v2.4.0", measurement: fx.measurement, offered: false });
+  const written = hidden.record("c", [{ t: "connection_created", time_ms: world.now, record_id: "r", provider: "slack", scope: "" }]);
+  const fault = withhold(fx, [hidden.id], "missing");
   const states = [];
   for (let day = 0; day < 4; day += 1) {
     await nextDay(fx);
@@ -999,15 +1060,559 @@ test("A3: a key of a node id the backend hands out no document for is a read hel
   assert.equal(world.state.log.store_failure, "documents:missing");
   assert.equal(world.reports.slice(-1)[0].undocumented_nodes, 1);
   assert.deepEqual(world.securityStatuses.slice(-1)[0].reasons, ["verification_blocked"]);
+  // The program asked the store itself whether it holds the document of that node: the listing
+  // of the versions under the key of the document, in the bucket of the node id, once per round.
+  const listings = documentListings(world);
+  assert.equal(listings.length, 4);
+  for (const url of listings) {
+    assert.equal(url.host, bridge.shardBucket("prod", hidden.id) + ".s3.us-west-2.amazonaws.com");
+    assert.equal(url.pathname, "/");
+    assert.equal(url.searchParams.get("prefix"), "n3/" + hidden.id);
+    assert.equal(url.searchParams.get("max-keys"), "1000");
+  }
+  // No body was asked for under the key of a node without a judgement, and no judgement of the
+  // node is kept.
+  assert.ok(askedBodies(world).indexOf(written.key) < 0);
+  assert.equal(world.stored("log.nodes")[hidden.id], undefined);
+  // The screen shows the entry as not verified.
+  const shown = await S.call(fx, "read_log", { limit: 50 });
+  assert.deepEqual(shownGroups(shown.value).map((group) => group.kind).sort(), ["grant_renewed", "unverified"]);
+  // The backend hands the document out: the node is one of an accepted measurement and its
+  // entry verifies.
+  fault.times = 0;
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(world.state.log.store, "verified");
+  assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  assert.equal(world.securityStatuses.slice(-1)[0].status, "ok");
+  assert.equal(world.stored("log.withheld"), undefined);
+  const after = await S.call(fx, "read_log", { limit: 50 });
+  assert.deepEqual(shownGroups(after.value).map((group) => group.kind).sort(), ["connected", "grant_renewed"]);
+  assert.ok(shownGroups(after.value).every((group) => group.verified === true));
+});
+
+test("A3: a use entry of a node whose document the backend withholds, which only the screen reads, is asked for again by every round and marks the log after three days", async () => {
+  const fx = S.fixture(source, { device: { securityStatus: true } });
+  await S.start(fx);
+  const world = fx.world;
+  const hidden = world.addNode({ release: "v2.4.0", measurement: fx.measurement, offered: false });
+  world.advance(HOUR_MS);
+  const used = hidden.record("u", [S.providerRequest(world.now)]);
+  const fault = withhold(fx, [hidden.id], "missing");
+  // A round a synchronization starts reads the control entries: it does not find the entry.
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "verified");
+  // The screen reads the use entries: the entry is shown as not verified and its read is held
+  // back.
+  const shown = await S.call(fx, "read_log", { limit: 50 });
+  assert.deepEqual(shownGroups(shown.value).map((group) => group.kind), ["unverified", "grant_renewed"]);
+  assert.equal(world.state.log.store, "blocked");
+  assert.equal(world.state.log.store_failure, "documents:missing");
+  assert.deepEqual(world.stored("log.withheld"), { keys: [used.key], pages: [] });
+  // The rounds after it ask for that key again, though they read the control entries only: the
+  // count of the rounds held back goes on, and the log is marked after three days.
+  const states = [];
+  for (let day = 0; day < 3; day += 1) {
+    await nextDay(fx);
+    states.push(world.state.log.status + ":" + world.state.log.store + ":" + world.reports.slice(-1)[0].blocked_attempts);
+  }
+  assert.deepEqual(states, ["pending:blocked:2", "pending:blocked:3", "attention:blocked:4"]);
+  assert.deepEqual(world.securityStatuses.slice(-1)[0].reasons, ["verification_blocked"]);
+  assert.ok(askedBodies(world).indexOf(used.key) < 0);
+  // The document is handed out: the round reads the entry, and nothing is kept as held back.
+  fault.times = 0;
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(world.stored("log.withheld"), undefined);
+  assert.ok(askedBodies(world).indexOf(used.key) >= 0);
+  const after = await S.call(fx, "read_log", { limit: 50 });
+  assert.deepEqual(shownGroups(after.value).map((group) => group.kind), ["request", "grant_renewed"]);
+});
+
+test("a node whose document the backend hands out is judged without a read of the store, and a document the node registry kept verifies without the nonce of a node document", async () => {
+  // The document a node wrote to the store: one request for it, and no listing of the store.
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  const other = world.addNode({ release: "v2.4.0", measurement: fx.measurement, offered: false });
+  other.record("c", [{ t: "connection_created", time_ms: world.now, record_id: "r", provider: "slack", scope: "" }]);
+  const sent = world.requests.length;
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(world.reports.slice(-1)[0].undocumented_nodes, 0);
+  assert.equal(documentListings(world).length, 0);
+  assert.equal(S.requestLines(world, sent).filter((line) => line === "POST /api/secure/log/documents").length, 1);
+  assert.equal(world.stored("log.nodes")[other.id].r, "v2.4.0");
+  // The next round asks for no document of that node.
+  const documents = world.sent("POST /api/secure/log/documents").length;
+  other.record("c", [{ t: "connection_removed", time_ms: world.now, record_id: "r", provider: "slack", provider_revoke: false }]);
+  await nextDay(fx);
+  assert.equal(world.sent("POST /api/secure/log/documents").length, documents);
+  assert.equal(world.reports.slice(-1)[0].keys_checked, 1);
+
+  // The backend could not read the object of the store and hands out the attestation document
+  // its node registry kept of the node (the nonce is the one of a request of the backend).
+  const kept = S.fixture(source);
+  await S.start(kept);
+  const node = kept.world.addNode({ release: "v2.4.0", measurement: kept.measurement, offered: false });
+  node.record("c", [{ t: "connection_created", time_ms: kept.world.now, record_id: "r", provider: "slack", scope: "" }]);
+  const origin = { value: "node_registry" };
+  documentsAnswer(kept, (answer) => {
+    answer.documents = [{ node: node.id, origin: origin.value, document: registryDocument(node) }];
+    answer.missing = [];
+  });
+  await nextDay(kept);
+  assert.equal(kept.world.state.log.status, "verified");
+  assert.equal(documentListings(kept.world).length, 0);
+  // The same document handed out as the object of the store is not the node document of the
+  // node: the store holds one, so the read is held back.
+  const wrong = S.fixture(source);
+  await S.start(wrong);
+  const third = wrong.world.addNode({ release: "v2.4.0", measurement: wrong.measurement, offered: false });
+  third.record("c", [{ t: "connection_created", time_ms: wrong.world.now, record_id: "r", provider: "slack", scope: "" }]);
+  documentsAnswer(wrong, (answer) => {
+    answer.documents = [{ node: third.id, origin: "log_store", document: registryDocument(third) }];
+    answer.missing = [];
+  });
+  await nextDay(wrong);
+  assert.equal(wrong.world.state.log.store, "blocked");
+  assert.equal(wrong.world.state.log.store_failure, "documents:rejected");
+});
+
+test("an object under a node id the store holds no node document of is no entry: it marks nothing, holds nothing back, no body is asked for, and the screen leaves it out", async () => {
+  const fx = S.fixture(source, { device: { securityStatus: true } });
+  await S.start(fx);
+  const world = fx.world;
+  // Objects under the prefix of the account whose keys name a node id no node has: nothing wrote a
+  // node document under that id.
+  const ghost = new bridge.Node(world, { release: "v2.4.0", measurement: fx.measurement, document: false });
+  world.advance(HOUR_MS);
+  const control = ghost.record("c", [{ t: "grant_revoked", time_ms: world.now }]);
+  const use = ghost.record("u", [S.providerRequest(world.now)]);
+  const reports = [];
+  for (let day = 0; day < 5; day += 1) {
+    await nextDay(fx);
+    const report = world.reports.slice(-1)[0];
+    reports.push([report.status, report.store, report.blocked_attempts, report.undocumented_nodes].join(":"));
+  }
+  // The round that finds the key reads from the store that no document of the node exists and
+  // counts the node; the rounds after it have nothing to judge.
+  assert.deepEqual(reports, ["verified:verified:0:1", "verified:verified:0:0", "verified:verified:0:0",
+    "verified:verified:0:0", "verified:verified:0:0"]);
+  assert.equal(documentListings(world).length, 1);
+  assert.equal(world.state.log.status, "verified");
+  assert.deepEqual(world.securityStatuses.map((told) => told.status), ["ok", "ok", "ok", "ok", "ok", "ok"]);
+  assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  assert.equal(world.stored("log.withheld"), undefined);
+  assert.equal(world.stored("log.nodes")[ghost.id], undefined);
+  // The screen leaves both objects out, and asks the store again (the judgement is not kept).
+  const shown = await S.call(fx, "read_log", { limit: 50 });
+  assert.deepEqual(shownGroups(shown.value).map((group) => group.kind), ["grant_renewed"]);
+  assert.equal(shown.value.status, "verified");
+  assert.equal(documentListings(world).length, 2);
+  for (const key of [control.key, use.key]) assert.ok(askedBodies(world).indexOf(key) < 0, key);
+  // A delete marker on the key of the node document is no version of it: nobody wrote a document.
+  world.putDeleteMarker(bridge.shardBucket("prod", ghost.id), "n3/" + ghost.id);
+  world.advance(HOUR_MS);
+  const marked = await S.call(fx, "read_log", { limit: 50 });
+  assert.deepEqual(shownGroups(marked.value).map((group) => group.kind), ["grant_renewed"]);
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(world.state.log.store, "verified");
+});
+
+test("that the store holds no document of a node id is judged for the keys listed before, and again for a key listed later: a node that writes its document then is read as a node", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  // A node of the accepted measurement that has not written its node document yet. An object
+  // under its node id is no entry of it: a node writes no entry before its document.
+  const late = world.addNode({ release: "v2.4.0", measurement: fx.measurement, offered: false, document: false });
+  world.advance(HOUR_MS);
+  late.record("c", [{ t: "connection_created", time_ms: world.now, record_id: "r0", provider: "slack", scope: "" }], {
+    signSeed: crypto.randomBytes(32),
+  });
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(world.reports.slice(-1)[0].undocumented_nodes, 1);
+  // The node writes its document, takes the delegation and writes entries. The keys the store
+  // lists now are judged by the document of the node, not by the earlier reading of the store.
+  late.writeDocument();
+  world.advance(HOUR_MS);
+  late.record("c", [{ t: "connection_created", time_ms: world.now, record_id: "r1", provider: "notion", scope: "" }]);
+  late.record("u", [S.providerRequest(world.now)]);
+  await nextDay(fx);
+  assert.equal(world.reports.slice(-1)[0].undocumented_nodes, 0);
+  assert.equal(world.reports.slice(-1)[0].keys_checked, 1);
   const shown = await S.call(fx, "read_log", { limit: 50 });
   const groups = shownGroups(shown.value);
-  assert.deepEqual(groups.map((group) => group.kind).sort(), ["grant_renewed", "unverified"]);
-  // The document arrives: the node is one of an accepted measurement, and the object that its
-  // signature does not verify over contradicts it (A2).
-  ghost.writeDocument();
+  assert.deepEqual(groups.filter((group) => group.verified === true).map((group) => group.kind), ["request", "connected", "grant_renewed"]);
+  // The object that was there before the document is one the node did not sign: under a node
+  // that passed attestation, it contradicts the node (A2).
+  assert.equal(groups.filter((group) => group.verified !== true).length, 1);
+  assert.equal(world.state.log.unverified_nodes, 1);
+  assert.equal(world.state.log.status, "attention");
+});
+
+test("A3: the listing of a node document is read through the address of that listing only: another bucket, another prefix, a marker, another page size, a key given twice or a fragment hold the read back, and so does an answer without the address", async () => {
+  const held = async (name, change, expected) => {
+    const fx = S.fixture(source);
+    await S.start(fx);
+    const world = fx.world;
+    const hidden = world.addNode({ release: "v2.4.0", measurement: fx.measurement, offered: false });
+    hidden.record("c", [{ t: "connection_created", time_ms: world.now, record_id: "r", provider: "slack", scope: "" }]);
+    documentsAnswer(fx, (answer) => {
+      answer.documents = [];
+      answer.missing = [hidden.id];
+      change(answer, hidden, world);
+    });
+    await nextDay(fx);
+    assert.equal(world.state.log.store, "blocked", name);
+    assert.equal(world.state.log.status, "pending", name);
+    assert.equal(world.state.log.store_failure, expected, name);
+    assert.equal(world.stored("log.blocked").count, 1, name);
+    return world;
+  };
+  const prefix = (node) => encodeURIComponent("n3/" + node.id);
+  // The address of the listing as the backend signs it is called, and the store shows the
+  // document the backend did not hand out.
+  const called = await held("the address of the listing", () => {}, "documents:missing");
+  assert.equal(documentListings(called).length, 1);
+  const uncalled = async (name, rewrite) => {
+    const world = await held(name, (answer, hidden, world) => {
+      answer.listings = answer.listings.map((item) => ({ node: item.node, url: rewrite(item.url, hidden, world) }));
+    }, "documents:url");
+    assert.equal(documentListings(world).length, 0, name);
+    assert.equal(world.sent("S3 ").filter((request) => request.url.indexOf("n3") >= 0).length, 0, name);
+  };
+  await uncalled("the bucket of the account", (url, hidden, world) =>
+    url.replace(bridge.shardBucket("prod", hidden.id), bridge.shardBucket("prod", world.userId)));
+  await uncalled("the bucket the binding names", (url, hidden, world) =>
+    url.replace(bridge.shardBucket("prod", hidden.id), world.bucket));
+  await uncalled("the prefix of another node id", (url, hidden) =>
+    url.replace(prefix(hidden), encodeURIComponent("n3/" + b64u(crypto.randomBytes(32)))));
+  await uncalled("a prefix below the key of the document", (url, hidden) =>
+    url.replace(prefix(hidden), prefix(hidden) + "%2F"));
+  await uncalled("a prefix that is a part of the key of the document", (url, hidden) =>
+    url.replace(prefix(hidden), encodeURIComponent("n3/" + hidden.id.slice(0, 42))));
+  await uncalled("a key marker", (url, hidden) => url.replace("&max-keys=1000", "&key-marker=" + prefix(hidden) + "&max-keys=1000"));
+  await uncalled("a version id marker", (url) => url.replace("&max-keys=1000", "&version-id-marker=v000001&max-keys=1000"));
+  await uncalled("a delimiter", (url) => url.replace("&max-keys=1000", "&delimiter=%2F&max-keys=1000"));
+  await uncalled("another page size", (url) => url.replace("&max-keys=1000", "&max-keys=1"));
+  await uncalled("no page size", (url) => url.replace("&max-keys=1000", ""));
+  await uncalled("not a listing of versions", (url) => url.replace("?versions&", "?"));
+  await uncalled("another query key", (url) => url + "&list-type=2");
+  await uncalled("the prefix given twice, the other one first", (url, hidden) =>
+    url.replace("prefix=" + prefix(hidden), "prefix=n3%2Fnone&prefix=" + prefix(hidden)));
+  await uncalled("the page size given twice", (url) => url.replace("&max-keys=1000", "&max-keys=1&max-keys=1000"));
+  await uncalled("a fragment in front of the query", (url) => url.replace("/?", "/#?"));
+  await uncalled("a fragment behind the query", (url) => url + "#x");
+  await uncalled("a path", (url) => url.replace("/?", "/n3?"));
+  await uncalled("http", (url) => url.replace("https://", "http://"));
+  await held("an answer without the addresses", (answer) => { delete answer.listings; }, "documents:url");
+  await held("an answer with the address of another node only", (answer, hidden, world) => {
+    answer.listings = [{ node: b64u(crypto.randomBytes(32)), url: world.documentUrl(hidden.id) }];
+  }, "documents:url");
+  // The store refuses the address the backend signed.
+  const refused = S.fixture(source);
+  await S.start(refused);
+  const node = refused.world.addNode({ release: "v2.4.0", measurement: refused.measurement, offered: false });
+  node.record("c", [{ t: "connection_created", time_ms: refused.world.now, record_id: "r", provider: "slack", scope: "" }]);
+  withhold(refused, [node.id], "missing");
+  refused.world.fault(isDocumentListing, { status: 403, body: "" });
+  await nextDay(refused);
+  assert.equal(refused.world.state.log.store, "blocked");
+  assert.equal(refused.world.state.log.store_failure, "document:403");
+});
+
+test("the answers Amazon S3 gives for the listing of the versions under a node document key are read as the store states them", async () => {
+  // Answers of Amazon S3 (us-west-2, a bucket with versioning, 2026-11-23) to the address a
+  // backend presigns for that listing (list-object-versions with the prefix n3/{node} and
+  // max-keys 1000; the SDK adds encoding-type url). NODE stands for the node id, and the owner
+  // id of the bucket is replaced.
+  const head = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">" +
+    "<Name>bucket</Name><Prefix>n3/NODE</Prefix><KeyMarker></KeyMarker><VersionIdMarker></VersionIdMarker><MaxKeys>1000</MaxKeys>" +
+    "<EncodingType>url</EncodingType><IsTruncated>false</IsTruncated>";
+  const owner = "<Owner><ID>0000000000000000000000000000000000000000000000000000000000000000</ID></Owner>";
+  const version = (key, id, latest) => "<Version><Key>" + key + "</Key><VersionId>" + id + "</VersionId><IsLatest>" + latest +
+    "</IsLatest><LastModified>2026-11-23T09:42:52.000Z</LastModified><ETag>&quot;a191475ae2bf7db9c7e320f7da455bbb&quot;</ETag>" +
+    "<ChecksumAlgorithm>CRC32</ChecksumAlgorithm><ChecksumType>FULL_OBJECT</ChecksumType><Size>7</Size>" + owner +
+    "<StorageClass>STANDARD</StorageClass></Version>";
+  const marker = (key, id) => "<DeleteMarker><Key>" + key + "</Key><VersionId>" + id + "</VersionId><IsLatest>true</IsLatest>" +
+    "<LastModified>2026-11-23T09:42:52.000Z</LastModified>" + owner + "</DeleteMarker>";
+  const tail = "</ListVersionsResult>";
+  const answers = [
+    // No object under the key.
+    { name: "nothing", xml: head + tail, held: false },
+    // A delete request on a key nothing was written under.
+    { name: "a delete marker alone", xml: head + marker("n3/NODE", ".jMBCIFW4NPrlvTe0fB41Ntu.Sa5VjHN") + tail, held: false },
+    // An object of a longer key with the same prefix.
+    { name: "a longer key", xml: head + version("n3/NODE/x", "n9ai.N4kxQnakCWEEfdGxye8jDXRliDU", "true") + tail, held: false },
+    // Two versions of the object, and an object of a longer key.
+    {
+      name: "two versions", held: true,
+      xml: head + version("n3/NODE", "MnGCFGbDzgSOxfZW8ARFpxfrYY4ZxIHU", "true") + version("n3/NODE", "R4oqorkd1wZcl6VWAFo6hdeKfqKCb4zj", "false") +
+        version("n3/NODE.other", "SrHRidnnOpKpjM7bdkTivwv2Ynm5bTZ6", "true") + tail,
+    },
+    // One version with a delete marker on top of it.
+    {
+      name: "a version under a delete marker", held: true,
+      xml: head + marker("n3/NODE", "ZqNvwFyG7X6L2uI6GQlNNKwkn7mx7RaQ") + version("n3/NODE", "XcHdAe4TXQGDvuIHuFE_BYGVaZxBnTMC", "false") + tail,
+    },
+  ];
+  for (const answer of answers) {
+    const fx = S.fixture(source);
+    await S.start(fx);
+    const ghost = new bridge.Node(fx.world, { release: "v2.4.0", measurement: fx.measurement, document: false });
+    ghost.record("c", [{ t: "grant_revoked", time_ms: fx.world.now }]);
+    fx.world.fault(isDocumentListing, { status: 200, body: answer.xml.split("NODE").join(ghost.id) });
+    await nextDay(fx);
+    assert.equal(fx.world.reports.slice(-1)[0].undocumented_nodes, 1, answer.name);
+    assert.equal(fx.world.state.log.store, answer.held ? "blocked" : "verified", answer.name);
+    assert.equal(fx.world.state.log.store_failure, answer.held ? "documents:missing" : "", answer.name);
+    assert.equal(fx.world.state.log.status, answer.held ? "pending" : "verified", answer.name);
+  }
+});
+
+test("a debug build reads the listing of a node document of the local stack in the path-style form of the bucket of the node id, and in that of no other bucket", async () => {
+  const run = async (bucketOf) => {
+    // The bridge of a debug build reports the server target prod whatever backend it talks to.
+    const fx = S.fixture(source, { target: "prod", nodes: 0, device: { debug_build: true } });
+    const world = fx.world;
+    world.addNode({ release: "v2.4.0", measurement: fx.measurement, platform: "local", log: { bucket: "character-credential-log-local-1", region: "us-west-2" } });
+    const ghost = new bridge.Node(world, { release: "v2.4.0", measurement: fx.measurement, document: false });
+    // The stand-in of the local stack: path-style addresses, answered from the objects of the
+    // model (the bucket of the account for the entries, the bucket of a node id for a document).
+    const standIn = (bucket, prefix) => "http://localhost:4566/" + bucket + "?versions&prefix=" +
+      encodeURIComponent(prefix) + "&max-keys=1000&encoding-type=url";
+    world.fault("POST /api/secure/log/read", (request) => ({
+      status: 200, body: {
+        pages: JSON.parse(request.body).pages.map((page) => ({
+          prefix: page.prefix, url: standIn(bridge.shardBucket("local", world.userId), "a3/" + world.userId + "/" + page.prefix + "/"),
+        })),
+      },
+    }));
+    documentsAnswer(fx, (answer) => {
+      answer.listings = answer.listings.map((item) => ({ node: item.node, url: standIn(bucketOf(item.node), "n3/" + item.node) }));
+    });
+    world.fault("S3 localhost:4566", (request) => {
+      const params = new URL(request.url).searchParams;
+      const owner = params.get("prefix").startsWith("n3/") ? params.get("prefix").slice(3) : world.userId;
+      return { status: 200, body: world.listing(bridge.shardBucket("prod", owner), params) };
+    });
+    await S.start(fx);
+    assert.equal(world.state.log.status, "verified");
+    ghost.record("c", [{ t: "grant_revoked", time_ms: world.now }]);
+    await nextDay(fx);
+    return { world: world, ghost: ghost };
+  };
+  // The bucket of the node id among the buckets of the local stack: the store holds no document.
+  const right = await run((node) => bridge.shardBucket("local", node));
+  assert.equal(right.world.state.log.status, "verified");
+  assert.equal(right.world.reports.slice(-1)[0].undocumented_nodes, 1);
+  const called = right.world.sent("S3 localhost:4566").map((request) => new URL(request.url))
+    .filter((url) => url.searchParams.get("prefix") === "n3/" + right.ghost.id);
+  assert.deepEqual(called.map((url) => url.pathname), ["/" + bridge.shardBucket("local", right.ghost.id)]);
+  // Another bucket of the local stack: the address is not called.
+  const wrong = await run((node) => {
+    const own = bridge.shardBucket("local", node);
+    for (let i = 0; i < 64; i += 1) {
+      const other = bridge.shardBucket("local", "owner-" + i);
+      if (other !== own) return other;
+    }
+    return own;
+  });
+  assert.equal(wrong.world.state.log.store, "blocked");
+  assert.equal(wrong.world.state.log.store_failure, "documents:url");
+  assert.equal(wrong.world.sent("S3 localhost:4566").filter((request) => request.url.indexOf("n3%2F") >= 0).length, 0);
+});
+
+test("a listing of a node document that goes on beyond its page holds the read back, and one the store fails to answer leaves the round pending without a count", async () => {
+  // More than a page of versions under the key of the document, none of them one the program
+  // can take for a version of the document: the store does not show that it holds none.
+  const long = S.fixture(source);
+  await S.start(long);
+  const ghost = new bridge.Node(long.world, { release: "v2.4.0", measurement: long.measurement, document: false });
+  ghost.record("c", [{ t: "grant_revoked", time_ms: long.world.now }]);
+  long.world.fault(isDocumentListing, {
+    status: 200,
+    body: "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListVersionsResult><IsTruncated>true</IsTruncated>" +
+      "<NextKeyMarker>n3%2F" + ghost.id + "</NextKeyMarker><NextVersionIdMarker>v1</NextVersionIdMarker></ListVersionsResult>",
+  });
+  await nextDay(long);
+  assert.equal(long.world.state.log.store, "blocked");
+  assert.equal(long.world.state.log.store_failure, "documents:missing");
+  // A listing that does not say whether it ends is no listing that ends.
+  const vague = S.fixture(source);
+  await S.start(vague);
+  const other = new bridge.Node(vague.world, { release: "v2.4.0", measurement: vague.measurement, document: false });
+  other.record("c", [{ t: "grant_revoked", time_ms: vague.world.now }]);
+  vague.world.fault(isDocumentListing, { status: 200, body: "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListVersionsResult></ListVersionsResult>" });
+  await nextDay(vague);
+  assert.equal(vague.world.state.log.store_failure, "documents:missing");
+  // The store fails: the round is pending, nothing is counted as held back, and the next round
+  // asks again.
+  const failing = S.fixture(source);
+  await S.start(failing);
+  const third = new bridge.Node(failing.world, { release: "v2.4.0", measurement: failing.measurement, document: false });
+  third.record("c", [{ t: "grant_revoked", time_ms: failing.world.now }]);
+  const fault = failing.world.fault(isDocumentListing, { status: 503, body: "" });
+  for (let day = 0; day < 5; day += 1) await nextDay(failing);
+  assert.equal(failing.world.state.log.status, "pending");
+  assert.equal(failing.world.state.log.store, "unreachable");
+  assert.equal(failing.world.state.log.store_failure, "document:503");
+  assert.deepEqual(failing.world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  fault.times = 0;
+  await nextDay(failing);
+  assert.equal(failing.world.state.log.status, "verified");
+  assert.equal(failing.world.reports.slice(-1)[0].undocumented_nodes, 1);
+});
+
+test("a key whose read was held back is asked for before the new keys of a round: more node ids without a document than a round asks for do not take its request", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  const hidden = world.addNode({ release: "v2.4.0", measurement: fx.measurement, offered: false });
+  world.advance(HOUR_MS);
+  const used = hidden.record("u", [S.providerRequest(world.now)]);
+  withhold(fx, [hidden.id], "missing");
+  await S.call(fx, "read_log", { limit: 50 });
+  assert.deepEqual(world.stored("log.withheld"), { keys: [used.key], pages: [] });
+  assert.equal(world.stored("log.blocked").count, 1);
+  // 130 objects under 130 node ids no node has, all later than the entry: one round asks for the
+  // documents of 128 nodes.
+  for (let i = 0; i < 130; i += 1) {
+    world.advance(1000);
+    new bridge.Node(world, { release: "v2.4.0", measurement: fx.measurement, document: false })
+      .record("c", [{ t: "grant_revoked", time_ms: world.now }]);
+  }
   await nextDay(fx);
+  const asked = world.sent("POST /api/secure/log/documents").slice(-2).map((request) => JSON.parse(request.body).nodes);
+  assert.equal(asked[0][0], hidden.id);
+  assert.equal(asked[0].length + asked[1].length, 128);
+  assert.equal(world.state.log.store, "blocked");
+  assert.equal(world.state.log.store_failure, "documents:missing");
+  assert.equal(world.stored("log.blocked").count, 2);
+  assert.equal(world.reports.slice(-1)[0].undocumented_nodes, 128);
+});
+
+test("a later page of the screen that finds a read held back hands the key to the rounds, which count it", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  const hidden = world.addNode({ release: "v2.4.0", measurement: fx.measurement, offered: false });
+  world.advance(HOUR_MS);
+  const old = hidden.record("u", [S.providerRequest(world.now)]);
+  // Eight days later (the entry is outside the days the summary counts): entries of the node of
+  // the device, enough to fill the first page of the screen.
+  world.advance(8 * DAY_MS);
+  for (let i = 0; i < 3; i += 1) {
+    world.advance(60000);
+    fx.nodes[0].record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/messages/" + i, "POST")]);
+  }
+  withhold(fx, [hidden.id], "missing");
+  const first = await S.call(fx, "read_log", { limit: 3 });
+  assert.equal(first.value.has_more, true);
   assert.equal(world.state.log.store, "verified");
-  assert.deepEqual(world.securityStatuses.slice(-1)[0].reasons, ["conflicting_signatures"]);
+  assert.equal(world.stored("log.withheld"), undefined);
+  const before = world.runtime.log_pages[0].before_ms;
+  const page = await S.call(fx, "read_log_page", { before_ms: before });
+  assert.equal(page.ok, true);
+  assert.ok(shownGroups(page.value).some((group) => group.kind === "unverified"));
+  assert.deepEqual(world.stored("log.withheld"), { keys: [old.key], pages: [] });
+  // The next synchronization runs a round for that key, though the last round completed.
+  world.advance(2 * 60000);
+  await S.event(fx, "foreground");
+  assert.equal(world.state.log.store, "blocked");
+  assert.equal(world.state.log.store_failure, "documents:missing");
+  assert.equal(world.stored("log.blocked").count, 1);
+});
+
+test("A3: a listing only the screen reads that is held back is read again by every round: the listing of the use entries, and the listings of a later page", async () => {
+  // The backend gives the address of another prefix for the listing of the use entries, and the
+  // right one for the listing of the control entries.
+  const fx = S.fixture(source, { device: { securityStatus: true } });
+  await S.start(fx);
+  const world = fx.world;
+  world.advance(HOUR_MS);
+  fx.nodes[0].record("u", [S.providerRequest(world.now)]);
+  const elsewhere = world.fault("POST /api/secure/log/read", (request) => ({
+    status: 200, body: {
+      pages: JSON.parse(request.body).pages.map((page) => ({
+        prefix: page.prefix,
+        url: page.prefix === "c" ? world.readUrl(page)
+          : world.readUrl(page).replace(encodeURIComponent("a3/" + world.userId + "/u/"), encodeURIComponent("a3/" + world.userId + "/x/")),
+      })),
+    },
+  }));
+  // A round of a synchronization reads the control listing alone: nothing is held back.
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "verified");
+  // The screen reads both listings: its read is held back, and the screen shows no entry of
+  // format 3 (it kept none).
+  const shown = await S.call(fx, "read_log", { limit: 50 });
+  assert.equal(shown.value.status, "pending");
+  assert.deepEqual(shownGroups(shown.value), []);
+  assert.equal(world.state.log.store, "blocked");
+  assert.equal(world.state.log.store_failure, "read:url");
+  assert.deepEqual(world.stored("log.withheld"), { keys: [], pages: [0] });
+  // Every round after it asks for the two listings as the screen does.
+  const states = [];
+  for (let day = 0; day < 3; day += 1) {
+    await nextDay(fx);
+    states.push(world.state.log.status + ":" + world.state.log.store + ":" + world.reports.slice(-1)[0].blocked_attempts);
+    const asked = JSON.parse(world.sent("POST /api/secure/log/read").slice(-1)[0].body).pages;
+    assert.deepEqual(asked.map((page) => page.prefix + ":" + page.key_marker), ["c:", "u:"]);
+  }
+  assert.deepEqual(states, ["pending:blocked:2", "pending:blocked:3", "attention:blocked:4"]);
+  assert.deepEqual(world.securityStatuses.slice(-1)[0].reasons, ["verification_blocked"]);
+  elsewhere.times = 0;
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(world.stored("log.withheld"), undefined);
+  assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
+
+  // An environment without a store of format 3, on a device that knows of none: a read of the
+  // screen that failed once is made again, and the statement that there is no such store ends it.
+  const closed = S.fixture(source, { nodes: 0, legacy: 1 });
+  closed.world.routes.log = "disabled";
+  await S.start(closed);
+  closed.world.fault("POST /api/secure/log/read", { status: 503, body: { detail: "log_store_unreachable" } }, 1);
+  await S.call(closed, "read_log", { limit: 50 });
+  assert.deepEqual(closed.world.stored("log.withheld"), { keys: [], pages: [0] });
+  for (let day = 0; day < 4; day += 1) {
+    await nextDay(closed);
+    assert.equal(closed.world.state.log.status, "verified", "day " + day);
+  }
+  assert.equal(closed.world.stored("log.withheld"), undefined);
+  assert.deepEqual(closed.world.stored("log.blocked"), { first_ms: 0, count: 0 });
+
+  // A later page: the backend answers the request for the listings below a time with an error,
+  // and then with the statement that it has no store of format 3.
+  for (const answer of [{ status: 503, body: { detail: "log_store_unreachable" } }, { status: 409, body: { detail: "log_store_disabled" } }]) {
+    const later = S.fixture(source);
+    await S.start(later);
+    for (let i = 0; i < 4; i += 1) {
+      later.world.advance(60000);
+      later.nodes[0].record("u", [S.providerRequest(later.world.now, "/gmail/v1/users/me/messages/" + i, "POST")]);
+    }
+    const first = await S.call(later, "read_log", { limit: 2 });
+    assert.equal(first.value.has_more, true);
+    const before = later.world.runtime.log_pages[0].before_ms;
+    later.world.fault("POST /api/secure/log/read", (request) =>
+      (JSON.parse(request.body).pages.some((page) => page.key_marker !== "") ? answer : undefined));
+    const page = await S.call(later, "read_log_page", { before_ms: before });
+    assert.deepEqual(page, { ok: false, code: "log_store_unreachable" });
+    assert.deepEqual(later.world.stored("log.withheld"), { keys: [], pages: [before] });
+    later.world.advance(2 * 60000);
+    await S.event(later, "foreground");
+    assert.equal(later.world.state.log.store, "blocked", JSON.stringify(answer));
+    assert.equal(later.world.stored("log.blocked").count, 1);
+    later.world.clearFaults();
+    later.world.advance(2 * 60000);
+    await S.event(later, "foreground");
+    assert.equal(later.world.state.log.status, "verified");
+    assert.equal(later.world.stored("log.withheld"), undefined);
+  }
 });
 
 test("an address of the store that gives a query key twice, or carries a fragment, is not called: the listing of format 3 and the listing of a chain of format 2", async () => {
@@ -1076,6 +1681,107 @@ test("the bridge is asked for the device as often for a listing of many keys as 
   const many = await calls(300);
   assert.equal(many, few);
   assert.ok(few < 40, String(few));
+});
+
+// ---- A transfer of the delegation a node of an earlier release made ----
+
+// 2026-11-23T00:00:00Z (LEGACY_TRANSFER_DOCUMENTS_FROM_MS).
+const TRANSFER_DOCUMENTS_FROM_MS = Date.UTC(2026, 10, 23);
+
+test("a transfer a node of an earlier release made to a node the backend hands out no document for: before 2026-11-23 the receiving node is followed as a node of that release, from then on the read is held back until a document verifies", async () => {
+  const fx = S.fixture(source, { nodes: 0, legacy: 1, device: { securityStatus: true } });
+  const world = fx.world;
+  world.now = TRANSFER_DOCUMENTS_FROM_MS - 3 * DAY_MS;
+  await S.start(fx);
+  const giver = fx.legacy[0];
+  const earlier = world.addNode({ release: fx.latest.release, measurement: fx.latest, offered: false });
+  const last = world.addNode({ release: fx.latest.release, measurement: fx.latest, offered: false });
+  const first = world.addNode({ release: fx.latest.release, measurement: fx.latest, offered: false });
+  // A transfer three days before that time, and one in the last millisecond before it.
+  giver.record("c", [{ t: "grant_transferred_out", time_ms: world.now, to: earlier.id }]);
+  world.now = TRANSFER_DOCUMENTS_FROM_MS - 1;
+  giver.record("c", [{ t: "grant_transferred_out", time_ms: world.now, to: last.id }]);
+  await S.event(fx, "foreground");
+  assert.equal(world.state.log.status, "verified");
+  assert.deepEqual(Object.keys(world.stored("log.legacy").nodes).sort(), [giver.id, earlier.id, last.id].sort());
+  assert.deepEqual(world.stored("log.legacy").waiting, {});
+  // The first millisecond of that time: the backend keeps the document of every node that takes
+  // a transfer from then on, and hands none out for this one.
+  world.now = TRANSFER_DOCUMENTS_FROM_MS;
+  giver.record("c", [{ t: "grant_transferred_out", time_ms: world.now, to: first.id }]);
+  const states = [];
+  for (let day = 0; day < 4; day += 1) {
+    await nextDay(fx);
+    states.push(world.state.log.status + ":" + world.state.log.store + ":" + world.reports.slice(-1)[0].blocked_attempts);
+  }
+  assert.deepEqual(states, ["pending:blocked:1", "pending:blocked:2", "pending:blocked:3", "attention:blocked:4"]);
+  assert.equal(world.state.log.store_failure, "receiver:missing");
+  assert.deepEqual(world.securityStatuses.slice(-1)[0].reasons, ["verification_blocked"]);
+  // The node waits and its chain is not followed. The store is not asked whether it holds a node
+  // document of it: a node of such a release wrote none.
+  assert.deepEqual(Object.keys(world.stored("log.legacy").waiting), [first.id]);
+  assert.equal(world.stored("log.legacy").nodes[first.id], undefined);
+  assert.equal(documentListings(world).length, 0);
+  // A document that answered a request of the backend, handed out as the object of the store: its
+  // nonce is not the one of a node document.
+  world.keptDocuments.set(first.id, registryDocument(first));
+  const fault = documentsAnswer(fx, (answer) => {
+    for (const item of answer.documents) item.origin = "log_store";
+  });
+  await nextDay(fx);
+  assert.equal(world.state.log.store_failure, "receiver:rejected");
+  // The same document, handed out as what the node registry kept: the node is one of a release
+  // the program accepts, and its chain is followed.
+  fault.times = 0;
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(world.state.log.store, "verified");
+  assert.deepEqual(world.stored("log.legacy").waiting, {});
+  assert.equal(world.stored("log.legacy").nodes[first.id].closed, false);
+  assert.equal(world.stored("log.nodes")[first.id].r, fx.latest.release);
+});
+
+test("a transfer a node of an earlier release made on or after 2026-11-23 to a node whose document states a measurement no list has marks the log (A1), and one in an environment without the routes of format 3 is followed", async () => {
+  // The backend hands out the document it kept: the receiving node is of a measurement no list
+  // of the program has.
+  const moved = S.fixture(source, { nodes: 0, legacy: 1 });
+  moved.world.now = TRANSFER_DOCUMENTS_FROM_MS + DAY_MS;
+  await S.start(moved);
+  const rogue = moved.world.addNode({ release: "v2.3.9", measurement: bridge.randomMeasurement(), format: 2, offered: false });
+  moved.world.keptDocuments.set(rogue.id, registryDocument(rogue));
+  moved.legacy[0].record("c", [{ t: "grant_transferred_out", time_ms: moved.world.now, to: rogue.id }]);
+  await nextDay(moved);
+  assert.equal(moved.world.state.log.status, "pending");
+  assert.equal(moved.world.state.log.newer_release_nodes, 1);
+  await nextDay(moved);
+  assert.equal(moved.world.state.log.status, "attention");
+  assert.equal(moved.world.state.log.unknown_nodes, 1);
+  // A backend that states it has no store of format 3, on a device that knows of none: no route
+  // hands a document out, and no receiving node is judged.
+  const closed = S.fixture(source, { nodes: 0, legacy: 1 });
+  closed.world.now = TRANSFER_DOCUMENTS_FROM_MS + DAY_MS;
+  closed.world.routes.log = "disabled";
+  await S.start(closed);
+  const receiver = closed.world.addNode({ release: closed.latest.release, measurement: closed.latest, offered: false });
+  closed.legacy[0].record("c", [{ t: "grant_transferred_out", time_ms: closed.world.now, to: receiver.id }]);
+  for (let day = 0; day < 4; day += 1) {
+    await nextDay(closed);
+    assert.equal(closed.world.state.log.status, "verified", "day " + day);
+  }
+  assert.deepEqual(Object.keys(closed.world.stored("log.legacy").nodes).sort(), [closed.legacy[0].id, receiver.id].sort());
+  assert.deepEqual(closed.world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  // A device that reads such a transfer when its event is older than the retention of the store:
+  // the backend keeps the document of a node no longer than that, so nothing is held back.
+  const aged = S.fixture(source, { nodes: 0, legacy: 1 });
+  aged.world.now = TRANSFER_DOCUMENTS_FROM_MS;
+  await S.start(aged);
+  const gone = aged.world.addNode({ release: aged.latest.release, measurement: aged.latest, offered: false });
+  aged.legacy[0].record("c", [{ t: "grant_transferred_out", time_ms: aged.world.now, to: gone.id }]);
+  aged.world.advance(366 * DAY_MS);
+  await S.event(aged, "foreground");
+  assert.equal(aged.world.state.log.status, "verified");
+  assert.deepEqual(aged.world.stored("log.legacy").waiting, {});
+  assert.notEqual(aged.world.stored("log.legacy").nodes[gone.id], undefined);
 });
 
 test("what does not mark the log: an empty seq, a node that ended without a shutdown, an entry of another key", async () => {
@@ -1677,6 +2383,64 @@ test("A3: an answer of the bodies that ends early is asked on, and an answer tha
   await nextDay(fx);
   assert.equal(world.state.log.status, "verified");
   assert.equal(world.stored("log.blocked").count, 0);
+});
+
+test("an answer of the bodies that reports keys as unread is read as an answer that does not name them: unread keys at its end are asked for again, and an unread key in front of a key it names is a read held back", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  const written = [];
+  for (const id of ["r1", "r2", "r3"]) {
+    world.advance(1000);
+    written.push(fx.nodes[0].record("c", [{ t: "connection_created", time_ms: world.now, record_id: id, provider: "slack", scope: "" }]));
+  }
+  // The backend answers the keys of a request in their order: everything from the first key it
+  // does not answer on is unread.
+  const answerUntil = (count) => {
+    world.clearFaults();
+    world.fault("POST /api/secure/log/bodies", (request) => {
+      const answer = JSON.parse(world.api("POST", "/api/secure/log/bodies", null, request.body).body);
+      const keys = JSON.parse(request.body).keys;
+      return {
+        status: 200, body: {
+          entries: answer.entries.filter((item) => keys.indexOf(item.key) < count), missing: [],
+          unread: keys.slice(count),
+        },
+      };
+    });
+  };
+  const asked = () => JSON.parse(world.sent("POST /api/secure/log/bodies").slice(-1)[0].body).keys;
+  answerUntil(1);
+  await nextDay(fx);
+  assert.deepEqual(asked(), written.map((entry) => entry.key));
+  assert.equal(world.state.log.status, "pending");
+  assert.equal(world.state.log.store, "verified");
+  assert.equal(world.stored("log.blocked").count, 0);
+  assert.equal(world.stored("log.withheld"), undefined);
+  // Every key of the next request is unread: its first key is held back.
+  answerUntil(0);
+  await nextDay(fx);
+  assert.deepEqual(asked(), [written[1].key, written[2].key]);
+  assert.equal(world.state.log.store, "blocked");
+  assert.equal(world.state.log.store_failure, "bodies:skipped");
+  assert.deepEqual(world.stored("log.withheld"), { keys: [written[1].key], pages: [] });
+  // An unread key in front of a key the answer names.
+  world.clearFaults();
+  world.fault("POST /api/secure/log/bodies", (request) => {
+    const answer = JSON.parse(world.api("POST", "/api/secure/log/bodies", null, request.body).body);
+    return {
+      status: 200, body: {
+        entries: answer.entries.filter((item) => item.key === written[2].key), missing: [], unread: [written[1].key],
+      },
+    };
+  });
+  await nextDay(fx);
+  assert.equal(world.state.log.store_failure, "bodies:skipped");
+  assert.equal(world.stored("log.blocked").count, 2);
+  world.clearFaults();
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(world.stored("log.withheld"), undefined);
 });
 
 // ---- An entry of the screen whose object was not read ----
