@@ -1,0 +1,68 @@
+# The attestation that the secure program of a release is a file of a commit of this repository
+# (docs/protocol.md, "The secure program release"). A workflow that the push of a
+# secure-program-v* tag starts calls this workflow at one fixed commit.
+#
+# The job takes nothing from its caller: no input and no secret. It reads the bytes of
+# secure-program/secure-program.js as the commit that started the run holds them (the blob of
+# that commit, not a file of a working tree) and attests their SHA-256. It runs no script and no
+# action of that commit, so the commit decides nothing of the attestation but those bytes.
+#
+# The certificate of the attestation states this file at the fixed commit as what signed (the
+# Build Signer URI and the Build Signer Digest), and the repository, the tag and the commit of
+# the tag as what the run was based on (the Source Repository URI, Ref and Digest). A change of
+# this file is another commit, which a verifier that fixed the commit of this file does not
+# accept.
+name: secure-program-source
+on:
+  workflow_call:
+    outputs:
+      sha256:
+        description: The SHA-256 the job attested, in lower-case hexadecimal.
+        value: ${{ jobs.attest.outputs.sha256 }}
+      bundle:
+        description: The Sigstore bundle of the attestation as one line of JSON, or the empty string when the job could not read it.
+        value: ${{ jobs.attest.outputs.bundle }}
+permissions: {}
+jobs:
+  attest:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      sha256: ${{ steps.file.outputs.sha256 }}
+      bundle: ${{ steps.bundle.outputs.bundle }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: The SHA-256 of the program file as the commit that started the run holds it
+        id: file
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          mode="$(git ls-tree "$GITHUB_SHA" -- secure-program/secure-program.js | cut -d' ' -f1)"
+          [[ "$mode" =~ ^100(644|755)$ ]]
+          digest="$(git cat-file blob "$GITHUB_SHA:secure-program/secure-program.js" | sha256sum | cut -d' ' -f1)"
+          [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          printf 'sha256=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+      - name: Attest that SHA-256
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: secure-program.js
+          subject-digest: sha256:${{ steps.file.outputs.sha256 }}
+      # The bundle is handed to the caller as an output. The attestation is made by then: a
+      # failure of this step does not fail the job.
+      - name: The bundle of the attestation
+        id: bundle
+        continue-on-error: true
+        shell: bash
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          bundle="$(jq --compact-output . "$BUNDLE_PATH")"
+          test "$(printf '%s\n' "$bundle" | wc -l)" -eq 1
+          printf 'bundle=%s\n' "$bundle" >> "$GITHUB_OUTPUT"
