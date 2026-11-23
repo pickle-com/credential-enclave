@@ -71,9 +71,9 @@ fn verified_peer(node: &Node, body: &JsonBody, accepted: Accepted<'_>) -> Result
 
 /// Checks 1 to 6 of the giving node (protocol.md 10.3): the release and the measurement that
 /// the statement of an endorsement states, when the release key of this program signed that
-/// statement, the transparency log of this program recorded the signature, and the release is
-/// later than the release of this node. Every failure is `peer_unverified`, also an
-/// endorsement that lacks a value or holds one of another type.
+/// statement, a transparency log of the table of this program holds the record of the
+/// signature, and the release is later than the release of this node. Every failure is
+/// `peer_unverified`, also an endorsement that lacks a value or holds one of another type.
 fn endorsed_release(
     node: &Node,
     endorsement: &serde_json::Value,
@@ -86,14 +86,7 @@ fn read_endorsed_release(
     endorsement: &serde_json::Value,
 ) -> Option<ReleaseMeasurement> {
     let statement = b64u_decode(endorsement.get("statement")?.as_str()?).ok()?;
-    let entry = endorsement.get("entry")?;
-    let entry = LogEntry {
-        body: entry.get("body")?.as_str()?,
-        integrated_time: entry.get("integrated_time")?.as_u64()?,
-        log_index: entry.get("log_index")?.as_u64()?,
-        log_id: entry.get("log_id")?.as_str()?,
-        signed_entry_timestamp: entry.get("signed_entry_timestamp")?.as_str()?,
-    };
+    let entry = LogEntry::read(endorsement.get("entry")?)?;
     verify_endorsement(
         &statement,
         &entry,

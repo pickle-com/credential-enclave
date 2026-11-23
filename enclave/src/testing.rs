@@ -43,7 +43,7 @@ use crate::clock::Clock;
 use crate::egress::Egress;
 use crate::faults::{self, Lock};
 use crate::frame;
-use crate::lineage::{Lineage, LOG_KEY_PEM, RELEASE_KEY_PEM};
+use crate::lineage::{Lineage, LOGS, RELEASE_KEY_PEM};
 use crate::platform::local::{kernel_random, local_document, system_time_ms};
 use crate::platform::{ConnectError, Listener, Measurement, Platform, PlatformError, Stream};
 use crate::providers::Definitions;
@@ -1118,7 +1118,7 @@ impl Harness {
                 RELEASE,
                 // The keys of the source. The release of the tests is not a release tag, so
                 // the node has no predecessor.
-                Lineage::read(RELEASE_KEY_PEM, LOG_KEY_PEM, b"[]", RELEASE).unwrap(),
+                Lineage::read(RELEASE_KEY_PEM, &LOGS, b"[]", RELEASE).unwrap(),
                 limits,
             )
             .unwrap(),
@@ -1150,7 +1150,7 @@ impl Harness {
                 Definitions::embedded(),
                 egress,
                 RELEASE,
-                Lineage::read(RELEASE_KEY_PEM, LOG_KEY_PEM, b"[]", RELEASE).unwrap(),
+                Lineage::read(RELEASE_KEY_PEM, &LOGS, b"[]", RELEASE).unwrap(),
                 limits,
             )
             .unwrap(),

@@ -1142,7 +1142,7 @@ pub struct Node {
     pub custody: Custody,
     /// The release tag compiled into the binary.
     pub release: &'static str,
-    /// The release key, the key of the transparency log and the predecessors of this
+    /// The release key, the table of transparency logs and the predecessors of this
     /// release (`crate::lineage`).
     pub lineage: Lineage,
     pub started_ms: u64,

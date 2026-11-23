@@ -27,6 +27,9 @@ use credential_enclave_protocol::envelope::{
 use credential_enclave_protocol::keys::{self, Custody, LogStoreId, NodeKeys};
 use credential_enclave_protocol::log::{self, EntryKey, EntryKind, EntryParts, Head, Last};
 use credential_enclave_protocol::record::{record_aad, seal_record, Kind};
+use credential_enclave_protocol::release::{
+    public_key_der, verify_endorsement, LogEntry, ReleaseKeys, TransparencyLog,
+};
 use credential_enclave_protocol::released::{released_aad, seal_released, Receiver, SealTo};
 use credential_enclave_protocol::secret::Secret;
 use credential_enclave_protocol::secret_use::{
@@ -2160,6 +2163,523 @@ fn sealed_release() -> Value {
     })
 }
 
+/// The release key of the vectors `endorsement` (ECDSA P-256). Its private half was not kept:
+/// the two ECDSA signatures of these vectors are constants, as a signature of that kind is not
+/// the same on a second run.
+const ENDORSEMENT_RELEASE_KEY_PEM: &str = "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEHLJ7rLfPcT5UUX+2jEUe8uLvwK80\nKjIDdgG5RuGaWh9zsj9bG3PTEmkGHwZbmffvD3xjk5hOjR0Dh1rKrfbuBw==\n-----END PUBLIC KEY-----\n";
+/// The release statement of the vectors `endorsement`: the form of a `measurements.json`.
+const ENDORSEMENT_STATEMENT: &str = concat!(
+    "{\n",
+    "  \"release\": \"v2.5.0\",\n",
+    "  \"git_commit\": \"0000000000000000000000000000000000000000\",\n",
+    "  \"pcr0\": \"1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a\",\n",
+    "  \"pcr1\": \"2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b\",\n",
+    "  \"pcr2\": \"3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c\",\n",
+    "  \"inputs\": {}\n",
+    "}\n"
+);
+/// The signature of that release key over the statement (ASN.1 DER, standard base64).
+const ENDORSEMENT_RELEASE_SIGNATURE: &str =
+    "MEUCIQDKfVJPxqfrvhKDusO5VyAe0fHnAd07xjCly6MlUXAjCQIgX0snRb5iZiP1dM6lFZPPUswEH8G7f+VdkiPdDSM4cOc=";
+/// The key of the log of the form Rekor v1 of the vectors `endorsement` (ECDSA P-256). Its
+/// private half was not kept.
+const ENDORSEMENT_REKOR_V1_KEY_PEM: &str = "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEH4Dw5oQhyPve/8OCS9n1B8Id2fn+\n7xAdEJ1ZyWcpthId6surOpFqwC9E4LPDVwJRKwwi17A2bdVKM1D5DosGDw==\n-----END PUBLIC KEY-----\n";
+/// The body of the entry of that log that records the signature of the release key over the
+/// statement: a `hashedrekord` of version 0.0.1, in standard base64.
+const ENDORSEMENT_REKOR_V1_BODY: &str = "eyJhcGlWZXJzaW9uIjoiMC4wLjEiLCJraW5kIjoiaGFzaGVkcmVrb3JkIiwic3BlYyI6eyJkYXRhIjp7Imhhc2giOnsiYWxnb3JpdGhtIjoic2hhMjU2IiwidmFsdWUiOiJhYTgwOGYzMGVkYmI1ZWFlMGRhMjdhOWY5Nzc1NDZkZGZlYTY3OTQ4YjAxNTMyMmI5OWZkZTNiOTRhYTU3ZDQ1In19LCJzaWduYXR1cmUiOnsiY29udGVudCI6Ik1FVUNJUURLZlZKUHhxZnJ2aEtEdXNPNVZ5QWUwZkhuQWQwN3hqQ2x5Nk1sVVhBakNRSWdYMHNuUmI1aVppUDFkTTZsRlpQUFVzd0VIOEc3ZitWZGtpUGREU000Y09jPSIsInB1YmxpY0tleSI6eyJjb250ZW50IjoiTFMwdExTMUNSVWRKVGlCUVZVSk1TVU1nUzBWWkxTMHRMUzBLVFVacmQwVjNXVWhMYjFwSmVtb3dRMEZSV1VsTGIxcEplbW93UkVGUlkwUlJaMEZGU0V4S04zSk1abEJqVkRWVlZWZ3JNbXBGVldVNGRVeDJkMHM0TUFwTGFrbEVaR2RITlZKMVIyRlhhRGw2YzJvNVlrY3pVRlJGYld0SFNIZGFZbTFtWm5aRU0zaHFhelZvVDJwU01FUm9NWEpMY21aaWRVSjNQVDBLTFMwdExTMUZUa1FnVUZWQ1RFbERJRXRGV1MwdExTMHRDZz09In19fX0=";
+/// The time at which that log took the entry, and the index of the entry.
+const ENDORSEMENT_REKOR_V1_TIME: u64 = 1_795_000_000;
+const ENDORSEMENT_REKOR_V1_INDEX: u64 = 4_100_000_000;
+/// The signed entry timestamp of that entry (ASN.1 DER, standard base64).
+const ENDORSEMENT_REKOR_V1_TIMESTAMP: &str =
+    "MEUCIC+VoS5OzM5y3kWY9pBVAbsfEN5Vaf56e0IIAoFWbGoaAiEA4jU7mq9VXwR6q0f/tbbA5acK8dyhdpg8hdruP4Gz0Fo=";
+/// The origin of the log of the form Rekor v2 of the vectors `endorsement`.
+const ENDORSEMENT_ORIGIN: &str = "log.vectors.example/2026h2";
+/// The release of the giving node of the vectors `endorsement`, and its clock in seconds.
+const ENDORSEMENT_OWN_RELEASE: &str = "v2.4.0";
+const ENDORSEMENT_NOW_S: u64 = 1_795_400_000;
+
+/// The hash of an inner node of a Merkle tree (RFC 6962 section 2.1).
+fn merkle_node(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update([0x01]);
+    hasher.update(left);
+    hasher.update(right);
+    hasher.finalize().into()
+}
+
+/// The Merkle tree hash of leaf hashes (RFC 6962 section 2.1), by its recursive definition.
+fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
+    match leaves {
+        [leaf] => *leaf,
+        _ => {
+            let split = leaves.len().next_power_of_two() / 2;
+            merkle_node(
+                &merkle_root(&leaves[..split]),
+                &merkle_root(&leaves[split..]),
+            )
+        }
+    }
+}
+
+/// The audit path of the leaf `index` (RFC 6962 section 2.1.1), by its recursive definition.
+fn merkle_path(index: usize, leaves: &[[u8; 32]]) -> Vec<[u8; 32]> {
+    if leaves.len() == 1 {
+        return Vec::new();
+    }
+    let split = leaves.len().next_power_of_two() / 2;
+    let (mut path, sibling) = if index < split {
+        (
+            merkle_path(index, &leaves[..split]),
+            merkle_root(&leaves[split..]),
+        )
+    } else {
+        (
+            merkle_path(index - split, &leaves[split..]),
+            merkle_root(&leaves[..split]),
+        )
+    };
+    path.push(sibling);
+    path
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The body of a `hashedrekord` entry of version 0.0.2 with a public key, as a log of the form
+/// Rekor v2 writes it: the JSON of its values with the keys in the order of their bytes and
+/// without white space.
+fn tiled_record(digest: &[u8], signature: &str, key_der: &[u8]) -> String {
+    format!(
+        concat!(
+            r#"{{"apiVersion":"0.0.2","kind":"hashedrekord","spec":{{"hashedRekordV002":{{"#,
+            r#""data":{{"algorithm":"SHA2_256","digest":"{}"}},"#,
+            r#""signature":{{"content":"{}","verifier":{{"#,
+            r#""keyDetails":"PKIX_ECDSA_P256_SHA_256","publicKey":{{"rawBytes":"{}"}}}}}}}}}}}}"#
+        ),
+        STANDARD.encode(digest),
+        signature,
+        STANDARD.encode(key_der),
+    )
+}
+
+/// The log of the form Rekor v2 of the vectors `endorsement`: its key, and the tree it holds.
+struct TiledLog {
+    key: SigningKey,
+    id: [u8; 32],
+}
+
+impl TiledLog {
+    fn new() -> TiledLog {
+        let key = SigningKey::from_bytes(&fixed("endorsement tiled log key"));
+        let mut hasher = Sha256::new();
+        hasher.update(ENDORSEMENT_ORIGIN.as_bytes());
+        hasher.update([0x0a, 0x01]);
+        hasher.update(key.verifying_key().as_bytes());
+        TiledLog {
+            key,
+            id: hasher.finalize().into(),
+        }
+    }
+
+    /// The DER of the SubjectPublicKeyInfo of the key.
+    fn key_der(&self) -> Vec<u8> {
+        let mut der = vec![
+            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+        ];
+        der.extend_from_slice(self.key.verifying_key().as_bytes());
+        der
+    }
+
+    fn key_pem(&self) -> String {
+        format!(
+            "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
+            STANDARD.encode(self.key_der())
+        )
+    }
+
+    /// The note of the tree head of `leaves`, with `extension` after its three lines.
+    fn note(&self, leaves: &[[u8; 32]], extension: &str) -> String {
+        format!(
+            "{ENDORSEMENT_ORIGIN}\n{}\n{}\n{extension}",
+            leaves.len(),
+            STANDARD.encode(merkle_root(leaves))
+        )
+    }
+
+    /// The signature line of the log on `note`.
+    fn line(&self, note: &str) -> String {
+        use ed25519_dalek::Signer;
+        let mut signature = self.id[..4].to_vec();
+        signature.extend_from_slice(&self.key.sign(note.as_bytes()).to_bytes());
+        format!(
+            "\u{2014} {ENDORSEMENT_ORIGIN} {}\n",
+            STANDARD.encode(signature)
+        )
+    }
+
+    fn checkpoint(&self, leaves: &[[u8; 32]]) -> String {
+        let note = self.note(leaves, "");
+        format!("{note}\n{}", self.line(&note))
+    }
+
+    /// The entry of the body `body` as the leaf `index` of a tree of `size` leaves, in the
+    /// form of the `entry` of an endorsement, and the leaves of that tree.
+    fn entry(&self, body: &str, index: usize, size: usize) -> (Value, Vec<[u8; 32]>) {
+        let mut leaves: Vec<[u8; 32]> = (0..size)
+            .map(|leaf| fixed(&format!("endorsement leaf {leaf}")))
+            .collect();
+        let mut hasher = Sha256::new();
+        hasher.update([0x00]);
+        hasher.update(body.as_bytes());
+        leaves[index] = hasher.finalize().into();
+        let hashes: Vec<String> = merkle_path(index, &leaves)
+            .iter()
+            .map(|hash| lower_hex(hash))
+            .collect();
+        let entry = json!({
+            "log_id": lower_hex(&self.id),
+            "body": STANDARD.encode(body),
+            "inclusion_proof": {
+                "log_index": index,
+                "hashes": hashes,
+                "checkpoint": self.checkpoint(&leaves),
+            },
+        });
+        (entry, leaves)
+    }
+}
+
+/// The vectors `endorsement` (protocol.md 10.3): the endorsements of a later release as a call
+/// of `peer/export` carries them, for a giving node whose table of logs holds a log of each
+/// form, each with the verdict of the giving node and, when it refuses, the number of the
+/// check that fails. The verdicts are written here by hand, and the generator stops when the
+/// library gives another one.
+fn endorsement() -> Value {
+    let release_key = public_key_der(ENDORSEMENT_RELEASE_KEY_PEM).expect("the release key");
+    let rekor_v1_key = public_key_der(ENDORSEMENT_REKOR_V1_KEY_PEM).expect("the log key");
+    let rekor_v1 = TransparencyLog::rekor_v1(&rekor_v1_key).expect("a log of the form Rekor v1");
+    let tiled = TiledLog::new();
+    let rekor_v2 = TransparencyLog::rekor_v2(ENDORSEMENT_ORIGIN, &tiled.key_der())
+        .expect("a log of the form Rekor v2");
+    assert_eq!(rekor_v2.id(), lower_hex(&tiled.id));
+    let logs = [rekor_v1, rekor_v2];
+
+    let statement = ENDORSEMENT_STATEMENT.as_bytes();
+    let digest = Sha256::digest(statement);
+    let of = |entry: Value| json!({"statement": b64u(statement), "entry": entry});
+    let promised = json!({
+        "log_id": logs[0].id(),
+        "body": ENDORSEMENT_REKOR_V1_BODY,
+        "integrated_time": ENDORSEMENT_REKOR_V1_TIME,
+        "log_index": ENDORSEMENT_REKOR_V1_INDEX,
+        "signed_entry_timestamp": ENDORSEMENT_REKOR_V1_TIMESTAMP,
+    });
+    let record = tiled_record(&digest, ENDORSEMENT_RELEASE_SIGNATURE, &release_key);
+    let (proven, leaves) = tiled.entry(&record, 5, 11);
+    let with = |entry: &Value, change: &dyn Fn(&mut Value)| {
+        let mut entry = entry.clone();
+        change(&mut entry);
+        entry
+    };
+    // The entry of another body of the tiled log, with the proof of that body.
+    let proven_body = |body: &str| tiled.entry(body, 5, 11).0;
+
+    let note = tiled.note(&leaves, "");
+    let witness = format!(
+        "\u{2014} witness.vectors.example {}\n",
+        STANDARD.encode(fixed("endorsement witness signature"))
+    );
+    let extended = tiled.note(&leaves, "an extension line\n");
+    let another_origin = note.replacen(ENDORSEMENT_ORIGIN, "log.vectors.example/2027h1", 1);
+    let other_statement = ENDORSEMENT_STATEMENT.replacen("v2.5.0", "v2.6.0", 1);
+    let upper_case = ENDORSEMENT_STATEMENT.replacen("1a1a", "1A1A", 1);
+
+    // (name, endorsement, release of the node, clock of the node, the check that fails)
+    let cases: Vec<(&str, Value, &str, u64, Option<u8>)> = vec![
+        (
+            "an entry of the log of the form Rekor v1",
+            of(promised.clone()),
+            ENDORSEMENT_OWN_RELEASE,
+            ENDORSEMENT_NOW_S,
+            None,
+        ),
+        (
+            "an entry of the log of the form Rekor v2",
+            of(proven.clone()),
+            ENDORSEMENT_OWN_RELEASE,
+            ENDORSEMENT_NOW_S,
+            None,
+        ),
+        (
+            "an entry of the log of the form Rekor v2, read by a clock that shows 0",
+            of(proven.clone()),
+            ENDORSEMENT_OWN_RELEASE,
+            0,
+            None,
+        ),
+        (
+            "a checkpoint with the signature of a witness and an extension line the log signed",
+            of(with(&proven, &|entry| {
+                entry["inclusion_proof"]["checkpoint"] =
+                    json!(format!("{extended}\n{witness}{}", tiled.line(&extended)));
+            })),
+            ENDORSEMENT_OWN_RELEASE,
+            ENDORSEMENT_NOW_S,
+            None,
+        ),
+        (
+            "a statement with a PCR in upper case",
+            json!({"statement": b64u(upper_case.as_bytes()), "entry": proven}),
+            ENDORSEMENT_OWN_RELEASE,
+            ENDORSEMENT_NOW_S,
+            Some(1),
+        ),
+        (
+            "an entry of a log the node does not know",
+            of(with(&proven, &|entry| {
+                entry["log_id"] = json!(lower_hex(&fixed("endorsement unknown log")));
+            })),
+            ENDORSEMENT_OWN_RELEASE,
+            ENDORSEMENT_NOW_S,
+            Some(2),
+        ),
+        (
+            "Rekor v1: another time than the log signed",
+            of(with(&promised, &|entry| {
+                entry["integrated_time"] = json!(ENDORSEMENT_REKOR_V1_TIME + 1);
+            })),
+            ENDORSEMENT_OWN_RELEASE,
+            ENDORSEMENT_NOW_S,
+            Some(3),
+        ),
+        (
+            "Rekor v1: the entry under the identifier of the log of the form Rekor v2",
+            of(with(&promised, &|entry| {
+                entry["log_id"] = json!(logs[1].id());
+            })),
+            ENDORSEMENT_OWN_RELEASE,
+            ENDORSEMENT_NOW_S,
+            Some(3),
+        ),
+        (
+            "Rekor v2: the entry under the identifier of the log of the form Rekor v1",
+            of(with(&proven, &|entry| {
+                entry["log_id"] = json!(logs[0].id());
+            })),
+            ENDORSEMENT_OWN_RELEASE,
+            ENDORSEMENT_NOW_S,
+            Some(3),
+        ),
+        (
+            "Rekor v2: a checkpoint without the signature of the log",
+            of(with(&proven, &|entry| {
+                entry["inclusion_proof"]["checkpoint"] = json!(format!("{note}\n{witness}"));
+            })),
+            ENDORSEMENT_OWN_RELEASE,
+            ENDORSEMENT_NOW_S,
+            Some(3),
+        ),
+        (
+            "Rekor v2: the note of another origin, signed by the key of the log",
+            of(with(&proven, &|entry| {
+                entry["inclusion_proof"]["checkpoint"] = json!(format!(
+                    "{another_origin}\n{}",
+                    tiled.line(&another_origin)
+                ));
+            })),
+            ENDORSEMENT_OWN_RELEASE,
+            ENDORSEMENT_NOW_S,
+            Some(3),
+        ),
+        (
+            "Rekor v2: another size than the log signed",
+            of(with(&proven, &|entry| {
+                entry["inclusion_proof"]["checkpoint"] =
+                    json!(tiled.checkpoint(&leaves).replacen("\n11\n", "\n12\n", 1));
+            })),
+            ENDORSEMENT_OWN_RELEASE,
+            ENDORSEMENT_NOW_S,
+            Some(3),
+        ),
+        (
+            "Rekor v2: a changed hash of the audit path",
+            of(with(&proven, &|entry| {
+                entry["inclusion_proof"]["hashes"][1] =
+                    json!(lower_hex(&fixed("endorsement another hash")));
+            })),
+            ENDORSEMENT_OWN_RELEASE,
+            ENDORSEMENT_NOW_S,
+            Some(3),
+        ),
+        (
+            "Rekor v2: an audit path without its last hash",
+            of(with(&proven, &|entry| {
+                entry["inclusion_proof"]["hashes"]
+                    .as_array_mut()
+                    .expect("the hashes")
+                    .pop();
+            })),
+            ENDORSEMENT_OWN_RELEASE,
+            ENDORSEMENT_NOW_S,
+            Some(3),
+        ),
+        (
+            "Rekor v2: the index of another leaf",
+            of(with(&proven, &|entry| {
+                entry["inclusion_proof"]["log_index"] = json!(4);
+            })),
+            ENDORSEMENT_OWN_RELEASE,
+            ENDORSEMENT_NOW_S,
+            Some(3),
+        ),
+        (
+            "Rekor v2: the checkpoint of a tree of one leaf more with the audit path of this tree",
+            of(with(&proven, &|entry| {
+                let mut later = leaves.clone();
+                later.push(fixed("endorsement leaf 11"));
+                entry["inclusion_proof"]["checkpoint"] = json!(tiled.checkpoint(&later));
+            })),
+            ENDORSEMENT_OWN_RELEASE,
+            ENDORSEMENT_NOW_S,
+            Some(3),
+        ),
+        (
+            "Rekor v2: the record of another statement",
+            of(proven_body(&tiled_record(
+                &Sha256::digest(other_statement.as_bytes()),
+                ENDORSEMENT_RELEASE_SIGNATURE,
+                &release_key,
+            ))),
+            ENDORSEMENT_OWN_RELEASE,
+            ENDORSEMENT_NOW_S,
+            Some(4),
+        ),
+        (
+            "Rekor v2: the record of another key",
+            of(proven_body(&tiled_record(
+                &digest,
+                ENDORSEMENT_RELEASE_SIGNATURE,
+                &rekor_v1_key,
+            ))),
+            ENDORSEMENT_OWN_RELEASE,
+            ENDORSEMENT_NOW_S,
+            Some(4),
+        ),
+        (
+            "Rekor v2: the release key with a signature that is not its signature over the statement",
+            of(proven_body(&tiled_record(
+                &digest,
+                ENDORSEMENT_REKOR_V1_TIMESTAMP,
+                &release_key,
+            ))),
+            ENDORSEMENT_OWN_RELEASE,
+            ENDORSEMENT_NOW_S,
+            Some(4),
+        ),
+        (
+            "Rekor v2: a record that states its digest twice",
+            of(proven_body(&record.replacen(
+                r#""data":{"#,
+                r#""data":{"digest":"AAAA","#,
+                1,
+            ))),
+            ENDORSEMENT_OWN_RELEASE,
+            ENDORSEMENT_NOW_S,
+            Some(4),
+        ),
+        (
+            "Rekor v2: a record under a certificate in the place of the key",
+            of(proven_body(&record.replacen(
+                r#""publicKey":{"rawBytes""#,
+                r#""x509Certificate":{"rawBytes""#,
+                1,
+            ))),
+            ENDORSEMENT_OWN_RELEASE,
+            ENDORSEMENT_NOW_S,
+            Some(4),
+        ),
+        (
+            "Rekor v2: the record of the form of a log of the form Rekor v1",
+            of(proven_body(&text(
+                &STANDARD
+                    .decode(ENDORSEMENT_REKOR_V1_BODY)
+                    .expect("the body is base64"),
+            ))),
+            ENDORSEMENT_OWN_RELEASE,
+            ENDORSEMENT_NOW_S,
+            Some(4),
+        ),
+        (
+            "Rekor v1: an entry whose time lies 301 seconds after the clock of the node",
+            of(promised.clone()),
+            ENDORSEMENT_OWN_RELEASE,
+            ENDORSEMENT_REKOR_V1_TIME - 301,
+            Some(5),
+        ),
+        (
+            "Rekor v1: an entry whose time lies 300 seconds after the clock of the node",
+            of(promised.clone()),
+            ENDORSEMENT_OWN_RELEASE,
+            ENDORSEMENT_REKOR_V1_TIME - 300,
+            None,
+        ),
+        (
+            "a node of the release of the statement",
+            of(proven.clone()),
+            "v2.5.0",
+            ENDORSEMENT_NOW_S,
+            Some(6),
+        ),
+        (
+            "a node whose release is not a release tag",
+            of(promised.clone()),
+            "dev",
+            ENDORSEMENT_NOW_S,
+            Some(6),
+        ),
+    ];
+
+    let keys = ReleaseKeys {
+        release: &release_key,
+        logs: &logs,
+    };
+    let cases: Vec<Value> = cases
+        .into_iter()
+        .map(|(name, endorsement, own_release, now_s, check)| {
+            let entry = LogEntry::read(&endorsement["entry"]).expect("the entry has its form");
+            let statement = b64u_decode(endorsement["statement"].as_str().expect("the statement"))
+                .expect("the statement is base64url");
+            let verdict = verify_endorsement(&statement, &entry, &keys, own_release, now_s);
+            assert_eq!(
+                verdict.as_ref().err().map(|failure| failure.check()),
+                check,
+                "{name}: {verdict:?}"
+            );
+            json!({
+                "name": name,
+                "own_release": own_release,
+                "now_s": now_s,
+                "endorsement": endorsement,
+                "accepted": verdict.is_ok(),
+                "check": check,
+            })
+        })
+        .collect();
+    json!({
+        "release_key_pem": ENDORSEMENT_RELEASE_KEY_PEM,
+        "logs": [
+            {"form": "rekor_v1", "key_pem": ENDORSEMENT_REKOR_V1_KEY_PEM, "log_id": logs[0].id()},
+            {"form": "rekor_v2", "origin": ENDORSEMENT_ORIGIN, "key_pem": tiled.key_pem(),
+             "log_id": logs[1].id()},
+        ],
+        "statement_text": ENDORSEMENT_STATEMENT,
+        "release": "v2.5.0",
+        "cases": cases,
+    })
+}
+
 fn generate() -> String {
     let document = json!({
         "v": 1,
@@ -2193,7 +2713,14 @@ fn generate() -> String {
             "is `header:<name>`, with the placeholder `placeholder_text` in them: `valid` says ",
             "whether a node of the forward role puts a value in the place of the placeholder, ",
             "and `refused_schemes` lists the names of the authentication schemes behind which ",
-            "it puts none."
+            "it puts none. `endorsement` holds endorsements of the release `release` (10.3) in ",
+            "the encodings of a `peer/export` call (the statement in base64url, the body of an ",
+            "entry in standard base64, a hash in hexadecimal), for a giving node with the release ",
+            "key `release_key_pem` whose table of logs is `logs`: a log of the form Rekor v1 ",
+            "and a log of the form Rekor v2 with its origin, each with its key and its log ",
+            "identifier. A case names the release of the giving node (`own_release`), its clock ",
+            "in seconds (`now_s`) and the verdict: `accepted`, and for a refusal the number of ",
+            "the check of 10.3 that fails (`check`)."
         ),
         "key_derivation": key_derivation(),
         "record": record(),
@@ -2210,6 +2737,7 @@ fn generate() -> String {
         "sealed_release": sealed_release(),
         "basic_credentials": basic_credentials(),
         "header_values": header_values(),
+        "endorsement": endorsement(),
     });
     let mut output = serde_json::to_string_pretty(&document).expect("vectors serialize");
     output.push('\n');

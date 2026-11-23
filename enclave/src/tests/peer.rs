@@ -1195,6 +1195,13 @@ async fn an_export_with_a_subset_hands_over_the_share_of_the_peer_and_an_import_
 const REKOR_ENTRY: &str =
     include_str!("../../../protocol/tests/fixtures/rekor-entry-150000000.json");
 
+/// The entry of the transparency log `log2025-1.rekor.sigstore.dev` with the index
+/// 200,000,163, in the form of the `entry` of an endorsement. Its inclusion proof verifies
+/// with the key of that log in the table of this program. It records the signature of another
+/// signer, not one of the release key.
+const REKOR_LOG2025_1_ENTRY: &str =
+    include_str!("../../../protocol/tests/fixtures/rekor-log2025-1-entry-200000163.json");
+
 #[tokio::test]
 async fn an_export_with_an_endorsement_hands_nothing_over_unless_the_endorsement_holds() {
     let provider = quiet_provider().await;
@@ -1234,6 +1241,12 @@ async fn an_export_with_an_endorsement_hands_nothing_over_unless_the_endorsement
         change(&mut entry);
         entry
     };
+    let tiled_entry: Value = serde_json::from_str(REKOR_LOG2025_1_ENTRY).unwrap();
+    let tiled_entry_with = |change: fn(&mut Value)| {
+        let mut entry = tiled_entry.clone();
+        change(&mut entry);
+        entry
+    };
     for endorsement in [
         json!({}),
         json!({"statement": statement}),
@@ -1259,6 +1272,25 @@ async fn an_export_with_an_endorsement_hands_nothing_over_unless_the_endorsement
         // A real entry of the log for a statement the release key did not sign, to a node
         // of the local platform, from a node whose release is not a release tag.
         json!({"statement": statement, "entry": entry}),
+        // The same for a real entry of the log of the form Rekor v2 of the table of this
+        // program, with its inclusion proof, and for such an entry without its proof, with a
+        // proof of another type, with a hash and with an index of another type.
+        json!({"statement": statement, "entry": tiled_entry}),
+        json!({"statement": statement, "entry": tiled_entry_with(|entry| {
+            entry.as_object_mut().unwrap().remove("inclusion_proof");
+        })}),
+        json!({"statement": statement, "entry": tiled_entry_with(|entry| {
+            entry["inclusion_proof"] = json!("proof");
+        })}),
+        json!({"statement": statement, "entry": tiled_entry_with(|entry| {
+            entry["inclusion_proof"]["hashes"][0] = json!(7);
+        })}),
+        json!({"statement": statement, "entry": tiled_entry_with(|entry| {
+            entry["inclusion_proof"]["log_index"] = json!("200000163");
+        })}),
+        json!({"statement": statement, "entry": tiled_entry_with(|entry| {
+            entry["inclusion_proof"]["checkpoint"] = json!(null);
+        })}),
     ] {
         let body = json!({"peer": to, "endorsement": endorsement});
         assert_eq!(

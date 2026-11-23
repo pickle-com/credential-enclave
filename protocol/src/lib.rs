@@ -184,6 +184,15 @@ pub mod limits {
     /// How far the time of an entry of the transparency log may lie after the clock of the
     /// giving node: 300 seconds (10.3).
     pub const RELEASE_ENTRY_AHEAD_SECONDS: u64 = 300;
+    /// Longest checkpoint of the inclusion proof of an entry of a transparency log, in bytes
+    /// (10.3): 262,144. It holds the note of a tree head, the signature of the log and the
+    /// signatures of witnesses, which a node does not read. A reader of a signed note takes at
+    /// least 16 signatures (c2sp.org/signed-note), and a signature of a witness can be close to
+    /// 5,000 bytes long.
+    pub const RELEASE_CHECKPOINT_BYTES: usize = 262_144;
+    /// Most hashes in the audit path of the inclusion proof of an entry of a transparency log
+    /// (10.3): 64, the height of a tree whose number of leaves fits 64 bits.
+    pub const RELEASE_PROOF_HASHES: usize = 64;
     /// Longest `name` of a record of kind `vault_secret`, in characters (section 6).
     pub const VAULT_SECRET_NAME_CHARS: usize = 64;
     /// Most hosts in `sites` of a record of kind `vault_secret` (section 6).
