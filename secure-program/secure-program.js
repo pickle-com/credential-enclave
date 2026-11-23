@@ -3267,8 +3267,9 @@
   // made it (a round, the first page of the screen, a later page), is kept (log.withheld: the key
   // of an entry whose document or body was held back, the listing page of the screen that was
   // held back) and made again by every round until it is no longer held back. So a round that
-  // reads the control entries alone does not end a count of rounds held back that a read of the
-  // screen began, and A3 holds for what only the screen reads as well.
+  // reads the control entries alone does not end a count of rounds held back while a read the
+  // screen made stays held back. A round judges such a read by the answers it receives itself;
+  // what it reads is not kept for the screen.
   //
   // What is an entry is decided by the listing and by the node documents. The operator domain can
   // write objects under any key of the store, so a key of the listing is the key of an entry only

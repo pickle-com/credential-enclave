@@ -1605,8 +1605,9 @@ node of the key, is no entry.
 A read that was held back is made again by every round until it is not (step 5): the key of an
 entry whose document or body was held back, and a listing page of the log screen that was held
 back. The log screen reads the use entries and the later pages of the two listings, which a round
-of a synchronization does not read. With this, a read only the screen makes counts for A3 as a
-read of a round does, and a round that reads the control entries alone does not end the count.
+of a synchronization does not read. So a round that reads the control entries alone does not end a
+count of rounds held back while a read the screen made stays held back. A round judges such a read
+by the answers it receives itself: what it reads is not kept for the screen, which reads again.
 
 The result of a round is `verified`, `pending` or `attention`. It is `attention` when one of four
 conditions holds, and each holds only in a situation that is a problem:
