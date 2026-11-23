@@ -1417,7 +1417,7 @@ key transfer ends with the expiry of the transfer.
 
 | Event | What the program does |
 | --- | --- |
-| `session_ready` | Clears the state of a master key transfer (a runtime does not take over the transfer of the runtime before it), publishes whether the build has the protected sheets, counts the calls the runtime before left open as interrupted, and starts a synchronization |
+| `session_ready` | Clears the state of a master key transfer (a runtime does not take over the transfer of the runtime before it), publishes whether the build has the protected sheets, publishes the log as pending when this program has ended no round on the installation (the state an earlier program published is not a judgement of this one), counts the calls the runtime before left open as interrupted, and starts a synchronization |
 | `foreground` | Starts a synchronization |
 | `background` | Notes the time for the calls that are open (the report of the outcomes) |
 | `push` | With the reason `transfer_request`: reads the pending requests of a master key transfer. With any other reason: starts a synchronization and, when it ended, sends the report of the synchronization. A synchronization of the reason `grant_required` hands a grant again to a node the backend reports no grant for (below) |
