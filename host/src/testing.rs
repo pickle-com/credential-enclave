@@ -120,7 +120,9 @@ pub fn health_body_with_descriptors(configured: bool, accounts: u64, started_ms:
 pub const LOAD_OBJECT_WITH_LIMIT: &str = r#"{"provider_inflight":4,"forward_calls":5,"inbound_connections":7,"inbound_refused":2,"inbound_limit":1502,"cpu_user_ms":1234,"cpu_system_ms":567,"cpu_idle_ms":89012,"memory_total_bytes":4294967296,"memory_available_bytes":3221225472,"descriptors_open":321,"descriptors_limit":65536,"lingering_connections":3,"lingering_cut":1,"contained_panics":2,"halted_accounts":1}"#;
 
 /// The `health` body of a node of release v2.4.0 with the given values:
-/// [`health_body_with_descriptors`] with the `load` object [`LOAD_OBJECT_WITH_LIMIT`].
+/// [`health_body_with_descriptors`] with the `load` object [`LOAD_OBJECT_WITH_LIMIT`], the
+/// `egress` object [`EGRESS_OBJECT_WITH_MAIL`] and the `state` object
+/// [`STATE_OBJECT_WITH_MAIL`].
 pub fn health_body_with_limit(configured: bool, accounts: u64, started_ms: u64) -> String {
     health_body_of(
         "v2.4.0",
@@ -130,10 +132,18 @@ pub fn health_body_with_limit(configured: bool, accounts: u64, started_ms: u64) 
         LOG_STORE_OBJECT,
         LOG_WRITE_COUNTS,
         &format!(
-            r#","load":{LOAD_OBJECT_WITH_LIMIT},"egress":{EGRESS_OBJECT},"refresh":{REFRESH_OBJECT},"state":{STATE_OBJECT}"#
+            r#","load":{LOAD_OBJECT_WITH_LIMIT},"egress":{EGRESS_OBJECT_WITH_MAIL},"refresh":{REFRESH_OBJECT},"state":{STATE_OBJECT_WITH_MAIL}"#
         ),
     )
 }
+
+/// The `egress` object of [`health_body_with_limit`]: [`EGRESS_OBJECT`] with the mail reads
+/// that went over a kept session, which a node of release v2.4.0 reports.
+pub const EGRESS_OBJECT_WITH_MAIL: &str = r#"{"opens":100,"open_failures":{"transport":1,"relay_refused":2,"tls":3,"http":4},"open_retries":5,"open_inflight":6,"idle_reuses":{"provider":200,"log_store":300,"mail":400}}"#;
+
+/// The `state` object of [`health_body_with_limit`]: [`STATE_OBJECT`] with the kept mail
+/// sessions, which a node of release v2.4.0 reports.
+pub const STATE_OBJECT_WITH_MAIL: &str = r#"{"kept_refreshes":11,"merge_keys":22,"pending_entries":33,"idle_connections":{"provider":44,"log_store":55,"mail":66}}"#;
 
 /// The `log_store` object of [`health_body_with_egress_and_refresh`].
 pub const LOG_STORE_OBJECT: &str = r#"{"bucket":"character-credential-log-dev-1","region":"us-west-2","shards":32,"credentials_expires_ms":1790000900000,"node_document_ms":1790000100250,"pending":6,"pending_oldest_ms":12345}"#;

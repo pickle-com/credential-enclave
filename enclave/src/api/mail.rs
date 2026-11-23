@@ -1,5 +1,7 @@
-//! Typed mail calls. Passwords are opened only after grant checks and used after logging.
+//! Typed mail calls. A record is opened after the grant checks, and its plaintext is read and
+//! used after the log store confirmed the entry of the call.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use axum::extract::{Request, State};
@@ -11,14 +13,14 @@ use credential_enclave_protocol::{purpose, ProtocolError};
 use hyper::body::Bytes;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tokio::sync::OwnedSemaphorePermit;
 
 use super::responses::forward_frame;
 use super::{invalid, read_body, record_of, respond, ApiError, JsonBody};
 use crate::frame::{self, META_LIMIT_BYTES};
 use crate::log_store;
-use crate::mail::{self, AppPassword, MailData, MailError, ReadMail};
-use crate::state::{events, lock, Limits, Node};
+use crate::mail::{self, MailData, MailError, ReadMail, Share};
+use crate::mail_sessions::{Delegation, SessionKey};
+use crate::state::{events, lock, AccountLock, GrantState, Node};
 
 pub async fn verify(State(node): State<Arc<Node>>, request: Request) -> Response {
     call(node, request, "verify").await
@@ -46,53 +48,57 @@ fn admission_error(error: tokio::sync::TryAcquireError) -> ApiError {
     }
 }
 
-/// Resizes the reservation to `keep` bytes without waiting: more is taken from the budget
-/// (`capacity_unavailable` when it is not free), less is given back.
-fn resize(node: &Node, budget: &mut OwnedSemaphorePermit, keep: usize) -> Result<(), ApiError> {
-    let held = budget.num_permits();
-    if keep > held {
-        let extra =
-            u32::try_from(keep - held).map_err(|_| ApiError::from(ProtocolError::TooLarge))?;
-        budget.merge(
-            node.body_budget
-                .clone()
-                .try_acquire_many_owned(extra)
-                .map_err(admission_error)?,
-        );
-    } else {
-        drop(budget.split(held - keep));
+/// The part of the share of the body budget of a mail call that does not follow its protocol
+/// input, without its request frame (`mail::Share`). The share of a call is what the call
+/// holds in memory at once:
+///
+/// | operation | taken before the request frame is read | taken as the protocol input arrives |
+/// | --- | --- | --- |
+/// | verify | the frame, `CALL_BYTES`, the input bounds of its IMAP connection and of its SMTP connection | nothing |
+/// | read: folders, search | the frame, `CALL_BYTES` | 6 bytes per byte of IMAP input (bound: 4 MiB) |
+/// | read: read | the frame, `CALL_BYTES` | 2 bytes per byte of IMAP input (bound: the body limit + 1 MiB) |
+/// | submit | the frame (the payload is part of it), `CALL_BYTES`, the input bound of its SMTP connection | nothing |
+///
+/// The frame is taken by its declared length (the frame limit when none is declared) and by
+/// its length once it was read. A verification and a submission take the whole of their share
+/// here, before a credential is opened: such a call never ends with `capacity_unavailable`
+/// after its entry was created. A read takes the second part while it reads, after its entry.
+fn fixed_share(operation: &str) -> usize {
+    match operation {
+        "verify" => mail::CALL_BYTES + mail::LOGIN_INPUT_BYTES + mail::SMTP_INPUT_BYTES,
+        "submit" => mail::CALL_BYTES + mail::SMTP_INPUT_BYTES,
+        _ => mail::CALL_BYTES,
     }
-    Ok(())
 }
 
-/// What a mail call holds in memory at once, by operation. The protocol input of a mail
-/// connection is capped at the stream, and a literal declaration above the cap is refused
-/// before the protocol parser allocates for it (`mail::LiteralGuard`), so the parser buffer
-/// is bounded by the cap and not by the parser's own maximum.
-///
-/// | operation | input cap | held at once | reserve |
-/// | --- | --- | --- | --- |
-/// | verify, folders, search | 4 MiB | parser buffer (the parsed rows borrow it), base64 headers, JSON, frame | cap × 6 + 2 × META |
-/// | read | body limit + 1 MiB | parser buffer (≤ cap) and the message copy (≤ body limit) | cap + body limit + 2 × META |
-/// | submit | the request frame | the payload | payload + 2 × META |
-///
-/// The request frame is read under a reservation of its declared length (the frame limit
-/// when none is declared); once the action and the payload are known, and before a
-/// credential is opened, the reservation is resized to the operation's amount.
-fn reservation(
-    limits: &Limits,
-    operation: &str,
-    action: Option<&str>,
-    payload_bytes: usize,
-) -> usize {
-    let frames = 2 * META_LIMIT_BYTES;
-    match (operation, action) {
-        ("submit", _) => payload_bytes + frames,
-        ("read", None | Some("read")) => {
-            mail::message_input_bytes(limits) + limits.body_bytes + frames
-        }
-        _ => mail::LISTING_INPUT_BYTES * 6 + frames,
+/// The failure of a read whose input the body budget of the node had no room for. The entry
+/// of the call is on the chain, the call read from the mailbox and changed nothing in it, and
+/// nothing of what it read leaves.
+fn no_room_for_the_input() -> ApiError {
+    ApiError::with_message(
+        ProtocolError::CapacityUnavailable,
+        "the node has no room for the mail the call reads; the call changed nothing",
+    )
+}
+
+/// True while the delegation a call ran under is in force and the node is open, at this
+/// moment: the node is not closing, the grant of the account is within its time and is the
+/// grant of the signing public key the call ran under, and the account accepted no revoke
+/// since the call created its event. A kept session is taken, and a session is kept, only
+/// while this holds (`crate::mail_sessions`). It does not hold for an account the node
+/// halted (`Account::halt`), which has no grant: a call that asks for the lock here after a
+/// panic under it halts the account before it reads the state.
+fn in_force(node: &Node, account: &AccountLock, delegation: &Delegation) -> bool {
+    if node.closing.load(Ordering::SeqCst) {
+        return false;
     }
+    let mut account = lock(account);
+    account.expire(node.now_ms());
+    account.revoke_serial == delegation.revoke_serial
+        && matches!(
+            account.grant(),
+            GrantState::Active(grant) if grant.sign_pk == delegation.sign_pk
+        )
 }
 
 async fn run(node: &Node, request: Request, operation: &str) -> Result<Response, ApiError> {
@@ -107,14 +113,18 @@ async fn run(node: &Node, request: Request, operation: &str) -> Result<Response,
         return Err(ProtocolError::TooLarge.into());
     }
     // The same budget also admits HTTP forwarding; no separate unbounded mail pool exists.
-    let reserve = u32::try_from(declared.unwrap_or(frame_limit))
-        .map_err(|_| ApiError::from(ProtocolError::TooLarge))?;
-    let mut budget = node
-        .body_budget
-        .clone()
-        .try_acquire_many_owned(reserve)
-        .map_err(admission_error)?;
+    // The call takes the share of its frame and its fixed share without waiting.
+    let fixed = fixed_share(operation);
+    let mut share = Share::admit(
+        &node.body_budget,
+        declared.unwrap_or(frame_limit).saturating_add(fixed),
+    )
+    .ok_or(ProtocolError::CapacityUnavailable)?;
     let frame_bytes = Bytes::from(read_body(request, frame_limit).await?);
+    // The frame is in memory: its share is its length.
+    if !share.resize(frame_bytes.len().saturating_add(fixed)) {
+        return Err(ProtocolError::CapacityUnavailable.into());
+    }
     let (meta_value, payload) = frame::decode(&frame_bytes)?;
     drop(frame_bytes);
     if payload.len() > node.limits.body_bytes {
@@ -160,16 +170,11 @@ async fn run(node: &Node, request: Request, operation: &str) -> Result<Response,
     if operation != "submit" && !payload.is_empty() {
         return Err(invalid("mail payload"));
     }
-    resize(
-        node,
-        &mut budget,
-        reservation(
-            &node.limits,
-            operation,
-            read_request.as_ref().map(|read| read.action.as_str()),
-            payload.len(),
-        ),
-    )?;
+    if operation == "submit" {
+        // The form of the submission. Whether its sender is the account of the record is
+        // judged after the entry: that answer depends on the content of the record.
+        mail::submission_sender(&recipients, &payload).map_err(|_| invalid("mail submission"))?;
+    }
 
     node.ensure_open()?;
     if node.log_store.id().is_none() {
@@ -177,17 +182,19 @@ async fn run(node: &Node, request: Request, operation: &str) -> Result<Response,
     }
     let account = node.account(user).ok_or(ProtocolError::GrantRequired)?;
     log_store::admit(node, &account).await?;
-    let (credentials, place, sign_pk, key_id) = {
+    // The record a kept session belongs to: its `id` and the hash of its ciphertext, both
+    // values of the caller. The record opens under the grant of the account below, so a call
+    // with this key carries the application password the session was authenticated with.
+    let session_key = SessionKey::of(user, &record);
+    let (opened, place, sign_pk, key_id, delegation) = {
         let mut account = lock(&account);
         node.ensure_open()?;
         let now_ms = node.now_ms();
         let grant = account.active(now_ms)?;
-        let credentials = AppPassword::open(&grant, user, &record)?;
-        if operation == "submit" {
-            credentials
-                .validate_submission(&recipients, &payload)
-                .map_err(|_| invalid("mail submission"))?;
-        }
+        let delegation = Delegation::of(&grant);
+        // What is judged before the event is the same for every value the record can hold:
+        // the grant, the AEAD verification, and the kind and the provider of the record.
+        let opened = mail::open_record(&grant, user, &record)?;
         let place = node.create_event(
             &mut account,
             user,
@@ -197,13 +204,18 @@ async fn run(node: &Node, request: Request, operation: &str) -> Result<Response,
             EntryKind::Use,
             events::mail_request(&record.id, operation, &params, &payload, context),
         )?;
-        (credentials, place, grant.sign_pk, grant.key_id)
+        (opened, place, grant.sign_pk, grant.key_id, delegation)
     };
     let log = log_store::commit(node, user, &account, &[(place, true)])
         .await?
         .into_iter()
         .next()
         .ok_or_else(ApiError::internal)?;
+    // The plaintext of the record is read only now, after the log store confirmed the entry
+    // that holds the event: an answer that depends on the content of the plaintext has an
+    // entry. A plaintext the call cannot use is `record_invalid` here: nothing goes to the
+    // provider, and the entry stays.
+    let credentials = opened.credentials()?;
     let outcome = match operation {
         "verify" => credentials.verify(node).await.map(|()| {
             let identity = credentials.identity();
@@ -217,21 +229,44 @@ async fn run(node: &Node, request: Request, operation: &str) -> Result<Response,
                     "identity": identity, "time_ms": node.now_ms(),
                 })),
             );
-            MailData::Json(json!({"identity": identity, "node": node.node, "statement": statement}))
+            MailData::Json(to_json(
+                &json!({"identity": identity, "node": node.node, "statement": statement}),
+            ))
         }),
         "read" => {
-            credentials
-                .read(
-                    node,
-                    read_request.as_ref().ok_or_else(|| invalid("request"))?,
-                )
-                .await
+            let read = read_request.as_ref().ok_or_else(|| invalid("request"))?;
+            let sessions = &node.egress.mail_sessions;
+            // The entry of this call is confirmed: the call may send its commands, over the
+            // session the node kept for this record or over a new one. A call takes a kept
+            // session only here, so no command goes over one for a call without an entry,
+            // and only while the delegation it ran under is in force.
+            let kept = match in_force(node, &account, &delegation) {
+                true => sessions.take(&log, &session_key, &delegation, node.now_ms()),
+                false => {
+                    sessions.end(&session_key);
+                    None
+                }
+            };
+            let (data, session) = credentials.read(node, read, kept, &mut share).await;
+            // The session of a call that ended in step is kept for the next call of the
+            // record, while the delegation is in force.
+            if let Some(session) = session {
+                if in_force(node, &account, &delegation) {
+                    sessions.keep(session_key.clone(), delegation, session, node.now_ms());
+                }
+            }
+            data
         }
         "submit" => credentials.submit(node, &recipients, &payload).await,
         _ => return Err(invalid("operation")),
     };
+    if matches!(outcome, Err(MailError::Auth)) {
+        // The server refuses the application password of the record: no session that was
+        // authenticated with it carries a further call.
+        node.egress.mail_sessions.end(&session_key);
+    }
     let (status, content_type, body) = match outcome {
-        Ok(MailData::Json(value)) => (200, "application/json", to_json(&value)),
+        Ok(MailData::Json(bytes)) => (200, "application/json", bytes),
         Ok(MailData::Raw(bytes)) => (200, "message/rfc822", bytes),
         Err(MailError::Auth) => (
             401,
@@ -254,19 +289,20 @@ async fn run(node: &Node, request: Request, operation: &str) -> Result<Response,
             to_json(&json!({"code": "invalid_mail_request"})),
         ),
         Err(MailError::TooLarge) => return Err(ProtocolError::TooLarge.into()),
+        Err(MailError::Capacity) => return Err(no_room_for_the_input()),
         Err(MailError::Unavailable) => return Err(ProtocolError::ProviderUnreachable.into()),
     };
     if body.len() > node.limits.body_bytes {
         return Err(ProtocolError::TooLarge.into());
     }
-    let retained = body.len() + META_LIMIT_BYTES;
     drop(payload);
-    let unused = budget.num_permits().saturating_sub(retained);
-    drop(budget.split(unused));
+    // The check holds at most one more copy of the body: it runs under the share the input
+    // of the call took. The response frame then keeps the share of what it holds.
     let response = credentials.check(
         status,
         vec![("content-type".into(), content_type.into())],
         body,
     )?;
+    let budget = share.settle(response.body_len().saturating_add(mail::CALL_BYTES));
     Ok(forward_frame(response, Some(log), budget))
 }

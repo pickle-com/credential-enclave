@@ -60,7 +60,7 @@ log store and is part of none, and neither appears in a response.
 | Channel | To | What |
 | --- | --- | --- |
 | C1 | The operator domain | The response of a call: status, headers, body |
-| C2 | A provider | A TLS connection that ends inside the node. Its destination is an address of the provider definitions or one of the fixed Naver mail endpoints. A connection to a provider carries the requests of one account: the node keeps at most 8 idle connections per (account, host) for at most 30 seconds, and sends the requests of a forward batch at most 6 at a time. The operator domain sees TLS records only |
+| C2 | A provider | A TLS connection that ends inside the node. Its destination is an address of the provider definitions or one of the fixed Naver mail endpoints. A connection to a provider carries the requests of one account: the node keeps at most 8 idle connections per (account, host) for at most 30 seconds, and sends the requests of a forward batch at most 6 at a time. An authenticated IMAP session carries the reads of one record of one account: the node keeps at most one per record, for at most 30 seconds between two reads and 300 seconds after its login ("Mail credentials" below). The operator domain sees TLS records only |
 | C3 | The console | Exists in a debug-mode enclave only (its attestation has all-zero PCRs and an app refuses it). In any mode the node writes fixed strings of its source only |
 | C4 | The log store | A TLS connection that ends inside the node, to `s3.{region}.amazonaws.com`, the endpoint of Amazon S3 in the region of the log store of the node (a node of the local platform may write to the endpoint of its configuration instead). It carries log entries (class C below), the key of each (`user_id` E, the node identifier, `seq`, `time_ms`, the kind, the count or the name of the control event, the hash of the body P, `key_id` E), the bucket of each (it follows from the bucket name of the binding and a hash of `user_id`, protocol.md 7.6), the node document of the node (the attestation document of the platform over the binding: S and P) and the credentials of the operator for the store. The node keeps at most 32 idle connections to the store. The operator domain sees TLS records only, and it can read the buckets |
 | C5 | The site of a vault secret | A TLS connection that ends inside a node of the forward role (protocol.md 4.1), to port 443 of the host the envelope of one use of a vault secret names (protocol.md 10.5). It carries the one request of that use, with the value at its slot, and ends with the response to it. The operator domain sees TLS records only |
@@ -140,7 +140,7 @@ The sinks:
 | K3 `Egress::send_to_provider` | Writes a request with a credential, a token request or a revocation request to a TLS connection | The request is addressed to a `Destination`, a type only the provider definitions create: an address that passed the address check of `forward`, the token address, or the revocation address. The certificate is verified against the WebPKI roots compiled into the binary. The node follows no redirect |
 | K4 `Selected::hand_out` | Puts one value of a vault record into the response of `release`, as it is or under the seal of a key the caller named | The record is of a vault kind and the field is one of that kind (E6). A record of kind `vault_secret` lists the slot `field`, and its sites hold the host of the origin of the call or a host above it. The function takes the log entry of the release as an argument: the entry is on the chain before the value leaves. A sealed value is a released value: the caller chose the key |
 | K5 `send_to_log_store` | Writes one object to the log store over a TLS connection, in a request signed with the credentials of the operator | What it takes is one of two objects, and the credentials of the log store. The first is a signed entry (`Signed`: the body and the signature of the node, whose content is sealed to the log public key of the account) with its key and the hash that names its bucket. The second is the node document: the attestation document of the platform over the binding of the node, which holds public values (protocol.md 7.7). No argument of it is a type that holds a user key, the plaintext of a record or a token: the secrets it reads are the two the operator domain gave. The destination is a bucket of the log store of the operator configuration (the buckets that follow from the bucket name of the binding, protocol.md 7.6), at the endpoint of Amazon S3 in the region of the store, a region name of a fixed form under `amazonaws.com`, and the certificate is verified against the WebPKI roots compiled into the binary |
-| K6 `AppPassword::imap` | Sends account name and application password through IMAP TLS | Only imap.naver.com:993, verified roots and trusted node clock; after grant and log-store confirmation |
+| K6 `AppPassword::imap` | Sends account name and application password through IMAP TLS | Only imap.naver.com:993, verified roots and trusted node clock; after grant and log-store confirmation. A read that goes over a kept session does not reach this sink: no password leaves for it |
 | K7 `AppPassword::smtp` | Sends account name and application password through SMTP TLS | Only smtp.naver.com:465 with the same verification and logging; one transaction, no retry after DATA |
 | K8 `seal_secret_use` | Seals the value of a record of kind `vault_secret`, with the one request it is for, with HPKE to the sealing public key of a node of the forward role | The receiving node is a `ForwardNode`, a type only the verification of an attestation response creates: a node of the platform and the measurement of this node whose binding names the role `forward`. The request is one the reach of the record admits (its host is one of the sites, its slot one of the slots), and the function takes the log entry of the use as an argument: the event `provider_request` is on the chain, and the log store confirmed it, before the value is sealed |
 | K9 `Egress::send_to_bound_host` | On a node of the forward role, sends the one request of an opened envelope, with the value written into it (`BoundRequest::build`), over a TLS connection | The request is a `BoundRequest`, a type only `BoundRequest::build` creates. It reads the host and the method from a `SecretUse`, a type only the opening of an envelope creates: an envelope sealed to this node and signed by the node it names, within its 30 seconds, whose number was not used before. The address is that of the envelope, the body the body the envelope names by its length and its hash, and the value stands at the slot of the envelope and nowhere else (protocol.md 10.5). The certificate is verified for that host against the WebPKI roots compiled into the binary, the connection carries this one request, and the node follows no redirect |
@@ -401,7 +401,7 @@ calls, and `egress/sink-callers.tsv` (the two callers of K1).
 
 | Call | The fields of a successful response and their classes |
 | --- | --- |
-| `GET /v1/health` | `node` P, `release` P, `platform` P, `custody` P, `role` P, `started_ms` P, `time_ms` P, `configured` P, `closing` P, `accounts` P, `grants` P, `mail_providers` P, `log_store` E and P (`bucket`, `region` and `credentials_expires_ms` E, `shards`, `node_document_ms`, `pending` and `pending_oldest_ms` P), `log` P (seven counts, six counts of failed write attempts under constant cause names, the count of repeated attempts, eight cumulative counts of the time to confirmation under constant bounds, their sum and their count), `load` P (two counts of the calls, two counts of the connections from the backend and their bound, three CPU times and two sizes of the kernel, two counts of the descriptors of the process, two counts of the connections that wait for the end of their peer, and two counts of the faults the node contained: the panics of the program and the accounts it halted; the five of the kernel are null when it exposes none, so is each count of the descriptors when the kernel or the platform gives none, and so are the two counts of the waiting connections on the local platform), `egress` P (the count of opened connections, four counts of failed opens under constant cause names, the counts of repeated opens and of opens in progress, two counts of reused idle connections), `refresh` P (four counts of late token address calls under constant outcome names, the count of those in progress), `state` P (three counts of kept `refresh` responses, merge keys and unconfirmed entries, two counts of idle connections under constant peer names) |
+| `GET /v1/health` | `node` P, `release` P, `platform` P, `custody` P, `role` P, `started_ms` P, `time_ms` P, `configured` P, `closing` P, `accounts` P, `grants` P, `mail_providers` P, `log_store` E and P (`bucket`, `region` and `credentials_expires_ms` E, `shards`, `node_document_ms`, `pending` and `pending_oldest_ms` P), `log` P (seven counts, six counts of failed write attempts under constant cause names, the count of repeated attempts, eight cumulative counts of the time to confirmation under constant bounds, their sum and their count), `load` P (two counts of the calls, two counts of the connections from the backend and their bound, three CPU times and two sizes of the kernel, two counts of the descriptors of the process, two counts of the connections that wait for the end of their peer, and two counts of the faults the node contained: the panics of the program and the accounts it halted; the five of the kernel are null when it exposes none, so is each count of the descriptors when the kernel or the platform gives none, and so are the two counts of the waiting connections on the local platform), `egress` P (the count of opened connections, four counts of failed opens under constant cause names, the counts of repeated opens and of opens in progress, three counts of reused idle connections under constant peer names), `refresh` P (four counts of late token address calls under constant outcome names, the count of those in progress), `state` P (three counts of kept `refresh` responses, merge keys and unconfirmed entries, three counts of idle connections under constant peer names) |
 | `POST /v1/config` | `configured` P, `node_document_ms` P |
 | `POST /v1/attestation` | `v` P, `platform` P, `document` S (the platform signs the two public keys of the node, the release and the nonce of the caller), `node` P, `challenge` P, `release` P, `challenge_statement` S (its body: `type`, `node`, `challenge`, `time_ms` P, the nonce of the caller E) |
 | `POST /v1/messages` | `reply` S (its body: `type`, `ok`, `code`, `node`, `time_ms` P, `user_id`, `challenge`, `key_id`, `not_after_ms` D), `log` P, `grant` D |
@@ -510,7 +510,10 @@ only after successful IMAP and SMTP authentication; verify binds it, the ciphert
 record id and account signing key in a node statement. OAuth forward/refresh and vault release
 refuse this kind. The three mail calls require a configured log store and confirm `mail_request`
 before authentication. The encrypted event holds the operation, request parameters and payload
-length/digest, never the application password or message body.
+length/digest, never the application password or message body. The plaintext of the record is
+read after that confirmation (`MailRecord::credentials`): the refusal `record_invalid` of a
+plaintext the call cannot use, and the refusal of a submission whose sender is not the account
+of the record, are outcomes of a check on a secret that leave only with an entry of the call.
 
 The two mail authentication sinks are K6 (`AppPassword::imap`) and K7 (`AppPassword::smtp`).
 Both use `Egress::open_mail`, whose destination check admits only imap.naver.com:993 and
@@ -519,9 +522,53 @@ Protocol error text and authentication transcripts never become response bodies.
 pass the existing credential reflection check before the frame response. The provider-contract
 assumption and the limits of E4 remain the same as for HTTP forwarding.
 
-All mail calls share the forward semaphore and body budget. A call reserves six body limits
-plus two metadata limits to cover MIME and JSON/base64 copies. IMAP calls also reserve the
-512 MiB maximum parser buffer of async-imap 0.12, since a declared literal can allocate
-ahead of the bounded stream. Every call has an
-end-to-end 30 second deadline including admission. IMAP reads use EXAMINE and BODY.PEEK.
-SMTP performs one transaction; no transport failure triggers a second connection or submission.
+What the IMAP server sends is read by the reader of the node (`enclave/src/imap.rs`) and by
+no parser of another crate. The reader takes from a response the values the commands of a
+mail call need and passes over the rest by its syntax; what it cannot read ends the
+connection with the fixed failure `provider_unreachable`. No byte of a server ends the node
+(enclave.md, "Mail call surface"): a node that ends takes the delegations it holds with it.
+
+The sessions of the reads. A node keeps the authenticated IMAP session of a read for the next
+read of the same record (`enclave/src/mail_sessions.rs`), so that read does not log in. This
+changes no rule above:
+
+- A kept session holds no secret. It is the TLS connection the server accepted the
+  application password for, on channel C2: no type of `protocol/src/secret.rs` is part of it,
+  and the password is sent once per session, at its login, through K6.
+- Every read has its entry before it reaches the mailbox. A read takes a kept session only
+  after the log store confirmed the entry that holds its event: the function that hands a
+  session over (`MailSessions::take`) takes the `log` object of the read, and its one caller is
+  the read call behind its commit. A kept session is no way to a mailbox that leaves no entry.
+- A session is handed to a read of the record it was authenticated with (the account, the
+  `id` of the record and the SHA-256 of its `ct`: a record that opens under the user key of the
+  account carries the password its ciphertext holds) and of the delegation it was kept under
+  (the signing public key of the grant and the revoke serial of the account), while that
+  delegation is in force and the node is not closing. No read goes over a session after a
+  revoke, after the end of its grant, under the grant of another key, or after the node
+  halted the account of the session (enclave.md 3.1): such an account has no grant.
+- A session ends 30 seconds after its last read and 300 seconds after its login at the latest.
+  The operator domain cannot keep one alive beyond that age by calling: a read 300 seconds
+  after the login logs in again, with the password of the record it presents. So an
+  application password the account withdrew at the provider is of no use to a node after 300
+  seconds, and a call in progress then ends within its time limit of 30 seconds.
+
+All mail calls share the forward places and the body budget of the node. A call takes its
+share of the budget for what it holds in memory: its request frame and a fixed part before
+its entry, and for a read 6 bytes (a folder listing, a search) or 2 bytes (one message) per
+byte of its IMAP input while the input arrives, within the input bound of its connection. A
+literal the server declares is held against that bound and taken into the share when it is
+declared, before a buffer is made for it; its declaration counts as input as well, and the
+text of one response has a bound of its own, so neither the number of the literals of a
+response nor the length of a line lets a connection hold more than its share covers
+(enclave.md, "Mail call surface"). Every call has an end-to-end 30 second deadline including
+admission. IMAP reads use EXAMINE and BODY.PEEK. SMTP performs one transaction; no transport
+failure triggers a second connection or submission.
+
+Fixed by: `enclave/src/tests/mail.rs` and `enclave/src/tests/mail_connections.rs` (the order
+of a call, the entry of every read over a kept session, that a read sends no command over a
+kept session before the log store confirmed its entry and none when the store refuses it, no
+read over a session after a revoke, after the end of a grant, after `grants/prune`, after the
+node halted the account or while the node closes, a read that panics leaves no session, the
+end of a session at its idle time and at the age of its login, the bounds of the input of a
+connection), the unit tests of `enclave/src/mail_sessions.rs`, of `enclave/src/mail.rs` and of
+`enclave/src/imap.rs`, and the canary test, which makes the three calls.

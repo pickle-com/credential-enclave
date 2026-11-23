@@ -138,6 +138,7 @@ pub async fn health(State(node): State<Arc<Node>>) -> Response {
             idle_reuses: IdleReuseCounts {
                 provider: read(&egress.idle_reuses.provider),
                 log_store: read(&egress.idle_reuses.log_store),
+                mail: read(&egress.idle_reuses.mail),
             },
         },
         refresh: RefreshCounts {
@@ -156,6 +157,7 @@ pub async fn health(State(node): State<Arc<Node>>) -> Response {
             idle_connections: IdleConnectionCounts {
                 provider: node.egress.provider_idle.idle_total(),
                 log_store: node.log_store.idle_connections(),
+                mail: node.egress.mail_sessions.count(),
             },
         },
     })

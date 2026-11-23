@@ -223,6 +223,8 @@ pub struct IdleReuseCounts {
     pub provider: u64,
     /// P: writes to the log store over an idle connection to it.
     pub log_store: u64,
+    /// P: mail reads that went over a kept session of their record.
+    pub mail: u64,
 }
 
 /// `refresh` of `GET /v1/health`: the token address calls of `refresh` that the node continued
@@ -269,6 +271,9 @@ pub struct IdleConnectionCounts {
     pub provider: usize,
     /// P: a count, the idle connections to the log store.
     pub log_store: usize,
+    /// P: a count, the authenticated IMAP sessions the node keeps between the reads of a
+    /// record, over every account.
+    pub mail: usize,
 }
 
 /// `load` of `GET /v1/health`: the load of the node at the moment of the call.

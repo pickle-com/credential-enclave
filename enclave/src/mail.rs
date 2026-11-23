@@ -1,35 +1,40 @@
 //! Fixed Naver IMAP/SMTP operations. Authentication bytes only reach in-node TLS streams.
+//!
+//! The responses of the IMAP server are read by the reader of this program (`crate::imap`),
+//! which reads what the commands of a mail call need and passes over the rest. This module
+//! sends those commands and decides what a response is to the command it answers.
 
 use std::{
     collections::BTreeMap,
     fmt, io,
     pin::Pin,
+    sync::atomic::Ordering,
+    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
 
-use async_imap::imap_proto::{
-    AttributeValue, MailboxDatum, MessageSection, Response, SectionPath, Status,
-};
-use async_imap::{Client, Session};
 use base64::{engine::general_purpose::STANDARD, Engine};
+use credential_enclave_protocol::encoding::to_json;
 use credential_enclave_protocol::record::{Kind, Record};
 use credential_enclave_protocol::secret::Secret;
 use credential_enclave_protocol::ProtocolError;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter,
     ReadBuf,
 };
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use zeroize::Zeroizing;
 
+use crate::imap::{self, Code, Condition, Fetched, Response, Status, Step};
 use crate::platform::Stream;
 use crate::provider_response::{self, CheckedResponse};
 use crate::state::{open_for, GrantView, Limits, Node};
 
-/// Protocol input a verify, folder listing or search connection accepts: 4 MiB. A UID set or
-/// headers above it end the connection; the search must be narrowed.
+/// Protocol input the IMAP connection of a folder listing or of a search accepts: 4 MiB. A
+/// UID set or headers above it end the connection; the search must be narrowed.
 pub(crate) const LISTING_INPUT_BYTES: usize = 4 * 1024 * 1024;
 
 /// The end-to-end time limit of a mail call, its admission included (`api::mail`). It is also
@@ -43,18 +48,207 @@ pub(crate) fn message_input_bytes(limits: &Limits) -> usize {
     limits.body_bytes + 1024 * 1024
 }
 
-/// Whether a `NO` reply to `LOGIN` says that the server refused the credentials. `text` is the
-/// SDK's rendering of the reply: its response code and its information. Two forms count: the
-/// RFC 5530 response code `AUTHENTICATIONFAILED`, and the information `Authentication failed`
-/// that imap.naver.com sends with its own response code `[AUTH]`
-/// (`NO [AUTH] "name": Authentication failed. (Please check your username, password)`). Any
-/// other `NO` is a provider failure.
-fn credentials_refused(text: &str) -> bool {
-    let text = text.to_ascii_lowercase();
-    text.contains("authenticationfailed") || text.contains("authentication failed")
+/// Protocol input the IMAP connection of a verification accepts: the greeting of the server
+/// and its answer to the login. A call that verifies reserves these bytes before it reads its
+/// request frame.
+pub(crate) const LOGIN_INPUT_BYTES: usize = 64 * 1024;
+
+/// Protocol input an SMTP connection accepts. A call that opens one reserves these bytes
+/// before it reads its request frame.
+pub(crate) const SMTP_INPUT_BYTES: usize = 64 * 1024;
+
+/// What a mail call holds besides its request frame and the mail it reads: its parsed
+/// request, the read buffer of its IMAP connection and the head of its response frame.
+/// Reserved with the frame, before the call reads it.
+pub(crate) const CALL_BYTES: usize = 64 * 1024;
+
+/// The step in which the share of a mail call follows its protocol input.
+pub(crate) const SHARE_STEP_BYTES: usize = 64 * 1024;
+
+/// What a folder listing or a search holds at once per byte of its protocol input. The
+/// responses are read one at a time, and a response is held as its text while it is read:
+/// the buffer of a text grows by doubling, so a text holds up to three times its bytes at
+/// the moment it grows. What a call keeps of its responses:
+///
+/// - A folder listing keeps the JSON document it answers with, written as the names arrive:
+///   no more than the bytes of the lines the names came in, in a buffer that grows by
+///   doubling. The check of the response makes one copy of the document.
+/// - A search keeps the numbers of its `SEARCH` responses: four bytes for a number, which
+///   is two bytes of text at the least, in a list that has the room for the numbers of one
+///   response when that response is read, and grows by doubling over several responses.
+/// - A search then keeps the header blocks of at most 50 messages, each once (the octets of
+///   its literal, or its base64, which is 4/3 of them), the JSON document it makes of them,
+///   and the copy the check of the response makes of that document.
+///
+/// Six covers the sum of each kind at its peak.
+pub(crate) const LISTING_HELD_PER_BYTE: usize = 6;
+
+/// What a raw message read holds at once per byte of its protocol input: the message, and the
+/// copy the check of the response makes of it.
+pub(crate) const MESSAGE_HELD_PER_BYTE: usize = 2;
+
+/// The most bytes a connection to the IMAP server takes from its stream in one read.
+const IMAP_READ_BYTES: usize = 16 * 1024;
+
+/// The longest text of one response of the IMAP server a connection reads: its lines without
+/// the octets of its literals. It is the input bound of a folder listing or of a search,
+/// whose longest response is the line of a search with its numbers. The connection of the
+/// read of one message has a larger input bound, for the literal of the message: the lines
+/// around that literal are short, and a text above this bound ends the connection. The buffer
+/// of a text grows as its bytes arrive, so a text holds more than its bytes while it grows;
+/// the buffer of a literal has the length of the literal from its declaration on.
+pub(crate) const RESPONSE_TEXT_BYTES: usize = LISTING_INPUT_BYTES;
+
+/// What the declaration of a literal counts as, in bytes of protocol input, beside the octets
+/// of the literal. The reader of the responses keeps 32 bytes for every literal of the
+/// response it stands in (the place of the literal in the text, and the head of its buffer),
+/// in two lists that grow by doubling: while one of them grows, the reader holds three times
+/// those bytes. A server can declare a literal without an octet in 4 bytes of a line, so
+/// without this count a response of such declarations would hold many times the bytes it was
+/// counted as.
+pub(crate) const LITERAL_INPUT_BYTES: usize = 96;
+
+/// The part of the share of the body budget of the node that one mail call holds for itself
+/// (the budget of `Limits::body_budget_bytes`, which `forward` reserves its bodies from).
+///
+/// A call takes its share without waiting, in two parts. The first is this value. It is taken
+/// before the call reads its request frame: the frame, [`CALL_BYTES`], and the input bound of
+/// every connection whose input the call does not follow ([`LOGIN_INPUT_BYTES`],
+/// [`SMTP_INPUT_BYTES`]). The second follows the protocol input of a read ([`InputShare`]): the
+/// allowance of the connection that carries the read holds it while the read takes its input,
+/// and the call takes it into this value when the read ends ([`Share::take_in`]), so the
+/// response frame of the call is made under the whole share. So the share of a call is what
+/// the call read, and the shares of the calls of a node add up to the mail the node holds, not
+/// to the largest mail each call could have read.
+///
+/// Each part is held by the one value that uses it, and both are given back when they are
+/// dropped: a call that ends in any way, a panic included, holds nothing of the budget
+/// afterwards, and no lock stands around either part.
+pub(crate) struct Share {
+    budget: Arc<Semaphore>,
+    /// The bytes of the budget the call holds.
+    permit: OwnedSemaphorePermit,
 }
 
-/// Only the mail call opens this kind. Neither field implements response serialization.
+/// Takes `bytes` of the budget without waiting. `None` when they are not free.
+fn take_bytes(budget: &Arc<Semaphore>, bytes: usize) -> Option<OwnedSemaphorePermit> {
+    let permits = u32::try_from(bytes).ok()?;
+    budget.clone().try_acquire_many_owned(permits).ok()
+}
+
+impl Share {
+    /// The share of a call that starts: `bytes` of the budget, taken without waiting. `None`
+    /// when they are not free.
+    pub(crate) fn admit(budget: &Arc<Semaphore>, bytes: usize) -> Option<Share> {
+        Some(Share {
+            budget: budget.clone(),
+            permit: take_bytes(budget, bytes)?,
+        })
+    }
+
+    /// Makes the share `bytes`: more is taken without waiting, less is given back. False
+    /// when the budget has no room for more. The call knows the length of its request frame
+    /// when it calls this.
+    pub(crate) fn resize(&mut self, bytes: usize) -> bool {
+        let now = self.permit.num_permits();
+        if bytes > now {
+            match take_bytes(&self.budget, bytes.saturating_sub(now)) {
+                Some(more) => self.permit.merge(more),
+                None => return false,
+            }
+        } else if let Some(freed) = self.permit.split(now.saturating_sub(bytes)) {
+            drop(freed);
+        }
+        true
+    }
+
+    /// Takes the part of the share that followed the input of a read into this value: the
+    /// read ended, and what it answers with is held by the call from here on.
+    pub(crate) fn take_in(&mut self, input: InputShare) {
+        if let Some(permit) = input.permit {
+            self.permit.merge(permit);
+        }
+    }
+
+    /// Ends the share at what the response frame of the call holds, `bytes` at the most,
+    /// and hands the permit to that frame: a share is never raised here.
+    pub(crate) fn settle(mut self, bytes: usize) -> OwnedSemaphorePermit {
+        let now = self.permit.num_permits();
+        self.resize(bytes.min(now));
+        self.permit
+    }
+}
+
+/// The part of the share of a read that follows its protocol input ([`Allowance`]): for
+/// every byte the read takes from its IMAP connection, for every octet of a literal the
+/// server declares and for every declaration, this part grows by what the read holds per
+/// byte of input, in whole steps of [`SHARE_STEP_BYTES`], before the reader of the responses
+/// takes the byte. When the budget has no room for a step, the input of the read ends there
+/// ([`MailError::Capacity`]).
+pub(crate) struct InputShare {
+    budget: Arc<Semaphore>,
+    /// What the read holds at once per byte of its input.
+    held_per_byte: usize,
+    /// The steps taken so far. `None` before the first one.
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl InputShare {
+    /// The part of a read that holds `held_per_byte` bytes at once per byte of its input. It
+    /// holds nothing before the read takes input.
+    pub(crate) fn new(budget: &Arc<Semaphore>, held_per_byte: usize) -> InputShare {
+        InputShare {
+            budget: budget.clone(),
+            held_per_byte,
+            permit: None,
+        }
+    }
+
+    /// Raises the part to what the read holds of `accounted` bytes of input, in whole steps.
+    /// A part that is that large already stays as it is. False when the budget has no room.
+    fn cover(&mut self, accounted: usize) -> bool {
+        let needed = accounted
+            .saturating_mul(self.held_per_byte)
+            .div_ceil(SHARE_STEP_BYTES)
+            .saturating_mul(SHARE_STEP_BYTES);
+        let now = self
+            .permit
+            .as_ref()
+            .map_or(0, OwnedSemaphorePermit::num_permits);
+        if now >= needed {
+            return true;
+        }
+        match take_bytes(&self.budget, needed.saturating_sub(now)) {
+            Some(more) => {
+                match self.permit.as_mut() {
+                    Some(permit) => permit.merge(more),
+                    None => self.permit = Some(more),
+                }
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// Whether a `NO` reply to `LOGIN` says that the server refused the credentials. Two forms
+/// count: the RFC 5530 response code `AUTHENTICATIONFAILED`, and the information
+/// `Authentication failed` that imap.naver.com sends with its own response code `[AUTH]`
+/// (`NO [AUTH] "name": Authentication failed. (Please check your username, password)`). Any
+/// other `NO` is a provider failure.
+fn credentials_refused(status: &Status) -> bool {
+    status.mentions(b"authenticationfailed") || status.mentions(b"authentication failed")
+}
+
+/// A record of kind `app_password` that opened under the grant of its account. Its plaintext
+/// is not read yet: [`MailRecord::credentials`] reads it, after the log store confirmed the
+/// entry of the call.
+pub struct MailRecord {
+    plaintext: Secret<Vec<u8>>,
+}
+
+/// The account name and the application password of a record. Only a mail call reads them.
+/// Neither field implements response serialization.
 pub struct AppPassword {
     identity: String,
     password: Secret<String>,
@@ -68,16 +262,38 @@ pub enum MailError {
     TooLarge,
     MailboxChanged,
     Missing,
+    /// The body budget of the node has no room for the input of the call: the input ended
+    /// there.
+    Capacity,
 }
 
-impl AppPassword {
-    pub fn open(grant: &GrantView, user: &str, record: &Record) -> Result<Self, ProtocolError> {
-        let (kind, bytes) = open_for(grant, user, record)?;
-        if kind != Kind::AppPassword || record.provider != "naver_mail" {
-            return Err(ProtocolError::NotAllowed);
-        }
+/// Opens the record of a mail call for the account of the call, before the event of the call
+/// is created. What is judged here is the same for every value the record can hold: the
+/// grant, the AEAD verification, and the kind and the provider of the record. The plaintext
+/// is not read.
+pub fn open_record(
+    grant: &GrantView,
+    user: &str,
+    record: &Record,
+) -> Result<MailRecord, ProtocolError> {
+    let (kind, plaintext) = open_for(grant, user, record)?;
+    if kind != Kind::AppPassword || record.provider != "naver_mail" {
+        return Err(ProtocolError::NotAllowed);
+    }
+    Ok(MailRecord { plaintext })
+}
+
+impl MailRecord {
+    /// Reads the plaintext of the record. A mail call does this after the log store confirmed
+    /// the entry that holds its event, so every answer that depends on the content of the
+    /// plaintext has an entry. A plaintext that is no JSON object, a `username` that is no
+    /// NAVER account name, and a `password` that is shorter than 8 bytes, longer than 256
+    /// bytes or holds a control character are `record_invalid` at that point: nothing goes
+    /// to the provider, and the entry stays on the chain as the entry of a mail call that did
+    /// not take place.
+    pub fn credentials(&self) -> Result<AppPassword, ProtocolError> {
         let value = Secret::new(
-            serde_json::from_slice::<Value>(bytes.expose_secret())
+            serde_json::from_slice::<Value>(self.plaintext.expose_secret())
                 .map_err(|_| ProtocolError::RecordInvalid)?,
         );
         let value = value.expose_secret();
@@ -102,12 +318,14 @@ impl AppPassword {
         if password.len() < 8 || password.len() > 256 || password.chars().any(char::is_control) {
             return Err(ProtocolError::RecordInvalid);
         }
-        Ok(Self {
+        Ok(AppPassword {
             identity: format!("{id}@naver.com"),
             password: Secret::new(password.to_string()),
         })
     }
+}
 
+impl AppPassword {
     /// D: identity is returned by the verify call only after both authentications succeed.
     pub fn identity(&self) -> &str {
         &self.identity
@@ -124,33 +342,34 @@ impl AppPassword {
             .map_err(|_| ProtocolError::ResponseWithheld)
     }
 
-    async fn imap(
-        &self,
-        node: &Node,
-        response_bytes: usize,
-    ) -> Result<Session<MailStream>, MailError> {
+    /// Opens a connection to imap.naver.com and authenticates: sink K6 of the egress policy.
+    /// The connection delivers its protocol input within `allowance`.
+    async fn imap(&self, node: &Node, allowance: Allowance) -> Result<ImapSession, MailError> {
         let stream = node
             .egress
             .open_mail(node.platform.as_ref(), "imap.naver.com", 993, CALL_TIMEOUT)
             .await
             .map_err(|_| MailError::Unavailable)?;
-        let mut client = Client::new(limited(stream, response_bytes));
-        client
-            .read_response()
-            .await
-            .map_err(|_| MailError::Unavailable)?
-            .ok_or(MailError::Unavailable)?;
+        let mut connection = ImapConnection::new(stream, allowance);
+        // The greeting of the server: a connection it refuses, or ends, carries no login.
+        match connection.response().await? {
+            Response::Untagged(status)
+                if matches!(status.condition, Condition::Ok | Condition::Preauth) => {}
+            _ => return Err(MailError::Unavailable),
+        }
         let login = self
             .identity
             .strip_suffix("@naver.com")
             .ok_or(MailError::Invalid)?;
-        client
+        connection
             .login(login, self.password.expose_secret())
-            .await
-            .map_err(|(error, _)| match error {
-                async_imap::error::Error::No(text) if credentials_refused(&text) => MailError::Auth,
-                _ => MailError::Unavailable,
-            })
+            .await?;
+        Ok(ImapSession {
+            connection,
+            in_step: true,
+            answered: false,
+            login_ms: node.now_ms(),
+        })
     }
 
     async fn smtp(&self, node: &Node) -> Result<Smtp, MailError> {
@@ -160,7 +379,10 @@ impl AppPassword {
             .await
             .map_err(|_| MailError::Unavailable)?;
         let mut smtp = Smtp {
-            io: BufReader::new(BufWriter::new(limited(stream, 65536))),
+            io: BufReader::new(BufWriter::new(MailStream::bounded(
+                stream,
+                SMTP_INPUT_BYTES,
+            ))),
             size: None,
         };
         if smtp.reply().await?.0 != 220 {
@@ -201,123 +423,86 @@ impl AppPassword {
     }
 
     pub async fn verify(&self, node: &Node) -> Result<(), MailError> {
-        drop(self.imap(node, LISTING_INPUT_BYTES).await?);
+        drop(
+            self.imap(node, Allowance::reserved(LOGIN_INPUT_BYTES))
+                .await?,
+        );
         drop(self.smtp(node).await?);
         Ok(())
     }
 
-    pub async fn read(&self, node: &Node, request: &ReadMail) -> Result<MailData, MailError> {
-        request.validate()?;
+    /// Reads mail for one call, and returns the session of the call when it can carry the
+    /// next one. The share of the call follows the input of its connection: the part that
+    /// follows the input is held by the connection while the call reads, and is taken into
+    /// `share` when the read ends.
+    ///
+    /// `kept` is the session the node kept for this record from an earlier call, when it
+    /// kept one (`crate::mail_sessions`). The call goes over it and neither opens a
+    /// connection nor authenticates: the server accepted the application password of this
+    /// record for that connection. A kept session that ends before the server completed a
+    /// command of this call had ended while it carried no call: the call starts once more
+    /// over a new connection, with a login. Every command of a read examines, lists, searches
+    /// or fetches and changes nothing in the mailbox, so the second start repeats no act.
+    ///
+    /// The session comes back when the call left it in step with the server: every command
+    /// the call sent got its completion, and the reader of the connection stands between two
+    /// responses. A call that ended at a failure of the connection, at the input bound or at
+    /// the end of its share of the body budget returns none, and the connection ends with
+    /// the call.
+    pub async fn read(
+        &self,
+        node: &Node,
+        request: &ReadMail,
+        kept: Option<ImapSession>,
+        share: &mut Share,
+    ) -> (Result<MailData, MailError>, Option<ImapSession>) {
+        if let Err(error) = request.validate() {
+            return (Err(error), kept);
+        }
         // A UID search can expand into a large set before pagination. Bound listing and
         // header input separately from a raw message, whose content has the frame limit.
-        let response_bytes = if request.action == "read" {
-            message_input_bytes(&node.limits)
-        } else {
-            LISTING_INPUT_BYTES
+        let (bound, held_per_byte) = match request.action.as_str() {
+            "read" => (message_input_bytes(&node.limits), MESSAGE_HELD_PER_BYTE),
+            _ => (LISTING_INPUT_BYTES, LISTING_HELD_PER_BYTE),
         };
-        let mut session = self.imap(node, response_bytes).await?;
-        if request.action == "folders" {
-            let folders = list_folders(&mut session).await?;
-            return Ok(MailData::Json(json!({"folders": folders})));
-        }
-        let mailbox = session
-            .examine(&request.mailbox)
-            .await
-            .map_err(|_| MailError::Unavailable)?;
-        let validity = mailbox.uid_validity.ok_or(MailError::Unavailable)?;
-        if request
-            .uid_validity
-            .is_some_and(|expected| expected != validity)
-        {
-            return Err(MailError::MailboxChanged);
-        }
-        if request.action == "search" {
-            let upper = request
-                .before_uid
-                .unwrap_or(mailbox.uid_next.unwrap_or(u32::MAX))
-                .saturating_sub(1);
-            if upper == 0 {
-                return Ok(MailData::Json(
-                    json!({"uid_validity": validity, "messages": [], "next_uid": null}),
-                ));
+        let input = InputShare::new(&node.body_budget, held_per_byte);
+        let (mut session, mut reused) = match kept {
+            Some(mut session) => {
+                session.serve(Allowance::charged(bound, input));
+                (session, true)
             }
-            let mut uids = search_uids(&mut session, request.query(upper)?).await?;
-            uids.sort_unstable_by(|a, b| b.cmp(a));
-            uids.dedup();
-            let more = uids.len() > request.limit;
-            uids.truncate(request.limit);
-            let next = if more { uids.last().copied() } else { None };
-            let mut messages = Vec::new();
-            if !uids.is_empty() {
-                let set = uids
-                    .iter()
-                    .map(u32::to_string)
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let rows =
-                    uid_fetch(&mut session, &set, "(UID RFC822.SIZE BODY.PEEK[HEADER])").await?;
-                let mut by_uid: BTreeMap<u32, (Option<u32>, Option<Vec<u8>>)> = BTreeMap::new();
-                for row in rows {
-                    let Some(uid) = row.uid else {
-                        continue;
-                    };
-                    if !uids.contains(&uid) {
-                        continue;
-                    }
-                    let entry = by_uid.entry(uid).or_insert((None, None));
-                    if row.size.is_some() {
-                        entry.0 = row.size;
-                    }
-                    if row.header.is_some() {
-                        entry.1 = row.header;
-                    }
-                }
-                for uid in &uids {
-                    if let Some((size, header)) = by_uid.get(uid) {
-                        messages.push(json!({
-                            "uid": uid,
-                            "size": size,
-                            "headers_b64": STANDARD.encode(header.as_deref().unwrap_or_default()),
-                        }));
-                    }
-                }
-            }
-            return Ok(MailData::Json(
-                json!({"uid_validity": validity, "messages": messages, "next_uid": next}),
-            ));
+            None => match self.imap(node, Allowance::charged(bound, input)).await {
+                Ok(session) => (session, false),
+                Err(error) => return (Err(error), None),
+            },
+        };
+        let mut data = session.read(request, &node.limits).await;
+        if reused && session.ended_unanswered() {
+            reused = false;
+            // The second start goes on under what the first one took of the budget.
+            let input = session
+                .release()
+                .unwrap_or_else(|| InputShare::new(&node.body_budget, held_per_byte));
+            session = match self.imap(node, Allowance::charged(bound, input)).await {
+                Ok(session) => session,
+                Err(error) => return (Err(error), None),
+            };
+            data = session.read(request, &node.limits).await;
         }
-        let uid = request.uid.ok_or(MailError::Invalid)?;
-        let uid_set = uid.to_string();
-        let sizes = uid_fetch(&mut session, &uid_set, "(UID RFC822.SIZE)").await?;
-        let size = sizes
-            .iter()
-            .find(|row| row.uid == Some(uid))
-            .and_then(|row| row.size)
-            .ok_or(MailError::Missing)?;
-        if size as usize > node.limits.body_bytes {
-            return Err(MailError::TooLarge);
+        if reused {
+            node.egress
+                .counters
+                .idle_reuses
+                .mail
+                .fetch_add(1, Ordering::Relaxed);
         }
-        let rows = uid_fetch(&mut session, &uid_set, "(UID BODY.PEEK[])").await?;
-        let body = rows
-            .into_iter()
-            .find(|row| row.uid == Some(uid))
-            .and_then(|row| row.body)
-            .ok_or(MailError::Missing)?;
-        if body.len() > node.limits.body_bytes {
-            return Err(MailError::TooLarge);
+        // The read ended: what it answers with is held by the call, under the share its
+        // input took.
+        if let Some(input) = session.release() {
+            share.take_in(input);
         }
-        Ok(MailData::Raw(body))
-    }
-
-    pub(crate) fn validate_submission(
-        &self,
-        recipients: &[String],
-        body: &[u8],
-    ) -> Result<(), MailError> {
-        if recipients.is_empty() || recipients.len() > 50 || recipients.iter().any(|v| !email(v)) {
-            return Err(MailError::Invalid);
-        }
-        validate_message(body, &self.identity)
+        let session = session.rest().then_some(session);
+        (data, session)
     }
 
     /// A single authenticated SMTP transaction through K7. No retry follows DATA.
@@ -327,7 +512,12 @@ impl AppPassword {
         recipients: &[String],
         body: &[u8],
     ) -> Result<MailData, MailError> {
-        self.validate_submission(recipients, body)?;
+        // The sender of the message is the account of the record. This judgement depends on
+        // the content of the record: the call makes it here, after its entry, and not with
+        // the form of the submission before it.
+        if submission_sender(recipients, body)? != self.identity {
+            return Err(MailError::Invalid);
+        }
         let mut smtp = self.smtp(node).await?;
         if smtp
             .size
@@ -369,9 +559,9 @@ impl AppPassword {
         }
         let code = smtp.command(b".\r\n").await?.0;
         match code {
-            250 => Ok(MailData::Json(
-                json!({"status": "accepted", "smtp_code": code}),
-            )),
+            250 => Ok(MailData::Json(to_json(
+                &json!({"status": "accepted", "smtp_code": code}),
+            ))),
             400..=599 => Ok(rejected(code)),
             _ => Err(MailError::Unavailable),
         }
@@ -379,11 +569,14 @@ impl AppPassword {
 }
 
 fn rejected(code: u16) -> MailData {
-    MailData::Json(json!({"status": "rejected", "smtp_code": code}))
+    MailData::Json(to_json(&json!({"status": "rejected", "smtp_code": code})))
 }
 
+/// What a mail call answers with.
 pub enum MailData {
-    Json(Value),
+    /// A JSON document, serialized.
+    Json(Vec<u8>),
+    /// A message as the server holds it.
     Raw(Vec<u8>),
 }
 
@@ -414,7 +607,7 @@ impl ReadMail {
         if !matches!(self.action.as_str(), "folders" | "search" | "read")
             || !(1..=50).contains(&self.limit)
             || self.mailbox.is_empty()
-            || self.mailbox.len() > 1024
+            || self.mailbox.len() > imap::FOLDER_NAME_BYTES
             || self.mailbox.chars().any(char::is_control)
         {
             return Err(MailError::Invalid);
@@ -450,161 +643,332 @@ impl ReadMail {
     }
 }
 
-async fn list_folders(session: &mut Session<MailStream>) -> Result<Vec<Value>, MailError> {
-    let tag = session
-        .run_command("LIST \"\" \"*\"")
-        .await
-        .map_err(|_| MailError::Unavailable)?;
-    let mut folders = Vec::new();
-    loop {
-        let response = session
-            .read_response()
-            .await
-            .map_err(|_| MailError::Unavailable)?
-            .ok_or(MailError::Unavailable)?;
-        match response.parsed() {
-            Response::MailboxData(MailboxDatum::List(data)) => {
-                folders.push(json!({"name": data.name.as_ref()}));
-            }
-            Response::Done {
-                tag: response_tag,
-                status: Status::Ok,
-                ..
-            } if *response_tag == tag => return Ok(folders),
-            Response::Done { .. }
-            | Response::Data {
-                status: Status::Bye,
-                ..
-            } => return Err(MailError::Unavailable),
-            _ => {}
+/// One folder of an account, as a folder listing answers: the listing is the JSON document
+/// `{"folders":[...]}` of these.
+#[derive(Serialize)]
+struct Folder<'a> {
+    name: &'a str,
+}
+
+/// One page of a search, as a search answers.
+#[derive(Serialize)]
+struct Page {
+    uid_validity: u32,
+    messages: Vec<Listed>,
+    next_uid: Option<u32>,
+}
+
+/// One message of a page: its UID, its size, and its header block in base64.
+#[derive(Serialize)]
+struct Listed {
+    uid: u32,
+    size: Option<u64>,
+    headers_b64: String,
+}
+
+/// An authenticated connection to imap.naver.com: the session of one login with the
+/// application password of one record.
+///
+/// A node keeps the session of a read for the next read of the same record
+/// (`crate::mail_sessions`). The session holds no byte of the application password: what it
+/// holds is the TLS connection the server accepted the password for.
+pub(crate) struct ImapSession {
+    connection: ImapConnection,
+    /// True while every command the node sent got its tagged completion: the next command
+    /// starts an exchange of its own. False from the moment a command is sent to the moment
+    /// its completion was read, and for good once the connection failed in between.
+    in_step: bool,
+    /// True once the server completed a command of the call the session carries.
+    answered: bool,
+    /// The node time of the login.
+    login_ms: u64,
+}
+
+/// What a response is to the command with a tag.
+enum Turn {
+    /// The tagged completion of the command, and whether its condition is `OK`.
+    Completed(bool),
+    /// The server ends the connection (`BYE`), or completes a command the node did not send.
+    Ended,
+    /// Data, of the command or unsolicited. An untagged `NO` or `BAD` is a warning (RFC 3501
+    /// sections 7.1.2 and 7.1.3): the completion of the command says how the command ended.
+    Data,
+}
+
+fn turn(response: &Response, tag: &str) -> Turn {
+    match response {
+        Response::Tagged(completed, status) if completed == tag.as_bytes() => {
+            Turn::Completed(status.condition == Condition::Ok)
         }
+        Response::Tagged(..) => Turn::Ended,
+        Response::Untagged(status) if status.condition == Condition::Bye => Turn::Ended,
+        _ => Turn::Data,
     }
 }
 
-struct FetchedMessage {
-    uid: Option<u32>,
-    size: Option<u32>,
-    header: Option<Vec<u8>>,
-    body: Option<Vec<u8>>,
-}
+impl ImapSession {
+    /// The node time of the login of the session.
+    pub(crate) fn login_ms(&self) -> u64 {
+        self.login_ms
+    }
 
-async fn uid_fetch(
-    session: &mut Session<MailStream>,
-    set: &str,
-    items: &str,
-) -> Result<Vec<FetchedMessage>, MailError> {
-    let tag = session
-        .run_command(format!("UID FETCH {set} {items}"))
-        .await
-        .map_err(|_| MailError::Unavailable)?;
-    let mut rows = Vec::new();
-    loop {
-        let response = session
-            .read_response()
-            .await
-            .map_err(|_| MailError::Unavailable)?
-            .ok_or(MailError::Unavailable)?;
-        match response.parsed() {
-            Response::Fetch(_, attrs) => {
-                let mut row = FetchedMessage {
-                    uid: None,
-                    size: None,
-                    header: None,
-                    body: None,
-                };
-                for attr in attrs {
-                    match attr {
-                        AttributeValue::Uid(uid) => row.uid = Some(*uid),
-                        AttributeValue::Rfc822Size(size) => row.size = Some(*size),
-                        AttributeValue::BodySection {
-                            section: Some(SectionPath::Full(MessageSection::Header)),
-                            data: Some(header),
-                            ..
-                        }
-                        | AttributeValue::Rfc822Header(Some(header)) => {
-                            row.header = Some(header.to_vec());
-                        }
-                        AttributeValue::BodySection {
-                            section: None,
-                            data: Some(body),
-                            ..
-                        }
-                        | AttributeValue::Rfc822(Some(body)) => {
-                            row.body = Some(body.to_vec());
-                        }
-                        _ => {}
+    /// Gives the session to a call: the call takes the input of the connection from here on,
+    /// within its allowance.
+    fn serve(&mut self, allowance: Allowance) {
+        self.answered = false;
+        self.connection.serve(allowance);
+    }
+
+    /// Takes the allowance of the call from the session, and returns the part of the share
+    /// of the call that followed its input. The session takes no further input for the call.
+    fn release(&mut self) -> Option<InputShare> {
+        self.connection.release()
+    }
+
+    /// Takes the session from its call. True when the session can carry a further call: it
+    /// is in step with the server, its connection has not ended, and its reader stands
+    /// between two responses.
+    fn rest(&mut self) -> bool {
+        let at_rest = self.connection.rest();
+        self.in_step && at_rest
+    }
+
+    /// True when the connection ended and the server completed no command of the call the
+    /// session carries: a session that was kept had ended while it carried no call.
+    fn ended_unanswered(&self) -> bool {
+        self.connection.lost && !self.answered
+    }
+
+    /// Sends a command and returns its tag. The session is out of step until the completion
+    /// of the command was read.
+    async fn send(&mut self, command: String) -> Result<String, MailError> {
+        self.in_step = false;
+        self.connection.command(&command).await
+    }
+
+    /// Ends a command at its completion: the session is in step again, and the command
+    /// succeeded when its condition is `OK`.
+    fn completed<T>(&mut self, ok: bool, value: T) -> Result<T, MailError> {
+        self.in_step = true;
+        self.answered = true;
+        match ok {
+            true => Ok(value),
+            false => Err(MailError::Unavailable),
+        }
+    }
+
+    /// The commands of one read, and what the read answers with.
+    async fn read(&mut self, request: &ReadMail, limits: &Limits) -> Result<MailData, MailError> {
+        if request.action == "folders" {
+            return Ok(MailData::Json(self.list_folders().await?));
+        }
+        let (validity, uid_next) = self.examine(&request.mailbox).await?;
+        if request
+            .uid_validity
+            .is_some_and(|expected| expected != validity)
+        {
+            return Err(MailError::MailboxChanged);
+        }
+        if request.action == "search" {
+            let upper = request
+                .before_uid
+                .unwrap_or(uid_next.unwrap_or(u32::MAX))
+                .saturating_sub(1);
+            let mut page = Page {
+                uid_validity: validity,
+                messages: Vec::new(),
+                next_uid: None,
+            };
+            if upper == 0 {
+                return Ok(MailData::Json(to_json(&page)));
+            }
+            let mut uids = self.search_uids(request.query(upper)?).await?;
+            uids.sort_unstable_by(|a, b| b.cmp(a));
+            uids.dedup();
+            let more = uids.len() > request.limit;
+            uids.truncate(request.limit);
+            // The numbers of the page stay: the room of the others is given back.
+            uids.shrink_to_fit();
+            page.next_uid = if more { uids.last().copied() } else { None };
+            if !uids.is_empty() {
+                let set = uids
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let mut rows = self
+                    .uid_fetch(&set, "(UID RFC822.SIZE BODY.PEEK[HEADER])", &uids)
+                    .await?;
+                for uid in &uids {
+                    // The header of a message leaves the rows when its text is made: a
+                    // page holds each header once, in one of the two forms.
+                    if let Some(row) = rows.remove(uid) {
+                        page.messages.push(Listed {
+                            uid: *uid,
+                            size: row.size,
+                            headers_b64: STANDARD.encode(row.header.unwrap_or_default()),
+                        });
                     }
                 }
-                rows.push(row);
             }
-            Response::Done {
-                tag: response_tag,
-                status: Status::Ok,
-                ..
-            } if *response_tag == tag => return Ok(rows),
-            Response::Done { .. }
-            | Response::Data {
-                status: Status::Bye,
-                ..
-            } => return Err(MailError::Unavailable),
-            _ => {}
+            return Ok(MailData::Json(to_json(&page)));
         }
+        let uid = request.uid.ok_or(MailError::Invalid)?;
+        let uid_set = uid.to_string();
+        let size = self
+            .uid_fetch(&uid_set, "(UID RFC822.SIZE)", &[uid])
+            .await?
+            .remove(&uid)
+            .and_then(|row| row.size)
+            .ok_or(MailError::Missing)?;
+        if size > limits.body_bytes as u64 {
+            return Err(MailError::TooLarge);
+        }
+        let body = self
+            .uid_fetch(&uid_set, "(UID BODY.PEEK[])", &[uid])
+            .await?
+            .remove(&uid)
+            .and_then(|row| row.body)
+            .ok_or(MailError::Missing)?;
+        if body.len() > limits.body_bytes {
+            return Err(MailError::TooLarge);
+        }
+        Ok(MailData::Raw(body))
     }
-}
 
-async fn search_uids(
-    session: &mut Session<MailStream>,
-    pieces: Vec<String>,
-) -> Result<Vec<u32>, MailError> {
-    let mut pieces = pieces.into_iter();
-    let tag = session
-        .run_command(pieces.next().ok_or(MailError::Invalid)?)
-        .await
-        .map_err(|_| MailError::Unavailable)?;
-    for piece in pieces {
+    /// `LIST "" "*"`: the folders of the account, as the JSON document a folder listing
+    /// answers with (`{"folders":[{"name":"INBOX"},...]}`). The document is written as the
+    /// names arrive: a listing holds the text it answers with, and no list of the names
+    /// beside it.
+    async fn list_folders(&mut self) -> Result<Vec<u8>, MailError> {
+        let tag = self.send("LIST \"\" \"*\"".to_string()).await?;
+        let mut document = b"{\"folders\":[".to_vec();
+        let mut first = true;
         loop {
-            let response = session
-                .read_response()
-                .await
-                .map_err(|_| MailError::Unavailable)?
-                .ok_or(MailError::Unavailable)?;
-            match response.parsed() {
-                Response::Continue(_) => break,
-                Response::Done { .. }
-                | Response::Data {
-                    status: Status::Bye,
-                    ..
-                } => return Err(MailError::Unavailable),
-                _ => {}
+            let response = self.connection.response().await?;
+            match turn(&response, &tag) {
+                Turn::Completed(ok) => {
+                    document.extend_from_slice(b"]}");
+                    return self.completed(ok, document);
+                }
+                Turn::Ended => return Err(MailError::Unavailable),
+                Turn::Data => {
+                    if let Response::List(name) = response {
+                        if !std::mem::take(&mut first) {
+                            document.push(b',');
+                        }
+                        document.extend_from_slice(&to_json(&Folder { name: &name }));
+                    }
+                }
             }
         }
-        session
-            .run_command_untagged(piece)
-            .await
-            .map_err(|_| MailError::Unavailable)?;
     }
-    let mut uids = Vec::new();
-    loop {
-        let response = session
-            .read_response()
-            .await
-            .map_err(|_| MailError::Unavailable)?
-            .ok_or(MailError::Unavailable)?;
-        match response.parsed() {
-            Response::MailboxData(MailboxDatum::Search(values)) => {
-                uids.extend(values.iter().copied())
+
+    /// `EXAMINE`: opens a mailbox for reading and returns its generation (`UIDVALIDITY`) and
+    /// the UID its next message gets (`UIDNEXT`), when the server names one. A mailbox the
+    /// server does not open, and one whose generation it does not name, fail the read.
+    async fn examine(&mut self, mailbox: &str) -> Result<(u32, Option<u32>), MailError> {
+        let tag = self
+            .send(format!("EXAMINE {}", imap::quoted(mailbox)))
+            .await?;
+        let (mut validity, mut uid_next) = (None, None);
+        loop {
+            let response = self.connection.response().await?;
+            match turn(&response, &tag) {
+                Turn::Completed(ok) => {
+                    let validity = self.completed(ok, validity)?;
+                    return Ok((validity.ok_or(MailError::Unavailable)?, uid_next));
+                }
+                Turn::Ended => return Err(MailError::Unavailable),
+                Turn::Data => {
+                    if let Response::Untagged(status) = response {
+                        match (status.condition, status.code) {
+                            (Condition::Ok, Code::UidValidity(value)) => validity = Some(value),
+                            (Condition::Ok, Code::UidNext(value)) => uid_next = Some(value),
+                            _ => {}
+                        }
+                    }
+                }
             }
-            Response::Done {
-                tag: response_tag,
-                status: Status::Ok,
-                ..
-            } if *response_tag == tag => return Ok(uids),
-            Response::Done { .. }
-            | Response::Data {
-                status: Status::Bye,
-                ..
-            } => return Err(MailError::Unavailable),
-            _ => {}
+        }
+    }
+
+    /// `UID FETCH set items`: the messages of `wanted` the server answers with, by UID. The
+    /// items of one message can arrive in more than one response: they are put together. A
+    /// response about another message (an unsolicited one, or one without a UID) is dropped
+    /// when it was read, so the rows hold the messages the read asked for and no more.
+    async fn uid_fetch(
+        &mut self,
+        set: &str,
+        items: &str,
+        wanted: &[u32],
+    ) -> Result<BTreeMap<u32, Fetched>, MailError> {
+        let tag = self.send(format!("UID FETCH {set} {items}")).await?;
+        let mut rows: BTreeMap<u32, Fetched> = BTreeMap::new();
+        loop {
+            let response = self.connection.response().await?;
+            match turn(&response, &tag) {
+                Turn::Completed(ok) => return self.completed(ok, rows),
+                Turn::Ended => return Err(MailError::Unavailable),
+                Turn::Data => {
+                    let Response::Fetch(fetched) = response else {
+                        continue;
+                    };
+                    let Some(uid) = fetched.uid.filter(|uid| wanted.contains(uid)) else {
+                        continue;
+                    };
+                    let row = rows.entry(uid).or_default();
+                    row.uid = Some(uid);
+                    row.size = fetched.size.or(row.size);
+                    if fetched.header.is_some() {
+                        row.header = fetched.header;
+                    }
+                    if fetched.body.is_some() {
+                        row.body = fetched.body;
+                    }
+                }
+            }
+        }
+    }
+
+    /// `UID SEARCH`: the UIDs the server answers with. Every piece after the first is the
+    /// octets of a literal, sent after the continuation request of the server.
+    async fn search_uids(&mut self, pieces: Vec<String>) -> Result<Vec<u32>, MailError> {
+        let mut pieces = pieces.into_iter();
+        let tag = self.send(pieces.next().ok_or(MailError::Invalid)?).await?;
+        for piece in pieces {
+            loop {
+                let response = self.connection.response().await?;
+                match turn(&response, &tag) {
+                    // The server completed the command where the node expected to go on.
+                    Turn::Completed(_) => return self.completed(false, Vec::new()),
+                    Turn::Ended => return Err(MailError::Unavailable),
+                    Turn::Data => {
+                        if response == Response::Continue {
+                            break;
+                        }
+                    }
+                }
+            }
+            self.connection.line(&piece).await?;
+        }
+        let mut uids = Vec::new();
+        loop {
+            let response = self.connection.response().await?;
+            match turn(&response, &tag) {
+                Turn::Completed(ok) => return self.completed(ok, uids),
+                Turn::Ended => return Err(MailError::Unavailable),
+                Turn::Data => {
+                    if let Response::Search(values) = response {
+                        // The numbers of the first response are the list: no copy of them
+                        // is made.
+                        match uids.is_empty() {
+                            true => uids = values,
+                            false => uids.extend(values),
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -664,7 +1028,18 @@ fn email(value: &str) -> bool {
         && !value.ends_with('@')
 }
 
-fn validate_message(body: &[u8], identity: &str) -> Result<(), MailError> {
+/// The form of a submission, which a call judges before it creates its event: one to 50
+/// recipients that are addresses, and a message of ASCII lines that end in CRLF whose header
+/// block holds exactly one `From` field. Returns the value of that field. Whether it names
+/// the account of the record is judged after the entry of the call ([`AppPassword::submit`]):
+/// that answer depends on the content of the record.
+pub(crate) fn submission_sender<'a>(
+    recipients: &[String],
+    body: &'a [u8],
+) -> Result<&'a str, MailError> {
+    if recipients.is_empty() || recipients.len() > 50 || recipients.iter().any(|v| !email(v)) {
+        return Err(MailError::Invalid);
+    }
     if !body.is_ascii()
         || !body.ends_with(b"\r\n")
         || body.windows(2).any(|pair| match pair {
@@ -685,10 +1060,10 @@ fn validate_message(body: &[u8], identity: &str) -> Result<(), MailError> {
             key.eq_ignore_ascii_case("from").then_some(value.trim())
         })
         .collect();
-    if from != [identity] {
-        return Err(MailError::Invalid);
+    match from.as_slice() {
+        [sender] => Ok(sender),
+        _ => Err(MailError::Invalid),
     }
-    Ok(())
 }
 
 struct Smtp {
@@ -748,131 +1123,521 @@ impl Smtp {
     }
 }
 
-/// Caps bytes delivered to the protocol client at `limit`, and refuses a literal declaration
-/// above `limit` before the client's parser reads it. async-imap 0.12 grows its parser buffer
-/// to a declared literal length with a zero-filled allocation (at most 512 MiB) before the
-/// octets arrive, so without the guard a server's declaration alone would commit that memory.
-/// With it, the parser buffer never exceeds `limit` plus one block, and the API reserves
-/// memory by `limit` instead of the parser maximum.
-fn limited(stream: Stream, limit: usize) -> MailStream {
-    let (read, write) = tokio::io::split(stream);
-    let read = LiteralGuard {
-        inner: read.take(limit as u64),
-        bound: limit,
-        scan: LiteralScan::Text,
-    };
-    MailStream(Box::new(tokio::io::join(read, write)))
+/// What one call may take from an IMAP connection, and what that costs the call.
+///
+/// `left` bounds the protocol input: the connection delivers no byte above it. `accounted` is
+/// what the call holds of its input: the bytes it took, the octets still to come of a
+/// literal the server declared, and [`LITERAL_INPUT_BYTES`] for every declaration. The buffer
+/// of a literal has the length of the literal from the moment the literal is admitted, so a
+/// declaration alone commits that memory, and the reader keeps a place for every literal it
+/// admitted, whatever its length. Three rules keep both inside the share of the call. A
+/// declaration above what is left of the input bound ends the input: its octets could not
+/// arrive under the bound. Every declaration takes [`LITERAL_INPUT_BYTES`] of the input bound,
+/// so the literals of a connection are bounded like its bytes. And the share of the call is
+/// raised to `accounted` times what the call holds per byte ([`InputShare`]) before the buffer
+/// of a literal is made and before a byte that was taken is read. So what a connection holds
+/// of its input never exceeds its input bound, whatever a server declares, and the call holds
+/// a share of the body budget for all of it.
+pub(crate) struct Allowance {
+    /// Bytes the call may still take from the connection, and bytes its declarations may
+    /// still count as.
+    left: usize,
+    /// Bytes the call took, the octets still to come of a declared literal, and what its
+    /// declarations counted as.
+    accounted: usize,
+    /// The octets of declared literals that are accounted and were not taken yet.
+    outstanding: usize,
+    /// The part of the share of the call that covers what the call holds of `accounted`.
+    /// `None` for a connection whose whole input bound the call reserved before it opened
+    /// the connection.
+    charge: Option<InputShare>,
 }
 
-/// Where a scan of server bytes stands between literal declarations. RFC 3501 section 4.3:
-/// a literal is `{` digits `}` CRLF followed by that many octets, and a quoted string holds
-/// no CR or LF, so a declaration is recognized without tracking quoted strings. A line of
-/// text that ends in `{digits}` is read as a declaration here and by the protocol parser
-/// alike, so the two never disagree about where the octets are.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LiteralScan {
-    /// Outside a declaration.
-    Text,
-    /// After `{`: the digits read so far.
-    Digits(u64),
-    /// After `}`: the declared length, expecting CR.
-    Closed(u64),
-    /// After CR: the declared length, expecting LF.
-    Cr(u64),
-    /// Inside the octets of a literal: those still to come.
-    Octets(u64),
+impl Allowance {
+    /// `bound` bytes of input, which the call takes into `share` as the input arrives. A
+    /// share that holds steps already (the share of a read that starts once more) covers the
+    /// input up to them.
+    pub(crate) fn charged(bound: usize, share: InputShare) -> Allowance {
+        Allowance {
+            left: bound,
+            accounted: 0,
+            outstanding: 0,
+            charge: Some(share),
+        }
+    }
+
+    /// `bound` bytes of input that the call reserved before it opened the connection.
+    pub(crate) fn reserved(bound: usize) -> Allowance {
+        Allowance {
+            left: bound,
+            accounted: 0,
+            outstanding: 0,
+            charge: None,
+        }
+    }
+
+    /// Raises the share of the call to what it holds of its input now.
+    fn cover(&mut self) -> Result<(), MailError> {
+        let covered = match self.charge.as_mut() {
+            Some(share) => share.cover(self.accounted),
+            None => true,
+        };
+        match covered {
+            true => Ok(()),
+            false => Err(MailError::Capacity),
+        }
+    }
+
+    /// Ends the allowance and returns the part of the share of the call that followed its
+    /// input, when the call takes that part as its input arrives.
+    pub(crate) fn into_share(self) -> Option<InputShare> {
+        self.charge
+    }
+
+    /// Counts `bytes` bytes the connection just delivered. The octets of a declared literal
+    /// among them were accounted when they were declared.
+    fn take(&mut self, bytes: usize) -> Result<(), MailError> {
+        self.left = self.left.saturating_sub(bytes);
+        let declared = bytes.min(self.outstanding);
+        self.outstanding = self.outstanding.saturating_sub(declared);
+        self.accounted = self
+            .accounted
+            .saturating_add(bytes.saturating_sub(declared));
+        self.cover()
+    }
+
+    /// Accounts the declaration of a literal: [`LITERAL_INPUT_BYTES`] of the input bound for
+    /// the declaration itself, and the `missing` octets of the literal that the connection
+    /// has not delivered yet. The octets arrive within what is left of the bound, or not at
+    /// all: a declaration the bound has no room for is [`MailError::Unavailable`].
+    fn declare(&mut self, missing: u64) -> Result<(), MailError> {
+        let left = self
+            .left
+            .checked_sub(LITERAL_INPUT_BYTES)
+            .ok_or(MailError::Unavailable)?;
+        let missing = usize::try_from(missing)
+            .ok()
+            .filter(|missing| *missing <= left)
+            .ok_or(MailError::Unavailable)?;
+        self.left = left;
+        self.outstanding = self.outstanding.saturating_add(missing);
+        self.accounted = self
+            .accounted
+            .saturating_add(LITERAL_INPUT_BYTES)
+            .saturating_add(missing);
+        self.cover()
+    }
 }
 
-impl LiteralScan {
-    /// Advances over `bytes`. `Err(length)` is a declaration above `bound`; the scan does not
-    /// continue past it.
-    pub(crate) fn feed(&mut self, bytes: &[u8], bound: usize) -> Result<(), u64> {
-        for &byte in bytes {
-            *self = match (*self, byte) {
-                (Self::Octets(remaining), _) if remaining > 1 => Self::Octets(remaining - 1),
-                (Self::Octets(_), _) => Self::Text,
-                (Self::Text, b'{') => Self::Digits(0),
-                (Self::Text, _) => Self::Text,
-                (Self::Digits(length), b'0'..=b'9') => Self::Digits(
-                    length
-                        .saturating_mul(10)
-                        .saturating_add(u64::from(byte - b'0')),
-                ),
-                (Self::Digits(length), b'}') => Self::Closed(length),
-                (Self::Closed(length), b'\r') => Self::Cr(length),
-                (Self::Cr(length), b'\n') => {
-                    if length > bound as u64 {
-                        return Err(length);
-                    }
-                    if length == 0 {
-                        Self::Text
-                    } else {
-                        Self::Octets(length)
-                    }
+/// A connection to the IMAP server: the byte pipe with TLS that ends inside the node, the
+/// reader of its responses ([`crate::imap`]) and the input its call may take from it. Every
+/// byte the server sends passes the [`Allowance`] of the call before the reader takes it: the
+/// input bound, and the share of the body budget. The reader is the one place that says where
+/// the octets of a literal are, so the octets the allowance counts are the octets a response
+/// holds.
+pub(crate) struct ImapConnection {
+    stream: Stream,
+    reader: imap::Reader,
+    /// Bytes the stream delivered. The reader took the first `taken` of them.
+    buffer: Vec<u8>,
+    taken: usize,
+    /// What the call of the connection may take from it. `None` for a connection that
+    /// carries no call (a kept session): it takes no input.
+    allowance: Option<Allowance>,
+    /// The number of the last tag.
+    tags: u64,
+    /// True once the stream ended or failed, or the server said that it ends the connection
+    /// (`BYE`).
+    lost: bool,
+}
+
+impl ImapConnection {
+    fn new(stream: Stream, allowance: Allowance) -> ImapConnection {
+        ImapConnection {
+            stream,
+            reader: imap::Reader::default(),
+            buffer: Vec::new(),
+            taken: 0,
+            allowance: Some(allowance),
+            tags: 0,
+            lost: false,
+        }
+    }
+
+    /// Gives the connection to a call: the call takes its input, within this allowance.
+    fn serve(&mut self, allowance: Allowance) {
+        self.allowance = Some(allowance);
+    }
+
+    /// Takes the allowance of the call from the connection, and returns the part of the
+    /// share of the call that followed its input. Without an allowance the connection takes
+    /// no input.
+    fn release(&mut self) -> Option<InputShare> {
+        self.allowance.take().and_then(Allowance::into_share)
+    }
+
+    /// Takes the connection from its call, with the allowance of the call when it still has
+    /// it, and gives back the room of its buffer. True when the connection can carry a
+    /// further call: its stream has not ended, and the reader stands between two responses.
+    /// Bytes the stream delivered behind the last response the call read (a server may send a
+    /// response nobody asked for at any time) stay for the next call, which reads them first:
+    /// they are less than one read of the connection.
+    fn rest(&mut self) -> bool {
+        self.allowance = None;
+        let taken = self.taken.min(self.buffer.len());
+        self.buffer.drain(..taken);
+        self.buffer.shrink_to_fit();
+        self.taken = 0;
+        !self.lost && self.reader.at_rest()
+    }
+
+    /// Writes bytes of a command.
+    async fn write(&mut self, bytes: &[u8]) -> Result<(), MailError> {
+        let written = async {
+            self.stream.write_all(bytes).await?;
+            self.stream.flush().await
+        };
+        written.await.map_err(|_| {
+            self.lost = true;
+            MailError::Unavailable
+        })
+    }
+
+    /// Writes one line of a command.
+    async fn line(&mut self, text: &str) -> Result<(), MailError> {
+        let mut line = Vec::with_capacity(text.len().saturating_add(2));
+        line.extend_from_slice(text.as_bytes());
+        line.extend_from_slice(b"\r\n");
+        self.write(&line).await
+    }
+
+    /// The tag of the next command.
+    fn next_tag(&mut self) -> String {
+        self.tags = self.tags.saturating_add(1);
+        format!("a{}", self.tags)
+    }
+
+    /// Sends a command under a new tag and returns the tag.
+    async fn command(&mut self, command: &str) -> Result<String, MailError> {
+        let tag = self.next_tag();
+        self.line(&format!("{tag} {command}")).await?;
+        Ok(tag)
+    }
+
+    /// `LOGIN` with the account name and the application password, each as a quoted string.
+    /// The line that holds the password is overwritten when it was written. A `NO` that says
+    /// the server refused the credentials is [`MailError::Auth`].
+    async fn login(&mut self, user: &str, password: &str) -> Result<(), MailError> {
+        let tag = self.next_tag();
+        // Room for the whole line, every character escaped: no shorter buffer with a part
+        // of the password is left behind by a growth.
+        let mut line = Zeroizing::new(String::with_capacity(
+            tag.len()
+                .saturating_add(16)
+                .saturating_add(user.len().saturating_add(password.len()).saturating_mul(2)),
+        ));
+        line.push_str(&tag);
+        line.push_str(" LOGIN ");
+        for (text, behind) in [(user, " "), (password, "\r\n")] {
+            line.push('"');
+            for character in text.chars() {
+                if matches!(character, '"' | '\\') {
+                    line.push('\\');
                 }
-                (Self::Digits(_) | Self::Closed(_) | Self::Cr(_), b'{') => Self::Digits(0),
-                (Self::Digits(_) | Self::Closed(_) | Self::Cr(_), _) => Self::Text,
-            };
+                line.push(character);
+            }
+            line.push('"');
+            line.push_str(behind);
         }
-        Ok(())
+        self.write(line.as_bytes()).await?;
+        loop {
+            let response = self.response().await?;
+            match turn(&response, &tag) {
+                Turn::Completed(true) => return Ok(()),
+                Turn::Completed(false) => {
+                    return match response {
+                        Response::Tagged(_, status)
+                            if status.condition == Condition::No
+                                && credentials_refused(&status) =>
+                        {
+                            Err(MailError::Auth)
+                        }
+                        _ => Err(MailError::Unavailable),
+                    };
+                }
+                Turn::Ended => return Err(MailError::Unavailable),
+                Turn::Data => {}
+            }
+        }
+    }
+
+    /// The next response of the server. The end of the connection, the end of the input the
+    /// call may take, a text above [`RESPONSE_TEXT_BYTES`] and bytes that are no response are
+    /// [`MailError::Unavailable`]; a body budget without room for the input is
+    /// [`MailError::Capacity`].
+    async fn response(&mut self) -> Result<Response, MailError> {
+        loop {
+            let ahead = self.buffer.get(self.taken..).unwrap_or_default();
+            let (taken, step) = self.reader.feed(ahead);
+            self.taken = self.taken.saturating_add(taken);
+            if self.taken >= self.buffer.len() {
+                self.buffer.clear();
+                self.taken = 0;
+            }
+            match step {
+                Step::Response(raw) => {
+                    let response = imap::parse(raw).ok_or(MailError::Unavailable)?;
+                    if matches!(&response, Response::Untagged(status) if status.condition == Condition::Bye)
+                    {
+                        self.lost = true;
+                    }
+                    return Ok(response);
+                }
+                Step::Malformed => return Err(MailError::Unavailable),
+                Step::Literal(octets) => {
+                    // The octets the stream has not delivered yet are accounted, and held
+                    // against the input bound, before the buffer of the literal is made.
+                    let ahead = self.buffer.len().saturating_sub(self.taken) as u64;
+                    self.allowance
+                        .as_mut()
+                        .ok_or(MailError::Unavailable)?
+                        .declare(octets.saturating_sub(ahead))?;
+                    self.reader.admit();
+                }
+                Step::More => {
+                    // The reader took every byte of the buffer and stands inside a response.
+                    if self.reader.text_bytes() > RESPONSE_TEXT_BYTES {
+                        return Err(MailError::Unavailable);
+                    }
+                    self.fill().await?;
+                }
+            }
+        }
+    }
+
+    /// Takes the next bytes from the stream, within the allowance of the call. The reader
+    /// took every byte the buffer held: the buffer is empty. Without a call, and at the input
+    /// bound of its call, the connection takes no further byte.
+    async fn fill(&mut self) -> Result<(), MailError> {
+        let allowance = self.allowance.as_mut().ok_or(MailError::Unavailable)?;
+        let window = IMAP_READ_BYTES.min(allowance.left);
+        if window == 0 {
+            return Err(MailError::Unavailable);
+        }
+        self.buffer.reserve(window);
+        let read = (&mut self.stream)
+            .take(window as u64)
+            .read_buf(&mut self.buffer)
+            .await;
+        match read {
+            Ok(read) if read > 0 => allowance.take(read),
+            _ => {
+                self.lost = true;
+                Err(MailError::Unavailable)
+            }
+        }
     }
 }
 
-/// The read half of a mail connection: every byte passes the literal scan before the
-/// protocol client sees it.
-struct LiteralGuard<R> {
-    inner: R,
-    bound: usize,
-    scan: LiteralScan,
-}
-
-impl<R: AsyncRead + Unpin> AsyncRead for LiteralGuard<R> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        let filled = buf.filled().len();
-        std::task::ready!(Pin::new(&mut this.inner).poll_read(cx, buf))?;
-        let arrived = buf.filled().get(filled..).unwrap_or_default();
-        if this.scan.feed(arrived, this.bound).is_err() {
-            return Poll::Ready(Err(io::Error::other(
-                "a literal declaration above the response bound",
-            )));
-        }
-        Poll::Ready(Ok(()))
-    }
-}
-
+/// The connection to the SMTP server: the byte pipe with TLS that ends inside the node, and
+/// the bound of its input. At its bound the connection delivers no further byte.
+///
 /// Debug never includes transport buffers or authentication bytes.
-struct MailStream(Stream);
+struct MailStream {
+    inner: Stream,
+    /// Bytes the connection may still deliver.
+    left: usize,
+}
+
+impl MailStream {
+    fn bounded(inner: Stream, input_bytes: usize) -> MailStream {
+        MailStream {
+            inner,
+            left: input_bytes,
+        }
+    }
+}
+
 impl fmt::Debug for MailStream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("MailStream(..)")
     }
 }
+
 impl AsyncRead for MailStream {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
+        let this = self.get_mut();
+        let window = buf.remaining().min(this.left);
+        if window == 0 {
+            // The end of the input.
+            return Poll::Ready(Ok(()));
+        }
+        let read = {
+            let mut within = ReadBuf::new(buf.initialize_unfilled_to(window));
+            std::task::ready!(Pin::new(&mut this.inner).poll_read(cx, &mut within))?;
+            within.filled().len()
+        };
+        buf.advance(read);
+        this.left = this.left.saturating_sub(read);
+        Poll::Ready(Ok(()))
     }
 }
+
 impl AsyncWrite for MailStream {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().0).poll_write(cx, bytes)
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, bytes)
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().0).poll_flush(cx)
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+impl ImapSession {
+    /// A session over `stream` whose login was at `login_ms`, that carries no call.
+    pub(crate) fn for_test(stream: Stream, login_ms: u64) -> ImapSession {
+        let mut connection = ImapConnection::new(stream, Allowance::reserved(0));
+        connection.rest();
+        ImapSession {
+            connection,
+            in_step: true,
+            answered: false,
+            login_ms,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_input_of_a_connection_ends_at_a_literal_that_cannot_arrive_within_its_bound() {
+        let declaration = LITERAL_INPUT_BYTES;
+        // The bound leaves room for a declaration and for the 40 octets it declares: both
+        // are accounted when the literal is declared, and the octets not again when they
+        // arrive.
+        let mut allowance = Allowance::reserved(64 + declaration);
+        assert!(allowance.take(24).is_ok());
+        assert!(allowance.declare(40).is_ok());
+        assert_eq!(
+            (allowance.accounted, allowance.left),
+            (64 + declaration, 40)
+        );
+        assert!(allowance.take(40).is_ok());
+        assert_eq!((allowance.accounted, allowance.left), (64 + declaration, 0));
+        // One byte less of the bound, and the literal cannot arrive: the input ends at the
+        // declaration.
+        let mut allowance = Allowance::reserved(63 + declaration);
+        assert!(allowance.take(24).is_ok());
+        assert!(matches!(allowance.declare(40), Err(MailError::Unavailable)));
+        assert!(matches!(
+            allowance.declare(u64::MAX),
+            Err(MailError::Unavailable)
+        ));
+    }
+
+    /// A declaration counts as input whatever length it declares: a server that declares
+    /// literals without an octet reaches the input bound by their number, and the share of
+    /// the call covers what the reader keeps for each of them.
+    #[test]
+    fn the_declarations_of_a_connection_are_bounded_by_its_input_bound() {
+        let declaration = LITERAL_INPUT_BYTES;
+        // Each declaration here is 4 bytes of a line: `{0}` and its line feed.
+        let mut allowance = Allowance::reserved(10 * (4 + declaration));
+        for _ in 0..10 {
+            assert!(allowance.take(4).is_ok());
+            assert!(allowance.declare(0).is_ok());
+        }
+        assert_eq!(
+            (allowance.accounted, allowance.left),
+            (10 * (4 + declaration), 0)
+        );
+        assert!(matches!(allowance.declare(0), Err(MailError::Unavailable)));
+
+        // The share of a call follows its declarations as it follows its bytes: two bytes of
+        // share per byte the declarations were counted as. The declarations that are counted
+        // as one step of input take two steps of the budget, and one more takes the third.
+        let step = SHARE_STEP_BYTES;
+        let budget = Arc::new(Semaphore::new(8 * step));
+        let held = |budget: &Arc<Semaphore>| 8 * step - budget.available_permits();
+        let mut allowance = Allowance::charged(1 << 20, InputShare::new(&budget, 2));
+        for _ in 0..step / (4 + declaration) {
+            assert!(allowance.take(4).is_ok());
+            assert!(allowance.declare(0).is_ok());
+        }
+        assert_eq!(held(&budget), 2 * step);
+        assert!(allowance.take(4).is_ok());
+        assert!(allowance.declare(0).is_ok());
+        assert_eq!(held(&budget), 3 * step);
+    }
+
+    #[test]
+    fn the_share_of_a_call_follows_its_input_and_ends_where_the_budget_does() {
+        let step = SHARE_STEP_BYTES;
+        let budget = Arc::new(Semaphore::new(4 * step));
+        let held = |budget: &Arc<Semaphore>| 4 * step - budget.available_permits();
+        let mut share = Share::admit(&budget, 1_000).unwrap();
+        assert_eq!(held(&budget), 1_000);
+        let mut allowance = Allowance::charged(1 << 20, InputShare::new(&budget, 2));
+
+        // Ten bytes of text, of which the call holds twenty: one step.
+        assert!(allowance.take(10).is_ok());
+        assert_eq!(held(&budget), 1_000 + step);
+        // A declared literal of one step: the call takes what it will hold of it, twice its
+        // length, before an octet arrived. With the text that is three steps.
+        assert!(allowance.take(30).is_ok());
+        assert!(allowance.declare(step as u64).is_ok());
+        assert_eq!(held(&budget), 1_000 + 3 * step);
+        // The octets arrive: nothing more is taken.
+        assert!(allowance.take(step).is_ok());
+        assert_eq!(held(&budget), 1_000 + 3 * step);
+
+        // A second literal of that length needs five steps in all, and the budget has four:
+        // the input ends, and the call keeps what it held.
+        assert!(matches!(
+            allowance.declare(step as u64),
+            Err(MailError::Capacity)
+        ));
+        assert_eq!(held(&budget), 1_000 + 3 * step);
+
+        // The read ends: the call takes the part that followed its input. The response frame
+        // then takes the share of what it holds and gives it back with itself. It never
+        // takes more than the call held.
+        share.take_in(allowance.into_share().unwrap());
+        assert_eq!(held(&budget), 1_000 + 3 * step);
+        let frame = share.settle(500);
+        assert_eq!(held(&budget), 500);
+        drop(frame);
+        assert_eq!(held(&budget), 0);
+        let share = Share::admit(&budget, 100).unwrap();
+        let frame = share.settle(4 * step);
+        assert_eq!(held(&budget), 100);
+        drop(frame);
+
+        // A read that ends without its answer gives back the part that followed its input
+        // with its connection: the allowance holds it, and nothing else does.
+        let mut allowance = Allowance::charged(1 << 20, InputShare::new(&budget, 2));
+        assert!(allowance.take(10).is_ok());
+        assert_eq!(held(&budget), step);
+        drop(allowance);
+        assert_eq!(held(&budget), 0);
+
+        // A share is taken without waiting: none when the bytes are not free.
+        let mut all = Share::admit(&budget, 4 * step).unwrap();
+        assert!(Share::admit(&budget, 1).is_none());
+        assert!(all.resize(step));
+        assert_eq!(held(&budget), step);
     }
 }
