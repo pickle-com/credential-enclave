@@ -11,6 +11,7 @@ use tokio::task::JoinHandle;
 
 use super::responses::Refreshed;
 use super::{json_ok, provider_credentials, record_of, respond, ApiError, JsonBody};
+use crate::faults::joined;
 use crate::log_store;
 use crate::oauth::{
     self, call_token_address, token_request, ClientId, ClientValues, ProviderError, TokenGrant,
@@ -156,18 +157,23 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
             Ok::<(Refreshed, bool), ApiError>((refreshed, kept))
         }
     };
+    // The failure of a call whose exchange gave no answer: the token address was called, and
+    // what it did is not known.
+    let no_answer = || ApiError::provider(ProtocolError::RefreshFailed, 0, ProviderError::NONE);
     let mut guard = ExchangeGuard {
         task: Some(tokio::spawn(exchange)),
     };
-    let task = guard.task.as_mut().ok_or_else(ApiError::internal)?;
-    match tokio::time::timeout(node.limits.token_timeout, task).await {
-        Ok(Ok(outcome)) => outcome.map(|(refreshed, _)| json_ok(&refreshed)),
-        Ok(Err(_)) => Err(ApiError::internal()),
+    let task = guard.task.as_mut().ok_or_else(no_answer)?;
+    // A panic of the exchange is a panic of this call (`joined`): the token address may have
+    // answered, and a failure response would say that the call can be made again.
+    match tokio::time::timeout(node.limits.token_timeout, joined(task)).await {
+        Ok(Some(outcome)) => outcome.map(|(refreshed, _)| json_ok(&refreshed)),
+        Ok(None) => Err(no_answer()),
         Err(_) => {
             // The time limit passed. The task goes on in a place among the late tasks, and the
             // watcher of that place counts how the exchange ended. Without a free place the
             // exchange is ended here, as the call is.
-            let task = guard.task.take().ok_or_else(ApiError::internal)?;
+            let task = guard.task.take().ok_or_else(no_answer)?;
             match node.late_refreshes.clone().try_acquire_owned() {
                 Ok(place) => {
                     let counters = node.clone();
@@ -189,11 +195,7 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
                         .fetch_add(1, Ordering::Relaxed);
                 }
             }
-            Err(ApiError::provider(
-                ProtocolError::RefreshFailed,
-                0,
-                ProviderError::NONE,
-            ))
+            Err(no_answer())
         }
     }
 }

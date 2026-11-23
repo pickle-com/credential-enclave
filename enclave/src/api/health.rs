@@ -14,6 +14,7 @@ use super::responses::{
     WriteAttemptFailureCounts, WriteMsBuckets,
 };
 use crate::descriptors;
+use crate::faults;
 use crate::load;
 use crate::state::Node;
 
@@ -29,8 +30,10 @@ use crate::state::Node;
 /// `load` is the load at the moment of the call: the provider requests in flight, the calls
 /// that hold a forward slot, the connections from the backend open now and the ones refused
 /// at accept since the start, the CPU time and the memory of the kernel the node runs in,
-/// read from procfs (`crate::load`), null where the kernel exposes no value, and the open
-/// file descriptors of the node process and their limit (`crate::descriptors`). `egress` counts
+/// read from procfs (`crate::load`), null where the kernel exposes no value, the open
+/// file descriptors of the node process and their limit (`crate::descriptors`), and the faults
+/// the node contained: the panics of the program since it started and the accounts it halted
+/// (`crate::faults`). `egress` counts
 /// the outbound connections (opened, failed by cause, repeated, being opened, and the requests
 /// that reused an idle connection), `refresh` the token address calls of `refresh` the node
 /// continued after their time limit, by outcome and in progress, and `state` the sizes of the
@@ -118,6 +121,8 @@ pub async fn health(State(node): State<Arc<Node>>) -> Response {
             descriptors_limit: descriptors::soft_limit(),
             lingering_connections: lingering.map(|(waiting, _)| waiting),
             lingering_cut: lingering.map(|(_, cut)| cut),
+            contained_panics: faults::panics(),
+            halted_accounts: node.halted_accounts(),
         },
         egress: EgressCounts {
             opens: read(&egress.opens),

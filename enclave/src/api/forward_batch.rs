@@ -10,8 +10,8 @@
 //! [`limits::FORWARD_BATCH_CONCURRENCY`] at a time. The response frame lists one result per
 //! request, in the order of the requests.
 
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Request, State};
@@ -155,7 +155,7 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
     // body is not kept.
     let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
     let gate = Semaphore::new(limits::FORWARD_BATCH_CONCURRENCY);
-    let body_sum = Mutex::new(0usize);
+    let body_sum = AtomicUsize::new(0);
     let outcomes = join_all(prepared.into_iter().zip(shares).map(|(prepared, share)| {
         let (gate, body_sum) = (&gate, &body_sum);
         async move {
@@ -175,11 +175,15 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
                 share,
             )
             .await?;
-            let mut sum = lock(body_sum);
-            if *sum + checked.body_len() > node.limits.body_bytes {
+            // The requests of one call run on its task, one at a time: the sum is read and
+            // raised in one step all the same.
+            let within = body_sum.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |sum| {
+                sum.checked_add(checked.body_len())
+                    .filter(|sum| *sum <= node.limits.body_bytes)
+            });
+            if within.is_err() {
                 return Err(ProtocolError::TooLarge);
             }
-            *sum += checked.body_len();
             Ok((checked, budget))
         }
     }))

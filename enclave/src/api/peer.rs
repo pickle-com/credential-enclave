@@ -28,7 +28,7 @@
 //! the entry `grant_transferred_in` for each. Such a transfer is not stopped by the limit of
 //! pending entries, like a command.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::extract::{Request, State};
 use axum::response::Response;
@@ -44,7 +44,9 @@ use super::responses::{AccountLogRef, Exported, Imported};
 use super::{invalid, json_ok, limit_of, respond, subset_of, ApiError, JsonBody};
 use crate::attest::{verify_peer, Accepted, Peer, Program};
 use crate::log_store;
-use crate::state::{events, lock, Account, ActiveGrant, EventPlace, GrantState, Handover, Node};
+use crate::state::{
+    events, lock, Account, AccountLock, ActiveGrant, EventPlace, GrantState, Handover, Node,
+};
 use crate::subset::Subset;
 
 /// The `seq` of the control entry a place names. A control event is never in an open batch,
@@ -237,7 +239,7 @@ pub(crate) async fn export_to(
         for _ in 0..page.len() {
             seeds.push(node.random_secret::<32>()?);
         }
-        let mut handed: Vec<(&Mutex<Account>, u64)> = Vec::with_capacity(page.len());
+        let mut handed: Vec<(&AccountLock, u64)> = Vec::with_capacity(page.len());
         for ((user_id, account), seed) in page.iter().zip(seeds) {
             let mut guard = lock(account);
             // The account was free between the choice of the page and this lock.
@@ -378,7 +380,8 @@ pub async fn import(State(node): State<Arc<Node>>, request: Request) -> Response
 /// same signing key, the later end stays. A grant of another signing key is never replaced by
 /// a transfer, and an account that revoked on this node takes no transfer at all, also after
 /// its revocation marker was replaced by a grant: an envelope can be kept and sent again, and
-/// what a revoke ended only a grant command brings back. `imported` is the number of grants
+/// what a revoke ended only a grant command brings back. An account the node halted takes no
+/// transfer either (`Account::halt`). `imported` is the number of grants
 /// this call put in place, and `accounts` names their accounts: the caller learns from the
 /// answer which accounts this node holds a delegation of now.
 ///
@@ -447,7 +450,7 @@ pub(crate) async fn import_from(
     let mut seeds = seeds.into_iter();
     let mut accounts = Vec::new();
     let mut logs = Vec::new();
-    let mut created: Vec<(Arc<Mutex<Account>>, u64)> = Vec::new();
+    let mut created: Vec<(Arc<AccountLock>, u64)> = Vec::new();
     for grant in transfer.grants {
         if grant.custody != node.custody
             || grant.not_after_ms <= now_ms
@@ -461,7 +464,7 @@ pub(crate) async fn import_from(
         if node.ensure_open().is_err() {
             break;
         }
-        if guard.revoked_here {
+        if guard.revoked_here || guard.is_halted() {
             continue;
         }
         guard.expire(now_ms);
@@ -523,7 +526,7 @@ pub(crate) async fn import_from(
     // now, in one round. The outcome of the round changes nothing: an entry that is not
     // confirmed is a pending entry.
     if !created.is_empty() {
-        let awaited: Vec<(&Mutex<Account>, u64)> = created
+        let awaited: Vec<(&AccountLock, u64)> = created
             .iter()
             .map(|(account, seq)| (account.as_ref(), *seq))
             .collect();

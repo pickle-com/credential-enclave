@@ -27,7 +27,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -47,6 +47,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsConnector;
 
 use crate::clock::{Clock, TlsTime};
+use crate::faults::NodeLock;
 use crate::platform::{ConnectError, DynPlatform};
 use crate::providers::Destination;
 use crate::state::lock;
@@ -580,7 +581,7 @@ impl Exchange {
 /// for at most [`limits::PROVIDER_IDLE_MS`], and at most [`IDLE_PROVIDER_CONNECTIONS_TOTAL`] in
 /// all. No connection carries the requests of two accounts.
 #[derive(Default)]
-pub struct ProviderConnections(Mutex<HashMap<(String, String), IdleSenders>>);
+pub struct ProviderConnections(NodeLock<HashMap<(String, String), IdleSenders>>);
 
 /// The idle connections of one (account, host) pair, each with the node time it became idle,
 /// the most recently used last.

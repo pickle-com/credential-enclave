@@ -17,7 +17,7 @@ use credential_enclave_protocol::secret::Secret;
 use serde_json::{json, Value};
 
 use super::{is_write_of, provider, provider_and_log_store, quiet_provider_and_log_store};
-use crate::state::{lock, Account, Limits, Node};
+use crate::state::{lock, AccountLock, Limits, Node};
 use crate::testing::{App, Harness, Provider, Reply, Seen, LOG_HOST};
 
 const MESSAGES: &str = "https://gmail.googleapis.com/gmail/v1/users/me/messages";
@@ -567,7 +567,7 @@ async fn a_control_event_closes_the_open_batch_and_stands_alone() {
 
 /// An account of the node under test with the key of `app`, for the tests that create events
 /// without a call.
-fn account_of(harness: &Harness, app: &App) -> Arc<Mutex<Account>> {
+fn account_of(harness: &Harness, app: &App) -> Arc<AccountLock> {
     let account = harness.node.account_or_create(&app.user_id);
     let mut guard = lock(&account);
     guard.open.key_id = app.keys.key_id();
@@ -577,7 +577,7 @@ fn account_of(harness: &Harness, app: &App) -> Arc<Mutex<Account>> {
 }
 
 /// Creates one use event on the chain of `app`, outside a call.
-fn create_use_event(harness: &Harness, account: &Mutex<Account>, app: &App, event: Value) {
+fn create_use_event(harness: &Harness, account: &AccountLock, app: &App, event: Value) {
     harness
         .node
         .create_event(
@@ -593,7 +593,7 @@ fn create_use_event(harness: &Harness, account: &Mutex<Account>, app: &App, even
 }
 
 /// The parts of the keys of the unconfirmed entries of an account, in order.
-fn unconfirmed_parts(account: &Mutex<Account>, user_id: &str) -> Vec<EntryKey> {
+fn unconfirmed_parts(account: &AccountLock, user_id: &str) -> Vec<EntryKey> {
     lock(account)
         .unconfirmed()
         .iter()
