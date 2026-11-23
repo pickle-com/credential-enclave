@@ -1325,7 +1325,7 @@ Test vectors of the assignment; the backend of the operator computes the same fu
 | `LOG_BLOCKED_ROUNDS`, `LOG_BLOCKED_MS`, `LOG_REACH_MS`, `LOG_URL_FRESH_MS` (the app) | 3 and 3 days: the rounds in a row whose reads were held back (or the reads of one kind the log screen notes as held back from it), and the age of the first of them, at which the log is marked (A3). 60,000: a request that was not answered counts as held back when the backend answered another request of the runtime within this time. 240,000: the age of a signed address from which a refusal of the store is the age of the address |
 | `LOG_RETENTION_DAYS` (the app) | 365: a key older than this is expected by no reader (the retention of its lock), and a key is expected in the listing while it is a day younger (A4) |
 | `LOG_SAMPLE_KEYS`, `LOG_SEEN_KEYS`, `LOG_NODES_KEPT` (the app) | 64, 4,096 and 256: the control keys of the sample of A4, the digests of the control keys the device judged, and the nodes whose judgement the device keeps |
-| `LOG_SCREEN_EVENTS`, `LOG_KEEP_EVENTS`, `LOG_SCREEN_WAIT_MS` (the app) | 50, 50 and 3,000: the events of one further page of the log screen, the events of the first page the device keeps, and the time `read_log` waits for the read of the store before it answers from what the device kept |
+| `LOG_SCREEN_EVENTS`, `LOG_KEEP_EVENTS`, `LOG_SCREEN_WAIT_MS`, `LOG_SCREEN_REFILLS` (the app) | 50, 50 and 3,000: the events of one further page of the log screen, the events of the first page the device keeps, and the time `read_log` waits for the read of the store before it answers from what the device kept. 2: the times the first page is read on below keys that turned out to be no entries |
 | `LOG_SUMMARY_DAYS`, `LOG_SUMMARY_ENTRIES`, `LOG_SUMMARY_REQUESTS` (the app) | 7, 1,000 and 5: the days of the summary of the log screen, the most entries one opening counts into it, and the requests for bodies one opening of the screen sends |
 | `LEGACY_NODES`, `LEGACY_ROUND_PASSES`, `LEGACY_ROUND_BODIES`, `LEGACY_CLOSE_SLACK_MS` (the app) | 64, 4, 64 and 1 day: the chains of formats 1 and 2 one round follows (of more open chains, the ones a round listed longest ago), the passes of listings and the entry bodies it spends on them (one request for the documents of receiving nodes per pass; the receiving nodes that wait for a document count into the entry bodies of a round), and the time after the end of a grant at which the chain of its node is read for the last time |
 | `LEGACY_SEQ_READS`, `LEGACY_PROBE_SEQS`, `LEGACY_SEQ_VERSIONS` (the app) | 8: the object versions a round reads under one `seq` of a chain for a control entry, and the log screen for an entry. 2: the `seq`s at the end of a listing page of a chain that a round reads to see how far the node wrote, when their keys name no control entry. 5: the object versions per `seq` a listing page of a chain that goes on holds at most, on average, when it holds what a node wrote and no more |
@@ -1822,6 +1822,14 @@ listings of the first page are held back, the page is made from the listing page
 since the screen last read those listings itself, and otherwise from what the device kept of the
 first page. The summary counts the use entries of the last seven days, each once per device, the
 1,000 latest at most (a count that is not complete is marked as such).
+
+A page takes its keys from the listings by the number of events the keys name, before it reads
+them. A key that turns out to be no entry (an object under a node id the store holds no node
+document of) is passed: it takes no entry from the screen. A page covers the listings down to the
+time of the last key it took, and the page after it begins there, whatever the time of the last
+entry it shows; the entries of formats 1 and 2 of a page lie above that time. The first page is
+read on below the keys it passed, twice at most, as a later page is read. A page that passed
+every key it took shows no entry and says that there is more.
 
 `read_log_page` returns one later page (50 events before `before_ms`). A listing page of the store
 names up to 1,000 keys, so the keys of a later page are taken from the listings the screen read in

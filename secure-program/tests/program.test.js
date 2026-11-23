@@ -1555,6 +1555,54 @@ test("a round whose reading ended calls the store no more: the listings of node 
   assert.equal(heldReads(world), undefined);
 });
 
+test("objects under the use prefix that are no entries take no entry from the log screen: the first page is read on below them, and when more of them lie on top than it passes, the page after it begins below the ones it passed", async () => {
+  // Five use entries, and objects under node ids no node has whose keys name a time a month from
+  // now and 128 events each: they sort in front of every entry, and each fills a page by what its
+  // key says.
+  const build = async (strays) => {
+    const fx = S.fixture(source);
+    const world = fx.world;
+    await S.start(fx);
+    for (let i = 0; i < 5; i += 1) {
+      world.advance(HOUR_MS);
+      fx.nodes[0].record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/messages/" + i, "POST")]);
+    }
+    const bucket = bridge.shardBucket(world.serverTarget, world.userId);
+    for (let i = 0; i < strays; i += 1) {
+      const time = world.now + 30 * DAY_MS + i * 1000;
+      world.putObject(bucket, "a3/" + world.userId + "/u/" + String(bridge.RTIME_MAX - time).padStart(13, "0") + "." +
+        b64u(crypto.randomBytes(32)) + ".1.128." + fx.keys.keyId + "." + b64u(crypto.randomBytes(32)), "x");
+    }
+    return fx;
+  };
+  const requests = (result) => shownGroups(result.value).filter((group) => group.kind === "request")
+    .reduce((sum, group) => sum + group.count, 0);
+  // One such object: the first page shows the five entries.
+  const one = await build(1);
+  const shown = await S.call(one, "read_log", { limit: 100 });
+  assert.equal(requests(shown), 5);
+  assert.equal(shown.value.status, "verified");
+  // Six: the first page passes three of them and shows no entry. It says that there is more,
+  // and the pages after it pass the rest and show the five entries.
+  const six = await build(6);
+  const world = six.world;
+  const first = await S.call(six, "read_log", { limit: 100 });
+  assert.equal(requests(first), 0);
+  assert.equal(first.value.has_more, true);
+  let found = 0;
+  for (let page = 0; page < 6 && found === 0; page += 1) {
+    const places = world.runtime.log_pages;
+    assert.ok(places.length > page, "page " + page);
+    const next = await S.call(six, "read_log_page", { before_ms: places[page].before_ms });
+    assert.equal(next.ok, true);
+    found = requests(next);
+  }
+  assert.equal(found, 5);
+  assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  assert.equal(world.stored("log.denied"), undefined);
+  assert.equal(heldReads(world), undefined);
+});
+
 test("A4: an entry this device verified that left the listing within its retention marks the log, after the listing was read a second time", async () => {
   const fx = S.fixture(source);
   await S.start(fx);

@@ -283,6 +283,8 @@
   const LOG_SUMMARY_REQUESTS = 5;
   const LOG_SCREEN_WAIT_MS = 3000;
   const LOG_SCREEN_BODIES = 200;
+  // The times the first page of the screen is read on below keys that turned out to be no entries.
+  const LOG_SCREEN_REFILLS = 2;
 
   // ---- The chains of format 1 and format 2 (the bucket the binding names) ----
   // The chains one round follows, the nodes one address request names, the passes of listings
@@ -6860,7 +6862,7 @@
    *  millisecond as the last one stay on the page). Returns {entries, items, last_ms, has_more}:
    *  items are the items of the entries with the latest first (the events of one entry in the
    *  reverse of their index). */
-  function mergePage(first, second, limit, more) {
+  function mergePage(first, second, limit, more, floorMs) {
     const all = first.concat(second).sort(function (a, b) { return b.time_ms - a.time_ms; });
     const entries = [];
     const items = [];
@@ -6877,7 +6879,22 @@
       count += entry.items.length;
       lastMs = entry.time_ms;
     }
-    return { entries: entries, items: items, last_ms: lastMs, has_more: left || more };
+    // A page that holds every entry given covers the listings down to floorMs (pageFloor): the
+    // page after it begins there, whatever the time of its last entry. The keys chosen for a
+    // page that turned out to be no entries are passed that way, and take no entry with them.
+    return {
+      entries: entries, items: items, last_ms: !left && whole(floorMs) > 0 ? floorMs : lastMs, has_more: left || more,
+    };
+  }
+
+  /** The time down to which the keys of format 3 chosen for a page (choosePage, recoveredPage)
+   *  cover the listings: the time of the last key chosen while keys remain below it (every key of
+   *  that millisecond is among the chosen ones), otherwise the time of the last entry shown (first)
+   *  when the keys chosen fill the page, and 0 when neither holds. The entries of the chains of
+   *  format 1 and format 2 of the page lie above that time. */
+  function pageFloor(page, first, limit) {
+    if (page.more && page.chosen.length > 0) return page.chosen[page.chosen.length - 1].time_ms;
+    return page.count >= limit && first.length > 0 ? first[first.length - 1].time_ms : 0;
   }
 
   /** The key marker of a listing of format 3 that begins below the time beforeMs: every key of an
@@ -7011,7 +7028,7 @@
         first.push(entryOfRecord(parsed, records.get(parsed.key)));
       }
     }
-    const floorMs = chosen.count >= limit && first.length > 0 ? first[first.length - 1].time_ms : 0;
+    const floorMs = pageFloor(chosen, first, limit);
     // The chains of format 1 and format 2. A read of that bucket that is held back goes to the
     // rounds, and the entries the rounds opened for the screen stand in.
     const reads = chainReads(cache);
@@ -7028,7 +7045,7 @@
     if (failed !== null && failed.kind !== "absent" && first.length === 0) {
       throw native.error("log_store_unreachable", "log screen");
     }
-    return mergePage(first, chains.entries, limit, chosen.more || chains.more);
+    return mergePage(first, chains.entries, limit, chosen.more || chains.more, floorMs);
   }
 
   /** The first page of the screen and the summary, read from the store: one round started by the
@@ -7078,6 +7095,8 @@
     let more = false;
     let floorMs = 0;
     let truncated = false;
+    // The keys chosen for the page that are no entries.
+    let passed = 0;
     // The listings this read gave the screen name the keys of its later pages as far as they
     // reach.
     screenListings = round.pages.c !== null && round.pages.u !== null
@@ -7091,9 +7110,10 @@
         const kept = keptById.get("3:" + parsed.tail);
         const entry = kept !== undefined ? kept : entryOf(parsed, false);
         if (entry !== null) first.push(entry);
+        else passed += 1;
       }
       more = plan.chosen.more;
-      if (plan.chosen.count >= limit && first.length > 0) floorMs = first[first.length - 1].time_ms;
+      floorMs = pageFloor(plan.chosen, first, limit);
       // The summary: the keys above the counted range from the one nearest to it, then the keys
       // below it; the range stays one range, so the count stops at the first entry not read.
       if (plan.counted.reset) {
@@ -7144,7 +7164,7 @@
           }
         }
         more = page.more;
-        if (page.count >= limit && first.length > 0) floorMs = first[first.length - 1].time_ms;
+        floorMs = pageFloor(page, first, limit);
         if (missing.size > 0) {
           saveWithheld({ withheld: missing, shown: missing, settled: new Set(), pagesHeld: new Set(), pagesRead: new Set() });
         }
@@ -7194,7 +7214,23 @@
     }
     saveChainReads(keys, reads, nodesHeld, nodesRead);
     timing.summary = Math.max(0, native.nowMs() - began);
-    const page = mergePage(first, chains.entries, limit, more || chains.more);
+    let page = mergePage(first, chains.entries, limit, more || chains.more, floorMs);
+    // Keys chosen for the page that turned out to be no entries (objects under a node id the
+    // store holds no node document of) left their places on the page empty: the page is read on
+    // below them, as a later page is read, LOG_SCREEN_REFILLS times at most.
+    for (let refill = 0; refill < LOG_SCREEN_REFILLS && passed > 0 && page.has_more && page.last_ms > 0 && page.items.length < limit; refill += 1) {
+      let rest = null;
+      try {
+        rest = await readPage(turn, keys, cache, page.last_ms, limit - page.items.length);
+      } catch (failure) {
+        if (failureCode(failure) !== "log_store_unreachable") throw failure;
+        break;
+      }
+      page = {
+        entries: page.entries.concat(rest.entries), items: page.items.concat(rest.items), last_ms: rest.last_ms,
+        has_more: rest.has_more,
+      };
+    }
     // What the device keeps: the entries of the page up to LOG_KEEP_EVENTS events, and the tally.
     const kept = [];
     let keptEvents = 0;
