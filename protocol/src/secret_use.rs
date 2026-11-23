@@ -610,7 +610,7 @@ pub fn occurrences(text: &[u8], needle: &[u8]) -> usize {
 
 /// True when `placeholder` is the whole value of exactly one pair `name=placeholder` of
 /// `pairs`, a text of pairs joined by `&` (a query, or a form body), and occurs nowhere else
-/// in it.
+/// in it. Other pairs of the same name are not counted: `pairs` may hold some.
 pub fn is_the_value_of(pairs: &[u8], name: &str, placeholder: &str) -> bool {
     let wanted = [name.as_bytes(), b"=", placeholder.as_bytes()].concat();
     occurrences(pairs, placeholder.as_bytes()) == 1
@@ -672,9 +672,10 @@ impl BoundRequest {
     /// The placeholder and the address agree with the slot: for the slot `path` the
     /// placeholder occurs once in the path and not in the query, and the path in front of it
     /// does not end with the beginning of a percent escape ([`leaves_the_value_alone`]). For a
-    /// slot `query:<name>` it is the whole value of the one parameter of that name and occurs
-    /// nowhere else in the address, and for every other slot it occurs neither in the path
-    /// nor in the query. For the two slots of HTTP Basic it stands in no part of a request as
+    /// slot `query:<name>` exactly one pair of the query is the name, `=` and the placeholder
+    /// ([`is_the_value_of`]: further pairs of the same name may stand beside it) and the
+    /// placeholder occurs nowhere else in the address, and for every other slot it occurs
+    /// neither in the path nor in the query. For the two slots of HTTP Basic it stands in no part of a request as
     /// it is: it is inside the base64 text of the `Authorization` header, which the node that
     /// sends the request reads ([`BasicCredentials::read`]).
     pub fn from_value(value: &serde_json::Value) -> Result<BoundRequest, ProtocolError> {
@@ -2174,10 +2175,18 @@ mod tests {
             assert!(placed("path", &path, ""), "{path}");
         }
 
-        // A slot `query:<name>`: the whole value of the one parameter of that name.
+        // A slot `query:<name>`: exactly one pair of the query is the name, `=` and the
+        // placeholder.
         assert!(placed("query:key", "/v1/items", &key));
         assert!(placed("query:key", "/v1/items", &format!("a=1&{key}&b=2")));
         assert!(placed("query:key", "/v1/items", &format!("{key}&key2=x")));
+        // Further pairs of the same name may stand beside that pair.
+        assert!(placed(
+            "query:key",
+            "/v1/items",
+            &format!("key=other&{key}")
+        ));
+        assert!(placed("query:key", "/v1/items", &format!("{key}&key=&key")));
         for query in [
             "".to_string(),
             "key=other".to_string(),
