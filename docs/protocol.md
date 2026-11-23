@@ -1736,10 +1736,10 @@ Where the proofs come from. Whoever hands them over, the checks above decide.
   verify because eight had failed within the hour). A backend without the route (the status 404
   and no code of its own) answers so. A request that fails any other way is no answer: the
   measurement waits, the round is pending, and the next round asks again without waiting for
-  the hour. Past the 24 hours of A1, in a runtime that knows that no later program is served, a
-  round whose request for the proofs failed on the side of the server (an error status, an
-  answer that is no JSON object, or no answer while the backend answered another request of the
-  runtime within 60 s) is a round held back (A3); a request that failed with the network of the
+  the hour. Past the 24 hours of A1, a round whose request for the proofs failed on the side of
+  the server (an error status, an answer that is no JSON object, or no answer while the backend
+  answered another request of the runtime within 60 s) is a round held back (A3), whether or
+  not the runtime knows what program is served; a request that failed with the network of the
   device leaves the round pending and counts nothing. So a device that could not ask, or was
   not answered, states nothing of a release whose proofs it has not seen, and a backend that
   does not answer the route for three days marks the log by A3. A release whose proofs hold and

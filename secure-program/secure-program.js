@@ -6851,8 +6851,8 @@
     let established = 0;
     // Whether a measurement past its grace waits because this runtime does not know that no
     // later program is served, and the name of the failure of the request for the release
-    // proofs of a measurement that waits for nothing but the answer to that request, when the
-    // request failed on the side of the server.
+    // proofs of a measurement past its grace that does not mark the log, when that request
+    // failed on the side of the server.
     let waiting = false;
     let unproved = "";
     const releases = [];
@@ -6883,7 +6883,7 @@
       if (stands) established += 1;
       else grace += 1;
       if (!within && !confirmed) waiting = true;
-      if (confirmed && !stands && unproved === "") unproved = proofsRefused(digest);
+      if (!within && !stands && unproved === "") unproved = proofsRefused(digest);
       const release = typeof item.release === "string" && item.release !== "" ? item.release.slice(0, 64) : "unknown";
       if (releases.indexOf(release) < 0) releases.push(release);
       if (item.held === true && NODE_ID.test(node) && heldNodes.indexOf(node) < 0) heldNodes.push(node);
@@ -6909,10 +6909,12 @@
         if (run.detail === "") run.detail = "delivery:" + (info.failed_status === 0 ? "silent" : String(info.failed_status));
       }
     }
-    // A measurement past its grace waits for the answer to the request for its release proofs,
-    // and that request failed for a reason on the side of the server: the operator domain keeps
-    // the device from learning whether the release has proofs, and the round is one held back.
-    // A request that failed with the network of the device leaves the round pending.
+    // A measurement past its grace does not mark the log, and the request for its release
+    // proofs failed for a reason on the side of the server: the operator domain keeps the
+    // device from learning whether the release has proofs, and the round is one held back,
+    // whether or not the runtime knows what program is served (every round asks, so the rounds
+    // of a backend that goes on failing that request are counted one after the other). A
+    // request that failed with the network of the device leaves the round pending.
     if (unproved !== "") {
       blocked = true;
       if (run.detail === "") run.detail = unproved.slice(0, 64);

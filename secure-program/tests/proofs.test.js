@@ -872,6 +872,13 @@ test("the release of a closed node whose node document carries no release proofs
   assert.equal(failing.asked.length, 3);
   assert.equal(failing.world.stored("log.blocked").count, 2);
   assert.equal(failing.world.state.log.store + ":" + failing.world.state.log.store_failure, "blocked:proofs:503");
+  // A round of a runtime that does not know what program is served (the answer of the account
+  // names none) asks as well and is held back as well: the count does not begin again.
+  failing.world.account.servedProgram = undefined;
+  failing.world.advance(2 * HOUR_MS);
+  await S.event(failing.fx, "foreground");
+  assert.equal(failing.world.stored("log.blocked").count, 3);
+  failing.world.account.servedProgram = VERSION;
   await nextDay(failing.fx);
   assert.equal(told(failing.world), "pending told pending grant active");
   await nextDay(failing.fx);
