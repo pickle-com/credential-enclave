@@ -535,7 +535,8 @@ changes no rule above:
   account carries the password its ciphertext holds) and of the delegation it was kept under
   (the signing public key of the grant and the revoke serial of the account), while that
   delegation is in force and the node is not closing. No read goes over a session after a
-  revoke, after the end of its grant or under the grant of another key.
+  revoke, after the end of its grant, under the grant of another key, or after the node
+  halted the account of the session (enclave.md 3.1): such an account has no grant.
 - A session ends 30 seconds after its last read and 300 seconds after its login at the latest.
   The operator domain cannot keep one alive beyond that age by calling: a read 300 seconds
   after the login logs in again, with the password of the record it presents. So an
@@ -557,8 +558,8 @@ failure triggers a second connection or submission.
 Fixed by: `enclave/src/tests/mail.rs` and `enclave/src/tests/mail_connections.rs` (the order
 of a call, the entry of every read over a kept session, that a read sends no command over a
 kept session before the log store confirmed its entry and none when the store refuses it, no
-read over a session after a revoke, after the end of a grant, after `grants/prune` or while
-the node closes, the end of a session at its idle time and at the age of its login, the
-bounds of the input of a connection), the unit tests of `enclave/src/mail_sessions.rs`, of
-`enclave/src/mail.rs` and of `enclave/src/imap.rs`, and the canary test, which makes the three
-calls.
+read over a session after a revoke, after the end of a grant, after `grants/prune`, after the
+node halted the account or while the node closes, a read that panics leaves no session, the
+end of a session at its idle time and at the age of its login, the bounds of the input of a
+connection), the unit tests of `enclave/src/mail_sessions.rs`, of `enclave/src/mail.rs` and of
+`enclave/src/imap.rs`, and the canary test, which makes the three calls.
