@@ -19,7 +19,10 @@ release proofs"): the signature of the release key over the measurements of the 
 public transparency log, a signature of a deploy key of the operator, and the attestation GitHub
 made of those measurements for a run of the release workflow of this repository at the tag of the
 release. A release of the enclave made after a program so reaches a device that runs that
-program. A release whose proofs fail a check is to that device a release it does not list.
+program. A release whose proofs fail a check is to that device a release it does not list, and so
+is a release whose statement states a version of the program above the one the device runs
+(`program_min`). The proofs reach the program with the attestation of a node, in a node document,
+or from the backend for the digest of a measurement.
 
 The program lists the log store itself (protocol.md 7.4): the listing of the two prefixes of its
 account, read from Amazon S3 through addresses it checks, names every act that took place with the
@@ -219,7 +222,11 @@ as the release workflow makes it. Every key is made there, and the program of a 
 those keys and certificates in the place of its constants. `tests/proof-cases.js` states proofs
 that hold and proofs that differ from them in one place, each with the check that refuses them;
 the test runs every case through a synchronization and compares whether the node received the
-grant and what the program logged. `tests/fixtures/release-proofs-v2.3.0.json` holds the proofs of
+grant and what the program logged. The other tests run histories: the key of an account moving
+through releases the program does not list, read by the device that saw every move and by an
+installation that kept nothing; a closed node whose proofs the backend hands out for the digest
+of its measurement; a release whose statement states a later program; and proofs that reach the
+device after it read the entries of a node. `tests/fixtures/release-proofs-v2.3.0.json` holds the proofs of
 a published release from public values (its `measurements.json`, the entry of that statement on
 rekor.sigstore.dev, and its `release-statement.sigstore.json`): they run against the constants of
 the program as they are, with the deploy keys of the test and without the element of that release

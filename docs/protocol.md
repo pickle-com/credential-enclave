@@ -185,7 +185,8 @@ convenience. A verifier trusts only the values it read from the `binding` inside
 A response may carry one more member, `release_proofs`: the release proofs of the release of the
 node ("The release proofs" in "The program of the app"). It is a public value outside the
 document, which the app verifies by its own checks whoever put it there. The app asks for it with
-the query `proofs=1` of the request for the attestation.
+the query `proofs=1` of the request for the attestation. The same value may stand in a node
+document (7.7), and the backend hands it out for the digest of a measurement.
 
 The challenge statement:
 
@@ -268,7 +269,8 @@ When release proofs show the measurement of the document to the program ("The re
 "The program of the app": the release key signed the measurements of the release and the public
 log recorded that, a deploy key signed them, GitHub attested them for the release workflow at the
 tag of the release in this repository, and the release is later than the listed ones), the
-release is an accepted one for that program, as an element of its list is. Without such proofs
+release is an accepted one for that program, as an element of its list is, unless its release
+statement states a program later than that one. Without such proofs
 the app hands the node no key, as for any measurement outside the list, and does not count the
 document as a failed verification: its verification of the log (7.4) leaves the chain of that
 node pending, counts the node as a node of a later release, and the program that lists the
@@ -1335,6 +1337,10 @@ Test vectors of the assignment; the backend of the operator computes the same fu
 | `WAIT_LATE_MS` (the app) | 5,000: a wait that ends later than its own limit by more than this ended in a runtime that did not run for a part of it (the app was suspended), and a read of the log that fails that way failed with the device |
 | `LOG_RELEASE_GRACE_MS`, `SERVED_FRESH_MS` (the app) | 24 hours: the time a measurement no list of the program has may hold the key of the account before it marks the log (A1). 1 hour: the age up to which a reading of the served version, or in a build that knows it itself the last check of the app for a new program, says that no later program is served |
 | `LOG_DOUBT_ROUNDS` (the app) | 2: the rounds whose answers carried no signature that verifies for a key before the signatures of its node contradict each other (A2) |
+| `PROOF_STATEMENT_BYTES`, `PROOF_ATTESTATION_BYTES`, `PROOF_PATH_HASHES`, `PROOF_DEPLOY_SIGNATURES`, `PROOF_JSON_DEPTH` (the app) | 16,384, 65,536, 64, 8 and 32: the bytes of a release statement, the bytes of the attestation of release proofs as JSON without white space, the hashes of its audit path, the elements of `deploy_signatures`, and the arrays and objects inside one another of a JSON value of release proofs ("The release proofs") |
+| `PROOF_REQUEST_NODES`, `PROOF_REQUEST_MEASURES`, `PROOF_ROUND_REQUESTS`, `PROOF_RETRY_MS` (the app) | 4: the nodes one grant step asks for the release proofs of their release, one of each measurement. 8 and 4: the measurements one request to the backend for release proofs names, and such requests per round. 1 hour: the time after which a measurement is asked for again, by a node and by a round each |
+| `PROOF_FAILURES`, `PROOF_FAILURE_SPAN_MS`, `PROOF_REFUSED_KEPT` (the app) | 8 and 1 hour: a runtime verifies no further release proofs while this many failed within this time. 8: the measurements for which a runtime remembers the proofs it refused last, which it does not verify again |
+| `PROOF_KEPT_VERDICTS`, `PROOF_KEPT_PROOFS`, `PROOF_KEPT_CHARS` (the app) | 256: the measurements whose verdicts of release proofs the device keeps (beyond them the verdict of the earliest release leaves). 4 and 65,536: the releases whose proofs are kept with the verdict, the latest ones the program accepts, and the characters of the JSON of proofs that are kept |
 | `LOG_BLOCKED_ROUNDS`, `LOG_BLOCKED_MS`, `LOG_REACH_MS`, `LOG_URL_FRESH_MS` (the app) | 3 and 3 days: the rounds in a row whose reads were held back (or the reads of one kind the log screen notes as held back from it), and the age of the first of them, at which the log is marked (A3). 60,000: a request that was not answered counts as held back when the backend answered another request of the runtime within this time. 240,000: the age of a signed address from which a refusal of the store is the age of the address |
 | `LOG_RETENTION_DAYS` (the app) | 365: a key older than this is expected by no reader (the retention of its lock), and a key is expected in the listing while it is a day younger (A4) |
 | `LOG_SAMPLE_KEYS`, `LOG_SEEN_PART`, `LOG_SEEN_PARTS`, `LOG_SEEN_KEYS`, `LOG_NODES_KEPT` (the app) | 64: the control keys of the sample of A4. 4,096, 9 and 32,768: the digests of the control keys the device judged are kept in parts of 4,096, nine parts at most (when one more begins, the oldest leaves), so the device remembers 32,768 judgements or more. 256: the nodes whose judgement the device keeps |
@@ -1526,11 +1532,13 @@ grant to.
 A node receives a grant when its attestation verifies (4.3) and:
 
 - its measurement (PCR0, PCR1, PCR2) equals an element of the list of accepted releases of the
-  program (4.5), or release proofs that this runtime verified show it ("The release proofs"). A
-  document that verifies with a measurement no list has and no proofs showed is the document of
-  a release later than the program: the node receives no grant and is not asked again by that
-  program, but for the release proofs of its measurement an hour after the last request for
-  them;
+  program (4.5), or release proofs that this runtime verified show it as that of a release whose
+  statement states no program later than this one ("The release proofs"). A document that
+  verifies with a measurement no list has and no proofs showed is the document of a release
+  later than the program: the node receives no grant and is not asked again by that program, but
+  for the release proofs of its measurement an hour after the last request for them. So is the
+  document of a measurement whose proofs hold and state a later program, and the proofs of such a
+  measurement are not asked for again;
 - its binding states no `program_min` above the version of the program (below);
 - its binding names the log store of the server target (4.3 step 10, a node of platform
   `nitro`);
@@ -1575,7 +1583,9 @@ writes to the log store: a node of the measurement receives the grant by the rul
 that receive a grant" (its binding names the log store of the server target), the format of its
 log follows from the name of the release, and its entries, and a transfer of the key of the account
 to its measurement, are judged as those of an accepted release (7.4, A1). Without proofs that
-pass, the node is one of a later release (4.3).
+pass, the node is one of a later release (4.3). A release whose proofs pass and whose statement
+states a program later than this one is none this program accepts ("A statement that states a
+later program" below).
 
 The proofs are a JSON object:
 
@@ -1598,10 +1608,10 @@ Every check must hold, for a measurement M (PCR0, PCR1 and PCR2 of a document th
 
 | Check | Rule |
 | --- | --- |
-| P1 | The statement is at most 16,384 bytes long and a JSON object that states `release`, `pcr0`, `pcr1` and `pcr2` once each: `release` a release tag (10.3), each PCR 96 lower-case hexadecimal characters. The three PCRs equal those of M. Other members of the statement are not read |
+| P1 | The statement is at most 16,384 bytes long and a JSON object that states `release`, `pcr0`, `pcr1` and `pcr2` once each: `release` a release tag (10.3), each PCR 96 lower-case hexadecimal characters. The three PCRs equal those of M. The statement may state `program_min`, once: a non-negative integer below 2^53, written as decimal digits without a leading zero (a lone `0` is one) and with neither a fraction nor an exponent. Other members of the statement are not read |
 | P2 | The release key signed the statement and a transparency log of the program recorded that signature: checks 2, 3 and 4 of 10.3 for a log of the form Rekor v1, with the release key and the log key the program holds. The time of the entry is compared with no clock (check 5 of 10.3 asks the clock of a node, and the notice period is 0 seconds) |
 | P3 | `deploy_signatures` has at most 8 elements, each with the texts `key_id` and `signature`. Exactly one element names the key id of the server target of the build (`prod` for the server target `prod`, `dev` for every other), and its signature is the Ed25519 signature of that deploy key over the UTF-8 bytes of `pickle-enclave-release-statement-v1`, a line feed, the lower-case hexadecimal SHA-256 of the statement and a line feed. The deploy keys are the keys with which the apps verify the deploy signature of a served program, by the same rule of the key id. The deploy signature of a program covers `pickle-secure-program-v1`, a line feed and the program, so neither signature is one of the other kind |
-| P4 | GitHub attested the statement: the attestation verifies by the rules below, under the identity of the release workflow at the tag `release` of the statement, and its in-toto statement has the predicate type `https://pickle.com/credential-enclave/release/v1` and a predicate whose `release`, `pcr0`, `pcr1` and `pcr2` equal those of the statement |
+| P4 | GitHub attested the statement: the attestation verifies by the rules below, under the identity of the release workflow at the tag `release` of the statement, and its in-toto statement has the predicate type `https://pickle.com/credential-enclave/release/v1` and a predicate whose `release`, `pcr0`, `pcr1`, `pcr2` and `program_min` equal those of the statement (a predicate states no `program_min` where the statement states none) |
 | P5 | The release of the statement is later than every release of the list of accepted releases of the program, in the order of releases (10.3) |
 
 The attestation (P4) is a Sigstore bundle: the certificate Fulcio issued to the workflow run
@@ -1692,23 +1702,83 @@ Where the proofs come from. Whoever hands them over, the checks above decide.
   step and fails nothing else.
 - A node document (7.7) may carry them as the member `release_proofs`. A round that reads the
   document of a node of a measurement no list has verifies them with that document.
+- The backend hands them out for the digest of a measurement. A round asks for the measurements
+  no list has and no proofs showed, whose nodes may be closed and whose node documents may carry
+  no proofs:
+
+  ```text
+  GET /api/secure/release-proofs?measures={digest},{digest},...
+  -> {"proofs": [{"measure": "{digest}", "release_proofs": {...}}, ...]}
+  ```
+
+  A digest is the base64url (without padding) of the SHA-256 of the UTF-8 bytes of `pcr0`, `pcr1`
+  and `pcr2` of the measurement, each as 96 lower-case hexadecimal characters, one after another:
+  the form in which the program keeps a measurement. The answer holds one element for each
+  measurement of the request whose proofs the backend has, and leaves the others out. Of the
+  answer, an element counts when it names a digest of the request for the first time and
+  carries proofs whose statement states the measurement of that digest; the checks above decide
+  the rest. A round asks at three places: at its start, for the measurements the device kept
+  before it (`log.unaccepted`), the ones that held the key of the account first; after the node
+  documents of step 3, for the measurements those documents state, before the entries of their
+  nodes are judged; and before its judgement, for the measurements it noted. One request names
+  eight measurements at most, and a round sends four such requests at most; a round that leaves
+  a measurement unasked has more to read than it read ("The round"). A runtime asks for one
+  measurement not sooner than an hour after it asked last. No request goes out while the device
+  has met no such measurement, and a stale runtime sends none. A request that fails, a backend
+  without the route (the status 404) and an answer without proofs that pass leave the
+  measurement what it was: nothing counts as a read held back, and what a measurement no list
+  has means for the log is judged by A1 as before (7.4).
 
 A node kept as one of a later release is asked for the proofs of its measurement again when the
 last request for them is an hour old: the proofs of a release may reach the backend after its
-nodes. A runtime verifies no further proofs while 8 of them failed within an hour. Proofs that
-fail are logged with the check that failed (`release proofs refused: p4: identity 11`).
+nodes. A runtime verifies no further proofs while 8 of them failed within an hour, and it does
+not verify again the proofs it refused last for a measurement: the same value reaches it from a
+node, from a node document and from the backend. Proofs that fail are logged with the check that
+failed (`release proofs refused: p4: identity 11`).
+
+Proofs that reach the device after it read the entries of a node. A control key is remembered as
+judged when its node is an accepted one (7.4, "The round"). The keys of a node of a measurement
+no list has are read again by every round. So when proofs make that measurement one of an
+accepted release, the next round judges the entries its nodes wrote before as those of accepted
+nodes: a transfer of the key they name is followed (A1), and what the node signed counts for A2.
+A round whose last request shows a measurement is not complete, and the next one judges those
+entries.
 
 A node of a measurement the proofs show states the release of the proofs in its binding: a
 document of that measurement whose binding names another release fails the verification.
 
-What the device keeps (`log.proven`): the measurement, the release, the time and the proofs, under
-the version of the program that verified them. A program reads what a program of another version
-kept as nothing. The kept verdict counts where the log is judged. A node receives a key only from
-a runtime that verified the proofs itself: a runtime verifies the kept proofs again before the
-first grant it hands to a node of that measurement, and a kept verdict whose proofs fail is kept
-no longer. The device keeps four measurements at most, and the proofs of one when their JSON is
-at most 131,072 characters long (the verdict of longer proofs is kept without them, and the next
-runtime asks for the proofs again).
+A statement that states a later program. `program_min` of a release statement is the lowest
+version of the program that reads what the nodes of the release write. A release whose proofs
+pass and whose statement states a `program_min` above the version of the program is none that
+program accepts, whatever version the backend serves:
+
+- its nodes receive no grant of that program;
+- what its nodes wrote is read as the entries of a node of a measurement no list has: the
+  entries are shown where the program reads them, nothing they hold marks the node (A2), and
+  their keys are not remembered as judged;
+- the release holding the key of the account marks the log under the conditions of a
+  measurement no list has (A1): 24 hours after the device first saw the measurement, in a
+  runtime that knows that no later program than this one is served. A stale runtime states
+  nothing.
+
+The proofs of such a measurement are not asked for again. The `program_min` of a binding (above)
+is another value: it keeps the grant of a program from a node and changes nothing of how the
+entries of that node are judged. Of two statements that passed for one measurement, the release
+of the one verified last and the higher `program_min` stand.
+
+What the device keeps (`log.proven`): per measurement the release and the `program_min` of the
+statement and the time, under the version of the program that verified them. A program reads
+what a program of another version kept as nothing. The kept verdict counts where the log is
+judged. A node receives a key only from a runtime that verified the proofs itself: a runtime
+verifies the kept proofs again before the first grant it hands to a node of that measurement,
+and a kept verdict whose proofs fail is kept no longer. The device keeps the verdicts of 256
+measurements. Beyond that number the verdict of the earliest release leaves first, in the order
+of releases (10.3): the key of an account moves to later releases, so the verdict of the release
+that holds it stays. A verdict a runtime made stays with that runtime whether or not the program
+store holds it, and a verdict that left is made again from the proofs of a response, of a node
+document or of the backend. The proofs themselves are kept for the four latest of those releases
+that the program accepts, each when its JSON is at most 65,536 characters long: for the other
+measurements a runtime asks for the proofs once.
 
 What the proofs show, and what they do not. A release whose proofs pass has: the signature of the
 release key over its measurements in the public log, where the monitor of this repository reads
@@ -1742,10 +1812,10 @@ it is a secret; what names services and addresses is sealed with a key derived f
 | `log.grants` | The nodes this device handed a grant to: the time of the grant, its end, the release and platform of the node, the time of the last attempt. A node is written before its grant goes out |
 | `log.nodes` | What the node documents that verified said: per node id the digest of the measurement, the platform, the release, the time first seen, and the time a contradiction of its signatures was found. A node id without a document that verifies is not kept, whatever the store showed of it |
 | `log.unaccepted` | The measurements no list of the program has and no release proofs showed, each with the time it was first seen, whether the key of the account went to a node of it, and the time the grant step last asked for its release proofs |
-| `log.proven` | The measurements release proofs showed to this program: per measurement the release, the three PCRs, the time and the proofs, under the version of the program that verified them ("The release proofs"). Four measurements at most |
+| `log.proven` | The measurements whose release proofs this program verified: per digest the release and the `program_min` of the statement and the time, under the version of the program that verified them ("The release proofs"). 256 measurements at most, those of the latest releases, with the proofs of the four latest releases the program accepts |
 | `log.blocked` | The rounds in a row whose reads were held back: the time of the first and their number |
 | `log.sample` | The 64 latest control keys the device verified |
-| `log.seen`, `log.seen.{n}` | The digests of the control keys the device judged, in parts of 4,096 digests: `log.seen` names the parts, the oldest first, and `log.seen.{n}` holds one. Nine parts are kept; when one more begins, the oldest leaves with the digests it holds, so 32,768 judgements or more are remembered |
+| `log.seen`, `log.seen.{n}` | The digests of the control keys the device judged (a key whose node is of a measurement no list has is not among them: every round reads it again), in parts of 4,096 digests: `log.seen` names the parts, the oldest first, and `log.seen.{n}` holds one. Nine parts are kept; when one more begins, the oldest leaves with the digests it holds, so 32,768 judgements or more are remembered |
 | `log.missing` | The keys of the sample that left the listing within their retention, until a listing names them again |
 | `log.doubted` | The keys whose body an answer handed out with a signature that does not verify under the accepted node of the key (32 at most): the number of rounds whose answers did, the time of the first, and the node id. A key leaves when an answer carries a signature that verifies |
 | `log.withheld` | The reads that were held back and that every round makes again. Of format 3: the keys of entries whose document or body was held back, and the keys the log screen asked for that no answer of the bodies reached (32 at most), with a mark on the ones the log screen asked for; the listing pages of the log screen that were held back (2 at most); and the time until which the rounds go on reading the first listing pages for the screen. Of the bucket of formats 1 and 2, as the log screen read it: the entries whose object versions were held back (16 at most), the `seq`s under which more objects lie than the screen reads, none of the ones it read the entry of the node (16 at most), the listings of chains (8 at most), and the listing of the node prefixes. And reads nobody held back: the new control keys a round listed and did not come to judge (`unjudged`, 32 at most), which the next round asks for before its listing |
@@ -1799,7 +1869,9 @@ most, the keys of the nodes of an accepted measurement first, the earliest entry
 under the id of such a node is the entry its key names or its read ends in a count, so nothing
 uncounted takes those places from an entry). Their documents and bodies are asked for as in steps
 3 and 4, with requests of their own (two document requests and two body requests at most), which
-take none from the requests of the listing pages.
+take none from the requests of the listing pages. Before any of that, a round that begins with a
+measurement no list has among what the device kept asks the backend for its release proofs ("The
+release proofs").
 
 1. The listing addresses from the backend (`POST /api/secure/log/read`). The program calls an
    address only when its host is the host of the bucket the program computed from its own
@@ -1826,7 +1898,9 @@ take none from the requests of the listing pages.
    prefix `n3/{node}`, `max-keys` 1000, no marker, `encoding-type` `url` when given, and no other
    key besides the keys of the signature. When the listing ends with its first page and names no
    version of the key `n3/{node}` (a delete marker is no version), the store holds no node
-   document of that node id.
+   document of that node id. For a document that verifies with a measurement no list has and
+   that carries no release proofs that pass, the round asks the backend for the release proofs
+   of that measurement before it judges the entries of the node ("The release proofs").
 4. The bodies of the keys it has not judged whose nodes it has a judgement of (`POST
    /api/secure/log/bodies`): with the request of step 3 for the nodes it had a judgement of
    before, and after it for the nodes step 3 judged (while a document is asked for, the first
@@ -1843,15 +1917,20 @@ take none from the requests of the listing pages.
    one its key names, handed out with a signature that does not verify under the accepted node
    of the key, leaves the key unjudged: the signature reaches the device through the backend,
    so one answer proves nothing of the node. The key is read again by every round, with the
-   keys held back, and the round is not complete (A2 below).
+   keys held back, and the round is not complete (A2 below). A control key whose read came to a
+   judgement is remembered as judged when its node is an accepted one. A key of a node of a
+   measurement no list has is not: every round reads it again, so the entries such a node wrote
+   are judged as those of an accepted node once release proofs or the list of a later program
+   make its measurement one of an accepted release.
 5. The reads that were held back before (`log.withheld`): the keys are read before step 1 (above),
    and each listing page of the log screen is asked for again in the request the screen sends for
    it, with the entries of the page the screen would show there.
 6. The chains of formats 1 and 2 the device follows, and the reads of that bucket that the log
    screen made and that were held back (the last part of this section).
-7. The judgement, the published state, and the report (`POST /api/secure/log/verified`). What the
-   round read for the log screen is kept for the screen before the reads it answers leave
-   `log.withheld`.
+7. The judgement, the published state, and the report (`POST /api/secure/log/verified`). Before
+   the judgement the round asks the backend for the release proofs of the measurements no list
+   has that it noted ("The release proofs"). What the round read for the log screen is kept for
+   the screen before the reads it answers leave `log.withheld`.
 
 A backend that answers the route of the listing addresses with the status 404 and no code of its
 own, or with the code `log_store_disabled`, states that its environment has no store of format 3.
@@ -1960,7 +2039,8 @@ answered is noted when the backend answered another request of the runtime withi
 A round that leaves reads undone because there was more to read than one round reads (the control
 listing goes on beyond its four pages, more nodes are without a judgement than its document
 requests name, more bodies are to be read than its body requests name, an answer of the bodies
-ends before its last key, the chains of formats 1 and 2 hold more control entries than it reads,
+ends before its last key, more measurements no list has wait for their release proofs than its
+requests for them name, the chains of formats 1 and 2 hold more control entries than it reads,
 the listing of such a chain goes on over pages that hold many object versions for each `seq`, or
 its time of 60 s passes before it has read everything) is pending, and the next round reads on
 from where it stopped: a round whose time passes is judged on what it read and keeps what it
@@ -1987,7 +2067,7 @@ conditions holds, and each holds only in a situation that is a problem:
 
 | | Condition | When it holds |
 | --- | --- | --- |
-| A1 | The key of the account went to a node of a release the program does not accept | A node of an accepted measurement wrote `grant_transferred_out` under the device's own `key_id` naming a measurement no list of the program has, or a node whose document states such a measurement wrote an entry under that `key_id`; 24 hours have passed since the device first saw that measurement; and the runtime knows that no later program than this one is served ("A runtime behind the served program"). Until all of that holds the measurement waits and the round is pending: a program that lists a new release is served before a node of that release takes a grant, and a device may run the program before it for longer than a day. The program that lists the release clears the condition. Once it holds, every round that ends states it, however its reads ended, and for a measurement the device kept the events of the app state it without a read when the runtime knows by then that no later program is served (a new runtime that learns it from the backend has read nothing at its event `session_ready`). A receiving node whose document the device has not seen is no measurement: it waits for its document, a round whose request for that document is answered without one that verifies is a round held back (A3), and no time marks the log for it. The receiving node of a transfer a round judged is kept whatever kept its document from that round |
+| A1 | The key of the account went to a node of a release the program does not accept | A node of an accepted measurement wrote `grant_transferred_out` under the device's own `key_id` naming a measurement no list of the program has and no release proofs show as that of a release the program accepts ("The release proofs"), or a node whose document states such a measurement wrote an entry under that `key_id`; 24 hours have passed since the device first saw that measurement; and the runtime knows that no later program than this one is served ("A runtime behind the served program"). Until all of that holds the measurement waits and the round is pending: a program that lists a new release is served before a node of that release takes a grant, and a device may run the program before it for longer than a day. The program that lists the release clears the condition, and so do release proofs that show the measurement as that of a release the program accepts. Once it holds, every round that ends states it, however its reads ended, and for a measurement the device kept the events of the app state it without a read when the runtime knows by then that no later program is served (a new runtime that learns it from the backend has read nothing at its event `session_ready`). A receiving node whose document the device has not seen is no measurement: it waits for its document, a round whose request for that document is answered without one that verifies is a round held back (A3), and no time marks the log for it. The receiving node of a transfer a round judged is kept whatever kept its document from that round |
 | A2 | The signatures of a node that passed attestation contradict each other | Under a key of a node of an accepted measurement: an entry of the device's own `key_id` that the node signed and that does not open; two different bodies of one `seq` that both verify; or the body the key names for which the answers of two rounds carried no signature that verifies. The first two are marks no answer can make up, and stay. The third holds until an answer carries a signature that verifies for that key: the key is read again by every round, and a round it is held back from is a round held back (A3) |
 | A3 | The operator domain has held the reads back for three days | Three rounds in a row or more were held back and the first of them is three days old; or the log screen notes three or more reads of one kind as held back from it (the later pages, the listings of one chain of formats 1 and 2, the pages that held no entry), on three days within 30 days, that it has not read since, and the first of them is three days old. A round is held back when a route of the reads answers with an error status, or does not answer within its limit while the backend answered another request of the runtime within 60 s; when an address is not the one of the request; when the store answers an address not older than 240 s with a status other than 200, 429 and 5xx; when the backend hands out no body, or another body, for a key of the listing whose node the device has a judgement of; when an answer of the bodies names none of the keys of a request, or names a key and not one before it in the request; when the backend hands out no verifying document for the node of a key of the listing and the store does not show that it holds none (it holds a version under the key of that node document or more than a page there, the answer gives no address of that listing or another address, or the store refuses the address); when the backend answers the request for the document of the receiving node of a transfer without a document that verifies (a transfer an entry of format 3 names, and a transfer a node of a release before v2.4.0 made on or after 2026-11-23T00:00:00Z: "Formats 1 and 2"); when a key whose signature an answer did not carry is held back from a round (A2); when a measurement past the 24 hours of A1 cannot be judged because the checks of the app for a new program fail on the side of the server ("A runtime behind the served program"); when more objects lie under a `seq` of a chain of formats 1 and 2 than are read there and none of the ones read is the entry of the node, or a listing page of such a chain goes on and shows the node writing nowhere ("Formats 1 and 2"); when a read the log screen made of the bucket of formats 1 and 2 is still held back; and, beyond eight rounds in a row that left reads undone because there was more to read than a round reads, when the first round of a synchronization ends that way again. A round that made every read, the reads held back before included, clears the count of the rounds. A read the screen makes itself ends the reads it noted that this read covers, and the reads it noted end together when the last of them is 30 days old |
 | A4 | An entry the device saw left the listing within its retention | A key of the sample that is younger than 364 days and lies in the range the listing covered is in neither of two readings of the listing. The condition ends for a key when a listing a round reads names it again |
