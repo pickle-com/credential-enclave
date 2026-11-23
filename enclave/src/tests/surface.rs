@@ -60,11 +60,11 @@ async fn health_reports_the_node_in_the_key_order_of_5_1() {
         "\"lingering_connections\":null,\"lingering_cut\":null",
         "},\"egress\":{\"opens\":0,\"open_failures\":{\"transport\":0,\"relay_refused\":0,",
         "\"tls\":0,\"http\":0},\"open_retries\":0,\"open_inflight\":0,",
-        "\"idle_reuses\":{\"provider\":0,\"log_store\":0}},",
+        "\"idle_reuses\":{\"provider\":0,\"log_store\":0,\"mail\":0}},",
         "\"refresh\":{\"late\":{\"kept\":0,\"dropped\":0,\"failed\":0,\"abandoned\":0},",
         "\"late_inflight\":0},",
         "\"state\":{\"kept_refreshes\":0,\"merge_keys\":0,\"pending_entries\":0,",
-        "\"idle_connections\":{\"provider\":0,\"log_store\":0}}}"
+        "\"idle_connections\":{\"provider\":0,\"log_store\":0,\"mail\":0}}}"
     );
     assert!(text.ends_with(suffix), "{text}");
     let load = health["load"].as_object().unwrap();
@@ -130,7 +130,7 @@ async fn health_reports_the_node_in_the_key_order_of_5_1() {
             "open_failures": {"transport": 0, "relay_refused": 0, "tls": 0, "http": 0},
             "open_retries": 0,
             "open_inflight": 0,
-            "idle_reuses": {"provider": 0, "log_store": 0},
+            "idle_reuses": {"provider": 0, "log_store": 0, "mail": 0},
         })
     );
     assert_eq!(
@@ -144,7 +144,7 @@ async fn health_reports_the_node_in_the_key_order_of_5_1() {
         health["state"],
         json!({
             "kept_refreshes": 0, "merge_keys": 0, "pending_entries": 0,
-            "idle_connections": {"provider": 0, "log_store": 0},
+            "idle_connections": {"provider": 0, "log_store": 0, "mail": 0},
         })
     );
 }

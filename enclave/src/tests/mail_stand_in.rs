@@ -22,9 +22,12 @@ use crate::testing::{App, Harness};
 /// The message of the mailbox of [`mailbox`].
 pub(super) const MESSAGE: &[u8] = b"From: friend@example.com\r\nTo: tester@naver.com\r\nSubject: a test\r\nMessage-ID: <one@pickle.com>\r\n\r\nhello\r\n";
 
-/// One command a client sent: its text without its tag, with the octets of its literals in
-/// the places of their declarations.
+/// One command a client sent: the number of its connection (the first is 0), its number on
+/// that connection (the first is 0, the `LOGIN`), and its text without its tag, with the
+/// octets of its literals in the places of their declarations.
 pub(super) struct Command<'a> {
+    pub connection: usize,
+    pub number: usize,
     pub text: &'a str,
 }
 
@@ -36,6 +39,8 @@ pub(super) enum Act {
     Wait(Arc<Semaphore>),
     /// Waits for this long.
     Pause(Duration),
+    /// Ends the connection: nothing follows, the completion of the command included.
+    Close,
 }
 
 /// The answer to a command: what the stand-in does, and then the completion of the command
@@ -128,7 +133,7 @@ pub(super) struct ImapServer {
     pub connections: Arc<AtomicUsize>,
     /// The `LOGIN` commands it received.
     pub logins: Arc<AtomicUsize>,
-    /// The connections that ended.
+    /// The connections that ended: the client closed them, or an act of the stand-in did.
     pub ended: Arc<AtomicUsize>,
     /// The commands that wait at a gate at this moment.
     pub waiting: Arc<AtomicUsize>,
@@ -208,6 +213,7 @@ impl ImapServer {
                     let mut io = BufReader::new(tls);
                     let served = async {
                         io.get_mut().write_all(greeting.as_bytes()).await.ok()?;
+                        let mut number = 0;
                         loop {
                             let mut line = Vec::new();
                             if io.read_until(b'\n', &mut line).await.ok()? == 0 {
@@ -237,7 +243,12 @@ impl ImapServer {
                             if text.starts_with("LOGIN ") {
                                 logins.fetch_add(1, Ordering::SeqCst);
                             }
-                            let answer = script(&Command { text: &text });
+                            let answer = script(&Command {
+                                connection,
+                                number,
+                                text: &text,
+                            });
+                            number += 1;
                             for act in answer.acts {
                                 match act {
                                     Act::Send(bytes) => {
@@ -250,6 +261,7 @@ impl ImapServer {
                                         permit.ok()?.forget();
                                     }
                                     Act::Pause(pause) => tokio::time::sleep(pause).await,
+                                    Act::Close => return None,
                                 }
                             }
                             if !answer.completion.is_empty() {

@@ -1,6 +1,7 @@
 //! Typed mail calls. Passwords are opened only after grant checks and used after logging.
 
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 use axum::extract::{Request, State};
 use axum::http::header::CONTENT_LENGTH;
@@ -17,7 +18,8 @@ use super::{invalid, read_body, record_of, respond, ApiError, JsonBody};
 use crate::frame::{self, META_LIMIT_BYTES};
 use crate::log_store;
 use crate::mail::{self, AppPassword, MailData, MailError, ReadMail, Share};
-use crate::state::{events, lock, Node};
+use crate::mail_sessions::{Delegation, SessionKey};
+use crate::state::{events, lock, Account, GrantState, Node};
 
 pub async fn verify(State(node): State<Arc<Node>>, request: Request) -> Response {
     call(node, request, "verify").await
@@ -76,6 +78,24 @@ fn no_room_for_the_input() -> ApiError {
         ProtocolError::CapacityUnavailable,
         "the node has no room for the mail the call reads; the call changed nothing",
     )
+}
+
+/// True while the delegation a call ran under is in force and the node is open, at this
+/// moment: the node is not closing, the grant of the account is within its time and is the
+/// grant of the signing public key the call ran under, and the account accepted no revoke
+/// since the call created its event. A kept session is taken, and a session is kept, only
+/// while this holds (`crate::mail_sessions`).
+fn in_force(node: &Node, account: &Mutex<Account>, delegation: &Delegation) -> bool {
+    if node.closing.load(Ordering::SeqCst) {
+        return false;
+    }
+    let mut account = lock(account);
+    account.expire(node.now_ms());
+    account.revoke_serial == delegation.revoke_serial
+        && matches!(
+            account.grant(),
+            GrantState::Active(grant) if grant.sign_pk == delegation.sign_pk
+        )
 }
 
 async fn run(node: &Node, request: Request, operation: &str) -> Result<Response, ApiError> {
@@ -154,11 +174,16 @@ async fn run(node: &Node, request: Request, operation: &str) -> Result<Response,
     }
     let account = node.account(user).ok_or(ProtocolError::GrantRequired)?;
     log_store::admit(node, &account).await?;
-    let (credentials, place, sign_pk, key_id) = {
+    // The record a kept session belongs to: its `id` and the hash of its ciphertext, both
+    // values of the caller. The record opens under the grant of the account below, so a call
+    // with this key carries the application password the session was authenticated with.
+    let session_key = SessionKey::of(user, &record);
+    let (credentials, place, sign_pk, key_id, delegation) = {
         let mut account = lock(&account);
         node.ensure_open()?;
         let now_ms = node.now_ms();
         let grant = account.active(now_ms)?;
+        let delegation = Delegation::of(&grant);
         let credentials = AppPassword::open(&grant, user, &record)?;
         if operation == "submit" {
             credentials
@@ -174,7 +199,7 @@ async fn run(node: &Node, request: Request, operation: &str) -> Result<Response,
             EntryKind::Use,
             events::mail_request(&record.id, operation, &params, &payload, context),
         )?;
-        (credentials, place, grant.sign_pk, grant.key_id)
+        (credentials, place, grant.sign_pk, grant.key_id, delegation)
     };
     let log = log_store::commit(node, user, &account, &[(place, true)])
         .await?
@@ -199,17 +224,37 @@ async fn run(node: &Node, request: Request, operation: &str) -> Result<Response,
             ))
         }),
         "read" => {
-            credentials
-                .read(
-                    node,
-                    read_request.as_ref().ok_or_else(|| invalid("request"))?,
-                    &share,
-                )
-                .await
+            let read = read_request.as_ref().ok_or_else(|| invalid("request"))?;
+            let sessions = &node.egress.mail_sessions;
+            // The entry of this call is confirmed: the call may send its commands, over the
+            // session the node kept for this record or over a new one. A call takes a kept
+            // session only here, so no command goes over one for a call without an entry,
+            // and only while the delegation it ran under is in force.
+            let kept = match in_force(node, &account, &delegation) {
+                true => sessions.take(&log, &session_key, &delegation, node.now_ms()),
+                false => {
+                    sessions.end(&session_key);
+                    None
+                }
+            };
+            let (data, session) = credentials.read(node, read, kept, &share).await;
+            // The session of a call that ended in step is kept for the next call of the
+            // record, while the delegation is in force.
+            if let Some(session) = session {
+                if in_force(node, &account, &delegation) {
+                    sessions.keep(session_key.clone(), delegation, session, node.now_ms());
+                }
+            }
+            data
         }
         "submit" => credentials.submit(node, &recipients, &payload).await,
         _ => return Err(invalid("operation")),
     };
+    if matches!(outcome, Err(MailError::Auth)) {
+        // The server refuses the application password of the record: no session that was
+        // authenticated with it carries a further call.
+        node.egress.mail_sessions.end(&session_key);
+    }
     let (status, content_type, body) = match outcome {
         Ok(MailData::Json(bytes)) => (200, "application/json", bytes),
         Ok(MailData::Raw(bytes)) => (200, "message/rfc822", bytes),

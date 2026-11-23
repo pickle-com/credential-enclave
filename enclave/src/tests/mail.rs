@@ -755,7 +755,7 @@ async fn the_share_of_a_mail_call_at_its_login_is_its_frame_and_its_fixed_share(
         false,
     )
     .await;
-    let (harness, _app, record) = server.harness().await;
+    let (harness, app, _) = server.harness().await;
     let harness = Arc::new(harness);
     let budget = harness.node.limits.body_budget_bytes;
     let read = mail::CALL_BYTES + mail::SHARE_STEP_BYTES;
@@ -773,6 +773,13 @@ async fn the_share_of_a_mail_call_at_its_login_is_its_frame_and_its_fixed_share(
             mail::CALL_BYTES + mail::LOGIN_INPUT_BYTES + mail::SMTP_INPUT_BYTES,
         ),
     ] {
+        // A record of its own for every call: no call goes over the session of the call
+        // before it, so each one logs in.
+        let record = app.record(
+            "app_password",
+            "naver_mail",
+            &json!({"username":"tester@naver.com","password":PASSWORD}),
+        );
         let expected = frame_of(&record, &params, b"").len() + fixed;
         let seen = server.passwords.lock().unwrap().len();
         let call = {

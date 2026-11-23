@@ -8,10 +8,11 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 
-use super::mail::{frame_of, request};
+use super::mail::{frame_of, request, PASSWORD};
 use super::mail_stand_in::{fetch_literal, mailbox, until, Act, Answer, ImapServer, MESSAGE};
 use crate::mail;
 use crate::state::Limits;
+use crate::testing::Harness;
 
 /// A message of `bytes` bytes.
 fn message_of(bytes: usize) -> Vec<u8> {
@@ -430,4 +431,472 @@ async fn a_folder_listing_names_the_folders_a_read_can_examine() {
     assert!(server
         .texts()
         .contains(&"EXAMINE \"quote\\\"and\\\\backslash\"".to_string()));
+}
+
+/// The mail reads that went over a kept session since the node started, and the sessions the
+/// node keeps at this moment (`mail` of `idle_reuses` and of `idle_connections` of health).
+async fn sessions_of(harness: &Harness) -> (u64, u64) {
+    let health = harness.health().await;
+    (
+        health["egress"]["idle_reuses"]["mail"].as_u64().unwrap(),
+        health["state"]["idle_connections"]["mail"]
+            .as_u64()
+            .unwrap(),
+    )
+}
+
+/// A folder listing of the account `mail-user` that succeeds.
+async fn list_folders(harness: &Harness, record: &Value) {
+    let (status, meta, _) =
+        request(harness, record, "read", json!({"action":"folders"}), b"").await;
+    assert_eq!(
+        (status, meta["status"].as_u64()),
+        (200, Some(200)),
+        "{meta}"
+    );
+}
+
+/// The reads of a record go over one authenticated session: the first one opens a connection
+/// and logs in, and the ones that follow send their commands over it. Every read has its own
+/// entry all the same. A record of another ciphertext has a session of its own.
+#[tokio::test]
+async fn the_reads_of_a_record_go_over_the_session_of_the_read_before_them() {
+    let server = ImapServer::start(mailbox).await;
+    let (harness, app, record) = server.harness(Limits::default()).await;
+    let entries = harness.last_seq("mail-user");
+    for params in [
+        json!({"action":"folders"}),
+        json!({"action":"search"}),
+        json!({"action":"read","uid":7,"uid_validity":42}),
+        json!({"action":"read","uid":7,"uid_validity":42}),
+    ] {
+        let (status, meta, _) = request(&harness, &record, "read", params, b"").await;
+        assert_eq!(
+            (status, meta["status"].as_u64()),
+            (200, Some(200)),
+            "{meta}"
+        );
+        // The entry of the call is on the chain, with the index of its event.
+        assert_eq!(meta["log"]["created"], true, "{meta}");
+    }
+    assert_eq!(harness.last_seq("mail-user"), entries + 4);
+    assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        server.commands.lock().unwrap().as_slice(),
+        [
+            (0, format!("LOGIN \"tester\" \"{PASSWORD}\"")),
+            (0, "LIST \"\" \"*\"".to_string()),
+            (0, "EXAMINE \"INBOX\"".to_string()),
+            (0, "UID SEARCH CHARSET UTF-8 UID 1:7".to_string()),
+            (
+                0,
+                "UID FETCH 7 (UID RFC822.SIZE BODY.PEEK[HEADER])".to_string()
+            ),
+            (0, "EXAMINE \"INBOX\"".to_string()),
+            (0, "UID FETCH 7 (UID RFC822.SIZE)".to_string()),
+            (0, "UID FETCH 7 (UID BODY.PEEK[])".to_string()),
+            (0, "EXAMINE \"INBOX\"".to_string()),
+            (0, "UID FETCH 7 (UID RFC822.SIZE)".to_string()),
+            (0, "UID FETCH 7 (UID BODY.PEEK[])".to_string()),
+        ]
+    );
+    assert_eq!(sessions_of(&harness).await, (3, 1));
+    // A kept session holds nothing of the body budget.
+    assert_eq!(
+        harness.node.body_budget.available_permits(),
+        harness.node.limits.body_budget_bytes
+    );
+
+    // The same mailbox under another record: another ciphertext, so another session.
+    let second = app.record(
+        "app_password",
+        "naver_mail",
+        &json!({"username":"tester@naver.com","password":PASSWORD}),
+    );
+    list_folders(&harness, &second).await;
+    list_folders(&harness, &second).await;
+    assert_eq!(server.connections.load(Ordering::SeqCst), 2);
+    assert_eq!(server.logins.load(Ordering::SeqCst), 2);
+    assert_eq!(sessions_of(&harness).await, (4, 2));
+    // A verification logs in on a connection of its own, whatever the record keeps. (It
+    // fails behind that login here: the stand-in is no SMTP server.)
+    let (status, _, _) = request(&harness, &record, "verify", json!({}), b"").await;
+    assert_eq!(status, 502);
+    assert_eq!(server.logins.load(Ordering::SeqCst), 3);
+    assert_eq!(sessions_of(&harness).await, (4, 2));
+}
+
+/// No call goes over a session after a revoke: a call is refused before it reaches one, and
+/// a grant after the revoke starts with a login. A read in progress when the revoke arrives
+/// runs to its end, and its session is not kept.
+#[tokio::test]
+async fn no_read_goes_over_a_session_after_a_revoke() {
+    let gate = Arc::new(Semaphore::new(0));
+    let server = {
+        let gate = gate.clone();
+        ImapServer::start(move |command| {
+            match command.connection == 1 && command.text.starts_with("LIST ") {
+                true => Answer::after(vec![
+                    Act::Send(b"* LIST () \"/\" \"INBOX\"\r\n".to_vec()),
+                    Act::Wait(gate.clone()),
+                ]),
+                false => mailbox(command),
+            }
+        })
+        .await
+    };
+    let (harness, app, record) = server.harness(Limits::default()).await;
+    let harness = Arc::new(harness);
+    list_folders(&harness, &record).await;
+    assert_eq!(sessions_of(&harness).await, (0, 1));
+
+    app.revoke(&harness).await;
+    let commands = server.texts().len();
+    let (status, meta, _) =
+        request(&harness, &record, "read", json!({"action":"folders"}), b"").await;
+    assert_eq!(
+        (status, meta["code"].as_str()),
+        (409, Some("grant_revoked"))
+    );
+    assert_eq!(server.texts().len(), commands);
+
+    // A grant of the same key after the revoke: its first read logs in, and the session that
+    // was kept under the delegation before the revoke ends.
+    app.grant(&harness).await;
+    let call = {
+        let (harness, record) = (harness.clone(), record.clone());
+        tokio::spawn(async move { list_folders(&harness, &record).await })
+    };
+    until(
+        "the read after the grant waits on its new connection",
+        || server.waiting.load(Ordering::SeqCst) == 1,
+    )
+    .await;
+    assert_eq!(server.logins.load(Ordering::SeqCst), 2);
+    until(
+        "the session of the delegation before the revoke ended",
+        || server.ended.load(Ordering::SeqCst) == 1,
+    )
+    .await;
+
+    // A revoke while that read is in progress: the read runs to its end, and no session is
+    // kept under the delegation it ran under.
+    app.revoke(&harness).await;
+    gate.add_permits(1);
+    call.await.unwrap();
+    until("the session of the read in progress ended", || {
+        server.ended.load(Ordering::SeqCst) == 2
+    })
+    .await;
+    assert_eq!(sessions_of(&harness).await, (0, 0));
+}
+
+/// A call after the end of its grant, and a call to a closing node, reach no session, and a
+/// read that ends while the node closes leaves none.
+#[tokio::test]
+async fn no_read_goes_over_a_session_after_the_end_of_its_grant_or_while_the_node_closes() {
+    let gate = Arc::new(Semaphore::new(0));
+    let server = {
+        let gate = gate.clone();
+        ImapServer::start(move |command| {
+            match command.connection == 1 && command.text.starts_with("LIST ") {
+                true => Answer::after(vec![Act::Wait(gate.clone())]),
+                false => mailbox(command),
+            }
+        })
+        .await
+    };
+    let (harness, app, record) = server.harness(Limits::default()).await;
+    let harness = Arc::new(harness);
+    // A grant that ends in 120 seconds, after a revoke: no renewal of the grant before it.
+    app.revoke(&harness).await;
+    let attested = app.attest(&harness).await;
+    let not_after_ms = harness.node.now_ms() + 120_000;
+    app.send(&harness, app.grant_envelope(&attested, not_after_ms))
+        .await;
+    list_folders(&harness, &record).await;
+    assert_eq!(sessions_of(&harness).await, (0, 1));
+
+    harness.node.clock.advance(121_000);
+    let commands = server.texts().len();
+    let (status, meta, _) =
+        request(&harness, &record, "read", json!({"action":"folders"}), b"").await;
+    assert_eq!(
+        (status, meta["code"].as_str()),
+        (409, Some("grant_expired"))
+    );
+    assert_eq!(server.texts().len(), commands);
+
+    // A new grant: the session of the grant before it sat for longer than the idle time, so
+    // the read logs in. It waits in front of the completion of its `LIST`.
+    app.grant(&harness).await;
+    harness.node.egress.mail_sessions.set_limits(300, 300_000);
+    let call = {
+        let (harness, record) = (harness.clone(), record.clone());
+        tokio::spawn(async move { list_folders(&harness, &record).await })
+    };
+    until("the read waits on a new connection", || {
+        server.waiting.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert_eq!(server.logins.load(Ordering::SeqCst), 2);
+
+    // The node starts to close while that read is in progress. The read runs to its end, its
+    // session is not kept, and a further call is refused before it reaches a session.
+    assert_eq!(harness.post("/v1/close", json!({})).await.0, 200);
+    gate.add_permits(1);
+    call.await.unwrap();
+    until("both connections ended", || {
+        server.ended.load(Ordering::SeqCst) == 2
+    })
+    .await;
+    assert_eq!(sessions_of(&harness).await, (0, 0));
+    let commands = server.texts().len();
+    let (status, meta, _) =
+        request(&harness, &record, "read", json!({"action":"folders"}), b"").await;
+    assert_eq!((status, meta["code"].as_str()), (503, Some("closing")));
+    assert_eq!(server.texts().len(), commands);
+}
+
+/// A kept session ends by itself at its idle time, and a session is handed to no call 300
+/// seconds after its login.
+#[tokio::test]
+async fn a_kept_session_ends_at_its_idle_time_and_at_the_age_of_its_login() {
+    let server = ImapServer::start(mailbox).await;
+    let (harness, _app, record) = server.harness(Limits::default()).await;
+    let sessions = harness.node.egress.mail_sessions.clone();
+
+    // The idle time, here 200 milliseconds: no call follows, and the connection ends.
+    sessions.set_limits(200, 300_000);
+    list_folders(&harness, &record).await;
+    assert_eq!(sessions_of(&harness).await, (0, 1));
+    until("the idle session ended", || {
+        server.ended.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert_eq!(sessions_of(&harness).await, (0, 0));
+
+    // The age of the login, by node time: a read 299 seconds after the login goes over the
+    // session, and a read 301 seconds after it logs in again.
+    sessions.set_limits(3_600_000, 300_000);
+    list_folders(&harness, &record).await;
+    assert_eq!(server.logins.load(Ordering::SeqCst), 2);
+    harness.node.clock.advance(299_000);
+    list_folders(&harness, &record).await;
+    assert_eq!(server.logins.load(Ordering::SeqCst), 2);
+    assert_eq!(sessions_of(&harness).await, (1, 1));
+    harness.node.clock.advance(2_000);
+    list_folders(&harness, &record).await;
+    assert_eq!(server.logins.load(Ordering::SeqCst), 3);
+    assert_eq!(sessions_of(&harness).await, (1, 1));
+    until("the session of the old login ended", || {
+        server.ended.load(Ordering::SeqCst) == 2
+    })
+    .await;
+}
+
+/// A kept session that ended while it carried no call does not fail the read that takes it:
+/// the read starts once more over a new connection, with a login. A session that fails after
+/// the server completed a command of the read fails the read, and is not kept.
+#[tokio::test]
+async fn a_read_over_a_session_that_ended_starts_once_more_with_a_login() {
+    let server = ImapServer::start(|command| {
+        match (command.connection, command.number, command.text) {
+            // The server ends the first connection when the second read sends its command.
+            (0, 2, _) => Answer {
+                acts: vec![Act::Close],
+                completion: String::new(),
+            },
+            // It ends the second one with a `BYE` in front of the completion.
+            (1, 2, _) => Answer {
+                acts: vec![
+                    Act::Send(b"* BYE Autologout; idle for too long\r\n".to_vec()),
+                    Act::Close,
+                ],
+                completion: String::new(),
+            },
+            // On the third one it ends inside a read, after it completed `EXAMINE`.
+            (2, _, text) if text.starts_with("UID FETCH ") => Answer {
+                acts: vec![Act::Close],
+                completion: String::new(),
+            },
+            _ => mailbox(command),
+        }
+    })
+    .await;
+    let (harness, _app, record) = server.harness(Limits::default()).await;
+    list_folders(&harness, &record).await;
+    list_folders(&harness, &record).await;
+    assert_eq!(server.logins.load(Ordering::SeqCst), 2);
+    list_folders(&harness, &record).await;
+    assert_eq!(server.logins.load(Ordering::SeqCst), 3);
+    // None of the three reads went over a kept session to its end.
+    assert_eq!(sessions_of(&harness).await, (0, 1));
+
+    let (status, meta, _) = request(
+        &harness,
+        &record,
+        "read",
+        json!({"action":"read","uid":7,"uid_validity":42}),
+        b"",
+    )
+    .await;
+    assert_eq!(
+        (status, meta["code"].as_str()),
+        (502, Some("provider_unreachable"))
+    );
+    assert_eq!(server.logins.load(Ordering::SeqCst), 3);
+    assert_eq!(sessions_of(&harness).await, (1, 0));
+    list_folders(&harness, &record).await;
+    assert_eq!(server.logins.load(Ordering::SeqCst), 4);
+}
+
+/// A session is kept when its read left it in step with the server, whatever the read
+/// answered, and not otherwise.
+#[tokio::test]
+async fn a_session_is_kept_when_its_read_left_it_in_step() {
+    let long = message_of(400_000);
+    let server = {
+        let long = long.clone();
+        ImapServer::start(move |command| {
+            let text = command.text;
+            if text.starts_with("EXAMINE \"Missing\"") {
+                Answer::completion("NO [NONEXISTENT] Mailbox doesn't exist: Missing")
+            } else if text.starts_with("UID FETCH 400 ") && text.ends_with(" (UID RFC822.SIZE)") {
+                Answer::ok(format!(
+                    "* 1 FETCH (UID 400 RFC822.SIZE {})\r\n",
+                    long.len()
+                ))
+            } else if text.starts_with("UID FETCH 400 ") {
+                Answer::ok(fetch_literal(400, "", "BODY[]", &long))
+            } else if text.starts_with("UID FETCH 9 ") {
+                Answer::ok("")
+            } else {
+                mailbox(command)
+            }
+        })
+        .await
+    };
+    let (harness, _app, record) = server.harness(Limits::default()).await;
+    // A folder that is not there, a message of another generation and a message that is not
+    // there: the server completed every command, and the session stays.
+    for (params, expected) in [
+        (json!({"action":"search","mailbox":"Missing"}), (502, None)),
+        (
+            json!({"action":"read","uid":7,"uid_validity":41}),
+            (200, Some(409)),
+        ),
+        (
+            json!({"action":"read","uid":9,"uid_validity":42}),
+            (200, Some(404)),
+        ),
+        (json!({"action":"folders"}), (200, Some(200))),
+    ] {
+        let (status, meta, _) = request(&harness, &record, "read", params, b"").await;
+        assert_eq!((status, meta["status"].as_u64()), expected, "{meta}");
+    }
+    assert_eq!(server.logins.load(Ordering::SeqCst), 1);
+    assert_eq!(sessions_of(&harness).await, (3, 1));
+
+    // A read that ends inside a response (here at the end of its share of the body budget)
+    // leaves a connection that is not in step: it ends with the call.
+    let budget = harness.node.limits.body_budget_bytes;
+    let rest = harness
+        .node
+        .body_budget
+        .clone()
+        .try_acquire_many_owned((budget - 512 * 1024) as u32)
+        .unwrap();
+    let (status, meta, _) = request(
+        &harness,
+        &record,
+        "read",
+        json!({"action":"read","uid":400,"uid_validity":42}),
+        b"",
+    )
+    .await;
+    assert_eq!(
+        (status, meta["code"].as_str()),
+        (503, Some("capacity_unavailable"))
+    );
+    drop(rest);
+    until("the connection of that read ended", || {
+        server.ended.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert_eq!(sessions_of(&harness).await, (4, 0));
+    list_folders(&harness, &record).await;
+    assert_eq!(server.logins.load(Ordering::SeqCst), 2);
+}
+
+/// Two reads of one record at the same time run over two connections, and the record keeps
+/// one session when both ended.
+#[tokio::test]
+async fn two_reads_of_a_record_at_the_same_time_leave_one_session() {
+    let gate = Arc::new(Semaphore::new(0));
+    let server = {
+        let gate = gate.clone();
+        ImapServer::start(move |command| match command.text.starts_with("LIST ") {
+            true => Answer::after(vec![
+                Act::Wait(gate.clone()),
+                Act::Send(b"* LIST () \"/\" \"INBOX\"\r\n".to_vec()),
+            ]),
+            false => mailbox(command),
+        })
+        .await
+    };
+    let (harness, _app, record) = server.harness(Limits::default()).await;
+    let harness = Arc::new(harness);
+    let mut calls = Vec::new();
+    for _ in 0..2 {
+        let (harness, record) = (harness.clone(), record.clone());
+        calls.push(tokio::spawn(async move {
+            list_folders(&harness, &record).await
+        }));
+    }
+    until("both reads wait", || {
+        server.waiting.load(Ordering::SeqCst) == 2
+    })
+    .await;
+    assert_eq!(server.logins.load(Ordering::SeqCst), 2);
+    gate.add_permits(2);
+    for call in calls {
+        call.await.unwrap();
+    }
+    until("one of the two connections ended", || {
+        server.ended.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert_eq!(sessions_of(&harness).await, (0, 1));
+    gate.add_permits(1);
+    list_folders(&harness, &record).await;
+    assert_eq!(server.logins.load(Ordering::SeqCst), 2);
+}
+
+/// A login the server refuses ends the session the record keeps: the server no longer
+/// accepts the application password that session was authenticated with.
+#[tokio::test]
+async fn a_refused_login_ends_the_kept_session_of_its_record() {
+    let server = ImapServer::start(|command| {
+        match command.connection > 0 && command.text.starts_with("LOGIN ") {
+            true => Answer::completion("NO [AUTHENTICATIONFAILED] Invalid credentials"),
+            false => mailbox(command),
+        }
+    })
+    .await;
+    let (harness, _app, record) = server.harness(Limits::default()).await;
+    list_folders(&harness, &record).await;
+    assert_eq!(sessions_of(&harness).await, (0, 1));
+    let (status, meta, _) = request(&harness, &record, "verify", json!({}), b"").await;
+    assert_eq!((status, meta["status"].as_u64()), (200, Some(401)));
+    assert_eq!(sessions_of(&harness).await, (0, 0));
+    until("the kept session ended", || {
+        server.ended.load(Ordering::SeqCst) == 2
+    })
+    .await;
+    // The next read logs in, and is refused as well.
+    let (status, meta, _) =
+        request(&harness, &record, "read", json!({"action":"folders"}), b"").await;
+    assert_eq!((status, meta["status"].as_u64()), (200, Some(401)));
+    assert_eq!(server.logins.load(Ordering::SeqCst), 3);
 }

@@ -99,7 +99,6 @@ impl Default for Reader {
 
 impl Reader {
     /// True when the reader stands between two responses: it holds no byte of one.
-    #[cfg(test)]
     pub(crate) fn at_rest(&self) -> bool {
         self.place == Place::Line
             && self.first_line

@@ -90,10 +90,14 @@ pub struct StateCounts {
 }
 
 /// `idle_connections` of the `state` object: the idle connections of the node, by peer.
+/// `mail` is the authenticated IMAP sessions a node of release v2.4.0 or later keeps between
+/// the reads of a record, and absent before.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct IdleConnections {
     pub provider: u64,
     pub log_store: u64,
+    #[serde(default)]
+    pub mail: Option<u64>,
 }
 
 /// The `log` object of the `health` call: counts since the node started. The five values after
@@ -205,10 +209,22 @@ pub struct OpenFailures {
 }
 
 /// `idle_reuses` of the `egress` object: requests sent over an idle connection, by peer.
+/// `mail` is the mail reads a node of release v2.4.0 or later sent over a kept session, and
+/// absent before.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct IdleReuses {
     pub provider: u64,
     pub log_store: u64,
+    #[serde(default)]
+    pub mail: Option<u64>,
+}
+
+/// The samples of a series by peer: the provider, the log store, and the mail server when
+/// the node reports it.
+fn by_peer(provider: u64, log_store: u64, mail: Option<u64>) -> Vec<(&'static str, u64)> {
+    let mut samples = vec![("provider", provider), ("log_store", log_store)];
+    samples.extend(mail.map(|mail| ("mail", mail)));
+    samples
 }
 
 /// The `refresh` object of the `health` call: the token address calls of `refresh` that passed
@@ -505,10 +521,11 @@ fn state_series(text: &mut String, state: &StateCounts) {
         "credential_enclave_idle_connections",
         "Idle connections the enclave node keeps at this moment, by peer.",
         "peer",
-        &[
-            ("provider", state.idle_connections.provider),
-            ("log_store", state.idle_connections.log_store),
-        ],
+        &by_peer(
+            state.idle_connections.provider,
+            state.idle_connections.log_store,
+            state.idle_connections.mail,
+        ),
     );
 }
 
@@ -765,10 +782,11 @@ fn egress_series(text: &mut String, egress: &EgressCounts) {
         "credential_enclave_egress_idle_reuses_total",
         "Requests the enclave node sent over an idle connection since it started, by peer.",
         "peer",
-        &[
-            ("provider", egress.idle_reuses.provider),
-            ("log_store", egress.idle_reuses.log_store),
-        ],
+        &by_peer(
+            egress.idle_reuses.provider,
+            egress.idle_reuses.log_store,
+            egress.idle_reuses.mail,
+        ),
     );
 }
 
@@ -1319,6 +1337,7 @@ mod tests {
                     idle_reuses: IdleReuses {
                         provider: 200,
                         log_store: 300,
+                        mail: None,
                     },
                 }),
                 refresh: Some(RefreshCounts {
@@ -1337,6 +1356,7 @@ mod tests {
                     idle_connections: IdleConnections {
                         provider: 44,
                         log_store: 55,
+                        mail: None,
                     },
                 }),
             })
@@ -2019,7 +2039,25 @@ mod tests {
              credential_enclave_lingering_cut_total 1\n"
         ), "{text}");
 
-        // A node of an earlier release gives neither the bound nor the two counts.
+        // The mail reads over a kept session and the kept sessions follow the two other
+        // peers of their series.
+        assert!(
+            text.contains(
+                "\ncredential_enclave_egress_idle_reuses_total{peer=\"log_store\"} 300\n\
+             credential_enclave_egress_idle_reuses_total{peer=\"mail\"} 400\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "\ncredential_enclave_idle_connections{peer=\"log_store\"} 55\n\
+             credential_enclave_idle_connections{peer=\"mail\"} 66\n"
+            ),
+            "{text}"
+        );
+
+        // A node of an earlier release gives neither the bound nor the two counts, and no
+        // series of the peer `mail`.
         let earlier = FakeNode::answering(|_| {
             (
                 200,
@@ -2037,6 +2075,7 @@ mod tests {
         );
         assert!(!text.contains("credential_enclave_inbound_limit"), "{text}");
         assert!(!text.contains("credential_enclave_lingering"), "{text}");
+        assert!(!text.contains("peer=\"mail\""), "{text}");
     }
 
     #[tokio::test]

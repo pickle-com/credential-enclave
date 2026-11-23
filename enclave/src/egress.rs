@@ -40,6 +40,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsConnector;
 
 use crate::clock::{Clock, TlsTime};
+use crate::mail_sessions::MailSessions;
 use crate::platform::{ConnectError, DynPlatform};
 use crate::providers::Destination;
 use crate::state::lock;
@@ -187,11 +188,13 @@ impl OpenFailureCounters {
 }
 
 /// The requests that went over an idle connection, by peer: a provider (enclave.md 5.8 step
-/// 8) or the log store (5.14).
+/// 8) or the log store (5.14), and the mail reads that went over a kept session ("Mail call
+/// surface").
 #[derive(Default)]
 pub struct IdleReuseCounters {
     pub provider: AtomicU64,
     pub log_store: AtomicU64,
+    pub mail: AtomicU64,
 }
 
 /// A full jitter backoff: a random time between zero and the smaller of `cap` and `base`
@@ -542,6 +545,8 @@ pub struct Egress {
     mail_connector: TlsConnector,
     /// The idle connections to providers.
     pub provider_idle: Arc<ProviderConnections>,
+    /// The authenticated IMAP sessions the node keeps between the reads of a record.
+    pub(crate) mail_sessions: Arc<MailSessions>,
     /// The node-wide bound of provider requests in flight (enclave.md section 8).
     inflight: Arc<Semaphore>,
     /// The node-wide bound of outbound connections being opened (enclave.md section 8): a
@@ -605,6 +610,7 @@ impl Egress {
             connector: TlsConnector::from(Arc::new(config)),
             mail_connector,
             provider_idle: Arc::new(ProviderConnections::default()),
+            mail_sessions: Arc::new(MailSessions::default()),
             inflight: Arc::new(Semaphore::new(limits::PROVIDER_INFLIGHT)),
             opens: Arc::new(Semaphore::new(open_concurrency)),
             open_concurrency,

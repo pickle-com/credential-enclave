@@ -55,6 +55,7 @@ mod load;
 )]
 mod log_store;
 mod mail;
+mod mail_sessions;
 mod oauth;
 mod platform;
 mod provider_response;

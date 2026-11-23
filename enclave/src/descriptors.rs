@@ -24,9 +24,10 @@ use rlimit::Resource;
 
 /// The open descriptors the node asks the kernel for at its start. The connections of a node
 /// are bounded by the limits of section 8 of enclave.md: 16,384 accepted connections
-/// (`inbound_connections`), 1,024 idle connections to the providers, 32 idle connections to
-/// the log store, 512 provider requests in flight, 256 connections being opened, and the
-/// writes to the log store of the calls in progress. The target leaves room above their sum.
+/// (`inbound_connections`), 1,024 idle connections to the providers, 1,024 kept mail
+/// sessions, 32 idle connections to the log store, 512 provider requests in flight, 256
+/// connections being opened, and the writes to the log store of the calls in progress. The
+/// target leaves room above their sum.
 pub const DESCRIPTOR_LIMIT: u64 = 65_536;
 
 /// The directory whose entries are the open descriptors of this process.
