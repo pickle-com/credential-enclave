@@ -280,6 +280,9 @@ pub struct Load {
     /// P: a count, the connections from the backend closed at accept because the bound of
     /// open connections was reached, since the node started.
     pub inbound_refused: u64,
+    /// P: a count, the bound of open connections from the backend in force: the node computed
+    /// it at its start from the memory of the kernel it runs in.
+    pub inbound_limit: usize,
     /// P: the CPU time in user mode of the kernel the node runs in since it booted, in
     /// milliseconds. Null when the kernel exposes no procfs value.
     pub cpu_user_ms: Option<u64>,
@@ -298,6 +301,13 @@ pub struct Load {
     /// P: a count, the soft limit of open file descriptors of the node process in force. Null
     /// when the platform has no such limit.
     pub descriptors_limit: Option<u64>,
+    /// P: a count, the connections the node is done with and keeps open until their peer
+    /// reported the end of its bytes, at this moment. Null on a platform that closes a
+    /// connection when the node is done with it.
+    pub lingering_connections: Option<usize>,
+    /// P: a count, the connections the node closed before their peer had reported its end,
+    /// since the node started. Null in the same way.
+    pub lingering_cut: Option<u64>,
 }
 
 /// `GET /v1/health`.
@@ -484,6 +494,118 @@ pub struct ForwardMeta {
     log: Option<LogRef>,
 }
 
+/// The end record of a stream (the stream form of `POST /v1/forward`, enclave.md 5.8).
+#[derive(Serialize)]
+pub struct StreamEnd {
+    /// P: true when every byte of the provider body was handed on.
+    complete: bool,
+    /// P: a failure code of protocol.md section 11, when the body was cut.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'static str>,
+    /// P: a fixed string of the source (rule E5), when the body was cut.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<&'static str>,
+}
+
+impl StreamEnd {
+    /// The end of a body that was handed on whole.
+    pub fn complete() -> StreamEnd {
+        StreamEnd {
+            complete: true,
+            code: None,
+            message: None,
+        }
+    }
+
+    /// The end of a body that was cut: the code and the fixed message of the failure.
+    pub fn cut(code: &'static str, message: &'static str) -> StreamEnd {
+        StreamEnd {
+            complete: false,
+            code: Some(code),
+            message: Some(message),
+        }
+    }
+}
+
+/// One element of the body of a stream, as the task that reads the provider hands it to the
+/// response body.
+pub enum StreamElement {
+    /// Bytes of a part: a length prefix, or the bytes of the part (R, after the search of rule
+    /// E4).
+    Part(Bytes),
+    /// The mark of the end and the end record: nothing follows.
+    End(Bytes),
+}
+
+/// The response body of the stream form of `forward`: the head, then what the task that reads
+/// the provider hands over, until the end record. A task that ended without an end record
+/// passed the time limit of the call while this body was not read: the body ends with the end
+/// record of that failure.
+struct StreamBody {
+    head: Option<Bytes>,
+    elements: tokio::sync::mpsc::Receiver<StreamElement>,
+    /// The end record of a call whose task ended without one.
+    late: Option<Bytes>,
+}
+
+impl HttpBody for StreamBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+        if let Some(head) = self.head.take() {
+            return Poll::Ready(Some(Ok(Frame::data(head))));
+        }
+        let Some(late) = self.late.clone() else {
+            return Poll::Ready(None);
+        };
+        match std::task::ready!(self.elements.poll_recv(context)) {
+            Some(StreamElement::Part(bytes)) => Poll::Ready(Some(Ok(Frame::data(bytes)))),
+            Some(StreamElement::End(bytes)) => {
+                self.late = None;
+                Poll::Ready(Some(Ok(Frame::data(bytes))))
+            }
+            None => {
+                self.late = None;
+                Poll::Ready(Some(Ok(Frame::data(late))))
+            }
+        }
+    }
+}
+
+/// The 200 response of the stream form of `forward`: the head of a provider response whose
+/// headers passed the checks of rule E4, the place of the event of the request, and the parts
+/// of the body as `elements` hands them over. `late` is the end record of a call whose task
+/// ended without one.
+pub fn forward_stream(
+    status: u16,
+    headers: Vec<(String, String)>,
+    log: Option<LogRef>,
+    elements: tokio::sync::mpsc::Receiver<StreamElement>,
+    late: StreamEnd,
+) -> Response {
+    let head = frame::encode_head(&ForwardMeta {
+        status,
+        headers,
+        log,
+    });
+    let body = StreamBody {
+        head: Some(Bytes::from(head)),
+        elements,
+        late: Some(Bytes::from(frame::encode_stream_end(&late))),
+    };
+    let mut response = Response::new(Body::new(body));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static(frame::STREAM_CONTENT_TYPE),
+    );
+    response
+}
+
 /// The meta of a `POST /v1/forward/batch` response frame. The payload of the frame is the
 /// provider bodies of the results one after another (R), `body_bytes` each.
 #[derive(Serialize)]
@@ -613,12 +735,32 @@ pub(super) fn json_error(status: StatusCode, body: &ErrorBody<'_>) -> Response {
     json_bytes(status, to_json(body))
 }
 
-/// A response frame of `forward`: the meta, then the provider body. The share of the body
-/// budget that the provider body occupies is held until the frame was written out.
+/// A response frame of `forward`: the meta, then the provider body. Every part keeps the
+/// share of the body budget that the provider body occupies ([`BudgetedPart`]), so the share
+/// is held until the frame was written out.
 struct FrameBody {
     parts: VecDeque<Bytes>,
     remaining: u64,
-    _budget: OwnedSemaphorePermit,
+}
+
+/// A part of a response frame together with the share of the body budget of the node the
+/// frame occupies. The share is free when the last part of the frame is dropped.
+///
+/// The body of a response is handed to the HTTP connection of the caller, which drops the
+/// body object as soon as it has taken every part, before a byte is written. What it keeps
+/// until its stream took the bytes is the parts themselves (a stream that writes several
+/// buffers in one write: `crate::platform::Attempted`, and a TCP stream). So the share
+/// travels with the bytes, and a peer that takes a response slowly, or not at all, holds
+/// memory the budget counts: for as long as the node waits for it (`inbound_idle`).
+struct BudgetedPart {
+    bytes: Bytes,
+    _budget: std::sync::Arc<OwnedSemaphorePermit>,
+}
+
+impl AsRef<[u8]> for BudgetedPart {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 impl HttpBody for FrameBody {
@@ -697,11 +839,17 @@ pub fn forward_batch_frame(results: Vec<BatchResult>, budget: OwnedSemaphorePerm
 
 fn frame_response(parts: Vec<Bytes>, budget: OwnedSemaphorePermit) -> Response {
     let remaining = parts.iter().map(|part| part.len() as u64).sum();
-    let frame_body = FrameBody {
-        parts: VecDeque::from(parts),
-        remaining,
-        _budget: budget,
-    };
+    let budget = std::sync::Arc::new(budget);
+    let parts = parts
+        .into_iter()
+        .map(|bytes| {
+            Bytes::from_owner(BudgetedPart {
+                bytes,
+                _budget: budget.clone(),
+            })
+        })
+        .collect();
+    let frame_body = FrameBody { parts, remaining };
     let mut response = Response::new(Body::new(frame_body));
     *response.status_mut() = StatusCode::OK;
     response

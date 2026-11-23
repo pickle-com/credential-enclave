@@ -51,3 +51,5 @@ tokio-vsock = "0.7"
 
 [dev-dependencies]
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"] }
+# The clock of the runtime a test stops and moves (src/tests/inbound.rs).
+tokio = { version = "1", features = ["test-util"] }

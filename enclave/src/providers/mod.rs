@@ -208,7 +208,7 @@ impl ApiRule {
             path.starts_with(prefix.as_str())
                 && (prefix.ends_with('/')
                     || path.len() == prefix.len()
-                    || path.as_bytes()[prefix.len()] == b'/')
+                    || path.as_bytes().get(prefix.len()) == Some(&b'/'))
         })
     }
 
@@ -229,7 +229,7 @@ impl ApiRule {
             let lenient = lenient_path(&reading);
             let denied = self.denied.iter().any(|denied| {
                 lenient.starts_with(denied.as_bytes())
-                    && (lenient.len() == denied.len() || lenient[denied.len()] == b'/')
+                    && (lenient.len() == denied.len() || lenient.get(denied.len()) == Some(&b'/'))
             });
             if denied {
                 return true;
@@ -422,8 +422,8 @@ fn is_ip_literal(host: &str) -> bool {
 fn has_valid_escapes(text: &str) -> bool {
     let bytes = text.as_bytes();
     let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
+    while let Some(byte) = bytes.get(index) {
+        if *byte == b'%' {
             let valid = bytes.get(index + 1).is_some_and(u8::is_ascii_hexdigit)
                 && bytes.get(index + 2).is_some_and(u8::is_ascii_hexdigit);
             if !valid {
@@ -445,9 +445,9 @@ fn decode_escapes(bytes: &[u8]) -> Vec<u8> {
     let hex = |byte: Option<&u8>| byte.and_then(|byte| char::from(*byte).to_digit(16));
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
-    while index < bytes.len() {
+    while let Some(literal) = bytes.get(index).copied() {
         let escape = match (
-            bytes[index],
+            literal,
             hex(bytes.get(index + 1)),
             hex(bytes.get(index + 2)),
         ) {
@@ -460,7 +460,7 @@ fn decode_escapes(bytes: &[u8]) -> Vec<u8> {
                 index += 3;
             }
             None => {
-                decoded.push(bytes[index]);
+                decoded.push(literal);
                 index += 1;
             }
         }
@@ -472,12 +472,12 @@ fn decode_escapes(bytes: &[u8]) -> Vec<u8> {
 /// letters: the escape of `.`, of `/` or of `\` with its `%` encoded once more. A server that
 /// decodes a path twice reads a dot or a separator there.
 fn has_twice_encoded_separator(path: &str) -> bool {
-    path.as_bytes().windows(5).any(|window| {
-        window[..3] == *b"%25"
-            && matches!(
-                (window[3], window[4].to_ascii_lowercase()),
-                (b'2', b'e') | (b'2', b'f') | (b'5', b'c')
-            )
+    path.as_bytes().windows(5).any(|window| match window {
+        [b'%', b'2', b'5', high, low] => matches!(
+            (high, low.to_ascii_lowercase()),
+            (b'2', b'e') | (b'2', b'f') | (b'5', b'c')
+        ),
+        _ => false,
     })
 }
 
@@ -817,6 +817,11 @@ impl Definitions {
     ///
     /// Panics when the embedded file is invalid. A test of this module parses the embedded
     /// file, so a release build never carries an invalid one.
+    #[expect(
+        clippy::expect_used,
+        reason = "runs once at the start of the node, on a constant of the source that a test \
+                  of this module parses: no input of a call reaches this place"
+    )]
     pub fn embedded() -> Definitions {
         Definitions::parse(EMBEDDED).expect("the embedded provider definitions are valid")
     }

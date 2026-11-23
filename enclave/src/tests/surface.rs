@@ -44,7 +44,7 @@ async fn health_reports_the_node_in_the_key_order_of_5_1() {
             "\"write_ms_buckets\":{{\"25\":0,\"50\":0,\"100\":0,\"250\":0,\"500\":0,",
             "\"1000\":0,\"2500\":0,\"5000\":0}},\"write_ms_sum\":0,\"write_count\":0}},",
             "\"load\":{{\"provider_inflight\":0,\"forward_calls\":0,",
-            "\"inbound_connections\":0,\"inbound_refused\":0,"
+            "\"inbound_connections\":0,\"inbound_refused\":0,\"inbound_limit\":16384,"
         ),
         harness.node.node, started_ms, time_ms
     );
@@ -52,9 +52,12 @@ async fn health_reports_the_node_in_the_key_order_of_5_1() {
     // The five values of the kernel and the two values of the descriptors follow. They depend
     // on the machine that runs the test: numbers from the procfs of a Linux kernel, null on
     // another kernel (the limit of the descriptors is a number on every Unix kernel). The
-    // counts of the outbound connections, of the late token address calls and of the state of
-    // the accounts end the body.
+    // two values of the connections that wait for the end of their peer are null: the
+    // local platform closes a connection when the node is done with it. The counts of the
+    // outbound connections, of the late token address calls and of the state of the accounts
+    // end the body.
     let suffix = concat!(
+        "\"lingering_connections\":null,\"lingering_cut\":null",
         "},\"egress\":{\"opens\":0,\"open_failures\":{\"transport\":0,\"relay_refused\":0,",
         "\"tls\":0,\"http\":0},\"open_retries\":0,\"open_inflight\":0,",
         "\"idle_reuses\":{\"provider\":0,\"log_store\":0}},",
@@ -75,7 +78,7 @@ async fn health_reports_the_node_in_the_key_order_of_5_1() {
         "descriptors_limit",
     ];
     assert_eq!(
-        load.keys().skip(4).collect::<Vec<_>>(),
+        load.keys().skip(5).take(7).collect::<Vec<_>>(),
         kernel_values.to_vec()
     );
     for key in kernel_values {
@@ -619,7 +622,9 @@ async fn exchange(stream: &mut TcpStream, request: &str) -> (u16, Value) {
 async fn the_node_serves_http_1_1_on_the_listener_of_its_platform() {
     let provider = quiet_provider().await;
     let harness = Harness::new(&provider);
-    let listener = Platform::listen(harness.platform.as_ref()).await.unwrap();
+    let listener = Platform::listen(harness.platform.as_ref(), 16)
+        .await
+        .unwrap();
     let address = listener.tcp_addr().unwrap();
     tokio::spawn(api::serve(
         listener,
@@ -671,7 +676,9 @@ async fn the_node_bounds_the_connections_it_holds_and_closes_an_idle_one() {
             ..Limits::default()
         },
     );
-    let listener = Platform::listen(harness.platform.as_ref()).await.unwrap();
+    let listener = Platform::listen(harness.platform.as_ref(), 16)
+        .await
+        .unwrap();
     let address = listener.tcp_addr().unwrap();
     tokio::spawn(api::serve(
         listener,

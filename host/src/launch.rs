@@ -145,7 +145,9 @@ fn log_tails(directory: &Path) -> Vec<(PathBuf, String)> {
         .into_iter()
         .filter_map(|path| {
             let bytes = std::fs::read(&path).ok()?;
-            let tail = &bytes[bytes.len().saturating_sub(LOG_TAIL_BYTES)..];
+            let tail = bytes
+                .get(bytes.len().saturating_sub(LOG_TAIL_BYTES)..)
+                .unwrap_or_default();
             let text = String::from_utf8_lossy(tail).into_owned();
             Some((path, text))
         })

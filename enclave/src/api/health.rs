@@ -45,6 +45,7 @@ pub async fn health(State(node): State<Arc<Node>>) -> Response {
     let state = &node.counters;
     let cpu = load::read_cpu();
     let memory = load::read_memory();
+    let lingering = node.platform.lingering();
     let read = |counter: &std::sync::atomic::AtomicU64| counter.load(Ordering::Relaxed);
     let count = |counter: &std::sync::atomic::AtomicUsize| counter.load(Ordering::Relaxed);
     let buckets = &counters.write_ms_buckets;
@@ -102,6 +103,7 @@ pub async fn health(State(node): State<Arc<Node>>) -> Response {
             forward_calls: node.forward_calls(),
             inbound_connections: node.inbound.open(),
             inbound_refused: node.inbound.refused(),
+            inbound_limit: node.limits.inbound_connections,
             cpu_user_ms: cpu.map(|cpu| cpu.user),
             cpu_system_ms: cpu.map(|cpu| cpu.system),
             cpu_idle_ms: cpu.map(|cpu| cpu.idle),
@@ -109,6 +111,8 @@ pub async fn health(State(node): State<Arc<Node>>) -> Response {
             memory_available_bytes: memory.map(|memory| memory.available),
             descriptors_open: descriptors::open_count(),
             descriptors_limit: descriptors::soft_limit(),
+            lingering_connections: lingering.map(|(waiting, _)| waiting),
+            lingering_cut: lingering.map(|(_, cut)| cut),
         },
         egress: EgressCounts {
             opens: read(&egress.opens),

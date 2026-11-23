@@ -186,10 +186,11 @@ pub fn open_record(
     {
         return Err(ProtocolError::RecordInvalid);
     }
-    let nonce = b64u_decode(&record.nonce).map_err(|_| ProtocolError::RecordInvalid)?;
-    if nonce.len() != 12 {
-        return Err(ProtocolError::RecordInvalid);
-    }
+    // The nonce is twelve bytes: a value of another length is no nonce of this cipher.
+    let nonce: [u8; 12] = b64u_decode(&record.nonce)
+        .ok()
+        .and_then(|nonce| nonce.try_into().ok())
+        .ok_or(ProtocolError::RecordInvalid)?;
     let ct = b64u_decode(&record.ct).map_err(|_| ProtocolError::RecordInvalid)?;
     let key = record_key(user_key, &id);
     let aad = record_aad(
@@ -202,7 +203,7 @@ pub fn open_record(
     );
     ChaCha20Poly1305::new(Key::from_slice(key.as_slice()))
         .decrypt(
-            Nonce::from_slice(&nonce),
+            &Nonce::from(nonce),
             Payload {
                 msg: &ct,
                 aad: &aad,
@@ -217,6 +218,11 @@ pub fn open_record(
 /// `nonce` are fresh random bytes. Writing the same `id` again (a token refresh) uses a new
 /// nonce and keeps `id`, `kind` and `provider`.
 #[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::expect_used,
+    reason = "the cipher refuses a plaintext of more than 2^38 bytes and nothing else: the \
+              plaintext of a record is a token response or a vault value, far below that"
+)]
 pub fn seal_record(
     user_key: &[u8; 32],
     id: &[u8; 16],

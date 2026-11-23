@@ -195,10 +195,13 @@ pub fn operator_config(
             }),
         );
     }
-    let mut body = json!({ "providers": entries });
-    if let Some(log_store) = log_store {
-        body["log_store"] = json!({"bucket": log_store.bucket, "region": log_store.region});
-    }
+    let body = match log_store {
+        Some(log_store) => json!({
+            "providers": entries,
+            "log_store": {"bucket": log_store.bucket, "region": log_store.region},
+        }),
+        None => json!({ "providers": entries }),
+    };
     Ok(body.to_string().into_bytes())
 }
 

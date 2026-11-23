@@ -119,7 +119,7 @@ fn number(text: &str) -> Option<u32> {
     let digits = text.as_bytes();
     let plain = !digits.is_empty()
         && digits.iter().all(u8::is_ascii_digit)
-        && (digits.len() == 1 || digits[0] != b'0');
+        && (digits.len() == 1 || digits.first() != Some(&b'0'));
     if !plain {
         return None;
     }
@@ -160,20 +160,22 @@ impl<'de> Deserialize<'de> for MeasurementFields {
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
                 let mut values: [Option<String>; 4] = [None, None, None, None];
                 while let Some(key) = map.next_key::<String>()? {
-                    match MEASUREMENT_KEYS.iter().position(|name| *name == key) {
-                        Some(index) if values[index].is_some() => {
-                            return Err(A::Error::duplicate_field(MEASUREMENT_KEYS[index]));
-                        }
-                        Some(index) => values[index] = Some(map.next_value()?),
+                    // The value of one of the four keys, with the name of that key.
+                    let named = MEASUREMENT_KEYS
+                        .iter()
+                        .zip(values.iter_mut())
+                        .find(|(name, _)| **name == key);
+                    match named {
+                        Some((name, Some(_))) => return Err(A::Error::duplicate_field(name)),
+                        Some((_, value)) => *value = Some(map.next_value()?),
                         None => {
                             map.next_value::<IgnoredAny>()?;
                         }
                     }
                 }
                 let mut fields: [String; 4] = Default::default();
-                for (index, value) in values.into_iter().enumerate() {
-                    fields[index] =
-                        value.ok_or_else(|| A::Error::missing_field(MEASUREMENT_KEYS[index]))?;
+                for ((field, value), name) in fields.iter_mut().zip(values).zip(MEASUREMENT_KEYS) {
+                    *field = value.ok_or_else(|| A::Error::missing_field(name))?;
                 }
                 Ok(MeasurementFields(fields))
             }

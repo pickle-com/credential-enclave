@@ -420,12 +420,22 @@ impl PublicFields {
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "a `TokenResponse` is made in one place, `judge_token_response`, from a value it \
+              read as a JSON object"
+)]
 fn object_of(value: &Value) -> &Map<String, Value> {
     value
         .as_object()
         .expect("a token response is created from a JSON object")
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "an `OauthPlaintext` is made in two places: `OauthRecord::parse`, which refuses a \
+              plaintext without a `token` object, and `from_parts`, which writes one"
+)]
 fn token_of(plaintext: &Value) -> &Map<String, Value> {
     plaintext
         .get("token")
@@ -460,8 +470,10 @@ fn push_percent_encoded(output: &mut String, text: &str) {
             output.push(char::from(byte));
         } else {
             output.push('%');
-            output.push(char::from(HEX[usize::from(byte >> 4)]));
-            output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+            // A half of a byte is below 16, the length of the table.
+            for half in [byte >> 4, byte & 0x0f] {
+                output.extend(HEX.get(usize::from(half)).map(|digit| char::from(*digit)));
+            }
         }
     }
 }
