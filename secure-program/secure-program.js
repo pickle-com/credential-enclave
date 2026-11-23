@@ -106,7 +106,11 @@
   //                   measurement, the platform, the release, the time first seen, the time a
   //                   contradiction of its signatures was found)
   //   log.unaccepted  the measurements no list of this program has: {digest: {first_ms, release,
-  //                   held, node}} (held: the key of this account went to a node of it)
+  //                   held, node, asked_ms}} (held: the key of this account went to a node of
+  //                   it; asked_ms: the time the grant step last asked a node for the release
+  //                   proofs of the measurement)
+  //   log.proven      the measurements whose release proofs this program verified (STORE_PROVEN,
+  //                   below)
   //   log.blocked     the blocked rounds in a row: {first_ms, count}
   //   log.sample      the newest control keys the last round verified (LOG_SAMPLE_KEYS at most)
   //   log.seen        the digests of the control keys judged: the index {v, parts: [n]} and one
@@ -716,26 +720,44 @@
   const PROOF_PATH_HASHES = 64;
   const PROOF_DEPLOY_SIGNATURES = 8;
   const PROOF_JSON_DEPTH = 32;
-  // What the device keeps of the measurements release proofs showed to this program
-  // (log.proven): {v, measures: {digest: {release, pcr0, pcr1, pcr2, proven_ms, proofs}}}. v is
-  // the version of the program that verified them: a program reads what a program of another
-  // version kept as nothing. The verdict counts where the log is judged. A node of such a
-  // measurement receives a key only from a runtime that verified the proofs itself: the kept
-  // proofs, once for a runtime (provenForGrant). PROOF_KEPT_MEASURES measurements are kept (the
-  // one shown first leaves first), and the proofs of a measurement are kept when their JSON is
-  // at most PROOF_KEPT_CHARS characters long.
+  // What the device keeps of the measurements whose release proofs this program verified
+  // (log.proven): {v, measures: {digest: {release, program_min, proven_ms, proofs}}}. v is the
+  // version of the program that verified them: a program reads what a program of another
+  // version kept as nothing. release and program_min are what the release statement of the
+  // proofs states (program_min 0 for a statement that states none). The verdict counts where
+  // the log is judged. A node of such a measurement receives a key only from a runtime that
+  // verified the proofs itself: the kept proofs, once for a runtime (provenForGrant).
+  // The verdicts of PROOF_KEPT_VERDICTS measurements are kept. Beyond that number the verdict
+  // of the earliest release leaves first, in the order of releases: the key of an account moves
+  // to later releases, so the verdict of the release that holds it stays. The proofs themselves
+  // are kept for the PROOF_KEPT_PROOFS latest of those releases that this program accepts, each
+  // when its JSON is at most PROOF_KEPT_CHARS characters long. A verdict that left is made
+  // again from the proofs of a response, of a node document or of the backend.
   const STORE_PROVEN = "log.proven";
-  const PROOF_KEPT_MEASURES = 4;
-  const PROOF_KEPT_CHARS = 131072;
+  const PROOF_KEPT_VERDICTS = 256;
+  const PROOF_KEPT_PROOFS = 4;
+  const PROOF_KEPT_CHARS = 65536;
   // Release proofs that fail cost the device their verification: a runtime verifies no further
-  // proofs while PROOF_FAILURES of them failed within PROOF_FAILURE_SPAN_MS.
+  // proofs while PROOF_FAILURES of them failed within PROOF_FAILURE_SPAN_MS, and it does not
+  // verify again the proofs it refused last for a measurement (it remembers them for
+  // PROOF_REFUSED_KEPT measurements).
   const PROOF_FAILURES = 8;
   const PROOF_FAILURE_SPAN_MS = 3600000;
+  const PROOF_REFUSED_KEPT = 8;
   // The grant step asks for the release proofs of a measurement no list has and no proofs
   // showed: of one node of each such measurement, of PROOF_REQUEST_NODES nodes at most in one
   // step, and for one measurement not sooner than PROOF_RETRY_MS after it asked last.
   const PROOF_REQUEST_NODES = 4;
   const PROOF_RETRY_MS = 3600000;
+  // A round asks the backend for the release proofs of the measurements no list has and no
+  // proofs showed that it met, by the digests of the measurements (PROOFS_PATH): of
+  // PROOF_REQUEST_MEASURES measurements in one request, in PROOF_ROUND_REQUESTS requests of one
+  // round at most, and for one measurement not sooner than PROOF_RETRY_MS after the runtime
+  // asked last. A round that leaves such a measurement unasked has more to read than it read.
+  // No request goes out while the device has met no such measurement.
+  const PROOFS_PATH = "/api/secure/release-proofs";
+  const PROOF_REQUEST_MEASURES = 8;
+  const PROOF_ROUND_REQUESTS = 4;
 
   // The record kinds this program makes in the migration (the device-side sealing of what was
   // stored before the switch), and the most rounds of fetching and uploading one sync runs (one
@@ -1196,8 +1218,9 @@
    *  an accepted release when release proofs show the measurement (provenForGrant: the proofs
    *  this runtime verified before, the ones the device kept, or the member release_proofs of the
    *  response) and the release of its binding is the release the proofs name. listed is false
-   *  for a measurement no list has and no proofs showed (a release later than this program,
-   *  verifyNitro): such a node receives no grant. measure is the digest of the measurement (the
+   *  for a measurement no list has and no proofs showed, and for one whose proofs state a
+   *  program later than this one (a release later than this program, verifyNitro and
+   *  provenLater): such a node receives no grant. measure is the digest of the measurement (the
    *  empty string for platform local), programMin the lowest version of the program whose grant
    *  command the node takes (0: any) and format the format of the log of the node. */
   function verifyAttestation(response, nonce, gate) {
@@ -1310,8 +1333,10 @@
       // of that measurement states that release in its binding.
       if (object.platform === "nitro" && build === undefined) {
         build = provenBuild(measure);
-        if (build === undefined && object.release_proofs !== undefined && object.release_proofs !== null) {
-          build = proveBuild(object.release_proofs, verified.measurement, measure) || undefined;
+        if (build === undefined && !provenLater(measure) && object.release_proofs !== undefined &&
+            object.release_proofs !== null &&
+            proveBuild(object.release_proofs, verified.measurement, measure) === "shown") {
+          build = provenBuild(measure);
         }
       }
       if (build !== undefined && build.proven === true && binding.release !== build.release) {
@@ -1423,8 +1448,9 @@
   /** The keys of the outermost object of a JSON text, in their order, a key as often as the
    *  text states it; null when the text does not begin with an object. The text is one that
    *  JSON.parse read. JSON.parse keeps the last value of a key an object states twice, so what
-   *  an object states once is read from here. */
-  function statedKeys(json) {
+   *  an object states once is read from here. With written (an object), the value of each key
+   *  is put there as the text writes it, without the white space around it. */
+  function statedKeys(json, written) {
     const end = json.length;
     let at = 0;
     const skipSpace = function () {
@@ -1456,6 +1482,8 @@
       if (json[at] !== ":") return null;
       at += 1;
       // The value of the key: up to the comma or the closing brace of the outermost object.
+      skipSpace();
+      const from = at;
       let depth = 0;
       while (at < end) {
         const symbol = json[at];
@@ -1474,6 +1502,11 @@
         at += 1;
       }
       if (at >= end || json[at] === "]") return null;
+      if (written !== undefined) {
+        let last = at;
+        while (last > from && " \t\n\r".indexOf(json[last - 1]) >= 0) last -= 1;
+        written[keys[keys.length - 1]] = json.slice(from, last);
+      }
       if (json[at] === "}") return keys;
       at += 1;
     }
@@ -1844,19 +1877,32 @@
   /** Reads a release statement (docs/protocol.md 10.3, check 1): the bytes of the file
    *  measurements.json of a release. They are at most PROOF_STATEMENT_BYTES long and a JSON
    *  object that states release, pcr0, pcr1 and pcr2 once each: release a text, each PCR 96
-   *  lower-case hexadecimal characters. The other members are not read. Returns {release, pcr0,
-   *  pcr1, pcr2}, or null. */
+   *  lower-case hexadecimal characters. The statement may state program_min, once: the lowest
+   *  version of the program that reads what the nodes of the release write, written as decimal
+   *  digits without a leading zero (a lone 0 is one) and a number the program holds exactly.
+   *  The other members are not read. Returns {release, pcr0, pcr1, pcr2, program_min}
+   *  (program_min undefined for a statement that states none), or null. */
   function readReleaseStatement(bytes) {
     if (bytes.length > PROOF_STATEMENT_BYTES) return null;
     const value = parseJson(bytes);
-    const stated = isObject(value) ? statedKeys(text(bytes)) : null;
+    const written = Object.create(null);
+    const stated = isObject(value) ? statedKeys(text(bytes), written) : null;
     if (stated === null) return null;
+    const times = function (name) {
+      return stated.filter(function (key) { return key === name; }).length;
+    };
     const read = {};
     for (const name of ["release", "pcr0", "pcr1", "pcr2"]) {
-      if (stated.filter(function (key) { return key === name; }).length !== 1) return null;
+      if (times(name) !== 1) return null;
       read[name] = member(value, name);
     }
     if (typeof read.release !== "string" || !hex96(read.pcr0) || !hex96(read.pcr1) || !hex96(read.pcr2)) return null;
+    read.program_min = undefined;
+    if (times("program_min") > 0) {
+      const stands = countOf(member(value, "program_min"), false);
+      if (times("program_min") !== 1 || stands === null || !/^(0|[1-9][0-9]{0,15})$/.test(written.program_min)) return null;
+      read.program_min = stands;
+    }
     return read;
   }
 
@@ -2097,9 +2143,12 @@
    *    P4  GitHub attested the statement: the attestation verifies (attestedStatement) under
    *        the identity of the release workflow at the tag of the release (trust.identity), and
    *        the predicate of its in-toto statement, of the type PROOF_PREDICATE_TYPE, states the
-   *        release and the three PCRs of the statement.
-   *  Returns the release the statement names. Throws unproven for proofs that fail a check:
-   *  the measurement is then one no list has and no proof showed, as before. */
+   *        release, the three PCRs and the program_min of the statement (no program_min where
+   *        the statement states none).
+   *  Returns {release, programMin}: the release the statement names and the program_min it
+   *  states (0 for a statement that states none). The caller decides what a program_min above
+   *  the version of the program means (proveBuild). Throws unproven for proofs that fail a
+   *  check: the measurement is then one no list has and no proof showed, as before. */
   function proveRelease(proofs, measurement, trust, target) {
     const statementText = member(proofs, "statement");
     if (typeof statementText !== "string" || statementText.length > 2 * PROOF_STATEMENT_BYTES ||
@@ -2125,10 +2174,10 @@
     const attested = attestedStatement(proofs.attestation, trust.identity(stated.release), trust);
     const predicate = member(attested, "predicate");
     if (member(attested, "predicateType") !== PROOF_PREDICATE_TYPE) throw unproven("p4: predicate type");
-    for (const name of ["release", "pcr0", "pcr1", "pcr2"]) {
+    for (const name of ["release", "pcr0", "pcr1", "pcr2", "program_min"]) {
       if (member(predicate, name) !== stated[name]) throw unproven("p4: predicate " + name);
     }
-    return stated.release;
+    return { release: stated.release, programMin: stated.program_min === undefined ? 0 : stated.program_min };
   }
 
   /** A transparency log of the form Rekor v1 with the key spki (the DER of the
@@ -2164,134 +2213,289 @@
 
   // ---- The release proofs: what the device keeps (log.proven) ----
 
-  // The kept measurements (null: not read yet in this runtime), by digest: {release, pcr0, pcr1,
-  // pcr2, proven_ms, proofs}; the digests of the measurements whose proofs this runtime
-  // verified; the times release proofs failed in this runtime; and, by digest, the time this
-  // runtime last asked for the release proofs of a measurement.
+  // What this runtime knows of the measurements whose release proofs this program verified
+  // (null: the program store is not read yet), by digest: {release, programMin, provenMs,
+  // proofs}. It holds what the device kept (STORE_PROVEN) and every verdict this runtime made,
+  // also a verdict the program store holds no longer (saveProven): a measurement this runtime
+  // verified stays what it is for the time of the runtime. provenSaved is the text the program
+  // store holds. provenHere are the digests of the measurements whose proofs this runtime
+  // verified, proofFailures the times release proofs failed in this runtime, proofRefused, by
+  // digest, the proofs this runtime refused last for a measurement (as JSON text, for
+  // PROOF_REFUSED_KEPT measurements), proofAsked, by digest, the time the grant step of this
+  // runtime last asked a node for the release proofs of a measurement, and proofSought the time
+  // a round of this runtime last asked the backend for them.
   let provenKept = null;
+  let provenSaved = null;
   const provenHere = new Set();
   let proofFailures = [];
+  const proofRefused = new Map();
   const proofAsked = new Map();
+  const proofSought = new Map();
   // The nodes of an accepted release that this runtime found to take the grant command of a
   // later program only (the program_min of their binding is above VERSION): the grant step asks
   // such a node once in a runtime.
   const laterProgram = new Set();
 
-  /** The kept measurements of this program on this installation (STORE_PROVEN). What a program
-   *  of another version kept, and an element that is not of the form this program writes, is not
+  /** The verdicts of this program on this installation (STORE_PROVEN). What a program of
+   *  another version kept, and an element that is not of the form this program writes, is not
    *  read. */
   function keptProven() {
     if (provenKept === null) {
       provenKept = new Map();
+      provenSaved = native.storeGet(STORE_PROVEN);
       const kept = storedObject(STORE_PROVEN);
       const measures = kept.v === VERSION && isObject(kept.measures) ? kept.measures : {};
       for (const digest of Object.keys(measures)) {
         const item = measures[digest];
-        if (!isObject(item) || releasePosition(item.release) === null || !hex96(item.pcr0) ||
-            !hex96(item.pcr1) || !hex96(item.pcr2)) {
-          continue;
-        }
+        const programMin = isObject(item) ? countOf(item.program_min, false) : null;
+        if (programMin === null || releasePosition(item.release) === null) continue;
         provenKept.set(digest, {
-          release: item.release, pcr0: item.pcr0, pcr1: item.pcr1, pcr2: item.pcr2,
-          proven_ms: whole(item.proven_ms), proofs: isObject(item.proofs) ? item.proofs : null,
+          release: item.release, programMin: programMin, provenMs: whole(item.proven_ms),
+          proofs: isObject(item.proofs) ? item.proofs : null,
         });
       }
     }
     return provenKept;
   }
 
-  /** Writes the kept measurements: PROOF_KEPT_MEASURES of them at most, the ones shown last. */
+  /** Writes the verdicts: those of the PROOF_KEPT_VERDICTS latest releases, in the order of
+   *  releases (of two verdicts of one release the one made last stands first), and with them
+   *  the proofs of the PROOF_KEPT_PROOFS latest of those releases that this program accepts.
+   *  The proofs that are not written are dropped from what the runtime holds; a verdict that is
+   *  not written stays with the runtime. The program store is written when its value changes. */
   function saveProven() {
     const kept = keptProven();
-    const digests = Array.from(kept.keys()).sort(function (x, y) { return kept.get(x).proven_ms - kept.get(y).proven_ms; });
-    while (digests.length > PROOF_KEPT_MEASURES) kept.delete(digests.shift());
+    const digests = Array.from(kept.keys()).sort(function (x, y) {
+      const a = kept.get(x);
+      const b = kept.get(y);
+      const first = releasePosition(a.release);
+      const second = releasePosition(b.release);
+      if (releaseLater(first, second)) return -1;
+      if (releaseLater(second, first)) return 1;
+      return b.provenMs - a.provenMs;
+    });
     const measures = {};
-    for (const digest of digests) measures[digest] = kept.get(digest);
-    storeJson(STORE_PROVEN, { v: VERSION, measures: measures });
+    let proofs = 0;
+    for (let at = 0; at < digests.length; at += 1) {
+      const item = kept.get(digests[at]);
+      const carries = at < PROOF_KEPT_VERDICTS && item.proofs !== null && item.programMin <= VERSION &&
+        proofs < PROOF_KEPT_PROOFS;
+      if (carries) proofs += 1;
+      else item.proofs = null;
+      if (at >= PROOF_KEPT_VERDICTS) continue;
+      measures[digests[at]] = { release: item.release, program_min: item.programMin, proven_ms: item.provenMs };
+      if (carries) measures[digests[at]].proofs = item.proofs;
+    }
+    const value = digests.length === 0 ? null : JSON.stringify({ v: VERSION, measures: measures });
+    if (value === provenSaved) return;
+    native.storeSet(STORE_PROVEN, value);
+    provenSaved = value;
   }
 
   /** The build of a measurement (by its digest) that release proofs showed to this program on
-   *  this installation: {release, pcr0, pcr1, pcr2, log_store, proven}, in the form of an element
-   *  of ACCEPTED_RELEASES that writes to the log store. undefined when none did. */
+   *  this installation as that of a release this program accepts: {release, log_store, proven},
+   *  in the form of an element of ACCEPTED_RELEASES that writes to the log store. undefined
+   *  when no proofs showed the measurement, and when the statement of the proofs states a
+   *  program later than this one (provenLater). */
   function provenBuild(measure) {
     const item = keptProven().get(measure);
-    if (item === undefined) return undefined;
-    return { release: item.release, pcr0: item.pcr0, pcr1: item.pcr1, pcr2: item.pcr2, log_store: true, proven: true };
+    if (item === undefined || item.programMin > VERSION) return undefined;
+    return { release: item.release, log_store: true, proven: true };
+  }
+
+  /** Whether release proofs showed the measurement (by its digest) as that of a release whose
+   *  statement states a program later than this one (program_min above VERSION). This program
+   *  does not read what the nodes of such a release write, so the release is none it accepts:
+   *  its nodes receive no grant, what they wrote is not judged as the entries of an accepted
+   *  node, and the release holding the key of the account marks the log as a measurement no
+   *  list has does (A1). The proofs of such a measurement are not asked for again. */
+  function provenLater(measure) {
+    const item = keptProven().get(measure);
+    return item !== undefined && item.programMin > VERSION;
   }
 
   /** Verifies release proofs for a measurement {pcr0, pcr1, pcr2} with the digest measure
-   *  (proveRelease, with the constants of this program and the server target of this build).
-   *  Proofs that pass make the measurement one of an accepted release: the verdict is kept with
-   *  the proofs, and the build is returned (provenBuild). Proofs that fail are logged with the
-   *  check that failed and return undefined. null is returned without a verification when
-   *  PROOF_FAILURES proofs failed in this runtime within PROOF_FAILURE_SPAN_MS. */
+   *  (proveRelease, with the constants of this program and the server target of this build)
+   *  and returns what came of it:
+   *    shown    the proofs hold: the measurement is that of an accepted release (provenBuild)
+   *    later    the proofs hold, and their statement states a program later than this one
+   *             (provenLater)
+   *    refused  the proofs fail a check, which is logged
+   *    spent    nothing was verified: PROOF_FAILURES proofs failed in this runtime within
+   *             PROOF_FAILURE_SPAN_MS
+   *  A verdict is kept with the release and the program_min of the statement. Of two statements
+   *  that held for one measurement, the release of the one verified last and the higher
+   *  program_min stand. */
   function proveBuild(proofs, measurement, measure) {
     const now = native.nowMs();
+    // The proofs this runtime refused last for the measurement are refused without a second
+    // verification: the same value comes from a node, from a node document and from the backend.
+    const presented = JSON.stringify(proofs);
+    if (typeof presented === "string" && proofRefused.get(measure) === presented) return "refused";
     proofFailures = proofFailures.filter(function (time) { return time <= now && now - time < PROOF_FAILURE_SPAN_MS; });
-    if (proofFailures.length >= PROOF_FAILURES) return null;
-    let release = null;
+    if (proofFailures.length >= PROOF_FAILURES) return "spent";
+    let shown = null;
     try {
-      release = proveRelease(proofs, measurement, releaseTrust(), native.deviceInfo().server_target);
+      shown = proveRelease(proofs, measurement, releaseTrust(), native.deviceInfo().server_target);
     } catch (error) {
       if (failureCode(error) === "cancelled") throw error;
       proofFailures.push(now);
       native.log("release proofs refused: " +
         (failureCode(error) === "release_unproven" ? String(error.message) : failureCode(error)));
-      return undefined;
+      if (typeof presented === "string" && presented.length <= 2 * PROOF_KEPT_CHARS) {
+        proofRefused.delete(measure);
+        proofRefused.set(measure, presented);
+        if (proofRefused.size > PROOF_REFUSED_KEPT) proofRefused.delete(proofRefused.keys().next().value);
+      }
+      return "refused";
     }
+    proofRefused.delete(measure);
     provenHere.add(measure);
     const kept = keptProven();
     const before = kept.get(measure);
-    // The kept proofs verified again: what the device keeps stays as it is.
-    if (before !== undefined && before.proofs === proofs) return provenBuild(measure);
-    const copy = JSON.stringify({
-      statement: proofs.statement, entry: proofs.entry, deploy_signatures: proofs.deploy_signatures,
-      attestation: proofs.attestation,
-    });
+    const programMin = Math.max(shown.programMin, before === undefined ? 0 : before.programMin);
+    // The proofs are kept as a copy of the four members the verdict read.
+    let copy = before === undefined ? null : before.proofs;
+    if (before === undefined || before.proofs !== proofs) {
+      const written = JSON.stringify({
+        statement: proofs.statement, entry: proofs.entry, deploy_signatures: proofs.deploy_signatures,
+        attestation: proofs.attestation,
+      });
+      copy = written.length <= PROOF_KEPT_CHARS ? JSON.parse(written) : null;
+    }
     kept.set(measure, {
-      release: release, pcr0: measurement.pcr0, pcr1: measurement.pcr1, pcr2: measurement.pcr2,
-      proven_ms: before === undefined ? now : before.proven_ms,
-      proofs: copy.length <= PROOF_KEPT_CHARS ? JSON.parse(copy) : null,
+      release: shown.release, programMin: programMin, provenMs: before === undefined ? now : before.provenMs,
+      proofs: copy,
     });
     saveProven();
-    return provenBuild(measure);
+    if (programMin > VERSION) {
+      native.log("release " + shown.release + " takes program " + programMin + " or later");
+      return "later";
+    }
+    return "shown";
   }
 
   /** The build of a measurement no list has, for a node that may receive a key: undefined
-   *  unless this runtime verified release proofs of the measurement. The proofs it verified
-   *  before count; then the proofs the device kept, verified again now (a kept verdict whose
-   *  proofs fail is kept no longer); then the proofs given (the member release_proofs of an
-   *  attestation response; undefined or null: none). */
+   *  unless this runtime verified release proofs that show the measurement as that of a release
+   *  this program accepts. The proofs it verified before count; then the proofs the device
+   *  kept, verified again now (a kept verdict whose proofs fail is kept no longer); then the
+   *  proofs given (the member release_proofs of an attestation response; undefined or null:
+   *  none). */
   function provenForGrant(measure, measurement, proofs) {
-    if (provenHere.has(measure)) return provenBuild(measure);
+    if (provenLater(measure)) return undefined;
     const item = keptProven().get(measure);
+    if (item !== undefined && provenHere.has(measure)) return provenBuild(measure);
     if (item !== undefined && item.proofs !== null) {
       const again = proveBuild(item.proofs, measurement, measure);
-      if (again) return again;
-      if (again === undefined) {
+      if (again === "shown") return provenBuild(measure);
+      if (again === "later") return undefined;
+      if (again === "refused") {
         keptProven().delete(measure);
         saveProven();
       }
     }
     if (proofs === undefined || proofs === null) return undefined;
-    return proveBuild(proofs, measurement, measure) || undefined;
+    return proveBuild(proofs, measurement, measure) === "shown" ? provenBuild(measure) : undefined;
   }
 
   /** Erases what the device kept of the release proofs (with the account). */
   function forgetProven() {
     native.storeSet(STORE_PROVEN, null);
     provenKept = null;
+    provenSaved = null;
     provenHere.clear();
+    proofRefused.clear();
     proofAsked.clear();
+    proofSought.clear();
   }
 
-  /** Whether the grant step may ask for the release proofs of a measurement now: it has not
-   *  asked for them within PROOF_RETRY_MS (unaccepted: what the device kept of the measurements
-   *  no list has, where the time of the last request stands as asked_ms). */
+  /** Whether the grant step may ask a node for the release proofs of a measurement now: no
+   *  proofs showed the measurement, and it has not asked for them within PROOF_RETRY_MS
+   *  (unaccepted: what the device kept of the measurements no list has, where the time of the
+   *  last request stands as asked_ms). */
   function proofsDue(unaccepted, measure, now) {
+    if (provenLater(measure)) return false;
     const item = unaccepted[measure];
     const last = Math.max(isObject(item) ? whole(item.asked_ms) : 0, proofAsked.get(measure) || 0);
     return last === 0 || last > now || now - last >= PROOF_RETRY_MS;
+  }
+
+  /** The measurement {pcr0, pcr1, pcr2} the release statement of release proofs states, or null
+   *  for proofs without a statement that reads. */
+  function statedMeasurement(proofs) {
+    const statementText = member(proofs, "statement");
+    const statement = typeof statementText === "string" && statementText.length <= 2 * PROOF_STATEMENT_BYTES
+      ? decodeStrict(statementText, true) : null;
+    const stated = statement === null ? null : readReleaseStatement(statement);
+    return stated === null ? null : { pcr0: stated.pcr0, pcr1: stated.pcr1, pcr2: stated.pcr2 };
+  }
+
+  /** Asks the backend for the release proofs of measurements, named by their digests, and
+   *  verifies what it answers (GET PROOFS_PATH with the query measures, the digests joined by
+   *  commas; the answer is {proofs: [{measure, release_proofs}]}). A round asks so for the
+   *  measurements no list has and no proofs showed that it met: release proofs are public
+   *  values, so whoever hands them over, the verdict is that of the five checks alone. A
+   *  measurement is asked for when this runtime did not ask for it within PROOF_RETRY_MS. One
+   *  call sends one request, for PROOF_REQUEST_MEASURES measurements at most, and a round
+   *  (run) sends PROOF_ROUND_REQUESTS of them at most. Of the answer, an element counts when it
+   *  names a measurement of the request for the first time and carries proofs whose statement
+   *  states that measurement. A request that fails, a backend without the route and an answer
+   *  without proofs that hold leave the measurements what they were: nothing is counted as
+   *  held back, and what a measurement no list has means for the log is judged as before.
+   *  Returns {shown, left}: the number of measurements the answer showed as those of an
+   *  accepted release, and whether a measurement that is due was not asked for (the request
+   *  was full, or the requests of the round were spent). */
+  async function seekProofs(turn, run, digests) {
+    const now = native.nowMs();
+    const wanted = [];
+    let left = false;
+    for (const digest of digests) {
+      if (typeof digest !== "string" || !canonical32(digest) || wanted.indexOf(digest) >= 0) continue;
+      if (buildOfMeasure(digest) !== undefined || provenLater(digest)) continue;
+      const last = proofSought.get(digest) || 0;
+      if (last !== 0 && last <= now && now - last < PROOF_RETRY_MS) continue;
+      if (wanted.length >= PROOF_REQUEST_MEASURES || whole(run.proofRequests) >= PROOF_ROUND_REQUESTS) {
+        left = true;
+        break;
+      }
+      wanted.push(digest);
+    }
+    if (wanted.length === 0) return { shown: 0, left: left };
+    run.proofRequests = whole(run.proofRequests) + 1;
+    for (const digest of wanted) proofSought.set(digest, now);
+    let answer = null;
+    try {
+      answer = (await api(turn, "GET", PROOFS_PATH, null, { measures: wanted.join(",") }, LOG_API_TIMEOUT_MS)).json;
+    } catch (error) {
+      if (failureCode(error) === "cancelled" || !(turnLeft(turn) > 0)) throw error;
+      native.log("release proofs request failed: " + failureCode(error));
+      return { shown: 0, left: left };
+    }
+    let shown = 0;
+    const answered = new Set();
+    for (const item of Array.isArray(answer.proofs) ? answer.proofs : []) {
+      const digest = member(item, "measure");
+      const proofs = member(item, "release_proofs");
+      if (typeof digest !== "string" || wanted.indexOf(digest) < 0 || answered.has(digest) || !isObject(proofs)) continue;
+      answered.add(digest);
+      // The statement of the proofs states the measurement that was asked for: the digest of
+      // what it states is the digest of the request. Proofs of another measurement fail the
+      // verdict at the measurement.
+      const stated = statedMeasurement(proofs);
+      const measurement = stated !== null && measureOf(stated) === digest ? stated : { pcr0: "", pcr1: "", pcr2: "" };
+      if (proveBuild(proofs, measurement, digest) === "shown") shown += 1;
+    }
+    return { shown: shown, left: left };
+  }
+
+  /** The digests of the measurements no list has that the device keeps (unaccepted), the ones
+   *  that held the key of the account first. */
+  function keptUnaccepted(unaccepted) {
+    return Object.keys(unaccepted).sort(function (x, y) {
+      const a = isObject(unaccepted[x]) && unaccepted[x].held === true ? 0 : 1;
+      const b = isObject(unaccepted[y]) && unaccepted[y].held === true ? 0 : 1;
+      return a - b;
+    });
   }
 
   // ---- Keys ----
@@ -5070,6 +5274,9 @@
     }
     // The nodes of listed keys without a document that verifies: {id, why, url, signedMs}.
     const checks = [];
+    // The digests of the measurements no list has and no proofs showed that the documents of
+    // this call stated.
+    const unshown = [];
     for (const item of requests) {
       const outcome = await item.sent;
       if (!outcome.ok) {
@@ -5086,6 +5293,7 @@
           try {
             const facts = verifyNodeDocument(given.document, id, given.registry);
             log.nodes[id] = { m: facts.measure, p: facts.platform, r: facts.release, f: native.nowMs(), c: 0 };
+            if (!facts.listed && unshown.indexOf(facts.measure) < 0) unshown.push(facts.measure);
             continue;
           } catch (error) {
             if (failureCode(error) !== "attestation_failed") throw error;
@@ -5099,6 +5307,10 @@
         checks.push({ id: id, why: why, url: outcome.value.listings.get(id), signedMs: outcome.value.signedMs });
       }
     }
+    // A document that verified with a measurement no list has, without release proofs that show
+    // it: the backend is asked for the release proofs of that measurement before the entries of
+    // its node are judged (seekProofs). A stale runtime judges nothing and asks for none.
+    if (unshown.length > 0 && !staleRuntime()) await seekProofs(turn, run, unshown);
     if (checks.length === 0) return left;
     // Whether the store holds the node document of each of them: one listing per node, from the
     // store itself, after the listings that named the keys of the node.
@@ -5354,7 +5566,12 @@
       run.entries.set(parsed.key, record);
       run.settled.add(parsed.key);
       if (item.keep === true) run.kept.add(parsed.key);
-      if (item.fresh) markSeen(log, digest);
+      // A key is remembered as judged when its node is an accepted one. What a node of a
+      // measurement no list has wrote is read without the judgement of an accepted node (its
+      // transfers are not followed, and nothing it signed marks the node), so every round reads
+      // its keys again: when release proofs or a later list make the measurement one of an
+      // accepted release, the entries it wrote before are judged as those of an accepted node.
+      if (item.fresh && verdict.state !== "unaccepted") markSeen(log, digest);
       if (checked.failure === "signature") {
         // The body is the one the key names and no signature of its node verifies over it: the
         // node is of no accepted measurement, and the object is shown as not verified.
@@ -6269,6 +6486,12 @@
       if (run.detail === "") run.detail = away ? "round:suspended" : "round:time";
     };
     try {
+      // The measurements no list has that this device kept before this round: the backend is
+      // asked for their release proofs before anything is read (seekProofs), so a round whose
+      // reading ends early has asked, and the entries of the nodes of a measurement the proofs
+      // show are judged in this round as those of accepted nodes. A stale runtime judges
+      // nothing and asks for none.
+      if (!staleRuntime()) await seekProofs(turn, run, keptUnaccepted(log.unaccepted));
       // The keys an earlier read left for the rounds, before any listing (a listing of that
       // read named them): the keys it found held back, then the new control keys a round listed
       // and did not come to judge. What the round reads under a key the log screen asked for is
@@ -6503,6 +6726,27 @@
       }
     }
     const unreachable = !denied && (run.unreachable || run.silent);
+    // The measurements no list has and no proofs showed that this device keeps: the backend is
+    // asked for their release proofs, the ones that held the key of the account first
+    // (seekProofs). Proofs that show such a measurement make it one of an accepted release from
+    // here on. What this round read of the nodes of that measurement before, it read without
+    // the judgement of an accepted node and did not remember as judged: the round is not
+    // complete, and the next one judges those entries. A stale runtime judges nothing and asks
+    // for none.
+    if (!away && !staleRuntime()) {
+      try {
+        const sought = await seekProofs(judging, run, keptUnaccepted(log.unaccepted));
+        if (sought.shown > 0) run.cut = true;
+        // More such measurements than the requests of one round name: the round has more to
+        // read than it read, and the next round asks for the others.
+        if (sought.left) {
+          run.cut = true;
+          run.over = true;
+        }
+      } catch (failure) {
+        ranOut(failure);
+      }
+    }
     // A measurement past its grace marks the log only for a runtime that read, not longer than
     // SERVED_FRESH_MS ago, that no later program is served (releaseConfirmed). A round that
     // holds such a measurement and no such reading asks for the account once: a round the
@@ -9928,7 +10172,9 @@
    *  this step. Without such proofs it is a node of a later release: it receives no grant, it
    *  is kept as such (log.nodes) and not asked again by this program but for the release
    *  proofs of its measurement, PROOF_RETRY_MS after the last request for them (a stale runtime
-   *  keeps it for its own time only). A node of an accepted release whose binding asks for a
+   *  keeps it for its own time only). Proofs that hold and whose statement states a program
+   *  later than this one leave the node one of a later release as well, and the proofs of that
+   *  measurement are not asked for again. A node of an accepted release whose binding asks for a
    *  later program (program_min above VERSION) receives no grant either, is counted with the
    *  nodes of a later release and is not asked again by this runtime; it is kept as nothing
    *  else than the node of an accepted release that it is. A node the list marks revoke_only

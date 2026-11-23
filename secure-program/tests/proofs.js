@@ -342,7 +342,9 @@ function attestationOf(parties, stated, options) {
     _type: "https://in-toto.io/Statement/v1",
     subject: [{ name: "enclave.eif", digest: { sha256: sha256(Buffer.from(stated.release)).toString("hex") } }],
     predicateType: given.predicateType === undefined ? PREDICATE_TYPE : given.predicateType,
-    predicate: given.predicate || { release: stated.release, pcr0: stated.pcr0, pcr1: stated.pcr1, pcr2: stated.pcr2 },
+    predicate: given.predicate || Object.assign(
+      { release: stated.release, pcr0: stated.pcr0, pcr1: stated.pcr1, pcr2: stated.pcr2 },
+      stated.program_min === undefined ? {} : { program_min: stated.program_min }),
   };
   const payload = Buffer.from(JSON.stringify(statement), "utf8");
   const payloadType = given.payloadType === undefined ? PAYLOAD_TYPE : given.payloadType;
@@ -392,7 +394,9 @@ function attestationOf(parties, stated, options) {
  *    attestation   options of attestationOf */
 function proofsOf(parties, release, measurement, options) {
   const given = options || {};
-  const statement = given.statement || statementOf(release, measurement);
+  // programMin: the statement states that program_min, and the attestation states it with it.
+  const stated = given.programMin === undefined ? {} : { program_min: given.programMin };
+  const statement = given.statement || statementOf(release, measurement, stated);
   return {
     statement: b64u(statement),
     entry: recordedEntry(parties, statement, given.entry),
@@ -400,7 +404,7 @@ function proofsOf(parties, release, measurement, options) {
       { key_id: "dev", signature: deploySignature(parties.deploy.dev, statement) },
       { key_id: "prod", signature: deploySignature(parties.deploy.prod, statement) },
     ],
-    attestation: attestationOf(parties, given.attested || Object.assign({ release: release }, measurement), given.attestation),
+    attestation: attestationOf(parties, given.attested || Object.assign({ release: release }, measurement, stated), given.attestation),
   };
 }
 

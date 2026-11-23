@@ -1582,10 +1582,12 @@ test("a round ends its reading when the app goes to the background: it sends not
   assert.equal(judgedKeys(world), judged + 3);
   assert.equal(world.state.log.newer_release_nodes, 0);
   // The third stay: the entry of the other node is read before the listing is asked for. The key
-  // of the account is at a measurement no list has: pending for a day.
+  // of the account is at a measurement no list has: pending for a day. The key of that entry is
+  // not remembered as judged: the rounds read it again, and judge it as the entry of an
+  // accepted node once its measurement is one of an accepted release.
   assert.deepEqual(await stay(), ["bodies", "read"]);
   assert.equal(heldReads(world), undefined);
-  assert.equal(judgedKeys(world), judged + 4);
+  assert.equal(judgedKeys(world), judged + 3);
   assert.equal(world.state.log.status, "pending");
   assert.equal(world.state.log.newer_release_nodes, 1);
   assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });

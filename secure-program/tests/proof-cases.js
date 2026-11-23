@@ -22,13 +22,15 @@ function otherPcr(pcr) {
 }
 
 /** The cases for a release tag that is later than every release the program lists. listed is
- *  the latest release the program lists. Returns [{name, reason, proofs, measurement, release,
- *  target, constants, logs}]: reason is null for proofs that hold, and the text the program logs
- *  for the check that refuses the others; measurement and release are those of the node that
- *  presents the proofs; target is the server target of the build; constants are the parties
- *  whose keys and certificates the program holds; logs are the keys of the logs the program
- *  holds (null: the key of the log of the constants). */
-function proofCases(release, listed) {
+ *  the latest release the program lists and version the version of the program. Returns
+ *  [{name, reason, proofs, measurement, release, target, constants, logs, later}]: reason is
+ *  null for proofs that hold, and the text the program logs for the check that refuses the
+ *  others; measurement and release are those of the node that presents the proofs; target is
+ *  the server target of the build; constants are the parties whose keys and certificates the
+ *  program holds; logs are the keys of the logs the program holds (null: the key of the log of
+ *  the constants); later is true for proofs that hold and whose statement states a program
+ *  later than version (the release is none the program accepts). */
+function proofCases(release, listed, version) {
   const parties = model.makeParties();
   const measurement = randomMeasurement();
   const cases = [];
@@ -111,6 +113,32 @@ function proofCases(release, listed) {
     const other = Object.assign({}, measurement, { [field]: otherPcr(measurement[field]) });
     add("the proofs of another measurement: one character of " + field, "p1: measurement", proofsOf({}, release, other));
   }
+
+  // ---- P1: the program_min of the statement ----
+  add("a statement that states the program_min of this program", null, proofsOf({ programMin: version }));
+  add("a statement that states program_min 0", null, proofsOf({ programMin: 0 }));
+  add("a statement that states the program_min of the next program", null, proofsOf({ programMin: version + 1 }), { later: true });
+  add("a statement that states the highest program_min the program holds exactly", null,
+    proofsOf({ programMin: 9007199254740991 }), { later: true });
+  /** Proofs of a statement that writes its program_min as the text written, attested with the
+   *  value attested for it. */
+  const minimum = (written, attested) => proofsOf({
+    statement: Buffer.from(statementOf().toString().replace("{", "{\n  \"program_min\": " + written + ","), "utf8"),
+    attested: Object.assign({ release: release }, measurement, { program_min: attested }),
+  });
+  for (const [name, written, attested] of [
+    ["a text", "\"44\"", "44"], ["a fraction", "44.5", 44.5], ["a negative number", "-1", -1], ["null", "null", null],
+    ["true", "true", true], ["an array", "[44]", [44]], ["written with an exponent", "4.4e1", 44],
+    ["written with a fraction part", "44.0", 44], ["written as -0", "-0", 0],
+    ["a number the program does not hold exactly", "9007199254740993", 9007199254740992],
+    ["a number of seventeen digits", "10000000000000000", 10000000000000000],
+  ]) {
+    add("a statement whose program_min is " + name, "p1: statement", minimum(written, attested));
+  }
+  add("a statement that states program_min twice", "p1: statement", proofsOf({
+    statement: Buffer.from(statementOf({ program_min: version }).toString().replace("{", "{\n  \"program_min\": " + version + ","), "utf8"),
+    attested: Object.assign({ release: release }, measurement, { program_min: version }),
+  }));
 
   // ---- P5: the order of releases ----
   for (const earlier of [listed, "v1.0.0", listed + "-rc.3"]) {
@@ -376,6 +404,18 @@ function proofCases(release, listed) {
     add("a predicate of another " + field, "p4: predicate " + field,
       proofsOf({ attested: Object.assign({ release: release }, measurement, { [field]: otherPcr(measurement[field]) }) }));
   }
+  add("a predicate without the program_min of the statement", "p4: predicate program_min",
+    proofsOf({ statement: statementOf({ program_min: version }) }));
+  add("a predicate with a program_min the statement does not state", "p4: predicate program_min",
+    proofsOf({ attested: Object.assign({ release: release }, measurement, { program_min: version }) }));
+  add("a predicate of another program_min than the statement", "p4: predicate program_min", proofsOf({
+    statement: statementOf({ program_min: version + 1 }),
+    attested: Object.assign({ release: release }, measurement, { program_min: version }),
+  }));
+  add("a predicate whose program_min is a text", "p4: predicate program_min", proofsOf({
+    statement: statementOf({ program_min: version }),
+    attested: Object.assign({ release: release }, measurement, { program_min: String(version) }),
+  }));
   add("a predicate of another release under the certificate of this release", "p4: predicate release",
     attested({ predicate: Object.assign({ release: release + "-rc.1" }, measurement) }));
   add("a predicate without a PCR", "p4: predicate pcr2",

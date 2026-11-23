@@ -664,9 +664,14 @@ class World {
     this.keptDocuments = new Map();
     // The release proofs the backend holds, by release: it hands them out with the attestation
     // of a node of that release when a request asks for them (the query proofs), or with every
-    // attestation when proofsUnasked is set.
+    // attestation when proofsUnasked is set, and for the measurement their statement states
+    // when a request names its digest (GET /api/secure/release-proofs; routes.proofs false: a
+    // backend without that route). measureProofs holds what the backend hands out for a digest
+    // in the place of that (by the digest of a measurement).
     this.releaseProofs = new Map();
     this.proofsUnasked = false;
+    this.measureProofs = new Map();
+    this.routes.proofs = true;
   }
 
   get storeHost() {
@@ -942,6 +947,27 @@ class World {
           return response;
         }),
       });
+    }
+    if (method === "GET" && path === "/api/secure/release-proofs") {
+      if (!this.routes.proofs) return absent();
+      const wanted = typeof query.measures === "string" && query.measures !== "" ? query.measures.split(",") : [];
+      // The digest of the measurement a statement states: the base64url SHA-256 of its three
+      // PCR values in hexadecimal, one after another.
+      const held = new Map();
+      for (const proofs of this.releaseProofs.values()) {
+        try {
+          const stated = JSON.parse(Buffer.from(proofs.statement, "base64url").toString("utf8"));
+          held.set(b64u(sha("sha256", utf8(stated.pcr0 + stated.pcr1 + stated.pcr2))), proofs);
+        } catch (error) {
+          // (Proofs without a statement that reads are handed out for no measurement.)
+        }
+      }
+      const answer = [];
+      for (const digest of wanted) {
+        const proofs = this.measureProofs.has(digest) ? this.measureProofs.get(digest) : held.get(digest);
+        if (proofs !== undefined) answer.push({ measure: digest, release_proofs: proofs });
+      }
+      return json(200, { proofs: answer });
     }
     const nodeRoute = /^\/api\/secure\/nodes\/([A-Za-z0-9_-]{43})\/(messages|status)$/.exec(path);
     if (nodeRoute !== null && method === "POST") {

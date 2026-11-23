@@ -33,6 +33,8 @@ for (const file of VECTORS_PATHS) {
 }
 const { HOUR_MS } = S;
 const REFUSED = "release proofs refused: ";
+const PROOFS_PATH = "/api/secure/release-proofs";
+const VERSION = bridge.declaredVersion(source);
 
 // ---- Helpers ----
 
@@ -48,12 +50,52 @@ function attestationRequests(world, from) {
     .map((request) => ({ nodes: String(request.query.nodes || "").split(",").filter((id) => id !== ""), proofs: request.query.proofs }));
 }
 
-/** The measurements the program store keeps as shown by release proofs: [{release, proofs}]
- *  (proofs: whether the proofs are kept with the verdict). */
+/** The verdicts of release proofs the program store keeps: [{release, proofs}] (proofs: whether
+ *  the proofs are kept with the verdict), with program_min for a verdict whose statement states
+ *  one above 0. */
 function keptProven(world) {
   const kept = world.stored("log.proven");
   if (kept === undefined) return [];
-  return Object.values(kept.measures).map((item) => ({ release: item.release, proofs: item.proofs !== null }));
+  return Object.values(kept.measures).map((item) => Object.assign(
+    { release: item.release, proofs: item.proofs !== null && typeof item.proofs === "object" },
+    item.program_min === 0 ? {} : { program_min: item.program_min }));
+}
+
+/** The requests the program sent for the release proofs of measurements since the index from:
+ *  for each the digests it named. */
+function proofRequests(world, from) {
+  return world.requests.slice(from === undefined ? 0 : from).filter((request) => request.path === PROOFS_PATH)
+    .map((request) => String(request.query.measures || "").split(",").filter((digest) => digest !== ""));
+}
+
+/** The digest of a measurement as the program names it: the base64url SHA-256 of its three PCR
+ *  values in hexadecimal, one after another. */
+function digestOf(measurement) {
+  return bridge.b64u(bridge.sha("sha256", bridge.utf8(measurement.pcr0 + measurement.pcr1 + measurement.pcr2)));
+}
+
+/** What the app was told of the log and what the program published, as one line. */
+function told(world) {
+  const last = world.securityStatuses.length === 0 ? null : world.securityStatuses[world.securityStatuses.length - 1];
+  return world.state.log.status + (last === null ? "" : " told " + last.status + (last.reasons.length > 0 ? ":" + last.reasons.join(",") : "")) +
+    " grant " + world.state.grant.state;
+}
+
+/** The key of the account moves from the node from (of fromRelease) to the node to (of the
+ *  measurement and the release given): the entries the two nodes write, and the giving node is
+ *  closed. */
+function moveKey(world, from, fromRelease, to, measurement, release) {
+  from.record("c", [{
+    t: "grant_transferred_out", time_ms: world.now, to: to.id, release: release,
+    pcr0: measurement.pcr0, pcr1: measurement.pcr1, pcr2: measurement.pcr2,
+  }]);
+  to.grants.set(world.userId, from.grants.get(world.userId));
+  to.record("c", [{
+    t: "grant_transferred_in", time_ms: world.now, from: from.id, release: fromRelease,
+    not_after_ms: world.now + 30 * S.DAY_MS, custody: "enclave",
+  }]);
+  to.record("u", [S.providerRequest(world.now)]);
+  from.alive = false;
 }
 
 /** Runs one round by a synchronization a day after the last one. */
@@ -148,7 +190,7 @@ test("the release proofs of release v2.3.0, from public values, show its measure
 
 test("release proofs that hold hand the node its grant, and proofs that differ from them in one place are refused by the check of that place: the node stays a node of a later release", async () => {
   const listed = bridge.listedMeasurements(S.fixture(source).source);
-  const cases = proofCases("v2.5.0", listed[listed.length - 1].release);
+  const cases = proofCases("v2.5.0", listed[listed.length - 1].release, VERSION);
   const seen = new Map();
   for (const item of cases) {
     const fx = S.fixture(source, { target: item.target });
@@ -160,21 +202,42 @@ test("release proofs that hold hand the node its grant, and proofs that differ f
     // The listed node receives its grant whatever the other node presents.
     assert.equal(fx.nodes[0].grants.has(world.userId), true, item.name);
     assert.deepEqual(attestationRequests(world).map((request) => [request.nodes.length, request.proofs]), [[2, undefined], [1, "1"]], item.name);
-    if (item.reason === null) {
+    if (item.reason === null && item.later !== true) {
       assert.deepEqual(refusals(world), [], item.name);
       assert.equal(later.grants.has(world.userId), true, item.name);
       assert.equal(world.state.log.status, "verified", item.name);
       assert.equal(world.state.log.newer_release_nodes, 0, item.name);
-      assert.deepEqual(keptProven(world), [{ release: item.release, proofs: true }], item.name);
+      assert.equal(keptProven(world).length, 1, item.name);
+      assert.equal(keptProven(world)[0].release, item.release, item.name);
+      assert.equal(keptProven(world)[0].proofs, true, item.name);
+      // The backend is asked for the proofs of no measurement: the node showed them.
+      assert.deepEqual(proofRequests(world), [], item.name);
       continue;
     }
-    // Proofs that are null are no proofs: nothing is verified and nothing refused.
+    if (item.reason === null) {
+      // Proofs that hold and whose statement states a later program: nothing is refused, the
+      // verdict is kept without the proofs, and the node is one of a release this program does
+      // not accept.
+      assert.deepEqual(refusals(world), [], item.name);
+      assert.equal(later.grants.has(world.userId), false, item.name);
+      assert.equal(world.state.log.status, "pending", item.name);
+      assert.equal(world.state.log.newer_release_nodes, 1, item.name);
+      assert.equal(keptProven(world).length, 1, item.name);
+      assert.equal(keptProven(world)[0].proofs, false, item.name);
+      assert.ok(keptProven(world)[0].program_min > VERSION, item.name);
+      assert.deepEqual(proofRequests(world), [], item.name);
+      continue;
+    }
+    // Proofs that are null are no proofs: nothing is verified and nothing refused. The proofs
+    // the node presented are refused once: the backend hands the same proofs out for the
+    // measurement, and the program does not verify them a second time.
     assert.deepEqual(refusals(world), item.proofs === null ? [] : [item.reason], item.name);
     assert.equal(later.grants.has(world.userId), false, item.name);
     assert.equal(world.state.log.status, "pending", item.name);
     assert.equal(world.state.log.newer_release_nodes, 1, item.name);
     assert.deepEqual(keptProven(world), [], item.name);
     assert.equal(world.runtime.rejected_nodes, 0, item.name);
+    assert.deepEqual(proofRequests(world), [[digestOf(item.measurement)]], item.name);
   }
   // Every check has its cases.
   for (const reason of [
@@ -186,6 +249,7 @@ test("release proofs that hold hand the node its grant, and proofs that differ f
     "p4: identity 20", "p4: identity 22", "p4: signature", "p4: log", "p4: log entry kind", "p4: log entry payload",
     "p4: log entry signature", "p4: log entry certificate", "p4: signed entry timestamp", "p4: inclusion proof",
     "p4: checkpoint", "p4: predicate type", "p4: predicate release", "p4: predicate pcr0", "p4: predicate pcr1", "p4: predicate pcr2",
+    "p4: predicate program_min",
   ]) {
     assert.ok(seen.get(reason) >= 1, "cases of " + reason);
   }
@@ -271,10 +335,13 @@ test("a node of a listed release is asked for no release proofs, and release pro
   assert.ok(world.requests.every((request) => request.query === undefined || request.query === null || request.query.proofs === undefined));
   assert.deepEqual(refusals(world), []);
   assert.deepEqual(keptProven(world), []);
-  // The renewals of the next days, and a procedure of the user, ask for none either.
+  // The renewals of the next days, and a procedure of the user, ask for none either. The
+  // backend is asked for the release proofs of no measurement, and the log screen asks for none.
   for (let day = 0; day < 3; day += 1) await nextDay(fx);
   await S.call(fx, "sync", {});
+  await S.call(fx, "read_log", { limit: 10 });
   assert.ok(world.requests.every((request) => request.query === undefined || request.query === null || request.query.proofs === undefined));
+  assert.deepEqual(proofRequests(world), []);
   assert.equal(world.stored("log.proven"), undefined);
 });
 
@@ -579,4 +646,441 @@ test("a stale runtime verifies release proofs as any runtime does: the node of t
   assert.equal(world.state.grant.state, "active");
   const called = await S.call(fx, "sync", {});
   assert.equal(called.ok, true);
+});
+
+// ---- The verdicts the device keeps, and the releases a log holds ----
+
+/** A fixture whose program holds the keys and the certificates of parties that make release
+ *  proofs: the fixture of scenarios.js with one listed node of release v2.4.0. */
+function partiesFixture(options) {
+  const fx = S.fixture(source, Object.assign({ nodes: 1, device: { securityStatus: true } }, options || {}));
+  fx.parties = model.makeParties();
+  fx.source = model.withParties(fx.source, fx.parties);
+  return fx;
+}
+
+/** A node of release with a measurement of its own and release proofs: {node, measurement,
+ *  release, proofs}. The backend holds the proofs when held is true, and the node document
+ *  carries them when carried is true. proofs are options of model.proofsOf, node options of the
+ *  node. */
+function releaseNode(fx, release, given) {
+  const options = given || {};
+  const measurement = bridge.randomMeasurement();
+  const proofs = model.proofsOf(fx.parties, release, measurement, options.proofs);
+  if (options.held !== false) fx.world.releaseProofs.set(release, proofs);
+  const node = fx.world.addNode(Object.assign(
+    { release: release, measurement: measurement, documentProofs: options.carried === false ? undefined : proofs }, options.node || {}));
+  return { node: node, measurement: measurement, release: release, proofs: proofs };
+}
+
+/** The key of the account moves from the listed node of the fixture through count releases the
+ *  program does not list, one a day, with a synchronization of the device after each move.
+ *  made(at) are the options of releaseNode for the release at the index at. Returns {lines,
+ *  holders}: what the device published and was told after each day, and the releases. */
+async function movedThrough(fx, count, made) {
+  const world = fx.world;
+  const lines = [];
+  const holders = [];
+  let holder = { node: fx.nodes[0], release: "v2.4.0" };
+  for (let at = 0; at < count; at += 1) {
+    const next = releaseNode(fx, "v2." + (5 + at) + ".0", made === undefined ? undefined : made(at));
+    moveKey(world, holder.node, holder.release, next.node, next.measurement, next.release);
+    holder = next;
+    holders.push(next);
+    await nextDay(fx);
+    lines.push(told(world));
+  }
+  return { lines: lines, holders: holders };
+}
+
+/** The app starts on an installation that kept nothing of the program store (the Keychain is
+ *  there), and synchronizes once a day for days days. Returns what the device published and was
+ *  told at the start and after each day. */
+async function freshInstallation(fx, days) {
+  const world = fx.world;
+  world.store.clear();
+  world.securityStatuses.length = 0;
+  await S.start(fx);
+  const lines = [told(world)];
+  for (let day = 0; day < days; day += 1) {
+    await nextDay(fx);
+    lines.push(told(world));
+  }
+  return lines;
+}
+
+test("the key of the account moves through releases the program does not list, each with release proofs that hold: the device that saw every move and an installation that kept nothing verify the log and keep the grant, with five, ten and thirty such releases", async () => {
+  for (const count of [5, 10, 30]) {
+    const fx = partiesFixture();
+    const world = fx.world;
+    await S.start(fx);
+    // The device that saw every move: the log is verified after each of them.
+    const seen = await movedThrough(fx, count);
+    for (let day = 0; day < 2; day += 1) {
+      await nextDay(fx);
+      seen.lines.push(told(world));
+    }
+    assert.deepEqual(Array.from(new Set(seen.lines)), ["verified told ok grant active"], String(count));
+    assert.equal(keptProven(world).length, count, String(count));
+    assert.equal(keptProven(world).filter((item) => item.proofs).length, Math.min(count, 4), String(count));
+    const shown = await S.call(fx, "read_log", { limit: 50 });
+    assert.equal(shown.value.status, "verified", String(count));
+    // An installation that kept nothing reads the same history: the release that holds the key
+    // is shown by its node, and the releases before it by the node documents of their nodes.
+    const fresh = await freshInstallation(fx, 3);
+    assert.deepEqual(Array.from(new Set(fresh)), ["verified told ok grant active"], String(count));
+    assert.equal(keptProven(world).length, count, String(count));
+    assert.equal(world.securityStatuses.filter((item) => item.status === "attention").length, 0, String(count));
+    // The runtime after it, and the screen.
+    await S.start(fx);
+    await nextDay(fx);
+    assert.equal(told(world), "verified told ok grant active", String(count));
+    assert.equal((await S.call(fx, "read_log", { limit: 50 })).value.status, "verified", String(count));
+    assert.deepEqual(refusals(world), [], String(count));
+  }
+});
+
+test("the same history where the node documents carry no release proofs: the backend is asked for the proofs of the measurements of the closed nodes by their digests, and an installation that kept nothing verifies the log without a mark", async () => {
+  for (const count of [5, 10, 30]) {
+    const fx = partiesFixture();
+    const world = fx.world;
+    await S.start(fx);
+    const seen = await movedThrough(fx, count, () => ({ carried: false }));
+    assert.deepEqual(Array.from(new Set(seen.lines)), ["verified told ok grant active"], String(count));
+    // The device that saw every move asked a node for the proofs of each release, and the
+    // backend for those of no measurement.
+    assert.deepEqual(proofRequests(world), [], String(count));
+    const before = world.requests.length;
+    const fresh = await freshInstallation(fx, 3);
+    assert.equal(fresh[fresh.length - 1], "verified told ok grant active", String(count));
+    assert.ok(fresh.every((line) => line.indexOf("attention") < 0 && line.indexOf("grant active") > 0), String(count) + ": " + fresh.join(" | "));
+    assert.equal(world.securityStatuses.filter((item) => item.status === "attention").length, 0, String(count));
+    assert.equal(keptProven(world).length, count, String(count));
+    // Every measurement of a closed node was asked for once, eight in one request at most.
+    const asked = proofRequests(world, before);
+    assert.ok(asked.every((digests) => digests.length >= 1 && digests.length <= 8), String(count));
+    assert.deepEqual(asked.flat().sort(), seen.holders.slice(0, count - 1).map((item) => digestOf(item.measurement)).sort(), String(count));
+    assert.deepEqual(refusals(world), [], String(count));
+  }
+});
+
+test("a release among them without release proofs that hold stays a measurement no list has: the log of an installation that kept nothing is pending for a day and then marked", async () => {
+  // The third of five releases that held the key has no proofs, proofs of a runner the owner of
+  // the repository hosts, or proofs of another measurement; the others have proofs that hold.
+  const other = bridge.randomMeasurement();
+  for (const [name, broken, refused] of [
+    ["no proofs", { held: false, carried: false }, []],
+    ["proofs of another runner", { proofs: { attestation: { identity: { 11: "self-hosted" } } } }, ["p4: identity 11"]],
+    ["a statement of another measurement", { proofs: { statement: null } }, ["p1: measurement"]],
+  ]) {
+    const fx = partiesFixture();
+    const world = fx.world;
+    await S.start(fx);
+    const made = (at) => {
+      if (at !== 2) return undefined;
+      if (broken.proofs !== undefined && broken.proofs.statement === null) {
+        return { proofs: { statement: model.statementOf("v2.7.0", other), attested: Object.assign({ release: "v2.7.0" }, other) } };
+      }
+      return broken;
+    };
+    const moved = await movedThrough(fx, 5, made);
+    const fresh = await freshInstallation(fx, 2);
+    assert.equal(fresh[0], "pending told pending grant active", name);
+    assert.equal(fresh[1], "attention told attention:unlisted_release grant active", name);
+    assert.equal(fresh[2], "attention told attention:unlisted_release grant active", name);
+    assert.deepEqual(keptProven(world).map((item) => item.release).sort(), ["v2.5.0", "v2.6.0", "v2.8.0", "v2.9.0"], name);
+    assert.deepEqual(Array.from(new Set(refusals(world))), refused, name);
+    // The one measurement the device keeps as one no list has is that of the third release,
+    // and it held the key.
+    const kept = world.stored("log.unaccepted");
+    assert.deepEqual(Object.keys(kept), [digestOf(moved.holders[2].measurement)], name);
+    assert.equal(kept[digestOf(moved.holders[2].measurement)].held, true, name);
+  }
+});
+
+test("the release of a closed node whose node document carries no release proofs: the backend hands the proofs out for the digest of the measurement and the log is verified; without them, from a backend without the route, and with proofs that fail, the log is pending for a day and then marked", async () => {
+  // The listed node hands the key to a node of release v2.5.0, which hands it to a node of
+  // release v2.6.0 and is closed. The node of v2.6.0 is alive and the backend holds its proofs.
+  const scene = async (given) => {
+    const fx = partiesFixture();
+    const world = fx.world;
+    await S.start(fx);
+    const closed = releaseNode(fx, "v2.5.0", { held: false, carried: false, node: { offered: false } });
+    const alive = releaseNode(fx, "v2.6.0");
+    moveKey(world, fx.nodes[0], "v2.4.0", closed.node, closed.measurement, "v2.5.0");
+    world.advance(S.DAY_MS);
+    moveKey(world, closed.node, "v2.5.0", alive.node, alive.measurement, "v2.6.0");
+    given(world, closed);
+    const before = world.requests.length;
+    const lines = await freshInstallation(fx, 2);
+    return { fx: fx, world: world, closed: closed, lines: lines, asked: proofRequests(world, before) };
+  };
+  // The backend holds the proofs of v2.5.0: one request names the digest of its measurement.
+  const held = await scene((world, closed) => world.releaseProofs.set("v2.5.0", closed.proofs));
+  assert.deepEqual(held.lines, ["verified told ok grant active", "verified told ok grant active", "verified told ok grant active"]);
+  assert.deepEqual(held.asked, [[digestOf(held.closed.measurement)]]);
+  assert.deepEqual(keptProven(held.world).map((item) => item.release).sort(), ["v2.5.0", "v2.6.0"]);
+  // The backend holds none: it is asked at the first read, and again when the round a day
+  // later judges.
+  const marked = ["pending told pending grant active", "attention told attention:unlisted_release grant active",
+    "attention told attention:unlisted_release grant active"];
+  const none = await scene(() => {});
+  assert.deepEqual(none.lines, marked);
+  assert.deepEqual(none.asked, [[digestOf(none.closed.measurement)], [digestOf(none.closed.measurement)], [digestOf(none.closed.measurement)]]);
+  assert.equal(none.world.state.log.store, "verified");
+  assert.deepEqual(none.world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  // A backend without the route: the request fails, and nothing is counted as held back.
+  const absent = await scene((world) => { world.routes.proofs = false; });
+  assert.deepEqual(absent.lines, marked);
+  assert.equal(absent.world.state.log.store, "verified");
+  assert.deepEqual(absent.world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  assert.ok(absent.world.logs.some((line) => line.indexOf("release proofs request failed") === 0));
+  // A backend that answers the request with an error.
+  const failing = await scene((world) => world.fault("GET " + PROOFS_PATH, { status: 503, body: { detail: "unavailable" } }));
+  assert.deepEqual(failing.lines, marked);
+  assert.deepEqual(failing.world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  // Proofs that fail, proofs of another measurement, and an answer for a digest that was not
+  // asked for.
+  const forged = await scene((world, closed) => world.measureProofs.set(digestOf(closed.measurement),
+    model.proofsOf(model.makeParties(), "v2.5.0", closed.measurement)));
+  assert.deepEqual(forged.lines, marked);
+  assert.deepEqual(Array.from(new Set(refusals(forged.world))), ["p3: signature"]);
+  const swapped = await scene((world, closed) => world.measureProofs.set(digestOf(closed.measurement),
+    world.releaseProofs.get("v2.6.0")));
+  assert.deepEqual(swapped.lines, marked);
+  assert.deepEqual(Array.from(new Set(refusals(swapped.world))), ["p1: measurement"]);
+  // The proofs reach the backend after the log was marked: the round that asks next verifies
+  // the log, and the app is told so.
+  none.world.releaseProofs.set("v2.5.0", none.closed.proofs);
+  await nextDay(none.fx);
+  assert.equal(told(none.world), "verified told ok grant active");
+  assert.deepEqual(none.world.stored("log.unaccepted"), {});
+});
+
+test("a backend that hands release proofs out for a digest is asked again for a measurement not sooner than an hour after the last request of the runtime", async () => {
+  const fx = partiesFixture();
+  const world = fx.world;
+  await S.start(fx);
+  const closed = releaseNode(fx, "v2.5.0", { held: false, carried: false, node: { offered: false } });
+  moveKey(world, fx.nodes[0], "v2.4.0", closed.node, closed.measurement, "v2.5.0");
+  await nextDay(fx);
+  assert.deepEqual(proofRequests(world), [[digestOf(closed.measurement)]]);
+  assert.equal(world.state.log.status, "pending");
+  // Within the hour: the rounds of the next events, a procedure of the user and the log screen
+  // ask for none.
+  for (let step = 0; step < 3; step += 1) {
+    world.advance(10 * 60000);
+    await S.event(fx, "foreground");
+  }
+  await S.call(fx, "sync", {});
+  await S.call(fx, "read_log", { limit: 10 });
+  assert.deepEqual(proofRequests(world), [[digestOf(closed.measurement)]]);
+  // After the hour, with the proofs at the backend: the round asks, the measurement is shown,
+  // and the entries of its node are judged as those of an accepted node.
+  world.releaseProofs.set("v2.5.0", closed.proofs);
+  world.advance(31 * 60000);
+  await S.event(fx, "foreground");
+  assert.equal(proofRequests(world).length, 2);
+  assert.equal(world.state.log.status, "verified");
+  assert.deepEqual(world.stored("log.unaccepted"), {});
+  assert.equal(world.securityStatuses.filter((item) => item.status === "attention").length, 0);
+});
+
+test("the device keeps the verdicts of 256 measurements, those of the latest releases, and the proofs of the latest four", async () => {
+  const fx = partiesFixture();
+  const world = fx.world;
+  // 256 verdicts of this program in the program store, of the releases v2.5.0 to v2.260.0.
+  const measures = {};
+  for (let at = 0; at < 256; at += 1) {
+    measures[digestOf(bridge.randomMeasurement())] = { release: "v2." + (5 + at) + ".0", program_min: 0, proven_ms: 1000 + at };
+  }
+  world.store.set("log.proven", JSON.stringify({ v: VERSION, measures: measures }));
+  // A node of release v2.100.1, later than 96 of them, and one of v3.0.0, later than all.
+  const middle = releaseNode(fx, "v2.100.1");
+  const last = releaseNode(fx, "v3.0.0");
+  await S.start(fx);
+  assert.equal(middle.node.grants.has(world.userId), true);
+  assert.equal(last.node.grants.has(world.userId), true);
+  const kept = world.stored("log.proven");
+  const releases = Object.values(kept.measures).map((item) => item.release);
+  assert.equal(releases.length, 256);
+  // The two earliest releases left; the two that were shown now are kept, with their proofs.
+  assert.equal(releases.indexOf("v2.5.0"), -1);
+  assert.equal(releases.indexOf("v2.6.0"), -1);
+  assert.ok(releases.indexOf("v2.7.0") >= 0);
+  assert.deepEqual(keptProven(world).filter((item) => item.proofs).map((item) => item.release).sort(), ["v2.100.1", "v3.0.0"]);
+  // A verdict that left the program store stays with the runtime that made it: a release
+  // earlier than every kept one is shown, its node receives the grant, and the same runtime
+  // renews it.
+  const first = releaseNode(fx, "v2.4.1");
+  world.advance(2 * HOUR_MS);
+  await S.event(fx, "foreground");
+  assert.equal(first.node.grants.has(world.userId), true);
+  assert.equal(Object.values(world.stored("log.proven").measures).some((item) => item.release === "v2.4.1"), false);
+  const commands = first.node.commands.length;
+  await nextDay(fx);
+  assert.equal(first.node.commands.length, commands + 1);
+  assert.equal(world.state.grant.state, "active");
+  // The next runtime asks the node for the proofs again and hands it the grant.
+  const before = world.requests.length;
+  world.advance(25 * HOUR_MS);
+  await S.start(fx);
+  assert.deepEqual(attestationRequests(world, before).filter((request) => request.proofs === "1").map((request) => request.nodes), [[first.node.id]]);
+  assert.equal(first.node.commands.length, commands + 2);
+});
+
+// ---- The program_min of a release statement ----
+
+/** Writes one object under the prefix of format 3 in the name of node, for the account of the
+ *  world, as a node of format 3 does but for the parts given: keyEvent (the event name of the
+ *  key of a control entry), info (the HPKE info of the sealing), purpose (the purpose of the
+ *  signature). Returns the key. */
+function deviantEntry(world, node, events, given) {
+  const keys = world.account.keys;
+  const user = world.userId;
+  const last = node.last.get(user) || { seq: 0, bodyHash: Buffer.alloc(32) };
+  const seq = last.seq + 1;
+  const sealed = bridge.hpkeSeal(
+    "chacha20poly1305", keys.logPk, bridge.utf8(given.info || "pickle.secure.v3.log-entry"),
+    bridge.utf8([node.id, user, keys.keyId, String(seq)].join("\n")), bridge.utf8(JSON.stringify(events)));
+  const body = bridge.utf8(JSON.stringify({
+    v: 3, node: node.id, user_id: user, key_id: keys.keyId, seq: seq, prev: bridge.b64u(last.bodyHash),
+    time_ms: world.now, kind: "c", count: events.length, enc: bridge.b64u(sealed.enc), ct: bridge.b64u(sealed.ciphertext),
+  }));
+  const sig = bridge.ed25519Sign(node.signSeed, bridge.concat(bridge.utf8(given.purpose || "pickle.secure.v3.log-entry\n"), body));
+  const bodyHash = bridge.sha("sha256", body);
+  const key = "a3/" + user + "/c/" + String(bridge.RTIME_MAX - world.now).padStart(13, "0") + "." + node.id + "." + seq + "." +
+    (given.keyEvent || events[0].t) + "." + keys.keyId + "." + bridge.b64u(bodyHash);
+  node.last.set(user, { seq: seq, bodyHash: bodyHash });
+  world.putObject(bridge.shardBucket(world.serverTarget, user), key, JSON.stringify({ body: bridge.b64u(body), sig: bridge.b64u(sig) }));
+  return key;
+}
+
+test("a release whose statement states a later program is none this program accepts: its nodes receive no grant, what they write in another form marks no node, and the release holding the key marks the log after its day unless a later program is served", async () => {
+  /** A node of release v2.5.0 with release proofs that hold: stated is the program_min of its
+   *  release statement and bound that of its binding (undefined: none). The key of the account
+   *  moves to that node, which writes a control entry whose key names another event than its
+   *  plaintext and one sealed with another HPKE info. */
+  const scene = async (stated, bound, served) => {
+    const fx = partiesFixture({ served: served });
+    const world = fx.world;
+    const later = releaseNode(fx, "v2.5.0", { proofs: stated === undefined ? undefined : { programMin: stated }, node: { programMin: bound } });
+    await S.start(fx);
+    const granted = later.node.grants.has(world.userId);
+    world.advance(2 * 60000);
+    const first = fx.nodes[0];
+    first.record("c", [{
+      t: "grant_transferred_out", time_ms: world.now, to: later.node.id, release: "v2.5.0",
+      pcr0: later.measurement.pcr0, pcr1: later.measurement.pcr1, pcr2: later.measurement.pcr2,
+    }]);
+    if (!granted) later.node.grants.set(world.userId, first.grants.get(world.userId));
+    later.node.record("c", [{ t: "grant_transferred_in", time_ms: world.now, from: first.id, release: "v2.4.0", not_after_ms: world.now + 30 * S.DAY_MS, custody: "enclave" }]);
+    deviantEntry(world, later.node, [{ t: "connection_created", time_ms: world.now, record_id: "r", provider: "github", scope: "" }], { keyEvent: "policy_changed" });
+    deviantEntry(world, later.node, [{ t: "policy_changed", time_ms: world.now }], { info: "pickle.secure.v4.log-entry" });
+    return { fx: fx, world: world, later: later, granted: granted };
+  };
+  const reasons = (world) => world.securityStatuses.filter((item) => item.status === "attention").map((item) => item.reasons.join(","));
+
+  // The statement states the next program, and the backend serves this one.
+  const held = await scene(VERSION + 1, undefined, VERSION);
+  assert.equal(held.granted, false);
+  assert.deepEqual(keptProven(held.world), [{ release: "v2.5.0", proofs: false, program_min: VERSION + 1 }]);
+  assert.ok(held.world.logs.some((line) => line === "release v2.5.0 takes program " + (VERSION + 1) + " or later"));
+  assert.equal(held.world.state.log.newer_release_nodes, 1);
+  // The round that reads what the node wrote: nothing marks the node, and the release that
+  // holds the key is within its day.
+  await S.event(held.fx, "foreground");
+  assert.equal(told(held.world), "pending told pending grant active");
+  assert.equal(held.world.state.log.unverified_nodes, 0);
+  assert.equal(held.world.stored("log.unaccepted")[digestOf(held.later.measurement)].held, true);
+  held.world.advance(12 * HOUR_MS);
+  await S.event(held.fx, "foreground");
+  assert.equal(told(held.world), "pending told pending grant active");
+  // A day after the device first saw the release: the log is marked for the release, and for
+  // nothing else.
+  held.world.advance(13 * HOUR_MS);
+  await S.event(held.fx, "foreground");
+  assert.deepEqual(reasons(held.world), ["unlisted_release"]);
+  assert.equal(held.world.state.log.status, "attention");
+  assert.equal(held.world.state.log.unverified_nodes, 0);
+  // The node was asked for its proofs once, the backend for those of no measurement, and the
+  // node received no grant of this program.
+  assert.equal(attestationRequests(held.world).filter((request) => request.proofs === "1").length, 1);
+  assert.deepEqual(proofRequests(held.world), []);
+  assert.equal(held.later.node.commands.length, 0);
+  assert.deepEqual(refusals(held.world), []);
+
+  // The backend serves the next program: the runtime is stale and states nothing.
+  const stale = await scene(VERSION + 1, undefined, VERSION + 1);
+  for (let day = 0; day < 3; day += 1) await nextDay(stale.fx);
+  assert.equal(stale.world.runtime.program_stale, true);
+  assert.deepEqual(reasons(stale.world), []);
+  assert.equal(stale.later.node.commands.length, 0);
+
+  // The backend serves this program, and the next one within the day: no mark.
+  const served = await scene(VERSION + 1, undefined, VERSION);
+  await S.event(served.fx, "foreground");
+  assert.equal(told(served.world), "pending told pending grant active");
+  served.world.advance(12 * HOUR_MS);
+  served.world.account.servedProgram = VERSION + 1;
+  for (let day = 0; day < 3; day += 1) await nextDay(served.fx);
+  assert.deepEqual(reasons(served.world), []);
+
+  // A statement without program_min, and one that states this program: the node is that of an
+  // accepted release. It receives its grant, and what it wrote in another form marks it.
+  for (const stated of [undefined, VERSION, 0]) {
+    const accepted = await scene(stated, undefined, VERSION);
+    assert.equal(accepted.granted, true, String(stated));
+    await nextDay(accepted.fx);
+    assert.deepEqual(reasons(accepted.world), ["conflicting_signatures"], String(stated));
+  }
+
+  // The binding alone states the next program: the node receives no grant, and it is judged as
+  // the node of an accepted release that it is.
+  const bound = await scene(undefined, VERSION + 1, VERSION);
+  assert.equal(bound.granted, false);
+  assert.deepEqual(keptProven(bound.world), [{ release: "v2.5.0", proofs: true }]);
+  await nextDay(bound.fx);
+  assert.deepEqual(reasons(bound.world), ["conflicting_signatures"]);
+});
+
+// ---- Release proofs that arrive after the entries ----
+
+test("release proofs that reach the device after it read the entries of a node: the entries that node wrote are judged again as those of an accepted node, and a transfer of the key they name to a measurement no list has marks the log", async () => {
+  const fx = partiesFixture();
+  const world = fx.world;
+  await S.start(fx);
+  // A node of release v2.5.0 takes the key from the listed node and hands it on to a node of a
+  // measurement no list has and no proofs show, which writes nothing. The backend hands the
+  // proofs of v2.5.0 out nowhere yet.
+  const middle = releaseNode(fx, "v2.5.0", { held: false, carried: false, node: { offered: false } });
+  const hidden = bridge.randomMeasurement();
+  const receiver = world.addNode({ release: "v2.6.0", measurement: hidden, offered: false });
+  const first = fx.nodes[0];
+  first.record("c", [{
+    t: "grant_transferred_out", time_ms: world.now, to: middle.node.id, release: "v2.5.0",
+    pcr0: middle.measurement.pcr0, pcr1: middle.measurement.pcr1, pcr2: middle.measurement.pcr2,
+  }]);
+  middle.node.record("c", [{ t: "grant_transferred_in", time_ms: world.now, from: first.id, release: "v2.4.0", not_after_ms: world.now + 30 * S.DAY_MS, custody: "enclave" }]);
+  world.advance(60000);
+  middle.node.record("c", [{
+    t: "grant_transferred_out", time_ms: world.now, to: receiver.id, release: "v2.6.0",
+    pcr0: hidden.pcr0, pcr1: hidden.pcr1, pcr2: hidden.pcr2,
+  }]);
+  // The device reads the entries: the release v2.5.0 held the key and is within its day.
+  await nextDay(fx);
+  assert.equal(told(world), "pending told pending grant active");
+  assert.deepEqual(Object.keys(world.stored("log.unaccepted")), [digestOf(middle.measurement)]);
+  // The proofs of v2.5.0 reach the backend. The round that asks next shows the measurement, and
+  // judges what its node wrote before: the transfer to the other measurement.
+  world.releaseProofs.set("v2.5.0", middle.proofs);
+  world.advance(2 * HOUR_MS);
+  await S.event(fx, "foreground");
+  assert.deepEqual(keptProven(world).map((item) => item.release), ["v2.5.0"]);
+  assert.deepEqual(Object.keys(world.stored("log.unaccepted")), [digestOf(hidden)]);
+  assert.equal(world.stored("log.unaccepted")[digestOf(hidden)].held, true);
+  assert.equal(told(world), "pending told pending grant active");
+  // A day later the measurement that took the key marks the log.
+  await nextDay(fx);
+  assert.equal(told(world), "attention told attention:unlisted_release grant active");
 });
