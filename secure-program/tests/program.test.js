@@ -1950,6 +1950,33 @@ test("what the rounds keep for the screen has its limits: of entries that hold m
   assert.equal(groups.filter((group) => group.kind === "unverified").length, 0);
   assert.equal(groups.filter((group) => group.kind === "request").reduce((sum, group) => sum + group.count, 0), 500);
   assert.deepEqual(heldReads(world).keys, [names[0]]);
+
+  // Five entries of 100 events with long strings: fewer events than the device keeps, and more
+  // bytes than it keeps (262,144). The entries kept first leave until the value is within them.
+  const wide = S.fixture(source);
+  await S.start(wide);
+  const long = [];
+  for (let i = 0; i < 5; i += 1) {
+    wide.world.advance(HOUR_MS);
+    const events = [];
+    for (let at = 0; at < 100; at += 1) {
+      events.push(Object.assign(
+        S.providerRequest(wide.world.now + at, "/" + "p".repeat(300) + "/" + i + "-" + at, "POST"), { context: "c".repeat(300) }));
+    }
+    long.push(wide.nodes[0].record("u", events));
+  }
+  const wideNames = long.map((entry) => entry.key);
+  const wideMode = screenOnly(wide, [], (key) => wideNames.indexOf(key) >= 0);
+  await onScreen(wide, wideMode, "read_log", { limit: 500 });
+  wide.world.advance(2 * 60000);
+  await S.event(wide, "foreground");
+  assert.equal(wide.world.state.log.status, "verified");
+  const wideKept = openRecovered(wide);
+  assert.ok(Buffer.byteLength(JSON.stringify(wideKept), "utf8") <= 262144);
+  assert.equal(wideKept.entries.length, 4);
+  assert.ok(wideKept.entries.every((item) => item[0] !== "3:" + wideNames[0].slice(wideNames[0].indexOf("/u/") + 3)));
+  // Every string kept is cut to 160 characters.
+  assert.ok(wideKept.entries.every((item) => item[3].items.every((shown) => shown.target.length === 160 && shown.context.length === 160)));
 });
 
 test("the later pages of the screen are made from the listings its first page read: no listing is asked for, and a page the listings do not reach is asked for from the time it begins below", async () => {

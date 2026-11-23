@@ -227,6 +227,9 @@
   // keeps of one (the entries of the same millisecond as the last one stay on the page).
   const LOG_RECOVERED_PAGES = 4;
   const LOG_RECOVERED_PAGE_EVENTS = 100;
+  // The bytes of the value the rounds keep for the screen, before it is sealed. Entries and
+  // pages of the usual size stay far below it; the limit bounds the work of reading the value.
+  const LOG_RECOVERED_BYTES = 262144;
   // The reads of the bucket of format 1 and format 2 that were held back from the screen and
   // that the device keeps for the rounds to make again: the entries (each the object versions
   // the screen asked for under one seq) and the listings of chains.
@@ -5842,7 +5845,9 @@
    *  LOG_RECOVERED_EVENTS events, the ones kept first leave first (among the ones kept at the
    *  same time, the earliest entry). The entries of a listing page are kept with that page and
    *  leave with it, so they take no place from the former. Beyond LOG_RECOVERED_PAGES listing
-   *  pages, the pages kept first leave. Nothing kept: no value. */
+   *  pages, the pages kept first leave. Beyond LOG_RECOVERED_BYTES of the value, an entry the
+   *  screen asked for or a listing page leaves, whichever was kept first. Nothing kept: no
+   *  value. */
   function saveRecovered(keys, recovered) {
     recovered.pages = recovered.pages.slice(-LOG_RECOVERED_PAGES);
     // The entries kept as parts of listing pages, with each kept page that names them.
@@ -5887,6 +5892,34 @@
         paged.get(page.before) || [],
       ];
     });
+    // The bytes kept have a limit as well (LOG_RECOVERED_BYTES): beyond it, what was kept first
+    // leaves first, an entry the screen asked for or a listing page with its entries. (A
+    // character is three bytes at most in the values the program keeps here: the bytes are
+    // counted only when the characters could reach the limit.)
+    let characters = 64 + JSON.stringify(recovered.found).length;
+    for (const part of entries.concat(pages)) characters += JSON.stringify(part).length + 1;
+    if (3 * characters > LOG_RECOVERED_BYTES) {
+      const size = function (value) { return utf8(JSON.stringify(value)).length + 1; };
+      const entrySizes = entries.map(size);
+      const pageSizes = pages.map(size);
+      let bytes = 64 + size(recovered.found);
+      for (const part of entrySizes.concat(pageSizes)) bytes += part;
+      while (bytes > LOG_RECOVERED_BYTES && entries.length + pages.length > 0) {
+        const entryAt = entries.length > 0 ? entries[0][1] : Infinity;
+        const pageAt = pages.length > 0 ? pages[0][1] : Infinity;
+        if (entryAt <= pageAt) {
+          entries.shift();
+          bytes -= entrySizes.shift();
+        } else {
+          pages.shift();
+          bytes -= pageSizes.shift();
+        }
+      }
+    }
+    if (entries.length === 0 && pages.length === 0 && recovered.found === null) {
+      native.storeSet(STORE_RECOVERED, null);
+      return;
+    }
     const nonce = native.randomBytes(12);
     const ct = native.aeadSeal({
       alg: "chacha20poly1305", key: keys.cacheKey, nonce: nonce, aad: recoveredAad(keys),
