@@ -247,6 +247,21 @@ async fn the_counts_of_health_equal_a_scan_of_the_accounts_after_every_change() 
         async move {
             let health = harness.health().await;
             assert_eq!(counts_of_health(&health), scan(&harness.node), "{step}");
+            // The state of an account lives as long as the node: an account holds memory for
+            // the merge keys, the kept responses and the unconfirmed entries it has, and none
+            // for those it no longer has.
+            for (user_id, account) in harness.node.accounts_after("") {
+                let account = lock(&account);
+                let has = [
+                    account.merge_key_count(),
+                    account.kept_refresh_count(),
+                    account.unconfirmed().len(),
+                ];
+                let (keys, kept, entries) = account.rooms();
+                for (count, room) in has.into_iter().zip([keys, kept, entries]) {
+                    assert!(count > 0 || room == 0, "{step}: {user_id} {has:?}");
+                }
+            }
             health
         }
     };

@@ -100,6 +100,9 @@ pub mod limits {
     /// Most bytes of the plaintext (the JSON array of the events) of one entry of format 2 or
     /// 3 (7.1).
     pub const ENTRY_PLAINTEXT_BYTES: usize = 1_048_576;
+    /// Most events of GET requests without a body that a node remembers for one account at
+    /// one time, so that an identical request shares one of them (7.2).
+    pub const MERGE_KEYS: usize = 8_192;
     /// Most requests in one `forward/batch` call (enclave.md 5.8b).
     pub const FORWARD_BATCH_REQUESTS: usize = 100;
     /// Requests of one `forward/batch` call that are in flight at the same time (enclave.md

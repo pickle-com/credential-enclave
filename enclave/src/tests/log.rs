@@ -17,7 +17,7 @@ use credential_enclave_protocol::secret::Secret;
 use serde_json::{json, Value};
 
 use super::{is_write_of, provider, provider_and_log_store, quiet_provider_and_log_store};
-use crate::state::{lock, Account, Node};
+use crate::state::{lock, Account, Limits, Node};
 use crate::testing::{App, Harness, Provider, Reply, Seen, LOG_HOST};
 
 const MESSAGES: &str = "https://gmail.googleapis.com/gmail/v1/users/me/messages";
@@ -328,6 +328,79 @@ async fn identical_get_requests_within_300_seconds_share_one_event() {
         .await
         .unwrap();
     assert_eq!(theirs.log, json!({"seq": 2, "index": 0, "created": true}));
+}
+
+#[tokio::test]
+async fn a_node_remembers_a_bounded_number_of_get_requests_of_one_account() {
+    let provider = quiet_provider_and_log_store().await;
+    let limits = Limits {
+        merge_keys: 2,
+        ..Limits::default()
+    };
+    let harness = Harness::with(&provider, crate::providers::Definitions::embedded(), limits);
+    harness.use_log_store().await;
+    let app = App::new("user-1", 1);
+    app.grant(&harness).await;
+    let record = google_record(&app);
+    let request = |query: &'static str| {
+        let (harness, app, record) = (&harness, &app, &record);
+        async move {
+            let address = format!("{MESSAGES}?q={query}");
+            harness
+                .forward(get(app, record, &address), b"")
+                .await
+                .unwrap()
+                .log
+        }
+    };
+    let window = |log: &Value| app.logged(&harness, &provider, log)["window_s"].clone();
+
+    // The two requests that fill the bound are remembered: each states the window in which
+    // the same request shares its event.
+    let first = request("a").await;
+    let second = request("b").await;
+    assert_eq!((window(&first), window(&second)), (json!(300), json!(300)));
+    // A third address finds the node at its bound: the request is sent with an event of its
+    // own that the node does not remember and that states no window. The same request again
+    // has an event of its own too.
+    let third = request("c").await;
+    assert_eq!(third["created"], true);
+    assert_eq!(window(&third), Value::Null);
+    let again = request("c").await;
+    assert_eq!(again["created"], true);
+    assert_ne!(again["seq"], third["seq"]);
+    assert_eq!(window(&again), Value::Null);
+    // The requests the node remembers are merged as before, at the bound as well.
+    assert_eq!(
+        request("a").await,
+        json!({"seq": first["seq"], "index": 0, "created": false})
+    );
+    assert_eq!(harness.health().await["state"]["merge_keys"], 2);
+    // Every request was sent.
+    assert_eq!(provider.requests().len(), 5);
+
+    // The bound is counted per account, and the window of the two keys ends it: after 300
+    // seconds the node remembers again.
+    let other = App::new("user-2", 2);
+    other.grant(&harness).await;
+    let log = harness
+        .forward(get(&other, &google_record(&other), MESSAGES), b"")
+        .await
+        .unwrap()
+        .log;
+    assert_eq!(other.logged(&harness, &provider, &log)["window_s"], 300);
+    harness.node.clock.advance(limits::MERGE_WINDOW_S * 1000);
+    let later = request("c").await;
+    assert_eq!(window(&later), json!(300));
+    assert_eq!(
+        request("c").await,
+        json!({"seq": later["seq"], "index": 0, "created": false})
+    );
+    assert_eq!(
+        crate::state::Limits::default().merge_keys,
+        limits::MERGE_KEYS
+    );
+    assert_eq!(limits::MERGE_KEYS, 8_192);
 }
 
 #[tokio::test]

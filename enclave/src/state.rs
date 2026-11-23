@@ -91,6 +91,10 @@ pub struct Limits {
     /// before the first request, and the idle time between two requests of a connection the
     /// caller keeps open (enclave.md section 8). A connection that passes it is closed.
     pub inbound_idle: Duration,
+    /// Events of GET requests without a body the node remembers for one account at one time
+    /// (protocol.md 7.2). A request beyond it has an event of its own that no later request
+    /// shares, so the table of one account has a bounded size whatever the account sends.
+    pub merge_keys: usize,
 }
 
 /// The connections from the backend the node holds open at the same time.
@@ -114,6 +118,7 @@ impl Default for Limits {
             sweep_write_rate: crate::log_store::SWEEP_WRITE_RATE,
             inbound_connections: INBOUND_CONNECTIONS,
             inbound_idle: INBOUND_IDLE,
+            merge_keys: limits::MERGE_KEYS,
         }
     }
 }
@@ -526,10 +531,13 @@ pub struct Account {
     /// for the entries it has.
     unconfirmed: Vec<Unconfirmed>,
     /// Merge key to its event: identical GET requests of `forward` that have no body. Kept
-    /// for 300 seconds.
+    /// for 300 seconds, at most `Limits::merge_keys` at one time. The table holds memory for
+    /// the keys it has: it gives back the memory of the keys it drops
+    /// ([`Account::prune_recent`], [`Account::clear_recent`]).
     recent: HashMap<[u8; 32], Recent>,
     /// The responses of the successful `refresh` calls of the last 3,600 seconds, at most 16.
-    /// A revoke, an expiry and a grant of another key drop them.
+    /// A revoke, an expiry and a grant of another key drop them, and the queue holds no memory
+    /// once the last of them left.
     kept_refreshes: VecDeque<KeptRefresh>,
     /// The counts of the node this account is part of.
     counters: Arc<StateCounters>,
@@ -645,6 +653,11 @@ impl Account {
         let before = self.kept_refreshes.len();
         self.kept_refreshes
             .retain(|kept| now_ms < kept.kept_ms.saturating_add(REFRESH_KEPT_MS));
+        if self.kept_refreshes.is_empty() && before > 0 {
+            // The queue of an account lives as long as the node: without a response it holds
+            // no memory.
+            self.kept_refreshes = VecDeque::new();
+        }
         adjust(
             &self.counters.kept_refreshes,
             before,
@@ -691,10 +704,11 @@ impl Account {
         true
     }
 
-    /// Drops the kept `refresh` responses: the delegation they were made under ended.
+    /// Drops the kept `refresh` responses, and the memory of their queue: the delegation they
+    /// were made under ended.
     pub fn forget_refreshes(&mut self) {
         let before = self.kept_refreshes.len();
-        self.kept_refreshes.clear();
+        self.kept_refreshes = VecDeque::new();
         adjust(&self.counters.kept_refreshes, before, 0);
     }
 
@@ -704,6 +718,13 @@ impl Account {
         self.recent.get(key).cloned()
     }
 
+    /// True when the account remembers fewer than `bound` events of GET requests: the event of
+    /// a further request is remembered, so that an identical request shares it. At the bound a
+    /// request has an event of its own that no later request shares (protocol.md 7.2).
+    pub fn remembers_more(&self, bound: usize) -> bool {
+        self.recent.len() < bound
+    }
+
     /// Remembers the event of a GET request under its merge key for the next 300 seconds.
     pub fn remember_event(&mut self, key: [u8; 32], recent: Recent) {
         let before = self.recent.len();
@@ -711,11 +732,11 @@ impl Account {
         adjust(&self.counters.merge_keys, before, self.recent.len());
     }
 
-    /// Drops every merge key: the grant the events were made under ended, or another one took
-    /// its place.
+    /// Drops every merge key, and the memory of the table with them: the grant the events
+    /// were made under ended, or another one took its place.
     pub fn clear_recent(&mut self) {
         let before = self.recent.len();
-        self.recent.clear();
+        self.recent = HashMap::new();
         adjust(&self.counters.merge_keys, before, 0);
     }
 
@@ -751,6 +772,11 @@ impl Account {
     pub fn store_confirmed(&mut self, seq: u64) {
         let before = self.unconfirmed.len();
         self.unconfirmed.retain(|entry| entry.seq != seq);
+        if self.unconfirmed.is_empty() && before > 0 {
+            // The list of an account lives as long as the node: without an entry it holds no
+            // memory.
+            self.unconfirmed = Vec::new();
+        }
         self.unconfirmed_changed(before);
     }
 
@@ -798,15 +824,28 @@ impl Account {
         !self.open.events.is_empty()
     }
 
-    /// Drops the merge keys whose window of 300 seconds passed (protocol.md 7.2). A call that
-    /// creates events drops them on its way, and the sweep of the node drops them for an
-    /// account that makes no call, so an idle account holds the keys of its last 300 seconds at
-    /// most.
+    /// Drops the merge keys whose window of 300 seconds passed (protocol.md 7.2), and the
+    /// memory the table held for them. A call that creates events drops them on its way, and
+    /// the sweep of the node drops them for an account that makes no call, so an idle account
+    /// holds the keys of its last 300 seconds at most, and no memory of a table once they are
+    /// gone.
+    ///
+    /// The state of an account lives as long as the node, and a table keeps the room of the
+    /// largest number of keys it ever held unless it is asked to give it back. So when keys
+    /// leave, a table without a key is replaced by one without memory, and a table with more
+    /// room than twice its keys need shrinks to that room: the room that is left keeps the
+    /// keys of an account that come and go around one number from resizing the table at every
+    /// change.
     pub fn prune_recent(&mut self, now_ms: u64) {
         let window_ms = limits::MERGE_WINDOW_S * 1000;
         let before = self.recent.len();
         self.recent
             .retain(|_, recent| now_ms < recent.entry_ms.saturating_add(window_ms));
+        match self.recent.len() {
+            keys if keys == before => {}
+            0 => self.recent = HashMap::new(),
+            keys => self.recent.shrink_to(2 * keys),
+        }
         adjust(&self.counters.merge_keys, before, self.recent.len());
     }
 
@@ -874,6 +913,17 @@ impl Account {
     #[cfg(test)]
     pub fn merge_key_count(&self) -> usize {
         self.recent.len()
+    }
+
+    /// The numbers of merge keys, of kept `refresh` responses and of unconfirmed entries the
+    /// account holds memory for, for the tests of that memory.
+    #[cfg(test)]
+    pub fn rooms(&self) -> (usize, usize, usize) {
+        (
+            self.recent.capacity(),
+            self.kept_refreshes.capacity(),
+            self.unconfirmed.capacity(),
+        )
     }
 }
 
@@ -1418,6 +1468,12 @@ impl Node {
     /// A request that matches an event of the open batch or of an entry created less than
     /// 300 seconds before shares that event (protocol.md 7.2), also inside the batch. Returns
     /// where every event is and whether this call created it.
+    ///
+    /// The node remembers at most `Limits::merge_keys` events of one account at one time. A
+    /// GET request without a body that finds no event to share while its account has that
+    /// many has an event of its own that the node does not remember: no later request shares
+    /// it, and the event carries no `window_s`, the key that says that the same request may
+    /// have happened again in the 300 seconds after it.
     pub fn create_events(
         &self,
         account: &mut Account,
@@ -1429,10 +1485,16 @@ impl Node {
     ) -> Result<Vec<(EventPlace, bool)>, ApiError> {
         account.prune_recent(now_ms);
         let mut places = Vec::with_capacity(events.len());
-        for (merge_key, event) in events {
+        for (merge_key, mut event) in events {
             if let Some(shared) = merge_key.and_then(|key| account.shared_event(&key)) {
                 places.push((shared.target, false));
                 continue;
+            }
+            let remembered = merge_key.filter(|_| account.remembers_more(self.limits.merge_keys));
+            if merge_key.is_some() && remembered.is_none() {
+                if let Some(keys) = event.as_object_mut() {
+                    keys.shift_remove("window_s");
+                }
             }
             let place = self.create_event(
                 account,
@@ -1443,7 +1505,7 @@ impl Node {
                 EntryKind::Use,
                 event,
             )?;
-            if let Some(key) = merge_key {
+            if let Some(key) = remembered {
                 account.remember_event(
                     key,
                     Recent {
@@ -2194,6 +2256,70 @@ mod tests {
         account.prune_recent(200_000 + limits::MERGE_WINDOW_S * 1000);
         assert!(account.shared_event(&[2u8; 32]).is_none());
         assert_eq!(account.merge_key_count(), 0);
+        assert_eq!(counters.merge_keys.load(Ordering::Relaxed), 0);
+    }
+
+    /// Remembers the merge key number `index`, of an event created at `entry_ms`.
+    fn remember(account: &mut Account, index: u32, entry_ms: u64) -> [u8; 32] {
+        let mut key = [0u8; 32];
+        key[..4].copy_from_slice(&index.to_le_bytes());
+        account.remember_event(
+            key,
+            Recent {
+                entry_ms,
+                target: EventPlace::Entry { seq: 1, index },
+            },
+        );
+        key
+    }
+
+    #[test]
+    fn the_merge_key_table_gives_back_the_memory_of_the_keys_it_drops() {
+        let window_ms = limits::MERGE_WINDOW_S * 1000;
+        let counters = Arc::new(StateCounters::default());
+        let mut account = Account::new(counters.clone());
+        let room = |account: &Account| account.rooms().0;
+        // An account without a merge key holds no table.
+        assert_eq!(room(&account), 0);
+
+        // 4,096 keys of one moment, and eight keys one second later.
+        for index in 0..4_096 {
+            remember(&mut account, index, 1_000);
+        }
+        let late: Vec<[u8; 32]> = (4_096..4_104)
+            .map(|index| remember(&mut account, index, 2_000))
+            .collect();
+        let grown = room(&account);
+        assert!(grown >= 4_104, "{grown}");
+        assert!(account.remembers_more(4_105) && !account.remembers_more(4_104));
+        // A look that drops no key moves no memory.
+        account.prune_recent(1_000 + window_ms - 1);
+        assert_eq!((account.merge_key_count(), room(&account)), (4_104, grown));
+
+        // The window of the 4,096 keys passed: the table keeps the eight others, and shrinks
+        // to room for twice their number and for little more. Before this rule the table kept
+        // the room of the 4,104 keys for as long as the node lived.
+        account.prune_recent(1_000 + window_ms);
+        assert_eq!(account.merge_key_count(), 8);
+        let kept = room(&account);
+        assert!((16..=64).contains(&kept), "{kept}");
+        for key in &late {
+            assert!(account.shared_event(key).is_some());
+        }
+        assert_eq!(counters.merge_keys.load(Ordering::Relaxed), 8);
+
+        // The window of the last keys passed: the table holds no memory.
+        account.prune_recent(2_000 + window_ms);
+        assert_eq!((account.merge_key_count(), room(&account)), (0, 0));
+        assert_eq!(counters.merge_keys.load(Ordering::Relaxed), 0);
+
+        // The keys of a grant that ended go with their memory, before their window passed.
+        for index in 0..4_096 {
+            remember(&mut account, index, 3_000);
+        }
+        assert!(room(&account) >= 4_096);
+        account.clear_recent();
+        assert_eq!((account.merge_key_count(), room(&account)), (0, 0));
         assert_eq!(counters.merge_keys.load(Ordering::Relaxed), 0);
     }
 
