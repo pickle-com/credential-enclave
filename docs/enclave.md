@@ -526,22 +526,21 @@ POST /v1/config {"role":"forward"}
   `abandoned` (the call found no free place at its time limit and was ended there).
   `late_inflight` is the number of late calls in progress at this moment.
 - `load` of `health`: the load of the node at the moment of the call. `provider_inflight` is the
-  number of provider requests in flight (the taken places of the node-wide bound of section 8),
-  and `forward_calls` the number of calls that hold one of the places of the bound of concurrent
-  `forward` and `forward/batch` calls (`forward`, `forward/batch` and the mail calls take one
-  each). `cpu_user_ms`, `cpu_system_ms` and `cpu_idle_ms` are the CPU time of the kernel the node
-  runs in, over all its processors, since that kernel booted, in milliseconds: the first line of
-  `/proc/stat` (`user` and `nice`; `system`, `irq`, `softirq` and `steal`; `idle` and `iowait`),
-  at the clock ticks per second that the auxiliary vector of the node process states
-  (`AT_CLKTCK` of `/proc/self/auxv`). `memory_total_bytes` and `memory_available_bytes` are
-  `MemTotal` and `MemAvailable` of `/proc/meminfo`, in bytes. The node reads the three files at
-  every call. Each of the five values of the kernel is null when the kernel exposes no procfs
-  value (a kernel without procfs, or a development machine that is not Linux); the two counts
-  are always numbers. `inbound_connections` is the number of connections from the backend the
-  node holds open at this moment, `inbound_refused` the number of connections it closed at
-  accept because its bound of open connections was reached, since it started, and
-  `inbound_limit` that bound: the node computed it at its start from the memory of its kernel
-  (section 8).
+  number of provider requests in flight (the taken places of the node-wide bound of section 8), and
+  `forward_calls` the number of calls that hold one of the places of the bound of concurrent
+  `forward` and `forward/batch` calls (`forward`, `forward/batch`, the mail calls and, on a node of
+  the forward role, `vault/send` take one each). `cpu_user_ms`, `cpu_system_ms` and `cpu_idle_ms`
+  are the CPU time of the kernel the node runs in, over all its processors, since that kernel
+  booted, in milliseconds: the first line of `/proc/stat` (`user` and `nice`; `system`, `irq`,
+  `softirq` and `steal`; `idle` and `iowait`), at the clock ticks per second that the auxiliary
+  vector of the node process states (`AT_CLKTCK` of `/proc/self/auxv`). `memory_total_bytes` and
+  `memory_available_bytes` are `MemTotal` and `MemAvailable` of `/proc/meminfo`, in bytes. The node
+  reads the three files at every call. Each of the five values of the kernel is null when the kernel
+  exposes no procfs value (a kernel without procfs, or a development machine that is not Linux); the
+  two counts are always numbers. `inbound_connections` is the number of connections from the backend
+  the node holds open at this moment, `inbound_refused` the number of connections it closed at
+  accept because its bound of open connections was reached, since it started, and `inbound_limit`
+  that bound: the node computed it at its start from the memory of its kernel (section 8).
   `descriptors_open` is the number of open file descriptors of the node process (the entries of
   `/proc/self/fd`, null when the kernel exposes none) and `descriptors_limit` the soft limit of
   open file descriptors in force (null when the platform has no such limit): the limit the

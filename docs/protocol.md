@@ -633,16 +633,19 @@ body_hash = SHA-256(body)
   the requests, all into the open batch of the account in one step. The requests of one batch may
   end up in two entries when the open batch reaches a cap between them; the batch waits for the
   confirmation of every entry that holds one of its events.
-- The entry and the act. `forward`, `forward/batch`, `refresh`, `revoke-token`, `release`, the
-  command grant that puts a user key into the node, the command revoke, and `peer/export` to a node
-  of a later release create their event before the act: the node creates the event, and the entry
-  that holds it, and after that it calls the provider, hands the value out, changes the delegation
-  or seals the user key to the peer. `peer/import` of a transfer from an earlier release creates its
-  entry before it puts a grant in place, and writes it after (7.6). `oauth/complete` receives the
-  token response of the provider first and creates the entry `connection_created` before the record
-  leaves the node: no part of an accepted token response leaves the node before that entry exists,
-  and when a step after the response fails, the tokens are dropped inside the node and nothing of
-  them leaves. `oauth/merge` calls no provider and creates no event.
+- The entry and the act. `forward`, `forward/batch`, `refresh`, `revoke-token`, `release`,
+  `vault/handoff`, the command grant that puts a user key into the node, the command revoke, and
+  `peer/export` to a node of a later release create their event before the act: the node creates the
+  event, and the entry that holds it, and after that it calls the provider, hands the value out,
+  seals the value of a vault secret for its one request (10.5), changes the delegation or seals the
+  user key to the peer. `peer/import` of a transfer from an earlier release creates its entry before
+  it puts a grant in place, and writes it after (7.6). `oauth/complete` receives the token response
+  of the provider first and creates the entry `connection_created` before the record leaves the
+  node: no part of an accepted token response leaves the node before that entry exists, and when a
+  step after the response fails, the tokens are dropped inside the node and nothing of them leaves.
+  `vault/store` makes a record of the value its caller gave and creates the entry
+  `connection_created` of that record before the record leaves the node. `oauth/merge` calls no
+  provider and creates no event.
 - The entry and the log store. A node that has a log store writes the entry to it between the
   creation of the entry and the act, and acts only after the store confirmed the entry. 7.6 names
   the act of every call and the two calls that do not wait.
@@ -1108,7 +1111,9 @@ entry as a pending entry (a call that waited writes it once more, 7.1):
 | `forward/batch` | `provider_request`, one per request | The requests to the provider, all of them, after every entry that holds one of their events is confirmed | `log_store_unavailable` for the whole call. No request is sent |
 | `refresh` | `credential_refreshed` | The call of the token address | `log_store_unavailable`. The token address is not called |
 | `revoke-token` | `connection_removed` | The call of the revocation address | `log_store_unavailable`. The revocation address is not called |
-| `release` | `secret_released`, `totp_issued` | The value in the response | `log_store_unavailable`. The value does not leave |
+| `release` | `secret_released`, `totp_issued` | The value in the response, as it is or under the seal of the key the call named (section 6). The node reads the plaintext of the record for the value only after the confirmation: a plaintext that does not hold the value, and a seed that is not base32, end the call with `record_invalid` then, and the entry stays (enclave.md 5.9) | `log_store_unavailable`. The value does not leave, and the plaintext is not read for it |
+| `vault/store` | `connection_created` | The record in the response (enclave.md 5.9b) | `log_store_unavailable`. The record does not leave and is dropped inside the node, the value with it |
+| `vault/handoff` | `provider_request` | The envelope in the response: the node reads the plaintext of the record for the value and seals it, with the one request it is for, to the node of the forward role only after the confirmation (10.5). A value no envelope carries ends the call with `record_invalid` then, and the entry stays (enclave.md 5.9c) | `log_store_unavailable`. No envelope leaves, so no request is sent |
 | `oauth/complete` | `connection_created` | The record in the response (the code is exchanged before the entry is created, 7.1) | `log_store_unavailable`. The record does not leave and the tokens are dropped inside the node: the connection is started again |
 | The command grant that puts a user key into the node (step 14 of 5.3) | `grant_accepted` | The user key is put into the memory of the node | The signed reply has `ok` false and the code `log_store_unavailable`. The node holds no key |
 | The command grant that renews the grant in force (step 13a of 5.3) | None | None: the node holds the same key before and after, and the entry `grant_accepted` of that key is in the store | |
@@ -1131,14 +1136,15 @@ entry as a pending entry (a call that waited writes it once more, 7.1):
   confirmed and nothing else.
 - What a missing object means. An object version of the log store cannot be deleted before its
   retention ends. So for an entry that is not in the store, the act that entry describes did not
-  take place: the node did not call the provider, did not hand the value out, did not take the user
-  key, did not hand the grant to a later release. This holds for an entry the store never confirmed,
-  whose `seq` no key of the store carries, and for whatever a node held in memory when it ended. The
-  two exceptions are the rows without an act that waits: a revoke erased the key, and an import from
-  an earlier release put the grant in place (the giving node's `grant_transferred_out` of that grant
-  is in the store). The store can hold more entries than there were acts, and not fewer: an entry
-  whose act failed afterwards or never started (the provider refused, the call ended, the store
-  confirmed and the answer was lost) is in the store like any other.
+  take place: the node did not call the provider, did not hand the value out, did not hand the
+  record of a stored value out, did not seal the value of a vault secret for a request, did not take
+  the user key, did not hand the grant to a later release. This holds for an entry the store never
+  confirmed, whose `seq` no key of the store carries, and for whatever a node held in memory when it
+  ended. The two exceptions are the rows without an act that waits: a revoke erased the key, and an
+  import from an earlier release put the grant in place (the giving node's `grant_transferred_out`
+  of that grant is in the store). The store can hold more entries than there were acts, and not
+  fewer: an entry whose act failed afterwards or never started (the provider refused, the call
+  ended, the store confirmed and the answer was lost) is in the store like any other.
 - A node of platform `nitro` does not act without a log store: while it has no log store in its
   configuration, no credentials within their time, or no node document in the store that outlives an
   entry written now (7.7), it refuses every act of the table with `log_store_unavailable`, before it
