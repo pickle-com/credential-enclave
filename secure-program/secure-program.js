@@ -3781,6 +3781,8 @@
     // of the entries that arrive later.
     const named = new Set();
     const requests = [];
+    // The keys a request of this read named.
+    const requested = new Set();
     const ask = function (judged) {
       let wanted = [];
       for (const item of items) {
@@ -3800,6 +3802,7 @@
       for (let at = 0; at < wanted.length && budget.bodies > 0; at += LOG_BODY_KEYS) {
         budget.bodies -= 1;
         const batch = wanted.slice(at, at + LOG_BODY_KEYS);
+        for (const key of batch) requested.add(key);
         requests.push({ keys: batch, sent: settled(readBodies(turn, batch)) });
       }
     };
@@ -3847,7 +3850,8 @@
     // The verified entries by node and seq: two of them with two bodies contradict each other.
     const signedBySeq = new Map();
     const transfers = [];
-    // The items the log screen asked for that no answer reached.
+    // The items the log screen asked for that a request named and no answer reached (a key this
+    // read had no request left for is asked for by the next read of the screen).
     const unanswered = [];
     for (const item of items) {
       const parsed = item.parsed;
@@ -3891,7 +3895,7 @@
         run.cut = true;
         if (!failed.has(parsed.key)) {
           run.over = true;
-          if (shown.has(parsed.key)) unanswered.push(parsed);
+          if (shown.has(parsed.key) && requested.has(parsed.key)) unanswered.push(parsed);
         }
         continue;
       }
