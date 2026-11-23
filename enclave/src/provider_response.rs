@@ -768,7 +768,15 @@ impl Readings {
                     .unwrap_or_default(),
             };
             if !reading.begun {
-                if !escapes.begin_in(source, end) {
+                // A layer above the first one of its kind reads the bytes the layer below it
+                // reads, while that layer is not searched for itself: it has just found that
+                // these bytes begin no escape of their kind.
+                let asked = source_of != from
+                    && before
+                        .get(from)
+                        .and_then(|below| below.origin)
+                        .is_some_and(|(_, below)| below == escapes);
+                if asked || !escapes.begin_in(source, end) {
                     self.same_as.push(source_of);
                     continue;
                 }
