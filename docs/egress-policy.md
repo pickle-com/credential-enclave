@@ -63,8 +63,12 @@ log store and is part of none, and neither appears in a response.
 | C2 | A provider | A TLS connection that ends inside the node. Its destination is an address of the provider definitions or one of the fixed Naver mail endpoints. A connection to a provider carries the requests of one account: the node keeps at most 8 idle connections per (account, host) for at most 30 seconds, and sends the requests of a forward batch at most 6 at a time. The operator domain sees TLS records only |
 | C3 | The console | Exists in a debug-mode enclave only (its attestation has all-zero PCRs and an app refuses it). In any mode the node writes fixed strings of its source only |
 | C4 | The log store | A TLS connection that ends inside the node, to `{bucket}.s3.{region}.amazonaws.com` of the log store of the node (a node of the local platform may write to the endpoint of its configuration instead). It carries log entries (class C below), the key of each (`user_id` E, the node identifier, `seq`, `time_ms`, the kind, the count, the hash of the body and the chain hash P, `key_id` E) and the credentials of the operator for the store. The node keeps at most 32 idle connections to the store. The operator domain sees TLS records only, and it can read the bucket |
+| C5 | The site of a vault secret | A TLS connection that ends inside a node of the forward role (protocol.md 4.1), to port 443 of the host the envelope of one use of a vault secret names (protocol.md 10.5). It carries the one request of that use, with the value at its slot, and ends with the response to it. The operator domain sees TLS records only |
 
-There is no other channel: the node writes no file and opens no other socket.
+There is no other channel: the node writes no file and opens no other socket. A node of the
+delegation role has the channels C1 to C4, and a node of the forward role C1, C3 and C5: the
+node that holds user keys opens no connection to a host an account chose, and the node that
+opens such a connection holds no user key and no record.
 
 ### 2.3 What a response can carry
 
@@ -124,17 +128,19 @@ functions that call it are of three kinds.
 | In-node | The bytes are used inside the node. The result is a secret again, a public key, a signature, a ciphertext or the outcome of a check |
 | Declassify | The result leaves in the clear and is one of the values section 4 lists |
 
-The five sinks:
+The sinks:
 
 | Sink | What it does | Condition, and what enforces it |
 | --- | --- | --- |
 | K1 `record::seal` | Encrypts a plaintext with AEAD under a record key derived from the user key | The AAD binds `id`, `user_id`, `key_id`, `custody`, `kind` and `provider`. The one caller is `OauthPlaintext::seal`: the plaintext is a token response the node received, an opened record, or the merge rules applied to those (E6) |
 | K2 `seal_transfer` | Seals user keys with HPKE to the sealing public key of a verified peer node | The peer is a `Peer`, a type only `verify_peer` creates. A verified peer is one of two nodes. The first: its attestation document verifies up to the AWS Nitro root, it is not a debug-mode enclave, and PCR0, PCR1 and PCR2 equal those of this node. A node of the same measurement is the same program and keeps the same rules. The second, for a call with an endorsement (protocol.md 10.3): its attestation document verifies in the same way, it is not a debug-mode enclave, PCR0, PCR1 and PCR2 equal those of a release statement, and its binding names the release of that statement. The statement names a release later than the release of this node, the release key inside the binary signed it, and the transparency log whose key is inside the binary recorded that signature in an entry whose signed entry timestamp verifies. Such a node is another program: the rules it keeps are those of its own source. In both cases the binding of the peer names the log store of this node. A node of the `local` platform accepts no peer under an endorsement and holds user keys of custody `operator` only |
 | K3 `Egress::send_to_provider` | Writes a request with a credential, a token request or a revocation request to a TLS connection | The request is addressed to a `Destination`, a type only the provider definitions create: an address that passed the address check of `forward`, the token address, or the revocation address. The certificate is verified against the WebPKI roots compiled into the binary. The node follows no redirect |
-| K4 `Selected::hand_out` | Puts one value of a vault record into the response of `release` | The record is of a vault kind and the field is one of that kind (E6). The function takes the log entry of the release as an argument: the entry is on the chain before the value leaves |
+| K4 `Selected::hand_out` | Puts one value of a vault record into the response of `release`, as it is or under the seal of a key the caller named | The record is of a vault kind and the field is one of that kind (E6). A record of kind `vault_secret` lists the slot `field`, and its sites hold the host of the origin of the call or a host above it. The function takes the log entry of the release as an argument: the entry is on the chain before the value leaves. A sealed value is a released value: the caller chose the key |
 | K5 `send_to_log_store` | Writes one log entry to the log store over a TLS connection, in a request signed with the credentials of the operator | What it takes is a signed entry (`Signed`: the body and the signature of the node, whose content is sealed to the log public key of the account), the parts of its key, and the credentials of the log store. No argument of it is a type that holds a user key, the plaintext of a record or a token: the secrets it reads are the two the operator domain gave. The destination is the log store of the operator configuration, a bucket name and a region name of a fixed form under `amazonaws.com`, and the certificate is verified against the WebPKI roots compiled into the binary |
 | K6 `AppPassword::imap` | Sends account name and application password through IMAP TLS | Only imap.naver.com:993, verified roots and trusted node clock; after grant and log-store confirmation |
 | K7 `AppPassword::smtp` | Sends account name and application password through SMTP TLS | Only smtp.naver.com:465 with the same verification and logging; one transaction, no retry after DATA |
+| K8 `seal_secret_use` | Seals the value of a record of kind `vault_secret`, with the one request it is for, with HPKE to the sealing public key of a node of the forward role | The receiving node is a `ForwardNode`, a type only the verification of an attestation response creates: a node of the platform and the measurement of this node whose binding names the role `forward`. The request is one the reach of the record admits (its host is one of the sites, its slot one of the slots), and the function takes the log entry of the use as an argument: the event `provider_request` is on the chain, and the log store confirmed it, before the value is sealed |
+| K9 `Egress::send_to_bound_host` | On a node of the forward role, sends the one request of an opened envelope, with the value written into it (`BoundRequest::build`), over a TLS connection | The request is a `BoundRequest`, a type only `BoundRequest::build` creates. It reads the host and the method from a `SecretUse`, a type only the opening of an envelope creates: an envelope sealed to this node and signed by the node it names, within its 30 seconds, whose number was not used before. The address is that of the envelope, the body the body the envelope names by its length and its hash, and the value stands at the slot of the envelope and nowhere else (protocol.md 10.5). The certificate is verified for that host against the WebPKI roots compiled into the binary, the connection carries this one request, and the node follows no redirect |
 
 Fixed by: `scripts/secret-access.sh --check`, which the `check` and `release` workflows run.
 It lists every function of the node source that names `expose_secret` (for
@@ -220,9 +226,9 @@ as an integer, 0 for a transport failure) and `provider_error` (rule E5).
 | `Content-Encoding` of the response | Present and not `identity`: `response_withheld`. The node does not hand on a body it cannot search. The header is read as it arrived, before the node leaves out the headers that the `Connection` header of the response lists: a response that lists `Content-Encoding` there is withheld like any other coded response. A response under an instance manipulation (RFC 3229: the status 226, or a header `IM`) is `response_withheld` as well |
 | `Transfer-Encoding` of the response | A coding other than `chunked`: `response_withheld`. The node sends no `TE` header, so `chunked` is the one transfer coding it removes. Under another one (`gzip, chunked`) the body would leave still coded, without the header that says so |
 | Response headers | The hop-by-hop headers, `Set-Cookie` and `Set-Cookie2` are left out. The node drops the `Cookie` of every request, so no cookie is in use, and a cookie handed to the caller would be an access that no log entry records |
-| The reflection check | A header name, a header value and the body are each read as received and with their percent escapes decoded, up to three times for a value that was encoded more than once. When one of these readings holds the injected credential (the token without the prefix of the definition) in one of these forms, the call fails with `response_withheld`: as it is, base64 or base64url (each of the three byte alignments, without padding), hexadecimal (lower or upper case). Decoding the escapes finds the credential under every percent-encoding: whichever bytes an encoder escapes and whichever case its digits have. A form shorter than 8 bytes is not searched for. The check overwrites the headers and the body it withholds with zeros before it drops them. It runs off the threads that serve the calls, and it makes at most one copy of what it reads |
+| The reflection check | A header name, a header value and the body are each read in six readings: as received, with their percent escapes decoded once, twice and three times (for a value that was encoded more than once), and with their JSON string escapes decoded once and twice (for a JSON text inside a JSON string). When one of these readings holds the injected credential (the token without the prefix of the definition) in one of these forms, the call fails with `response_withheld`: as it is, base64 or base64url (each of the three byte alignments, without padding), hexadecimal (lower or upper case). Decoding the escapes finds the credential under every percent-encoding and under every way a writer of JSON escapes it: whichever bytes an encoder escapes and whichever case its digits have. A header whose bytes are not UTF-8 is handed on with one character for each byte, and it is searched as those bytes as well. A form shorter than 8 bytes is not searched for. The check overwrites the headers and the body it withholds with zeros before it drops them. It runs off the threads that serve the calls, and it makes at most one copy of what it reads |
 | Redirects | Not followed. A 3xx response is returned as it is |
-| A response that is handed on as a stream | A call that asks for it gets the body of the provider in parts while it arrives (enclave.md 5.8 step 11). The head passes the rows above before the status 200 leaves: a coded body, and a header name or a header value that holds the credential, is `response_withheld`, and no stream begins. The body passes the reflection check in parts (`StreamCheck` of `enclave/src/provider_response.rs`): the check holds back as many bytes as the longest form of the credential can take under three layers of percent escapes (27 bytes for each of its bytes) and 32 more, and hands on the bytes in front of them once a search of everything it holds found no form. A form that ends in a byte still to come begins inside the bytes held back, so no byte of a form the check finds has left; and every form lies whole in the bytes of one search, so the verdict on a body is the verdict of the check of a whole response on the same bytes. A body that holds the credential is cut in front of it, and the end record of the stream says `response_withheld` |
+| A response that is handed on as a stream | A call that asks for it gets the body of the provider in parts while it arrives (enclave.md 5.8 step 11). The head passes the rows above before the status 200 leaves: a coded body, and a header name or a header value that holds the credential, is `response_withheld`, and no stream begins. The body passes the reflection check in parts (`StreamCheck` of `enclave/src/provider_response.rs`). Each of the six readings is decoded part by part from the first byte of the body (an escape that a part begins and does not end waits for the bytes that follow) and searched together with its last bytes from the part before, so the verdict on a body is the verdict of the check of a whole response on the same bytes, whatever its parts are. The check holds back the last bytes it received, as many as one byte more than the longest form of the credential can take in a reading (36 bytes for each of them: a byte takes at most 36 bytes under two layers of JSON string escapes and 27 under three layers of percent escapes), and hands on the bytes in front of them once a search found no form. A form that ends in a byte still to come begins inside the bytes held back, so no byte of a form the check finds has left, and neither has the byte in front of it. How far the handed on bytes lag depends on the length of the credential and on nothing else: no byte leaves sooner or later because it resembles the credential. A body that holds the credential is cut in front of it, and the end record of the stream says `response_withheld`. The bytes held back leave at the end of the body as its sender ended it: of a body that is cut (a failed connection, the time limit of the call) they do not leave |
 
 `response_withheld` is a failure after the entry `provider_request` is on the chain: the
 request went to the provider. Of a frame, no part of the response leaves. Of a stream, the
@@ -230,14 +236,31 @@ head and the bytes of the body in front of the bytes held back have left when th
 finds the credential: bytes of the provider (class R) that passed the check, and no byte of
 a form of the credential.
 
+**The response of `vault/send`.** The request carried the value of a vault secret to a host an
+account chose, and the response is R. The rows of the table above hold for it with the value in
+the place of the injected credential, and with these differences:
+
+| Item | Rule |
+| --- | --- |
+| The request | The node of the forward role sends the request of the envelope and no other one (protocol.md 10.5, sink K9): it drops and refuses the headers of that section, asks for `identity` and for the whole of a response, and refuses an `Accept` header that names another character encoding than UTF-8 |
+| The response | Always a stream. The head passes the checks of a stream before the status 200 leaves, and the body passes the reflection check in parts. The value is 8 bytes or longer (a shorter one is sealed by no node), so every form of it is searched for |
+| The memory of the search | A value has up to 12,000 bytes, and the search holds back 36 bytes for each byte of its longest form. The call holds the share of the body budget of the node that the search can hold, from before its request leaves to the end of the stream |
+| A second request | None. One envelope is one request, and a response that was cut or withheld is followed by no other request of the node: whoever asks again leaves another `provider_request` on the log of the account |
+
+What the search does not find is a value in a form it does not know: a host that sends the value
+back encrypted, compressed, split, or under an encoding other than the ones above is not held
+back. The entry of the use names the method, the host, the path and the query of every request
+that carried the value.
+
 **The response of the revocation address.** What leaves is `revoked`: one bit, whether the
 status was 2xx.
 
 Fixed by: the tests of `enclave/src/oauth.rs` and `enclave/src/provider_response.rs` (for a
 stream: bodies in parts of any length, cut in front of every form at every place, with the
-verdict of the check of a whole response), the tests of the stream form in
-`enclave/src/tests/forward.rs`, the definition tests of `enclave/src/providers/mod.rs`, and
-the canary test.
+verdict of the check of a whole response, and with the credential behind a run of backslashes),
+the tests of the stream form in `enclave/src/tests/forward.rs`, the tests of
+`enclave/src/tests/vault_send.rs` and `enclave/src/bound.rs`, the definition tests of
+`enclave/src/providers/mod.rs`, and the canary test.
 
 ### E5. Diagnostics are a closed vocabulary
 
@@ -280,14 +303,26 @@ and the tests of `enclave/src/oauth.rs`.
 | `oauth` | The node: the response of the token address that `oauth/complete` received, and after that the results of `refresh` and `oauth/merge` | enclave-use | `forward`, `refresh`, `revoke-token`, `oauth/merge` |
 | `oauth_imported` | The device of the account: it encrypted a token the operator domain held before it used this node. The plaintext has the form of kind `oauth` | enclave-use. The operator domain knew this token once: the record does not say that its token never left a node. A new connection of the account gives a record of kind `oauth` | `forward`, `refresh`, `revoke-token` |
 | `app_password` | The device encrypts a NAVER application password and account name | enclave-use; authenticated identity is declassified after verification | `mail/verify`, `mail/read`, `mail/submit` |
-| `vault_password` | The device: the app encrypts what the user entered | release | `release`, field `password` |
+| `vault_password` | The device: the app encrypts what the user entered. Or a node, of a value the operator domain gave it (`vault/store`): the plaintext of such a record says `source` `operator`, and the plaintext of a device has no such key | release | `release`, field `password` |
 | `vault_totp` | The device | enclave-use: the seed stays, the code leaves as V | `release`, field `totp` |
 | `vault_card` | The device | release | `release`, fields `card_number`, `card_cvc` |
+| `vault_secret` | The device, of a value its user entered (`source` `device`), or a node, of a value the operator domain gave it (`vault/store`, `source` `operator`). The plaintext names the hosts and the slots the value may go to | By its slots. The slot `field`: release. Slots of a request: enclave-use, the value goes into a request of a node of the forward role and no call hands it out | `release`, field `value`, for a record with the slot `field`. `vault/handoff` for a record with slots of a request |
 
-- No call takes a plaintext and makes a record of it. The node creates a record of kind `oauth`
-  from a token response it received itself, and writes an existing record of kind `oauth` or
-  `oauth_imported` again after a refresh, under the kind it had. `oauth/merge` takes records of
-  kind `oauth` only: the refresh token of an imported record is not moved into an issued one.
+- No call takes a plaintext and makes a token record of it. The node creates a record of kind
+  `oauth` from a token response it received itself, and writes an existing record of kind `oauth`
+  or `oauth_imported` again after a refresh, under the kind it had. `oauth/merge` takes records
+  of kind `oauth` only: the refresh token of an imported record is not moved into an issued one.
+- `vault/store` is the one call that takes a value of its caller and makes a record of it: a
+  record of kind `vault_secret` or `vault_password`. The node writes the plaintext itself, with
+  the source `operator`, under an `id` and a nonce it draws itself, and after the control event
+  `connection_created` of that record is on the chain and the log store confirmed it. So a value
+  the operator domain knew does not pass for a value a user entered on a device, the call
+  overwrites no record that exists, and every record it made has an entry.
+- The reach of a record of kind `vault_secret` (its sites and its slots) is part of its plaintext.
+  Whoever cannot encrypt under the user key cannot widen it, and the two calls that use the value
+  hold their caller to it: `release` to the slot `field` and to an origin of the sites,
+  `vault/handoff` to a host of the sites and a slot of the slots. No record lists `field` beside
+  a slot of a request, so a value that goes into requests is handed out by no call.
 - The kind is an enum (`Kind` in `protocol/src/record.rs`) and part of the AAD of a record, so
   a record that opens has the kind it names. A kind the release does not know is `not_allowed`.
 - A record is opened by the function of its call family, and the two return different types.
@@ -295,7 +330,8 @@ and the tests of `enclave/src/oauth.rs`.
   takes the vault kinds and refuses a token kind. So the code of `release` cannot hold the
   plaintext of a token, and the code of `forward` cannot hold a vault plaintext. The type of a
   vault value offers one way out, `hand_out`, and for a `vault_totp` record the value it holds
-  is the code: the seed has no way out.
+  is the code: the seed has no way out. The value of a record with slots of a request has another
+  type, whose one way out is the seal of sink K8.
 
 Fixed by: the types of `enclave/src/oauth.rs` and `enclave/src/vault.rs`, the tests of the
 calls, and `egress/sink-callers.tsv` (the one caller of K1).
@@ -334,6 +370,12 @@ calls, and `egress/sink-callers.tsv` (the one caller of K1).
   secret of one provider appears in no request to another provider. Both nodes of the walk have
   a log store. Of all markers, a write to the log store carries the session token for the log
   store and no other: no secret of the account, and not the secret access key.
+- The verdict on C5: a node of the forward role asks its platform for connections to the site of
+  the vault secret whose use it was handed, and to no other host. The marked value of a vault
+  secret appears in the one request to that site, and in no response of the node of the forward
+  role or of the node of the delegation role that sealed it. A site that sends the value back,
+  in a header or in the body, in the forms of E4, has its response withheld or cut in front of
+  the value.
 - A record of kind `oauth_imported` with marked tokens is used by `forward`, `refresh` and
   `revoke-token` and refused by `oauth/merge` and `release`. Records of the kinds this release
   removed (`oauth_operator`, `api_key`) are used by no call.
@@ -342,7 +384,7 @@ calls, and `egress/sink-callers.tsv` (the one caller of K1).
 
 | Call | The fields of a successful response and their classes |
 | --- | --- |
-| `GET /v1/health` | `node` P, `release` P, `platform` P, `custody` P, `started_ms` P, `time_ms` P, `configured` P, `closing` P, `accounts` P, `grants` P, `mail_providers` P, `log_store` E and P (`bucket`, `region` and `credentials_expires_ms` E, `pending` and `pending_oldest_ms` P), `log` P (seven counts, six counts of failed write attempts under constant cause names, the count of repeated attempts, eight cumulative counts of the time to confirmation under constant bounds, their sum and their count), `load` P (two counts of the calls, two counts of the connections from the backend and their bound, three CPU times and two sizes of the kernel, two counts of the descriptors of the process, and two counts of the connections that wait for the end of their peer; the five of the kernel are null when it exposes none, so is each count of the descriptors when the kernel or the platform gives none, and so are the two counts of the waiting connections on the local platform), `egress` P (the count of opened connections, four counts of failed opens under constant cause names, the counts of repeated opens and of opens in progress, two counts of reused idle connections), `refresh` P (four counts of late token address calls under constant outcome names, the count of those in progress), `state` P (three counts of kept `refresh` responses, merge keys and unconfirmed entries, two counts of idle connections under constant peer names) |
+| `GET /v1/health` | `node` P, `release` P, `platform` P, `custody` P, `role` P, `started_ms` P, `time_ms` P, `configured` P, `closing` P, `accounts` P, `grants` P, `mail_providers` P, `log_store` E and P (`bucket`, `region` and `credentials_expires_ms` E, `pending` and `pending_oldest_ms` P), `log` P (seven counts, six counts of failed write attempts under constant cause names, the count of repeated attempts, eight cumulative counts of the time to confirmation under constant bounds, their sum and their count), `load` P (two counts of the calls, two counts of the connections from the backend and their bound, three CPU times and two sizes of the kernel, two counts of the descriptors of the process, and two counts of the connections that wait for the end of their peer; the five of the kernel are null when it exposes none, so is each count of the descriptors when the kernel or the platform gives none, and so are the two counts of the waiting connections on the local platform), `egress` P (the count of opened connections, four counts of failed opens under constant cause names, the counts of repeated opens and of opens in progress, two counts of reused idle connections), `refresh` P (four counts of late token address calls under constant outcome names, the count of those in progress), `state` P (three counts of kept `refresh` responses, merge keys and unconfirmed entries, two counts of idle connections under constant peer names) |
 | `POST /v1/config` | `configured` P |
 | `POST /v1/attestation` | `v` P, `platform` P, `document` S (the platform signs the two public keys of the node, the release and the nonce of the caller), `node` P, `challenge` P, `release` P, `challenge_statement` S (its body: `type`, `node`, `challenge`, `time_ms` P, the nonce of the caller E) |
 | `POST /v1/messages` | `reply` S (its body: `type`, `ok`, `code`, `node`, `time_ms` P, `user_id`, `challenge`, `key_id`, `not_after_ms` D, `head` P), `log` P, `grant` D |
@@ -357,7 +399,10 @@ calls, and `egress/sink-callers.tsv` (the one caller of K1).
 | `POST /v1/mail/verify` | `identity` D, `node` P, `statement` S (identity D, record bindings E/P), `log` P, after E4 |
 | `POST /v1/mail/read` | `status` P, `headers` P, bounded provider mail data R, `log` P, after E4 |
 | `POST /v1/mail/submit` | `status` P, `headers` P, submission status P, SMTP code R, `log` P, after E4. A lost reply is not a rejection |
-| `POST /v1/release` | `value` V, `log` P |
+| `POST /v1/release` | `value` V, or for a call that named a key to seal to `sealed` V (the value under the seal of that key: the caller holds the key), `log` P |
+| `POST /v1/vault/store` | `record` C (its plaintext: the value, the name, the sites and the slots E, the source P; its `id` and nonce P), `log` P |
+| `POST /v1/vault/handoff` | `envelope` C (K8: sealed to a node of the forward role; `from` and `to` P), `log` P |
+| `POST /v1/vault/send` | `status` R, `headers` R, the body R in parts, and the end record `complete` P, `code` P (a failure code) and `message` P (a fixed string of the source) |
 | `POST /v1/close` | `accounts` P |
 | `POST /v1/close/heads` | `heads` S, `next` E, `truncated` P, `skipped` P |
 | `POST /v1/peer/export` | `envelope` C (K2), `logs` E and P (`user_id` E, `seq` P), `next` E |
@@ -397,7 +442,10 @@ enclave.md describes it.
 They show: when the source of a node and its measurement agree, the operator domain cannot,
 with any input, obtain on C1 a token of a record of kind `oauth` or `oauth_imported`, a user
 key, a private key of the node, a PKCE verifier or a TOTP seed. A vault value leaves through
-`release` only, one requested field at a time, after its log entry. Every request that carries
+`release` only, one requested field at a time, after its log entry. The value of a record of
+kind `vault_secret` with slots of a request leaves through no call: it goes, sealed, to a node
+of the forward role of the same measurement, and from there into one request to a host of the
+record, at a slot of the record, after the log entry of that request. Every request that carries
 a credential to a provider has its log entry. On a node with a log store, that entry is in the
 log store before the request leaves and before the vault value leaves (protocol.md 7.6), and
 what the node writes to the log store is entries: ciphertexts under the log public key of the
@@ -408,6 +456,10 @@ They do not show:
 | Limit | What it means |
 | --- | --- |
 | The contract of a provider | A token that a provider sends at a place the definition does not list, in another form, or a second credential an API derives from the token and returns, is not found by the checks of E4 |
+| The rest of a request that carries a vault secret | The reach of a record binds the host and the slot. Which path of that host a request goes to, and what its body and its other headers are, is chosen by the caller, the operator domain. A host with an address that stores what it receives and returns it to another request, or that returns a value in a form the reflection check does not know, lets the operator domain read the value there. Every such request is on the log with its method, host, path, query and the hash of its body |
+| A value a page receives | A value `release` hands out (a record with the slot `field`) is in the hands of the operator domain from then on, sealed or not: the caller chose the key of the seal. The origin of a release is what the caller stated. The rules hold the origin an entry names to the sites of the record, and they do not show that a browser was at that origin |
+| A value the operator domain gave | A record `vault/store` made holds a value the operator domain knew, and says so (`source` `operator`). What the rules show for it begins with the record |
+| An earlier record | The operator domain stores records and can present an earlier record of a vault secret, with the reach it had then, for as long as a grant is in force. Its use is on the log like any other |
 | Consent outside the app | The OAuth application (client id and client secret) belongs to the operator. When a user consents on the authorization page outside the connect flow of the app, that authorization does not pass through a node and these rules do not reach it. The app continues its connect flow only after it verified the signature and the 32-byte `sign_pk` of the node statement (protocol.md 8.2) |
 | Providers without PKCE (`slack`, `notion`) | The authorization code passes through the callback of the operator domain, which also holds the client secret: the operator domain can exchange that code itself. With PKCE the verifier never leaves the node, so the code is of no use outside it |
 | A token of kind `oauth_imported` | The operator domain held it before the device encrypted it. From then on the node keeps it like any token. What happened to it before is outside these rules |

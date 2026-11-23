@@ -140,6 +140,8 @@ All purpose strings (no string outside this table is used):
 | `pickle.secure.v1.register\n` | Signature purpose of the account key registration (the operator's backend verifies it) |
 | `pickle.secure.v1.witness\n` | Signature purpose of a witness signature (stage 2) |
 | `pickle.secure.v1.peer`, `pickle.secure.v1.peer\n` | HPKE info and signature purpose of the messages between nodes (section 10) |
+| `pickle.secure.v3.secret-use`, `pickle.secure.v3.secret-use\n` | HPKE info and signature purpose of the envelope of one use of a vault secret (10.5) |
+| `pickle.secure.v3.release` | HPKE info of a vault value that `release` seals to a key its caller named (section 6) |
 
 ## 4. Attestation
 
@@ -153,6 +155,23 @@ binding = UTF-8(JSON {"v":1,"sign":b64u(node signing public key),"seal":b64u(nod
 ```
 
 - `binding` is at most 512 bytes long.
+- `role` names the role of a node. One node program runs in two roles (enclave.md section 4). A
+  node of the delegation role holds the delegations of accounts, and its binding has no `role`
+  key. A node of the forward role holds no delegation, opens no record and writes no log entry:
+  it sends the one request of a use of a vault secret that a node of the delegation role sealed
+  to it (10.5). Its binding is the two keys and the release with `"role":"forward"` behind them,
+  and it has no `log` key:
+
+  ```text
+  binding = UTF-8(JSON {"v":1,"sign":b64u(node signing public key),"seal":b64u(node sealing public key),"release":"v1.0.0","role":"forward"})
+  ```
+
+  A node takes its role once and does not change it, so the `role` of a binding a verifier read
+  holds for as long as that node lives. Whoever hands a user key to a node refuses a node whose
+  binding has a `role` key, whatever its value: an app before it sends the command grant (5.3),
+  and a node before it seals a delegation transfer (10.1). A node of the delegation role seals a
+  use of a vault secret to a node whose binding has the `role` `forward`, and to no other node
+  (10.5).
 - `log` names the log store of the node (7.6): the bucket and its region. A node that has no log
   store writes no `log` key: its binding ends with `release`. A node takes a log store once and
   does not change it (enclave.md 5.1), so the `log` of a binding a verifier read holds for as long
@@ -456,9 +475,10 @@ caller, after the log entry of that release is on the chain.
 | `oauth` | The name of a provider (enclave.md section 6) | A node (`oauth/complete`: the node receives the token from the provider itself). `refresh` and `oauth/merge` write the record again | enclave-use: the token is used through `forward` only. No call hands the plaintext out | `{"token":{the token response of the provider, merged by the rules of section 8},"obtained_ms":n}`. A dynamically registered client (granola, mercury) also carries `"client_id"` |
 | `oauth_imported` | The name of a provider | The device of the account: the app encrypted a token that the operator domain held before it used a node. No call of a node creates a record of this kind | enclave-use: `forward`, `refresh` and `revoke-token` take the record by the same rules as kind `oauth`, and `refresh` writes the record again under the same kind. `oauth/merge` and `release` refuse it (`not_allowed`) | The form of kind `oauth` |
 | `app_password` | `naver_mail` | The app | enclave-use: mail calls only; no release | `{"username":"...","password":"..."}` |
-| `vault_password` | `vault` | The app | release: `release` hands the value out | `{"value":"..."}` |
+| `vault_password` | `vault` | The app, and a node (`vault/store` with `kind` `vault_password`: the operator domain gave the value) | release: `release` hands the value out | `{"value":"..."}` of the app, `{"value":"...","source":"operator"}` of a node |
 | `vault_totp` | `vault` | The app | enclave-use: the seed does not leave. `release` hands out only the code that the node computed | `{"value":"<base32 seed>"}` |
 | `vault_card` | `vault` | The app | release | `{"number":"...","cvc":"..."}` |
+| `vault_secret` | `vault` | The app, and a node (`vault/store`: the operator domain gave the value) | By the slots of the record. A record whose slot is `field`: release, `release` hands the value out for an origin of its sites. A record with slots of a request: enclave-use, `vault/handoff` seals the value to a node of the forward role for one request to a site of the record (10.5), and no call hands the plaintext out | `{"value":"...","name":"...","sites":[...],"slots":[...],"source":"...","pad":"..."}` (below) |
 
 The guarantee tier of a record follows from the use mode of this table and from the `custody` of
 the record. A record with `custody` `enclave` and use mode enclave-use is of the provable tier:
@@ -486,6 +506,59 @@ and what happens to a value after it left the node is a promise of the operator.
   the field that the call uses, the call fails with `record_invalid`.
 - A secret value of the vault is one record per secret field (a password and a TOTP seed are two
   records). A save that changes one of them does not touch the record of the other.
+
+**The plaintext of a record of kind `vault_secret`.** The record holds a value under a name,
+where that value may go, and which side made the record:
+
+```text
+{"value":"sk-...","name":"OPENAI_API_KEY","sites":["api.openai.com"],"slots":["header:authorization"],"source":"device","pad":"...."}
+```
+
+`sites` and `slots` together are the reach of the record: the hosts and the places its value may
+go to. They are part of the plaintext, so whoever cannot encrypt under the user key cannot change
+them. A node reads the keys of this table and passes over every other key of the plaintext.
+
+| Key | Form |
+| --- | --- |
+| `value` | A string. A node hands out or uses the whole of it |
+| `name` | `[A-Z][A-Z0-9_]{0,63}`: an ASCII capital letter, then at most 63 ASCII capital letters, digits and `_` |
+| `sites` | The string `"any"` (every host), or a list of 1 to 8 hosts, each named once. A host is a DNS name in lower case: two labels or more joined by `.`, each label 1 to 63 characters of `[a-z0-9-]` that neither begins nor ends with `-`, at most 253 bytes in all, and the last label begins with a letter. A scheme, a port, a path, a dot at the end, a capital letter and a character outside ASCII make a string no host: a reader does not repair it |
+| `slots` | A list of 1 to 4 slots, each named once: the one slot `field`, or slots of a request (the table below). No record lists `field` beside a slot of a request, and a record whose `sites` is `"any"` lists `field` |
+| `source` | `device` for a record the device of the account made of a value its user entered, `operator` for a record a node made of a value the operator domain gave it (`vault/store`). A record without this key, and one with another value, does not open as a record of this kind |
+| `pad` | Only in a record of a device: a string of the character `.`, as long as it takes to make the UTF-8 length of the whole plaintext the smallest of 256, 512, 1,024, 2,048, 4,096, 8,192 and 12,272 bytes the plaintext fits. So the length of a record tells one of seven steps and not the length of its value. A node does not read this key |
+
+| Slot | The place of the value |
+| --- | --- |
+| `field` | An input field of a web page, typed there by whoever fills the page. `release` hands the value out |
+| `header:<name>` | Inside the value of the request header `<name>`. The name is 1 to 64 characters of `[a-z0-9-]`, and it is none of the headers a node of the forward role drops or refuses (10.5) |
+| `query:<name>` | The whole value of the query parameter `<name>`. The name is 1 to 64 of the characters a query writes without a percent escape: ASCII letters, digits, `-`, `.`, `_` and `~` |
+| `form:<name>` | The whole value of the field `<name>` of a body of the type `application/x-www-form-urlencoded`. The name has the form of the name of `query` |
+| `json:<name>` | A string member of a JSON body. The name is the keys of the objects on the way to the member joined by `.` (`auth.token` is the member `token` of the member `auth` of the top-level object): no key is empty, no key holds a control character or a space character, and the name is at most 64 bytes of UTF-8 |
+| `path` | Inside the path of the request |
+| `basic:user`, `basic:password` | The whole user-id, or the whole password, of the credentials of HTTP Basic in the `Authorization` header (RFC 7617) |
+
+A host covers what its slot says. For a slot of a request it is that host alone: a value stored
+for `api.openai.com` goes into no request to `files.openai.com`. For the slot `field` it is that
+host and every host below it: `release` hands the value of a record whose `sites` hold
+`shop.example` out for the origin `https://pay.shop.example`, and not for
+`https://notshop.example`.
+
+**A value `release` hands out sealed.** A `release` call may carry `seal_to`, the b64u of an
+X25519 public key its caller made for that one call. The node then answers with `sealed` in the
+place of `value`:
+
+```text
+sealed = {"enc": b64u(32 bytes), "ct": b64u}
+enc, ct = single-shot HPKE (section 2) to the key seal_to,
+          info = UTF-8("pickle.secure.v3.release"),
+          aad  = UTF-8(user_id + "\n" + record id + "\n" + field + "\n" + origin),
+          plaintext = the UTF-8 bytes of the value the call hands out
+```
+
+The seal changes where the value is in the clear on its way: whoever carries the response between
+the node and the holder of the private key carries a ciphertext. It does not change who can read
+the value: the caller chose the key, the caller is the operator domain, and a sealed value is a
+released value with the log entry of a release. A call without `seal_to` gets the value as it is.
 
 ## 7. The credential log
 
@@ -572,12 +645,12 @@ the body is `{"v":1,"node","user_id","key_id","seq","prev","time_ms","enc","ct"}
 | --- | --- | --- |
 | `grant_accepted` | `time_ms`, `not_after_ms`, `custody` | The command grant |
 | `grant_revoked` | `time_ms` | The command revoke |
-| `connection_created` | `time_ms`, `record_id`, `provider`, `scope` (the scope string among the public fields of enclave.md 6.4: the `scope` of the token place, else the top-level `scope`, when the provider definition lists it. Otherwise the empty string) | `oauth/complete` |
+| `connection_created` | `time_ms`, `record_id`, `provider`, `scope` (the scope string among the public fields of enclave.md 6.4: the `scope` of the token place, else the top-level `scope`, when the provider definition lists it. Otherwise the empty string). The event of `vault/store` has the provider `vault`, the empty `scope`, and behind them `kind` (`vault_secret` or `vault_password`), `name` (the name of a `vault_secret`) or `site` (the host the call stated for the login of a `vault_password`), and `context` | `oauth/complete`, `vault/store` |
 | `credential_refreshed` | `time_ms`, `record_id`, `provider`. It records a refresh call (the event is created before the call, so a refresh that the provider refused is on the log as well) | `refresh` |
 | `connection_removed` | `time_ms`, `record_id`, `provider`, `provider_revoke` (bool: whether the node calls the revocation address of the provider after this event. It is true when the definition has a revocation address and the plaintext of the record has a token. The event is created before the call, so it does not carry the outcome of the call) | `revoke-token` |
-| `provider_request` | `time_ms`, `record_id`, `provider`, `method`, `host`, `path`, `query`, `body_bytes`, `body_sha256` (b64u, the empty string when there is no body), `context`, `window_s` (300, only on a request that can be merged) | `forward`, `forward/batch` (one per request) |
+| `provider_request` | `time_ms`, `record_id`, `provider`, `method`, `host`, `path`, `query`, `body_bytes`, `body_sha256` (b64u, the empty string when there is no body), `context`, `window_s` (300, only on a request that can be merged). The event of `vault/handoff` has the provider `vault`, no `window_s`, and behind `context` the keys `name` (the name of the record), `slot` (the place of the value in the request) and `to` (the `node` of the node of the forward role the value was sealed to). Its `path` and its `query` hold the placeholder where the value goes, and its `body_sha256` is that of the body with the placeholder in it: no part of the value is in the event | `forward`, `forward/batch` (one per request), `vault/handoff` |
 | `mail_request` | `time_ms`, `record_id`, `provider`, `operation`, `request`, `body_bytes`, `body_sha256`, `context` (the mail call surface at the end of this document) | `mail/verify`, `mail/read`, `mail/submit` |
-| `secret_released` | `time_ms`, `record_id`, `kind`, `field`, `origin`, `context` | `release` |
+| `secret_released` | `time_ms`, `record_id`, `kind`, `field`, `origin`, `context`, and for a record of kind `vault_secret` the `name` of the record behind them | `release` |
 | `totp_issued` | `time_ms`, `record_id`, `origin`, `context` | `release` |
 | `grant_transferred_out` | `time_ms`, `to` (the `node` of the receiving node) | `peer/export` (section 10) |
 | `grant_transferred_in` | `time_ms`, `from` (the `node` of the giving node), `not_after_ms`, `custody` | `peer/import` (section 10) |
@@ -602,8 +675,8 @@ the body is `{"v":1,"node","user_id","key_id","seq","prev","time_ms","enc","ct"}
   an event made under a grant that is over. An event that can
   be the target of a merge (a GET without a body) carries `window_s: 300`: it says that the same
   request may have happened any number of times in the 300 seconds after it. A GET request with a
-  body, a request of another method and the release of a vault value (`release`) are not merged:
-  each has its own event.
+  body, a request of another method, the release of a vault value (`release`) and the use of a
+  vault secret in a request (`vault/handoff`) are not merged: each has its own event.
 - The identifier of a node (`node`) is the signing public key of that node. So an app that read the
   `to` of a `grant_transferred_out` can verify the signatures of the entries of the receiving node
   with that value.
@@ -1249,6 +1322,137 @@ Test vectors of the assignment; the backend of the operator computes the same fu
 | `사용자 1` | 6 | 2 | {0, 4} |
 | `carol` | 2 | 5 | {0, 1} |
 
+### 10.5 The use of a vault secret in a request
+
+A node of the delegation role holds user keys and connects to the addresses of its provider
+definitions and to its log store only. The site of a vault secret is a host the account chose, so
+that node does not connect to it. It records the use, and then seals the value, with the one
+request the value is for, to a node of the forward role (4.1), which holds no user key and sends
+that request.
+
+**The request object.** `vault/handoff` (enclave.md 5.9c) states the request the value goes into,
+without the value: a placeholder stands where the value goes.
+
+```text
+request = {"method":"POST","host":"api.openai.com","path":"/v1/chat/completions","query":"",
+           "slot":"header:authorization","placeholder":"...","body_bytes":0,"body_sha256":""}
+```
+
+| Key | Form |
+| --- | --- |
+| `method` | `GET`, `POST`, `PUT`, `PATCH` or `DELETE` |
+| `host` | A host of the form of section 6. The request goes to port 443 of it |
+| `path` | Begins with `/`: at most 8,192 bytes of printable ASCII (0x21 to 0x7e) without `?` and `#` |
+| `query` | At most 8,192 bytes of printable ASCII without `#`. The empty string for a request without a query |
+| `slot` | A slot of a request of section 6: not `field` |
+| `placeholder` | 16 to 128 characters of `[A-Za-z0-9_-]` |
+| `body_bytes`, `body_sha256` | The length of the body, at most 64 MiB, and the b64u of its SHA-256 (the empty string for a request without a body). The body is the body the caller sends, with the placeholder in it |
+
+The placeholder and the address agree with the slot. For the slot `path` the placeholder occurs
+once in the path and not in the query, and the path in front of it does not end with the
+beginning of a percent escape, neither as it stands nor with its percent escapes decoded up to
+three times. For a slot `query:<name>` it is the whole value of the one parameter of that name and
+occurs nowhere else in the address. For every other slot it occurs neither in the path nor in the
+query.
+
+**The envelope.** After the log store confirmed the entry that holds the event `provider_request`
+of the use (7.2), the node of the delegation role signs and seals:
+
+```text
+payload  = UTF-8(JSON {"v":1,"type":"secret_use","from":<node>,"to":<node>,"time_ms":n,"not_after_ms":n,
+                       "nonce":b64u(16),"user_id":"...","record_id":<id>,"value":"...","request":{...}})
+signed   = UTF-8(JSON {"payload":b64u(payload),"sig":b64u(Ed25519(giving node key, "pickle.secure.v3.secret-use\n" + payload))})
+envelope = JSON {"v":1,"from":<node>,"to":<node>,"enc":b64u(32),"ct":b64u}
+enc, ct  = single-shot HPKE to the sealing key of the receiving node,
+           info = UTF-8("pickle.secure.v3.secret-use"), aad = UTF-8(from + "\n" + to), plaintext = signed
+```
+
+- `not_after_ms` is `time_ms` plus 30,000: an envelope can be used for 30 seconds of the time of
+  the giving node. `nonce` is 16 fresh random bytes, the number of the use.
+- `value` is the value of the record: 8 to 12,000 bytes. A shorter value is not searched for in
+  the response to its request (egress-policy.md, rule E4), so no node seals or sends one.
+- The purpose strings are those of this envelope alone. A node opens a delegation transfer (10.1)
+  under other ones, so a node of the forward role has no operation that opens a transfer, and a
+  node of the delegation role has none that opens this envelope.
+- Before it seals, the giving node verifies the attestation response of the receiving node by
+  the rules of 10.1 for a node of its own platform and measurement, and the binding of that
+  node has the `role` `forward` (4.1). A node that fails a check is `peer_unverified`. The giving
+  node seals to no node of another measurement: a node of the forward role is a node that runs
+  the source of the node that opened the record.
+
+**The checks of the receiving node** (`vault/send`, enclave.md 5.16), in this order:
+
+| Check | Failure |
+| --- | --- |
+| `envelope.v` is 1 | `unsupported_version` |
+| `envelope.to` is this node | `wrong_node` |
+| `enc` and `ct` are b64u and the HPKE open succeeds | `open_failed` |
+| `signed` is JSON with b64u `payload` and `sig`, and `envelope.from` is b64u of 32 bytes | `invalid_request` |
+| `sig` verifies under the signing key that `envelope.from` names | `bad_signature` |
+| `payload` is a JSON object with `v` 1 and `type` `secret_use` | `unsupported_version`, `invalid_request` |
+| `payload.from` and `payload.to` equal those of the envelope | `wrong_node` |
+| The form of the fields: the two times, a `nonce` of 16 bytes, a `user_id`, a `record_id` of 16 bytes, a `value` of 8 to 12,000 bytes, a request object | `invalid_request`, `too_large` for a body above 64 MiB |
+| The time of the node is before `not_after_ms`, and `not_after_ms` is at most 60 seconds ahead of it | `bad_expiry` |
+| The body of the call has the length and the SHA-256 the request object states, and the request of the call is the request of the envelope (below) | `invalid_request`, `not_allowed` |
+| The `nonce` was not marked before | `bad_challenge` |
+
+The receiving node does not verify an attestation of the giving node: it holds no secret of its
+own, and what an envelope makes it do is send the value inside the envelope to the host inside
+the envelope. What the giving node relies on is its own verification of the receiving node.
+
+**One envelope, one request.** Right before the request leaves, the receiving node marks the
+`nonce` of the envelope as used, at a node time before `not_after_ms`, and keeps the mark for 60
+seconds. An envelope whose number is marked sends nothing. The number is marked also when the
+request then fails: the request may have reached the host.
+
+**The request that leaves.** The caller of `vault/send` gives the headers and the body, with the
+placeholder where the value goes. The method, the host, the path and the query are those of the
+envelope. The node puts the value at the slot and nowhere else:
+
+- The placeholder occurs once in the whole request (the names and the values of the headers, the
+  path, the query, the body), and that occurrence is at the slot. A request with the placeholder
+  at another place, or with none at the slot, is not sent.
+- The value is written in the form of its place: as it is inside a header value (a value with a
+  control character is not written there), percent-encoded in the path, in a query parameter and
+  in a form field, and as the content of a JSON string in a JSON body.
+- `header:<name>`: the header is stated once. The placeholder begins its value or stands behind a
+  space, `=`, `:` or `"`. In a header a server reads credentials from (`Authorization`, and every
+  header whose name holds that word) the text in front of the placeholder is ASCII and names none
+  of the schemes `basic`, `digest`, `negotiate` and `ntlm`, in any case of their letters and at
+  any place: behind such a name a server decodes what follows, and may send back bytes the search
+  of the response does not find.
+- `basic:user`, `basic:password`: the one `Authorization` header of the caller is `Basic`, a
+  space and the base64 text of `user-id:password`, and the placeholder is the whole of the half
+  the slot names. The node writes the header anew with the value as that half. A value with a
+  control character, and for the user-id a value with a colon, is not written. Credentials with
+  the placeholder as the other half are not sent: a value its record holds as a password does not
+  leave as a user-id.
+- `form:<name>`, `json:<name>`: the one `Content-Type` header of the caller is
+  `application/x-www-form-urlencoded` for a form slot and a JSON type (`application/json`, or a
+  type whose subtype ends with `+json`) for a JSON slot, it states no `charset` but UTF-8, and the
+  caller states no `Content-Encoding`. For a form slot the placeholder is the whole value of the
+  one field of that name. For a JSON slot it is the whole content of the string member the name
+  leads to, written without an escape.
+- The node drops these headers of the caller: `host`, `content-length`, `transfer-encoding`,
+  `connection`, `keep-alive`, `proxy-connection`, `upgrade`, `te`, `trailer`, `expect`,
+  `accept-encoding`, `proxy-authorization`, `range`, `if-range` and `accept-charset`. It writes
+  the host and the framing of the body itself, asks for the coding `identity` and for the whole of
+  a response, and says `Connection: close`.
+- The node refuses a call that carries one of these headers, with `not_allowed`:
+  `x-http-method-override`, `x-http-method`, `x-method-override`, `forwarded`, `x-forwarded-host`,
+  `x-forwarded-server`, `x-forwarded-uri`, `x-forwarded-prefix`, `x-original-url`,
+  `x-original-uri`, `x-original-host`, `x-rewrite-url`, `x-host` and `x-http-host-override`. Such a
+  header asks a server to treat a request as one of another method, or as one to another host or
+  path, than the entry of the use names. An `Accept` header that names another character encoding
+  than UTF-8 is refused the same way.
+- A header name is compared in lower case and with `-` for every `_`: some servers read the two
+  characters as one. No slot names a header of the two lists.
+
+The request goes to port 443 of the host over TLS that ends inside the node, with a certificate
+verified for that host, on a connection that carries this one request. The node follows no
+redirect. The response passes rule E4 of the egress policy before any part of it is handed on
+(egress-policy.md).
+
 ## 11. All failure codes (node)
 
 | Code | Meaning |
@@ -1256,7 +1460,7 @@ Test vectors of the assignment; the backend of the operator computes the same fu
 | `invalid_request` | A violation of a form, a length or a required key. A call of a path that is not defined and a call with a method that is not allowed have this code too |
 | `unsupported_version` | `v` is not 1 (envelope, command, record) |
 | `wrong_node`, `open_failed`, `bad_signature`, `bad_challenge`, `bad_expiry`, `unsupported_policy`, `custody_mismatch` | Failures of command processing (5.3). `custody_mismatch` means that the `custody` of the grant is not the custody of the platform of that node |
-| `peer_unverified` | The attestation response of a peer does not verify, or its platform, its measurement or its log store is not one this node accepts (10.1). The endorsement of a later release fails a check of 10.3 |
+| `peer_unverified` | The attestation response of a peer does not verify, or its platform, its measurement or its log store is not one this node accepts (10.1). The endorsement of a later release fails a check of 10.3. The node a use of a vault secret is to be sealed to is not a node of the forward role of the measurement of this node (10.5) |
 | `user_mismatch` | The `user_id` of a command is not the account of the call (5.3). The `user_id` of a record is not the account of the call (section 6). The account of a pending authorization is not the account of the call |
 | `internal` | A failure of the platform (the attestation device, the random source). The call ends without changing anything |
 | `not_configured` | The operator configuration has not arrived yet |
@@ -1267,14 +1471,14 @@ Test vectors of the assignment; the backend of the operator computes the same fu
 | `key_mismatch` | The `key_id` or the `custody` of a record is not that of the grant. The `sign_pk` of a pending authorization is not the `sign_pk` of the grant |
 | `record_invalid` | The form of a record is wrong, or its AEAD verification failed. The plaintext lacks the field that the call uses (no token to inject, no `refresh_token` to refresh with) |
 | `provider_unknown` | The provider has no definition |
-| `not_allowed` | An address, a method, an authorization parameter or a field that the provider definition does not allow. A record of a kind that the call does not take |
+| `not_allowed` | An address, a method, an authorization parameter or a field that the provider definition does not allow. A record of a kind that the call does not take. A use of a vault secret outside the reach of its record: an origin, a host or a slot the record does not list (section 6, 10.5). A call of the other role than the role of the node (enclave.md section 4) |
 | `state_unknown` | There is no pending authorization, or its time (600 seconds) has passed |
 | `exchange_failed`, `refresh_failed` | The provider refused the exchange or the refresh. The failure carries the HTTP status of the provider and one word of a closed vocabulary for the error of its response (enclave.md 5.7) |
 | `provider_unreachable`, `timeout` | A transport failure, a time limit that passed |
 | `response_withheld` | A provider response failed a check of rule E4 of the egress policy (egress-policy.md) and was not handed on. A repeated call does not change the outcome |
 | `too_large` | A body above the limit (64 MiB each for a request and a response; for `forward/batch`, the bodies of the results together) |
 | `log_store_unavailable` | The log store did not confirm the entry of the call, or the node cannot write to it: it has no log store in its configuration, or no credentials within their time (7.6). The act of the call did not take place. A repeated call can succeed |
-| `capacity_unavailable` | The mail call could not immediately reserve its slot or body budget. No credential was opened and no provider request was sent. A later call can succeed |
+| `capacity_unavailable` | The mail call could not immediately reserve its slot or body budget. No credential was opened and no provider request was sent. A later call can succeed. A node of the forward role holds the marks of as many used envelopes as it keeps (10.5): no request was sent, and the envelope stays unused |
 
 ## 12. Constants
 
@@ -1321,6 +1525,14 @@ Test vectors of the assignment; the backend of the operator computes the same fu
 | Object versions one verification run fetches at a time (the app) | 8 |
 | `LOG_RUN_STALE_MS` (the app) | 600,000: a run whose judgement took longer than this is judged again on fresh reads (7.4) |
 | `LOG_STORE_ATTEMPTS`, `LOG_STORE_RETRY_MS` (the app) | 3 attempts of one request to the store, pauses of 500 and 1,500 milliseconds between them: a transport failure, a 429 and a 5xx status are tried again |
+| Hosts in `sites`, slots in `slots` of a record of kind `vault_secret` (section 6) | 1 to 8, 1 to 4 |
+| Longest name of such a record, longest name inside a slot | 64 characters, 64 bytes |
+| Longest `value` that `vault/store` takes, longest plaintext of a record it makes | 12,000 bytes, 12,272 bytes |
+| Lengths a device pads the plaintext of a record of kind `vault_secret` to | 256, 512, 1,024, 2,048, 4,096, 8,192 and 12,272 bytes |
+| Value of a vault secret that is used in a request (10.5) | 8 to 12,000 bytes |
+| Time an envelope of a use of a vault secret can be used, time a node keeps the mark of a used one | 30 seconds, 60 seconds |
+| Marks of used envelopes a node of the forward role keeps at once | 1,048,576 |
+| Placeholder of a request (10.5) | 16 to 128 characters |
 | Body limit | 64 MiB (67,108,864 bytes) |
 | Longest `context` | 256 characters |
 
@@ -1346,6 +1558,10 @@ name ends with `_text` holds the same value again as UTF-8 text.
 | `attestation.local` | `nonce`, `response` (with its `challenge_statement`), `document_text`, `binding` (of a node without a log store: it has no `log` key), `sign_pk`, `seal_pk`, `release`, `challenge_statement_text` (the body of the statement), `accepted`, `rejected`: another nonce, a binding of version 2, and four responses with the accepted document and nonce that fail for the challenge statement alone (the statement is missing, it is the statement of another request, of another challenge, of another node) | The result of the verification of a local document and of its challenge statement (4.2, 4.4) |
 | `attestation.nitro` | `included` (bool). When it is true: a real Nitro document, its nonce and the expected `binding`. In the committed file it is false, and a `note` states that the file holds no Nitro document | Nothing while `included` is false. Real Nitro documents are inputs of the tests of this repository (`protocol/tests/fixtures/`, `verify/tests/fixtures/`) |
 | `totp` | A list of `seed_base32`, `time_ms`, `code` | RFC 6238 |
+| `vault_secret` | A record of that kind (`id`, `nonce`, `plaintext`, `aad_text`, `record_key`, `record`), and the verdicts of the form rules of its plaintext: `names`, `hosts` and `slots` (lists of `text` and `valid`), `reserved_headers` (the slot of every header no slot names) and `reaches` (lists of `sites`, `slots` and `valid`) | A reader of a name, a host, a slot and a reach gives the verdict `valid` on every case. A node, an app and the caller of a node read these four forms, and all of them pass with this file |
+| `sealed_release` | A `release` call that named a key to seal to: `receiver_private` and `seal_to` (the key pair of the caller), `hpke_seed`, `user_id`, `record_id`, `field`, `origin`, `info_text`, `aad_text`, `value_text` and `sealed` | `sealed` opens with `receiver_private` to `value_text`, and does not open under another `aad` |
+| `basic_credentials` | `placeholder_text`, `value_text` and `cases`: values of an `Authorization` header (`authorization_text`) with the `slot` of the half the placeholder is (`basic:user`, `basic:password`, or null for a header a node sends under neither), and `written_text`, the header a node of the forward role writes for the value | The caller of a node tells from a header which of the two slots it is |
+| `header_values` | `placeholder_text`, `refused_schemes` and `cases`: values of the header of a slot `header:<name>` with `valid`, whether a node of the forward role puts the value in the place of the placeholder (10.5) | The same |
 | `transfer` | The keys of the giving node and of the receiving node, `payload_text`, `signed`, `envelope`, `hpke_seed`, the result that the receiving node opened (`grants`), and `cases`: an envelope with a changed ciphertext (`opens: false`), a transfer signed by another key (`signature_valid: false`), an envelope for another node | A receiving node implementation opens the envelope and obtains the same list of grants (10.1) |
 
 Of these, the tests of the app use `key_derivation`, `record`, `signed`, `log` and

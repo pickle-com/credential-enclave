@@ -101,9 +101,8 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
     // The search of the response holds back the last bytes of the body, as many as the
     // longest form of the value can take, and a value has up to 12,000 bytes. The call takes
     // the share of the body budget that search can hold before its request leaves.
-    let value_bytes = secret_use.value().expose_secret().len();
     let check_budget = admission
-        .budget(node, StreamCheck::memory_bound(value_bytes))
+        .budget(node, StreamCheck::memory_bound(secret_use.value_bytes()))
         .await?;
 
     // The request of the caller is the request of the envelope, and the value goes to its

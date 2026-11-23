@@ -870,6 +870,14 @@ impl SecretUse {
         &self.record_id
     }
 
+    /// The length of the value in bytes. The search of the response to the request holds back
+    /// as many bytes as the longest form of the value can take (egress-policy.md, rule E4),
+    /// and the node that sends the request reserves the memory of that search by this
+    /// length.
+    pub fn value_bytes(&self) -> usize {
+        self.value.expose_secret().len()
+    }
+
     /// The value.
     pub fn value(&self) -> &Secret<String> {
         &self.value

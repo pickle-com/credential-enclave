@@ -61,11 +61,13 @@ credential-enclave/
 │   ├── src/providers/mod.rs      # the provider definitions: parsing, validation, the address check
 │   ├── src/providers/definitions.json
 │   ├── src/oauth.rs              # the authorization address, the token address call, the merge rules, the public fields
-│   ├── src/vault.rs              # the vault kinds and the value `release` hands out
-│   ├── src/provider_response.rs  # the check of a provider response before `forward` returns it
+│   ├── src/vault.rs              # the vault kinds, the value `release` hands out, the value `vault/handoff` seals, the record `vault/store` makes
+│   ├── src/role.rs               # the role of a node, taken once, and the numbers of the secret uses a node of the forward role sent
+│   ├── src/bound.rs              # the request of one use of a vault secret, with the value at its slot (5.16)
+│   ├── src/provider_response.rs  # the check of a provider response before `forward` returns it, and of the response of a site before `vault/send` does
 │   ├── src/egress.rs             # the TLS client (rustls), the idle connections per (account, host), the node-wide bound of provider requests
 │   ├── src/log_store.rs          # the log store: the group commit, the write of an entry, its signature, the pending entries, the idle connections (5.14)
-│   ├── src/frame.rs              # the frame of `forward` (5.8) and of `forward/batch` (5.8b), and the stream of `forward`
+│   ├── src/frame.rs              # the frame of `forward` (5.8) and of `forward/batch` (5.8b), and the stream of `forward` and of `vault/send`
 │   ├── src/testing.rs            # tests only: the provider stand-in, the test platform and clock
 │   └── src/tests/                # tests only: the tests of the whole node (section 12)
 ├── host/                         # crate credential-enclave-host (binary credential-enclave-host)
@@ -154,6 +156,9 @@ reads a clock: randomness and time are arguments.
 | `log.rs` | The log entry of format 2 (one entry, one or more events) and of format 1 (read only), the two chain hashes, the head, the key of an entry in the log store and its parsing into the parts of either format |
 | `statement.rs` | The node statements: the challenge statement of an attestation response (protocol.md 4.2), and `oauth_begin` and `oauth_complete` (protocol.md 8.2) |
 | `totp.rs` | TOTP (RFC 6238, HMAC-SHA1, 6 digits, 30 seconds) |
+| `vault_secret.rs` | The plaintext of a record of kind `vault_secret` (protocol.md section 6): the name, the sites, the slots, the source and the padding, and whether a reach admits an origin or a request |
+| `secret_use.rs` | The use of a vault secret in a request (protocol.md 10.5): the one reader of a slot and of the host of a site, the request object, the two lists of request headers a node of the forward role drops and refuses, the rules of a placeholder in a header and in the credentials of HTTP Basic, and the envelope between the two nodes |
+| `released.rs` | A vault value `release` hands out under the seal of a key its caller named (protocol.md section 6) |
 | `release.rs` | The delegation transfer to a later release (protocol.md 10.3): the release statement, the six checks of an endorsement (the statement, the log identifier, the signed entry timestamp, the body of the entry with the release key and its signature, the time of the entry, the order of the two releases), the order of release tags, the reader of a list of predecessors, the reader of the PEM of a public key. The release key and the log key are arguments |
 | `attestation.rs` | Reading and verifying attestation documents: the Nitro document (CBOR, COSE_Sign1, the certificate chain, the signature, the PCRs), the binding, the local document. It holds the trust root (AWS Nitro Enclaves Root-G1, DER) as a public constant. It returns what a document states and does not judge a measurement: which PCR values are acceptable is the decision of the caller |
 | `app.rs` | The app side of the protocol: the derivation of the account keys, the check of a challenge statement, sealing a command, opening log entries, verifying a chain of format 2 from the keys of the listing (index verification) and from its entries (content verification), verifying a chain of format 1. The node program does not call this module. The generator of the test vectors and the tests use it in the place of the app |
@@ -344,8 +349,21 @@ struct Credentials { access_key_id: String, secret_access_key: Secret<String>, s
 - The caller is the operator domain (its backend processes). A node does not trust its caller: a
   decision rests on the grant of the account, on the AEAD authentication of a record and on the
   provider definitions, and on nothing else.
-- Bodies: `POST /v1/forward` and `POST /v1/forward/batch` take and return a frame (5.8). Every
-  other body is `application/json`.
+- Bodies: `POST /v1/forward` and `POST /v1/forward/batch` take and return a frame (5.8), and
+  `POST /v1/vault/send` takes a frame and returns a stream (5.16). Every other body is
+  `application/json`.
+- The role of a node. One node program runs in two roles (protocol.md 4.1), and a node answers
+  the calls of its own role. `health`, `config`, `attestation` and `close` are calls of either
+  role: none of them reads or changes a delegation, a record or the log of an account.
+  `vault/send` is the call of the forward role. Every other call is a call of the delegation
+  role. A node starts without a role and takes one once: the forward role with an operator
+  configuration that names it (5.1), the delegation role with the first call of that role or
+  with an operator configuration that names no role. A call of the other role than the role of
+  the node is `not_allowed` (403), before the node reads anything of the request: a node of the
+  forward role takes no command, no delegation transfer and no call that opens a record, so no
+  call can make it hold a user key, and a node that holds delegations sends no request to a host
+  that is not an address of its definitions. A node without a role refuses `vault/send` the
+  same way.
 - A success is 200. A failure is one of the statuses below with the body
   `{"code":"<code of protocol.md section 11>","message":"..."}`. `message` is a fixed string of the
   source. The failures `exchange_failed` and `refresh_failed` carry two more keys,
@@ -374,13 +392,14 @@ HTTP connection, before a call sees it. The responses of a node carry no `Date` 
 would be a value of the system clock).
 
 - The common front of the calls that use a credential (`forward`, `forward/batch`, `refresh`,
-  `revoke-token`, `release`, `oauth/complete`, the mail calls): (1) the node is not `closing`. (2)
-  The operator configuration is present (`release` is the exception). (3) The node can write to
+  `revoke-token`, `release`, `vault/store`, `vault/handoff`, `oauth/complete`, the mail calls):
+  (1) the node is not `closing`. (2) The operator configuration is present (`release`,
+  `vault/store` and `vault/handoff` are the exceptions). (3) The node can write to
   its log store, and the account has fewer than 64 pending entries (5.14. A node of platform
   `local` without a log store passes. An account the node holds no state of fails before this
   step, with `grant_required`). (4) The grant of the account is Active and within its time. (5)
-  The node opens the record (protocol.md section 6. `oauth/complete` creates a record and has no
-  step 5). `oauth/merge` passes (1), (4) and (5) only (it creates no event and calls no provider).
+  The node opens the record (protocol.md section 6. `oauth/complete` and `vault/store` create a
+  record and have no step 5). `oauth/merge` passes (1), (4) and (5) only (it creates no event and calls no provider).
   `oauth/begin` passes (1), (2) and (4).
 - A command (`messages`) is not stopped by the limit of (3): a revocation must always be possible.
   The entries of commands and of delegation transfers can raise the pending entries of an account
@@ -408,7 +427,7 @@ would be a value of the system clock).
 ### 5.1 `GET /v1/health`, `POST /v1/config`
 
 ```json
-GET /v1/health -> {"node":"...","release":"v2.1.0","platform":"nitro","custody":"enclave","started_ms":0,"time_ms":0,"configured":true,"closing":false,"accounts":0,"grants":0,
+GET /v1/health -> {"node":"...","release":"v2.1.0","platform":"nitro","custody":"enclave","role":"forward"|null,"started_ms":0,"time_ms":0,"configured":true,"closing":false,"accounts":0,"grants":0,
                    "mail_providers":["naver_mail"],
                    "log_store":{"bucket":"...","region":"...","credentials_expires_ms":0,"pending":0,"pending_oldest_ms":0}|null,
                    "log":{"entries":0,"events":0,"writes":0,"write_failures":0,"open_batches":0,"batch_calls":0,"batch_requests":0,
@@ -421,7 +440,20 @@ GET /v1/health -> {"node":"...","release":"v2.1.0","platform":"nitro","custody":
 POST /v1/config {"providers":{"google_workspace":{"client_id":"...","client_secret":"...","redirect_uri":"https://.../api/integrations/google_workspace/oauth/callback","publishable_key":""}, ...},
                  "log_store":{"bucket":"...","region":"...","endpoint":"http://host:port"}}
              -> {"configured":true}
+POST /v1/config {"role":"forward"}
+             -> {"configured":true}
 ```
+
+- `role` of `health` is `forward` on a node that took the forward role, and null on every other
+  node (section 4). `role` of the configuration names the role of the node: its one value is
+  `forward`, and a configuration without the key is the configuration of a node of the
+  delegation role. A node takes its role once. The configuration of a node of the forward role
+  is `{"role":"forward"}` and nothing else: with `providers` or `log_store` beside the role it
+  is `invalid_request`. A node of the forward role holds no client value of a provider, connects
+  to no token address and has no log store, so its `health` reports `log_store` null. A
+  configuration of the other role than the role the node has is `invalid_request` and changes
+  nothing: a node that took a call of the delegation role does not become a node of the forward
+  role, and a node of the forward role takes no client value.
 
 - `accounts` of `health` is the number of accounts that have a chain (a `seq` of at least 1).
   `grants` is the number of accounts that have a grant within its time (the operator domain reads
@@ -825,10 +857,11 @@ which form it holds. The order of the processing:
     3229: the status 226, or a header `IM`) fails the check as well. A response
     fails the check when a header name, a header value or the body holds the injected credential
     (the token without the prefix of the definition). Each of the three is read as it was
-    received and with its percent escapes decoded (up to three times, for a value that was
-    encoded more than once), and each reading is searched for the credential as it is, in base64
-    or base64url (each of the three byte alignments, without padding) and in hexadecimal (lower
-    or upper case). A form shorter than 8 bytes is not searched for. A failed check is
+    received, with its percent escapes decoded (up to three times, for a value that was
+    encoded more than once) and with its JSON string escapes decoded (up to twice, for a JSON
+    text inside a JSON string), and each reading is searched for the credential as it is, in
+    base64 or base64url (each of the three byte alignments, without padding) and in hexadecimal
+    (lower or upper case). A header whose bytes are not UTF-8 is searched as those bytes as well. A form shorter than 8 bytes is not searched for. A failed check is
     `response_withheld`: no part of the response leaves. The event `provider_request` is already
     on the chain, because the request went to the provider.
 11. A call that asked for a stream. Steps 8 and 9 run up to the head of the provider response:
@@ -839,13 +872,17 @@ which form it holds. The order of the processing:
     injected credential, is `response_withheld`, and no stream begins. Then the node answers
     200 with the stream meta, and a task hands the body on: every part of the body goes
     through the search of step 10 (`provider_response::StreamCheck`) before it leaves. The
-    search holds back as many bytes as the longest form of the credential can take under
-    three layers of percent escapes (27 bytes for each of its bytes) and 32 more, and hands
-    on the bytes in front of them once a search of everything it holds found no form of the
-    credential (it searches when 65,536 new bytes have arrived, or as many as it holds back
-    when that is more, and at the end of the body). Its verdict on a body is the verdict of
-    step 10 on the same bytes, and a body that holds the credential is cut in front of it: no
-    byte of the form leaves. The end record says how the body ended: `{"complete":true}`, or
+    search decodes each reading of step 10 part by part, from the first byte of the body, and
+    searches it together with its last bytes from the part before. It holds back the last
+    bytes it received, as many as one byte more than the longest form of the credential can
+    take in a reading (36 bytes for each of them), and hands on the bytes in front of them
+    once a search found no form of the credential (it searches when as many new bytes as the
+    longest form has have arrived, at most 16,384 bytes at a time or the length of that form
+    when it is longer, and at the end of the body). How far the bytes that leave lag depends
+    on the length of the credential and on nothing else. Its verdict on a body is the verdict
+    of step 10 on the same bytes, and a body that holds the credential is cut in front of it:
+    no byte of the form leaves, and the bytes held back leave only at the end of a body as
+    its sender ended it. The end record says how the body ended: `{"complete":true}`, or
     `complete` false with the `code` `response_withheld`, `provider_unreachable` (the
     connection of the provider failed or ended inside the body) or `timeout`, and the fixed
     `message` of that code. A stream that ends without an end record was cut on its way and
@@ -916,8 +953,9 @@ confirmation of the entry. `requests` holds 1 to 100 objects; another count is `
 ### 5.9 `POST /v1/release`
 
 ```json
-{"user_id":"...","record":{...},"field":"password|totp|card_number|card_cvc","origin":"https://host","context":"..."}
+{"user_id":"...","record":{...},"field":"password|totp|card_number|card_cvc|value","origin":"https://host","seal_to":"<b64u of 32 bytes>","context":"..."}
 -> {"value":"...","log":{"seq":1,"index":0,"created":true}}
+-> {"sealed":{"enc":"...","ct":"..."},"log":{"seq":1,"index":0,"created":true}}
 ```
 
 | Record kind | Allowed field | The value that is returned | Event |
@@ -925,16 +963,155 @@ confirmation of the entry. `requests` holds 1 to 100 objects; another count is `
 | `vault_password` | `password` | `value` of the plaintext | `secret_released` |
 | `vault_totp` | `totp` | The 6-digit code computed from the seed of the plaintext (RFC 6238, node time). The seed does not leave | `totp_issued` |
 | `vault_card` | `card_number`, `card_cvc` | `number` or `cvc` of the plaintext | `secret_released` |
+| `vault_secret` | `value` | `value` of the plaintext, the whole of it | `secret_released`, with the `name` of the record |
 
 Any other pair of kind and field is `not_allowed`, and so is a record of kind `oauth` or
-`oauth_imported`: no call hands out the plaintext of a token. A plaintext without the field, and a
-seed that is not base32, are `record_invalid`. The entry that holds the event is on the chain, and
-the log store confirmed it, before the value leaves the node.
+`oauth_imported`: no call hands out the plaintext of a token.
+
+A record of kind `vault_secret` says itself where its value may go (protocol.md section 6). The
+call is `not_allowed` when the slots of the record are not the slot `field`, or when its `sites`
+are not `"any"` and hold neither the host of `origin` (what stands between the scheme and the
+port, in lower case) nor a host that host lies below. So the value of a record with slots of a
+request leaves a node through no call, and the origin an entry names for a value is an origin of
+the sites of that value. A plaintext of this kind that does not state a name, sites, slots and a
+source of the forms of protocol.md section 6 is `record_invalid`.
 
 `origin` is an origin string `https://host` or `https://host:port` of at most 512 bytes (the node
-checks the form only). Whether that origin is the site of the vault item is decided by the backend,
-and the node writes the value it received into the entry. The call works without the operator
-configuration.
+checks the form only). The node cannot know whether the browser of the caller is at that origin:
+the caller states it, and the node writes the value it received into the entry. For the kinds
+other than `vault_secret` the backend decides whether that origin is the site of the vault item.
+The call works without the operator configuration.
+
+`seal_to` is optional: the b64u of an X25519 public key the caller made for this call. With it,
+the response carries `sealed` in the place of `value`: the value under a single-shot HPKE seal to
+that key (protocol.md section 6). The key material of the seal is drawn before the event is
+created, so a failure of the random source leaves no entry of a release without a value. A
+`seal_to` that is no key HPKE can seal to is `invalid_request`. The seal holds for every kind of
+this call. A call without the key gets the value as it is.
+
+The order of the call: the form of the body, the common front, the AEAD verification of the
+record and its kind, the pair of kind and field, and for a `vault_secret` the reach. A call that
+is refused up to here creates no event. Then the event, and the confirmation of the log store
+for the entry that holds it. Only then does the node read the plaintext for the value, and the
+value leaves. A plaintext that does not hold the field, and a seed that is not base32, are
+`record_invalid` at that point: the response carries no value, and the entry stays on the chain.
+So no answer of this call depends on the content of a value unless an entry records the call: a
+caller that repeats the call to learn the form of a value a user entered leaves an entry for
+every try.
+
+### 5.9b `POST /v1/vault/store`
+
+```json
+{"user_id":"...","name":"OPENAI_API_KEY","sites":["api.openai.com"],"slots":["header:authorization"],"value":"...","context":"..."}
+-> {"record":{...},"log":{"seq":1,"index":0,"created":true}}
+
+{"user_id":"...","kind":"vault_password","site":"shop.example","value":"...","context":"..."}
+-> {"record":{...},"log":{"seq":1,"index":0,"created":true}}
+```
+
+The call takes a value the operator domain holds and hands it back as a record of the vault under
+the user key of the grant, and records that it did. It works without the operator configuration,
+and it needs an active grant: without one no value is stored.
+
+- `kind` is `vault_secret` (also when the key is absent) or `vault_password`. A body of the first
+  kind carries `name`, `sites` and `slots` of the forms of protocol.md section 6 and no `site`. A
+  body of the second kind carries `site`, a host of that form (the host of the login the password
+  belongs to), and no `name`, `sites` or `slots`. `value` is 1 to 12,000 bytes of UTF-8 without
+  U+0000. A violation is `invalid_request`. A plaintext above 12,272 bytes is `too_large`.
+- The node draws the `id` (16 bytes) and the nonce of the record from its random source. A body
+  with a key `id` or `nonce`, whatever its value, is `invalid_request`: the node does not encrypt
+  a value of its caller under the record key of a record that exists.
+- The plaintext is written by the node: `value`, `name`, `sites`, `slots` and `source`, in this
+  order, for a `vault_secret`, and `value` and `source` for a `vault_password`. `source` is
+  `operator`. The plaintext of a record a device makes has the source `device`, or for a
+  `vault_password` no source, so a value that came in through this call cannot pass for a value
+  a user entered on a device.
+- The event is a control event `connection_created` (protocol.md 7.2): `record_id`, the provider
+  `vault`, the empty `scope`, `kind`, `name` (of a `vault_secret`) or `site` (of a
+  `vault_password`, as the caller stated it), and `context`. The record leaves only after the log
+  store confirmed the entry that holds the event. When it does not, the call ends with
+  `log_store_unavailable` and the record is dropped inside the node, the value with it.
+
+### 5.9c `POST /v1/vault/handoff`
+
+```json
+{"user_id":"...","record":{...},"peer":{the attestation response of a node of the forward role},
+ "request":{"method":"POST","host":"api.openai.com","path":"/v1/chat/completions","query":"",
+            "slot":"header:authorization","placeholder":"...","body_bytes":0,"body_sha256":""},
+ "context":"..."}
+-> {"envelope":{"v":1,"from":"<node>","to":"<node>","enc":"...","ct":"..."},"log":{"seq":1,"index":0,"created":true}}
+```
+
+A node of the delegation role hands the value of a record of kind `vault_secret`, for one request
+to a site of that record, to a node of the forward role (protocol.md 10.5). The call works
+without the operator configuration.
+
+1. The form of the body: `request` is a request object of protocol.md 10.5, `peer` an
+   attestation response, `context` at most 256 characters.
+2. The receiving node: its attestation response verifies as that of a node of the platform and
+   the measurement of this node, and its binding has the `role` `forward` (protocol.md 4.1).
+   Otherwise `peer_unverified`. The node keeps the nodes it verified, so the next call for the
+   same node verifies no document again.
+3. The common front (section 4), and the record: its kind is `vault_secret` and it opens.
+4. The reach of the record: its `sites` are a list that holds `host` of the request, and its
+   `slots` hold `slot` of the request. A record whose `sites` is `"any"`, and a record whose slot
+   is `field`, goes into no request. A use outside the reach is `not_allowed`.
+5. The event: a use event `provider_request` with the provider `vault`, the method, the host, the
+   path, the query, the size and the hash of the body as the request object states them,
+   `context`, `name`, `slot` and `to` (protocol.md 7.2). It is merged with no other event. A call
+   that is refused up to here creates no event.
+6. After the log store confirmed the entry: the value is 8 to 12,000 bytes, and for a slot of a
+   header and for the two slots of HTTP Basic it holds no control character (for `basic:user`, no
+   colon either). A value that fails is `record_invalid`: no envelope leaves, and the entry stays.
+7. The node seals the value and the request object to the sealing key of the receiving node
+   (protocol.md 10.5, sink K8 of the egress policy) and returns the envelope.
+
+The entry of a use is on the chain before a value is sealed, and an envelope is one request
+within 30 seconds: the log of an account holds one `provider_request` for every handoff that
+passed step 5.
+
+### 5.16 `POST /v1/vault/send`
+
+The request is a frame (5.8): `meta_len || meta || payload`.
+
+```text
+meta    = {"envelope":{...},"headers":[["authorization","Bearer <placeholder>"], ...],"timeout_ms":30000}
+payload = the body of the request, with the placeholder where the value goes
+```
+
+A node of the forward role sends the one request of the envelope, with the value at its slot, and
+hands the response on while it arrives. `timeout_ms` is 1,000 to 600,000 (30,000 when absent): the
+time from the moment the request leaves to the end of the response body.
+
+1. The call takes one of the places of the forward calls of the node and the share of the body
+   budget its frame occupies, and waits for them for 30 seconds at the most
+   (`capacity_unavailable`, section 8). A closing node begins no request (`closing`): the envelope
+   of such a call stays unused.
+2. The envelope opens for this node, its signature verifies, and the node time is before its
+   `not_after_ms` (protocol.md 10.5).
+3. The call takes the share of the body budget that the search of the response can hold for a
+   value of this length (rule E4, `StreamCheck`), within the same 30 seconds.
+4. The request of the caller is the request of the envelope: the body has the length and the
+   SHA-256 the envelope states, the placeholder occurs once and at the slot, and the headers pass
+   the rules of protocol.md 10.5. A request that fails here leaves the envelope unused.
+5. The node marks the number of the envelope as used and sends the request to port 443 of the
+   host, on a connection of its own, with `Connection: close` (sink K9 of the egress policy). A
+   failure from here on is not followed by a second request: the caller does not send the
+   envelope again either, because the request may have reached the host.
+6. The head of the response passes rule E4: a response under a content coding, a transfer
+   coding the node does not remove or an instance manipulation, and a response with the value in
+   a header name or a header value, ends the call with `response_withheld` and nothing of it is
+   handed on. A redirect is returned as it is and not followed.
+7. The 200 response is a stream of the form of 5.8 (`application/vnd.pickle.stream`): the meta
+   `{"status":n,"headers":[[name,value],...]}`, the parts of the body, and the end record. Every
+   part passes the search of rule E4 before it leaves, and a body that holds the value in a form
+   the search knows is cut in front of it (`{"complete":false,"code":"response_withheld",...}`).
+   A body that ends early, or not within the time limit, ends with the end record of that
+   failure, and the bytes the search held back at that moment are not handed on.
+
+The call holds its place, the share of its frame and the share of its search until the body has
+ended, was cut, the time limit passed or the caller is gone. The node holds no user key and
+opens no record: what it learns of an account is one value for one request.
 
 ### 5.10 `POST /v1/log/entries`, `POST /v1/log/ack`
 
@@ -1411,11 +1588,14 @@ The rules:
   place that creates an event or closes a batch never dates it before the one in front of it),
   and an expiry that has passed does not come back into force.
 - Randomness: the kernel random source.
-- Concurrency: at most 512 `forward` and `forward/batch` calls run at the same time (a semaphore; a
-  batch call takes one place, and holds it for the round trips of its requests, so the places
-  are not the bound of the throughput of a node: the provider requests in flight and the body
-  budget are). A `forward` or `forward/batch` call waits for its place and for the share of the
-  body budget its request frame occupies for at most 30 seconds together (`ADMISSION_WAIT`)
+- Concurrency: at most 512 `forward`, `forward/batch` and `vault/send` calls run at the same
+  time (a semaphore; a batch call takes one place, and holds it for the round trips of its
+  requests, so the places are not the bound of the throughput of a node: the provider requests
+  in flight and the body budget are). A `forward`, `forward/batch` or `vault/send` call waits
+  for its place and for the shares of the body budget it takes before its request leaves (the
+  share its request frame occupies, and for `vault/send` the share the search of its response
+  can hold: about 0.3 MiB for a value of 30 bytes and 2.7 MiB for one of 12,000 bytes) for at
+  most 30 seconds together (`ADMISSION_WAIT`)
   and ends with `capacity_unavailable` when it has not got them by then: the node reads
   nothing from the connection of a call that waits, so it does not learn that the caller of
   such a call is gone, and the wait is what bounds the time such a call holds its connection.
@@ -1565,6 +1745,29 @@ configuration from environment variables.
 
 The output of the host program is its log: lines on the standard output, and the output of
 `nitro-cli`. The client values of the operator are never part of a line.
+
+**The pod of a node of the forward role.** The environment variable `CREDENTIAL_ENCLAVE_ROLE`
+names the role of the node of the pod: a pod that does not set it is a pod of the delegation
+role, the value `forward` names the forward role, and any other value ends the host program
+before it starts an enclave. In a pod of the forward role:
+
+- The operator configuration is `{"role":"forward"}` (5.1). The host program sends it once the
+  node answers, and it starts the inbound relay only after the node took the role: a call of the
+  delegation role would give a node without a role that role. A node that refuses the role ends
+  the host program, and the container starts again with a new enclave.
+- The host program reads no client value of a provider, no log store and no address of the
+  shutdown collection, and makes no shutdown collection call: the node holds nothing to collect.
+- The egress relay connects to port 443 of any site at a public address, and to nothing else. It
+  takes a DNS name of two labels or more whose last label begins with a letter (the form of the
+  host of a site, protocol.md section 6), looks the name up once as a name from the root (the
+  search list of the pod is not applied), and connects to the public IPv4 addresses among the
+  answers: an address outside the special-purpose ranges of IPv4 (this network, private use,
+  shared address space, loopback, link local, the protocol assignments, documentation,
+  benchmarking, multicast and the reserved ranges). A name whose addresses are all outside the
+  public internet, every IPv6 address, another port and the two mail endpoints are refused
+  (`ERR\n`). The site of a vault secret is a host an account chose, so no list names it. What
+  the relay keeps the node from is the network of the operator: the addresses of the cluster, of
+  the VPC and of the instance metadata service.
 
 ### 9.1 The pipe of the two relays
 
@@ -1718,6 +1921,7 @@ place of every provider (`enclave/src/testing.rs`).
 | Address check | The unit tests of `enclave/src/providers/mod.rs` | The refusals of section 7 (another host, a path outside the lists, a denied path in its spellings, dot segments, dot segments in front of a path parameter, encoded separators and separators that are encoded twice, a port, user information), and the validation of the definitions, including the rules for public fields |
 | OAuth | `enclave/src/tests/oauth.rs`, the unit tests of `enclave/src/oauth.rs` | Against the provider stand-in: exchange, refresh, the merge of a reconnect, the nested token place of slack and its `ok: false`, the public fields and the containment check, the closed vocabulary of `provider_error`, the kept response of a repeated refresh, a token address call of `refresh` whose response arrives after the time limit of the call (kept for the next call with the same record; dropped after a revoke or after `close`; a late refusal and the late limit; the bound of the late calls and their counts in health), a record of kind `oauth_imported` |
 | forward | `enclave/src/tests/forward.rs`, the unit tests of `enclave/src/provider_response.rs` and `enclave/src/egress.rs` | Header removal, the refusal of a header that overrides the method and of the batch address of Microsoft Graph, the injected credential, the event of a GET request with a body, the whole path and the whole query in the event of the longest address, redirects that are not followed, chunked responses, the body limit, the time limit, a response that reflects the credential (as it is, under percent escapes of up to three layers, in base64 and in hexadecimal), the idle connections per (account, host): two accounts never share one, a connection is dropped after 30 seconds idle, a GET over an idle connection that ends without a response is sent once more and a POST is not; an open that fails before a request byte left is repeated within half the time limit of the call (two refusals and then a success, three refusals, a refusal that arrives after half the time limit), the bound of connections being opened at once, and the counts of `egress` of health; a call that is not admitted within its wait ends with `capacity_unavailable` and holds nothing; the headers the node drops (`Range`, `If-Range`, `Accept-Charset`, names written with `_`), the refusal of an `Accept` header that names another character encoding than UTF-8. The stream form: a body above the body limit is handed on in parts, with a declared length and chunked; a body that holds the credential is cut in front of it; a head that holds it, or a coded body, begins no stream; the end record of a body that does not arrive and of the time limit; the place of the call is free at the time limit whether or not the caller reads, and at once when the caller is gone; `stream` and the time limit of a stream are checked. The search of a stream (`provider_response.rs`): bodies in parts of any length are handed on whole without the credential, are cut in front of every form of it at every place (as it is, base64, hexadecimal, under one to three layers of escapes, each byte escaped), and get the verdict of the check of a whole response |
+| Vault | `enclave/src/tests/vault.rs`, `vault_handoff.rs`, `vault_send.rs` and `roles.rs`, the unit tests of `enclave/src/vault.rs`, `enclave/src/bound.rs`, `enclave/src/role.rs`, `protocol/src/vault_secret.rs`, `protocol/src/secret_use.rs` and `protocol/src/released.rs` | `release` of a vault secret: the slot `field`, the hosts of the record and the hosts below them, no entry for a refused call, the value judged after its entry, the sealed value and its key. `vault/store`: the two kinds, the plaintext the node writes and its source, the `id` and the nonce of the node, no record before the store confirmed the entry. The roles: a node takes one role, a node of the forward role answers no call of the delegation role and gets no delegation. `vault/handoff` and `vault/send` with both nodes and a stand-in for the site: the value at every slot in the form of its place, the reach of the record, one event per handoff and no envelope before its entry is confirmed, one envelope one request within its time, a request that is not the request of its envelope, the two lists of headers, the two halves of HTTP Basic, a value that cannot add a header or leave its place, the stream of the response and its cut in front of a reflected value in every form, a body that ends early or not in time, a connection of its own for every request, the shares of the body budget, a closing node |
 | forward/batch | `enclave/src/tests/forward_batch.rs` | One entry names every request before any leaves; a batch of 100 with 6 in flight; a request that fails the address check refuses the whole call with its index and creates no event; a merged request inside a batch shares the event; two entries when the open batch reaches its cap inside a batch; one failed request leaves the other results intact and keeps its `log` object; the bodies of the results together under the body limit; the results in the order of the requests; the bodies split by `body_bytes`; a batch of 0 or 101 requests is invalid |
 | Delegation transfer | `enclave/src/tests/peer.rs` | The round trip of export and import between two nodes of the local platform, paging, the exclusion of expired grants and of accounts that revoked, a grant of another `sign_pk` is not replaced, the refusal of a changed envelope and of an envelope for another node, the entries `grant_transferred_out` and `grant_transferred_in` (the `logs` of the responses and the objects of the store), a repeated export to the same peer without a new entry, the limit of 64 peers per grant, an export with an endorsement that does not hold (it hands nothing over and leaves no entry, also for a peer the call without an endorsement accepts), the `subset` of export (the share of the peer alone, with entries for it alone, and pages that count the selected grants) and of import (the share of the receiving node alone out of a transfer of every account, `copies` at or above `pods` names every account, `null` is a call without a subset, a subset outside its bounds is refused by both calls) |
 | Delegation subset and pruning | `enclave/src/tests/grants.rs`, the unit tests of `enclave/src/subset.rs` | The assignment vectors of protocol.md 10.4 and the agreement of `contains` with `assign`; `grants/prune` drops the grants within their time and the expired grants outside the share page by page in `user_id` order, leaves the chains, the revocation markers and the grants of the share, prunes nothing more on a repeated walk, works in the state `closing`, and refuses a missing subset, a subset outside its bounds and a `limit` of 0; after grants, a refresh, merged GET requests, refused writes, an expiry, a revoke, an import, a prune, two sweeps and the shutdown, every count of health (`accounts`, `grants`, `pending`, `pending_entries`, `kept_refreshes`, `merge_keys`, `open_batches`) equals a scan of the accounts |

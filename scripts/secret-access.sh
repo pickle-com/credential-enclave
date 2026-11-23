@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Rule E2 of the egress policy (docs/egress-policy.md): the functions that read the bytes of a
-# secret are a closed list, and so are the functions that call one of the seven sinks.
+# secret are a closed list, and so are the functions that call one of the nine sinks.
 #
 #   scripts/secret-access.sh           prints the two lists, as the source has them
 #   scripts/secret-access.sh --check   compares them with egress/secret-access.tsv and
@@ -24,6 +24,13 @@
 #   K4  hand_out          a vault value becomes part of the response of `release`
 #   K5  send_to_log_store a signed log entry goes to the log store over TLS, in a request
 #                         signed with the credentials of the operator
+#   K6  imap              the account name and the application password of a mail record go
+#                         to the IMAP endpoint of the mail provider over TLS
+#   K7  smtp              the same two values go to its SMTP endpoint over TLS
+#   K8  seal_secret_use   the value of a vault secret leaves inside the seal to a verified
+#                         node of the forward role, with the one request it is for
+#   K9  send_to_bound_host  a node of the forward role sends that request, with the value at
+#                         its place, to the host the seal names, over TLS
 #
 # The node source is protocol/src and enclave/src without the code that is compiled for tests
 # only and without the vector generator (`protocol/src/bin/`), which is a separate program.
@@ -43,7 +50,7 @@
 # egress/secret-access.tsv holds one line per function: file, function, uses, use, note. The
 # first three columns are what this script prints. `use` is one of:
 #
-#   K1 K2 K3 K4 K5 K6 K7   the function is that sink
+#   K1 K2 K3 K4 K5 K6 K7 K8 K9   the function is that sink
 #   in-node       the bytes are used inside the node: the result is a secret again, a public
 #                 key, a signature, a ciphertext, or the outcome of a check
 #   declassify    the result leaves in the clear and is one of the declassified values of
@@ -63,15 +70,18 @@ ACCESSOR="expose_secret"
 
 # The sinks: the sink, the name of its function, and how a call of it is written. `function`:
 # after a path or alone. `method`: also after a `.`. K1 is `function` because `seal` is also the
-# name of the method `OauthPlaintext::seal`, the one function that calls K1: `.seal(` is a call
-# of that method. The patterns below are made from this table and from nothing else.
+# name of the two methods that call K1, `OauthPlaintext::seal` and `OperatorValue::seal`:
+# `.seal(` is a call of one of those methods. The patterns below are made from this table and
+# from nothing else.
 SINKS='K1 seal function
 K2 seal_transfer method
 K3 send_to_provider method
 K4 hand_out method
 K5 send_to_log_store method
 K6 imap method
-K7 smtp method'
+K7 smtp method
+K8 seal_secret_use method
+K9 send_to_bound_host method'
 
 SINK_NAMES=$(printf '%s\n' "$SINKS" | cut -d ' ' -f 2 | paste -s -d '|' -)
 
@@ -292,7 +302,7 @@ case "${1:-}" in
         compare "$CALLER_LIST" 1-4 "$callers" "the functions that call a sink" || failed=1
         for use in $(grep -v '^#' "$ACCESS_LIST" | grep -v '^$' | cut -f 4 | LC_ALL=C sort -u); do
             case "$use" in
-                K1 | K2 | K3 | K4 | K5 | K6 | K7 | in-node | declassify) ;;
+                K1 | K2 | K3 | K4 | K5 | K6 | K7 | K8 | K9 | in-node | declassify) ;;
                 *)
                     fail "unknown use '$use' in $ACCESS_LIST"
                     failed=1
