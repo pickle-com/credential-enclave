@@ -352,8 +352,8 @@ struct Credentials { access_key_id: String, secret_access_key: Secret<String>, s
 - Bodies: `POST /v1/forward` and `POST /v1/forward/batch` take and return a frame (5.8), and
   `POST /v1/vault/send` takes a frame and returns a stream (5.16). Every other body is
   `application/json`.
-- The role of a node. One node program runs in two roles (protocol.md 4.1), and a node answers
-  the calls of its own role. `health`, `config`, `attestation` and `close` are calls of either
+- The role of a node. A node of this program takes one of two roles, the delegation role or the
+  forward role (protocol.md 4.1), and answers the calls of its own role. `health`, `config`, `attestation` and `close` are calls of either
   role: none of them reads or changes a delegation, a record or the log of an account.
   `vault/send` is the call of the forward role. Every other call is a call of the delegation
   role. A node starts without a role and takes one once: the forward role with an operator
@@ -876,9 +876,11 @@ which form it holds. The order of the processing:
     searches it together with its last bytes from the part before. It holds back the last
     bytes it received, as many as one byte more than the longest form of the credential can
     take in a reading (36 bytes for each of them), and hands on the bytes in front of them
-    once a search found no form of the credential (it searches when as many new bytes as the
-    longest form has have arrived, at most 16,384 bytes at a time or the length of that form
-    when it is longer, and at the end of the body). How far the bytes that leave lag depends
+    once a search found no form of the credential (it searches when 4,096 new bytes have
+    arrived, or four times the length of the longest form when that is more, and at the end
+    of the body). A reading that decodes escapes is searched for itself only around an
+    escape: where no escape was decoded for as many bytes as a form can have, it is the same
+    bytes as the reading it is decoded from, and one search reads both. How far the bytes that leave lag depends
     on the length of the credential and on nothing else. Its verdict on a body is the verdict
     of step 10 on the same bytes, and a body that holds the credential is cut in front of it:
     no byte of the form leaves, and the bytes held back leave only at the end of a body as
@@ -1594,7 +1596,7 @@ The rules:
   in flight and the body budget are). A `forward`, `forward/batch` or `vault/send` call waits
   for its place and for the shares of the body budget it takes before its request leaves (the
   share its request frame occupies, and for `vault/send` the share the search of its response
-  can hold: about 0.3 MiB for a value of 30 bytes and 2.7 MiB for one of 12,000 bytes) for at
+  can hold: about 20 KiB for a value of 30 bytes and 2.3 MiB for one of 12,000 bytes) for at
   most 30 seconds together (`ADMISSION_WAIT`)
   and ends with `capacity_unavailable` when it has not got them by then: the node reads
   nothing from the connection of a call that waits, so it does not learn that the caller of

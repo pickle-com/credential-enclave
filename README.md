@@ -61,7 +61,7 @@ operator domain (not trusted by the node)        node (AWS Nitro Enclave, memory
 | TOTP seed | When the user enters it | In memory, while `release` computes a code | Ciphertext only. `release` hands out the 6-digit code |
 | Log entry | Opens it with the log decryption key | Creates it, writes it to the log store before the act, keeps it until its storage is acknowledged | Stores it sealed. Cannot delete the copy in the log store for 365 days |
 
-One node program runs in two roles, and a node takes its role once. A node of the delegation role
+A node of this program takes one of two roles, once. A node of the delegation role
 is the node of the picture: it holds the delegations of accounts, and it connects to the addresses
 of its provider definitions and to its log store only. A node of the forward role holds no user
 key, opens no record and writes no log entry. It receives one value of a vault secret at a time,

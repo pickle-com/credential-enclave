@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use credential_enclave_protocol::encoding::{b64u, b64u_decode, to_json, Signed};
 use credential_enclave_protocol::keys::{
-    binding, forward_binding, Custody, LogStoreId, NodeKeys, Role,
+    binding, role_binding, Custody, LogStoreId, NodeKeys, Role,
 };
 use credential_enclave_protocol::log::{self, signed_head, EntryKind, Head};
 use credential_enclave_protocol::record::{self, Kind, Record};
@@ -1275,14 +1275,17 @@ impl Node {
         self.chains.load(Ordering::SeqCst)
     }
 
-    /// The binding of this node (protocol.md 4.1): its two public keys, its release and, when
-    /// it has one, its log store. The binding of a node of the forward role names that role in
-    /// the place of a log store: such a node has none.
+    /// The binding of this node (protocol.md 4.1): its two public keys, its release, its log
+    /// store when it has one, and its role when that is one a binding names. A node of the
+    /// forward role has no log store. A node that has taken no role yet states none, as a
+    /// node of the delegation role does: it is one with the first call of that role.
     pub fn binding(&self) -> Vec<u8> {
-        match self.role.get() {
-            Some(Role::Forward) => forward_binding(&self.keys, self.release),
-            Some(Role::Delegation) | None => binding(&self.keys, self.release, self.log_store.id()),
-        }
+        let role = self.role.get().unwrap_or(Role::Delegation);
+        let log = match role {
+            Role::Forward => None,
+            Role::Delegation | Role::Reserve => self.log_store.id(),
+        };
+        role_binding(&self.keys, self.release, log, role)
     }
 
     /// The age of the oldest pending entry in milliseconds of node time, as the last sweep of

@@ -178,20 +178,21 @@ pub struct NodeBinding {
     pub release: String,
     /// The log store the node writes its entries to before it acts, when it has one.
     pub log: Option<LogStoreId>,
-    /// The role of the node: the forward role when the binding says so, the delegation role
-    /// otherwise.
+    /// The role of the node: the role the key `role` of the binding names, the delegation role
+    /// for a binding without that key.
     pub role: Role,
 }
 
 /// Reads a binding document (protocol.md 4.1):
 /// `{"v":1,"sign":b64u(32 bytes),"seal":b64u(32 bytes),"release":"..."}` of at most 512 bytes,
-/// with the key `"log":{"bucket":"...","region":"..."}` when the node has a log store, or the
-/// key `"role":"forward"` when the node has the forward role.
+/// with the key `"log":{"bucket":"...","region":"..."}` when the node has a log store, and the
+/// key `"role"` when the node has the reserve role (`reserve`) or the forward role (`forward`).
 /// A sealing key HPKE cannot seal to (a small-order point) is refused, so whatever is sealed
 /// for the keys of a binding this function returned can be sealed. A `log` that is not a bucket
 /// name and a region name is refused: a binding states its log store or none. A `role` that is
-/// not the string `forward` is refused, and so is a binding with both a `role` and a `log`: a
-/// node of the forward role has no log store.
+/// neither the string `reserve` nor the string `forward` is refused: it names no role this
+/// release knows. So is a binding with the role `forward` and a `log`: a node of the forward
+/// role has no log store.
 pub fn read_binding(binding: &[u8]) -> Result<NodeBinding, AttestationError> {
     binding_of(binding).ok_or(AttestationError::Malformed)
 }
@@ -1831,9 +1832,24 @@ mod tests {
             |binding| binding["log"] = json!({"bucket": "character-credential-log-prod-1", "region": "us-west-2", "future": 1}),
         ));
         assert_eq!(stated.unwrap().log, Some(log));
-        // A binding states the forward role, or it is the binding of a node of the delegation
-        // role.
+        // A binding states the reserve role or the forward role, or it is the binding of a
+        // node of the delegation role. A node of the reserve role has a log store, like one
+        // of the delegation role.
         assert_eq!(read_binding(&value(|_| {})).unwrap().role, Role::Delegation);
+        let reserve = read_binding(&value(|binding| {
+            binding["role"] = json!("reserve");
+            binding["log"] =
+                json!({"bucket": "character-credential-log-prod-1", "region": "us-west-2"});
+        }))
+        .unwrap();
+        assert_eq!(reserve.role, Role::Reserve);
+        assert!(reserve.log.is_some());
+        assert_eq!(
+            read_binding(&value(|binding| binding["role"] = json!("reserve")))
+                .unwrap()
+                .role,
+            Role::Reserve
+        );
         let forward = read_binding(&forward_binding(&keys, "v1.0.0")).unwrap();
         assert_eq!((forward.role, forward.log), (Role::Forward, None));
         assert_eq!(forward.seal_public, keys.seal_public());
@@ -1844,10 +1860,12 @@ mod tests {
             Role::Forward
         );
 
-        let changes: [fn(&mut serde_json::Value); 22] = [
+        let changes: [fn(&mut serde_json::Value); 24] = [
             // A role this release does not know, and a role that is no string.
             |binding| binding["role"] = json!("delegation"),
             |binding| binding["role"] = json!("Forward"),
+            |binding| binding["role"] = json!("Reserve"),
+            |binding| binding["role"] = json!("witness"),
             |binding| binding["role"] = json!(""),
             |binding| binding["role"] = json!(null),
             |binding| binding["role"] = json!(["forward"]),

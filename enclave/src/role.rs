@@ -24,10 +24,12 @@ impl RoleCell {
     const NONE: u8 = 0;
     const DELEGATION: u8 = 1;
     const FORWARD: u8 = 2;
+    const RESERVE: u8 = 3;
 
     fn code(role: Role) -> u8 {
         match role {
             Role::Delegation => RoleCell::DELEGATION,
+            Role::Reserve => RoleCell::RESERVE,
             Role::Forward => RoleCell::FORWARD,
         }
     }
@@ -36,6 +38,7 @@ impl RoleCell {
     pub fn get(&self) -> Option<Role> {
         match self.0.load(Ordering::SeqCst) {
             RoleCell::DELEGATION => Some(Role::Delegation),
+            RoleCell::RESERVE => Some(Role::Reserve),
             RoleCell::FORWARD => Some(Role::Forward),
             _ => None,
         }

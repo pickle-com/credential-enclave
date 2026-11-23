@@ -155,23 +155,28 @@ binding = UTF-8(JSON {"v":1,"sign":b64u(node signing public key),"seal":b64u(nod
 ```
 
 - `binding` is at most 512 bytes long.
-- `role` names the role of a node. One node program runs in two roles (enclave.md section 4). A
-  node of the delegation role holds the delegations of accounts, and its binding has no `role`
-  key. A node of the forward role holds no delegation, opens no record and writes no log entry:
-  it sends the one request of a use of a vault secret that a node of the delegation role sealed
-  to it (10.5). Its binding is the two keys and the release with `"role":"forward"` behind them,
-  and it has no `log` key:
+- `role` names the role of a node, and a binding states it by its value. A node of the
+  delegation role holds the delegations of accounts, and its binding has no `role` key. The
+  value `reserve` names the role of a node that holds delegations as well, and that gives and
+  takes delegation transfers: its binding carries the key behind its `log`. The value `forward`
+  names the forward role (enclave.md section 4): such a node holds no delegation, opens no
+  record and writes no log entry. It sends the one request of a use of a vault secret that a
+  node of the delegation role sealed to it (10.5). Its binding is the two keys and the release
+  with `"role":"forward"` behind them, and it has no `log` key:
 
   ```text
   binding = UTF-8(JSON {"v":1,"sign":b64u(node signing public key),"seal":b64u(node sealing public key),"release":"v1.0.0","role":"forward"})
   ```
 
-  A node takes its role once and does not change it, so the `role` of a binding a verifier read
-  holds for as long as that node lives. Whoever hands a user key to a node refuses a node whose
-  binding has a `role` key, whatever its value: an app before it sends the command grant (5.3),
-  and a node before it seals a delegation transfer (10.1). A node of the delegation role seals a
-  use of a vault secret to a node whose binding has the `role` `forward`, and to no other node
-  (10.5).
+  A `role` of any other value names no role: a document with such a binding is no binding, and
+  so is one with the role `forward` and a `log`. A node takes its role once and does not change
+  it, so the `role` of a binding a verifier read holds for as long as that node lives. Whoever
+  hands a user key to a node reads the role by its value: an app before it sends the command
+  grant (5.3), and a node before it seals a delegation transfer (10.1), hand a user key to a
+  node whose binding has no `role` key or the `role` `reserve`, and to no node whose binding
+  has the `role` `forward` or a value this section does not define. A node of the delegation
+  role seals a use of a vault secret to a node whose binding has the `role` `forward`, and to
+  no other node (10.5).
 - `log` names the log store of the node (7.6): the bucket and its region. A node that has no log
   store writes no `log` key: its binding ends with `release`. A node takes a log store once and
   does not change it (enclave.md 5.1), so the `log` of a binding a verifier read holds for as long
@@ -1078,6 +1083,7 @@ receiving node):
 | 2 | The platform of the receiving node is the platform of this node (nothing is handed to a node of another custody) | `peer_unverified` |
 | 3 | Platform `nitro`: PCR0, PCR1 and PCR2 of the receiving node all equal those of this node (without an endorsement, delegations go to a node of the same release only. A PCR whose value is all zero is refused). A call with an endorsement follows check 7 of 10.3 in the place of this step | `peer_unverified` |
 | 3a | The log store that the binding of the receiving node names is the log store of this node: the same bucket and the same region, or no `log` on both sides (delegations stay among nodes that write to the same log store) | `peer_unverified` |
+| 3b | The binding of the receiving node has no `role` key or the `role` `reserve` (4.1: delegations stay among nodes that hold delegations. A node of the forward role takes none, and a binding with any other `role` is no binding) | `peer_unverified` |
 | 4 | The receiving node is not this node | `invalid_request` |
 | 4a | The node can write to its log store (7.6). A node of platform `local` without a log store passes | `log_store_unavailable` |
 | 5 | The node selects the accounts that have a grant within its time, in the lexical order of `user_id`, one page at a time (at most 1,000 accounts). An account whose final head (`final`) is already signed is skipped (no entry may follow a final head, and no transfer is made without its entry). An account whose grant was handed to 64 other nodes is skipped as well (see below). For every selected account, inside the lock of that account: when the node hands that grant to the receiving node for the first time, it creates the log entry `grant_transferred_out` | |

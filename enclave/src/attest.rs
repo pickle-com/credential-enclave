@@ -195,8 +195,10 @@ fn read_peer(
     if binding.log.as_ref() != log {
         return None;
     }
-    // And it stays among nodes of the delegation role.
-    if binding.role != Role::Delegation {
+    // And it stays among nodes that hold delegations: a node whose binding names no role, and
+    // a node of the reserve role. A node of the forward role takes none, and a binding that
+    // names any other role is no binding (`read_binding`).
+    if !binding.role.holds_delegations() {
         return None;
     }
     Some(Peer {
@@ -990,6 +992,22 @@ mod tests {
         };
         assert!(!refused(binding_with(|_| {})));
         assert!(refused(binding_with(|binding| binding["v"] = json!(2))));
+        // A delegation goes to a node that holds delegations: one whose binding names no
+        // role, and one of the reserve role. It goes to no node of the forward role, and a
+        // binding that names any other role is no binding.
+        assert!(!refused(binding_with(
+            |binding| binding["role"] = json!("reserve")
+        )));
+        for role in ["forward", "delegation", "Reserve", "witness", ""] {
+            let keys = NodeKeys::from_random(&[0x11; 32], &[0x22; 32]);
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&binding(&keys, "v1.0.0", None)).unwrap();
+            value["role"] = json!(role);
+            assert!(
+                refused(response("local", &local_document(&to_json(&value)))),
+                "{role:?}"
+            );
+        }
         assert!(refused(binding_with(
             |binding| binding["seal"] = json!(b64u(&[0u8; 32]))
         )));
