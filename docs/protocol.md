@@ -1568,9 +1568,10 @@ grant command the node takes. A node of an accepted release whose `program_min` 
 version of the program receives no grant of that program. It is counted with the nodes of a later
 release in the result of a synchronization, and a runtime asks it once. It is no node of a release
 the program does not accept: its entries are judged as those of an accepted node, and nothing is
-kept of its measurement. A binding whose `program_min` is anything but a non-negative integer is
-refused (the target of a revoke is read whatever it states). A binding without the key states
-none.
+kept of its measurement. A node whose binding states a `program_min` that is anything but a
+non-negative integer fails the attestation of a node that is to receive a key, and receives none
+(the target of a revoke is read whatever it states). Its node document is read as that of any
+node: a node document hands no key over. A binding without the key states none.
 
 ### The release proofs
 

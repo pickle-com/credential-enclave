@@ -545,13 +545,31 @@ test("a node of an accepted release whose binding asks for a later program recei
   // The program of the version the node asks for hands it the grant.
   await S.start(fx, fx.source.replace(/^\s*const VERSION = \d+;/m, "  const VERSION = " + (version + 1) + ";"));
   assert.equal(ahead.grants.has(world.userId), true);
-  // A binding whose program_min is no non-negative integer is no binding.
+  // A node whose binding states a program_min that is no non-negative integer fails the
+  // attestation of a node that is to receive a key. Its node document is read as that of any
+  // node: when the key of the account reaches it by a transfer, its entries are those of an
+  // accepted node, and no round is held back.
   for (const value of ["44", -1, 1.5, null]) {
-    const odd = S.fixture(source, { nodes: 1 });
+    const odd = S.fixture(source, { nodes: 1, device: { securityStatus: true } });
     const node = odd.world.addNode({ release: "v2.4.0", measurement: odd.measurement, programMin: value });
     await S.start(odd);
     assert.equal(node.grants.has(odd.world.userId), false, String(value));
     assert.equal(odd.world.runtime.rejected_nodes, 1, String(value));
+    const first = odd.nodes[0];
+    first.record("c", [{
+      t: "grant_transferred_out", time_ms: odd.world.now, to: node.id, release: "v2.4.0",
+      pcr0: odd.measurement.pcr0, pcr1: odd.measurement.pcr1, pcr2: odd.measurement.pcr2,
+    }]);
+    node.grants.set(odd.world.userId, first.grants.get(odd.world.userId));
+    node.record("c", [{ t: "grant_transferred_in", time_ms: odd.world.now, from: first.id, release: "v2.4.0", not_after_ms: odd.world.now + 30 * S.DAY_MS, custody: "enclave" }]);
+    node.record("c", [{ t: "connection_created", time_ms: odd.world.now, record_id: "r", provider: "slack", scope: "" }]);
+    for (let day = 0; day < 4; day += 1) {
+      await nextDay(odd);
+      assert.equal(odd.world.state.log.status, "verified", String(value) + " day " + day);
+    }
+    assert.deepEqual(odd.world.stored("log.blocked"), { first_ms: 0, count: 0 }, String(value));
+    assert.equal(odd.world.securityStatuses.filter((item) => item.status === "attention").length, 0, String(value));
+    assert.equal(odd.world.stored("log.nodes")[node.id].r, "v2.4.0", String(value));
   }
   // When no node takes a grant of this program, a procedure of the user fails as for the nodes
   // of a later release.

@@ -1167,10 +1167,11 @@
    *  revoke is read whatever its role, since a revoke hands no key over. When logStore is true
    *  the binding must name the log store of this server target. A binding may state
    *  program_min, a non-negative integer: the lowest version of the program whose grant command
-   *  the node takes. A binding without the key states none, and one whose program_min is
-   *  anything else is refused (unless anyRole is set: the target of a revoke is read whatever
-   *  it states). Returns {signPk, sealPk, release, role, programMin} (role: the role of the
-   *  binding, undefined when it has none; programMin: 0 when the binding states none). */
+   *  the node takes. A binding without the key states none. Returns {signPk, sealPk, release,
+   *  role, programMin} (role: the role of the binding, undefined when it has none; programMin: 0
+   *  when the binding states none, and null when it states anything but a non-negative integer:
+   *  a node with such a binding receives no key, verifyAttestation, and its node document is
+   *  read as that of any node, since a node document hands no key over). */
   function readBinding(bindingBytes, logStore, anyRole) {
     if (bindingBytes.length > 512) throw attestationFailure("binding size");
     const binding = JSON.parse(text(bindingBytes));
@@ -1182,7 +1183,6 @@
       throw attestationFailure("binding role");
     }
     const programMin = binding.program_min === undefined ? 0 : countOf(binding.program_min, false);
-    if (anyRole !== true && programMin === null) throw attestationFailure("binding program_min");
     const signPk = decode(binding.sign);
     const sealPk = decode(binding.seal);
     if (signPk.length !== 32 || sealPk.length !== 32) throw attestationFailure("binding keys");
@@ -1198,8 +1198,7 @@
       }
     }
     return {
-      signPk: signPk, sealPk: sealPk, release: binding.release, role: binding.role,
-      programMin: programMin === null ? 0 : programMin,
+      signPk: signPk, sealPk: sealPk, release: binding.release, role: binding.role, programMin: programMin,
     };
   }
 
@@ -1243,6 +1242,8 @@
         throw attestationFailure("unknown platform");
       }
       const binding = readBinding(verified.binding, verified.logStore === true, gate === false);
+      // A node that is to receive a key states a program_min this program reads, or none.
+      if (gate !== false && binding.programMin === null) throw attestationFailure("binding program_min");
       // The challenge statement: the signed value that this node issued the challenge of the
       // response in answer to the nonce of this request. The challenge is plaintext outside the
       // document, so without the statement the relay could hand the challenge of an earlier request
@@ -1273,7 +1274,7 @@
         release: binding.release, platform: response.platform,
         custody: response.platform === "nitro" ? "enclave" : "operator", timeMs: verified.timeMs,
         measure: measure, listed: response.platform !== "nitro" || build !== undefined, role: binding.role,
-        programMin: binding.programMin,
+        programMin: binding.programMin === null ? 0 : binding.programMin,
         format: response.platform === "nitro" ? (build === undefined ? 3 : logFormatOf(build.release))
           : logFormatOf(binding.release),
       };
