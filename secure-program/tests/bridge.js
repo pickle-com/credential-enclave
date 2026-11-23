@@ -632,6 +632,7 @@ class World {
     this.device = {
       platform: "ios", debug_build: false, locale: "en-US", sheets: false, securityStatus: false,
       ownerAuth: true, ownerAuths: [], prompts: [], presented: [], promptAnswer: null, webAuth: null,
+      confirmations: false, confirmAnswer: true, confirmed: [],
     };
     if (given.device) Object.assign(this.device, given.device);
     // The backend: which routes it has, and the faults of a fixture (see fault).
@@ -866,7 +867,10 @@ class World {
     const body = typeof bodyText === "string" && bodyText !== "" ? JSON.parse(bodyText) : null;
     const absent = () => json(404, { detail: "Not Found" });
     if (method === "GET" && path === "/api/secure/account") {
-      return json(200, { user_id: this.userId, key: this.account.key === null ? null : { key_id: this.account.key.key_id } });
+      const account = { user_id: this.userId, key: this.account.key === null ? null : { key_id: this.account.key.key_id } };
+      // The backend names the vault items with a name only for an account it turned them on for.
+      if (this.account.namedSecrets === true) account.named_secrets = true;
+      return json(200, account);
     }
     if (method === "PUT" && path === "/api/secure/account/key") {
       const signPk = bytes(body.sign_pk);
@@ -1235,7 +1239,8 @@ function keychainName(item) {
 /** The global native of one runtime on world: the functions of the bridge tables that the flows of
  *  the tests reach, and a stub that fails with invalid_argument for the ones they do not (the
  *  hardware key of the device, RSA). The functions a later build of the apps adds
- *  (securityStatus, promptSecret, presentSecret) exist only when the device of the world has them.
+ *  (securityStatus, promptSecret, presentSecret, confirmDestinations) exist only when the device
+ *  of the world has them.
  *  While world.bridgeOpen is false (the top-level evaluation) every call fails with cancelled. */
 function makeNative(world) {
   const device = world.device;
@@ -1371,6 +1376,18 @@ function makeNative(world) {
       if (!valid) return Promise.reject(new SecureError("invalid_argument", "presentSecret"));
       device.presented.push(JSON.parse(JSON.stringify(args)));
       return Promise.resolve(null);
+    };
+  }
+  if (device.confirmations) {
+    asyncFunctions.confirmDestinations = (args) => {
+      const valid = args !== null && typeof args === "object" && typeof args.title === "string" &&
+        args.title.length >= 1 && args.title.length <= 120 && Array.isArray(args.destinations) &&
+        args.destinations.length >= 1 && args.destinations.length <= 16 &&
+        args.destinations.every((line) => typeof line === "string" && line.length >= 1 && line.length <= 200);
+      if (!valid) return Promise.reject(new SecureError("invalid_argument", "confirmDestinations"));
+      device.confirmed.push(JSON.parse(JSON.stringify(args)));
+      const answer = typeof device.confirmAnswer === "function" ? device.confirmAnswer(args) : device.confirmAnswer;
+      return Promise.resolve(answer === true ? { confirmed: true } : null);
     };
   }
   const stubs = ["rsaVerify", "secureEnclaveP256Create", "secureEnclaveP256PublicKey", "secureEnclaveP256Sign"];

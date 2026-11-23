@@ -7594,7 +7594,10 @@
    *  (fetched: the promise of the query when the caller sent it ahead). When the user_id of the
    *  response differs from the bound userId (the account the server authenticated and the bound
    *  account of this device differ), the key is not read, key_state account_mismatch is published
-   *  and the call ends with account_mismatch (a response without user_id counts as no mismatch). */
+   *  and the call ends with account_mismatch (a response without user_id counts as no mismatch).
+   *  A response of this account that says named_secrets true is published as
+   *  runtime.named_secrets true (the screens of the app choose their names by it); any other
+   *  response leaves what this runtime published. */
   async function registeredKeyId(turn, fetched) {
     const body = (await (fetched === undefined ? api(turn, "GET", "/api/secure/account") : fetched)).json;
     if (typeof body.user_id === "string" && body.user_id !== "" && body.user_id !== userId()) {
@@ -7606,6 +7609,10 @@
       throw native.error("account_mismatch", "server account differs from bound account");
     }
     accountMismatch = false;
+    // The backend turns the vault items with a name on for an account. The value is what the
+    // operator domain says, handed on to the screens as it is: no procedure of this program
+    // acts on it.
+    if (body.named_secrets === true) native.publish({ runtime: { named_secrets: true } });
     const key = body.key;
     if (key === null) return null;
     if (key === undefined || typeof key !== "object" || typeof key.key_id !== "string" || key.key_id === "") {
@@ -8724,9 +8731,15 @@
     return { sites: hosts, slots: places };
   }
 
+  // What separates the names of a list argument given as one string: commas and white space
+  // between the hosts of sites, white space alone between slots (the name of a json slot may
+  // hold a comma).
+  const HOST_SEPARATOR = /[\s,]+/;
+  const SLOT_SEPARATOR = /\s+/;
+
   /** A list argument of a definition action: an array, the JSON of one, the string "any", or
-   *  names separated by commas or white space. */
-  function listArgument(value) {
+   *  names in one string, separated by separator. null for any other value. */
+  function listArgument(value, separator) {
     if (Array.isArray(value)) return value;
     if (typeof value !== "string") return null;
     const trimmed = value.trim();
@@ -8739,7 +8752,31 @@
         return null;
       }
     }
-    return trimmed.split(/[\s,]+/).filter(function (part) { return part !== ""; });
+    return trimmed.split(separator).filter(function (part) { return part !== ""; });
+  }
+
+  /** Whether a list argument was given: an array, or a string that is not blank. */
+  function listGiven(value) {
+    return Array.isArray(value) || (typeof value === "string" && value.trim() !== "");
+  }
+
+  /** Whether two lists of a reach (the hosts, or the slots) name the same members, in whatever
+   *  order: the string "any" equals itself alone. */
+  function sameMembers(one, other) {
+    if (!Array.isArray(one) || !Array.isArray(other)) return one === "any" && other === "any";
+    return one.every(function (member) { return other.indexOf(member) >= 0; }) &&
+      other.every(function (member) { return one.indexOf(member) >= 0; });
+  }
+
+  /** Whether a label is one an item can have: 80 characters at most and no control character
+   *  (the rule of the backend, so that a label it would refuse ends the call before anything is
+   *  asked of the user). */
+  function labelAccepted(label) {
+    const symbols = Array.from(label);
+    return symbols.length <= 80 && symbols.every(function (symbol) {
+      const code = symbol.codePointAt(0);
+      return code > 0x1f && (code < 0x7f || code > 0x9f);
+    });
   }
 
   /** The plaintext of a record of kind vault_secret as a device writes it (base64url of the UTF-8
@@ -8772,7 +8809,7 @@
 
   const SLOT_WORDS = {
     en: { field: "typed into its pages", path: "the path of a request", "basic:user": "the user name of a request", "basic:password": "the password of a request", header: "request header ", query: "request parameter ", form: "form field ", json: "JSON field ", any: "Any website", below: " and the hosts below it" },
-    ko: { field: "웹 페이지에 입력", path: "요청의 주소 경로", "basic:user": "요청의 사용자 이름", "basic:password": "요청의 비밀번호", header: "요청 헤더 ", query: "요청 매개변수 ", form: "폼 필드 ", json: "JSON 필드 ", any: "모든 웹사이트", below: "과 그 하위 호스트" },
+    ko: { field: "웹 페이지에 입력", path: "요청의 주소 경로", "basic:user": "요청의 사용자 이름", "basic:password": "요청의 비밀번호", header: "요청 헤더 ", query: "요청 매개변수 ", form: "폼 필드 ", json: "JSON 필드 ", any: "모든 웹사이트", below: " 및 그 하위 호스트" },
     ja: { field: "ページに入力", path: "リクエストのパス", "basic:user": "リクエストのユーザー名", "basic:password": "リクエストのパスワード", header: "リクエストヘッダー ", query: "リクエストパラメータ ", form: "フォーム項目 ", json: "JSON項目 ", any: "すべてのウェブサイト", below: "とその下位ホスト" },
   };
 
@@ -8826,42 +8863,90 @@
     return title.slice(0, 120);
   }
 
+  /** The value of a secret from the user: in a build with the protected sheets it is asked for in
+   *  the input sheet, with the lines of where the value can go made from reach; otherwise it is
+   *  the argument value. A sheet the user closes ends the call with cancelled. */
+  async function askedValue(turn, args, title, reach) {
+    if (!protectedSheets()) return args.value;
+    const answer = await interactive(turn, function () {
+      return native.promptSecret({ title: title, destinations: destinationLines(reach) });
+    });
+    if (answer === null || typeof answer !== "object") throw native.error("cancelled", "secret prompt");
+    return answer.value;
+  }
+
   /** store_secret: makes the value the user entered a record of kind vault_secret and uploads it.
-   *  The name, the sites and the slots of the item come from the backend and are checked against
-   *  the form of a vault secret before they enter the plaintext. Without a name, the item is made
-   *  first from the label, sites and slots given (an item the user adds on the vault screen). In a
-   *  build with the protected sheets the value is asked for in the input sheet, with the lines of
-   *  where the value can go made from the reach that is sealed; otherwise it is the argument
-   *  value. A node that holds the grant is made sure of before the value is asked for. */
+   *  A node that holds the grant is made sure of before the value is asked for.
+   *  With a name (an item that exists): the name, the sites and the slots of the item come from
+   *  the backend and are checked against the form of a vault secret before they enter the
+   *  plaintext. The arguments sites and slots, when given, are the reach the screen showed the
+   *  user: a reach of the item that names other hosts or other slots ends the call with
+   *  binding_changed, and nothing is sealed. The lines of the input sheet are made from the reach
+   *  that is sealed.
+   *  Without a name (an item the user adds on the vault screen): storeNewSecret. */
   async function storeSecret(turn, args) {
     const keys = await presentKeys(turn);
     const custody = await recordCustody(turn);
-    let name = stringArgument(args.name).trim();
-    if (name === "") {
-      const wanted = readReach(listArgument(args.sites), listArgument(args.slots));
-      if (wanted === null) throw native.error("invalid_input", "sites and slots");
-      const made = (await api(turn, "POST", VAULT_PATH + "/secret", {
-        label: stringArgument(args.label).trim(), sites: wanted.sites, slots: wanted.slots,
-      })).json;
-      name = stringArgument(made.name);
-    }
+    const name = stringArgument(args.name).trim();
+    if (name === "") return storeNewSecret(turn, args, keys, custody);
     if (!SECRET_NAME.test(name)) throw native.error("invalid_input", "name");
     const item = (await api(turn, "GET", VAULT_PATH + "/secret/" + name)).json;
     const reach = readReach(item.sites, item.slots);
     if (item.name !== name || reach === null) throw native.error("invalid_response", "secret");
-    let value = args.value;
-    if (protectedSheets()) {
-      const answer = await interactive(turn, function () {
-        return native.promptSecret({ title: sheetTitle(item.label, name), destinations: destinationLines(reach) });
-      });
-      if (answer === null || typeof answer !== "object") throw native.error("cancelled", "secret prompt");
-      value = answer.value;
+    for (const part of ["sites", "slots"]) {
+      if (!listGiven(args[part])) continue;
+      const shown = listArgument(args[part], part === "sites" ? HOST_SEPARATOR : SLOT_SEPARATOR);
+      if (shown === null) throw native.error("invalid_input", part);
+      if (!sameMembers(shown, reach[part])) throw native.error("binding_changed", part);
     }
+    const value = await askedValue(turn, args, sheetTitle(item.label, name), reach);
     const record = sealRecordBytes(keys, custody, "vault_secret", "vault", secretPlaintext(value, name, reach, "device"));
     const saved = (await api(turn, "PUT", VAULT_PATH + "/secret/" + name, {
       record: record, sites: reach.sites, slots: reach.slots,
     })).json;
     return { name: name, state: typeof saved.state === "string" ? saved.state : "ready" };
+  }
+
+  /** store_secret without a name: makes an item from the label, sites and slots given and stores
+   *  the value in it. The item is made only once the value is known to be one an item can hold:
+   *  the form of the label, the sites and the slots is checked, the value is asked for (the lines
+   *  of the input sheet are made from the reach given), and the value is checked (not empty, no
+   *  U+0000, a plaintext within the longest padded length, whatever name the item gets) before
+   *  the request that makes the item. The reach the backend then gives for the item must name
+   *  the hosts and the slots that were shown (binding_changed otherwise). When a step after the
+   *  item was made fails, the item is removed with one request, whose failure changes nothing,
+   *  and the call ends with the failure of that step: an item this call made is never left
+   *  without a value. */
+  async function storeNewSecret(turn, args, keys, custody) {
+    const label = stringArgument(args.label).trim();
+    if (!labelAccepted(label)) throw native.error("invalid_input", "label");
+    const wanted = readReach(listArgument(args.sites, HOST_SEPARATOR), listArgument(args.slots, SLOT_SEPARATOR));
+    if (wanted === null) throw native.error("invalid_input", "sites and slots");
+    const first = wanted.sites === "any" ? SLOT_WORDS[language()].any : wanted.sites[0];
+    const value = await askedValue(turn, args, sheetTitle(label, first), wanted);
+    secretPlaintext(value, "A".repeat(64), wanted, "device");
+    const made = (await api(turn, "POST", VAULT_PATH + "/secret", {
+      label: label, sites: wanted.sites, slots: wanted.slots,
+    })).json;
+    const name = stringArgument(made.name);
+    try {
+      if (!SECRET_NAME.test(name)) throw native.error("invalid_response", "name");
+      const item = (await api(turn, "GET", VAULT_PATH + "/secret/" + name)).json;
+      const reach = readReach(item.sites, item.slots);
+      if (item.name !== name || reach === null) throw native.error("invalid_response", "secret");
+      if (!sameMembers(wanted.sites, reach.sites) || !sameMembers(wanted.slots, reach.slots)) {
+        throw native.error("binding_changed", "secret");
+      }
+      const record = sealRecordBytes(keys, custody, "vault_secret", "vault", secretPlaintext(value, name, reach, "device"));
+      const saved = (await api(turn, "PUT", VAULT_PATH + "/secret/" + name, {
+        record: record, sites: reach.sites, slots: reach.slots,
+      })).json;
+      return { name: name, state: typeof saved.state === "string" ? saved.state : "ready" };
+    } catch (failure) {
+      // The request is one of its own turn: it is sent when the time of the call has passed too.
+      if (SECRET_NAME.test(name)) await settled(api(freeTurn(), "DELETE", VAULT_PATH + "/secret/" + name));
+      throw failure;
+    }
   }
 
   /** The plaintext of the record of the item name, opened with the user key of this device:
@@ -8899,16 +8984,47 @@
     return { name: name };
   }
 
-  /** update_secret: changes the reach of an item. The device owner authentication comes before
-   *  the query. An item with a record has it opened and sealed again under the same id with the new
+  /** update_secret: changes the reach of an item. Without the argument slots (absent or blank)
+   *  the slots stay what the item has. In a build with the bridge primitive confirmDestinations
+   *  the user confirms the new reach first, on a surface the app binary draws: the lines are
+   *  made from the new reach as the lines of the input sheet are, the confirmation comes before
+   *  the device owner authentication and before the request that changes the item, and a
+   *  confirmation the user closes ends the call with cancelled. (When the slots stay what the
+   *  item has, the item is read before the confirmation, so that the lines name them; an item
+   *  whose slots are other ones when it is read again after the confirmation is not written:
+   *  binding_changed.) The device owner authentication comes before the query whose record is
+   *  opened. An item with a record has it opened and sealed again under the same id with the new
    *  reach (the source of the value stays what it was). */
   async function updateSecret(turn, args) {
     const name = secretName(args);
-    const reach = readReach(listArgument(args.sites), listArgument(args.slots));
-    if (reach === null) throw native.error("invalid_input", "sites and slots");
+    const sites = listArgument(args.sites, HOST_SEPARATOR);
+    const slotsGiven = listGiven(args.slots);
+    // The reach the item is to have: the hosts given, and the slots given or those of the item.
+    const reachOf = function (item) {
+      if (!slotsGiven && readReach(item.sites, item.slots) === null) throw native.error("invalid_response", "secret");
+      const wanted = readReach(sites, slotsGiven ? listArgument(args.slots, SLOT_SEPARATOR) : item.slots);
+      if (wanted === null) throw native.error("invalid_input", "sites and slots");
+      return wanted;
+    };
+    if (slotsGiven) reachOf(null);
     const keys = heldKeys();
+    let confirmed = null;
+    if (typeof native.confirmDestinations === "function") {
+      const before = slotsGiven ? null : (await api(turn, "GET", VAULT_PATH + "/secret/" + name)).json;
+      confirmed = reachOf(before);
+      const answer = await interactive(turn, function () {
+        return native.confirmDestinations({
+          title: sheetTitle(before === null ? "" : before.label, name), destinations: destinationLines(confirmed),
+        });
+      });
+      if (answer === null || typeof answer !== "object" || answer.confirmed !== true) {
+        throw native.error("cancelled", "destinations");
+      }
+    }
     await ownerAuth(turn, "change");
     const item = (await api(turn, "GET", VAULT_PATH + "/secret/" + name)).json;
+    const reach = reachOf(item);
+    if (confirmed !== null && !sameMembers(confirmed.slots, reach.slots)) throw native.error("binding_changed", "slots");
     const body = { sites: reach.sites, slots: reach.slots };
     if (item.record !== undefined && item.record !== null) {
       const secret = openSecret(keys, item, name);
@@ -9869,9 +9985,11 @@
         // A new runtime does not take over the transfer of the previous runtime (the secrets exist
         // in the runtime only): the transfer state is cleared. The calls the runtime before left
         // open are counted as interrupted (outcomes), and the build is asked for its protected
-        // sheets.
+        // sheets. What a runtime before published of the vault items with a name (of this
+        // account or of another) does not stand: it is false until the account query of this
+        // runtime says otherwise.
         resetTransfer();
-        native.publish({ runtime: { protected_sheets: protectedSheets() } });
+        native.publish({ runtime: { protected_sheets: protectedSheets(), named_secrets: false } });
         // The state of the log that a program before this one published is not a judgement of
         // this program: until this program ended a round on this installation, the log is pending.
         if (storedObject(STORE_ROUND).v !== VERSION) native.publish({ state: { log: keptLogState() } });

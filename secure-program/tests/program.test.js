@@ -3495,11 +3495,13 @@ test("the log screen reads eight objects under a seq of a chain of format 2: obj
   // The entry of the node is the first of those lines, verified.
   assert.equal(lines(shown), "3210");
   assert.equal(heldReads(world), undefined);
-  // Nine such objects under the seq of the entry before it: none of the eight the screen reads
-  // is the entry of the node. Its line is not verified, it stands where the latest key under the
-  // seq places it (below the entry after it and above the entry before it), and the read goes to
-  // the rounds.
-  for (let j = 0; j < 9; j += 1) strayObject(fx, chain, used[2].seq, 1, "u", String(j));
+  // Nine objects someone else wrote under the seq of the entry before it, eight of them in front
+  // of the key of the node and one whose key names a time a year from now: none of the eight the
+  // screen reads is the entry of the node. Its line is not verified, and it stands between the
+  // entry after it and the entry before it (the earlier times move it no further down, and the
+  // later time does not move it above the seq after it). The read goes to the rounds.
+  for (let j = 0; j < 8; j += 1) strayObject(fx, chain, used[2].seq, 1, "u", String(j));
+  strayObject(fx, chain, used[2].seq, world.now + 400 * DAY_MS, "u", "9");
   await S.start(fx);
   const again = await S.call(fx, "read_log", { limit: 50 });
   assert.equal(lines(again), "3?10");
@@ -3994,6 +3996,213 @@ test("reveal_secret opens a record of kind vault_secret of the name asked for an
   assert.equal(leaked(world, value), false);
 });
 
+test("update_secret has the user confirm the new reach on a surface the app draws, before the device owner is asked and before anything is asked of the backend, in a build that has the confirmation; a confirmation the user closes changes nothing and is no failure", async () => {
+  const value = "sk-live-0123456789abcdefghij";
+  for (const confirmations of [false, true]) {
+    const fx = S.fixture(source, { device: { confirmations: confirmations, locale: "ko-KR" } });
+    await S.start(fx);
+    const world = fx.world;
+    await S.call(fx, "store_secret", { label: "key", sites: ["api.openai.com"], slots: ["header:authorization"], value: value });
+    const auths = world.device.ownerAuths.length;
+    const requests = world.requests.length;
+    let seen = null;
+    world.device.confirmAnswer = () => {
+      seen = { auths: world.device.ownerAuths.length, requests: world.requests.length };
+      return true;
+    };
+    const changed = await S.call(fx, "update_secret", { name: "SECRET_1", sites: "api.openai.com files.openai.com", slots: "header:authorization" });
+    assert.deepEqual(changed, { ok: true, value: { name: "SECRET_1", sites: ["api.openai.com", "files.openai.com"], slots: ["header:authorization"] } });
+    assert.equal(world.device.ownerAuths.length, auths + 1);
+    if (confirmations) {
+      // The lines are the ones of the reach that is sealed, and the user saw them first.
+      assert.deepEqual(world.device.confirmed, [{
+        title: "SECRET_1", destinations: ["api.openai.com · 요청 헤더 authorization", "files.openai.com · 요청 헤더 authorization"],
+      }]);
+      assert.deepEqual(seen, { auths: auths, requests: requests });
+    } else {
+      assert.equal(seen, null);
+    }
+    assert.deepEqual(openRecord(fx.keys, world.vault.secrets.get("SECRET_1").record).json.sites, ["api.openai.com", "files.openai.com"]);
+  }
+  // The user closes the confirmation: no device owner authentication, no request, the item as it
+  // was, and the call is not counted as one that failed.
+  const fx = S.fixture(source, { device: { confirmations: true, confirmAnswer: false } });
+  await S.start(fx);
+  const world = fx.world;
+  await S.call(fx, "store_secret", { label: "pin", sites: ["coupang.com"], slots: ["field"], value: "4821" });
+  const auths = world.device.ownerAuths.length;
+  const requests = world.requests.length;
+  assert.deepEqual(await S.call(fx, "update_secret", { name: "SECRET_1", sites: "coupang.com pay.coupang.com", slots: "field" }), { ok: false, code: "cancelled" });
+  assert.equal(world.device.ownerAuths.length, auths);
+  assert.equal(world.requests.length, requests);
+  assert.deepEqual(world.device.confirmed[0].destinations, [
+    "coupang.com and the hosts below it · typed into its pages", "pay.coupang.com and the hosts below it · typed into its pages",
+  ]);
+  assert.deepEqual(world.vault.secrets.get("SECRET_1").sites, ["coupang.com"]);
+  const counted = world.stored("outcomes").done.update_secret;
+  assert.deepEqual([counted.calls, counted.failed], [1, 0]);
+});
+
+test("store_secret without a name makes the item only once the value is one an item can hold, and removes an item it made and could not fill: a sheet the user closes, a value that is too long and a request that fails leave no item in the vault", async () => {
+  // A build with the protected sheets: the lines of the sheet are made from the reach given, and
+  // a sheet the user closes ends the call before any item is made.
+  const sheets = S.fixture(source, { device: { sheets: true, locale: "ko-KR" } });
+  await S.start(sheets);
+  const made = () => sheets.world.sent("POST /api/secure/vault/secret").length;
+  sheets.world.device.promptAnswer = null;
+  assert.deepEqual(await S.call(sheets, "store_secret", { name: "", label: "쿠페이 비밀번호", sites: "coupang.com", slots: "field" }), { ok: false, code: "cancelled" });
+  assert.deepEqual(sheets.world.device.prompts, [{ title: "쿠페이 비밀번호", destinations: ["coupang.com 및 그 하위 호스트 · 웹 페이지에 입력"] }]);
+  assert.equal(made(), 0);
+  assert.equal(sheets.world.vault.secrets.size, 0);
+  // A value from the sheet that no item can hold: no item is made either.
+  sheets.world.device.promptAnswer = "x".repeat(12300);
+  assert.deepEqual(await S.call(sheets, "store_secret", { name: "", label: "pin", sites: "coupang.com", slots: "field" }), { ok: false, code: "too_large" });
+  assert.equal(made(), 0);
+  sheets.world.device.promptAnswer = "4821";
+  assert.deepEqual(await S.call(sheets, "store_secret", { name: "", label: "pin", sites: "coupang.com", slots: "field" }), { ok: true, value: { name: "SECRET_1", state: "ready" } });
+  assert.equal(openRecord(sheets.keys, sheets.world.vault.secrets.get("SECRET_1").record).json.value, "4821");
+
+  // A build without the sheets: the form of the label, the sites, the slots and the value is
+  // checked before the item is made.
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  const base = { name: "", label: "key", sites: "api.openai.com", slots: "header:authorization", value: "sk-live" };
+  for (const [change, code] of [
+    [{ value: "x".repeat(12300) }, "too_large"], [{ value: "" }, "invalid_input"], [{ value: "a\u0000b" }, "invalid_input"],
+    [{ label: "x".repeat(81) }, "invalid_input"], [{ label: "a\u0007b" }, "invalid_input"],
+    [{ sites: "Api.OpenAI.com" }, "invalid_input"], [{ slots: "header:host" }, "invalid_input"],
+  ]) {
+    assert.deepEqual(await S.call(fx, "store_secret", Object.assign({}, base, change)), { ok: false, code: code }, JSON.stringify(change).slice(0, 40));
+  }
+  assert.equal(world.sent("POST /api/secure/vault/secret").length, 0);
+  // A step after the item was made fails: the item is removed with one request, without the
+  // device owner being asked, and the call ends with the failure of that step.
+  const removed = () => world.sent("DELETE /api/secure/vault/secret/").length;
+  world.fault("PUT /api/secure/vault/secret/", { status: 503, body: { code: "unavailable" } }, 1);
+  assert.deepEqual(await S.call(fx, "store_secret", base), { ok: false, code: "unavailable" });
+  assert.equal(world.vault.secrets.size, 0);
+  assert.equal(removed(), 1);
+  assert.equal(world.device.ownerAuths.length, 0);
+  // The backend gives the item it made another reach than the one shown: nothing is sealed.
+  world.fault("GET /api/secure/vault/secret/", (request) => {
+    const item = JSON.parse(world.api("GET", request.path, null, undefined).body);
+    return { status: 200, body: Object.assign({}, item, { sites: ["api.openai.com", "evil.example"] }) };
+  }, 1);
+  const puts = world.sent("PUT /api/secure/vault/secret/").length;
+  assert.deepEqual(await S.call(fx, "store_secret", base), { ok: false, code: "binding_changed" });
+  assert.equal(world.sent("PUT /api/secure/vault/secret/").length, puts);
+  assert.equal(world.vault.secrets.size, 0);
+  assert.equal(removed(), 2);
+  // The request that removes the item fails as well: the call ends with the failure of the step.
+  world.fault("PUT /api/secure/vault/secret/", { status: 503, body: { code: "unavailable" } }, 1);
+  world.fault("DELETE /api/secure/vault/secret/", { status: 500, body: {} }, 1);
+  assert.deepEqual(await S.call(fx, "store_secret", base), { ok: false, code: "unavailable" });
+  assert.equal(removed(), 3);
+  assert.equal(leaked(world, base.value), false);
+});
+
+test("store_secret with a name seals nothing when the reach of the item is not the one the screen showed: the arguments sites and slots are compared with it as sets", async () => {
+  for (const sheets of [false, true]) {
+    const fx = S.fixture(source, { device: { sheets: sheets, promptAnswer: "4821" } });
+    await S.start(fx);
+    const world = fx.world;
+    world.vault.secrets.set("COUPAY_PIN", {
+      name: "COUPAY_PIN", label: "Coupay PIN", sites: ["coupang.com", "pay.coupang.com"], slots: ["field"], state: "empty", source: "",
+    });
+    const puts = () => world.sent("PUT /api/secure/vault/secret/").length;
+    // Another reach: other hosts, a host more, other slots.
+    for (const shown of [
+      { sites: "coupang.com", slots: "field" }, { sites: "coupang.com pay.coupang.com evil.example", slots: "field" },
+      { sites: "coupang.com,pay.coupang.com", slots: "header:authorization" }, { sites: "any" }, { slots: "path" },
+    ]) {
+      assert.deepEqual(await S.call(fx, "store_secret", Object.assign({ name: "COUPAY_PIN", value: "4821" }, shown)), { ok: false, code: "binding_changed" }, JSON.stringify(shown));
+    }
+    assert.equal(puts(), 0);
+    assert.equal(world.device.prompts.length, 0);
+    // The same reach in another order, and no reach at all.
+    assert.equal((await S.call(fx, "store_secret", { name: "COUPAY_PIN", value: "4821", sites: "pay.coupang.com, coupang.com", slots: ["field"] })).ok, true);
+    assert.equal((await S.call(fx, "store_secret", { name: "COUPAY_PIN", value: "4821", sites: "", slots: "" })).ok, true);
+    assert.equal((await S.call(fx, "store_secret", { name: "COUPAY_PIN", value: "4821" })).ok, true);
+    assert.equal(puts(), 3);
+    assert.equal(world.device.prompts.length, sheets ? 3 : 0);
+  }
+});
+
+test("the slots of a list argument are separated by white space alone and the hosts by commas or white space, and update_secret without slots leaves the slots of the item as they are", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  const value = "sk-live-0123456789abcdefghij";
+  // The name of a json slot holds a comma.
+  const stored = await S.call(fx, "store_secret", { name: "", label: "key", sites: "api.example.com, files.example.com", slots: "json:auth,key  header:x-api-key", value: value });
+  assert.deepEqual(stored, { ok: true, value: { name: "SECRET_1", state: "ready" } });
+  const item = world.vault.secrets.get("SECRET_1");
+  assert.deepEqual([item.sites, item.slots], [["api.example.com", "files.example.com"], ["json:auth,key", "header:x-api-key"]]);
+  // The hosts change and the slots stay: without the argument, and with a blank one.
+  const id = item.record.id;
+  for (const [args, sites] of [[{ sites: "api.example.com" }, ["api.example.com"]], [{ sites: "api.example.com,cdn.example.com", slots: " " }, ["api.example.com", "cdn.example.com"]]]) {
+    const changed = await S.call(fx, "update_secret", Object.assign({ name: "SECRET_1" }, args));
+    assert.deepEqual(changed, { ok: true, value: { name: "SECRET_1", sites: sites, slots: ["json:auth,key", "header:x-api-key"] } });
+    const plain = openRecord(fx.keys, world.vault.secrets.get("SECRET_1").record).json;
+    assert.deepEqual([plain.value, plain.sites, plain.slots], [value, sites, ["json:auth,key", "header:x-api-key"]]);
+    assert.equal(world.vault.secrets.get("SECRET_1").record.id, id);
+  }
+  // The slots change when the argument names them.
+  const narrowed = await S.call(fx, "update_secret", { name: "SECRET_1", sites: "api.example.com", slots: "json:auth,key" });
+  assert.deepEqual(narrowed.value.slots, ["json:auth,key"]);
+  // A build with the confirmation reads the item first, so that the lines name the slots that stay.
+  const confirming = S.fixture(source, { device: { confirmations: true } });
+  await S.start(confirming);
+  await S.call(confirming, "store_secret", { name: "", label: "key", sites: "api.example.com", slots: "header:x-api-key", value: value });
+  const kept = await S.call(confirming, "update_secret", { name: "SECRET_1", sites: "api.example.com files.example.com" });
+  assert.deepEqual(kept.value.slots, ["header:x-api-key"]);
+  assert.deepEqual(confirming.world.device.confirmed, [{
+    title: "key", destinations: ["api.example.com · request header x-api-key", "files.example.com · request header x-api-key"],
+  }]);
+  // An item whose slots are other ones when it is read again after the confirmation is not written.
+  confirming.world.device.confirmAnswer = () => {
+    confirming.world.vault.secrets.get("SECRET_1").slots = ["header:authorization"];
+    return true;
+  };
+  assert.deepEqual(await S.call(confirming, "update_secret", { name: "SECRET_1", sites: "api.example.com" }), { ok: false, code: "binding_changed" });
+  assert.deepEqual(confirming.world.vault.secrets.get("SECRET_1").sites, ["api.example.com", "files.example.com"]);
+});
+
+test("the runtime publishes whether the backend names vault items for the account: true once the account query says so, false in a new runtime until its own query says so", async () => {
+  // An account the backend turned the items on for, on a device with a master key and on one
+  // without.
+  for (const account of [true, false]) {
+    const fx = S.fixture(source, { account: account });
+    fx.world.account.namedSecrets = true;
+    await S.start(fx);
+    assert.equal(fx.world.runtime.named_secrets, true, String(account));
+  }
+  // An account whose query does not say so.
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  assert.equal(world.runtime.named_secrets, false);
+  // The query says so later: true from then on, whatever a later answer says or fails to say.
+  world.account.namedSecrets = true;
+  await S.event(fx, "foreground");
+  assert.equal(world.runtime.named_secrets, true);
+  world.account.namedSecrets = false;
+  world.advance(60000);
+  await S.event(fx, "foreground");
+  assert.equal(world.runtime.named_secrets, true);
+  // A new runtime (another account signed in on the device): what the runtime before published
+  // does not stand.
+  await S.start(fx);
+  assert.equal(world.runtime.named_secrets, false);
+  // A query that fails changes nothing.
+  world.account.namedSecrets = true;
+  world.fault("GET /api/secure/account", "transport");
+  S.load(fx);
+  await world.run(Promise.resolve(fx.program.onEvent("session_ready", {})).then(() => {}, () => {}));
+  assert.equal(world.runtime.named_secrets, false);
+});
+
 test("reveal_login_password shows a password a node made and none the user typed", async () => {
   const fx = S.fixture(source);
   await S.start(fx);
@@ -4021,23 +4230,27 @@ test("the form of a name, a host, a slot and a reach of a vault secret is the on
   const world = fx.world;
   // What the backend gives for an item is checked before it enters the plaintext of a record: a
   // reach or a name of another form fails the call, and nothing is sealed.
-  const accepted = async (name, sites, slots) => {
+  // (made: the call makes the item and takes its name from the backend; otherwise the item
+  // exists and is asked for by its name.)
+  const accepted = async (name, sites, slots, made) => {
     world.clearFaults();
     world.fault("POST /api/secure/vault/secret", { status: 200, body: { name: name, sites: sites, slots: slots } });
     world.fault("GET /api/secure/vault/secret/", { status: 200, body: { name: name, label: "", sites: sites, slots: slots, state: "empty", source: "" } });
     world.fault("PUT /api/secure/vault/secret/", { status: 200, body: { name: name, state: "ready" } });
     const puts = world.sent("PUT /api/secure/vault/secret/").length;
-    const result = await S.call(fx, "store_secret", { label: "x", sites: ["example.com"], slots: ["field"], value: "v" });
+    const result = made
+      ? await S.call(fx, "store_secret", { label: "x", sites: sites, slots: slots, value: "v" })
+      : await S.call(fx, "store_secret", { name: name, value: "v" });
     assert.equal(world.sent("PUT /api/secure/vault/secret/").length, puts + (result.ok ? 1 : 0));
     return result.ok;
   };
-  for (const item of cases.names) assert.equal(await accepted(item.text, ["example.com"], ["field"]), item.valid, "name " + JSON.stringify(item.text));
-  for (const item of cases.hosts) assert.equal(await accepted("NAME", [item.text], ["field"]), item.valid, "host " + JSON.stringify(item.text));
+  for (const item of cases.names) assert.equal(await accepted(item.text, ["example.com"], ["field"], true), item.valid, "name " + JSON.stringify(item.text));
+  for (const item of cases.hosts) assert.equal(await accepted("NAME", [item.text], ["field"], false), item.valid, "host " + JSON.stringify(item.text));
   for (const item of cases.slots.concat(cases.reserved_headers)) {
-    assert.equal(await accepted("NAME", ["example.com"], [item.text]), item.valid, "slot " + JSON.stringify(item.text));
+    assert.equal(await accepted("NAME", ["example.com"], [item.text], false), item.valid, "slot " + JSON.stringify(item.text));
   }
   for (const item of cases.reaches) {
-    assert.equal(await accepted("NAME", item.sites, item.slots), item.valid, "reach " + JSON.stringify([item.sites, item.slots]));
+    assert.equal(await accepted("NAME", item.sites, item.slots, false), item.valid, "reach " + JSON.stringify([item.sites, item.slots]));
   }
   // The record of the vectors opens on the device to the value of the vectors.
   const record = cases.record;
