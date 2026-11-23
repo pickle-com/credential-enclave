@@ -21,8 +21,9 @@
 //! The request goes to port 443 of the host, over TLS that ends inside the node, with a
 //! certificate verified for that host against the trust roots of the binary, on a connection
 //! that carries this one request. The response passes rule E4 of the egress policy before any
-//! part of it is handed on: the head as a whole, the body piece by piece
-//! (`crate::provider_response::StreamCheck`).
+//! part of it is handed on: the head as a whole, the body part by part
+//! (`crate::provider_response::StreamCheck`, the search of the stream form of `forward`).
+//! The response is a stream of the form of that call (`crate::frame`).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,13 +33,13 @@ use axum::response::Response;
 use credential_enclave_protocol::secret_use::{open_secret_use, SecretUseEnvelope};
 use credential_enclave_protocol::{limits, ProtocolError};
 
-use super::forward::read_frame;
+use super::forward::{hand_on_body, read_frame, Admission};
 use super::responses::send_stream;
 use super::{invalid, respond, ApiError, JsonBody};
 use crate::bound;
 use crate::egress::EgressError;
 use crate::oauth::Withheld;
-use crate::provider_response;
+use crate::provider_response::StreamCheck;
 use crate::role::{NonceRefusal, UsedNonces};
 use crate::state::{lock, Node};
 
@@ -73,20 +74,17 @@ fn timeout_of(meta: &JsonBody) -> Result<u64, ApiError> {
 
 async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
     // A request holds one of the places of the forward calls of the node until its response
-    // has ended.
-    let slot = node
-        .forward_slots
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| ApiError::internal())?;
+    // has ended. A further call waits for a place, and for the shares of the body budget it
+    // takes below, for the time of its admission at the longest (enclave.md section 8).
+    let admission = Admission::begin();
+    let slot = admission.slot(node).await?;
     // A closing node begins no request. The call holds its place before it reads the flag:
     // whoever closes the node and then finds no place held knows that no call that read the
     // flag before the close is still on its way to a request.
     node.ensure_open()?;
 
     // The request frame enters memory only after its share of the body budget is reserved.
-    let (meta, payload, request_budget) = read_frame(node, request).await?;
+    let (meta, payload, request_budget) = read_frame(node, request, &admission).await?;
     let envelope = SecretUseEnvelope::from_value(meta.object("envelope")?)?;
     let timeout = Duration::from_millis(timeout_of(&meta)?);
 
@@ -99,6 +97,14 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
     if ahead_ms == 0 || ahead_ms > UsedNonces::KEPT_MS {
         return Err(out_of_time());
     }
+
+    // The search of the response holds back the last bytes of the body, as many as the
+    // longest form of the value can take, and a value has up to 12,000 bytes. The call takes
+    // the share of the body budget that search can hold before its request leaves.
+    let value_bytes = secret_use.value().expose_secret().len();
+    let check_budget = admission
+        .budget(node, StreamCheck::memory_bound(value_bytes))
+        .await?;
 
     // The request of the caller is the request of the envelope, and the value goes to its
     // slot. A request that fails here leaves the envelope unused. The check reads the whole
@@ -152,20 +158,19 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
     };
 
     // Rule E4 for the head: a response under a content coding, or with the value in a header,
-    // is not handed on. The body is searched piece by piece as it is handed on.
-    let headers = std::mem::take(&mut exchange.headers);
-    let (head, check) =
-        provider_response::check_head(secret_use.value(), exchange.status, headers)?;
+    // is not handed on. The body is searched part by part as it is handed on, by the task of
+    // the stream, which ends at the time limit of the call whatever its caller reads.
+    let status = exchange.status;
+    let mut headers = std::mem::take(&mut exchange.headers);
+    let check =
+        StreamCheck::begin(secret_use.value(), &mut headers).map_err(ProtocolError::from)?;
+    drop(secret_use);
     // The share of the body budget the request body occupies is held to the end of the
     // response: a host may answer before it read the body, and the body is in memory until
     // the connection ends.
-    Ok(send_stream(
-        head,
-        check,
-        exchange,
-        deadline,
-        (slot, request_budget),
-    ))
+    let held = (slot, request_budget, check_budget);
+    let (body, late) = hand_on_body(exchange, check, deadline, held);
+    Ok(send_stream(status, headers, body, late))
 }
 
 /// The longest envelope a request meta can carry stays far below the limit of a frame meta:

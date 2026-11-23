@@ -23,6 +23,7 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use zeroize::Zeroizing;
 
+use crate::inbound;
 use crate::oauth::{ProviderError, Withheld};
 use crate::platform::{Listener, PlatformError};
 use crate::providers::{ClientKind, Definition};
@@ -51,6 +52,8 @@ mod vault;
 mod vault_handoff;
 mod vault_send;
 
+#[cfg(test)]
+pub(crate) use forward::ADMISSION_WAIT;
 pub use responses::json_ok;
 use responses::{json_error, ErrorBody};
 
@@ -59,6 +62,11 @@ const JSON_BODY_LIMIT_BYTES: usize = 1024 * 1024;
 
 type Route = (Method, &'static str, MethodRouter<Arc<Node>>);
 
+#[expect(
+    clippy::expect_used,
+    reason = "runs once at the start of the node, for the rows of the table of `routes`: every \
+              method of the table is GET or POST, and no input of a call reaches this place"
+)]
 fn route<H, T>(method: Method, path: &'static str, handler: H) -> Route
 where
     H: axum::handler::Handler<T, Arc<Node>>,
@@ -93,11 +101,7 @@ fn routes() -> Vec<Route> {
         route(Method::POST, "/v1/mail/submit", mail::submit),
         route(Method::POST, "/v1/release", release::release),
         route(Method::POST, "/v1/vault/store", vault::store),
-        route(
-            Method::POST,
-            "/v1/vault/handoff",
-            vault_handoff::handoff,
-        ),
+        route(Method::POST, "/v1/vault/handoff", vault_handoff::handoff),
         route(Method::POST, "/v1/vault/send", vault_send::send),
         route(Method::POST, "/v1/close", close::close),
         route(Method::POST, "/v1/close/heads", close::heads),
@@ -180,7 +184,9 @@ fn admit(node: &Node, of: Of) -> Result<(), ApiError> {
 
 /// The router of every call. Each call passes the role rule of its path ([`admit`]) before
 /// its handler runs. The rule is part of the route of a call: a path that is not defined and
-/// a method a path does not accept pass no rule and give a node no role.
+/// a method a path does not accept pass no rule and give a node no role. The handler of a
+/// call reads the body of its request under the time limit of the bytes of a body
+/// (`inbound_idle`, [`inbound::TimedBody`]).
 pub fn router(node: Arc<Node>) -> Router {
     let mut router = Router::new();
     for (_, path, handler) in routes() {
@@ -189,7 +195,10 @@ pub fn router(node: Arc<Node>) -> Router {
             node.clone(),
             move |State(node): State<Arc<Node>>, request: Request, next: Next| async move {
                 match admit(&node, of) {
-                    Ok(()) => next.run(request).await,
+                    Ok(()) => {
+                        next.run(inbound::timed(request, node.limits.inbound_idle))
+                            .await
+                    }
                     Err(refusal) => refusal.into_response(),
                 }
             },
@@ -224,13 +233,14 @@ async fn unknown_method() -> Response {
     .into_response()
 }
 
-/// Serves HTTP/1.1 on every connection of the listener. A call in progress runs to its end:
-/// nothing here cancels a connection. Two limits of section 8 of enclave.md bound the
-/// connections (`node.limits`): a connection accepted while `inbound_connections` are open is
-/// closed without a byte and counted in `inbound_refused` of `load` of health, and a
-/// connection that waits longer than `inbound_idle` for the head of its next request (before
-/// its first request, or idle between two requests) is closed. Both keep the descriptors of
-/// the node (`crate::descriptors`) for the writes to the log store and the provider requests.
+/// Serves HTTP/1.1 on every connection of the listener. Two limits of section 8 of enclave.md
+/// bound the connections (`node.limits`): a connection accepted while `inbound_connections`
+/// are open is closed without a byte and counted in `inbound_refused` of `load` of health,
+/// and a connection on which the node waits for its peer for longer than `inbound_idle` is
+/// closed ([`serve_connection`]). The first keeps the memory of the node for its calls and
+/// the descriptors of the node (`crate::descriptors`) for the writes to the log store and the
+/// provider requests. The second frees what a connection holds whose peer went away or
+/// stopped.
 pub async fn serve(listener: Listener, router: Router, node: Arc<Node>) {
     loop {
         let stream = match listener.accept().await {
@@ -244,21 +254,46 @@ pub async fn serve(listener: Listener, router: Router, node: Arc<Node>) {
             drop(stream);
             continue;
         };
-        let service = TowerToHyperService::new(router.clone());
+        let router = router.clone();
         let idle = node.limits.inbound_idle;
         tokio::spawn(async move {
             // The place of the connection is held until the connection ends.
             let _place = place;
-            // No `Date` header: it would be the only value a node takes from the system
-            // clock instead of its own clock.
-            let _ = hyper::server::conn::http1::Builder::new()
-                .auto_date_header(false)
-                .timer(TokioTimer::new())
-                .header_read_timeout(idle)
-                .serve_connection(TokioIo::new(stream), service)
-                .await;
+            serve_connection(stream, router, idle).await;
         });
     }
+}
+
+/// Serves HTTP/1.1 on one connection until it ends. A call in progress runs to its end
+/// unless its connection ends first, and a connection ends when its peer closed it, when it
+/// failed, or when the node waited for its peer for `idle`:
+///
+/// - for the head of a request, before the first request and between two requests;
+/// - for the next bytes of a request body (the router reads a body under that limit:
+///   [`inbound::TimedBody`]. The call ends with `invalid_request`, and the connection after
+///   its response);
+/// - for the peer to take bytes of a response ([`inbound::TimedStream`]).
+///
+/// The connection reads at most [`inbound::READ_BUFFER_BYTES`] ahead of what it has parsed
+/// and buffers at most as much of a response before it writes, so what a connection holds
+/// outside the bodies of its call has a bound (`inbound::CONNECTION_BYTES`).
+pub async fn serve_connection<S>(stream: S, router: Router, idle: std::time::Duration)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let service = TowerToHyperService::new(router);
+    // No `Date` header: it would be the only value a node takes from the system clock
+    // instead of its own clock.
+    let _ = hyper::server::conn::http1::Builder::new()
+        .auto_date_header(false)
+        .max_buf_size(inbound::READ_BUFFER_BYTES)
+        .timer(TokioTimer::new())
+        .header_read_timeout(idle)
+        .serve_connection(
+            TokioIo::new(inbound::TimedStream::new(stream, idle)),
+            service,
+        )
+        .await;
 }
 
 /// A failed call (rule E5 of the egress policy). The code is one of the closed list of
@@ -414,7 +449,9 @@ pub fn respond(outcome: Result<Response, ApiError>) -> Response {
     outcome.unwrap_or_else(IntoResponse::into_response)
 }
 
-/// Reads a request body up to `limit` bytes. A longer body is `too_large`.
+/// Reads a request body up to `limit` bytes. A longer body is `too_large`. A body whose
+/// bytes stop arriving for the time limit of the bytes of a body (`inbound_idle`) is
+/// `invalid_request`, as a body that cannot be read is.
 pub async fn read_body(request: Request, limit: usize) -> Result<Vec<u8>, ApiError> {
     let declared = request
         .headers()
@@ -430,11 +467,15 @@ pub async fn read_body(request: Request, limit: usize) -> Result<Vec<u8>, ApiErr
         let frame = std::future::poll_fn(|context| Pin::new(&mut body).poll_frame(context)).await;
         match frame {
             None => return Ok(collected),
-            Some(Err(_)) => {
+            Some(Err(error)) => {
+                let message = match inbound::is_body_idle(error) {
+                    true => "the request body did not arrive within the time limit",
+                    false => "the request body could not be read",
+                };
                 return Err(ApiError::with_message(
                     ProtocolError::InvalidRequest,
-                    "the request body could not be read",
-                ))
+                    message,
+                ));
             }
             Some(Ok(frame)) => {
                 if let Ok(data) = frame.into_data() {
@@ -581,6 +622,7 @@ fn missing(key: &str) -> ApiError {
         "url" => "url is missing or invalid",
         "headers" => "headers is missing or invalid",
         "timeout_ms" => "timeout_ms is missing or invalid",
+        "stream" => "stream is missing or invalid",
         "requests" => "requests is missing or invalid: 1 to 100 request objects",
         "body_bytes" => "body_bytes of the requests do not add up to the payload",
         "endpoint" => "endpoint is missing or invalid",

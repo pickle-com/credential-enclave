@@ -164,7 +164,8 @@ async fn prune_drops_the_grants_outside_the_subset_page_by_page() {
 
 /// A stand-in for the providers and for the log store. The providers answer a token request
 /// with a token response and every other request with `200 {"ok":true}`; the store confirms a
-/// write unless `refusing` is set.
+/// write unless `refusing` is set. Every answer of the store says `Connection: close` and ends
+/// its connection, so every write opens a connection of its own.
 async fn stand_in() -> (Provider, Arc<Mutex<bool>>) {
     let refusing = Arc::new(Mutex::new(false));
     let script = refusing.clone();
@@ -180,8 +181,8 @@ async fn stand_in() -> (Provider, Arc<Mutex<bool>>) {
             _ => Reply::json(200, &json!({"ok": true})),
         },
         move |_| match *lock(&script) {
-            true => Reply::with_body(503, &[], b"<Error></Error>"),
-            false => Reply::with_body(200, &[("etag", "\"0\"")], b""),
+            true => Reply::with_body(503, &[("connection", "close")], b"<Error></Error>"),
+            false => Reply::with_body(200, &[("etag", "\"0\""), ("connection", "close")], b""),
         },
     )
     .await;

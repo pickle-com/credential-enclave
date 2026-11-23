@@ -159,7 +159,7 @@ impl Platform for TestPlatform {
         system_time_ms()
     }
 
-    async fn listen(&self) -> Result<Listener, PlatformError> {
+    async fn listen(&self, _connections: usize) -> Result<Listener, PlatformError> {
         TcpListener::bind("127.0.0.1:0")
             .await
             .map(Listener::Tcp)
@@ -857,6 +857,53 @@ pub fn decode_stream(bytes: &[u8]) -> Sent {
     }
 }
 
+/// The 200 response of a `forward` call that asked for a stream, read to its end.
+#[derive(Debug)]
+pub struct Streamed {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    /// The `log` object of the head: where the event of the request is.
+    pub log: Value,
+    /// The parts of the body, in order.
+    pub parts: Vec<Vec<u8>>,
+    /// The end record.
+    pub end: Value,
+}
+
+impl Streamed {
+    /// The bytes of the body that were handed on.
+    pub fn body(&self) -> Vec<u8> {
+        self.parts.concat()
+    }
+}
+
+/// Reads the bytes of a stream (`frame`, the stream form): the head, the parts and the end
+/// record. Panics when the bytes are not a stream that ends with an end record.
+pub fn read_stream(bytes: &[u8]) -> Streamed {
+    let length = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+    let meta_length = length(0);
+    let meta: Value = serde_json::from_slice(&bytes[4..4 + meta_length]).unwrap();
+    let mut at = 4 + meta_length;
+    let mut parts = Vec::new();
+    loop {
+        let part_length = length(at);
+        at += 4;
+        if part_length == 0 {
+            break;
+        }
+        assert!(part_length <= frame::STREAM_PART_LIMIT_BYTES);
+        parts.push(bytes[at..at + part_length].to_vec());
+        at += part_length;
+    }
+    Streamed {
+        status: meta["status"].as_u64().unwrap() as u16,
+        headers: header_pairs(&meta["headers"]),
+        log: meta["log"].clone(),
+        parts,
+        end: serde_json::from_slice(&bytes[at..]).unwrap(),
+    }
+}
+
 /// One result of a `forward/batch` call: the provider response of the request, or the failure
 /// code of the request, each with the `log` object of the request.
 #[derive(Clone, Debug)]
@@ -1101,6 +1148,24 @@ impl Harness {
             log: meta["log"].clone(),
             body: body.to_vec(),
         })
+    }
+
+    /// A `forward` call whose meta asks for a stream. `Err` carries the status and the failure
+    /// body of a call that failed before the head of the provider response.
+    pub async fn forward_stream(
+        &self,
+        meta: Value,
+        payload: &[u8],
+    ) -> Result<Streamed, (u16, Value)> {
+        let mut request = frame::encode_head(&meta);
+        request.extend_from_slice(payload);
+        let (status, content_type, bytes) = self.send(Method::POST, "/v1/forward", request).await;
+        if status != StatusCode::OK {
+            assert_eq!(content_type, "application/json");
+            return Err((status.as_u16(), serde_json::from_slice(&bytes).unwrap()));
+        }
+        assert_eq!(content_type, frame::STREAM_CONTENT_TYPE);
+        Ok(read_stream(&bytes))
     }
 
     /// A `forward/batch` call. `meta` carries `requests` and `payload` their bodies one after

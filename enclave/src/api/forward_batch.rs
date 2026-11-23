@@ -20,7 +20,7 @@ use credential_enclave_protocol::{limits, ProtocolError};
 use hyper::body::Bytes;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use super::forward::{execute, prepare, read_frame, timeout_of, Prepared};
+use super::forward::{execute, prepare, read_frame, timeout_of, Admission, Prepared};
 use super::responses::{forward_batch_frame, BatchResult, LogRef};
 use super::{record_of, respond, ApiError};
 use crate::log_store::{self, join_all};
@@ -67,12 +67,9 @@ fn split_bodies(requests: &[serde_json::Value], payload: &Bytes) -> Result<Vec<B
 
 async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
     // A batch call takes one forward slot: the slots count calls, not requests.
-    let _slot = node
-        .forward_slots
-        .acquire()
-        .await
-        .map_err(|_| ApiError::internal())?;
-    let (meta, payload, request_budget) = read_frame(node, request).await?;
+    let admission = Admission::begin();
+    let _slot = admission.slot(node).await?;
+    let (meta, payload, request_budget) = read_frame(node, request, &admission).await?;
     let user_id = meta.user_id()?;
     let record = record_of(&meta, "record")?;
     let context = meta.context()?;

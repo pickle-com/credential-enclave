@@ -536,27 +536,27 @@ impl Exchange {
         }
     }
 
-    /// The next piece of the response body, for a body that is handed on while it arrives.
-    /// `Ready(None)` at the end of the body: the connection then goes back to the idle
-    /// connections of its account and host. `Transfer-Encoding: chunked` is already decoded,
-    /// and the trailers of a body are left out.
-    pub fn poll_piece(
+    /// The next part of the response body, for a body that is handed on while it arrives
+    /// (the stream form of `forward`). `Transfer-Encoding: chunked` is already decoded.
+    /// `None` is the end of the body: the connection goes back to the idle connections of its
+    /// account and host when the provider did not close it.
+    pub fn poll_part(
         &mut self,
         context: &mut Context<'_>,
     ) -> Poll<Option<Result<Bytes, EgressError>>> {
         loop {
-            match Pin::new(&mut self.body).poll_frame(context) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => {
+            match std::task::ready!(Pin::new(&mut self.body).poll_frame(context)) {
+                None => {
                     self.keep_connection();
                     return Poll::Ready(None);
                 }
-                Poll::Ready(Some(Err(_))) => {
-                    return Poll::Ready(Some(Err(EgressError::Unreachable)))
-                }
-                Poll::Ready(Some(Ok(frame))) => {
+                Some(Err(_)) => return Poll::Ready(Some(Err(EgressError::Unreachable))),
+                Some(Ok(frame)) => {
+                    // A frame that is no data (the trailers of a chunked body) is passed over.
                     if let Ok(data) = frame.into_data() {
-                        return Poll::Ready(Some(Ok(data)));
+                        if !data.is_empty() {
+                            return Poll::Ready(Some(Ok(data)));
+                        }
                     }
                 }
             }
@@ -714,6 +714,11 @@ impl Egress {
             .saturating_sub(self.opens.available_permits())
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "runs once at the start of the node, with the provider and the protocol \
+                  versions the program is built with: no input of a call reaches this place"
+    )]
     fn build(clock: Arc<Clock>, roots: RootCertStore, open_concurrency: usize) -> Egress {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut config = ClientConfig::builder_with_details(provider, Arc::new(TlsTime(clock)))

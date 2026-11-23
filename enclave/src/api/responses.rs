@@ -2,9 +2,9 @@
 //! `docs/egress-policy.md`).
 //!
 //! A response body is a value of a type that implements [`OperatorResponse`], and the functions
-//! that turn a value into a response ([`json_ok`], [`forward_frame`], [`send_stream`], the
-//! failure body of [`super::ApiError`]) take nothing else. The trait is implemented in this file only: its
-//! supertrait is private to it. So this file lists everything the operator domain can receive
+//! that turn a value into a response ([`json_ok`], [`forward_frame`], [`forward_stream`],
+//! [`send_stream`], the failure body of [`super::ApiError`]) take nothing else. The trait is
+//! implemented in this file only: its supertrait is private to it. So this file lists everything the operator domain can receive
 //! from a node. Adding a response type means changing this file.
 //!
 //! Every field carries the class of its value:
@@ -24,9 +24,7 @@
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
-use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use axum::body::Body;
@@ -37,17 +35,14 @@ use credential_enclave_protocol::encoding::{to_json, Signed};
 use credential_enclave_protocol::envelope::TransferEnvelope;
 use credential_enclave_protocol::record::Record;
 use credential_enclave_protocol::secret_use::SecretUseEnvelope;
-use credential_enclave_protocol::ProtocolError;
 use hyper::body::{Body as HttpBody, Bytes, Frame, SizeHint};
 use serde::Serialize;
 use tokio::sync::OwnedSemaphorePermit;
 
-use super::ApiError;
-use crate::egress::Exchange;
 use crate::frame;
 use crate::oauth::PublicFields;
-use crate::provider_response::{CheckedHead, CheckedResponse, StreamCheck};
-use crate::state::{lock, GrantStatus};
+use crate::provider_response::CheckedResponse;
+use crate::state::GrantStatus;
 use crate::vault::HandedOut;
 
 mod sealed {
@@ -290,6 +285,9 @@ pub struct Load {
     /// P: a count, the connections from the backend closed at accept because the bound of
     /// open connections was reached, since the node started.
     pub inbound_refused: u64,
+    /// P: a count, the bound of open connections from the backend in force: the node computed
+    /// it at its start from the memory of the kernel it runs in.
+    pub inbound_limit: usize,
     /// P: the CPU time in user mode of the kernel the node runs in since it booted, in
     /// milliseconds. Null when the kernel exposes no procfs value.
     pub cpu_user_ms: Option<u64>,
@@ -308,6 +306,13 @@ pub struct Load {
     /// P: a count, the soft limit of open file descriptors of the node process in force. Null
     /// when the platform has no such limit.
     pub descriptors_limit: Option<u64>,
+    /// P: a count, the connections the node is done with and keeps open until their peer
+    /// reported the end of its bytes, at this moment. Null on a platform that closes a
+    /// connection when the node is done with it.
+    pub lingering_connections: Option<usize>,
+    /// P: a count, the connections the node closed before their peer had reported its end,
+    /// since the node started. Null in the same way.
+    pub lingering_cut: Option<u64>,
 }
 
 /// `GET /v1/health`.
@@ -497,6 +502,130 @@ pub struct ForwardMeta {
     log: Option<LogRef>,
 }
 
+/// The end record of a stream (the stream form of `POST /v1/forward`, enclave.md 5.8, and
+/// `POST /v1/vault/send`, enclave.md 5.16).
+#[derive(Serialize)]
+pub struct StreamEnd {
+    /// P: true when every byte of the provider body was handed on.
+    complete: bool,
+    /// P: a failure code of protocol.md section 11, when the body was cut.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'static str>,
+    /// P: a fixed string of the source (rule E5), when the body was cut.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<&'static str>,
+}
+
+impl StreamEnd {
+    /// The end of a body that was handed on whole.
+    pub fn complete() -> StreamEnd {
+        StreamEnd {
+            complete: true,
+            code: None,
+            message: None,
+        }
+    }
+
+    /// The end of a body that was cut: the code and the fixed message of the failure.
+    pub fn cut(code: &'static str, message: &'static str) -> StreamEnd {
+        StreamEnd {
+            complete: false,
+            code: Some(code),
+            message: Some(message),
+        }
+    }
+}
+
+/// One element of the body of a stream, as the task that reads the provider hands it to the
+/// response body.
+pub enum StreamElement {
+    /// Bytes of a part: a length prefix, or the bytes of the part (R, after the search of rule
+    /// E4).
+    Part(Bytes),
+    /// The mark of the end and the end record: nothing follows.
+    End(Bytes),
+}
+
+/// The response body of a stream (the stream form of `forward`, `vault/send`): the head, then
+/// what the task that reads the provider hands over, until the end record. A task that ended without an end record
+/// passed the time limit of the call while this body was not read: the body ends with the end
+/// record of that failure.
+struct StreamBody {
+    head: Option<Bytes>,
+    elements: tokio::sync::mpsc::Receiver<StreamElement>,
+    /// The end record of a call whose task ended without one.
+    late: Option<Bytes>,
+}
+
+impl HttpBody for StreamBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+        if let Some(head) = self.head.take() {
+            return Poll::Ready(Some(Ok(Frame::data(head))));
+        }
+        let Some(late) = self.late.clone() else {
+            return Poll::Ready(None);
+        };
+        match std::task::ready!(self.elements.poll_recv(context)) {
+            Some(StreamElement::Part(bytes)) => Poll::Ready(Some(Ok(Frame::data(bytes)))),
+            Some(StreamElement::End(bytes)) => {
+                self.late = None;
+                Poll::Ready(Some(Ok(Frame::data(bytes))))
+            }
+            None => {
+                self.late = None;
+                Poll::Ready(Some(Ok(Frame::data(late))))
+            }
+        }
+    }
+}
+
+/// The 200 response of the stream form of `forward`: the head of a provider response whose
+/// headers passed the checks of rule E4, the place of the event of the request, and the parts
+/// of the body as `elements` hands them over. `late` is the end record of a call whose task
+/// ended without one.
+pub fn forward_stream(
+    status: u16,
+    headers: Vec<(String, String)>,
+    log: Option<LogRef>,
+    elements: tokio::sync::mpsc::Receiver<StreamElement>,
+    late: StreamEnd,
+) -> Response {
+    let meta = ForwardMeta {
+        status,
+        headers,
+        log,
+    };
+    stream_response(&meta, elements, late)
+}
+
+/// The 200 response that is a stream: `meta` as the head, then what `elements` hands over,
+/// until the end record. `late` is the end record of a call whose task ended without one.
+fn stream_response<T: OperatorResponse>(
+    meta: &T,
+    elements: tokio::sync::mpsc::Receiver<StreamElement>,
+    late: StreamEnd,
+) -> Response {
+    let head = frame::encode_head(meta);
+    let body = StreamBody {
+        head: Some(Bytes::from(head)),
+        elements,
+        late: Some(Bytes::from(frame::encode_stream_end(&late))),
+    };
+    let mut response = Response::new(Body::new(body));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static(frame::STREAM_CONTENT_TYPE),
+    );
+    response
+}
+
 /// The meta of a `POST /v1/forward/batch` response frame. The payload of the frame is the
 /// provider bodies of the results one after another (R), `body_bytes` each.
 #[derive(Serialize)]
@@ -651,12 +780,32 @@ pub(super) fn json_error(status: StatusCode, body: &ErrorBody<'_>) -> Response {
     json_bytes(status, to_json(body))
 }
 
-/// A response frame of `forward`: the meta, then the provider body. The share of the body
-/// budget that the provider body occupies is held until the frame was written out.
+/// A response frame of `forward`: the meta, then the provider body. Every part keeps the
+/// share of the body budget that the provider body occupies ([`BudgetedPart`]), so the share
+/// is held until the frame was written out.
 struct FrameBody {
     parts: VecDeque<Bytes>,
     remaining: u64,
-    _budget: OwnedSemaphorePermit,
+}
+
+/// A part of a response frame together with the share of the body budget of the node the
+/// frame occupies. The share is free when the last part of the frame is dropped.
+///
+/// The body of a response is handed to the HTTP connection of the caller, which drops the
+/// body object as soon as it has taken every part, before a byte is written. What it keeps
+/// until its stream took the bytes is the parts themselves (a stream that writes several
+/// buffers in one write: `crate::platform::Attempted`, and a TCP stream). So the share
+/// travels with the bytes, and a peer that takes a response slowly, or not at all, holds
+/// memory the budget counts: for as long as the node waits for it (`inbound_idle`).
+struct BudgetedPart {
+    bytes: Bytes,
+    _budget: std::sync::Arc<OwnedSemaphorePermit>,
+}
+
+impl AsRef<[u8]> for BudgetedPart {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 impl HttpBody for FrameBody {
@@ -742,262 +891,32 @@ pub struct SendMeta {
     headers: Vec<(String, String)>,
 }
 
-/// The end record of the response of `vault/send`: how the body ended.
-#[derive(Serialize)]
-pub struct StreamEnd {
-    /// P: true when the body ended as the host ended it, and every byte of it was handed on.
-    complete: bool,
-    /// P: a code of the closed list of protocol.md section 11, when the body was cut.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    code: Option<&'static str>,
-    /// P: a fixed string of the source.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    message: Option<&'static str>,
-}
-
-/// The body of the response of `POST /v1/vault/send` (enclave.md 5.16): the meta, then the
-/// body of the response of the host in parts as it arrives, then the end record.
-///
-/// ```text
-/// stream = meta_len (unsigned 32 bit, big-endian) || meta (UTF-8 JSON) || part* || end
-/// part   = part_len (unsigned 32 bit, big-endian, at least 1) || part_len bytes of the body
-/// end    = 0 (unsigned 32 bit) || UTF-8 JSON {"complete":true}
-///                               | {"complete":false,"code":"...","message":"..."}
-/// ```
-///
-/// Every piece of the body passes the search of rule E4 before a byte of it is queued
-/// (`StreamCheck`), and what is queued lags behind what arrived by the bytes that search
-/// keeps back. When the body ends as the host ended it, the kept bytes follow and the end
-/// record says `complete`. When the search finds the value, when the host or the connection
-/// fails, or when the time limit of the call passes, the body is cut there: the connection to
-/// the host is dropped, the kept bytes are overwritten and not handed on, and the end record
-/// names the reason. A stream that ends without an end record was cut by something else, and
-/// a reader takes it for a failure.
-///
-/// The stream reads a piece of the body when its caller took what was queued before, and it
-/// queues no more than what one piece gives: the node holds of a body the piece it reads and
-/// the bytes the search keeps back, whatever the length of the body.
-///
-/// The time limit of the call holds whatever its caller does. A stream is read only while
-/// its caller takes what it hands on, so a caller that stops reading would keep the response
-/// of the host, and the places of the call, for as long as its connection to the node lasts.
-/// The watch of the time limit ([`BodyStream::watch`]) runs apart from the reading: at the
-/// time limit it drops what the call holds, read or not.
-struct BodyStream {
-    /// What is ready to be written: the meta first, then the parts, then the end record.
-    queue: VecDeque<Bytes>,
-    /// What the call holds while its body goes on. `None` once the body ended or was cut:
-    /// by this stream, or by the watch of the time limit.
-    held: Arc<Mutex<Option<Held>>>,
-    /// True once the end record is queued.
-    ended: bool,
-    /// The time limit of the call, for a stream whose caller reads: the body is cut when it
-    /// passes while the stream waits for the host.
-    deadline: Pin<Box<tokio::time::Sleep>>,
-    /// The watch of the time limit, ended with the stream.
-    watch: tokio::task::AbortHandle,
-}
-
-/// What a call whose response is a stream holds until the body of that response ended or
-/// was cut.
-struct Held {
-    /// The response of the host, with the connection to it and the place of the call among
-    /// the provider requests in flight.
-    exchange: Exchange,
-    check: StreamCheck,
-    /// The place among the forward calls of the node and the share of the body budget the
-    /// request body occupies.
-    _places: (OwnedSemaphorePermit, OwnedSemaphorePermit),
-}
-
-/// The four bytes in front of a part that its length is written into.
-const PART_LENGTH_BYTES: usize = 4;
-
-impl BodyStream {
-    /// The stream of `exchange`, behind `meta`. The watch of the time limit starts with it.
-    fn new(
-        meta: Vec<u8>,
-        check: StreamCheck,
-        exchange: Exchange,
-        deadline: tokio::time::Instant,
-        places: (OwnedSemaphorePermit, OwnedSemaphorePermit),
-    ) -> BodyStream {
-        let held = Arc::new(Mutex::new(Some(Held {
-            exchange,
-            check,
-            _places: places,
-        })));
-        BodyStream {
-            queue: VecDeque::from([Bytes::from(meta)]),
-            watch: BodyStream::watch(held.clone(), deadline),
-            held,
-            ended: false,
-            deadline: Box::pin(tokio::time::sleep_until(deadline)),
-        }
-    }
-
-    /// Drops what a call holds at its time limit, whether or not its stream is read: the
-    /// response of the host with its connection, the search with the bytes it kept, and the
-    /// places of the call. A stream that is read afterwards finds nothing held and ends with
-    /// `timeout`.
-    fn watch(
-        held: Arc<Mutex<Option<Held>>>,
-        deadline: tokio::time::Instant,
-    ) -> tokio::task::AbortHandle {
-        tokio::spawn(async move {
-            tokio::time::sleep_until(deadline).await;
-            let dropped = lock(&held).take();
-            drop(dropped);
-        })
-        .abort_handle()
-    }
-
-    /// A part without a byte of the body yet: the place of its length.
-    fn open_part() -> Vec<u8> {
-        vec![0; PART_LENGTH_BYTES]
-    }
-
-    /// Queues a part, when it holds a byte of the body.
-    fn queue_part(&mut self, mut part: Vec<u8>) {
-        // A part begins with the room for its length. One without that room, and one whose
-        // length the four bytes cannot state, is not queued.
-        let length = part
-            .len()
-            .checked_sub(PART_LENGTH_BYTES)
-            .and_then(|length| u32::try_from(length).ok());
-        if let (Some(length @ 1..), Some(prefix)) = (length, part.get_mut(..PART_LENGTH_BYTES)) {
-            prefix.copy_from_slice(&length.to_be_bytes());
-            self.queue.push_back(Bytes::from(part));
-        }
-    }
-
-    /// Ends the body: drops what the call still holds (the response of the host, the search
-    /// with the bytes it kept, the places of the call) and queues the end record.
-    fn end(&mut self, cut: Option<ProtocolError>) {
-        let dropped = lock(&self.held).take();
-        drop(dropped);
-        self.watch.abort();
-        self.ended = true;
-        let record = StreamEnd {
-            complete: cut.is_none(),
-            code: cut.map(|error| error.code()),
-            message: cut.map(|error| ApiError::from(error).message),
-        };
-        let mut bytes = 0u32.to_be_bytes().to_vec();
-        bytes.extend_from_slice(&to_json(&record));
-        self.queue.push_back(Bytes::from(bytes));
-    }
-
-    /// Reads the next piece of the body and queues what the search hands on of it. `Ready`
-    /// with how the body ended once it ended or was cut (`None` in it for a body that ended
-    /// as the host ended it), and `Ready(None)` for a body that goes on.
-    fn read(&mut self, context: &mut Context<'_>) -> Poll<Option<Option<ProtocolError>>> {
-        let mut held = lock(&self.held);
-        // The watch took what the call held: the time limit passed.
-        let Some(state) = held.as_mut() else {
-            return Poll::Ready(Some(Some(ProtocolError::Timeout)));
-        };
-        let piece = match state.exchange.poll_piece(context) {
-            Poll::Ready(piece) => piece,
-            Poll::Pending => return Poll::Pending,
-        };
-        let mut part = BodyStream::open_part();
-        let ended = match piece {
-            // A piece: what the search hands on of it and of the pieces before it.
-            Some(Ok(piece)) => match state.check.push(&piece, &mut part) {
-                Ok(()) => None,
-                Err(_) => Some(Some(ProtocolError::ResponseWithheld)),
-            },
-            // The end of the body as the host ended it: the bytes the search kept.
-            None => match held.take().map(|state| state.check.finish(&mut part)) {
-                Some(Ok(())) => Some(None),
-                _ => Some(Some(ProtocolError::ResponseWithheld)),
-            },
-            // The connection failed inside the body.
-            Some(Err(_)) => Some(Some(ProtocolError::ProviderUnreachable)),
-        };
-        drop(held);
-        // A part of a body that was cut is not handed on: the cut is in front of it.
-        if !matches!(ended, Some(Some(_))) {
-            self.queue_part(part);
-        }
-        Poll::Ready(ended)
-    }
-}
-
-/// A stream whose caller went away: what the call still holds is dropped with it, here and
-/// not when the watch of the time limit ends.
-impl Drop for BodyStream {
-    fn drop(&mut self) {
-        let dropped = lock(&self.held).take();
-        drop(dropped);
-        self.watch.abort();
-    }
-}
-
-impl HttpBody for BodyStream {
-    type Data = Bytes;
-    type Error = Infallible;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
-        loop {
-            if let Some(next) = self.queue.pop_front() {
-                return Poll::Ready(Some(Ok(Frame::data(next))));
-            }
-            if self.ended {
-                return Poll::Ready(None);
-            }
-            if self.deadline.as_mut().poll(context).is_ready() {
-                self.end(Some(ProtocolError::Timeout));
-                continue;
-            }
-            match self.read(context) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => {}
-                Poll::Ready(Some(cut)) => self.end(cut),
-            }
-        }
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.queue.is_empty() && self.ended
-    }
-}
-
-/// The 200 response of `vault/send`: the head of a response that passed the checks of rule E4
-/// on its status and its headers, and its body as it arrives, each piece after the search of
-/// that rule. `deadline` is the end of the time limit of the call, and `held` the place of the
-/// call among the forward calls of the node with the share of the body budget of its request
-/// body.
+/// The 200 response of `vault/send` (enclave.md 5.16), a stream: the head of a response of
+/// the host whose headers passed the checks of rule E4, and the parts of the body as
+/// `elements` hands them over. `late` is the end record of a call whose task ended without
+/// one.
 pub fn send_stream(
-    head: CheckedHead,
-    check: StreamCheck,
-    exchange: Exchange,
-    deadline: tokio::time::Instant,
-    held: (OwnedSemaphorePermit, OwnedSemaphorePermit),
+    status: u16,
+    headers: Vec<(String, String)>,
+    elements: tokio::sync::mpsc::Receiver<StreamElement>,
+    late: StreamEnd,
 ) -> Response {
-    let (status, headers) = head.into_parts();
-    let meta = frame::encode_head(&SendMeta { status, headers });
-    let stream = BodyStream::new(meta, check, exchange, deadline, held);
-    let mut response = Response::new(Body::new(stream));
-    *response.status_mut() = StatusCode::OK;
-    response.headers_mut().insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static(frame::STREAM_CONTENT_TYPE),
-    );
-    response
+    stream_response(&SendMeta { status, headers }, elements, late)
 }
 
 fn frame_response(parts: Vec<Bytes>, budget: OwnedSemaphorePermit) -> Response {
     let remaining = parts.iter().map(|part| part.len() as u64).sum();
-    let frame_body = FrameBody {
-        parts: VecDeque::from(parts),
-        remaining,
-        _budget: budget,
-    };
+    let budget = std::sync::Arc::new(budget);
+    let parts = parts
+        .into_iter()
+        .map(|bytes| {
+            Bytes::from_owner(BudgetedPart {
+                bytes,
+                _budget: budget.clone(),
+            })
+        })
+        .collect();
+    let frame_body = FrameBody { parts, remaining };
     let mut response = Response::new(Body::new(frame_body));
     *response.status_mut() = StatusCode::OK;
     response

@@ -38,6 +38,25 @@
 //! `CREDENTIAL_ENCLAVE_DRAIN_TOKEN` and `CREDENTIAL_ENCLAVE_POD_NAME` of `drain`.
 
 #![forbid(unsafe_code)]
+// The host program is built to abort on a panic, and the enclave ends with it. So:
+// No input ends the program. Its code (not the code of its tests) holds no `unwrap`, no
+// `expect`, no `panic!`, and no index or slice expression that can fail. A place that keeps
+// one of them says, where it stands, why no input reaches its failure
+// (`#[expect(clippy::.., reason = "..")]`).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::get_unwrap
+    )
+)]
 
 mod config;
 mod descriptors;
@@ -46,6 +65,7 @@ mod egress;
 mod health;
 mod http;
 mod launch;
+mod memory;
 mod relay;
 #[cfg(test)]
 mod testing;
@@ -101,18 +121,44 @@ const FIRST_ANSWER_POLL_PAUSE: Duration = Duration::from_millis(250);
 /// every such line.
 const FIRST_SILENCE_REPORT: Duration = Duration::from_secs(10);
 
+/// Sets the connections of callers the inbound relay holds at once from what the node says of
+/// the connections it holds itself (`inbound_limit` of `load` of its `health` call: a node
+/// computes that bound from the memory of its kernel, enclave.md section 8), and writes one
+/// line with the two numbers. A node that does not say it leaves the relay at the most it
+/// holds.
+fn follow_node_connections(health: &health::NodeHealth, inbound: &InboundCounters) {
+    let node_connections = health.load.as_ref().and_then(|load| load.inbound_limit);
+    match node_connections {
+        Some(node_connections) => {
+            let pipes = relay::inbound_pipes_for(node_connections);
+            inbound.pipes().set_limit(pipes);
+            log(&format!(
+                "inbound: the node holds {node_connections} connections at once, the relay \
+                 holds {pipes} connections of callers"
+            ));
+        }
+        None => log(&format!(
+            "inbound: the node does not say how many connections it holds, the relay holds \
+             {} connections of callers",
+            inbound.pipes().limit()
+        )),
+    }
+}
+
 /// Writes one line when the node first answers its `health` call, and lines at growing
 /// distances while it does not: the log then shows how long the node took to start, or that it
-/// did not.
-async fn report_first_answer(node: Arc<dyn NodeConnector>) {
+/// did not. The first answer also says how many connections the node holds at once, and the
+/// inbound relay follows it ([`follow_node_connections`]).
+async fn report_first_answer(node: Arc<dyn NodeConnector>, inbound: Arc<InboundCounters>) {
     let started = tokio::time::Instant::now();
     let mut next_report = FIRST_SILENCE_REPORT;
     loop {
-        if health::node_health(node.as_ref()).await.is_some() {
+        if let Some(health) = health::node_health(node.as_ref()).await {
             log(&format!(
                 "node: answering, {} ms after the start of the enclave",
                 started.elapsed().as_millis()
             ));
+            follow_node_connections(&health, &inbound);
             return;
         }
         if started.elapsed() >= next_report {
@@ -290,10 +336,10 @@ async fn run() -> Result<(), String> {
     // Every listener is open before the enclave starts: a port that cannot be opened ends the
     // program before there is an enclave.
     let status_address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, STATUS_PORT));
-    let status_listener = relay::listen_tcp(status_address)
+    let status_listener = relay::listen_tcp(status_address, relay::LISTEN_BACKLOG)
         .map_err(|error| format!("cannot listen on TCP {status_address}: {error}"))?;
     let inbound_address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, INBOUND_PORT));
-    let inbound_listener = relay::listen_tcp(inbound_address)
+    let inbound_listener = relay::listen_tcp(inbound_address, relay::INBOUND_LISTEN_BACKLOG)
         .map_err(|error| format!("cannot listen on TCP {inbound_address}: {error}"))?;
     let egress_listener = VsockListener::bind(egress::EGRESS_PORT).map_err(|error| {
         format!(
@@ -345,9 +391,9 @@ async fn run() -> Result<(), String> {
     tokio::spawn(relay::serve(
         inbound_listener,
         node.clone(),
-        inbound_counters,
+        inbound_counters.clone(),
     ));
-    tokio::spawn(report_first_answer(node.clone()));
+    tokio::spawn(report_first_answer(node.clone(), inbound_counters));
     tokio::spawn(watch::keep_watching(
         watch.clone(),
         launch::describe_enclaves,

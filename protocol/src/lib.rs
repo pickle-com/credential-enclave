@@ -10,6 +10,25 @@
 //! `docs/enclave.md`. The rules on what leaves a node are in `docs/egress-policy.md`.
 
 #![forbid(unsafe_code)]
+// The node program calls this crate with what its callers and a peer node sent. So:
+// No input ends the program. Its code (not the code of its tests) holds no `unwrap`, no
+// `expect`, no `panic!`, and no index or slice expression that can fail. A place that keeps
+// one of them says, where it stands, why no input reaches its failure
+// (`#[expect(clippy::.., reason = "..")]`).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::get_unwrap
+    )
+)]
 // Rule E5 of the egress policy: the node writes no diagnostic output of its own making.
 #![deny(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
 
@@ -17,7 +36,27 @@ pub mod app;
 pub mod attestation;
 pub mod encoding;
 pub mod envelope;
+// The rule on input that ends the program is not in force in this module.
+#[cfg_attr(
+    not(test),
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::string_slice
+    )
+)]
 pub mod keys;
+// The rule on input that ends the program is not in force in this module.
+#[cfg_attr(
+    not(test),
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::string_slice
+    )
+)]
 pub mod log;
 pub mod record;
 pub mod release;
@@ -165,7 +204,8 @@ pub mod limits {
     pub const VAULT_SECRET_PLAINTEXT_BYTES: usize = 12_272;
     /// The lengths the device of an account pads the plaintext of a record of kind
     /// `vault_secret` to, in bytes (section 6): the shortest of them the plaintext fits.
-    pub const VAULT_SECRET_PADDED_BYTES: [usize; 7] = [256, 512, 1_024, 2_048, 4_096, 8_192, 12_272];
+    pub const VAULT_SECRET_PADDED_BYTES: [usize; 7] =
+        [256, 512, 1_024, 2_048, 4_096, 8_192, 12_272];
     /// How long the envelope of one use of a vault secret can be used, from the node time of
     /// the giving node at which it was made: 30 seconds (10.5).
     pub const SECRET_USE_MS: u64 = 30_000;

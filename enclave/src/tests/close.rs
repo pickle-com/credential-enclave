@@ -24,7 +24,9 @@ use crate::testing::{App, Harness, Provider, Reply};
 /// response; it reads every write without answering while `hang` is set. `confirmed` holds the
 /// request targets of the writes it answered with 200: the objects the store holds (a write
 /// refused with a 4xx status stores nothing; a write answered with a 5xx status, a lost write and
-/// a hanging write may or may not have been stored, as far as the node can tell).
+/// a hanging write may or may not have been stored, as far as the node can tell). Every answer
+/// says `Connection: close` and ends its connection, so every write of these tests opens a
+/// connection of its own: a test that refuses connections refuses the next write.
 #[derive(Default)]
 struct Refusal {
     status: u16,
@@ -62,12 +64,12 @@ async fn refusing_store() -> (Provider, Store) {
                         0 => 403,
                         status => status,
                     },
-                    &[],
+                    &[("connection", "close")],
                     b"<Error></Error>",
                 ),
                 false => {
                     refusal.confirmed.push(seen.target.clone());
-                    Reply::with_body(200, &[("etag", "\"0\"")], b"")
+                    Reply::with_body(200, &[("etag", "\"0\""), ("connection", "close")], b"")
                 }
             }
         },

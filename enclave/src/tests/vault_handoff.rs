@@ -552,7 +552,12 @@ async fn a_use_outside_the_reach_of_its_record_is_refused_and_creates_no_entry()
     let other_slots = named(
         &app,
         json!([SITE]),
-        json!(["header:x-api-key", "query:authorization", "form:key", "path"]),
+        json!([
+            "header:x-api-key",
+            "query:authorization",
+            "form:key",
+            "path"
+        ]),
         VALUE,
     );
     let other_name = named(&app, json!([SITE]), json!(["query:Key"]), VALUE);

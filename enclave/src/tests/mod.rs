@@ -14,6 +14,7 @@ mod commands;
 mod forward;
 mod forward_batch;
 mod grants;
+mod inbound;
 mod log;
 mod log_store;
 mod mail;

@@ -200,7 +200,12 @@ async fn a_named_value_is_not_released_outside_its_reach_and_no_entry_is_created
     );
     // A site that is a host below another name: the value goes neither to that name nor to
     // its other hosts.
-    let below = named(&app, json!(["pay.shop.example"]), json!(["field"]), "493817");
+    let below = named(
+        &app,
+        json!(["pay.shop.example"]),
+        json!(["field"]),
+        "493817",
+    );
 
     let refused = [
         // A host that is neither one of the sites nor below one: another name, a name above
@@ -263,7 +268,10 @@ async fn a_named_value_of_every_host_is_released_for_any_origin() {
     // An origin whose host is no name is an origin all the same: a value of every host is
     // compared with none.
     let (status, released) = release(&harness, &anywhere, "value", "https://10.0.0.1").await;
-    assert_eq!((status, &released["value"]), (200, &json!("900101-1234567")));
+    assert_eq!(
+        (status, &released["value"]),
+        (200, &json!("900101-1234567"))
+    );
 
     // A record of every host states the one slot `field`: with another slot, with a second
     // slot or with none, its plaintext has not the form of a record and it does not open.
@@ -726,7 +734,10 @@ async fn a_body_that_has_not_the_form_of_vault_store_is_refused_and_creates_no_e
             "a host twice",
             with("sites", json!(["shop.example", "shop.example"])),
         ),
-        ("a kind the call does not make", with("kind", json!("vault_totp"))),
+        (
+            "a kind the call does not make",
+            with("kind", json!("vault_totp")),
+        ),
         ("the kind of a token", with("kind", json!("oauth"))),
         ("a kind that is no kind", with("kind", json!("secret"))),
         ("a kind that is no string", with("kind", json!(7))),
@@ -1029,7 +1040,8 @@ fn stored_password(site: &str, value: &str) -> Value {
 async fn a_password_the_caller_gave_comes_back_as_a_record_that_says_who_made_it() {
     let provider = quiet_provider_and_log_store().await;
     let (harness, app) = node(&provider).await;
-    let (status, response) = store(&harness, stored_password("shop.example", "c0rrect horse")).await;
+    let (status, response) =
+        store(&harness, stored_password("shop.example", "c0rrect horse")).await;
     assert_eq!(status, 200, "{response}");
     let keys: Vec<&String> = response.as_object().unwrap().keys().collect();
     assert_eq!(keys, ["record", "log"]);
@@ -1126,8 +1138,14 @@ async fn a_body_that_has_not_the_form_of_a_stored_password_is_refused_and_create
         ("a site with a capital", with("site", json!("Shop.example"))),
         ("a site of one label", with("site", json!("localhost"))),
         ("an address for a site", with("site", json!("10.0.0.1"))),
-        ("an origin for a site", with("site", json!("https://shop.example"))),
-        ("a site with a port", with("site", json!("shop.example:443"))),
+        (
+            "an origin for a site",
+            with("site", json!("https://shop.example")),
+        ),
+        (
+            "a site with a port",
+            with("site", json!("shop.example:443")),
+        ),
         ("a list of sites", with("site", json!(["shop.example"]))),
         // The keys of a named value: a password has a site and no reach of its own.
         ("a name", with("name", json!("SIGNUP_PASSWORD"))),
@@ -1201,7 +1219,13 @@ fn opened(
 ) -> Option<String> {
     let sealed: SealedValue = serde_json::from_value(sealed.clone()).unwrap();
     receiver
-        .open("user-1", record["id"].as_str().unwrap(), field, origin, &sealed)
+        .open(
+            "user-1",
+            record["id"].as_str().unwrap(),
+            field,
+            origin,
+            &sealed,
+        )
         .ok()
         .map(|plaintext| String::from_utf8(plaintext.to_vec()).unwrap())
 }
@@ -1261,7 +1285,13 @@ async fn a_release_that_names_a_key_hands_the_value_out_under_the_seal_of_that_k
             "{field}"
         );
         assert_eq!(
-            opened(&private, &released["sealed"], record, field, "https://other.example"),
+            opened(
+                &private,
+                &released["sealed"],
+                record,
+                field,
+                "https://other.example"
+            ),
             None
         );
         assert_eq!(
@@ -1269,7 +1299,13 @@ async fn a_release_that_names_a_key_hands_the_value_out_under_the_seal_of_that_k
             None
         );
         assert_eq!(
-            opened(&receiver(0x42).0, &released["sealed"], record, field, origin),
+            opened(
+                &receiver(0x42).0,
+                &released["sealed"],
+                record,
+                field,
+                origin
+            ),
             None
         );
         // The entry of the release is the entry of a release without a key: the event says
@@ -1358,13 +1394,18 @@ async fn a_release_with_a_key_that_is_no_key_is_refused_and_creates_no_entry() {
     // What a call is refused for without a key it is refused for with one, and a value its
     // plaintext does not hold fails after the entry all the same.
     let (_, seal_to) = receiver(0x41);
-    let outcome =
-        release_sealed(&harness, &record, "totp", "https://shop.example", &seal_to).await;
+    let outcome = release_sealed(&harness, &record, "totp", "https://shop.example", &seal_to).await;
     assert_eq!(code(&outcome), (403, "not_allowed"));
     assert_eq!(harness.head_seq("user-1"), 2);
     let empty = app.record("vault_password", "vault", &json!({"other": "x"}));
-    let outcome =
-        release_sealed(&harness, &empty, "password", "https://shop.example", &seal_to).await;
+    let outcome = release_sealed(
+        &harness,
+        &empty,
+        "password",
+        "https://shop.example",
+        &seal_to,
+    )
+    .await;
     assert_eq!(code(&outcome), (422, "record_invalid"));
     assert_eq!(outcome.1.as_object().unwrap().len(), 2);
     assert_eq!(harness.head_seq("user-1"), 3);

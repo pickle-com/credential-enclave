@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 
 use super::quiet_provider;
 use crate::frame;
-use crate::provider_response::Forms;
+use crate::provider_response::{Forms, StreamCheck, ESCAPED_BYTE_SPAN};
 use crate::state::lock;
 use crate::testing::{decode_stream, operator_config, Harness, Provider, Reply, Seen, Sent};
 
@@ -1160,7 +1160,9 @@ pub(super) fn reflections(value: &str) -> Vec<(String, Vec<u8>)> {
 async fn a_streamed_response_that_reflects_the_value_is_cut_in_front_of_the_reflection() {
     let forms = Forms::of(&[Secret::new(VALUE.to_string())]);
     for (name, form) in reflections(VALUE) {
-        let lead = format!("{{\"lead\":\"{}\",\"echo\":\"", "0123456789".repeat(40)).into_bytes();
+        // The lead is longer than what the search holds back.
+        let lead = format!("{{\"lead\":\"{}\",\"echo\":\"", "0123456789".repeat(400)).into_bytes();
+        assert!(lead.len() > HELD_BACK + LONGEST);
         let whole = [lead.as_slice(), &form, b"\",\"tail\":true}"].concat();
         // The body arrives in pieces that end inside the reflection: after its first byte, in
         // its middle, and one byte before its end.
@@ -1185,17 +1187,17 @@ async fn a_streamed_response_that_reflects_the_value_is_cut_in_front_of_the_refl
             assert_eq!(sent.end["complete"], false, "{name}");
             assert_eq!(sent.end["code"], "response_withheld", "{name}");
             let body = sent.body();
-            // A first piece that holds a whole form of the value already (the text of a
-            // base64 reflection is longer than the form the search finds in it) is withheld
-            // as a whole. Of a first piece that holds a part of a form, the bytes in front
-            // of what the search keeps back were handed on before the second piece came.
-            assert_eq!(
-                body.is_empty(),
-                forms.found_in(&whole[..cut]),
-                "{name} at {inside}"
-            );
+            // Of a first piece that holds a part of a form, the bytes in front of what the
+            // search holds back were handed on before the second piece came. A first piece
+            // that holds a whole form of the value already (the text of a base64 reflection
+            // is longer than the form the search finds in it) is cut where the search read
+            // that form. Either way what was handed on ends in front of what the search held
+            // back when it found the form, which the reflection lies in.
+            if !forms.found_in(&whole[..cut]) {
+                assert!(!body.is_empty(), "{name} at {inside}");
+            }
             assert!(
-                body.len() < lead.len(),
+                body.len() + HELD_BACK <= whole.len() && body.len() < lead.len(),
                 "{name} at {inside}: {}",
                 body.len()
             );
@@ -1308,14 +1310,55 @@ async fn a_value_a_site_sends_back_in_a_header_that_is_not_utf8_is_not_handed_on
     }
 }
 
-/// How many of its last bytes the search of a streamed body keeps back for `VALUE`: the
-/// length of its longest form, the hexadecimal one, plus one.
-const KEPT: usize = 2 * VALUE.len() + 1;
+/// The length of the longest form of `VALUE`, the hexadecimal one. A search of a streamed
+/// body waits for as many bytes.
+const LONGEST: usize = 2 * VALUE.len();
+
+/// How many of its last bytes the search of a streamed body holds back for `VALUE`: the bytes
+/// that one byte more than its longest form can take.
+const HELD_BACK: usize = (LONGEST + 1) * ESCAPED_BYTE_SPAN;
+
+/// The bytes of the body in the parts of a stream that arrived whole so far.
+fn body_bytes_so_far(stream: &[u8]) -> usize {
+    let length = |at: usize| {
+        stream
+            .get(at..at + 4)
+            .map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()) as usize)
+    };
+    let Some(meta_length) = length(0) else {
+        return 0;
+    };
+    let (mut at, mut body) = (4 + meta_length, 0);
+    while let Some(part_length) = length(at).filter(|part| *part > 0) {
+        if at + 4 + part_length > stream.len() {
+            break;
+        }
+        body += part_length;
+        at += 4 + part_length;
+    }
+    body
+}
+
+/// Asserts that `handed_on` is what a search hands on of a body that was cut behind `part`:
+/// the bytes of `part` in front of the ones the search held back, but for the bytes that
+/// still waited for a search.
+fn assert_cut_behind(handed_on: &[u8], part: &[u8]) {
+    let most = part.len() - HELD_BACK;
+    assert!(
+        handed_on.len() <= most && handed_on.len() + LONGEST > most,
+        "{} of {}",
+        handed_on.len(),
+        part.len()
+    );
+    assert_eq!(handed_on, &part[..handed_on.len()]);
+}
 
 #[tokio::test]
 async fn a_response_is_handed_on_while_it_arrives() {
     // The site sends the head and the first events at once and the last event 600 ms later.
-    let first = b"data: 0123456789\n\n".repeat(64);
+    // The first events are more bytes than the search holds back.
+    let first = b"data: 0123456789\n\n".repeat(400);
+    assert!(first.len() > 2 * HELD_BACK);
     let last = b"data: done\n\n".to_vec();
     let chunks = [first.clone(), last.clone()];
     let provider = site(move |_| {
@@ -1344,25 +1387,30 @@ async fn a_response_is_handed_on_while_it_arrives() {
     );
     let mut body = response.into_body();
     let mut received = Vec::new();
-    // What the caller holds of the first events but for the bytes the search keeps back.
-    let early = &first[..first.len() - KEPT];
+    // What the caller holds of the first events before the last one came: all of them but
+    // the bytes the search holds back, and but the bytes that still wait for a search.
+    let early = first.len() - HELD_BACK;
     let mut early_after = None;
     loop {
         let frame =
             std::future::poll_fn(|context| std::pin::Pin::new(&mut body).poll_frame(context)).await;
         let Some(frame) = frame else { break };
         received.extend_from_slice(&frame.unwrap().into_data().unwrap());
-        if early_after.is_none() && received.ends_with(early) {
+        let so_far = body_bytes_so_far(&received);
+        if started.elapsed() < Duration::from_millis(550) {
+            // The bytes the search holds back did not leave before the site went on.
+            assert!(so_far <= early, "{so_far}");
+        }
+        if early_after.is_none() && so_far + LONGEST > early {
             early_after = Some(started.elapsed());
         }
     }
     // The first events were in the hands of the caller before the site sent the last one.
-    let early_after = early_after.expect("the first events came as a part of their own");
+    let early_after = early_after.expect("the first events came before the last one");
     assert!(early_after < Duration::from_millis(450), "{early_after:?}");
     assert!(started.elapsed() >= Duration::from_millis(600));
     let sent = decode_stream(&received);
     assert_eq!(sent.header("content-type"), Some("text/event-stream"));
-    assert_eq!(sent.parts[0], early);
     assert_eq!(sent.body(), [first, last].concat());
     assert_eq!(sent.end, json!({"complete": true}));
 }
@@ -1377,16 +1425,17 @@ async fn a_body_that_ends_early_or_not_in_time_is_cut_with_its_reason() {
             "timeout_ms": 1000,
         })
     };
-    // A response that announces 1,000 bytes and sends 400 of them.
-    let part = b"0123456789".repeat(40);
+    // A response that announces 10,000 bytes and sends 4,000 of them: more than the search
+    // holds back.
+    let part = b"0123456789".repeat(400);
+    assert!(part.len() > HELD_BACK + LONGEST);
     let partial = [
-        b"HTTP/1.1 200 OK\r\ncontent-length: 1000\r\n\r\n".as_slice(),
+        b"HTTP/1.1 200 OK\r\ncontent-length: 10000\r\n\r\n".as_slice(),
         &part,
     ]
     .concat();
-    // Of a body that is cut, the bytes the search kept back are not handed on: they may be
+    // Of a body that is cut, the bytes the search held back are not handed on: they may be
     // the beginning of a reflection the rest of the body would have completed.
-    let handed = &part[..part.len() - KEPT];
 
     // The site closes the connection before the body it announced is whole.
     let reply = partial.clone();
@@ -1394,7 +1443,7 @@ async fn a_body_that_ends_early_or_not_in_time_is_cut_with_its_reason() {
     let forward = forward_node(&provider).await;
     let sent = forward.vault_send(meta(&forward), b"").await.unwrap();
     assert_eq!(sent.status, 200);
-    assert_eq!(sent.body(), handed);
+    assert_cut_behind(&sent.body(), &part);
     assert_eq!(sent.end["complete"], false);
     assert_eq!(sent.end["code"], "provider_unreachable");
     assert!(sent.end["message"]
@@ -1408,7 +1457,7 @@ async fn a_body_that_ends_early_or_not_in_time_is_cut_with_its_reason() {
     let started = Instant::now();
     let sent = forward.vault_send(meta(&forward), b"").await.unwrap();
     assert!(started.elapsed() >= Duration::from_millis(900));
-    assert_eq!(sent.body(), handed);
+    assert_cut_behind(&sent.body(), &part);
     assert_eq!(sent.end["complete"], false);
     assert_eq!(sent.end["code"], "timeout");
 
@@ -1425,7 +1474,7 @@ async fn a_body_that_ends_early_or_not_in_time_is_cut_with_its_reason() {
     let provider = site(move |_| Reply::Abrupt(unframed.clone())).await;
     let forward = forward_node(&provider).await;
     let sent = forward.vault_send(meta(&forward), b"").await.unwrap();
-    assert_eq!(sent.body(), handed);
+    assert_cut_behind(&sent.body(), &part);
     assert_eq!(sent.end["complete"], false);
     assert_eq!(sent.end["code"], "provider_unreachable");
 
@@ -1589,7 +1638,7 @@ async fn every_request_goes_over_a_connection_of_its_own() {
 }
 
 #[tokio::test]
-async fn the_share_of_a_request_body_is_held_until_its_response_has_ended() {
+async fn the_shares_of_a_request_are_held_until_its_response_has_ended() {
     // The site answers with the head and a part of the body, and then stays silent.
     let provider = site(|_| {
         let head = b"HTTP/1.1 200 OK\r\ncontent-length: 1000\r\n\r\n".to_vec();
@@ -1611,18 +1660,26 @@ async fn the_share_of_a_request_body_is_held_until_its_response_has_ended() {
         .respond(Method::POST, "/v1/vault/send", frame_bytes)
         .await;
     assert_eq!(response.status().as_u16(), 200);
-    // The response goes on: the call holds the share of its request body and its place.
+    // The response goes on: the call holds the share of its request body, the share the
+    // search of its response can hold, and its place.
     let mut stream = response.into_body();
     let first =
         std::future::poll_fn(|context| std::pin::Pin::new(&mut stream).poll_frame(context)).await;
     assert!(first.is_some());
     assert_eq!(
         forward.node.body_budget.available_permits(),
-        whole - frame_length
+        whole - frame_length - StreamCheck::memory_bound(VALUE.len())
     );
     assert_eq!(forward.health().await["load"]["forward_calls"], 1);
-    // The caller goes away: the node drops the response of the site, and both are free.
+    // The caller goes away: the task of the stream drops the response of the site, and all
+    // of it is free.
     drop(stream);
+    for _ in 0..200 {
+        if forward.node.body_budget.available_permits() == whole {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     assert_eq!(forward.node.body_budget.available_permits(), whole);
     assert_eq!(forward.health().await["load"]["forward_calls"], 0);
     assert_eq!(forward.health().await["load"]["provider_inflight"], 0);

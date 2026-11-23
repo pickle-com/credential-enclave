@@ -302,12 +302,14 @@ fn ecdsa_der(raw: &[u8]) -> Option<Vec<u8>> {
     for half in raw.chunks(ECDSA_P384_SIGNATURE_BYTES / 2) {
         // A DER integer is the shortest two's complement form: no leading zero bytes, and one
         // zero byte in front of a value whose first bit is set.
+        // The digits from the first one that is not zero, or the last digit of a value of
+        // zero: one digit at the least.
         let start = half
             .iter()
             .position(|byte| *byte != 0)
-            .unwrap_or(half.len() - 1);
-        let digits = &half[start..];
-        let pad = digits[0] & 0x80 != 0;
+            .unwrap_or(half.len().saturating_sub(1));
+        let digits = half.get(start..)?;
+        let pad = digits.first()? & 0x80 != 0;
         body.push(0x02);
         body.push(u8::try_from(digits.len() + usize::from(pad)).ok()?);
         if pad {
@@ -432,15 +434,20 @@ impl<'a> CborReader<'a> {
         Ok(slice)
     }
 
+    /// The next byte.
+    fn byte(&mut self) -> Result<u8, Malformed> {
+        self.take(1)?.first().copied().ok_or(Malformed)
+    }
+
     /// Reads the head of the next item: its major type and its argument. An indefinite length
     /// is malformed here: [`CborReader::array`] and [`CborReader::map`] read the two items that
     /// may have one. A break outside of such a container is malformed as well.
     fn head(&mut self) -> Result<(u8, u64), Malformed> {
-        let initial = self.take(1)?[0];
+        let initial = self.byte()?;
         let major = initial >> 5;
         let argument = match initial & 0x1f {
             small @ 0..=23 => u64::from(small),
-            24 => u64::from(self.take(1)?[0]),
+            24 => u64::from(self.byte()?),
             25 => u64::from(u16::from_be_bytes(
                 self.take(2)?.try_into().map_err(|_| Malformed)?,
             )),
