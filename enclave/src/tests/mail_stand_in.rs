@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{RootCertStore, ServerConfig};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
@@ -87,6 +87,15 @@ pub(super) fn fetch_literal(uid: u32, items: &str, item: &str, octets: &[u8]) ->
     response.extend_from_slice(octets);
     response.extend_from_slice(b")\r\n");
     response
+}
+
+/// Writes `bytes` to a connection of the stand-in and hands them to its socket. A TLS stream
+/// takes the bytes of a write into its own buffer and keeps what the socket did not take at
+/// that moment: without the flush, the end of a long answer stays in the stand-in until its
+/// next write, and the client waits for it.
+async fn send(stream: &mut (impl AsyncWrite + Unpin), bytes: &[u8]) -> Option<()> {
+    stream.write_all(bytes).await.ok()?;
+    stream.flush().await.ok()
 }
 
 /// The answers of a mailbox with the folder `INBOX` of the generation 42 and the one message
@@ -212,7 +221,7 @@ impl ImapServer {
                     let connection = connections.fetch_add(1, Ordering::SeqCst);
                     let mut io = BufReader::new(tls);
                     let served = async {
-                        io.get_mut().write_all(greeting.as_bytes()).await.ok()?;
+                        send(io.get_mut(), greeting.as_bytes()).await?;
                         let mut number = 0;
                         loop {
                             let mut line = Vec::new();
@@ -228,7 +237,7 @@ impl ImapServer {
                                 let (front, declared) = text.rsplit_once('{')?;
                                 let count: usize = declared.trim_end_matches('}').parse().ok()?;
                                 let front = front.to_string();
-                                io.get_mut().write_all(b"+ send it\r\n").await.ok()?;
+                                send(io.get_mut(), b"+ send it\r\n").await?;
                                 let mut literal = vec![0; count];
                                 io.read_exact(&mut literal).await.ok()?;
                                 let mut rest = Vec::new();
@@ -251,9 +260,7 @@ impl ImapServer {
                             number += 1;
                             for act in answer.acts {
                                 match act {
-                                    Act::Send(bytes) => {
-                                        io.get_mut().write_all(&bytes).await.ok()?
-                                    }
+                                    Act::Send(bytes) => send(io.get_mut(), &bytes).await?,
                                     Act::Wait(gate) => {
                                         waiting.fetch_add(1, Ordering::SeqCst);
                                         let permit = gate.acquire().await;
@@ -266,7 +273,7 @@ impl ImapServer {
                             }
                             if !answer.completion.is_empty() {
                                 let completion = format!("{tag} {}\r\n", answer.completion);
-                                io.get_mut().write_all(completion.as_bytes()).await.ok()?;
+                                send(io.get_mut(), completion.as_bytes()).await?;
                             }
                         }
                     };
