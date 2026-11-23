@@ -110,8 +110,9 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
 
 /// Steps 10 to 15 of protocol.md 5.3.
 ///
-/// A grant of the key of the grant in force renews that grant: its end moves to the later of
-/// the two ends, and the node creates no entry and writes nothing. The entry `grant_accepted`
+/// A grant of the key of the grant in force renews that grant: its end becomes the end of the
+/// command, earlier or later than the end it had, and the node creates no entry and writes
+/// nothing. The entry `grant_accepted`
 /// that the log store confirmed when the node took the user key of that grant names the key,
 /// and the node holds the same key before and after the command.
 ///
@@ -186,7 +187,7 @@ async fn accept_grant(
         // 13a: a grant of the key of the grant in force renews it, without an entry.
         if let GrantState::Active(held) = account.grant_mut() {
             if held.sign_pk == grant.sign_pk {
-                held.not_after_ms = held.not_after_ms.max(not_after_ms);
+                held.not_after_ms = not_after_ms;
                 return Ok(answered(None, held.not_after_ms, None));
             }
         }
@@ -216,11 +217,11 @@ async fn accept_grant(
         return Ok(failed(ProtocolError::BadChallenge));
     }
     account.expire(now_ms);
-    // A grant of the same key that another command put in place in that time is renewed: the
-    // later end stays, and so does what the node kept for it.
+    // A grant of the same key that another command put in place in that time is renewed: its
+    // end becomes the end of this command, and what the node kept for it stays.
     if let GrantState::Active(held) = account.grant_mut() {
         if held.sign_pk == grant.sign_pk {
-            held.not_after_ms = held.not_after_ms.max(not_after_ms);
+            held.not_after_ms = not_after_ms;
             return Ok(answered(None, held.not_after_ms, Some(log)));
         }
     }

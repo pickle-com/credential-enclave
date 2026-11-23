@@ -350,7 +350,7 @@ code of the first of them.
 | 11a | (grant) The node can write to its log store: it has one, credentials for it within their time, and its node document in the store (7.6, 7.7). A node of platform `local` without a log store passes | `log_store_unavailable` |
 | 12 | This node issued `challenge`, not more than 300 seconds ago, and it was not used before. When this check passes, the challenge is marked as used. (grant) The node issued the challenge after the last revoke of that account that it accepted (5.4) | `bad_challenge` |
 | 13 | (grant) `not_after_ms > now`. A value larger than `now + 30 days` is shortened to `now + 30 days` (5.2) | `bad_expiry` |
-| 13a | (grant) When the account has a grant of the same `sign_pk` within its time, the command renews that grant: its end becomes the later of its end and the end of step 13. The node creates no entry and writes nothing, step 14 does not apply, and the reply carries the end the grant has now | |
+| 13a | (grant) When the account has a grant of the same `sign_pk` within its time, the command renews that grant: its end becomes the end of step 13, earlier or later than the end it had. The node creates no entry and writes nothing, step 14 does not apply, and the reply carries the end the grant has now | |
 | 14 | (grant) In every other case (the account has no grant, its grant ended by its time or by a revoke, or its grant has another `sign_pk`) the node creates the log entry `grant_accepted` (section 7) and writes it to the log store. After the store confirmed the entry, it puts the grant into its memory (the grant replaces the grant and the revocation marker that were there) | `log_store_unavailable`, `bad_challenge` |
 | 15 | The node signs the reply and returns it (5.5) | |
 
@@ -374,9 +374,11 @@ user key names that key, and the node holds the same key before and after a rene
 no key into the node, so it has no entry. It is a command of the account all the same: it passed
 steps 1 to 13, so only the key of the account moves the end of its grant, and a carrier cannot
 repeat it (its challenge is used). A grant that ended, by its time or by a revoke, is not renewed:
-the next grant command of that key is a grant of step 14 and has its entry. When another command put
-a grant of the same key in place while the entry of step 14 was written, the later end stays as
-well.
+the next grant command of that key is a grant of step 14 and has its entry. A renewal can shorten
+a grant: the end in force is the end of the last grant command of that key the node accepted, so
+an account that lowers the time of its delegation does so with a grant command and without a
+revoke. When another command put a grant of the same key in place while the entry of step 14 was
+written, the end of the command whose entry was written is the end in force.
 
 ### 5.4 The order in which a node processes a revoke
 
