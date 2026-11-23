@@ -117,7 +117,7 @@ fn asked_of(body: &JsonBody) -> Result<Asked, ApiError> {
 /// `id` or a `nonce` is `invalid_request`: the node does not encrypt a value of its caller
 /// under the record key of a record that exists.
 async fn run_store(node: &Node, request: Request) -> Result<Response, ApiError> {
-    let body = JsonBody::read(request).await?;
+    let body = JsonBody::read(node, request).await?;
     let user_id = body.user_id()?;
     if DRAWN_BY_THE_NODE
         .iter()

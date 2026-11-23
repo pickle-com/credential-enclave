@@ -34,7 +34,7 @@ pub async fn prune(State(node): State<Arc<Node>>, request: Request) -> Response 
 /// accounts looked at; `next` is the last `user_id` it looked at, the empty string when it
 /// reached the end. The call works in the state `closing` too, and `subset` is required.
 async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
-    let body = JsonBody::read(request).await?;
+    let body = JsonBody::read(node, request).await?;
     let subset = subset_of(&body)?.ok_or_else(|| invalid("subset"))?;
     let after = body.text_or_empty("after")?;
     let limit = limit_of(&body, PAGE_LIMIT)?;

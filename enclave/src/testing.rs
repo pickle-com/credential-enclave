@@ -1112,6 +1112,13 @@ fn header_pairs(value: &Value) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// The share of the body budget a call holds for the request `request`, the JSON body of a
+/// call or the meta of a frame, written the way [`Harness`] writes it
+/// (`Marks::request_share`).
+pub fn request_share(request: &Value) -> usize {
+    crate::room::Marks::of(&to_json(request)).request_share()
+}
+
 /// The release of a node under test. It is not a release tag (protocol.md 10.3).
 const RELEASE: &str = "v0.0.0-test";
 

@@ -368,6 +368,14 @@ pub(super) fn frame_of(record: &Value, params: &Value, body: &[u8]) -> Vec<u8> {
     wire
 }
 
+/// What a mail call holds of the body budget for the frame [`frame_of`] makes, once it has
+/// read it: the bytes of the frame, and the share of the request of its meta.
+pub(super) fn frame_share(record: &Value, params: &Value, body: &[u8]) -> usize {
+    let frame = frame_of(record, params, body);
+    let meta = &frame[4..frame.len() - body.len()];
+    frame.len() + crate::room::Marks::of(meta).request_share()
+}
+
 /// One mail call of the account `mail-user`: the status of the answer, the meta of its frame
 /// (the failure body of an answer that is no frame) and the body of the frame.
 pub(super) async fn request(
@@ -758,20 +766,6 @@ async fn mixed_admission_scenario() -> Value {
     .await;
     let (harness, app, record) = server.harness().await;
     let harness = Arc::new(harness);
-    // A budget with room for two folder listings that wait for their login and for 32 KiB
-    // more: a third mail call is refused while the small HTTP calls still fit, each with its
-    // frame and the share of its credential (about 25 KiB before its record is open). The
-    // rest of the budget of the node is held here.
-    let listing = frame_of(&record, &json!({"action":"folders"}), b"").len()
-        + mail::CALL_BYTES
-        + mail::SHARE_STEP_BYTES;
-    let free = 2 * listing + 32 * 1024;
-    let _rest = harness
-        .node
-        .body_budget
-        .clone()
-        .try_acquire_many_owned((harness.node.limits.body_budget_bytes - free) as u32)
-        .unwrap();
     let google = app.record(
         "oauth",
         "google_workspace",
@@ -784,6 +778,31 @@ async fn mixed_admission_scenario() -> Value {
             "headers":[],"context":"cli:gog","timeout_ms":5000,
         })
     };
+    // A budget with room for two folder listings that wait for their login and for one small
+    // HTTP call more: its frame, the share of its request, and the share of its credential
+    // as it takes it before its record is open. A third folder listing is refused: with its
+    // frame read it holds more than that. The rest of the budget of the node is held here.
+    let of_a_listing = frame_share(&record, &json!({"action":"folders"}), b"") + mail::CALL_BYTES;
+    let listing = of_a_listing + mail::SHARE_STEP_BYTES;
+    let small = ["emailAddress", "messagesTotal", "threadsTotal"]
+        .map(|field| {
+            let meta = google_meta(field);
+            let longest = google["ct"].as_str().unwrap().len().div_ceil(4) * 3;
+            crate::frame::encode_head(&meta).len()
+                + crate::testing::request_share(&meta)
+                + crate::api::credential_share(longest, 1, 1)
+        })
+        .into_iter()
+        .max()
+        .unwrap();
+    assert!(small < of_a_listing, "{small} {of_a_listing}");
+    let free = 2 * listing + small;
+    let _rest = harness
+        .node
+        .body_budget
+        .clone()
+        .try_acquire_many_owned((harness.node.limits.body_budget_bytes - free) as u32)
+        .unwrap();
     let start = Instant::now();
     assert_eq!(
         harness
@@ -893,9 +912,9 @@ async fn oversized_literal_declaration_is_refused_before_it_is_read() {
     );
 }
 
-/// What a mail call holds of the body budget while its login waits: its request frame, its
-/// fixed share, and for a read one step for the greeting it read. No call holds the largest
-/// mail it could read.
+/// What a mail call holds of the body budget while its login waits: its request frame, the
+/// share of its request, its fixed share, and for a read one step for the greeting it read.
+/// No call holds the largest mail it could read.
 #[tokio::test]
 async fn the_share_of_a_mail_call_at_its_login_is_its_frame_and_its_fixed_share() {
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
@@ -934,7 +953,7 @@ async fn the_share_of_a_mail_call_at_its_login_is_its_frame_and_its_fixed_share(
             "naver_mail",
             &json!({"username":"tester@naver.com","password":PASSWORD}),
         );
-        let expected = frame_of(&record, &params, b"").len() + fixed;
+        let expected = frame_share(&record, &params, b"") + fixed;
         let seen = server.passwords.lock().unwrap().len();
         let call = {
             let harness = harness.clone();

@@ -163,6 +163,19 @@ pub mod limits {
     pub const EVENT_ADDRESS_BYTES: usize = 8192;
     /// Longest binding document, in bytes (4.1).
     pub const BINDING_BYTES: usize = 512;
+    /// Longest token a node handles, in bytes (section 6): the strings `access_token`,
+    /// `refresh_token` and `id_token` of a token object, and the string a provider definition
+    /// injects. A token travels in the value of a request header, and a header value of that
+    /// length is above what servers commonly take.
+    pub const TOKEN_BYTES: usize = 16_384;
+    /// Longest plaintext of a record a node opens or creates, in bytes (section 6): four
+    /// times the longest token. That is the room of the three token strings of a token
+    /// response at their longest (`access_token`, `refresh_token`, `id_token`), and as much
+    /// as one of them for its other values.
+    pub const RECORD_PLAINTEXT_BYTES: usize = 4 * TOKEN_BYTES;
+    /// Longest `ct` of a record, in characters (section 6): the base64url text of the longest
+    /// plaintext and its 16-byte tag.
+    pub const RECORD_CT_CHARS: usize = (4 * (RECORD_PLAINTEXT_BYTES + 16)).div_ceil(3);
     /// How long the log store keeps an entry from the moment a node writes it: 365 days. Until
     /// then nobody can delete the object or shorten its retention (7.6).
     pub const LOG_RETENTION_DAYS: u64 = 365;

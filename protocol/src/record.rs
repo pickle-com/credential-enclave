@@ -9,7 +9,7 @@ use zeroize::Zeroizing;
 use crate::encoding::{b64u, b64u_decode};
 use crate::keys::{record_key, Custody};
 use crate::secret::Secret;
-use crate::{is_valid_name, purpose, ProtocolError};
+use crate::{is_valid_name, limits, purpose, ProtocolError};
 
 /// How a credential is used (rule E6 of the egress policy).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -121,12 +121,22 @@ pub struct Record {
 
 impl Record {
     /// Reads a record from parsed JSON. A `v` other than the integer 1 is
-    /// `unsupported_version`. A missing or non-string field is `record_invalid`. Keys the
-    /// protocol does not define are ignored.
+    /// `unsupported_version`. A missing or non-string field is `record_invalid`, and so is a
+    /// `ct` of more than [`limits::RECORD_CT_CHARS`] characters: a reader makes no copy of
+    /// such a record and does not open it. The length of a ciphertext says nothing of what
+    /// it holds, so this judgement needs no key. Keys the protocol does not define are
+    /// ignored.
     pub fn from_value(value: &serde_json::Value) -> Result<Record, ProtocolError> {
         let object = value.as_object().ok_or(ProtocolError::RecordInvalid)?;
         if object.get("v").and_then(serde_json::Value::as_u64) != Some(1) {
             return Err(ProtocolError::UnsupportedVersion);
+        }
+        let ct_chars = object
+            .get("ct")
+            .and_then(serde_json::Value::as_str)
+            .map_or(0, str::len);
+        if ct_chars > limits::RECORD_CT_CHARS {
+            return Err(ProtocolError::RecordInvalid);
         }
         let text = |key: &str| {
             object
@@ -496,6 +506,45 @@ mod tests {
         assert_eq!(
             Record::from_value(&serde_json::json!("text")),
             Err(ProtocolError::RecordInvalid)
+        );
+    }
+
+    #[test]
+    fn a_record_is_read_up_to_the_longest_ciphertext() {
+        let sealed = |plaintext_bytes: usize| {
+            seal_record(
+                &USER_KEY,
+                &[0x31; 16],
+                &[0x41; 12],
+                "user-1",
+                KEY_ID,
+                Custody::Enclave,
+                "oauth",
+                "google_workspace",
+                &vec![b'p'; plaintext_bytes],
+            )
+        };
+        let read = |record: &Record| {
+            Record::from_value(&serde_json::from_slice(&to_json(record)).unwrap())
+        };
+        // The longest plaintext gives the longest `ct`: its bytes and the tag of 16 bytes,
+        // four characters for three bytes.
+        let longest = sealed(limits::RECORD_PLAINTEXT_BYTES);
+        assert_eq!(limits::RECORD_PLAINTEXT_BYTES, 65_536);
+        assert_eq!(limits::RECORD_CT_CHARS, 87_403);
+        assert_eq!(longest.ct.len(), limits::RECORD_CT_CHARS);
+        let opened = open_record(&USER_KEY, &read(&longest).unwrap()).unwrap();
+        assert_eq!(opened.len(), limits::RECORD_PLAINTEXT_BYTES);
+        // One byte more of plaintext is one character more of `ct`: the record is not read.
+        let longer = sealed(limits::RECORD_PLAINTEXT_BYTES + 1);
+        assert_eq!(longer.ct.len(), limits::RECORD_CT_CHARS + 1);
+        assert_eq!(read(&longer), Err(ProtocolError::RecordInvalid));
+        // The version of a record is judged first.
+        let mut other_version = serde_json::to_value(&longer).unwrap();
+        other_version["v"] = serde_json::json!(2);
+        assert_eq!(
+            Record::from_value(&other_version),
+            Err(ProtocolError::UnsupportedVersion)
         );
     }
 

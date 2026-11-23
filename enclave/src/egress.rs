@@ -59,6 +59,15 @@ pub const PROVIDER_PORT: u16 = 443;
 /// Open connections to providers in total that carry no request, over every account.
 const IDLE_PROVIDER_CONNECTIONS_TOTAL: usize = 1024;
 
+/// The longest head of a request (its request line and its headers) after which a connection
+/// is kept for a further request of its account and host: 32 KiB. The HTTP client writes the
+/// head of a request from a buffer that belongs to the connection and keeps the room of the
+/// longest head it held, twice that head at the most. So a connection that carried a longer
+/// head carries no further request and is closed when its response has ended: what an idle
+/// connection holds of the requests it carried is bounded by this constant, whatever the
+/// headers of those requests were.
+pub const KEPT_HEAD_BYTES: usize = 32 * 1024;
+
 /// Outbound connections a node opens at the same time (enclave.md section 8): the default of
 /// `Limits::open_concurrency`. A quarter of the backlog of the egress relay of the host
 /// program, so a burst of opens waits in the node and not in a queue the kernel resets.
@@ -254,6 +263,25 @@ impl OutboundRequest {
         self.destination.host()
     }
 
+    /// No fewer bytes than the head of this request has when it is written: the request
+    /// line, the `Host`, `Content-Length` and `Connection` headers of the node, and every
+    /// other header with its separator and its line end.
+    fn head_bytes(&self) -> usize {
+        // The method, the version and the two line ends of the request line, the names and
+        // the values of the three headers of the node, and the empty line: 128 bytes hold
+        // them beside the host.
+        let fixed = 128usize
+            .saturating_add(self.method.len())
+            .saturating_add(self.destination.request_target().len())
+            .saturating_add(self.destination.host().len());
+        self.headers.iter().fold(fixed, |bytes, header| {
+            bytes
+                .saturating_add(header.name.len())
+                .saturating_add(header.value.len())
+                .saturating_add(4)
+        })
+    }
+
     /// The request method.
     #[cfg(test)]
     pub fn method(&self) -> &str {
@@ -303,6 +331,16 @@ pub enum HeaderText {
     Plain(String),
     /// A value that carries a credential or a client secret.
     Secret(Secret<String>),
+}
+
+impl HeaderText {
+    /// The length of the value in bytes.
+    fn len(&self) -> usize {
+        match self {
+            HeaderText::Plain(text) => text.len(),
+            HeaderText::Secret(text) => text.expose_secret().len(),
+        }
+    }
 }
 
 /// One header of an outbound request.
@@ -952,7 +990,9 @@ impl Egress {
     ///
     /// With `account`, the request goes over an idle connection of that account to the host
     /// when there is one, and its connection goes back to those idle connections when the
-    /// response has ended (enclave.md 5.8 step 8). A request over an idle connection that ends
+    /// response has ended (enclave.md 5.8 step 8). The connection of a request whose head
+    /// was longer than [`KEPT_HEAD_BYTES`] does not go back: it is closed when the response
+    /// has ended. A request over an idle connection that ends
     /// without a response goes once more over a new connection when its method is `GET` or
     /// `HEAD`; a request of another method is not repeated, because whether the provider
     /// received it is unknown. Without `account` (the token address and the revocation
@@ -1016,8 +1056,11 @@ impl Egress {
             }
         };
         // A connection of an account goes back to the idle connections of that account and
-        // host when the response has ended, unless the provider closes it.
-        let keep = account.map(|user_id| Keep {
+        // host when the response has ended, unless the provider closes it, or the head of
+        // this request was longer than the head a kept connection may have carried
+        // ([`KEPT_HEAD_BYTES`]).
+        let kept = outbound.head_bytes() <= KEPT_HEAD_BYTES;
+        let keep = account.filter(|_| kept).map(|user_id| Keep {
             pool: self.provider_idle.clone(),
             user_id: user_id.to_string(),
             host: host.clone(),

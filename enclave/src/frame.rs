@@ -63,10 +63,11 @@ pub fn encode_head<T: Serialize>(meta: &T) -> Vec<u8> {
     head
 }
 
-/// Splits a frame into its meta (a JSON object) and its payload. A frame shorter than its
-/// length prefix says, a meta above [`META_LIMIT_BYTES`] and a meta that is not a JSON object
-/// are `invalid_request`.
-pub fn decode(frame: &Bytes) -> Result<(serde_json::Value, Bytes), ProtocolError> {
+/// Splits a frame into the bytes of its meta and its payload. A frame shorter than its length
+/// prefix says and a meta above [`META_LIMIT_BYTES`] are `invalid_request`. The meta is not
+/// parsed here: a call parses it under the share of the body budget it takes for it
+/// (`crate::api`), which it computes from these bytes.
+pub fn split(frame: &Bytes) -> Result<(Bytes, Bytes), ProtocolError> {
     let prefix: [u8; 4] = frame
         .get(..4)
         .and_then(|bytes| bytes.try_into().ok())
@@ -77,16 +78,23 @@ pub fn decode(frame: &Bytes) -> Result<(serde_json::Value, Bytes), ProtocolError
     }
     // The meta lies in the frame whole, behind the four bytes of its length.
     let payload_at = 4 + meta_length;
-    let meta = frame
-        .get(4..payload_at)
-        .ok_or(ProtocolError::InvalidRequest)?;
+    if frame.len() < payload_at {
+        return Err(ProtocolError::InvalidRequest);
+    }
+    Ok((frame.slice(4..payload_at), frame.slice(payload_at..)))
+}
+
+/// Splits a frame into its meta (a JSON object) and its payload. A frame [`split`] refuses
+/// and a meta that is not a JSON object are `invalid_request`.
+#[cfg(test)]
+pub fn decode(frame: &Bytes) -> Result<(serde_json::Value, Bytes), ProtocolError> {
+    let (meta, payload) = split(frame)?;
     let meta: serde_json::Value =
-        serde_json::from_slice(meta).map_err(|_| ProtocolError::InvalidRequest)?;
+        serde_json::from_slice(&meta).map_err(|_| ProtocolError::InvalidRequest)?;
     if !meta.is_object() {
         return Err(ProtocolError::InvalidRequest);
     }
-    // `payload_at` is not behind the end of the frame: the meta was read up to it.
-    Ok((meta, frame.slice(payload_at..)))
+    Ok((meta, payload))
 }
 
 #[cfg(test)]

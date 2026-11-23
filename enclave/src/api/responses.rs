@@ -745,9 +745,11 @@ pub struct Exported {
 /// `POST /v1/peer/import`.
 #[derive(Serialize)]
 pub struct Imported {
-    /// P: a count.
+    /// P: a count, the grants this call put in place.
     pub imported: usize,
-    /// E: the `user_id` of every account whose grant this call put in place.
+    /// E: the `user_id` of every account whose grant of the transfer this node holds when
+    /// the call ends: this call put it in place, or the node held the grant of the same
+    /// signing key already.
     pub accounts: Vec<String>,
     /// E and P: the entries `grant_transferred_in` this call created: one per grant of a
     /// transfer from an earlier release, none for a transfer from a node of this program.

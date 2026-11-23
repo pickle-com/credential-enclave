@@ -24,13 +24,16 @@ use axum::response::Response;
 use credential_enclave_protocol::record::Record;
 use credential_enclave_protocol::secret::Secret;
 use credential_enclave_protocol::secret_use::{header_key, names_no_other_charset};
-use credential_enclave_protocol::ProtocolError;
+use credential_enclave_protocol::{limits, ProtocolError};
 use hyper::body::Bytes;
 use serde_json::Value;
 use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit};
 
 use super::responses::{forward_frame, forward_stream, LogRef, StreamElement, StreamEnd};
-use super::{invalid, read_body, record_of, respond, ApiError, JsonBody};
+use super::{
+    above_bounds, invalid, narrowed, read_body, record_of, request_share_of, reserve, respond,
+    Admission, ApiError, JsonBody,
+};
 use crate::egress::{self, EgressError, Exchange, OutboundBody, OutboundHeader, OutboundRequest};
 use crate::faults::joined;
 use crate::frame::{self, META_LIMIT_BYTES};
@@ -88,16 +91,6 @@ const REFUSED_HEADERS: [&str; 3] = [
 ];
 
 pub(super) const TIMEOUT_DEFAULT_MS: u64 = 30_000;
-/// Longest time a `forward` or `forward/batch` call waits to be admitted: for one of the places
-/// of the forward calls of the node and for the shares of the body budget it takes before
-/// anything of it is recorded or sent, the share its request frame occupies and the share of
-/// what it holds of its credential (enclave.md section 8).
-#[cfg(not(test))]
-pub(crate) const ADMISSION_WAIT: Duration = Duration::from_secs(30);
-/// The tests of the node wait for a shorter time: a test that holds every place does not
-/// take 30 seconds.
-#[cfg(test)]
-pub(crate) const ADMISSION_WAIT: Duration = Duration::from_millis(400);
 pub(super) const TIMEOUT_MIN_MS: u64 = 1_000;
 pub(super) const TIMEOUT_MAX_MS: u64 = 120_000;
 /// The longest time limit of a call that asked for its response as a stream: the time from
@@ -109,64 +102,6 @@ const STREAM_ELEMENTS: usize = 4;
 
 pub async fn forward(State(node): State<Arc<Node>>, request: Request) -> Response {
     respond(run(&node, request).await)
-}
-
-/// The admission of a call that takes one of the places of the forward calls of the node
-/// (`forward`, `forward/batch`): its place, the share of the body budget its request frame
-/// occupies, and the share of what it holds of its credential ([`credential_share`]). A call
-/// waits for them together for at most [`ADMISSION_WAIT`], counted from the moment it began,
-/// and ends with `capacity_unavailable` when it has not got them by then. It has read nothing
-/// of its frame while it waits for the first two: the frame enters memory only under its
-/// share of the budget. It has created no entry and sent nothing while it waits for the
-/// third.
-///
-/// The limit is what bounds the time a connection is held by a call that does nothing yet.
-/// The node reads nothing from the connection of a call that waits, so it does not learn
-/// that the caller of such a call is gone (enclave.md section 8).
-pub(super) struct Admission {
-    until: tokio::time::Instant,
-}
-
-impl Admission {
-    /// The admission of a call that begins now.
-    pub(super) fn begin() -> Admission {
-        Admission {
-            until: tokio::time::Instant::now() + ADMISSION_WAIT,
-        }
-    }
-
-    /// One of the places of the forward calls of the node, held until it is dropped.
-    pub(super) async fn slot(&self, node: &Node) -> Result<OwnedSemaphorePermit, ApiError> {
-        let slot = node.forward_slots.clone().acquire_owned();
-        match tokio::time::timeout_at(self.until, slot).await {
-            Ok(Ok(slot)) => Ok(slot),
-            Ok(Err(_)) => Err(ApiError::internal()),
-            Err(_) => Err(ProtocolError::CapacityUnavailable.into()),
-        }
-    }
-
-    /// `bytes` of the body budget of the node: for the request frame of the call, or for
-    /// what the call holds of its credential ([`credential_share`]).
-    pub(super) async fn budget(
-        &self,
-        node: &Node,
-        bytes: usize,
-    ) -> Result<OwnedSemaphorePermit, ApiError> {
-        match tokio::time::timeout_at(self.until, reserve(node, bytes)).await {
-            Ok(reserved) => reserved,
-            Err(_) => Err(ProtocolError::CapacityUnavailable.into()),
-        }
-    }
-}
-
-/// Takes `bytes` of the body budget of the node, waiting for them.
-pub(super) async fn reserve(node: &Node, bytes: usize) -> Result<OwnedSemaphorePermit, ApiError> {
-    let permits = u32::try_from(bytes).map_err(|_| ApiError::from(ProtocolError::TooLarge))?;
-    node.body_budget
-        .clone()
-        .acquire_many_owned(permits)
-        .await
-        .map_err(|_| ApiError::internal())
 }
 
 /// The `timeout_ms` of a call: 1,000 to 120,000, 30,000 when absent.
@@ -252,11 +187,15 @@ fn caller_headers(
 }
 
 /// A request that passed steps 2 to 4 of enclave.md 5.8: the outbound request with the
-/// credential injected, the token to search the response for (rule E4) and its length, the
-/// merge key of a GET without a body, and the event `provider_request` of the request.
+/// credential injected and the token to search the response for (rule E4), the length of
+/// that token, the merge key of a GET without a body, and the event `provider_request` of
+/// the request.
 pub(super) struct Prepared {
-    pub outbound: OutboundRequest,
-    pub token: Secret<String>,
+    /// The request and its token. `None` for a record whose plaintext, or whose token, is
+    /// above what a node reads (`oauth::Unusable::AboveBounds`): no credential was made and
+    /// nothing is sent. The request has its event all the same, and its call ends with
+    /// `above_bounds` once the log store confirmed the entry of that event.
+    pub request: Option<(OutboundRequest, Secret<String>)>,
     pub token_bytes: usize,
     pub merge_key: Option<[u8; 32]>,
     pub event: Value,
@@ -266,13 +205,13 @@ pub(super) struct Prepared {
 /// its body: the address check of the definition, the method, the credential header of the
 /// rule of the host, `Accept-Encoding: identity`, the headers of the caller, and the check
 /// that the request can be expressed in HTTP/1.1. `parsed` is the parsed plaintext of the
-/// record the credential comes from.
+/// record the credential comes from, or why the node does not use that plaintext.
 pub(super) fn prepare(
     request: &Value,
     payload: &Bytes,
     record: &Record,
     definition: &Definition,
-    parsed: &oauth::OauthPlaintext,
+    parsed: Result<&oauth::OauthPlaintext, oauth::Unusable>,
     context: &str,
 ) -> Result<Prepared, ApiError> {
     let method = request
@@ -295,15 +234,27 @@ pub(super) fn prepare(
     let rule = definition
         .inject_rule(target.host())
         .ok_or(ProtocolError::NotAllowed)?;
-    let credential = parsed
-        .credential(rule)
-        .ok_or(ProtocolError::RecordInvalid)?;
-    let token_bytes = credential.token_bytes();
-    let (header_value, token) = credential.into_parts();
-    let mut headers = vec![
-        OutboundHeader::secret(&rule.header, header_value),
-        OutboundHeader::plain("accept-encoding", "identity"),
-    ];
+    // A plaintext without a token for this rule ends the call here. A plaintext, or a
+    // token, above what a node reads does not: that judgement depends on the content of
+    // the plaintext, so it is made after the entry of the call. No credential is made of
+    // such a record, and the rest of the request is checked without one.
+    let credential = match parsed.and_then(|plaintext| plaintext.credential(rule)) {
+        Ok(credential) => Some(credential),
+        Err(oauth::Unusable::Invalid) => return Err(ProtocolError::RecordInvalid.into()),
+        Err(oauth::Unusable::AboveBounds) => None,
+    };
+    let token_bytes = credential
+        .as_ref()
+        .map_or(0, oauth::Credential::token_bytes);
+    let (token, mut headers) = match credential {
+        Some(credential) => {
+            let (header_value, token) = credential.into_parts();
+            let header = OutboundHeader::secret(&rule.header, header_value);
+            (Some(token), vec![header])
+        }
+        None => (None, Vec::new()),
+    };
+    headers.push(OutboundHeader::plain("accept-encoding", "identity"));
     headers.extend(caller_headers(request, definition)?);
     let outbound = OutboundRequest::new(
         target.destination(),
@@ -340,8 +291,7 @@ pub(super) fn prepare(
         mergeable,
     );
     Ok(Prepared {
-        outbound,
-        token,
+        request: token.map(|token| (outbound, token)),
         token_bytes,
         merge_key,
         event,
@@ -414,14 +364,18 @@ pub(super) async fn execute(
     // reads the whole body, so it runs off the threads that serve the calls. A panic of the
     // search is a panic of this call (`joined`): the request has reached the provider, and a
     // failure response would say that the call can be made again.
+    //
+    // The share of the body budget the response body occupies goes into the task with the
+    // body and comes back with its outcome: the body is in memory until that task has
+    // ended, whether or not the call still waits for it, and so is its share.
     let mut search = tokio::task::spawn_blocking(move || {
-        provider_response::check(&token, status, headers, body)
+        let checked = provider_response::check(&token, status, headers, body);
+        (checked, budget)
     });
-    let checked = joined(&mut search)
+    let (checked, budget) = joined(&mut search)
         .await
-        .ok_or(ProtocolError::ProviderUnreachable)?
-        .map_err(ProtocolError::from)?;
-    Ok((checked, budget))
+        .ok_or(ProtocolError::ProviderUnreachable)?;
+    Ok((checked.map_err(ProtocolError::from)?, budget))
 }
 
 /// The end record of a body that was cut with the failure `error`.
@@ -444,21 +398,25 @@ pub(super) fn cut(error: ProtocolError) -> StreamEnd {
 /// node holds of it is what the search holds: the bytes it has not handed on yet, its
 /// readings and the forms of the credential, as many bytes as the length of the credential
 /// bounds (`StreamCheck::memory_bound`). `held` is the place of the call among the forward
-/// calls of the node and the share of the body budget of that bound: the two are free when
-/// the body has ended, was cut, the time limit passed or the caller is gone, whichever comes
-/// first.
+/// calls of the node, the share of the body budget of that bound, and the share of the
+/// request of the call (the connection to the provider keeps the buffer the head of the
+/// request was written from as long as the stream lasts): the three are free when the body
+/// has ended, was cut, the time limit passed or the caller is gone, whichever comes first.
+#[allow(clippy::too_many_arguments)]
 async fn stream(
     node: &Arc<Node>,
     user_id: &str,
-    prepared: Prepared,
+    outbound: OutboundRequest,
+    token: Secret<String>,
     timeout: Duration,
     log: LogRef,
     request_budget: OwnedSemaphorePermit,
-    held: (OwnedSemaphorePermit, OwnedSemaphorePermit),
+    held: (
+        OwnedSemaphorePermit,
+        OwnedSemaphorePermit,
+        OwnedSemaphorePermit,
+    ),
 ) -> Result<Response, ApiError> {
-    let Prepared {
-        outbound, token, ..
-    } = prepared;
     let deadline = tokio::time::Instant::now() + timeout;
     let head = tokio::time::timeout_at(
         deadline,
@@ -487,18 +445,30 @@ async fn stream(
     Ok(forward_stream(status, headers, Some(log), body, late))
 }
 
-/// More bytes than the credential of `record` has: the credential is a part of the plaintext
-/// of the record, and that plaintext is shorter than the ciphertext, which `ct` writes with
-/// four characters for three bytes.
-pub(super) fn credential_bytes_at_most(record: &Record) -> usize {
-    record.ct.len().div_ceil(4).saturating_mul(3)
+/// No fewer bytes than the token of `record` has that a call makes a credential of. The token
+/// is a part of the plaintext of the record, and that plaintext is shorter than the
+/// ciphertext, which `ct` writes with four characters for three bytes. And a node makes no
+/// credential of a token of more than `limits::TOKEN_BYTES` bytes ([`prepare`]).
+pub(super) fn longest_token(record: &Record) -> usize {
+    record
+        .ct
+        .len()
+        .div_ceil(4)
+        .saturating_mul(3)
+        .min(limits::TOKEN_BYTES)
 }
 
-/// `budget` without what it holds above `needed` bytes of the body budget: those are free.
-pub(super) fn narrowed(mut budget: OwnedSemaphorePermit, needed: usize) -> OwnedSemaphorePermit {
-    let above = budget.num_permits().saturating_sub(needed);
-    drop(budget.split(above));
-    budget
+/// The parsed plaintext of the record of a call, or that the node does not read it because
+/// it is above its bounds (`oauth::Unusable::AboveBounds`: the call goes on to its entry and
+/// ends after it). A plaintext that is no token object ends the call here, with
+/// `record_invalid`.
+pub(super) fn usable(
+    parsed: Result<oauth::OauthPlaintext, oauth::Unusable>,
+) -> Result<Result<oauth::OauthPlaintext, oauth::Unusable>, ApiError> {
+    match parsed {
+        Err(oauth::Unusable::Invalid) => Err(ProtocolError::RecordInvalid.into()),
+        parsed => Ok(parsed),
+    }
 }
 
 /// The bytes the header value of a request holds of a token of `token_bytes` bytes, at the
@@ -644,14 +614,28 @@ async fn hand_on(
     }
 }
 
-/// The frame of a call: its meta (a JSON object) and its payload, read under a reservation of
-/// the body budget for the declared length of the request. The call waits for that
-/// reservation within the time of its admission.
+/// The frame of a call, and the two shares of the body budget the call holds for it.
+pub(super) struct Framed {
+    /// The meta: a JSON object.
+    pub meta: JsonBody,
+    pub payload: Bytes,
+    /// The share of the bytes of the frame, reserved for the declared length of the request
+    /// before a byte of it was read. A call gives it back when its request is on the wire.
+    pub frame_budget: OwnedSemaphorePermit,
+    /// The share of the request (`Marks::request_share` of the meta): a bound of the parsed
+    /// meta and of what the call makes of it. A call holds it to its end.
+    pub request_share: OwnedSemaphorePermit,
+}
+
+/// Reads the frame of a call: its meta (a JSON object) and its payload. The frame is read
+/// under a reservation of the body budget for the declared length of the request, and the
+/// meta is parsed under the share of the request, which is computed from the bytes of the
+/// meta ([`request_share_of`]). The call waits for both within the time of its admission.
 pub(super) async fn read_frame(
     node: &Node,
     request: Request,
     admission: &Admission,
-) -> Result<(JsonBody, Bytes, OwnedSemaphorePermit), ApiError> {
+) -> Result<Framed, ApiError> {
     let frame_limit = 4 + META_LIMIT_BYTES + node.limits.body_bytes;
     let declared = request
         .headers()
@@ -661,16 +645,26 @@ pub(super) async fn read_frame(
     if declared.is_some_and(|length| length > frame_limit) {
         return Err(ProtocolError::TooLarge.into());
     }
-    let request_budget = admission
+    let frame_budget = admission
         .budget(node, declared.unwrap_or(frame_limit))
         .await?;
     let frame_bytes = Bytes::from(read_body(request, frame_limit).await?);
-    let (meta, payload) = frame::decode(&frame_bytes)?;
+    let (meta_bytes, payload) = frame::split(&frame_bytes)?;
     drop(frame_bytes);
+    let request_share = admission
+        .budget(node, request_share_of(&meta_bytes)?)
+        .await?;
+    let meta = JsonBody::of_meta(&meta_bytes)?;
+    drop(meta_bytes);
     if payload.len() > node.limits.body_bytes {
         return Err(ProtocolError::TooLarge.into());
     }
-    Ok((JsonBody::from_value(meta)?, payload, request_budget))
+    Ok(Framed {
+        meta,
+        payload,
+        frame_budget,
+        request_share,
+    })
 }
 
 async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
@@ -681,8 +675,15 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
     let admission = Admission::begin();
     let slot = admission.slot(node).await?;
 
-    // The request frame enters memory only after its share of the body budget is reserved.
-    let (meta, payload, request_budget) = read_frame(node, request, &admission).await?;
+    // The request frame enters memory only after its share of the body budget is reserved,
+    // and its meta is parsed under the share of the request, which the call holds to its
+    // end: for a frame that is the end of this function, for a stream the end of the stream.
+    let Framed {
+        meta,
+        payload,
+        frame_budget: request_budget,
+        request_share,
+    } = read_frame(node, request, &admission).await?;
     let user_id = meta.user_id()?;
     let record = record_of(&meta, "record")?;
     let context = meta.context()?;
@@ -698,16 +699,16 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
     // takes that share of the body budget before anything of it is recorded or sent, within
     // the time of its admission. The credential is known once the record is open, under the
     // account lock, where a call does not wait. So the share is taken for the longest
-    // credential a record of this size can hold, and what the credential does not need is
-    // given back when it is known. The search of a response that is handed on as a stream
-    // lasts as long as the stream and holds a buffer of received bytes as well: the share
-    // of such a call is the bound of that search.
+    // credential a record of this size can hold (and a node handles: `longest_token`), and
+    // what the credential does not need is given back when it is known. The search of a
+    // response that is handed on as a stream lasts as long as the stream and holds a buffer
+    // of received bytes as well: the share of such a call is the bound of that search.
     let share_of = |token_bytes: usize| match streamed {
         true => StreamCheck::memory_bound(token_bytes),
         false => credential_share(token_bytes, 1, 1),
     };
     let credential_budget = admission
-        .budget(node, share_of(credential_bytes_at_most(&record)))
+        .budget(node, share_of(longest_token(&record)))
         .await?;
 
     // 1: the common front. Everything up to the event happens under the account lock, so a
@@ -723,7 +724,7 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
         let grant = account.active(now_ms)?;
         // The record is an `oauth` record: a vault record is `not_allowed` here.
         let opened = oauth::open_record(&grant, user_id, &record)?;
-        let parsed = opened.parse()?;
+        let parsed = usable(opened.parse())?;
         let definition = node
             .definitions
             .get(&record.provider)
@@ -733,7 +734,7 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
             &payload,
             &record,
             definition,
-            &parsed,
+            parsed.as_ref().map_err(|unusable| *unusable),
             context,
         )?;
         // 5, 6: the merge decision and the event. `place` is where the event of this request
@@ -763,17 +764,30 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
         .next()
         .ok_or_else(ApiError::internal)?;
 
+    // A record above what a node reads: the entry of the call is confirmed, and the call ends
+    // here. Nothing is sent.
+    let Some((outbound, token)) = prepared.request else {
+        return Err(above_bounds());
+    };
+
     // 8, 9: the provider call runs outside the account lock, within the time limit. The
     // reservation of the request frame goes with it and is free once the request is on the
     // wire (`execute`).
     let timeout = Duration::from_millis(timeout_ms);
     if streamed {
-        let held = (slot, credential_budget);
-        return stream(node, user_id, prepared, timeout, log, request_budget, held).await;
+        let held = (slot, credential_budget, request_share);
+        return stream(
+            node,
+            user_id,
+            outbound,
+            token,
+            timeout,
+            log,
+            request_budget,
+            held,
+        )
+        .await;
     }
-    let Prepared {
-        outbound, token, ..
-    } = prepared;
     // The share of the credential goes with the call into the check of the response and is
     // free when that check has ended.
     let (checked, budget) = execute(
@@ -787,5 +801,6 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
     )
     .await?;
     drop(slot);
+    drop(request_share);
     Ok(forward_frame(checked, Some(log), budget))
 }

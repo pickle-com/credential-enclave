@@ -2097,19 +2097,20 @@ async fn the_shares_of_a_request_are_held_until_its_response_has_ended() {
     let mut frame_bytes = frame::encode_head(&meta);
     frame_bytes.extend_from_slice(&body);
     let (frame_length, whole) = (frame_bytes.len(), forward.node.limits.body_budget_bytes);
+    let of_the_request = crate::testing::request_share(&meta);
     let response = forward
         .respond(Method::POST, "/v1/vault/send", frame_bytes)
         .await;
     assert_eq!(response.status().as_u16(), 200);
-    // The response goes on: the call holds the share of its request body, the share the
-    // search of its response can hold, and its place.
+    // The response goes on: the call holds the share of its request body, the share of its
+    // request, the share the search of its response can hold, and its place.
     let mut stream = response.into_body();
     let first =
         std::future::poll_fn(|context| std::pin::Pin::new(&mut stream).poll_frame(context)).await;
     assert!(first.is_some());
     assert_eq!(
         forward.node.body_budget.available_permits(),
-        whole - frame_length - StreamCheck::memory_bound(VALUE.len())
+        whole - frame_length - of_the_request - StreamCheck::memory_bound(VALUE.len())
     );
     assert_eq!(forward.health().await["load"]["forward_calls"], 1);
     // The caller goes away: the task of the stream drops the response of the site, and all

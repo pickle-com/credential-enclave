@@ -12,7 +12,7 @@ use tokio::sync::Semaphore;
 
 use super::assign;
 use super::faults;
-use super::mail::{frame_of, request, PASSWORD};
+use super::mail::{frame_of, frame_share, request, PASSWORD};
 use super::mail_stand_in::{fetch_literal, mailbox, until, Act, Answer, ImapServer, MESSAGE};
 use super::provider_and_log_store;
 use crate::mail;
@@ -74,7 +74,7 @@ async fn the_share_of_a_read_follows_the_input_it_took() {
 
     // Eight folder listings at once, each in front of the completion of its `LIST`.
     let params = json!({"action":"folders"});
-    let fixed = frame_of(&record, &params, b"").len() + mail::CALL_BYTES;
+    let fixed = frame_share(&record, &params, b"") + mail::CALL_BYTES;
     let mut calls = Vec::new();
     for _ in 0..8 {
         let (harness, record, params) = (harness.clone(), record.clone(), params.clone());
@@ -105,7 +105,7 @@ async fn the_share_of_a_read_follows_the_input_it_took() {
     // One raw message read, in the middle of the octets of its message: the share covers
     // the whole of the literal from its declaration on, two bytes per byte.
     let params = json!({"action":"read","uid":7,"uid_validity":42});
-    let fixed = frame_of(&record, &params, b"").len() + mail::CALL_BYTES;
+    let fixed = frame_share(&record, &params, b"") + mail::CALL_BYTES;
     let call = {
         let (harness, record) = (harness.clone(), record.clone());
         tokio::spawn(async move { request(&harness, &record, "read", params, b"").await })

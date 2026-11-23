@@ -60,7 +60,7 @@ pub async fn handoff(State(node): State<Arc<Node>>, request: Request) -> Respons
 /// colon for the slot `basic:user`) is `record_invalid` at that point: the response carries no
 /// envelope and the entry stays.
 async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
-    let body = JsonBody::read(request).await?;
+    let body = JsonBody::read(node, request).await?;
     let user_id = body.user_id()?;
     let record = record_of(&body, "record")?;
     let bound = BoundRequest::from_value(body.object("request")?)?;

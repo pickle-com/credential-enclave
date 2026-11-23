@@ -17,7 +17,7 @@ pub async fn status(State(node): State<Arc<Node>>, request: Request) -> Response
 /// of, and `internal` for an account the node halted. The call signs nothing: a node of this
 /// release keeps no head of a chain.
 async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
-    let body = JsonBody::read(request).await?;
+    let body = JsonBody::read(node, request).await?;
     let user_id = body.user_id()?;
     let now_ms = node.now_ms();
     let grant = match node.account(user_id) {

@@ -135,7 +135,7 @@ pub async fn export(State(node): State<Arc<Node>>, request: Request) -> Response
 /// The call also works on a closing node: the orderly shutdown hands the delegations on before
 /// the node ends.
 async fn run_export(node: &Node, request: Request) -> Result<Response, ApiError> {
-    let body = JsonBody::read(request).await?;
+    let body = JsonBody::read(node, request).await?;
     let after = body.text_or_empty("after")?;
     let limit = limit_of(&body, limits::TRANSFER_GRANTS)?;
     let subset = subset_of(&body)?;
@@ -375,8 +375,13 @@ pub async fn import(State(node): State<Arc<Node>>, request: Request) -> Response
 /// its revocation marker was replaced by a grant: an envelope can be kept and sent again, and
 /// what a revoke ended only a grant command brings back. An account the node halted takes no
 /// transfer either (`Account::halt`). `imported` is the number of grants
-/// this call put in place, and `accounts` names their accounts: the caller learns from the
-/// answer which accounts this node holds a delegation of now.
+/// this call put in place. `accounts` names the accounts whose grant of this transfer the
+/// node holds when the call ends: the accounts of the grants this call put in place, and the
+/// accounts that had the grant of the same signing key here already. So the caller learns
+/// from the answer which accounts of the transfer this node holds a delegation of, also when
+/// it sends a transfer a second time because it could not record the answer to the first.
+/// An account whose grant here is of another signing key, an account that revoked here, a
+/// halted account and an account outside the share of this node are not named.
 ///
 /// The peer is a node of the measurement of this node, or a node of a release that this
 /// program lists as a predecessor: its measurement is the measurement of an element of the
@@ -392,7 +397,7 @@ pub async fn import(State(node): State<Arc<Node>>, request: Request) -> Response
 /// When the orderly shutdown starts while the call runs, it stops there and answers with what
 /// it took until then.
 async fn run_import(node: &Node, request: Request) -> Result<Response, ApiError> {
-    let body = JsonBody::read(request).await?;
+    let body = JsonBody::read(node, request).await?;
     let envelope = body.object("envelope")?;
     let subset = subset_of(&body)?;
     node.ensure_open()?;
@@ -441,6 +446,7 @@ pub(crate) async fn import_from(
         }
     }
     let mut seeds = seeds.into_iter();
+    let mut imported = 0usize;
     let mut accounts = Vec::new();
     let mut logs = Vec::new();
     let mut created: Vec<(Arc<AccountLock>, u64)> = Vec::new();
@@ -465,6 +471,9 @@ pub(crate) async fn import_from(
             GrantState::Active(held) => {
                 if held.sign_pk == grant.sign_pk {
                     held.not_after_ms = held.not_after_ms.max(not_after_ms);
+                    // The node holds this grant already: its account is one of the accounts
+                    // of the transfer this node holds a delegation of.
+                    accounts.push(grant.user_id.clone());
                 }
             }
             GrantState::Revoked { .. } => {}
@@ -504,6 +513,7 @@ pub(crate) async fn import_from(
                     exported_to: Vec::new(),
                 }));
                 drop(guard);
+                imported += 1;
                 accounts.push(grant.user_id.clone());
                 if let Some(seq) = seq {
                     logs.push(AccountLogRef {
@@ -526,7 +536,7 @@ pub(crate) async fn import_from(
         let _ = log_store::confirm_each(node, &awaited).await;
     }
     Ok(Imported {
-        imported: accounts.len(),
+        imported,
         accounts,
         logs,
     })

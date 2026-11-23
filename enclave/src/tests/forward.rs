@@ -14,7 +14,7 @@ use super::{provider_with_log_store, quiet_provider, quiet_provider_and_log_stor
 use crate::log_store;
 use crate::providers::Definitions;
 use crate::state::Limits;
-use crate::testing::{App, Harness, Reply};
+use crate::testing::{request_share, App, Harness, Reply};
 
 const PROFILE: &str = "https://gmail.googleapis.com/gmail/v1/users/me/profile";
 
@@ -1149,10 +1149,10 @@ async fn a_response_that_reflects_the_credential_is_withheld() {
 #[tokio::test]
 async fn two_calls_whose_responses_have_no_length_do_not_wait_for_each_other() {
     // Each response declares no length, so each reserves the whole body limit. The budget
-    // holds two request frames, what the two calls hold of their credential and one such
-    // response, but not all of that and two responses: a call must give its frame back
-    // before its response asks for its share, or the two calls hold their frames and wait
-    // for each other until the time limit.
+    // holds two request frames, what the two calls hold of their requests and of their
+    // credential, and one such response, but not all of that and two responses: a call must
+    // give its frame back before its response asks for its share, or the two calls hold
+    // their frames and wait for each other until the time limit.
     const LIMIT: usize = 32 * 1024;
     let provider = provider_with_log_store(|_| {
         Reply::Raw(
@@ -1172,7 +1172,9 @@ async fn two_calls_whose_responses_have_no_length_do_not_wait_for_each_other() {
         "https://gmail.googleapis.com/gmail/v1/users/me/messages",
         json!([]),
     );
-    let frame = crate::frame::encode_head(&first).len();
+    let frames = crate::frame::encode_head(&first).len() + crate::frame::encode_head(&second).len();
+    // What a call holds of its request, from the reading of its frame to its end.
+    let requests = request_share(&first) + request_share(&second);
     // What a call holds of its credential once it knows the token, and what it takes before:
     // the share of the longest token the record can hold. The budget has room for both calls
     // to take that at the same time.
@@ -1185,17 +1187,27 @@ async fn two_calls_whose_responses_have_no_length_do_not_wait_for_each_other() {
         Definitions::embedded(),
         Limits {
             body_bytes: LIMIT,
-            body_budget_bytes: 2 * frame + 2 * held + LIMIT - 1,
             ..Limits::default()
         },
     );
     harness.use_log_store().await;
     app.grant(&harness).await;
+    // The node is set up under its whole budget. The two calls run under what the test
+    // leaves of it.
+    let left = frames + requests + 2 * held + LIMIT - 1;
+    let rest = u32::try_from(harness.node.limits.body_budget_bytes - left).unwrap();
+    let rest = harness
+        .node
+        .body_budget
+        .clone()
+        .try_acquire_many_owned(rest)
+        .unwrap();
     let started = Instant::now();
     let (one, two) = tokio::join!(harness.forward(first, b""), harness.forward(second, b""));
     assert_eq!(one.unwrap().status, 200);
     assert_eq!(two.unwrap().status, 200);
     assert!(started.elapsed() < Duration::from_secs(2));
+    drop(rest);
     assert_budget_is_free(&harness);
 }
 
@@ -1889,39 +1901,40 @@ async fn a_stream_holds_the_share_of_its_search_until_its_body_has_ended() {
     .await;
     let (harness, app, record) = ready(&provider).await;
     let whole = harness.node.limits.body_budget_bytes;
+    // The frame of a call, and the share of the body budget of its request.
     let frame_of = |query: &str| {
         let mut request = stream_meta(&app, &record, "POST", &format!("{PROFILE}?{query}"));
         request["timeout_ms"] = json!(30000);
         let mut bytes = frame::encode_head(&request);
         bytes.extend_from_slice(b"{}");
-        bytes
+        (bytes, request_share(&request))
     };
 
     // The response goes on. The share of the request frame is free: the request is on the
     // wire. The call holds what the search of its response can hold for the token of the
     // record, and no more: what it took for the longest token a record of that size can hold
-    // is free again.
-    let response = harness
-        .respond(Method::POST, "/v1/forward", frame_of("n=1"))
-        .await;
+    // is free again. And it holds the share of its request until the stream has ended.
+    let (bytes, of_the_request) = frame_of("n=1");
+    let response = harness.respond(Method::POST, "/v1/forward", bytes).await;
     assert_eq!(response.status().as_u16(), 200);
     let of_the_search = StreamCheck::memory_bound("ya29.injected".len());
     assert_eq!(
         harness.node.body_budget.available_permits(),
-        whole - of_the_search
+        whole - of_the_search - of_the_request
     );
     assert_eq!(harness.health().await["load"]["forward_calls"], 1);
-    // The caller goes away: the task of the stream frees the share and the place.
+    // The caller goes away: the task of the stream frees the shares and the place.
     drop(response);
     places_are_free(&harness).await;
     assert_budget_is_free(&harness);
 
     // A call that asks for a stream and does not get the share of its search within the time
     // of its admission ends: it created no entry and sent nothing, and it holds nothing. The
-    // body budget has room for its request frame and for nothing else.
+    // body budget has room for its request frame and for the share of its request, and for
+    // nothing else.
     let (stored, requests) = (provider.stored().len(), provider.requests().len());
-    let bytes = frame_of("n=2");
-    let taken = u32::try_from(whole - bytes.len()).unwrap();
+    let (bytes, of_the_request) = frame_of("n=2");
+    let taken = u32::try_from(whole - bytes.len() - of_the_request).unwrap();
     let budget = harness
         .node
         .body_budget
@@ -1957,25 +1970,27 @@ async fn a_frame_holds_the_share_of_its_credential_until_its_response_is_checked
     .await;
     let (harness, app, record) = ready(&provider).await;
     let whole = harness.node.limits.body_budget_bytes;
+    // The frame of a call, and the share of the body budget of its request.
     let frame_of = |query: &str| {
         let url = format!("{PROFILE}?{query}");
         let mut request = meta(&app, &record, "POST", &url, json!([]));
         request["timeout_ms"] = json!(30000);
         let mut bytes = frame::encode_head(&request);
         bytes.extend_from_slice(b"{}");
-        bytes
+        (bytes, request_share(&request))
     };
 
     // The body of the response does not end, so the call waits for it. Its request is on the
     // wire, and the share of the request frame is free. The call holds the share of the
-    // response body, by its declared length, and the share of its credential: what the
-    // search of the response can hold for the token of the record, and the copies of that
-    // token its request carries. What it took for the longest token a record of that size
-    // can hold is free again.
+    // response body, by its declared length, the share of its request, and the share of its
+    // credential: what the search of the response can hold for the token of the record, and
+    // the copies of that token its request carries. What it took for the longest token a
+    // record of that size can hold is free again.
     let of_the_credential = crate::api::credential_share("ya29.injected".len(), 1, 1);
-    let left = whole - 1_000 - of_the_credential;
+    let (bytes, of_the_request) = frame_of("n=1");
+    let left = whole - 1_000 - of_the_credential - of_the_request;
     {
-        let call = harness.respond(Method::POST, "/v1/forward", frame_of("n=1"));
+        let call = harness.respond(Method::POST, "/v1/forward", bytes);
         tokio::pin!(call);
         let mut free = whole;
         for _ in 0..4_000 {
@@ -2000,10 +2015,10 @@ async fn a_frame_holds_the_share_of_its_credential_until_its_response_is_checked
 
     // A call that does not get the share of its credential within the time of its admission
     // ends: it created no entry and sent nothing, and it holds nothing. The body budget has
-    // room for its request frame and for nothing else.
+    // room for its request frame and for the share of its request, and for nothing else.
     let (stored, requests) = (provider.stored().len(), provider.requests().len());
-    let bytes = frame_of("n=2");
-    let taken = u32::try_from(whole - bytes.len()).unwrap();
+    let (bytes, of_the_request) = frame_of("n=2");
+    let taken = u32::try_from(whole - bytes.len() - of_the_request).unwrap();
     let budget = harness
         .node
         .body_budget
@@ -2026,7 +2041,7 @@ async fn a_frame_holds_the_share_of_its_credential_until_its_response_is_checked
 }
 
 #[test]
-fn the_share_of_a_credential_stays_with_the_check_until_it_has_ended() {
+fn the_shares_of_a_response_stay_with_its_check_until_the_check_has_ended() {
     use crate::frame;
     use axum::http::Method;
 
@@ -2054,13 +2069,15 @@ fn the_share_of_a_credential_stays_with_the_check_until_it_has_ended() {
         // waits for it.
         let (let_go, taken) = std::sync::mpsc::channel::<()>();
         let holder = tokio::task::spawn_blocking(move || taken.recv().is_ok());
-        let request = frame::encode_head(&meta(&app, &record, "GET", PROFILE, json!([])));
+        let request = meta(&app, &record, "GET", PROFILE, json!([]));
+        let of_the_request = request_share(&request);
+        let request = frame::encode_head(&request);
         {
             let call = harness.respond(Method::POST, "/v1/forward", request);
             tokio::pin!(call);
-            // The body has been read: the call holds the share of its two bytes and the
-            // share of its credential, and waits for the check.
-            let read = whole - 2 - of_the_credential;
+            // The body has been read: the call holds the share of its two bytes, the share
+            // of its credential and the share of its request, and waits for the check.
+            let read = whole - 2 - of_the_credential - of_the_request;
             let mut free = whole;
             for _ in 0..4_000 {
                 tokio::select! {
@@ -2075,10 +2092,13 @@ fn the_share_of_a_credential_stays_with_the_check_until_it_has_ended() {
             assert_eq!(free, read);
             // The caller goes away here, and the check has not run.
         }
-        // The share of the credential is held for the check that is still to run.
+        // The call is gone, and the share of its request with it. The body of the response
+        // is in memory for the check that is still to run, with the token it is searched
+        // for: the share of the body and the share of the credential are held, and nothing
+        // else.
         let held = whole - harness.node.body_budget.available_permits();
-        assert!(held >= of_the_credential, "{held}");
-        // The check runs and ends, and the share is free.
+        assert_eq!(held, of_the_credential + 2);
+        // The check runs and ends, and the two shares are free.
         let_go.send(()).unwrap();
         assert!(holder.await.unwrap());
         for _ in 0..4_000 {

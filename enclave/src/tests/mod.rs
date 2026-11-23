@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use crate::providers::{endpoint, Definitions};
 use crate::testing::{Provider, Reply, Seen, LOG_HOST};
 
+mod bounds;
 mod canary;
 mod close;
 mod commands;

@@ -10,11 +10,15 @@ use credential_enclave_protocol::ProtocolError;
 use tokio::task::JoinHandle;
 
 use super::responses::Refreshed;
-use super::{json_ok, provider_credentials, record_of, respond, ApiError, JsonBody};
+use super::{
+    above_bounds, json_ok, narrowed, provider_credentials, record_of, respond, Admission, ApiError,
+    JsonBody,
+};
 use crate::faults::joined;
 use crate::log_store;
 use crate::oauth::{
-    self, call_token_address, token_request, ClientId, ClientValues, ProviderError, TokenGrant,
+    self, call_token_address, token_request, ClientId, ClientValues, OauthPlaintext, ProviderError,
+    TokenGrant, Unusable,
 };
 use crate::state::{events, lock, refresh_key, Node};
 
@@ -38,8 +42,19 @@ pub async fn refresh(State(node): State<Arc<Node>>, request: Request) -> Respons
 /// task goes on until the late limit, when a place among the late tasks is free, and a success
 /// that arrives late is kept the same way: the next call with the same record gets it. Without
 /// a free place the task is ended at the time limit, as the call is.
+///
+/// The call holds two shares of the body budget of the node. The share of its request, from
+/// the reading of its body to its end (`JsonBody::read_within`). And the share of what it
+/// holds while it waits for the token address (`oauth::refresh_share`): the parsed plaintext
+/// of its record, which it merges the response into, and the response while it arrives. It
+/// takes the second for the largest plaintext a node parses before its entry is created,
+/// within the time of its admission, and ends with `capacity_unavailable` without it: no
+/// entry, no provider call. It gives back what its plaintext does not need once the record
+/// is open, and the exchange holds the rest until it has ended, also after the call gave up
+/// waiting for it.
 async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
-    let body = JsonBody::read(request).await?;
+    let admission = Admission::of_request();
+    let body = JsonBody::read_within(node, request, &admission).await?;
     let user_id = body.user_id()?;
     let record = record_of(&body, "record")?;
     body.context()?;
@@ -48,6 +63,7 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
     let config = node.operator_config()?;
     let account = node.account(user_id).ok_or(ProtocolError::GrantRequired)?;
     log_store::admit(node, &account).await?;
+    let token_share = admission.budget(node, oauth::REFRESH_SHARE_BYTES).await?;
     let replay_key = refresh_key(&record);
     let (grant, old, place, definition, credentials) = {
         let mut account = lock(&account);
@@ -65,10 +81,23 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
             .get(&record.provider)
             .ok_or(ProtocolError::ProviderUnknown)?;
         let credentials = provider_credentials(definition, &config, &record.provider)?;
-        let old = opened.parse()?;
+        // A plaintext, or a token of it, above what a node reads is not judged here: that
+        // judgement depends on the content of the plaintext, so the call goes on to its
+        // entry and ends after it, without a provider call.
+        let bounded = opened
+            .parse()
+            .and_then(|old| old.within_bounds(definition).map(|()| old));
+        let old = match bounded {
+            Ok(old) => Some(old),
+            Err(Unusable::Invalid) => return Err(ProtocolError::RecordInvalid.into()),
+            Err(Unusable::AboveBounds) => None,
+        };
         // A record without a refresh token cannot be renewed: the plaintext lacks what this
         // call needs. No entry is created and no provider is called.
-        if old.refresh_token(&definition.token_container).is_none() {
+        let lacks_refresh_token = old
+            .as_ref()
+            .is_some_and(|old| old.refresh_token(&definition.token_container).is_none());
+        if lacks_refresh_token {
             return Err(ApiError::with_message(
                 ProtocolError::RecordInvalid,
                 "the record holds no refresh token",
@@ -85,6 +114,9 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
         )?;
         (grant, old, place, definition, credentials)
     };
+    // The call holds no more than the share of this plaintext and of the response.
+    let plaintext_room = old.as_ref().map_or(0, OauthPlaintext::room);
+    let token_share = narrowed(token_share, oauth::refresh_share(plaintext_room));
 
     // The token address is called only after the log store confirmed the entry that holds the
     // event. The provider call runs outside the account lock.
@@ -93,6 +125,11 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
         .into_iter()
         .next()
         .ok_or_else(ApiError::internal)?;
+    // A record above what a node reads: the entry of the call is confirmed, and the call ends
+    // here. No provider is called.
+    let Some(old) = old else {
+        return Err(above_bounds());
+    };
     let refresh_token = old
         .refresh_token(&definition.token_container)
         .ok_or(ProtocolError::RecordInvalid)?;
@@ -131,6 +168,9 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
         // failure of the random source ends the call with `internal` and nothing changed.
         let nonce = node.random_public::<12>()?;
         async move {
+            // The share of the plaintext and of the response is held until this exchange has
+            // ended: the call may have given up waiting for it by then.
+            let _token_share = token_share;
             let definition = node
                 .definitions
                 .get(&provider)
@@ -147,8 +187,15 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
             let now_ms = node.now_ms();
             let renewed = old.refreshed(&response, &definition.token_container, now_ms);
             let public = renewed.public_fields(definition, Some(&response))?;
+            // The token address answered, and the merged token is one a node would not read
+            // again: no record is made of it.
+            let record = renewed
+                .seal(&grant, &id, &nonce, &user_id, &provider)
+                .ok_or_else(|| {
+                    ApiError::provider(ProtocolError::RefreshFailed, 200, ProviderError::NONE)
+                })?;
             let refreshed = Refreshed {
-                record: renewed.seal(&grant, &id, &nonce, &user_id, &provider),
+                record,
                 public,
                 log,
             };

@@ -24,7 +24,7 @@ pub async fn credentials(State(node): State<Arc<Node>>, request: Request) -> Res
 /// where the node writes: that is the log store of the configuration, which the binding of
 /// the attestation names.
 async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
-    let body = JsonBody::read(request).await?;
+    let body = JsonBody::read(node, request).await?;
     let expires_ms = body.number("expires_ms")?;
     let credentials = Credentials::new(
         body.text("access_key_id")?,

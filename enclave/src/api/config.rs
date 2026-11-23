@@ -159,7 +159,7 @@ fn providers_of(
 /// document attests the binding, and the binding of a node of the reserve role names that
 /// role.
 async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
-    let body = JsonBody::read(request).await?;
+    let body = JsonBody::read(node, request).await?;
     // A value that is not a string names no role: it equals neither of the two names.
     let reserve = match body.get("role") {
         None => false,

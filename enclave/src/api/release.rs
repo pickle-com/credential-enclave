@@ -98,7 +98,7 @@ fn seal_to_of(body: &JsonBody) -> Result<Option<SealTo>, ApiError> {
 /// With `seal_to`, the value leaves under the seal of that key (`sealed` of the response) and
 /// not as it is: whoever carries the response to the holder of the key carries a ciphertext.
 async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
-    let body = JsonBody::read(request).await?;
+    let body = JsonBody::read(node, request).await?;
     let user_id = body.user_id()?;
     let record = record_of(&body, "record")?;
     let field = body.text("field")?;

@@ -505,9 +505,9 @@ async fn grant_state(harness: &Harness, user_id: &str) -> String {
     response["grant"]["state"].as_str().unwrap().to_string()
 }
 
-/// Moves the delegations of `giving` to `receiving` in one page and returns the accounts
-/// whose grants the import put in place. The two nodes run one program: neither call creates
-/// an entry.
+/// Moves the delegations of `giving` to `receiving` in one page and returns the accounts the
+/// import names: the accounts whose grant of the transfer the receiving node holds
+/// afterwards. The two nodes run one program: neither call creates an entry.
 async fn transfer(giving: &Harness, receiving: &Harness) -> Vec<String> {
     let (status, exported) = giving
         .post(
@@ -1008,8 +1008,9 @@ async fn delegations_move_among_the_nodes_that_hold_them_and_to_no_node_of_the_f
     }
     // An account that granted on a node of the reserve role moves to a node of the
     // delegation role the same way.
+    // The receiving node holds the grant of user-1 already: the answer names both accounts.
     App::new("user-2", 2).grant(&reserve[0]).await;
-    assert_eq!(transfer(&reserve[0], &calls[0]).await, ["user-2"]);
+    assert_eq!(transfer(&reserve[0], &calls[0]).await, ["user-1", "user-2"]);
     for node in calls.iter().chain(&reserve) {
         assert_eq!(grant_state(node, "user-1").await, "active");
     }

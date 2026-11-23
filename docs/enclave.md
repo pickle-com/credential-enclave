@@ -71,6 +71,7 @@ credential-enclave/
 │   ├── src/mail_sessions.rs      # the authenticated IMAP sessions a node keeps between the reads of a record
 │   ├── src/log_store.rs          # the log store: the group commit, the write of an entry, its signature, the pending entries, the idle connections, the node document (5.14)
 │   ├── src/frame.rs              # the frame of `forward` (5.8) and of `forward/batch` (5.8b), and the stream of `forward` and of `vault/send`
+│   ├── src/room.rs               # the room a JSON text takes once it is parsed, counted before it is parsed: the share of a request, the room of a token object (section 8)
 │   ├── src/testing.rs            # tests only: the provider stand-in, the test platform and clock
 │   └── src/tests/                # tests only: the tests of the whole node (section 12)
 ├── host/                         # crate credential-enclave-host (binary credential-enclave-host)
@@ -518,7 +519,15 @@ a panic ends the smallest part of the node that it can have left in doubt
 
 A path that is not defined is 404, and a method that a path does not accept is 405. Both have the
 code `invalid_request`. `user_mismatch` is 400 also when the account of a record does not match
-(protocol.md section 6). A JSON body is accepted up to 1 MiB, and a longer one is `too_large`. A
+(protocol.md section 6). A JSON body is accepted up to 1 MiB, and a longer one is `too_large`.
+A call holds a share of a budget of the node for its request, the JSON body of the call or the
+meta of its frame, from before the request is parsed to the end of the call (section 8, "The
+share of a request"). A call with a JSON body that does not get that share within 2 seconds
+(a call with a frame: within the 30 seconds of its admission, 5.8 step 0) ends with
+`capacity_unavailable` (503): it parsed nothing, created no entry and sent nothing. A request
+whose share would be above the largest share of one request is `too_large` with the message
+`the request takes more room than a node gives one request`, and is not parsed. `health` and
+`close` read no body and take no share. A
 body whose bytes stop arriving for 60 seconds (`inbound_idle`, section 8) is `invalid_request`
 with the message `the request body did not arrive within the time limit`, and the connection
 ends after that response. A request head above 32 KiB is answered with the status 431 by the
@@ -745,7 +754,9 @@ POST /v1/config {"role":"forward"}
 
 The nonce is 16 to 64 bytes long. Every call issues a new `challenge`. The response carries
 `challenge_statement` (protocol.md 4.2): the signature of the node over that challenge and the
-nonce of the call. The field is present on both platforms.
+nonce of the call. The field is present on both platforms. The call is one of the two calls of
+a command (an app asks for a challenge here before it sends a grant or a revoke), and its
+request is held under the command budget of the node (section 8).
 
 ### 5.3 `POST /v1/messages`
 
@@ -770,6 +781,12 @@ the state of the account that the call named, after the processing. `state` is `
 `revoked`, and a grant whose time has passed is reported as `none`. `key_id`, `custody` and
 `not_after_ms` have values in the state `active` only, and `revoked` has `key_id` only. `custody`
 is the custody of the platform of that node.
+
+The request of the call is held under the command budget of the node and not under its body
+budget (section 8): a grant and a revoke do not wait behind the bodies of the calls that use a
+credential. The share of one request of a command is at most 256 KiB, so a body of more than
+some 25 KB is `too_large`: a command of protocol.md 5.2 in its envelope is a body of about
+1 KB.
 
 ### 5.4 `POST /v1/status`
 
@@ -838,11 +855,17 @@ complete:
    start of the authorization (otherwise `key_mismatch`. protocol.md 8.2).
 3. The node calls the token address (6.3). A failure is `exchange_failed`, and the body carries
    `provider_status` (the HTTP status of the provider, 0 for a transport failure) and
-   `provider_error` (the rule of 5.7).
+   `provider_error` (the rule of 5.7). A response the node does not take as a token object
+   (6.3: above the room of a token object, or with a token of more than 16,384 bytes) is such
+   a failure, with the status of the provider.
 4. The node creates the record: a new `id`, kind `oauth`, the plaintext
    `{"token": the response, "obtained_ms": now}` (with `"client_id"` for a dynamically registered
    client). The public fields (6.4) are computed first: when they fail the containment check, the
-   call fails with `response_withheld`, and no record, no public field and no event leaves.
+   call fails with `response_withheld`, and no record, no public field and no event leaves. A
+   node creates no record it would not read (protocol.md section 6): when that plaintext is
+   longer than 65,536 bytes or above the room of a token object, the call fails with
+   `exchange_failed`, `provider_status` 200 and an empty `provider_error`, and no record and
+   no event leaves.
 5. The node creates the control entry `connection_created` (the open batch of the account is
    closed before it) and writes it to the log store. After the store confirmed it, the node
    returns the record, the `log` object of the entry, the statement `oauth_complete` and the
@@ -853,12 +876,22 @@ complete:
    authorization stays and the code is not spent, so the same call passes once the node can
    write.
 
+The share of the token response. Before step 1 the call takes 196,608 bytes of the body budget
+of the node (section 8): what it holds of the response of the token address while that
+response arrives, and of the record and the public fields it answers with while the log store
+confirms its entry. It waits for them within the 2 seconds of its admission and ends with
+`capacity_unavailable` without them: the pending authorization stays, the code is not spent
+and no provider is called, so the same call passes once the node has room.
+
 merge moves the `refresh_token` of the old record when, in a reconnect, the new response has none
 (protocol.md 8.3). The node opens both records (both are of kind `oauth`, otherwise `not_allowed`).
 Their providers must be equal (otherwise `invalid_request`). The node returns the new record,
 encrypted again under the `id` of the new record, and its public fields. merge creates no event.
 It works without the operator configuration and is not stopped by the limit of pending entries
-(section 4).
+(section 4). A record whose plaintext is above what a node reads (protocol.md section 6: the
+room of a token object, a token of more than 16,384 bytes) is `record_invalid`, as either of
+the two records, and so is a merge whose plaintext would be longer than 65,536 bytes or above
+that room: the call creates no entry, so it has none to make that judgement behind.
 
 ### 5.7 `POST /v1/refresh`, `POST /v1/revoke-token`
 
@@ -876,6 +909,26 @@ revoke-token {"user_id":"...","record":{...},"context":"..."} -> {"revoked":true
   address with `grant_type=refresh_token` after that, and creates the new record of the same `id`
   and the same kind by the merge rules (protocol.md 8.3). When the provider refuses, the call fails
   with `refresh_failed`, and the body carries `provider_status` and `provider_error`.
+- refresh and a record above what a node reads (protocol.md section 6: a plaintext above the
+  room of a token object, or a token of more than 16,384 bytes). That judgement depends on the
+  content of the plaintext, so it is made behind the entry of the call: the node creates the
+  event `credential_refreshed`, waits until the store confirmed its entry, and ends the call
+  with `record_invalid` and the message `the plaintext of the record is above what a node
+  reads; nothing was sent`. It calls no provider. The node made no copy of such a token and
+  did not parse such a plaintext.
+- refresh and the bounds of a response. A response the node does not take as a token object
+  (6.3) fails the call with `refresh_failed` and the status of the provider. A node creates
+  no record it would not read: when the merge of the response into the token object of the
+  record gives a plaintext of more than 65,536 bytes, or one above the room of a token
+  object, the call fails with `refresh_failed`, `provider_status` 200 and an empty
+  `provider_error`, and nothing is kept.
+- refresh and the body budget (section 8). Before its event is created, the call takes 458,752
+  bytes of the body budget of the node: the room of the largest plaintext a node parses, and
+  what it holds of the response of the token address while that response arrives. It waits
+  for them within the 2 seconds of its admission and ends with `capacity_unavailable`
+  without them: no event, no provider call. Once the record is open it gives back what the
+  plaintext of this record does not need, and the rest stays with the exchange until the
+  exchange has ended, also for a call that goes on after its time limit (below).
 - `provider_error` is a word of a closed vocabulary, `other`, or the empty string. The node reads
   the error strings of the provider response, in this order: when the response is a JSON object,
   a string `error`; for an object `error` its string `code` and then its string `message`; and,
@@ -914,7 +967,9 @@ revoke-token {"user_id":"...","record":{...},"context":"..."} -> {"revoked":true
   its `token_type_hint`. The time limit is 5 seconds). `provider_revoke` of the event says whether
   the node makes that call (protocol.md 7.2), and `revoked` of the response is the outcome of the
   call: one bit, true for a 2xx status. A provider without a revocation address and a failed
-  revocation call are not errors: the response says `revoked: false`.
+  revocation call are not errors: the response says `revoked: false`. The node sends no token
+  of a record above what a node reads (protocol.md section 6), as of a record without a
+  token: `provider_revoke` of the event is false, and the response says `revoked: false`.
 
 ### 5.8 `POST /v1/forward`
 
@@ -965,8 +1020,14 @@ which form it holds. The order of the processing:
    call takes one of the 512 places of the forward calls and the share of the body budget its
    request frame occupies before it reads the frame, and waits for the two together for at most
    30 seconds (`ADMISSION_WAIT`, section 8): a call that has not got them by then ends with
-   `capacity_unavailable`, having read nothing, created no entry and sent nothing. The call
-   takes one share more within the same 30 seconds, after it read its frame: the share of the
+   `capacity_unavailable`, having read nothing, created no entry and sent nothing. With the
+   frame read, the call takes the share of its request within the same 30 seconds (section 8,
+   "The share of a request"): it is computed from the bytes of the meta, the meta is parsed
+   under it, and the call holds it to its end, a call that asks for a stream to the end of the
+   stream. A meta whose share would be above 64 MiB is `too_large` and is not parsed. A
+   record whose `ct` is longer than 87,403 characters is `record_invalid` (protocol.md
+   section 6): the node does not open it. The call
+   takes one share more within the same 30 seconds: the share of the
    body budget for what it holds of the credential of the record beside its bodies. For a
    call that answers with a frame that is what the search of the response can hold (step 10:
    the forms of the credential, twice, and the last bytes and one step of every reading) and
@@ -974,11 +1035,19 @@ which form it holds. The order of the processing:
    twice more while the request is sent): about 32 KiB for a token of 200 bytes and 206 KiB
    for one of 2,000 bytes. Such a call holds the share until the search of its response has
    ended. For a call that asks for a stream it is what the search of step 11 can hold. The
-   share is taken for the longest token a record of that size can hold and narrowed once the
-   record is open (step 11). Without the share the call ends with `capacity_unavailable` as
-   well, having created no entry and sent nothing.
+   share is taken for the longest token a record of that size can hold, 16,384 bytes at the
+   most (the longest token a node handles, protocol.md section 6), and narrowed once the
+   record is open (step 11): 1.6 MiB at the most for a call that answers with a frame and
+   3.8 MiB for a call that asks for a stream. Without the share the call ends with
+   `capacity_unavailable` as well, having created no entry and sent nothing.
 1. The common front. The kind of the record is `oauth` or `oauth_imported` (any other kind is
-   `not_allowed`).
+   `not_allowed`). A record above what a node reads (protocol.md section 6: a plaintext above
+   the room of a token object, or a token of the rule of step 4 of more than 16,384 bytes) is
+   not refused here. That judgement depends on the content of the plaintext, so it is made
+   behind the entry of the call: the node parses no such plaintext and makes no credential
+   of such a token, the call passes steps 2 to 6 without a credential, and it ends with
+   `record_invalid` and the message `the plaintext of the record is above what a node reads;
+   nothing was sent` once the store confirmed the entry of step 6. No request is sent.
 2. The address check (section 7). A violation is `not_allowed`.
 3. The method is one of `GET`, `POST`, `PUT`, `PATCH`, `DELETE` (any other is `not_allowed`).
 4. The header check: a name holds token characters only, and a value holds no control character
@@ -1027,7 +1096,11 @@ which form it holds. The order of the processing:
    `Connection: keep-alive`. The node keeps at most 8 idle connections per (account, host), each
    for at most 30 seconds, and a request of an account goes over an idle connection of that
    account and host when there is one. No connection carries requests of two accounts, and a
-   connection whose response said `Connection: close` is not kept. A connection whose 30
+   connection whose response said `Connection: close` is not kept. Neither is a connection
+   that carried a request whose head (its request line and its headers) was longer than
+   32 KiB: the HTTP client writes a head from a buffer that belongs to the connection and
+   keeps the room of the longest head it wrote, so what an idle connection holds of the
+   requests it carried stays below a constant. A connection whose 30
    seconds passed carries no further request, and the node closes it: when the next request of
    its account and host asks for a connection, when the next response of any account ends, and
    in its sweep (section 3), so a node that receives no further call closes it at its next
@@ -1104,7 +1177,8 @@ which form it holds. The order of the processing:
     the body budget from step 0 to the end of the stream. The token is known once the record
     is open, under the lock of the account, where a call does not wait: so the call takes
     the share for the longest token a record of that size can hold (the plaintext of a
-    record is shorter than its ciphertext) and gives back what the token does not need once
+    record is shorter than its ciphertext, and no token a node handles is longer than 16,384
+    bytes) and gives back what the token does not need once
     the record is open. At the time limit of the call the task frees the connection to the
     provider, that share and the place of the call among the forward calls whether or not
     the caller reads the response; it frees them as well when the connection of the caller
@@ -1114,7 +1188,8 @@ which form it holds. The order of the processing:
 
 The value of the credential header: `inject.prefix` followed by the value at the first path of
 `inject.paths` that holds a non-empty string in the token object. When there is no such value, the
-call fails with `record_invalid`.
+call fails with `record_invalid`. A value of more than 16,384 bytes is no credential: the node
+makes no copy of it, and the call ends behind its entry (step 1).
 
 The node does not judge the expiry of a token and does not refresh. The response of the provider
 (a 401 and the `ok: false` of slack included) goes back as it is, after the check of step 10.
@@ -1137,7 +1212,9 @@ sum that is not the length of the payload is `invalid_request`). `timeout_ms` (1
 30,000 when omitted) is the time the node gives the provider calls of the batch together, from the
 confirmation of the entry. `requests` holds 1 to 100 objects; another count is `invalid_request`.
 
-1. The common front of section 4, once for the call. The call takes one forward slot (section 8).
+1. The common front of section 4, once for the call. The call takes one forward slot (section 8)
+   and the shares of the body budget of 5.8 step 0: the share of its frame, the share of its
+   request, which it holds to its end, and the share of what it holds of its credential.
 2. For every request, in order: the method is one of the methods of 5.8 step 3, the address
    passes the check of section 7, and the headers pass the rules of 5.8 step 4. The first request
    that fails refuses the whole call: `not_allowed`, `invalid_request` or `record_invalid` with
@@ -1150,7 +1227,9 @@ confirmation of the entry. `requests` holds 1 to 100 objects; another count is `
    The call leaves the lock with the place of every request.
 4. The call waits until every entry that holds one of its events is confirmed (the group commit
    of protocol.md 7.1: the call is the writer when none is active). When a write is not
-   confirmed, the call fails with `log_store_unavailable` and no request is sent.
+   confirmed, the call fails with `log_store_unavailable` and no request is sent. A record
+   above what a node reads (5.8 step 1) ends the call here, behind its entries, with
+   `record_invalid` and no `index`: no request of the batch is sent.
 5. The grant is checked once more (a revoke the node accepted while the entry was written
    refuses the call with `grant_revoked`: the entry stays on the chain and no request leaves).
    The requests leave over the idle connections of (account, host) of 5.8 step 8, at most 6 at a
@@ -1304,8 +1383,9 @@ time from the moment the request leaves to the end of the response body.
 
 1. The call takes one of the places of the forward calls of the node and the share of the body
    budget its frame occupies, and waits for them for 30 seconds at the most
-   (`capacity_unavailable`, section 8). A closing node begins no request (`closing`): the envelope
-   of such a call stays unused.
+   (`capacity_unavailable`, section 8). With the frame read, it takes the share of its
+   request within the same 30 seconds, and its meta is parsed under it (5.8 step 0). A closing
+   node begins no request (`closing`): the envelope of such a call stays unused.
 2. The envelope opens for this node, its signature verifies, and the node time is before its
    `not_after_ms` (protocol.md 10.5).
 3. The call takes the share of the body budget that the search of the response can hold for a
@@ -1328,7 +1408,8 @@ time from the moment the request leaves to the end of the response body.
    A body that ends early, or not within the time limit, ends with the end record of that
    failure, and the bytes the search held back at that moment are not handed on.
 
-The call holds its place, the share of its frame and the share of its search until the body has
+The call holds its place, the share of its frame, the share of its request and the share of its
+search until the body has
 ended, was cut, the time limit passed or the caller is gone. So a closing node that holds no
 place of a forward call (`forward_calls` of `load` of `health`) sends no request and begins
 none: the host program of its pod waits for that before it ends the enclave (section 9). The
@@ -1431,9 +1512,17 @@ The rules are those of protocol.md 10.1, 10.3 and 10.4. What this document adds:
   sorted index one chunk of 1,000 accounts at a time (section 3), until `limit` grants are
   selected, and `next` is the last `user_id` it looked at (the last page can be empty). An
   omitted `limit` is 1,000 and an omitted `after` is the empty string. `imported` of import is
-  the number of grants that this call put in place, and `accounts` names their accounts (the
-  `user_id` of each): the caller learns from the response which accounts this node holds a
-  delegation of now. `logs` of import names the control entries `grant_transferred_in` the call
+  the number of grants that this call put in place. `accounts` of import names the accounts
+  (the `user_id` of each) whose grant of the transfer the node holds when the call ends: the
+  accounts of the grants this call put in place, and the accounts that had the grant of the
+  same signing key on this node already. So the caller learns from the response which
+  accounts of the transfer this node holds a delegation of, also when it sends a transfer a
+  second time because it could not record the answer to the first: the second answer has
+  `imported` 0 and names the same accounts. Not named are the accounts of the grants the
+  node did not take (protocol.md 10.1, step 3 of the receiving node): a grant of another
+  custody or whose time has passed, an account whose grant on this node is of another signing
+  key, an account that revoked on this node, a halted account, and an account outside the
+  share of this node. `logs` of import names the control entries `grant_transferred_in` the call
   created: one per grant it put in place from a node of an earlier release, and none for a
   transfer from a node of the measurement of this node. Within the 1 MiB limit of a JSON
   body, a page of 1,000 grants fits when a `user_id` is at most about 350 bytes long (a `user_id`
@@ -1703,10 +1792,18 @@ The inject rules by host (6.1): every definition but github has one rule for eve
   values, `token.fixed`. When `client` is `dynamic`, `client_id` is the value of the plaintext of
   the record.
 - The time limit is 15 seconds (`token_timeout` of section 8). The call of `oauth/complete` ends
-  with it; the call of `refresh` goes on after it by the rule of 5.7. The node reads at most 1
-  MiB of the response. A success is: the status is 200, the body is a JSON object, the
+  with it; the call of `refresh` goes on after it by the rule of 5.7. The node reads at most
+  65,536 bytes of the response, the longest plaintext of a record: a longer response is a
+  transport failure (`provider_status` 0). A success is: the status is 200, the body is a JSON
+  object, the
   `ok_field` check passes, and the token place holds an `access_token` string (reading the token
   place: protocol.md 8.3).
+- A node takes a response as a token object only within its bounds (section 8, "Token
+  objects"). A response whose parsed form would take more than 262,144 bytes is not parsed,
+  and a response in which a token (the string at `access_token`, `refresh_token` or `id_token`,
+  at the top level or in the token place, or the string an injection rule of the definition
+  names) is longer than 16,384 bytes is not taken. Both fail the call like a response that is
+  no JSON object, with the status of the provider.
 - The body of a revocation: `token`, `token_type_hint`, and the client authentication values that
   `client_auth` names. A revocation with `client_auth` `none` sends no client value (the `none` of
   the token address sends `client_id`).
@@ -1731,7 +1828,9 @@ value that the definition does not list does not leave the node.
   the listed leaves only.
 - `id_token_claims` is a list of the same form: claim name, type, limit. The claims are read from
   the body of the `id_token` (a JWT) of the token object, decoded without a verification of its
-  signature (the TLS connection to the token address vouches for where the value came from).
+  signature (the TLS connection to the token address vouches for where the value came from). A
+  body whose parsed form would take more than the room of a token object (section 8) is not
+  parsed and gives no claim. That is no failure.
 - The validation of a definition refuses a public path that names a token (`access_token`,
   `refresh_token` or `id_token` as its last key, at any depth), the path that the node injects as
   a credential, a path that is listed twice, and a path that is the parent of another listed path
@@ -1864,7 +1963,8 @@ The rules:
   requests, so the places are not the bound of the throughput of a node: the provider requests
   in flight and the body budget are). A `forward`, `forward/batch` or `vault/send` call waits
   for its place and for the shares of the body budget it takes before its request leaves (the
-  share its request frame occupies, and the share of what it holds of its credential beside
+  share its request frame occupies, the share of its request, and the share of what it holds
+  of its credential beside
   its bodies. For `vault/send` and for a `forward` call that asks for a stream that is what
   the search of its response can hold with the forms of the credential: about 31 KiB for a
   credential of 30 bytes, 62 KiB for one of 200 bytes and 2.7 MiB for a vault value of 12,000
@@ -1872,7 +1972,9 @@ The rules:
   what the search of one response can hold, which keeps no received bytes, and the copies of
   the token its requests carry: the token and the header value of every request, and that
   header value twice more for every request that is being sent. That is about 32 KiB for a
-  `forward` call with a token of 200 bytes and 206 KiB with one of 2,000 bytes. The searches
+  `forward` call with a token of 200 bytes and 206 KiB with one of 2,000 bytes. No token a
+  node handles is longer than 16,384 bytes (protocol.md section 6), so the share of a
+  `forward` call is at most 1.6 MiB with a frame and 3.8 MiB with a stream. The searches
   of the responses of one call run one at a time) for at
   most 30 seconds together (`ADMISSION_WAIT`)
   and ends with `capacity_unavailable` when it has not got them by then: the node reads
@@ -1882,11 +1984,60 @@ The rules:
   and a batch sends at most 6 of its requests at a time. The bodies of a request and of a
   response are held in memory, and each of them is `too_large` above 64 MiB (for a batch, the
   bodies of its results together). A call that would raise the sum of the bodies in memory above
-  2 GiB waits until there is room. The share of the budget a response body occupies travels
+  2 GiB waits until there is room. The share of the budget a response body occupies is held
+  wherever the body is. While the response is checked (5.8 step 10), the check holds the body
+  and its share, and both are free when the check has ended, whether or not the caller still
+  waits for it. After that the share travels
   with the bytes of the response and is free when the connection wrote them: a caller that
   takes a response slowly, or not at all, holds memory the budget counts. The body of a
   response that is handed on as a stream (5.8 step 11) is not held in memory and takes no
   share: its call holds the share of its search instead.
+- The share of a request. A node parses requests that others wrote: the JSON body of a call
+  and the meta of a frame. What a parsed JSON text holds in memory is not a multiple of its
+  length: it grows with the number of the values of the text. So a call
+  holds a share of the body budget for its request that is computed from the bytes of the
+  request before they are parsed (`enclave/src/room.rs`): ten times the bytes of the text;
+  four times 512 bytes for each array and object of the text and 448 bytes for each comma
+  outside its strings (one stands in front of every element of an array and every member of
+  an object but the first); and 4,096 bytes. The share is a bound of the parsed request and
+  of what the call makes of it: the record it reads, the ciphertext and the plaintext while
+  the record is opened, the request it assembles and the head the HTTP client writes, the
+  event and its copy for the log. A call takes the share of the length its request declares
+  before it reads a byte (a call with a frame: the share of its frame), makes that the share
+  of its request once the bytes are read, and holds it until the call ends (a call that
+  answers with a stream: until the stream ends). A call with a frame waits for the share
+  within the 30 seconds of its admission (`ADMISSION_WAIT`), and a call with a JSON body
+  for at most 2 seconds, counted from its start (`REQUEST_WAIT`): the request of such a
+  call is small, its caller gives the call a few seconds, and a caller that is told within
+  two seconds that the node has no room can ask another node before its own time limit
+  ends the call. A call ends with `capacity_unavailable` without the share: it
+  parsed nothing, created no entry and sent nothing. The request of a `forward` call for a
+  record of 2,184 characters with four headers has a share of about 80 KiB. A request whose
+  share would be above 64 MiB, the share of the largest body, is `too_large` and is not
+  parsed: a request holds tens of thousands of values before its share is that large.
+  A mail call takes the share of its request with its fixed share, without waiting ("Mail
+  call surface").
+- The command budget. A grant and a revoke are two calls, `attestation` and `messages`. Their
+  requests are held under a budget of their own of 32 MiB, by the rule of the share of a
+  request, and not under the body budget: a command does not wait behind the bodies of the
+  calls that use a credential, and a revoke is taken while the body budget has no room. The
+  share of one such request is at most 256 KiB (a longer request is `too_large`), and a
+  command in its envelope has a share of some tens of kibibytes. A call that does not get its
+  share of this budget within 2 seconds ends with `capacity_unavailable`: the node parsed
+  nothing of it and used no challenge.
+- Token objects. A token object is the plaintext of a record of kind `oauth` or
+  `oauth_imported` and the response of a token address. A node parses a token object only
+  when its parsed form takes at most 262,144 bytes by the count of the share of a request
+  (the bytes of the text and a quarter, 512 bytes for each array and object, 448 bytes for
+  each comma, and 1,024 bytes), and it handles no token of more than 16,384 bytes
+  (protocol.md section 6). `refresh` and `oauth/complete` hold a share of the body budget
+  for what they hold while they wait for a token address (5.6, 5.7): `refresh` the parsed
+  plaintext of its record and the response while it arrives, at most 458,752 bytes, and
+  `oauth/complete` 196,608 bytes. What a call makes of a response once it has arrived (the
+  parsed response, the merged token object, the search of the public fields, the new
+  record) it makes in one piece, without a wait: a node does that work for as many calls at
+  once as it has threads for its calls, two in an enclave, and each of those values is
+  bounded by one of the constants above.
 - Connections from the backend: the node holds a bounded number of them open at the same time
   (`inbound_limit` of `load` of health). It computes the bound at its start from the memory of
   its kernel: one eighth of `MemTotal` divided by what one connection can hold that no other
@@ -1958,9 +2109,15 @@ The limits, as the source states them:
 | JSON body of a call | 1 MiB |
 | `meta` of a `forward` or `forward/batch` frame | 1 MiB |
 | Body of a provider request and of a provider response (`forward`); the bodies of the results of a `forward/batch` call together | 64 MiB each |
-| Sum of the bodies in memory | 2 GiB |
+| Sum of the bodies in memory, and of the other shares of the body budget (the requests of the calls, what a call holds of its credential and of a token response) | 2 GiB |
+| Share of the body budget of one request, the JSON body of a call or the meta of a frame (`Marks::request_share`), and the largest one (`REQUEST_SHARE_LIMIT_BYTES`) | 10 times its bytes, 4 times 512 bytes for each of its arrays and objects and 448 bytes for each of its commas outside strings, and 4,096 bytes; 64 MiB |
+| Sum of the shares of the requests of the calls of a command, `attestation` and `messages` (`COMMAND_BUDGET_BYTES`), and the largest share of one (`COMMAND_SHARE_LIMIT_BYTES`) | 32 MiB, 256 KiB |
+| Longest token a node handles, longest plaintext of a record a node opens or creates, longest `ct` of a record (`TOKEN_BYTES`, `RECORD_PLAINTEXT_BYTES`, `RECORD_CT_CHARS`, protocol.md section 6) | 16,384 bytes, 65,536 bytes, 87,403 characters |
+| Room of a parsed token object, the plaintext of a record of kind `oauth` or `oauth_imported` and the response of a token address (`TOKEN_OBJECT_ROOM_BYTES`) | 262,144 bytes: the bytes of its text and a quarter, 512 bytes for each of its arrays and objects, 448 bytes for each of its commas outside strings, and 1,024 bytes |
+| Share of the body budget of a `refresh` call for its plaintext and the token response, before its record is open and after (`REFRESH_SHARE_BYTES`, `refresh_share`); of an `oauth/complete` call (`TOKEN_RESPONSE_SHARE_BYTES`) | 458,752 bytes, the room of its parsed plaintext and 196,608 bytes; 196,608 bytes |
 | Concurrent `forward` and `forward/batch` calls | 512 |
-| Wait of a `forward` or `forward/batch` call for its place, for the share of the body budget of its request frame and for the share of what it holds of its credential (`ADMISSION_WAIT`) | 30 seconds |
+| Wait of a `forward`, `forward/batch` or `vault/send` call for its place and for the shares of the body budget it takes before anything of it is recorded or sent: the share of its request frame, of its request and of what it holds of its credential (`ADMISSION_WAIT`) | 30 seconds |
+| Wait of a call with a JSON body for the shares it takes before anything of it is recorded or sent: the share of the body it reads and of its request (of the body budget, or of the command budget for `attestation` and `messages`), and for `refresh` and `oauth/complete` the share of what the call holds of a token response (`REQUEST_WAIT`) | 2 seconds |
 | Connections from the backend held open at once (`inbound_limit` of health) | One eighth of the memory of the kernel divided by 344,064 bytes, 64 to 16,384: 1,502 in an enclave of 4,096 MiB |
 | Longest wait for the peer of a connection from the backend: for the head of a request, for the next bytes of a request body, for the peer to take bytes of a response (`inbound_idle`) | 60 seconds |
 | Read buffer of the HTTP connection of a caller, and the longest request head | 32 KiB |
@@ -1973,6 +2130,7 @@ The limits, as the source states them:
 | Outbound connections being opened at once (`open_concurrency`) | 256 |
 | Attempts to open one outbound connection (`OPEN_ATTEMPTS`), and the backoff between them | 3, a full jitter of 50 milliseconds doubled per attempt and at most 400 milliseconds, within half the time limit of the call |
 | Idle connections to one provider host for one account, and their idle time | 8, 30 seconds. A connection whose idle time passed is closed at the next sweep at the latest (section 3) |
+| Longest head of a request after which its connection to a provider is kept (`KEPT_HEAD_BYTES`) | 32 KiB |
 | Events in one entry | 128 |
 | Plaintext of one entry | 1,048,576 bytes |
 | `timeout_ms` of `forward` and `forward/batch` | 1,000 to 120,000, default 30,000 |
@@ -1980,7 +2138,7 @@ The limits, as the source states them:
 | One part of a stream | 1,048,576 bytes |
 | Bytes the search of a stream holds back | 36 bytes for each byte of the longest form of the credential, and 36 more |
 | Address of `forward` | 8,192 bytes |
-| Response of a token address | 1 MiB, time limit 15 seconds (`token_timeout`) |
+| Response of a token address | 65,536 bytes (the longest plaintext of a record), time limit 15 seconds (`token_timeout`) |
 | Late response of a token address call of `refresh` (`token_late_limit`) | 120 seconds from the start of the call |
 | Token address calls of `refresh` that go on after their time limit at once (`refresh_late_tasks`) | 128 |
 | Call of a revocation address | Time limit 5 seconds |
@@ -2345,10 +2503,11 @@ place of every provider (`enclave/src/testing.rs`).
 | Mail calls | `enclave/src/tests/mail.rs`, `enclave/src/tests/mail_connections.rs`, the unit tests of `enclave/src/imap.rs`, `enclave/src/mail.rs` and `enclave/src/mail_sessions.rs` | Against TLS stand-ins for imap.naver.com and smtp.naver.com (`enclave/src/tests/mail_stand_in.rs` is one whose answers a test writes): the three calls authenticate over TLS that ends inside the node and return no password; a read checks the generation of its mailbox and a reflected password is withheld; a submission whose reply is lost is delivered once and not sent again, and a refused recipient sends no data; a refused login is told apart from a provider failure. The order of a call: a record of another kind and a submission of another form are refused without an entry; a plaintext the call cannot use is `record_invalid` after the entry of the call, for each of the three calls, and a submission of another sender is refused after its entry, each without a connection to the provider. The reader of the responses: the responses of a read in pieces of every length, a status line that ends in the form of a literal declaration, a declaration that is reported before an octet behind it is taken, three responses that end the parser of the crate imap-proto 0.17.0 with a panic (a character outside ASCII directly behind the response code of a tagged and of an untagged status response, and `INTERNALDATE NIL`), bytes that are no response, 60,000 responses with changed, removed and added bytes, and that the reading of a response does not depend on its pieces; inside a call: those three responses, a warning while a mailbox opens, responses about other messages, the items of one message in two responses, and the names of a folder listing (a quoted name without its escapes, a name in a literal, a name in UTF-8, names a node cannot put into a command). The share of the body budget: the fixed share of each call at its login, the share of concurrent folder listings and of a read inside its message, a read that ends where the budget has no room for its input (with its entry, and its share given back), a verification and a submission that are refused before their entry, a literal above the input bound, and that excess mail calls do not wait in front of an HTTP call. The bounds of a connection: the bytes of a search, the text of one response and the declarations of literals end a read at their bound with `provider_unreachable`, and the same responses below the bounds are read; a declaration counts as input whatever length it declares. The kept sessions: the reads of a record go over one session and each has its entry; a read sends no command over a kept session before the log store confirmed its entry (the command arrives after the answer of a store that holds the confirmation back), and a read whose entry the store refuses sends nothing and leaves the session where it was; another ciphertext has a session of its own; no read goes over a session after a revoke, after the end of its grant, after `grants/prune` dropped its grant or while the node closes, and a read in progress at a revoke or at `close` leaves none; a session ends at its idle time without a call and is handed to no call 300 seconds after its login; a read over a session that ended starts once more with a login, and one whose session fails after the server completed a command fails; a session is kept when its read left it in step; two reads at the same time leave one session; a refused login ends the kept session of its record; the bound of the kept sessions of a node. A panic (3.1), raised by the test platform on a node that takes its calls from a listener: a read that panics behind its entry, on the second start of a read whose kept session had ended, ends without a response, the session it went over ends with it and is not kept, no forward place and nothing of the body budget stays held, the account is not halted, and the next read of the record logs in and is answered; after a panic inside the lock of an account, a read of the account that was reading its mailbox is answered and leaves no session, every mail call of the account after it ends with `internal` without a command to the server, a connection or an entry, and the session the node kept for a record of the account is handed to none of them. Three tests are not part of `cargo test` (`--ignored`): two print what concurrent folder listings hold of the body budget and what consecutive reads cost in connections and logins, and one reads the mailbox of an IMAP server of another implementation and compares the result with what another client read (`enclave/src/tests/mail_probe.rs`) |
 | Vault | `enclave/src/tests/vault.rs`, `vault_handoff.rs`, `vault_send.rs` and `roles.rs`, the unit tests of `enclave/src/vault.rs`, `enclave/src/bound.rs`, `enclave/src/role.rs`, `protocol/src/vault_secret.rs`, `protocol/src/secret_use.rs` and `protocol/src/released.rs` | `release` of a vault secret: the slot `field`, the hosts of the record and the hosts below them, no entry for a refused call, the value judged after its entry, the sealed value and its key. `vault/store`: the two kinds, the plaintext the node writes and its source, the `id` and the nonce of the node, no record before the store confirmed the entry. The forward role: a node takes one role, a node of the forward role answers no call of a node that holds delegations and no call that uses a credential, and gets no delegation. `vault/handoff` and `vault/send` with both nodes and a stand-in for the site: the value at every slot in the form of its place, the reach of the record, one event per handoff and no envelope before its entry is confirmed, one envelope one request within its time, a request that is not the request of its envelope, the two lists of headers, the two halves of HTTP Basic, a value that cannot add a header or leave its place, the stream of the response and its cut in front of a reflected value in every form, a body that ends early or not in time, a connection of its own for every request, the shares of the body budget, a closing node. The log of format 3: the entries of `vault/store`, `release` and `vault/handoff` in the store verify against their keys and open with the log key of the account, in the bucket of the account and under the prefix of their kind; the three calls create no entry while the store holds no node document that outlives it; a node of the forward role takes no credentials for a log store and writes nothing to one; a transfer among nodes of one program has no entry and goes to no node of the forward role |
 | forward/batch | `enclave/src/tests/forward_batch.rs` | One entry names every request before any leaves; a batch of 100 with 6 in flight; a request that fails the address check refuses the whole call with its index and creates no event; a merged request inside a batch shares the event; two entries when the open batch reaches its cap inside a batch; one failed request leaves the other results intact and keeps its `log` object; the bodies of the results together under the body limit; the results in the order of the requests; the bodies split by `body_bytes`; a batch of 0 or 101 requests is invalid |
-| Delegation transfer | `enclave/src/tests/peer.rs` | The round trip of export and import between two nodes of the local platform without an entry on either node (the `accounts` of the import, the node documents of both nodes in the store), a transfer to a later release and from an earlier release with the entries `grant_transferred_out` (the receiving node, its release and its measurement) and `grant_transferred_in` (the giving node and its release), paging, the exclusion of expired grants and of accounts that revoked, a grant of another `sign_pk` is not replaced, the refusal of a changed envelope and of an envelope for another node, a repeated export to the same peer of a later release without a new entry, the limit of 64 peers of a later release per grant, an export with an endorsement that does not hold (it hands nothing over and leaves no entry, also for a peer the call without an endorsement accepts), the `subset` of export (the share of the peer alone, and pages that count the selected grants) and of import (the share of the receiving node alone out of a transfer of every account, `copies` at or above `pods` names every account, `null` is a call without a subset, a subset outside its bounds is refused by both calls). The transfers between releases run on peers the tests accept themselves: the attestation of a peer has its own tests (the row "Attestation documents") |
+| Delegation transfer | `enclave/src/tests/peer.rs` | The round trip of export and import between two nodes of the local platform without an entry on either node (the `accounts` of the import, which a repeated import names again with `imported` 0, the node documents of both nodes in the store), a transfer to a later release and from an earlier release with the entries `grant_transferred_out` (the receiving node, its release and its measurement) and `grant_transferred_in` (the giving node and its release), paging, the exclusion of expired grants and of accounts that revoked, a grant of another `sign_pk` is not replaced, the refusal of a changed envelope and of an envelope for another node, a repeated export to the same peer of a later release without a new entry, the limit of 64 peers of a later release per grant, an export with an endorsement that does not hold (it hands nothing over and leaves no entry, also for a peer the call without an endorsement accepts), the `subset` of export (the share of the peer alone, and pages that count the selected grants) and of import (the share of the receiving node alone out of a transfer of every account, `copies` at or above `pods` names every account, `null` is a call without a subset, a subset outside its bounds is refused by both calls). The transfers between releases run on peers the tests accept themselves: the attestation of a peer has its own tests (the row "Attestation documents") |
 | Delegation subset and pruning | `enclave/src/tests/grants.rs` and `pools.rs`, the unit tests of `protocol/src/subset.rs`, `delegation_subset` of `protocol/tests/vectors.rs` | The assignment vectors of protocol.md 10.4 without groups, and that the assignment without groups is that of release v2.3.0, written apart from the function, whatever `skip` says; with groups, the nodes of an account are the first ordinal of each of its `copies` groups from the position `skip` on, the order of the groups does not depend on the ordinals, two pools that share their groups place an account in three groups, the loss of one group takes one node of an account, and a node more in a group moves the accounts that rank it first there; the agreement of `contains` with `assign`; the form of `groups` and `skip`; `peer/export`, `peer/import` and `grants/prune` with `groups` (the share of a node, a giving node that hands every account over, the refusal of a subset outside its bounds by the three calls); a fleet that takes a pool of the reserve role and then the groups of its nodes: every node is filled with the subset of the new placement, an account is on its nodes of both placements between the fill and the prune, and it ends on two nodes of the delegation role and one of the reserve role in three groups; `grants/prune` drops the grants within their time and the expired grants outside the share page by page in `user_id` order, leaves the chains, the revocation markers and the grants of the share, prunes nothing more on a repeated walk, works in the state `closing`, and refuses a missing subset, a subset outside its bounds and a `limit` of 0; after grants, a refresh, merged GET requests, refused writes, an expiry, a revoke, an import, a prune, two sweeps and the shutdown, every count of health (`accounts`, `grants`, `pending`, `pending_entries`, `kept_refreshes`, `merge_keys`, `open_batches`) equals a scan of the accounts, and no account holds memory for merge keys, kept responses or unconfirmed entries it does not have |
 | The reserve role | `enclave/src/tests/roles.rs`, the node of the reserve role of `canary.rs`, the unit tests of `enclave/src/role.rs` | A node takes the reserve role once, from a configuration that names the role and a log store and no client value, and names it in its binding behind its log store; a refused configuration gives no role; a node that took a call of a node that holds delegations, or a call that uses a credential, takes neither the reserve role nor the forward role, and a call of every role and `vault/send` give no role; the calls a node of the reserve role answers and the calls it refuses, and the calls a node of the delegation role answers, over the route list of the router; the grant and the revoke of an app on such a node, its node document with the role in the binding, and that its entries are control entries; a call that uses a credential creates no event, writes nothing and asks for no connection on a node that holds the user key of the account, and the same call succeeds on a node of the delegation role; such a call is refused before a byte of its body arrived (a `forward` call that announces a body of 64 MiB is answered at once, where a node of the delegation role waits for the body); delegations move among the nodes of the delegation role and of the reserve role in every direction and to no node of the forward role; a transfer from an earlier release and to a later release on a node of the reserve role, with its two control entries. In the canary test: the node of the reserve role takes the delegation of the account, refuses every call that uses a credential with the records of the account, asks for connections to its log store alone and hands the delegation on, and no marker is in a response of it |
 | Connections from the backend | `enclave/src/tests/inbound.rs`, the unit tests of `enclave/src/inbound.rs` and `enclave/src/platform/lingering.rs` | The bound of the connections from the memory of the kernel. A request body whose bytes stop arriving ends its call with `invalid_request` after the time limit and frees its share of the body budget; a caller that takes no byte of a response is cut after the time limit and frees the share of the response body, which is held until then; a write that is not taken is attempted again without an event; a request head above the read buffer is answered with 431. A connection that is dropped closes its write side and is closed after the end of its peer, within the time limit and the bound of waiting connections, and a connection whose peer had ended is closed at once |
+| The bounds of what a call holds | `enclave/src/tests/bounds.rs`, the unit tests of `enclave/src/room.rs`, `enclave/src/oauth.rs` and `protocol/src/record.rs` | The share of a request (section 8): a call with a JSON body holds the share of its request, computed from its bytes, until it ends, and ends with `capacity_unavailable` without it, having created no entry; a request of more values than the largest share holds is `too_large` in a JSON call, in the three calls with a frame and in a mail call, and one below that bound is parsed; the count of the arrays, objects and commas of a text outside its strings, and that the room computed from it is not below what the parsed values state of their own room, for texts of many values and of arrays and objects that hold one another. The command budget: `attestation`, a revoke and a grant are answered while the body budget has no room and another call waits; a command holds the share of its request of the command budget and nothing of the body budget, ends with `capacity_unavailable` without it and uses no challenge, and a request above the largest share of a command is `too_large`. The longest record: a `ct` of 87,403 characters opens, and one character more is `record_invalid` in every call that carries a record, without an entry. The longest token and the room of a token object: a token of 16,384 bytes is injected; one byte more, and a plaintext above the room, end `forward`, a stream, `forward/batch` and `refresh` with `record_invalid` behind the confirmed entry of the call and without a request; `revoke-token` sends no token of such a record and its entry says so; `oauth/merge` refuses it; the share a call takes before its record is open is that of the longest token a node handles. The token address: `refresh` holds the room of its plaintext and the share of the response while it waits, its exchange holds them after the call gave up, a call whose caller is gone holds nothing, and `refresh` and `oauth/complete` end with `capacity_unavailable` without their share, with no entry, no provider call and an authorization that is not used up; a response with a longer token, of more room or of more bytes makes no record, and neither does a merge above the longest plaintext. A connection that carried a request head above 32 KiB is not kept |
 | Faults | `enclave/src/tests/faults.rs`, the unit tests of `enclave/src/faults.rs` and `enclave/src/state.rs` | A node that takes its calls from a listener, with panics the test platform raises at a place of a call (a draw of the random source, a request to the attestation device): a call that panics, and a call whose task panics, end without a response while a call in progress runs to its end and the next calls are answered; nothing of the call stays held, and the panic is counted in health. A call that panics while it is the writer of its account, in the backoff after a refused write: its entry is a pending entry, the account has no writer and is not halted, and the call that waited for it writes both entries and acts. A panic inside the lock of an account halts the account: every call that needs its state (the calls that use a credential, a grant command, `status`) ends with `internal` without a provider request and without an entry, a revoke command gets the signed reply of a revoke and leaves the account halted, its grant, its pending entry and its confirmed entries are given up, the counts of health follow, the sweep writes nothing of it, a transfer does not hand it on and does not bring it back, a prune passes it by, and the other account of the node is served. The writer and a waiting call of an account that is halted meanwhile end with `internal` and hand no value out, also after the store confirmed the entry of the writer. A sweep whose step panicked is followed by the next sweep, which writes what the first left. The steps of one sweep: while the attestation device panics, the write of the node document panics in the sweep, and the same sweep ends the grant whose time passed, writes the pending entry and ends the idle connection whose time passed; while the draw of the jitter panics, the step of the pending entries ends before it writes, health reports the age of the entry that step found, and the same sweep ends the idle connection. In a process of their own: a panic under a lock of the whole node ends the process at the next lock, a panic of a task the node cannot do without ends the process and the panic of another task does not, the panic hook of the node writes nothing and counts, and a second panic while a first one unwinds ends the process without a line that holds the message or the place of either |
 | Call surface | `enclave/src/tests/surface.rs`, the unit tests of `enclave/src/load.rs` and `enclave/src/descriptors.rs` | `health` with the counts of its `log`, `egress`, `refresh` and `state` objects and the values of its `load` object (the readers of `/proc/stat`, `/proc/meminfo` and the auxiliary vector on sample text: the columns of each mode, a line with fewer columns, malformed text; the limit of open descriptors is raised or kept and never lowered, and the count of open descriptors follows the descriptors the process holds), the bound of the connections from the backend (a connection above the bound is closed without a byte and counted, an idle connection is closed after the idle time and frees its place), the operator configuration, attestation and its challenge statement, the failure bodies, HTTP/1.1 over a real connection, that `log/entries` and `log/ack` do not exist, and that the calls of the router are the calls of the table in section 4 of egress-policy.md |
 | Egress policy | `enclave/src/tests/canary.rs` | The canary test of egress-policy.md: every secret carries a distinct marker, the provider stand-in breaks its contract on purpose (reflected credentials, tokens in public fields, content and transfer codings, cookies, redirects), every call of the router is made in a success and in a failure, no marker appears in a response in any of the searched encodings, and a credential reaches only the addresses of its own provider. The one exception is the requested field of a successful `release`. Both nodes of the walk have a log store: no write to it carries a secret of the account, and of the credentials for it the session token reaches the log store alone and the secret access key no request |
@@ -2476,8 +2635,12 @@ in two parts.
 | `mail/submit` | The frame (the payload is part of it), 64 KiB, the 64 KiB of its SMTP connection | Nothing |
 
 - The frame is taken by its declared length (the frame limit when none is declared) and by its
-  length once it was read. The 64 KiB are what a call holds beside its frame and its mail: its
-  parsed request, the read buffer of its connection and the head of its response frame.
+  length once it was read. With the frame read, the call takes the share of its request as
+  well (section 8, "The share of a request": a bound of its parsed meta and of what it makes
+  of it, computed from the bytes of the meta before they are parsed), without waiting, and
+  holds it to its end. A meta whose share would be above 64 MiB is `too_large`. The 64 KiB
+  are what a call holds beside its frame, its request and its mail: the read buffer of its
+  connection and the head of its response frame.
 - The second part follows the input of a read in steps of 64 KiB: for every byte the read takes
   from its connection, for every octet of a literal when the server declares it, and for the
   96 bytes each declaration counts as, the share grows before the reader takes the byte. Six
@@ -2491,9 +2654,9 @@ in two parts.
   JSON document it makes of them. The check of the response makes one copy of the document.
   Two bytes per byte cover a message and the copy the check makes of it.
   So the share of a read is what the read took, and the shares of the reads of a node add up
-  to the mail the node holds: a folder listing whose server sends 3,750 bytes holds its frame
-  and 128 KiB, and the 512 forward places bound the number of such calls before the budget
-  does.
+  to the mail the node holds: a folder listing whose server sends 3,750 bytes holds its frame,
+  the share of its request and 128 KiB, and the 512 forward places bound the number of such
+  calls before the budget does.
 - A mail call takes its forward place and every part of its share without waiting: no mail
   call stands in the queue of the body budget. When the place or the first part is not free,
   the call ends with HTTP 503 `capacity_unavailable` before its entry is created: no credential
@@ -2505,7 +2668,8 @@ in two parts.
   share before their entry, so `capacity_unavailable` of one of them says that nothing was
   sent.
 - The response frame keeps the share of its body and 64 KiB until the connection wrote it; the
-  rest of the share is given back when the frame is made. A call that ends without a frame
+  rest of the share, the share of the request included, is given back when the frame is made.
+  A call that ends without a frame
   gives all of it back. Admitted calls retain the 30-second deadline, their admission included.
 
 The sessions of the reads. The reads of a record go over one authenticated IMAP session

@@ -424,7 +424,7 @@ calls, and `egress/sink-callers.tsv` (the two callers of K1).
 | `POST /v1/vault/send` | `status` R, `headers` R, the body R in parts, and the end record `complete` P, `code` P (a failure code) and `message` P (a fixed string of the source) |
 | `POST /v1/close` | `accounts` P |
 | `POST /v1/peer/export` | `envelope` C (K2), `logs` E and P (`user_id` E, `seq` P), `next` E |
-| `POST /v1/peer/import` | `imported` P, `accounts` E (the `user_id` of every account whose grant the call put in place), `logs` E and P (`user_id` E, `seq` P) |
+| `POST /v1/peer/import` | `imported` P, `accounts` E (the `user_id` of every account whose grant of the transfer the node holds when the call ends: the call put it in place, or the node held the grant of the same signing key already), `logs` E and P (`user_id` E, `seq` P) |
 | `POST /v1/grants/prune` | `pruned` E (the `user_id` of every account whose grant the call dropped), `next` E |
 | `POST /v1/log-store/credentials` | `credentials_expires_ms` E, `node_document_ms` P |
 
@@ -443,7 +443,7 @@ The declassified values, all of them:
 | The public keys of the node | Its private keys | `node`, the binding inside the attestation document |
 | The S256 challenge | The PKCE verifier | The authorization address |
 | `has_refresh_token` | The token object | `public` |
-| The outcome of a check | A secret | The failure code of a call, for example `record_invalid` (a record does not open under the user key, or its plaintext lacks the field the call needs), `not_allowed` (the kind of an opened record), `response_withheld` (a provider response held a token) |
+| The outcome of a check | A secret | The failure code of a call, for example `record_invalid` (a record does not open under the user key, its plaintext lacks the field the call needs, or its plaintext is above what a node reads: that last judgement is made behind the entry of the call in `forward`, `forward/batch` and `refresh`, enclave.md 5.7 and 5.8), `not_allowed` (the kind of an opened record), `response_withheld` (a provider response held a token), `exchange_failed` and `refresh_failed` with the status 200 (a token response a node does not take or makes no record of) |
 
 No other value that comes from a secret or from a sealed input leaves in the clear.
 

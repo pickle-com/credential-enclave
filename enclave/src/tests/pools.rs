@@ -78,9 +78,11 @@ async fn holders(nodes: &[Harness], user_id: &str) -> Vec<u32> {
 
 /// Hands the share of `receiving`, the node the `subset` is about, from `giving` to it: every
 /// page of `peer/export` with the subset, each taken by `peer/import` with the same subset.
-/// Returns the accounts whose grants the imports put in place.
-async fn fill(giving: &Harness, receiving: &Harness, subset: &Value) -> Vec<String> {
+/// Returns the number of grants the imports put in place, and the accounts they named: the
+/// accounts whose grant of the transfer the receiving node holds afterwards.
+async fn fill(giving: &Harness, receiving: &Harness, subset: &Value) -> (usize, Vec<String>) {
     let (to, from) = (attestation(receiving).await, attestation(giving).await);
+    let mut placed = 0;
     let mut taken = Vec::new();
     let mut after = String::new();
     loop {
@@ -95,12 +97,13 @@ async fn fill(giving: &Harness, receiving: &Harness, subset: &Value) -> Vec<Stri
             let import = json!({"peer": from, "envelope": page["envelope"], "subset": subset});
             let (status, imported) = receiving.post("/v1/peer/import", import).await;
             assert_eq!(status, 200, "{imported}");
+            placed += imported["imported"].as_u64().unwrap() as usize;
             let accounts = imported["accounts"].as_array().unwrap().iter();
             taken.extend(accounts.map(|user_id| user_id.as_str().unwrap().to_string()));
         }
         after = page["next"].as_str().unwrap().to_string();
         if after.is_empty() {
-            return taken;
+            return (placed, taken);
         }
     }
 }
@@ -155,8 +158,9 @@ async fn the_three_calls_with_groups_follow_the_assignment_of_the_groups() {
             // `peer/export` selects the accounts of the share of the receiving node, and the
             // receiving node takes them all.
             let receiving = Harness::new(&provider);
-            let taken = fill(&giving, &receiving, &subset(&pool, pod)).await;
+            let (placed, taken) = fill(&giving, &receiving, &subset(&pool, pod)).await;
             assert_eq!(taken, share(pod), "{pod} {skip}");
+            assert_eq!(placed, taken.len(), "{pod} {skip}");
             shared += taken.len();
 
             // A giving node that hands every account over (a call without a subset, or a
@@ -271,7 +275,7 @@ async fn a_fleet_takes_a_reserve_pool_and_then_its_groups_and_no_account_loses_a
         let pod = pod as u32;
         let mut taken = BTreeSet::new();
         for giving in &calls {
-            taken.extend(fill(giving, receiving, &subset(&reserve_pool, pod)).await);
+            taken.extend(fill(giving, receiving, &subset(&reserve_pool, pod)).await.1);
         }
         // What the node took is its share of the pool, and nothing else.
         let share: BTreeSet<String> = apps
@@ -311,11 +315,11 @@ async fn a_fleet_takes_a_reserve_pool_and_then_its_groups_and_no_account_loses_a
         let subset = subset(&after, pod as u32);
         for (other, giving) in calls.iter().enumerate() {
             if other != pod {
-                moved += fill(giving, receiving, &subset).await.len();
+                moved += fill(giving, receiving, &subset).await.0;
             }
         }
         for giving in &reserve {
-            moved += fill(giving, receiving, &subset).await.len();
+            moved += fill(giving, receiving, &subset).await.0;
         }
     }
     assert!(moved > 0);

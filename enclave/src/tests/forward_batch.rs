@@ -535,23 +535,28 @@ async fn a_batch_holds_the_share_of_its_credential_until_its_responses_are_check
     .await;
     let (harness, app, record) = node_with_log_store(&provider).await;
     let whole = harness.node.limits.body_budget_bytes;
+    // The frame of a call, and the share of the body budget of its request.
     let frame_of = |count: usize| {
         let mut meta = batch(&app, &record, &messages(count));
         meta["timeout_ms"] = json!(30000);
-        crate::frame::encode_head(&meta)
+        (
+            crate::frame::encode_head(&meta),
+            crate::testing::request_share(&meta),
+        )
     };
 
     // Eight requests, of which six are sent at a time: no body of a response ends, so the
-    // call waits. It holds the shares of six response bodies, by their declared lengths, and
-    // the share of its credential: what the search of one response can hold for the token of
-    // the record, the copies of that token of its eight requests, and those of the six that
-    // are being sent. What it took for the longest token a record of that size can hold is
-    // free again.
+    // call waits. It holds the shares of six response bodies, by their declared lengths, the
+    // share of its request, and the share of its credential: what the search of one response
+    // can hold for the token of the record, the copies of that token of its eight requests,
+    // and those of the six that are being sent. What it took for the longest token a record
+    // of that size can hold is free again.
     let in_flight = limits::FORWARD_BATCH_CONCURRENCY;
     let of_the_credential = crate::api::credential_share("ya29.injected".len(), 8, in_flight);
-    let left = whole - in_flight * 1_000 - of_the_credential;
+    let (bytes, of_the_request) = frame_of(8);
+    let left = whole - in_flight * 1_000 - of_the_credential - of_the_request;
     {
-        let call = harness.respond(Method::POST, "/v1/forward/batch", frame_of(8));
+        let call = harness.respond(Method::POST, "/v1/forward/batch", bytes);
         tokio::pin!(call);
         let mut free = whole;
         for _ in 0..4_000 {
@@ -576,10 +581,10 @@ async fn a_batch_holds_the_share_of_its_credential_until_its_responses_are_check
 
     // A call that does not get the share of its credential within the time of its admission
     // ends: it created no entry and sent nothing, and it holds nothing. The body budget has
-    // room for its request frame and for nothing else.
+    // room for its request frame and for the share of its request, and for nothing else.
     let (stored, sent) = (provider.stored().len(), provider_targets(&provider).len());
-    let bytes = frame_of(8);
-    let taken = u32::try_from(whole - bytes.len()).unwrap();
+    let (bytes, of_the_request) = frame_of(8);
+    let taken = u32::try_from(whole - bytes.len() - of_the_request).unwrap();
     let budget = harness
         .node
         .body_budget

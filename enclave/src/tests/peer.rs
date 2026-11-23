@@ -49,7 +49,8 @@ async fn import(receiving: &Harness, peer: &Value, envelope: &Value) -> (u16, Va
         .await
 }
 
-/// The accounts whose grants an import call put in place.
+/// The accounts an import call names: the accounts whose grant of the transfer the node
+/// holds when the call ends.
 fn accounts_of(imported: &Value) -> Vec<String> {
     imported["accounts"]
         .as_array()
@@ -59,13 +60,16 @@ fn accounts_of(imported: &Value) -> Vec<String> {
         .collect()
 }
 
-/// Moves every delegation of `giving` to `receiving`, page by page, and returns the accounts
-/// whose grants the import calls put in place. The two nodes run one program: neither call
-/// creates an entry.
-async fn transfer(giving: &Harness, receiving: &Harness, limit: u64) -> Vec<String> {
+/// Moves every delegation of `giving` to `receiving`, page by page, and returns what the
+/// import calls answered: the number of grants they put in place, and the accounts they
+/// named (the accounts whose grant of the transfer the receiving node holds afterwards: it
+/// took the grant, or it held the grant of the same signing key already). The two nodes run
+/// one program: neither call creates an entry.
+async fn transfer(giving: &Harness, receiving: &Harness, limit: u64) -> (usize, Vec<String>) {
     let to = attestation(receiving).await;
     let from = attestation(giving).await;
-    let mut taken = Vec::new();
+    let mut placed = 0;
+    let mut named = Vec::new();
     let mut after = String::new();
     loop {
         let (status, page) = export(giving, &to, &after, limit).await;
@@ -75,15 +79,12 @@ async fn transfer(giving: &Harness, receiving: &Harness, limit: u64) -> Vec<Stri
             let (status, imported) = import(receiving, &from, &page["envelope"]).await;
             assert_eq!(status, 200, "{imported}");
             assert_eq!(imported["logs"], json!([]));
-            assert_eq!(
-                imported["imported"].as_u64().unwrap() as usize,
-                accounts_of(&imported).len()
-            );
-            taken.extend(accounts_of(&imported));
+            placed += imported["imported"].as_u64().unwrap() as usize;
+            named.extend(accounts_of(&imported));
         }
         after = page["next"].as_str().unwrap().to_string();
         if after.is_empty() {
-            return taken;
+            return (placed, named);
         }
     }
 }
@@ -270,11 +271,15 @@ async fn a_delegation_moves_to_a_node_of_the_same_program_without_an_entry() {
         .any(|document| document.node == new.node.node));
     assert_eq!(release(&old, &alice, &record).await.0, 200);
 
-    // The same envelope again changes nothing: the grants are there.
+    // The same envelope again changes nothing: the grants are there. The call puts no grant
+    // in place and names the two accounts, whose grant of this transfer the node holds.
     let (status, again) = import(&new, &from, envelope).await;
     assert_eq!(
         (status, again),
-        (200, json!({"imported": 0, "accounts": [], "logs": []}))
+        (
+            200,
+            json!({"imported": 0, "accounts": ["alice", "bob"], "logs": []})
+        )
     );
     assert_eq!(new.last_seq("alice"), 1);
 
@@ -361,11 +366,15 @@ async fn a_delegation_moves_to_a_later_release_and_both_nodes_record_it() {
         json!({"seq": 2, "index": 0, "created": true})
     );
 
-    // The same envelope again changes nothing: the grants are there.
+    // The same envelope again changes nothing: the grants are there. The call creates no
+    // entry and names the two accounts, whose grant of this transfer the node holds.
     let again = import_earlier(&new, &peer_of(&old, "v2.3.0"), envelope)
         .await
         .unwrap();
-    assert_eq!(again, json!({"imported": 0, "accounts": [], "logs": []}));
+    assert_eq!(
+        again,
+        json!({"imported": 0, "accounts": ["alice", "bob"], "logs": []})
+    );
     assert_eq!(new.last_seq("alice"), 2);
 }
 
@@ -433,8 +442,10 @@ async fn export_pages_through_the_accounts_that_have_a_grant() {
     }
 
     // The whole listing once more to the node that holds every grant already: the grants are
-    // carried again, and the receiving node puts none in place.
-    assert!(transfer(&old, &new, 3).await.is_empty());
+    // carried again, and the receiving node puts none in place and names the accounts of all
+    // of them.
+    let held = ["a", "c", "e", "f"].map(String::from).to_vec();
+    assert_eq!(transfer(&old, &new, 3).await, (0, held));
     assert_eq!(new.health().await["grants"], 4);
     for user_id in ["b", "d", "g"] {
         assert_eq!(
@@ -482,8 +493,12 @@ async fn an_import_never_replaces_what_the_app_of_the_account_put_in_place() {
         .map(|user_id| new.last_seq(user_id))
         .collect();
 
-    // Only the accounts without a grant in force and without a marker were taken.
-    assert_eq!(transfer(&old, &new, 1000).await, ["expired", "fresh"]);
+    // Only the accounts without a grant in force and without a marker were taken: two
+    // grants. The answer names them and the two accounts that had the grant of the same
+    // signing key here already, and neither the account that revoked here nor the account
+    // whose grant here is of another key.
+    let named = ["expired", "fresh", "longer", "shorter"].map(String::from);
+    assert_eq!(transfer(&old, &new, 1000).await, (2, named.to_vec()));
 
     // No grant here: taken.
     assert_eq!(grant_state(&new, "fresh").await["state"], "active");
@@ -538,7 +553,10 @@ async fn an_import_reads_the_end_of_a_grant_against_its_own_clock() {
     let granted = app.grant(&old).await;
     let given_end = granted["grant"]["not_after_ms"].as_u64().unwrap();
     let before = new.node.now_ms();
-    assert_eq!(transfer(&old, &new, 1000).await, ["user-1"]);
+    assert_eq!(
+        transfer(&old, &new, 1000).await,
+        (1, vec!["user-1".to_string()])
+    );
     let after = new.node.now_ms();
     assert_eq!(grant_state(&new, "user-1").await["state"], "active");
     let taken_end = end_of(&new, "user-1").await;
@@ -551,7 +569,7 @@ async fn an_import_reads_the_end_of_a_grant_against_its_own_clock() {
     let new = Harness::new(&provider);
     grant_until(&app, &old, old.node.now_ms() + 3_600_000).await;
     new.node.clock.advance(2 * 3_600_000);
-    assert!(transfer(&old, &new, 1000).await.is_empty());
+    assert_eq!(transfer(&old, &new, 1000).await, (0, Vec::new()));
     assert_eq!(grant_state(&new, "user-1").await["state"], "none");
     assert!(new.node.account("user-1").is_none());
 }
@@ -768,7 +786,7 @@ async fn a_revoke_on_a_node_is_not_undone_by_a_transfer() {
     let seq = new.last_seq("user-1");
     let (status, again) = import(&new, &from, &envelope).await;
     assert_eq!((status, &again), (200, &nothing));
-    assert!(transfer(&old, &new, 1000).await.is_empty());
+    assert_eq!(transfer(&old, &new, 1000).await, (0, Vec::new()));
     assert_eq!(new.last_seq("user-1"), seq);
     assert_eq!(
         code(&release(&new, &app, &record).await),
@@ -833,7 +851,10 @@ async fn a_repeated_export_to_a_later_release_carries_the_grant_again_without_an
     let imported = import_earlier(&new, &from, &mixed["envelope"])
         .await
         .unwrap();
-    assert_eq!(accounts_of(&imported), ["bob"]);
+    // One grant is put in place, and the answer names both accounts: the node holds the
+    // grant of alice from the transfer before.
+    assert_eq!(imported["imported"], 1);
+    assert_eq!(accounts_of(&imported), ["alice", "bob"]);
     assert_eq!(new.health().await["grants"], 2);
     // The pages count grants, whether a grant gets an entry or not.
     let page = export_later(&old, &to, "", 1).await.unwrap();
@@ -943,7 +964,8 @@ async fn a_grant_is_handed_to_at_most_64_peers_of_a_later_release() {
     // a node of the same program takes the grant of both accounts.
     let same = Harness::new(&provider);
     same.use_log_store().await;
-    assert_eq!(transfer(&old, &same, 1000).await, ["alice", "bob"]);
+    let both = ["alice", "bob"].map(String::from).to_vec();
+    assert_eq!(transfer(&old, &same, 1000).await, (2, both));
     assert_eq!(old.last_seq("alice"), 65);
 
     // A grant that follows a revoke starts a new list: the 65th peer gets the new grant, with

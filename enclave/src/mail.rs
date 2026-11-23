@@ -57,9 +57,10 @@ pub(crate) const LOGIN_INPUT_BYTES: usize = 64 * 1024;
 /// before it reads its request frame.
 pub(crate) const SMTP_INPUT_BYTES: usize = 64 * 1024;
 
-/// What a mail call holds besides its request frame and the mail it reads: its parsed
-/// request, the read buffer of its IMAP connection and the head of its response frame.
-/// Reserved with the frame, before the call reads it.
+/// What a mail call holds besides its request frame, its request and the mail it reads: the
+/// read buffer of its IMAP connection and the head of its response frame. Reserved with the
+/// frame, before the call reads it. The share of its request (its parsed meta and what it
+/// makes of it, `Marks::request_share`) is taken when the frame has been read.
 pub(crate) const CALL_BYTES: usize = 64 * 1024;
 
 /// The step in which the share of a mail call follows its protocol input.

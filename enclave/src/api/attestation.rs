@@ -23,8 +23,12 @@ pub async fn attestation(State(node): State<Arc<Node>>, request: Request) -> Res
 /// The challenge is drawn in this call and signed with the nonce of this call only: the node
 /// signs no challenge statement for a value a caller names. So a statement that verifies for a
 /// nonce proves that its challenge was issued after that nonce was chosen.
+///
+/// The call is one of the two calls of a command: an app asks for a challenge here before
+/// it sends a grant or a revoke. Its request is held under the command budget of the node
+/// (`JsonBody::read_command`).
 async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
-    let body = JsonBody::read(request).await?;
+    let body = JsonBody::read_command(node, request).await?;
     let nonce = b64u_decode(body.text("nonce")?).map_err(|_| invalid("nonce"))?;
     if !(16..=64).contains(&nonce.len()) {
         return Err(invalid("nonce"));

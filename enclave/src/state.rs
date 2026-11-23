@@ -50,6 +50,12 @@ pub const TOKEN_LATE_LIMIT: Duration = Duration::from_secs(120);
 /// Token address calls of `refresh` that a node continues after their time limit at the same
 /// time (enclave.md 5.7): the default of `Limits::refresh_late_tasks`.
 pub const REFRESH_LATE_TASKS: usize = 128;
+/// The budget of the requests of the two calls of a command, `attestation` and `messages`
+/// (enclave.md section 8): the default of `Limits::command_budget_bytes`, 32 MiB. A grant
+/// and a revoke are those two calls. Their requests are held under this budget and not under
+/// the body budget of the node, so a command does not wait behind the bodies of the calls
+/// that use a credential.
+pub const COMMAND_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 
 /// The capacities of a node (enclave.md sections 3 and 8).
 #[derive(Clone, Copy, Debug)]
@@ -59,6 +65,9 @@ pub struct Limits {
     /// Sum of the bodies that may be in memory at the same time. A call that would exceed it
     /// waits.
     pub body_budget_bytes: usize,
+    /// Sum of the shares the calls of a command (`attestation`, `messages`) hold for their
+    /// requests at the same time. A call that would exceed it waits.
+    pub command_budget_bytes: usize,
     /// `forward` and `forward/batch` calls that run at the same time. The bodies in memory are
     /// bounded by `body_budget_bytes` and the provider requests in flight by
     /// `limits::PROVIDER_INFLIGHT`, so a call that waits for a slot holds nothing but its frame
@@ -113,6 +122,7 @@ impl Default for Limits {
         Limits {
             body_bytes: limits::BODY_BYTES,
             body_budget_bytes: 2 * 1024 * 1024 * 1024,
+            command_budget_bytes: COMMAND_BUDGET_BYTES,
             forward_concurrency: 512,
             challenges: 100_000,
             pending: 100_000,
@@ -1174,6 +1184,9 @@ pub struct Node {
     pub limits: Limits,
     pub forward_slots: Arc<Semaphore>,
     pub body_budget: Arc<Semaphore>,
+    /// The budget of the requests of the calls of a command
+    /// (`Limits::command_budget_bytes`).
+    pub command_budget: Arc<Semaphore>,
     /// The numbers of the secret uses this node sent (`vault/send`): a node of the forward
     /// role sends the request of one number once.
     pub used_nonces: NodeLock<UsedNonces>,
@@ -1306,6 +1319,7 @@ impl Node {
             egress,
             forward_slots: Arc::new(Semaphore::new(limits.forward_concurrency)),
             body_budget: Arc::new(Semaphore::new(limits.body_budget_bytes)),
+            command_budget: Arc::new(Semaphore::new(limits.command_budget_bytes)),
             used_nonces: NodeLock::new(UsedNonces::default()),
             forward_nodes,
             late_refreshes: Arc::new(Semaphore::new(limits.refresh_late_tasks)),

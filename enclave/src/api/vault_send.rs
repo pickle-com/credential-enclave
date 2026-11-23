@@ -33,9 +33,9 @@ use axum::response::Response;
 use credential_enclave_protocol::secret_use::{open_secret_use, SecretUseEnvelope};
 use credential_enclave_protocol::{limits, ProtocolError};
 
-use super::forward::{hand_on_body, read_frame, Admission};
+use super::forward::{hand_on_body, read_frame, Framed};
 use super::responses::send_stream;
-use super::{invalid, respond, ApiError, JsonBody};
+use super::{invalid, respond, Admission, ApiError, JsonBody};
 use crate::bound;
 use crate::egress::EgressError;
 use crate::faults::joined;
@@ -84,8 +84,15 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
     // flag before the close is still on its way to a request.
     node.ensure_open()?;
 
-    // The request frame enters memory only after its share of the body budget is reserved.
-    let (meta, payload, request_budget) = read_frame(node, request, &admission).await?;
+    // The request frame enters memory only after its share of the body budget is reserved,
+    // and its meta is parsed under the share of the request, which the call holds until its
+    // response has ended.
+    let Framed {
+        meta,
+        payload,
+        frame_budget: request_budget,
+        request_share,
+    } = read_frame(node, request, &admission).await?;
     let envelope = SecretUseEnvelope::from_value(meta.object("envelope")?)?;
     let timeout = Duration::from_millis(timeout_of(&meta)?);
 
@@ -166,8 +173,9 @@ async fn run(node: &Arc<Node>, request: Request) -> Result<Response, ApiError> {
     drop(secret_use);
     // The share of the body budget the request body occupies is held to the end of the
     // response: a host may answer before it read the body, and the body is in memory until
-    // the connection ends.
-    let held = (slot, request_budget, check_budget);
+    // the connection ends. So is the share of the request: the connection keeps the buffer
+    // the head of the request was written from.
+    let held = (slot, request_budget, check_budget, request_share);
     let (body, late) = hand_on_body(exchange, check, deadline, held);
     Ok(send_stream(status, headers, body, late))
 }

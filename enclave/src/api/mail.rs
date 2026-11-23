@@ -15,7 +15,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use super::responses::forward_frame;
-use super::{invalid, read_body, record_of, respond, ApiError, JsonBody};
+use super::{invalid, read_body, record_of, request_share_of, respond, ApiError, JsonBody};
 use crate::frame::{self, META_LIMIT_BYTES};
 use crate::log_store;
 use crate::mail::{self, MailData, MailError, ReadMail, Share};
@@ -60,9 +60,12 @@ fn admission_error(error: tokio::sync::TryAcquireError) -> ApiError {
 /// | submit | the frame (the payload is part of it), `CALL_BYTES`, the input bound of its SMTP connection | nothing |
 ///
 /// The frame is taken by its declared length (the frame limit when none is declared) and by
-/// its length once it was read. A verification and a submission take the whole of their share
-/// here, before a credential is opened: such a call never ends with `capacity_unavailable`
-/// after its entry was created. A read takes the second part while it reads, after its entry.
+/// its length once it was read. With the frame read, every call takes the share of its
+/// request as well (a bound of its parsed meta and of what it makes of it, computed from the
+/// bytes of the meta before they are parsed: `Marks::request_share`), without waiting, and
+/// holds it to its end. A verification and a submission take the whole of their share here,
+/// before a credential is opened: such a call never ends with `capacity_unavailable` after
+/// its entry was created. A read takes the second part while it reads, after its entry.
 fn fixed_share(operation: &str) -> usize {
     match operation {
         "verify" => mail::CALL_BYTES + mail::LOGIN_INPUT_BYTES + mail::SMTP_INPUT_BYTES,
@@ -121,16 +124,23 @@ async fn run(node: &Node, request: Request, operation: &str) -> Result<Response,
     )
     .ok_or(ProtocolError::CapacityUnavailable)?;
     let frame_bytes = Bytes::from(read_body(request, frame_limit).await?);
-    // The frame is in memory: its share is its length.
-    if !share.resize(frame_bytes.len().saturating_add(fixed)) {
+    let (meta_bytes, payload) = frame::split(&frame_bytes)?;
+    // The frame is in memory: its share is its length. The meta is parsed under the share
+    // of the request (a bound of the parsed meta and of what the call makes of it, computed
+    // from its bytes), which the call holds to its end with the rest of its share.
+    let held = frame_bytes
+        .len()
+        .saturating_add(fixed)
+        .saturating_add(request_share_of(&meta_bytes)?);
+    drop(frame_bytes);
+    if !share.resize(held) {
         return Err(ProtocolError::CapacityUnavailable.into());
     }
-    let (meta_value, payload) = frame::decode(&frame_bytes)?;
-    drop(frame_bytes);
+    let meta = JsonBody::of_meta(&meta_bytes)?;
+    drop(meta_bytes);
     if payload.len() > node.limits.body_bytes {
         return Err(ProtocolError::TooLarge.into());
     }
-    let meta = JsonBody::from_value(meta_value)?;
     let user = meta.user_id()?;
     let record = record_of(&meta, "record")?;
     let context = meta.context()?;

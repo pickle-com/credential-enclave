@@ -64,7 +64,10 @@ pub async fn messages(State(node): State<Arc<Node>>, request: Request) -> Respon
 }
 
 async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
-    let body = JsonBody::read(request).await?;
+    // The request of a command is held under the command budget of the node, not under its
+    // body budget: a revoke does not wait behind the bodies of the calls that use a
+    // credential.
+    let body = JsonBody::read_command(node, request).await?;
     let user_id = body.user_id()?;
     let envelope = body.object("envelope")?;
     node.ensure_open()?;

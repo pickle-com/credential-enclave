@@ -53,6 +53,7 @@ mod platform;
 mod provider_response;
 mod providers;
 mod role;
+mod room;
 mod state;
 #[cfg(test)]
 mod testing;

@@ -543,10 +543,36 @@ and what happens to a value after it left the node is a promise of the operator.
   account (when either differs: `key_mismatch`). `id` is b64u of 16 bytes, `nonce` is b64u of 12
   bytes, the other fields have the form this document gives them, and the AEAD verification passes
   (a failure is `record_invalid`).
+- The longest record. The plaintext of a record a node opens or creates is at most 65,536
+  bytes, so its `ct` (the plaintext and the tag of 16 bytes in b64u) is at most 87,403
+  characters. A record with a longer `ct` is `record_invalid` in every call that carries a
+  record, before the node opens it and before an entry is created: the length of a ciphertext
+  says nothing of what it holds, so this judgement needs no key. The records of the vault are
+  shorter by their own rule (a plaintext of at most 12,272 bytes).
 - When the opened record has a `kind` that the call does not take, the call fails with
   `not_allowed` (enclave.md section 5 names the kinds of every call). A kind that the release does
   not know is `not_allowed` too. When the plaintext is not a JSON object, or the plaintext lacks
   the field that the call uses, the call fails with `record_invalid`.
+- The bounds of a token object. The plaintext of a record of kind `oauth` or `oauth_imported`
+  holds a token object, and a node reads one within two bounds. It handles no token of more
+  than 16,384 bytes: the strings at `access_token`, `refresh_token` and `id_token` of the
+  token object (at its top level and in the token place of the provider), and the string a
+  provider definition injects as the credential. A token travels in the value of a request
+  header, and a header value of that length is above what servers commonly take. And it
+  parses no plaintext whose parsed
+  form would take more than 262,144 bytes of memory, by a count it makes of the text before
+  it parses it: the bytes of the text and a quarter, 512 bytes for each array and object, 448
+  bytes for each comma outside a string, and 1,024 bytes (a text of 65,536 bytes may hold 350
+  arrays and objects or 400 further elements; the token objects of the defined providers hold
+  some thirty values). A node makes no copy of a longer token and does not parse such a
+  plaintext. Whether a record is above these bounds depends on the content of its plaintext,
+  so a call that creates an entry makes the judgement behind that entry: it creates the event
+  of its act, waits until the log store confirmed the entry, and ends with `record_invalid`
+  without the act (`forward`, `forward/batch` and `refresh` send nothing, enclave.md 5.7 and
+  5.8). `revoke-token` sends no token of such a record, and its entry says so. `oauth/merge`,
+  which creates no entry, refuses such a record with `record_invalid`. A node creates no
+  record above these bounds: a token response it would not read again from a record is not
+  taken (section 8).
 - A secret value of the vault is one record per secret field (a password and a TOTP seed are two
   records). A save that changes one of them does not touch the record of the other.
 
@@ -1267,6 +1293,16 @@ not there (the exchange response of slack is nested and its refresh response is 
 response is accepted when `access_token` is at one of the two places. A `scope` of a refresh
 response that is the empty string counts as absent (the old value stays).
 
+A node takes a token response within the bounds of a token object (section 6) and makes no
+record above them. It reads at most 65,536 bytes of a response. A response whose parsed form
+would take more than 262,144 bytes by the count of section 6, and a response with a token of
+more than 16,384 bytes, is not taken: the call fails as for a response that is no JSON object
+(`exchange_failed`, `refresh_failed`, with the status of the provider). When the plaintext a
+rule of the table above gives is longer than 65,536 bytes, or its parsed form would take more
+than 262,144 bytes by that count, the node makes no record of it:
+`oauth/complete` fails with `exchange_failed` and `refresh` with `refresh_failed`, both with
+`provider_status` 200 and an empty `provider_error`, and `oauth/merge` with `record_invalid`.
+
 ## 9. Release statements and the public record (stage 3)
 
 - A release statement is an in-toto statement. Its `predicateType` is
@@ -1955,16 +1991,16 @@ redirect. The response passes rule E4 of the egress policy before any part of it
 | `grant_revoked` | The account revoked its delegation |
 | `grant_expired` | The time of the grant has passed |
 | `key_mismatch` | The `key_id` or the `custody` of a record is not that of the grant. The `sign_pk` of a pending authorization is not the `sign_pk` of the grant |
-| `record_invalid` | The form of a record is wrong, or its AEAD verification failed. The plaintext lacks the field that the call uses (no token to inject, no `refresh_token` to refresh with) |
+| `record_invalid` | The form of a record is wrong (a `ct` of more than 87,403 characters included), or its AEAD verification failed. The plaintext lacks the field that the call uses (no token to inject, no `refresh_token` to refresh with). The plaintext of a token record is above what a node reads (section 6: the room of a token object, a token of more than 16,384 bytes): a call that creates an entry ends with this code behind its confirmed entry, with the message `the plaintext of the record is above what a node reads; nothing was sent` |
 | `provider_unknown` | The provider has no definition |
 | `not_allowed` | An address, a method, an authorization parameter or a field that the provider definition does not allow. A record of a kind that the call does not take. A use of a vault secret outside the reach of its record: an origin, a host or a slot the record does not list (section 6, 10.5). A call that the role of the node does not answer (enclave.md section 4: a node has one of three roles) |
 | `state_unknown` | There is no pending authorization, or its time (600 seconds) has passed |
-| `exchange_failed`, `refresh_failed` | The provider refused the exchange or the refresh. The failure carries the HTTP status of the provider and one word of a closed vocabulary for the error of its response (enclave.md 5.7) |
+| `exchange_failed`, `refresh_failed` | The provider refused the exchange or the refresh, or answered with a response a node does not take as a token object or makes no record of (8.3). The failure carries the HTTP status of the provider and one word of a closed vocabulary for the error of its response (enclave.md 5.7) |
 | `provider_unreachable`, `timeout` | A transport failure, a time limit that passed |
 | `response_withheld` | A provider response failed a check of rule E4 of the egress policy (egress-policy.md) and was not handed on. A repeated call does not change the outcome |
-| `too_large` | A body above the limit (64 MiB each for a request and a response; for `forward/batch`, the bodies of the results together). An event that no entry can hold (7.1) |
+| `too_large` | A body above the limit (64 MiB each for a request and a response; for `forward/batch`, the bodies of the results together; 1 MiB for a JSON body). A request, the JSON body of a call or the meta of a frame, whose share of the budget of the node would be above the largest share of one request (enclave.md section 8: 64 MiB, and 256 KiB for `attestation` and `messages`): the node does not parse it, and the message is `the request takes more room than a node gives one request`. An event that no entry can hold (7.1) |
 | `log_store_unavailable` | The log store did not confirm the entry of the call, or the node cannot write to it: it has no log store in its configuration, no credentials within their time, or no node document in the store (7.6, 7.7). The act of the call did not take place. A repeated call can succeed |
-| `capacity_unavailable` | The node has no room for the call. A `forward`, `forward/batch` or `vault/send` call was not admitted within its wait, or a mail call could not take its place or the first part of its share of the body budget at once: no credential was opened and no provider request was sent. A `mail/read` also ends with this code while it reads, when the body budget has no room for its input (the message `the node has no room for the mail the call reads; the call changed nothing`): that call has its entry, read from the mailbox and changed nothing in it (enclave.md, "Mail call surface"). A node of the forward role also answers a `vault/send` with this code when it holds the marks of as many used envelopes as it keeps (10.5): no request was sent, and the envelope stays unused. A later call can succeed |
+| `capacity_unavailable` | The node has no room for the call. A `forward`, `forward/batch` or `vault/send` call was not admitted within its wait, or a mail call could not take its place or the first part of its share of the body budget at once: no credential was opened and no provider request was sent. A call with a JSON body did not get the share of its request within its wait (enclave.md section 8: of the body budget, and of the command budget for `attestation` and `messages`): the node parsed nothing of the request, created no entry and sent nothing. A `refresh` or an `oauth/complete` did not get the share of what it holds of the token response within that wait: no entry was created, no provider was called, and the authorization of an `oauth/complete` is not used up. A `mail/read` also ends with this code while it reads, when the body budget has no room for its input (the message `the node has no room for the mail the call reads; the call changed nothing`): that call has its entry, read from the mailbox and changed nothing in it (enclave.md, "Mail call surface"). A node of the forward role also answers a `vault/send` with this code when it holds the marks of as many used envelopes as it keeps (10.5): no request was sent, and the envelope stays unused. A later call can succeed |
 
 ## 12. Constants
 
@@ -2019,6 +2055,10 @@ redirect. The response passes rule E4 of the egress policy before any part of it
 | Object versions one verification run fetches at a time (the app) | 8 |
 | `LOG_RUN_STALE_MS` (the app) | 600,000: a run whose judgement took longer than this is judged again on fresh reads (7.4) |
 | `LOG_STORE_ATTEMPTS`, `LOG_STORE_RETRY_MS` (the app) | 3 attempts of one request to the store, pauses of 500 and 1,500 milliseconds between them: a transport failure, a 429 and a 5xx status are tried again |
+| Longest token a node handles (`TOKEN_BYTES`, section 6) | 16,384 bytes |
+| Longest plaintext of a record a node opens or creates, and the longest `ct` of a record (`RECORD_PLAINTEXT_BYTES`, `RECORD_CT_CHARS`, section 6) | 65,536 bytes, 87,403 characters |
+| Most memory the parsed form of a token object may take, by the count of section 6 | 262,144 bytes |
+| Longest response of a token address a node reads (8.3) | 65,536 bytes |
 | Hosts in `sites`, slots in `slots` of a record of kind `vault_secret` (section 6) | 1 to 8, 1 to 4 |
 | Longest name of such a record, longest name inside a slot | 64 characters, 64 bytes |
 | Longest `value` that `vault/store` takes, longest plaintext of a record it makes | 12,000 bytes, 12,272 bytes |
