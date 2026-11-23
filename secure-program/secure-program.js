@@ -193,12 +193,17 @@
   // A round that leaves reads undone because there was more to read than one round reads (more
   // listing pages, more nodes without a judgement, more bodies than its requests name, an answer
   // of the bodies that ended before its last key, more than fits its time) is not complete, and
-  // the next round reads on.
-  // An account in normal use is read to its end within a few such rounds, whatever it holds: the
-  // rounds of a synchronization that end that way in a row, beyond this many, are rounds whose
-  // reads are held back (someone writes objects under the prefix of the account faster than the
-  // device reads them, or the answers of the backend never reach the end).
+  // the next round reads on. A synchronization has the next round follow at once,
+  // LOG_SYNC_ROUNDS rounds in a row at most: a device with much to read (a new device, a device
+  // that was off for long) reads it during its stays in the app, and not one round a day.
+  // An account in normal use is read to its end within a few such rounds, whatever it holds.
+  // Beyond LOG_UNFINISHED_ROUNDS rounds in a row that ended that way, a synchronization whose
+  // first round ends that way again is one whose reads are held back (someone writes objects
+  // under the prefix of the account faster than the device reads them, or the answers of the
+  // backend never reach the end): that round counts as a round held back, once for the
+  // synchronization.
   const LOG_UNFINISHED_ROUNDS = 8;
+  const LOG_SYNC_ROUNDS = 8;
   // A request of a round that was not answered counts as held back by the operator domain when
   // the backend answered another request of this runtime within this time of it.
   const LOG_REACH_MS = 60000;
@@ -4463,9 +4468,11 @@
    *    6 the judgement, the published state, the report. What the round read for the screen is
    *      kept for it (log.recovered) before the reads it answers leave log.withheld
    *  A round that ends with reads left undone because there was more to read than a round reads
-   *  (run.truncated, run.over) is not complete and the next round reads on. From the round after
-   *  LOG_UNFINISHED_ROUNDS such rounds of synchronizations in a row, a round that ends that way
-   *  counts as a round whose reads are held back.
+   *  (run.truncated, run.over) is not complete and the next round reads on: follow says how
+   *  many rounds may follow this one at once (a synchronization starts its round with
+   *  LOG_SYNC_ROUNDS - 1). first says that the round is the first round of a synchronization:
+   *  beyond LOG_UNFINISHED_ROUNDS such rounds of synchronizations in a row, a first round that
+   *  ends that way counts as a round whose reads are held back.
    *  A backend that states it has no store of format 3 (the route is absent, or it answers
    *  log_store_disabled) is read as an environment without entries of format 3, unless this device
    *  knows otherwise: it handed a grant to a node of a release that writes format 3, or it read
@@ -4473,7 +4480,7 @@
    *  Returns {log, pages: {c, u}, entries, absent}: the published state, the first listing pages
    *  (null when they were not read), the entries read by key, and whether the environment has no
    *  store of format 3. */
-  async function runRound(turn, keys, origin, extra) {
+  async function runRound(turn, keys, origin, extra, first, follow) {
     const started = native.nowMs();
     const log = loadLog();
     // The reads an earlier read found held back, and whether what this device kept before this
@@ -4681,9 +4688,11 @@
     const unreachable = !denied && (run.unreachable || run.silent);
     // The rounds of a synchronization in a row that left reads undone because there was more to
     // read than a round reads. A round that read everything it had to read ends the row; a round
-    // whose reads were held back, or that could not reach the store, leaves it as it is. Beyond
-    // LOG_UNFINISHED_ROUNDS such rounds, a round that ends that way is one whose reads are held
-    // back (a round the log screen started reads one listing page and adds nothing to the row).
+    // whose reads were held back, or that could not reach the store, leaves it as it is (a round
+    // the log screen started reads one listing page and adds nothing to the row). Beyond
+    // LOG_UNFINISHED_ROUNDS such rounds, the reads are held back: the first round of a
+    // synchronization that ends that way counts as a round held back, and the rounds that follow
+    // it in that synchronization read on and neither add to that count nor end it.
     const over = !unreachable && (run.truncated || run.over);
     let unfinished = log.round.v === VERSION ? whole(log.round.unfinished) : 0;
     if (over) {
@@ -4691,8 +4700,9 @@
     } else if (!denied && !unreachable) {
       unfinished = 0;
     }
-    const overrun = over && unfinished > LOG_UNFINISHED_ROUNDS;
-    if (overrun && run.detail === "") run.detail = "round:unfinished";
+    const beyond = over && unfinished > LOG_UNFINISHED_ROUNDS;
+    const overrun = beyond && first === true;
+    if (beyond && run.detail === "") run.detail = "round:unfinished";
     const blocked = denied || overrun;
     let grace = 0;
     let established = 0;
@@ -4732,7 +4742,7 @@
     if (blocked) {
       if (log.blocked.count === 0 || log.blocked.first_ms === 0 || log.blocked.first_ms > now) log.blocked.first_ms = now;
       log.blocked.count += 1;
-    } else if (!unreachable) {
+    } else if (!unreachable && !beyond) {
       log.blocked = { first_ms: 0, count: 0 };
     }
     // The reads held back from the screen that the reads of the screen count themselves.
@@ -4754,7 +4764,7 @@
       status: status, verified_ms: status === "pending" ? before.verified_ms : now,
       unverified_nodes: conflicts, missing: log.missing.length, expired: 0, unknown_nodes: established,
       newer_release_nodes: grace,
-      store: blocked || deep ? "blocked" : unreachable ? "unreachable" : run.truncated ? "truncated" : "verified",
+      store: blocked || beyond || deep ? "blocked" : unreachable ? "unreachable" : run.truncated ? "truncated" : "verified",
       store_failure: run.detail, program_version: VERSION,
       store_failing_ms: log.blocked.first_ms !== 0 || !deep ? log.blocked.first_ms : deniedMs,
     };
@@ -4837,6 +4847,13 @@
         Math.max(0, native.nowMs() - started));
     };
     if (origin !== "screen") run.report();
+    // A round of a synchronization that ended with more to read than a round reads, and with
+    // nothing held back: the next round follows at once (follow of them at most after this
+    // one), and nothing waits for it. A round that ends any other way (complete, held back,
+    // without the store, in a runtime that did not run) is followed by none.
+    if (origin === "sync" && over && !denied && whole(follow) > 0 && !accountClosed) {
+      startRound(keys, "sync", undefined, false, follow - 1).then(noop, noop);
+    }
     return {
       log: state, pages: pages, entries: run.entries, junk: run.junk, absent: absent, report: run.report,
     };
@@ -4846,18 +4863,24 @@
   // the result of the one that runs.
   let roundFlight = null;
 
-  /** Asks for a round and waits for it within the turn of the caller. A round runs in a turn of
-   *  its own (LOG_ROUND_LIMIT_MS from its start), one at a time (the round lock). */
-  function requestRound(turn, keys, origin, extra) {
-    if (origin === "sync" && roundFlight !== null) return limited(turn, roundFlight, Infinity, "round");
+  /** Starts a round in a turn of its own (LOG_ROUND_LIMIT_MS from its start) behind the rounds
+   *  that run or wait (the round lock) and returns its promise. first and follow: runRound. */
+  function startRound(keys, origin, extra, first, follow) {
     const own = newTurn(LOG_ROUND_LIMIT_MS, "");
-    const flight = roundLock.run(own, function () { return runRound(own, keys, origin, extra); }, true);
+    const flight = roundLock.run(own, function () { return runRound(own, keys, origin, extra, first, follow); }, true);
     const ended = function () {
       if (roundFlight === flight) roundFlight = null;
     };
     flight.then(ended, ended);
     roundFlight = flight;
-    return limited(turn, flight, Infinity, "round");
+    return flight;
+  }
+
+  /** Asks for a round and waits for it within the turn of the caller. A round that a
+   *  synchronization asks for while one runs is the one that runs. */
+  function requestRound(turn, keys, origin, extra, first, follow) {
+    if (origin === "sync" && roundFlight !== null) return limited(turn, roundFlight, Infinity, "round");
+    return limited(turn, startRound(keys, origin, extra, first, follow), Infinity, "round");
   }
 
   let formats = null;
@@ -7579,7 +7602,10 @@
         await afterGrants(turn, keys, step.grants);
         if (roundDue()) {
           try {
-            await requestRound(turn, keys, "sync");
+            // When the round ends with more to read than a round reads, the next rounds follow
+            // it at once (LOG_SYNC_ROUNDS rounds in a row at most); the synchronization does not
+            // wait for them.
+            await requestRound(turn, keys, "sync", undefined, true, LOG_SYNC_ROUNDS - 1);
           } catch (error) {
             if (failureCode(error) === "cancelled") throw error;
             native.log("round: " + failureCode(error));

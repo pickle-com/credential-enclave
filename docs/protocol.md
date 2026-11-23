@@ -1318,7 +1318,7 @@ Test vectors of the assignment; the backend of the operator computes the same fu
 | `LOG_WATCH_MS` (the app) | 30 days: the time every round of a synchronization goes on reading the first listing pages for the log screen after that read was held back from the screen, unless the screen makes it sooner |
 | `LOG_RECOVERED_KEYS`, `LOG_RECOVERED_EVENTS`, `LOG_RECOVERED_TEXT`, `LOG_RECOVERED_PAGES`, `LOG_RECOVERED_PAGE_EVENTS`, `LOG_RECOVERED_BYTES` (the app) | 128, 512 and 160: the entries the rounds keep for the log screen because the screen asked for their keys, the events of those entries (an entry holds 128 at most, so one entry is always kept), and the characters kept of one string of an event. 4 and 100: the listing pages they keep, and the events of the page kept of one (its entries are kept with it and take no place from the former). 262,144: the bytes of the kept value before it is sealed (beyond them an entry or a listing page leaves, whichever was kept first) |
 | `LOG_DENIED_INTERVAL_MS`, `LOG_DENIED_KEPT_MS`, `LOG_DENIED_READS`, `LOG_DENIED_CHAINS` (the app) | 20 hours: a read held back from the log screen is noted as one more read when the last one noted is this old (the reads of one day are one, and the reads of two days in a row are two whatever the hours). 30 days: a read noted that is not among reads that mark the log ends this long after it was noted, and reads that mark the log end together when the last of them is this old. 8 and 8: the reads noted of one kind (the later pages, the listings of one chain of formats 1 and 2), and the chains whose listings are noted |
-| `LOG_UNFINISHED_ROUNDS` (the app) | 8: the rounds of synchronizations in a row that may end with more to read than a round reads before such a round counts as one whose reads are held back (A3) |
+| `LOG_UNFINISHED_ROUNDS`, `LOG_SYNC_ROUNDS` (the app) | 8: the rounds of synchronizations in a row that may end with more to read than a round reads before the first round of a synchronization that ends that way counts as one whose reads are held back (A3). 8: the rounds one synchronization has follow one another at most while each ends that way |
 | `WAIT_LATE_MS` (the app) | 5,000: a wait that ends later than its own limit by more than this ended in a runtime that did not run for a part of it (the app was suspended), and a read of the log that fails that way failed with the device |
 | `LOG_RELEASE_GRACE_MS` (the app) | 24 hours: the time a measurement no list of the program has may hold the key of the account before it marks the log (A1) |
 | `LOG_BLOCKED_ROUNDS`, `LOG_BLOCKED_MS`, `LOG_REACH_MS`, `LOG_URL_FRESH_MS` (the app) | 3 and 3 days: the rounds in a row whose reads were held back (or the reads of one kind the log screen notes as held back from it), and the age of the first of them, at which the log is marked (A3). 60,000: a request that was not answered counts as held back when the backend answered another request of the runtime within this time. 240,000: the age of a signed address from which a refusal of the store is the age of the address |
@@ -1536,9 +1536,11 @@ A round is one reading and judging of the log of the account (7.4). A synchroniz
 when the last completed round is 24 hours old, when this program has completed none on the
 installation, when the last round did not complete, and while the device keeps a read that was
 held back (in the last two cases not sooner than 60 s after the round before; the first listing
-pages the rounds go on reading for the screen make no round due by themselves). The log screen
-runs a round with its first page, and starts one when the reads it notes as held back from it
-begin or cease to mark the log. One round runs at a time.
+pages the rounds go on reading for the screen make no round due by themselves). A round of a
+synchronization that ends with more to read than a round reads is followed at once by the next
+round, eight in a row at most. The log screen runs a round with its first page, and starts one
+when the reads it notes as held back from it begin or cease to mark the log. One round runs at a
+time.
 
 1. The listing addresses from the backend (`POST /api/secure/log/read`). The program calls an
    address only when its host is the host of the bucket the program computed from its own
@@ -1680,15 +1682,23 @@ ends before its last key, the chains of formats 1 and 2 hold more control entrie
 the listing of such a chain goes on over pages that hold many object versions for each `seq`, or
 its time of 60 s passes before it has read everything) is pending, and the next round reads on
 from where it stopped: a round whose time passes is judged on what it read and keeps what it
-judged. Eight such rounds read 32 listing pages, the documents of 1,024 nodes and 6,400 bodies,
-which an account in normal use does not hold within the retention of the store. The rounds of
-synchronizations that end that way in a row are counted, a round that reads everything ends the
-row, and from the ninth on such a round is a round whose reads are held back: someone writes
-objects under the prefix of the account faster than the device reads them, or the answers of the
-backend never reach their end. Time that passed while the runtime did not run is not time the
-round had (the app went to the background during the round, or the time of the round passed more
-than 5 s later than a running runtime lets it): a round that ends that way is pending and is not
-counted in that row.
+judged. A synchronization has the next round follow such a round at once, eight rounds in a row
+at most, and does not wait for them: a device with much to read (a new device, a device that was
+off for long) reads it during its stays in the app, and not one round a day. The eight rounds of
+one synchronization read 32 listing pages, the documents of 1,024 nodes and 6,400 bodies, which
+an account in normal use does not hold within the retention of the store.
+
+The rounds of synchronizations that end that way in a row are counted, and a round that reads
+everything ends the row. Beyond eight such rounds in a row, the first round of a synchronization
+that ends that way again is a round whose reads are held back: someone writes objects under the
+prefix of the account faster than the device reads them, or the answers of the backend never
+reach their end. It counts once for its synchronization: the rounds that follow it read on, and
+neither add to the count of the rounds held back nor end it. So such reads mark the log when three
+synchronizations after the first could not reach the end and three days have passed since the
+first of them. Time that passed while the runtime did not run is not time the round had (the app
+went to the background during the round, or the time of the round passed more than 5 s later than
+a running runtime lets it): a round that ends that way is pending, is not counted in that row,
+and is followed by none.
 
 The result of a round is `verified`, `pending` or `attention`. It is `attention` when one of four
 conditions holds, and each holds only in a situation that is a problem:
@@ -1697,7 +1707,7 @@ conditions holds, and each holds only in a situation that is a problem:
 | --- | --- | --- |
 | A1 | The key of the account went to a node of a release the program does not accept | A node of an accepted measurement wrote `grant_transferred_out` under the device's own `key_id` naming a measurement no list of the program has, or a node whose document states such a measurement wrote an entry under that `key_id`, and 24 hours have passed since the device first saw that measurement. Within the 24 hours the round is pending: a program that lists a new release is served before a node of that release takes a grant, and a runtime loads the served program at its next start or return to the foreground. The program that lists the release clears the condition |
 | A2 | The signatures of a node that passed attestation contradict each other | Under a key of a node of an accepted measurement: the body the key names with a signature that does not verify, an entry of the device's own `key_id` that does not open, or two different bodies of one `seq` that both verify |
-| A3 | The operator domain has held the reads back for three days | Three rounds in a row or more were held back and the first of them is three days old; or the log screen notes three or more reads of one kind as held back from it (the later pages, the listings of one chain of formats 1 and 2), on three days within 30 days, that it has not read since, and the first of them is three days old. A round is held back when a route of the reads answers with an error status, or does not answer within its limit while the backend answered another request of the runtime within 60 s; when an address is not the one of the request; when the store answers an address not older than 240 s with a status other than 200, 429 and 5xx; when the backend hands out no body, or another body, for a key of the listing whose node the device has a judgement of; when an answer of the bodies names none of the keys of a request, or names a key and not one before it in the request; when the backend hands out no verifying document for the node of a key of the listing and the store does not show that it holds none (it holds a version under the key of that node document or more than a page there, the answer gives no address of that listing or another address, or the store refuses the address); when the backend hands out no verifying document for the receiving node of a transfer that a node of a release before v2.4.0 made on or after 2026-11-23T00:00:00Z ("Formats 1 and 2"); when a read the log screen made of the bucket of formats 1 and 2 is still held back; and, from the ninth in a row on, when the round leaves reads undone because there was more to read than a round reads. A round that made every read, the reads held back before included, clears the count of the rounds. A read the screen makes itself ends the reads it noted that this read covers, and the reads it noted end together when the last of them is 30 days old |
+| A3 | The operator domain has held the reads back for three days | Three rounds in a row or more were held back and the first of them is three days old; or the log screen notes three or more reads of one kind as held back from it (the later pages, the listings of one chain of formats 1 and 2), on three days within 30 days, that it has not read since, and the first of them is three days old. A round is held back when a route of the reads answers with an error status, or does not answer within its limit while the backend answered another request of the runtime within 60 s; when an address is not the one of the request; when the store answers an address not older than 240 s with a status other than 200, 429 and 5xx; when the backend hands out no body, or another body, for a key of the listing whose node the device has a judgement of; when an answer of the bodies names none of the keys of a request, or names a key and not one before it in the request; when the backend hands out no verifying document for the node of a key of the listing and the store does not show that it holds none (it holds a version under the key of that node document or more than a page there, the answer gives no address of that listing or another address, or the store refuses the address); when the backend hands out no verifying document for the receiving node of a transfer that a node of a release before v2.4.0 made on or after 2026-11-23T00:00:00Z ("Formats 1 and 2"); when a read the log screen made of the bucket of formats 1 and 2 is still held back; and, beyond eight rounds in a row that left reads undone because there was more to read than a round reads, when the first round of a synchronization ends that way again. A round that made every read, the reads held back before included, clears the count of the rounds. A read the screen makes itself ends the reads it noted that this read covers, and the reads it noted end together when the last of them is 30 days old |
 | A4 | An entry the device saw left the listing within its retention | A key of the sample that is younger than 364 days and lies in the range the listing covered is in neither of two readings of the listing |
 
 A device without a network, a store that answers 5xx or 429, and an address that aged while the
@@ -1725,7 +1735,7 @@ The program publishes the result as `state.log`:
 | `unverified_nodes` | The nodes for which A2 holds |
 | `missing` | The keys for which A4 holds |
 | `expired` | 0 |
-| `store` | `verified`, `unreachable` (the device or the store failed), `blocked` (a read was held back, or the reads the log screen notes as held back from it mark the log), `truncated` (the control listing goes on beyond the pages of the round, and the round is not yet one of those counted as held back) |
+| `store` | `verified`, `unreachable` (the device or the store failed), `blocked` (a read was held back, or the reads the log screen notes as held back from it mark the log), `truncated` (the control listing goes on beyond the pages of the round, and no more than eight rounds in a row ended with more to read; beyond eight, the value is `blocked`) |
 | `store_failure` | The first failed read of the round, as `{request}:{status or code}` |
 | `store_failing_ms` | The time of the first of the rounds held back in a row or, when there is none, of the first of the reads the log screen notes that mark the log |
 | `program_version` | The version of the program |
