@@ -3376,9 +3376,10 @@
   // an answer to a round is an answer the user sees. Two kinds of listings cannot be kept in a
   // form that answers every later read of the screen (a later page of format 3, the listing of a
   // chain); what is held back of them is noted by the reads of the screen themselves
-  // (log.denied), and those reads mark the log as the count of the rounds does. And a round that
-  // keeps ending with more to read than a round reads is, from LOG_UNFINISHED_ROUNDS such rounds
-  // in a row on, a round whose reads are held back.
+  // (log.denied), and those reads mark the log as the count of the rounds does. And rounds that
+  // end with more to read than a round reads follow one another at once, and beyond
+  // LOG_UNFINISHED_ROUNDS such rounds in a row the first round of a synchronization that ends
+  // that way again is a round whose reads are held back.
   //
   // What is an entry is decided by the listing and by the node documents. The operator domain can
   // write objects under any key of the store, so a key of the listing is the key of an entry only
