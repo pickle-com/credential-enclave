@@ -33,10 +33,16 @@ answer the user sees. The reads of the screen that cannot be kept in a form that
 later read (a later listing page, the listing of a chain of formats 1 and 2) are noted by the
 screen itself when they are held back, and mark the log when such reads of three days stay
 unread by the screen; rounds that keep ending with more to read than a round reads count as
-rounds held back. The
+rounds held back. A round ends its reading when the app goes to the background and is judged on
+what it read, and the keys it listed and did not come to judge are the first the next round asks
+for, so a device whose stays in the app are short reads the log on with every stay; a
+measurement no list of the program has that held the key of the account marks the log at the next
+event of the app once the device first saw it a day ago, without a read. The
 entries of the nodes of the releases before v2.4.0 (formats 1 and 2) are read from the bucket
 their bindings name, for display and to follow a transfer of the delegation a node of such a
-release made. The storage of the operator holds no entry. An entry older than 365 days (the
+release made: under one `seq` of such a chain the program reads eight objects at most until one
+is the entry of the node, and a round reads a chain on only where its node wrote. The storage of
+the operator holds no entry. An entry older than 365 days (the
 retention of its Object Lock) is expected by nobody, and the lifecycle rule of a bucket removes
 entries at 400 days (7.6).
 
@@ -78,7 +84,11 @@ The value of a vault secret goes into the record the device seals, and nowhere e
 no request, of no published value and of no value of the program store (`native.storeSet`). When
 the user asks to see a value, the program opens the record on the device and hands the value to
 the protected sheet of the app (`native.presentSecret`); in a build without that sheet the value
-is the result of the procedure, which the user interface definition shows. The first page of the
+is the result of the procedure, which the user interface definition shows. The hosts and the
+places a value may go to are part of the record the device seals: where the screen showed them to
+the user, the program seals nothing under other ones, and in a build with the confirmation of the
+app (`native.confirmDestinations`) the user confirms a change of them on a surface the app binary
+draws. The first page of the
 log screen and what the rounds read for the screen, which name services and addresses, are kept in
 the program store sealed with a key derived from the master key.
 
@@ -94,7 +104,8 @@ screen), `native.http(` (every
 request the program sends: `request` builds the requests to the backend and `fetchStore` the
 requests to the log store), `native.publish(` (every value the program hands to the user
 interface), `native.storeSet(` (every value the program keeps on the device outside the key
-store), `presentSecret` and `promptSecret` (where a vault value passes the app).
+store), `presentSecret` and `promptSecret` (where a vault value passes the app), and
+`confirmDestinations` (where the user confirms the hosts and places of a vault value).
 
 ## How a release is made
 

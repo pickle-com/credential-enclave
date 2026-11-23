@@ -1314,7 +1314,8 @@ Test vectors of the assignment; the backend of the operator computes the same fu
 | `LOG_ROUND_INTERVAL_MS`, `LOG_ROUND_RETRY_MS` (the app) | 24 hours and 60,000: a synchronization runs a round when the last completed one is this old, and tries a round that did not complete again not sooner than this after it |
 | `LOG_CONTROL_PAGES` (the app) | 4: the listing pages of the control prefix one round reads (1,000 object versions each); a longer listing is read on by the next round |
 | `LOG_DOCUMENT_NODES`, `LOG_DOCUMENT_REQUESTS`, `LOG_BODY_KEYS`, `LOG_ROUND_BODY_REQUESTS` (the app) | 64 and 2: the nodes one request for node documents names, and such requests per round (the store is asked for one listing per node such a request hands out no verifying document for). 200 and 4: the keys one request for bodies names, and such requests per round |
-| `LOG_WITHHELD_KEYS`, `LOG_WITHHELD_PAGES`, `LOG_WITHHELD_OBJECTS`, `LOG_WITHHELD_CHAINS` (the app) | 32, 2, 16 and 8: the keys of entries, the listing pages of the log screen, the entries of chains of formats 1 and 2 and the listings of such chains whose read was held back that the device keeps for the rounds to make again |
+| `LOG_WITHHELD_KEYS`, `LOG_WITHHELD_PAGES`, `LOG_WITHHELD_OBJECTS`, `LOG_WITHHELD_CHAINS` (the app) | 32, 2, 16 and 8: the keys of entries, the listing pages of the log screen, the entries of chains of formats 1 and 2 and the listings of such chains whose read was held back that the device keeps for the rounds to make again. 32 is also the number of new control keys a round listed and did not come to judge that the device keeps for the next round, and 16 the number of `seq`s of chains under which more objects lie than the screen reads |
+| `LOG_LEFT_DOCUMENT_REQUESTS`, `LOG_LEFT_BODY_REQUESTS` (the app) | 2 and 2: the requests for node documents and for bodies a round sends for the keys an earlier read left it, before it asks for a listing. They are not taken from the requests of the listing pages |
 | `LOG_WATCH_MS` (the app) | 30 days: the time every round of a synchronization goes on reading the first listing pages for the log screen after that read was held back from the screen, unless the screen makes it sooner |
 | `LOG_RECOVERED_KEYS`, `LOG_RECOVERED_EVENTS`, `LOG_RECOVERED_TEXT`, `LOG_RECOVERED_PAGES`, `LOG_RECOVERED_PAGE_EVENTS`, `LOG_RECOVERED_BYTES` (the app) | 128, 512 and 160: the entries the rounds keep for the log screen because the screen asked for their keys, the events of those entries (an entry holds 128 at most, so one entry is always kept), and the characters kept of one string of an event. 4 and 100: the listing pages they keep, and the events of the page kept of one (its entries are kept with it and take no place from the former). 262,144: the bytes of the kept value before it is sealed (beyond them an entry or a listing page leaves, whichever was kept first) |
 | `LOG_DENIED_INTERVAL_MS`, `LOG_DENIED_KEPT_MS`, `LOG_DENIED_READS`, `LOG_DENIED_CHAINS` (the app) | 20 hours: a read held back from the log screen is noted as one more read when the last one noted is this old (the reads of one day are one, and the reads of two days in a row are two whatever the hours). 30 days: a read noted that is not among reads that mark the log ends this long after it was noted, and reads that mark the log end together when the last of them is this old. 8 and 8: the reads noted of one kind (the later pages, the listings of one chain of formats 1 and 2), and the chains whose listings are noted |
@@ -1327,7 +1328,7 @@ Test vectors of the assignment; the backend of the operator computes the same fu
 | `LOG_SCREEN_EVENTS`, `LOG_KEEP_EVENTS`, `LOG_SCREEN_WAIT_MS` (the app) | 50, 50 and 3,000: the events of one further page of the log screen, the events of the first page the device keeps, and the time `read_log` waits for the read of the store before it answers from what the device kept |
 | `LOG_SUMMARY_DAYS`, `LOG_SUMMARY_ENTRIES`, `LOG_SUMMARY_REQUESTS` (the app) | 7, 1,000 and 5: the days of the summary of the log screen, the most entries one opening counts into it, and the requests for bodies one opening of the screen sends |
 | `LEGACY_NODES`, `LEGACY_ROUND_PASSES`, `LEGACY_ROUND_BODIES`, `LEGACY_CLOSE_SLACK_MS` (the app) | 64, 4, 64 and 1 day: the chains of formats 1 and 2 one round follows (of more open chains, the ones a round listed longest ago), the passes of listings and the entry bodies it spends on them (one request for the documents of receiving nodes per pass; the receiving nodes that wait for a document count into the entry bodies of a round), and the time after the end of a grant at which the chain of its node is read for the last time |
-| `LEGACY_SEQ_READS`, `LEGACY_SEQ_VERSIONS` (the app) | 8: the object versions a round reads under one `seq` of a chain for a control entry. 5: the object versions per `seq` a listing page of a chain that goes on holds at most, on average, when it holds what a node wrote and no more |
+| `LEGACY_SEQ_READS`, `LEGACY_PROBE_SEQS`, `LEGACY_SEQ_VERSIONS` (the app) | 8: the object versions a round reads under one `seq` of a chain for a control entry, and the log screen for an entry. 2: the `seq`s at the end of a listing page of a chain that a round reads to see how far the node wrote, when their keys name no control entry. 5: the object versions per `seq` a listing page of a chain that goes on holds at most, on average, when it holds what a node wrote and no more |
 | `LEGACY_TRANSFER_DOCUMENTS_FROM_MS` (the app) | 1,795,392,000,000 (2026-11-23T00:00:00Z): for an event of this time or later, the receiving node of a transfer that a node of a release before v2.4.0 made is judged by a document that verifies and by nothing else ("Formats 1 and 2") |
 | `LOG_STORE_CONCURRENCY`, `LOG_STORE_OBJECTS` (the app) | 8 and 100: the reads of the bucket of formats 1 and 2 in flight at once, and the object versions one address request names |
 | `LOG_STORE_ATTEMPTS`, `LOG_STORE_RETRY_MS` (the app) | 2 attempts of one request to the store, a pause of 500 milliseconds between them: a transport failure, a 429 and a 5xx status are tried again |
@@ -1428,10 +1429,10 @@ key transfer ends with the expiry of the transfer.
 
 | Event | What the program does |
 | --- | --- |
-| `session_ready` | Clears the state of a master key transfer (a runtime does not take over the transfer of the runtime before it), publishes whether the build has the protected sheets, publishes the log as pending when this program has ended no round on the installation (the state an earlier program published is not a judgement of this one), counts the calls the runtime before left open as interrupted, and starts a synchronization |
-| `foreground` | Starts a synchronization |
-| `background` | Notes the time for the calls that are open (the report of the outcomes) |
-| `push` | With the reason `transfer_request`: reads the pending requests of a master key transfer. With any other reason: starts a synchronization and, when it ended, sends the report of the synchronization. A synchronization of the reason `grant_required` hands a grant again to a node the backend reports no grant for (below) |
+| `session_ready` | Clears the state of a master key transfer (a runtime does not take over the transfer of the runtime before it), publishes whether the build has the protected sheets and `runtime.named_secrets` as false ("The synchronization"), publishes the log as pending when this program has ended no round on the installation (the state an earlier program published is not a judgement of this one), counts the calls the runtime before left open as interrupted, judges the measurements the device kept (A1, "The round"), and starts a synchronization |
+| `foreground` | Judges the measurements the device kept (A1) and starts a synchronization |
+| `background` | Ends the reading of the round that runs: the round is judged on what it read and writes what it kept within the event ("The round"). Judges the measurements the device kept (A1), and notes the time for the calls that are open (the report of the outcomes) |
+| `push` | With the reason `transfer_request`: reads the pending requests of a master key transfer. With any other reason: judges the measurements the device kept (A1), starts a synchronization and, when it ended, sends the report of the synchronization. A synchronization of the reason `grant_required` hands a grant again to a node the backend reports no grant for (below) |
 | `account_end` | With the reasons `account_deleted` and `dev_reset`: deletes the master key item, the node ledger and the reception key of a mail setup from the key store, and everything the program store holds of the account. Work that is still running writes nothing of the account after that |
 
 A synchronization the app itself triggers (`session_ready`, `foreground`) within 5 s of the start
@@ -1468,6 +1469,13 @@ of the one that runs is served by that one.
    sealing (`GET` and `PUT /api/secure/sealing`, until a query found none) and the completion
    of a mail setup; then a round of the log when one is due.
 8. The catch-up of a master key transfer.
+
+The program publishes one more value of the answer of step 1, on a device with a master key and
+on one without:
+
+| Published | Value |
+| --- | --- |
+| `runtime.named_secrets` | Whether the backend turned the vault items with a name on for the account. A runtime publishes false at its start (what a runtime before it published, of this account or of another, does not stand) and true once the answer to `GET /api/secure/account` of the account of the device carries `named_secrets` true; any other answer, and a query that fails, leave the value as it is. The value is what the operator domain says, handed on to the screens as it is: the screens of the app choose their names by it, and no procedure of the program acts on it |
 
 A procedure that needs a node holding the grant (a connection, the storing of a value) runs steps
 1 to 4 once under the lock of the grants. With delegation off it fails with `delegation_off`; when
@@ -1507,10 +1515,10 @@ it is a secret; what names services and addresses is sealed with a key derived f
 | `log.sample` | The 64 latest control keys the device verified |
 | `log.seen` | The digests of the control keys the device judged (4,096 at most) |
 | `log.missing` | The keys of the sample that left the listing within their retention |
-| `log.withheld` | The reads that were held back and that every round makes again. Of format 3: the keys of entries whose document or body was held back, and the keys the log screen asked for that no answer of the bodies reached (32 at most), with a mark on the ones the log screen asked for; the listing pages of the log screen that were held back (2 at most); and the time until which the rounds go on reading the first listing pages for the screen. Of the bucket of formats 1 and 2, as the log screen read it: the entries whose object versions were held back (16 at most), the listings of chains (8 at most), and the listing of the node prefixes |
+| `log.withheld` | The reads that were held back and that every round makes again. Of format 3: the keys of entries whose document or body was held back, and the keys the log screen asked for that no answer of the bodies reached (32 at most), with a mark on the ones the log screen asked for; the listing pages of the log screen that were held back (2 at most); and the time until which the rounds go on reading the first listing pages for the screen. Of the bucket of formats 1 and 2, as the log screen read it: the entries whose object versions were held back (16 at most), the `seq`s under which more objects lie than the screen reads, none of the ones it read the entry of the node (16 at most), the listings of chains (8 at most), and the listing of the node prefixes. And reads nobody held back: the new control keys a round listed and did not come to judge (`unjudged`, 32 at most), which the next round asks for before its listing |
 | `log.recovered` | What the rounds read of the reads of the log screen that were held back, kept for the screen and sealed (the key of `log.cache`, with associated data of its own): the entries the screen asked for, as the screen shows them, each string cut to 160 characters (128 entries and 512 events at most; beyond that the ones kept first leave), the listing pages (4 at most, each the keys of 100 events with their entries, which leave with the page), and the node prefixes of the bucket of formats 1 and 2. The value holds 262,144 bytes at most before it is sealed: beyond them an entry the screen asked for or a listing page leaves, whichever was kept first |
 | `log.denied` | The reads held back from the log screen that the screen notes itself and has not read since, one for each day on which a read was held back (8 at most of one kind): the later pages of format 3 (the time the read was noted, the lowest time a page held back that day began below, the events it was asked for), and per node (8 at most) the listings of its chain of format 1 or 2 (the time, the lowest `seq` a listing held back that day began after, and whether one of them was a listing below the keys the screen knew) |
-| `log.cursor`, `log.resume` | The latest control key of the last round that covered the whole listing, and where a round that its page limit cut short goes on |
+| `log.cursor`, `log.resume` | The latest control key of the last round that covered the whole listing, and where a round that its page limit cut short goes on, with a mark when a round of that walk through the listing left keys unjudged |
 | `log.legacy` | The chains of formats 1 and 2 the device follows: per node the `seq` up to which the control entries were read and the latest end of a grant. And the receiving nodes of transfers whose documents the device has still to judge |
 | `log.round` | The last round: when it ran, how it ended, the published state, what the app was told, and the rounds of synchronizations in a row that had more to read than they read |
 | `log.cache` | The first page of the log screen, the time the screen last read the listings of that page itself, and the summary tally, sealed |
@@ -1541,6 +1549,22 @@ synchronization that ends with more to read than a round reads is followed at on
 round, eight in a row at most. The log screen runs a round with its first page, and starts one
 when the reads it notes as held back from it begin or cease to mark the log. One round runs at a
 time: a round whose time passed judges and writes what it kept before the next round begins.
+
+A round ends its reading when the app goes to the background (the event `background`). It calls
+the backend and the store no more, and it judges what it read and writes what it kept within that
+event, as a round whose time passed while the runtime did not run: nothing is counted, and the
+next synchronization runs a round however soon it comes. A read that ends this way, or with the
+time of the round, judges what was answered before the end. So a device whose stays in the app
+are shorter than a round reads the log on with every stay, and no backend that answers slowly
+keeps a round from its judgement.
+
+Before step 1, a round asks for the keys an earlier read left it (`log.withheld`): the keys whose
+read was held back, and the new control keys a round listed and did not come to judge (32 at
+most, the keys of the nodes of an accepted measurement first, the earliest entry first: an object
+under the id of such a node is the entry its key names or its read ends in a count, so nothing
+uncounted takes those places from an entry). Their documents and bodies are asked for as in steps
+3 and 4, with requests of their own (two document requests and two body requests at most), which
+take none from the requests of the listing pages.
 
 1. The listing addresses from the backend (`POST /api/secure/log/read`). The program calls an
    address only when its host is the host of the bucket the program computed from its own
@@ -1579,10 +1603,9 @@ time: a round whose time passed judges and writes what it kept before the next r
    Each object is verified by 7.4: the SHA-256 of the body against the `body_hash` of the key, the
    signature under the node id of the key, and the fields of the body against the key and the
    account. The events of an entry of the device's own `key_id` are opened.
-5. The reads that were held back before (`log.withheld`): the keys are read with steps 3 and 4,
-   as the first keys of the request of the round, and each listing page of the log screen is asked
-   for again in the request the screen sends for it, with the entries of the page the screen would
-   show there.
+5. The reads that were held back before (`log.withheld`): the keys are read before step 1 (above),
+   and each listing page of the log screen is asked for again in the request the screen sends for
+   it, with the entries of the page the screen would show there.
 6. The chains of formats 1 and 2 the device follows, and the reads of that bucket that the log
    screen made and that were held back (the last part of this section).
 7. The judgement, the published state, and the report (`POST /api/secure/log/verified`). What the
@@ -1621,6 +1644,13 @@ object under the key of a node document. A key whose body the backend does not h
 held back as well. Besides the objects of a node id without a node document, only an object whose
 body is the one its key names and whose fields are not those of the key, under a signature of the
 node of the key, is no entry.
+
+A listing longer than the four pages of a round is walked over several rounds, and a later round
+of the walk does not list the pages of an earlier one again. A walk in which a round listed more
+keys than it judged or left to the next round does not end as a reading that read everything: the
+round that ends it has more to read than it read, and the next round walks again from the start of
+the listing. The device remembers the judgements of 4,096 control keys, so the control prefix of
+an account that holds more objects than that is never read to its end.
 
 A read that was held back is made again by every round until it is not (step 5). The log screen
 reads the use entries and the later pages of the two listings, which a round of a synchronization
@@ -1705,9 +1735,9 @@ conditions holds, and each holds only in a situation that is a problem:
 
 | | Condition | When it holds |
 | --- | --- | --- |
-| A1 | The key of the account went to a node of a release the program does not accept | A node of an accepted measurement wrote `grant_transferred_out` under the device's own `key_id` naming a measurement no list of the program has, or a node whose document states such a measurement wrote an entry under that `key_id`, and 24 hours have passed since the device first saw that measurement. Within the 24 hours the round is pending: a program that lists a new release is served before a node of that release takes a grant, and a runtime loads the served program at its next start or return to the foreground. The program that lists the release clears the condition |
+| A1 | The key of the account went to a node of a release the program does not accept | A node of an accepted measurement wrote `grant_transferred_out` under the device's own `key_id` naming a measurement no list of the program has, or a node whose document states such a measurement wrote an entry under that `key_id`, and 24 hours have passed since the device first saw that measurement. Within the 24 hours the round is pending: a program that lists a new release is served before a node of that release takes a grant, and a runtime loads the served program at its next start or return to the foreground. The program that lists the release clears the condition. Once the 24 hours have passed, the condition holds whatever the device reads after that: every round that ends states it, however it ended, and for a measurement the device kept the events `session_ready`, `foreground`, `background` and `push` state it without a read (a receiving node whose document the device has not seen is judged by a round, which asks for the document). The receiving node of a transfer a round judged is kept whatever kept its document from that round |
 | A2 | The signatures of a node that passed attestation contradict each other | Under a key of a node of an accepted measurement: the body the key names with a signature that does not verify, an entry of the device's own `key_id` that does not open, or two different bodies of one `seq` that both verify |
-| A3 | The operator domain has held the reads back for three days | Three rounds in a row or more were held back and the first of them is three days old; or the log screen notes three or more reads of one kind as held back from it (the later pages, the listings of one chain of formats 1 and 2), on three days within 30 days, that it has not read since, and the first of them is three days old. A round is held back when a route of the reads answers with an error status, or does not answer within its limit while the backend answered another request of the runtime within 60 s; when an address is not the one of the request; when the store answers an address not older than 240 s with a status other than 200, 429 and 5xx; when the backend hands out no body, or another body, for a key of the listing whose node the device has a judgement of; when an answer of the bodies names none of the keys of a request, or names a key and not one before it in the request; when the backend hands out no verifying document for the node of a key of the listing and the store does not show that it holds none (it holds a version under the key of that node document or more than a page there, the answer gives no address of that listing or another address, or the store refuses the address); when the backend hands out no verifying document for the receiving node of a transfer that a node of a release before v2.4.0 made on or after 2026-11-23T00:00:00Z ("Formats 1 and 2"); when a read the log screen made of the bucket of formats 1 and 2 is still held back; and, beyond eight rounds in a row that left reads undone because there was more to read than a round reads, when the first round of a synchronization ends that way again. A round that made every read, the reads held back before included, clears the count of the rounds. A read the screen makes itself ends the reads it noted that this read covers, and the reads it noted end together when the last of them is 30 days old |
+| A3 | The operator domain has held the reads back for three days | Three rounds in a row or more were held back and the first of them is three days old; or the log screen notes three or more reads of one kind as held back from it (the later pages, the listings of one chain of formats 1 and 2), on three days within 30 days, that it has not read since, and the first of them is three days old. A round is held back when a route of the reads answers with an error status, or does not answer within its limit while the backend answered another request of the runtime within 60 s; when an address is not the one of the request; when the store answers an address not older than 240 s with a status other than 200, 429 and 5xx; when the backend hands out no body, or another body, for a key of the listing whose node the device has a judgement of; when an answer of the bodies names none of the keys of a request, or names a key and not one before it in the request; when the backend hands out no verifying document for the node of a key of the listing and the store does not show that it holds none (it holds a version under the key of that node document or more than a page there, the answer gives no address of that listing or another address, or the store refuses the address); when the backend hands out no verifying document for the receiving node of a transfer that a node of a release before v2.4.0 made on or after 2026-11-23T00:00:00Z ("Formats 1 and 2"); when more objects lie under a `seq` of a chain of formats 1 and 2 than are read there and none of the ones read is the entry of the node, or a listing page of such a chain goes on and shows the node writing nowhere ("Formats 1 and 2"); when a read the log screen made of the bucket of formats 1 and 2 is still held back; and, beyond eight rounds in a row that left reads undone because there was more to read than a round reads, when the first round of a synchronization ends that way again. A round that made every read, the reads held back before included, clears the count of the rounds. A read the screen makes itself ends the reads it noted that this read covers, and the reads it noted end together when the last of them is 30 days old |
 | A4 | An entry the device saw left the listing within its retention | A key of the sample that is younger than 364 days and lies in the range the listing covered is in neither of two readings of the listing |
 
 A device without a network, a store that answers 5xx or 429, and an address that aged while the
@@ -1717,7 +1747,9 @@ while the request was open (the events `background` and `foreground` tell the pr
 request ended more than 5 s after its own limit, which no running runtime lets a wait do. A
 runtime does not run while its app is suspended, and what it had sent fails when it runs again;
 such a failure says nothing of the backend, in a round and in a read of the log screen alike. A
-request the backend answers with an error status counts whenever it is answered.
+request the backend answers with an error status counts whenever it is answered. A round that
+runs when the app goes to the background does not wait for that failure: it ends its reading with
+the event.
 
 These mark nothing: an object under a node id the store holds no node document of (it is no entry
 of a node), a `seq` of a node that no key carries (an entry the store did not confirm: its act did
@@ -1758,11 +1790,14 @@ or another address, for the listing of a node document), `document:{status}` (th
 that listing with that status), `bodies:missing`, `bodies:hash`, `bodies:skipped`,
 `receiver:missing` and `receiver:rejected` (the receiving node of a transfer of formats 1 and 2),
 `listings:{status}` and `objects:{status}` (a read of the bucket of formats 1 and 2),
-`round:time` (the time of the round passed before it had read everything), `round:unfinished` (a
-round counted as held back because the rounds keep ending with more to read than a round reads),
-`screen:held` (the reads the log screen notes as held back from it mark the log), and
-`{request}:suspended` and `round:suspended` (a request, or the time of the round, ended in a
-runtime that did not run for a part of it).
+`chain:keys` (more objects lie under a `seq` of a chain of formats 1 and 2 than are read there,
+none of them the entry of the node, or a listing page of the chain shows the node writing
+nowhere), `round:time` (the time of the round passed before it had read everything),
+`round:unfinished` (a round counted as held back because the rounds keep ending with more to read
+than a round reads), `screen:held` (the reads the log screen notes as held back from it mark the
+log), and `{request}:suspended` and `round:suspended` (a request, or the round, ended in a runtime
+that did not run for a part of it, or the round ended its reading because the app went to the
+background).
 
 ### The log screen
 
@@ -1828,9 +1863,9 @@ may go to and the places it may be put, all inside the plaintext the device seal
 
 | Procedure | What it does | The device owner authentication |
 | --- | --- | --- |
-| `store_secret` | Seals the value the user entered into a record and uploads it. The name, the hosts and the places of the item come from the backend and are checked against the form of section 6 before they enter the plaintext; an item of another form fails the call. The plaintext is padded to the shortest of the lengths 256, 512, 1,024, 2,048, 4,096, 8,192 and 12,272 bytes it fits | None |
+| `store_secret` | Seals the value the user entered into a record and uploads it. The name, the hosts and the places of the item come from the backend and are checked against the form of section 6 before they enter the plaintext; an item of another form fails the call. The plaintext is padded to the shortest of the lengths 256, 512, 1,024, 2,048, 4,096, 8,192 and 12,272 bytes it fits. With a name (an item that exists), the arguments `sites` and `slots`, when given, are the hosts and the places the screen showed the user: when the item names other ones (compared as sets), nothing is sealed and the call fails with `binding_changed`. Without a name (an item the user adds), the item is made from the arguments `label`, `sites` and `slots`, and only once the value is one an item can hold (below) | None |
 | `reveal_secret` | Opens the record on the device and shows the value to the user. It opens a record of kind `vault_secret` only, and a plaintext that names another name than the one asked for is `record_invalid` | Before the query |
-| `update_secret` | Changes the hosts and the places of an item: the record is opened and sealed again under the same id with the new ones | Before the query |
+| `update_secret` | Changes the hosts and the places of an item: the record is opened and sealed again under the same id with the new ones. Without the argument `slots` (absent or blank) the places stay what the item has. In a build with the bridge primitive `confirmDestinations` the user confirms the new hosts and places first (below) | After the confirmation, before the query whose record is opened |
 | `delete_secret` | Removes an item | Before the request |
 | `reveal_login_password` | Shows a password a node made for a login. It opens a record of kind `vault_password` only, and a plaintext whose `source` is not `operator` is `record_invalid`: a password the user typed is not shown | Before the query |
 
@@ -1843,6 +1878,31 @@ part of the result of the two procedures. The program publishes which of the two
 (`runtime.protected_sheets`). In no build is the value part of a request, of a published value or
 of the program store.
 
+`store_secret` without a name makes no item it cannot fill. It checks the form of the label (80
+characters at most, no control character), of the hosts and of the places, asks for the value (in
+a build with the protected sheets, in the input sheet, with the lines made from the hosts and
+places given), and checks the value (not empty, no U+0000, a plaintext within 12,272 bytes
+whatever name the item gets) before `POST /api/secure/vault/secret`. The item the backend made
+must name the hosts and the places that were shown (`binding_changed` otherwise). When a step
+after that request fails, the program sends `DELETE /api/secure/vault/secret/{name}` once, without
+a device owner authentication and whatever that request answers, and the call ends with the
+failure of that step.
+
+In a build with the bridge primitive `confirmDestinations({title, destinations})`, `update_secret`
+shows the user the new hosts and places on a surface the app binary draws, with the lines
+`store_secret` gives the input sheet, before the device owner authentication and before any
+request that changes the item. The primitive resolves to `{confirmed: true}`, or to null when the
+user closes it: the call then ends with `cancelled`, which is no failure of the procedure ("The
+reports of the program"), and nothing is asked of the device owner or of the backend. The time the
+user takes is not counted into the time of the procedure. When the places stay what the item has,
+the item is read before the confirmation, so that the lines name them, and an item whose places
+are other ones when it is read again after the confirmation is not written (`binding_changed`).
+A build without the primitive changes the item as before.
+
+A list argument of a definition action is an array, the JSON of one, the string `any`, or one
+string of names: the hosts of `sites` separated by commas or white space, the places of `slots`
+by white space alone (the name of a `json:` place may hold a comma).
+
 ### Formats 1 and 2
 
 The entries of the nodes of the releases before v2.4.0 stay in the bucket their bindings name
@@ -1853,6 +1913,18 @@ chains the device follows and the node prefixes the listing of the account prefi
 is shown as verified when the signature of the node id of its prefix verifies over its body, its
 key and body agree (for format 2: `seq`, `time_ms`, `kind`, `count`, `key_id` and the hash of the
 body), and it opens with the key of the account.
+
+Under one `seq` the screen reads the latest version of eight objects at most, as a round does for
+a control entry, and the first that verifies is the entry of that `seq`, shown at its own time.
+When none verifies, the `seq` is one line that is not verified, placed at the latest time the
+keys under the `seq` name and not later than the `seq` above it: a key someone wrote there with
+an earlier time moves the line no further down the list. A `seq` whose keys name several times is
+read before it is placed. When more objects lie under a `seq` than the screen reads and none of
+the ones it read is the entry of the node, the `seq` goes to the rounds (`log.withheld`): every
+round lists the objects under it again and reads the latest eight, and while none of them is the
+entry of the node and more lie under the `seq`, the round is one held back (`chain:keys`). An
+entry the screen opened is opened again when a listing names other object versions under its
+`seq`.
 
 A read of that bucket that the log screen makes and that is held back goes to the rounds
 (`log.withheld`), which make it again, and a round that finds it still held back is a round held
@@ -1875,11 +1947,21 @@ that bucket as well, so under one `seq` the round reads the object versions whos
 control entry, the latest first, until one is the entry of the node (eight at most: a node writes
 one object under a `seq`, and one more version when it repeats a write). When none of the eight
 is and more are left, the read is held back (`chain:keys`) and the chain is not read past that
-`seq`. The last `seq` of a listing page that goes on is read with the page after it. A chain an
-account used heavily is long, and the rounds read on through it, four listing pages a round,
-without a count; a listing that goes on over pages that hold more than five object versions for
-each `seq` they name, on average, is one of the reads that leave a round with more to read than
-it reads ("The round"). Such an event names the receiving node and
+`seq`. The last `seq` of a listing page that goes on is read with the page after it.
+
+The `seq` up to which a round read a chain moves on only to a `seq` under which the node is seen
+to have written: an object the node signed for that `seq`. The round sees that in the control
+entries it reads and in the last two `seq`s of a listing page, whose objects it reads for that
+alone when their keys name no control entry (eight versions each at most). An object someone else
+wrote under a `seq` the node has not reached, or far beyond the end of the chain, moves nothing:
+the entry the node writes there later is read. A listing page that goes on and shows the node
+writing nowhere cannot be read on, and the read is held back (`chain:keys`); a page a node wrote
+always shows it in its last `seq`s.
+
+A chain an account used heavily is long, and the rounds read on through it, four listing pages a
+round, without a count; a listing that goes on over pages that hold more than five object
+versions for each `seq` they name, on average, is one of the reads that leave a round with more
+to read than it reads ("The round"). The event of a transfer names the receiving node and
 no measurement, so the program asks for the document of the receiving node (`POST
 /api/secure/log/documents`: the node document of a node of a release from v2.4.0 on, the
 attestation document the backend kept of a node of an earlier release). A receiving node whose
