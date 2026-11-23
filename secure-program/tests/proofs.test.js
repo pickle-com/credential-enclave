@@ -1193,3 +1193,44 @@ test("a device that could not get the release proofs of a release when it first 
   assert.equal(later.node.commands.length, 1);
   assert.equal(world.securityStatuses.filter((item) => item.status === "attention").length, 0);
 });
+
+test("the grant step that asks a node the device knows for the release proofs of its measurement again writes nothing of that measurement but the time it asked: what a round that ran meanwhile noted of it stands", async () => {
+  const fx = partiesFixture();
+  const world = fx.world;
+  await S.start(fx);
+  // A node of a measurement no list has and no proofs show. The device met it two hours ago and
+  // keeps it as a node of a later release.
+  const hidden = bridge.randomMeasurement();
+  const later = world.addNode({ release: "v2.6.0", measurement: hidden });
+  world.advance(2 * HOUR_MS);
+  await S.event(fx, "foreground");
+  assert.equal(world.stored("log.unaccepted")[digestOf(hidden)].held, false);
+  // 70 minutes later the listed node hands the key of the account to it. The user reads the log
+  // screen (a round) while a synchronization runs (the grant step, which asks the node for the
+  // proofs of its measurement again): the first request of the round is answered after two
+  // seconds and the attestation request with the query proofs after eight, so the round ends
+  // while the grant step waits.
+  world.advance(70 * 60000);
+  const first = fx.nodes[0];
+  first.record("c", [{
+    t: "grant_transferred_out", time_ms: world.now, to: later.id, release: "v2.6.0",
+    pcr0: hidden.pcr0, pcr1: hidden.pcr1, pcr2: hidden.pcr2,
+  }]);
+  later.grants.set(world.userId, first.grants.get(world.userId));
+  world.fault("POST /api/secure/log/read", { delay_ms: 2000 }, 1);
+  world.fault((line, request) => request.path === "/api/secure/nodes" && request.query.proofs === "1", { delay_ms: 8000 }, 1);
+  const before = world.requests.length;
+  const asked = world.now;
+  const outcome = await world.run(Promise.allSettled([fx.program.procedures.read_log({ limit: 10 }), fx.program.onEvent("foreground", {})]));
+  await world.settle(0);
+  assert.deepEqual(outcome.map((item) => item.status), ["fulfilled", "fulfilled"]);
+  assert.deepEqual(attestationRequests(world, before), [{ nodes: [later.id], proofs: "1" }]);
+  // The round noted that the measurement took the key, and the grant step that ended after it
+  // left that and wrote the time of its request.
+  const kept = world.stored("log.unaccepted")[digestOf(hidden)];
+  assert.equal(kept.held, true);
+  assert.equal(kept.asked_ms, asked);
+  // A day after the device first saw the measurement, it marks the log.
+  await nextDay(fx);
+  assert.equal(told(world), "attention told attention:unlisted_release grant active");
+});

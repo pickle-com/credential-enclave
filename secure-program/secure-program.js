@@ -10427,25 +10427,35 @@
         staleLater.add(node.node);
         continue;
       }
-      if (nodes[node.node] === undefined) nodes[node.node] = { m: node.measure, p: "nitro", r: node.release, f: now, c: 0 };
+      // A node the device kept as one of a later release before this step (it was asked for the
+      // proofs of its measurement again) has nothing new to be noted: what the device keeps of
+      // it and of its measurement is not written by this step.
+      if (retried.has(node.node)) continue;
+      nodes[node.node] = { m: node.measure, p: "nitro", r: node.release, f: now, c: 0 };
       if (unaccepted[node.measure] === undefined) {
         unaccepted[node.measure] = { first_ms: now, release: String(node.release).slice(0, 64), held: false, node: node.node };
       }
       noted = true;
     }
-    // The time of the request for the release proofs of a measurement that no proofs showed is
-    // kept with that measurement (proofsDue).
-    if (proofNodes.size > 0 && !staleRuntime()) {
-      proofNodes.forEach(function (id, measure) {
-        if (buildOfMeasure(measure) === undefined && isObject(unaccepted[measure])) {
-          unaccepted[measure].asked_ms = now;
-          noted = true;
-        }
-      });
-    }
     if (noted) {
       saveNodes(nodes);
       storeJson(STORE_UNACCEPTED, unaccepted);
+    }
+    // The time of the request for the release proofs of a measurement that no proofs showed is
+    // kept with that measurement (proofsDue). It is written into what the program store holds
+    // now, read and written in this one step of the runtime: a round that ran while this step
+    // waited for its answers wrote what it found of the measurement (that it held the key of
+    // the account), and that stands.
+    if (proofNodes.size > 0 && !staleRuntime()) {
+      const kept = storedObject(STORE_UNACCEPTED);
+      let asked = false;
+      proofNodes.forEach(function (id, measure) {
+        if (buildOfMeasure(measure) === undefined && isObject(kept[measure])) {
+          kept[measure].asked_ms = now;
+          asked = true;
+        }
+      });
+      if (asked) storeJson(STORE_UNACCEPTED, kept);
     }
     const sentMs = native.nowMs();
     for (const item of wanted) {
