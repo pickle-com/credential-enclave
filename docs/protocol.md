@@ -1319,7 +1319,7 @@ Test vectors of the assignment; the backend of the operator computes the same fu
 | `LOG_RECOVERED_KEYS`, `LOG_RECOVERED_EVENTS`, `LOG_RECOVERED_TEXT`, `LOG_RECOVERED_PAGES`, `LOG_RECOVERED_PAGE_EVENTS`, `LOG_RECOVERED_BYTES` (the app) | 128, 512 and 160: the entries the rounds keep for the log screen because the screen asked for their keys, the events of those entries (an entry holds 128 at most, so one entry is always kept), and the characters kept of one string of an event. 4 and 100: the listing pages they keep, and the events of the page kept of one (its entries are kept with it and take no place from the former). 262,144: the bytes of the kept value before it is sealed (beyond them an entry or a listing page leaves, whichever was kept first) |
 | `LOG_DENIED_INTERVAL_MS`, `LOG_DENIED_KEPT_MS`, `LOG_DENIED_READS`, `LOG_DENIED_CHAINS` (the app) | 20 hours: a read held back from the log screen is noted as one more read when the last one noted is this old (the reads of one day are one, and the reads of two days in a row are two whatever the hours). 30 days: a read noted that is not among reads that mark the log ends this long after it was noted, and reads that mark the log end together when the last of them is this old. 8 and 8: the reads noted of one kind (the later pages, the listings of one chain of formats 1 and 2), and the chains whose listings are noted |
 | `LOG_UNFINISHED_ROUNDS` (the app) | 8: the rounds of synchronizations in a row that may end with more to read than a round reads before such a round counts as one whose reads are held back (A3) |
-| `WAIT_LATE_MS` (the app) | 2,000: a wait that ends later than its own limit by more than this ended in a runtime that did not run for a part of it (the app was suspended), and a read of the log that fails that way failed with the device |
+| `WAIT_LATE_MS` (the app) | 5,000: a wait that ends later than its own limit by more than this ended in a runtime that did not run for a part of it (the app was suspended), and a read of the log that fails that way failed with the device |
 | `LOG_RELEASE_GRACE_MS` (the app) | 24 hours: the time a measurement no list of the program has may hold the key of the account before it marks the log (A1) |
 | `LOG_BLOCKED_ROUNDS`, `LOG_BLOCKED_MS`, `LOG_REACH_MS`, `LOG_URL_FRESH_MS` (the app) | 3 and 3 days: the rounds in a row whose reads were held back (or the reads of one kind the log screen notes as held back from it), and the age of the first of them, at which the log is marked (A3). 60,000: a request that was not answered counts as held back when the backend answered another request of the runtime within this time. 240,000: the age of a signed address from which a refusal of the store is the age of the address |
 | `LOG_RETENTION_DAYS` (the app) | 365: a key older than this is expected by no reader (the retention of its lock), and a key is expected in the listing while it is a day younger (A4) |
@@ -1414,7 +1414,7 @@ requests, and every request has a time limit.
 | One round, from its start | 60 s |
 
 A request that is not answered within its limit fails with the code `timeout`; an answer that
-arrives later is dropped. A wait that ends more than 2 s after its own limit, or that was open
+arrives later is dropped. A wait that ends more than 5 s after its own limit, or that was open
 when the app went to the background, ended in a runtime that may not have run for a part of it:
 its failure is marked, and a read of the log that fails with that mark failed with the device
 ("The round"). A procedure whose time is used up fails with `timeout` and its line goes
@@ -1687,7 +1687,7 @@ row, and from the ninth on such a round is a round whose reads are held back: so
 objects under the prefix of the account faster than the device reads them, or the answers of the
 backend never reach their end. Time that passed while the runtime did not run is not time the
 round had (the app went to the background during the round, or the time of the round passed more
-than 2 s later than a running runtime lets it): a round that ends that way is pending and is not
+than 5 s later than a running runtime lets it): a round that ends that way is pending and is not
 counted in that row.
 
 The result of a round is `verified`, `pending` or `attention`. It is `attention` when one of four
@@ -1704,7 +1704,7 @@ A device without a network, a store that answers 5xx or 429, and an address that
 app was suspended leave the round pending and count nothing. So does a request to the backend
 that failed in a runtime that did not run for a part of its wait: the app went to the background
 while the request was open (the events `background` and `foreground` tell the program), or the
-request ended more than 2 s after its own limit, which no running runtime lets a wait do. A
+request ended more than 5 s after its own limit, which no running runtime lets a wait do. A
 runtime does not run while its app is suspended, and what it had sent fails when it runs again;
 such a failure says nothing of the backend, in a round and in a read of the log screen alike. A
 request the backend answers with an error status counts whenever it is answered.

@@ -58,7 +58,8 @@
   const WAIT_INTERACTIVE_PASSES = 64;
   // A wait of a running runtime ends at its limit. A wait that ends later than its own limit by
   // more than this ended in a runtime that did not run for a part of it (the app was suspended).
-  const WAIT_LATE_MS = 2000;
+  // The time is longer than any piece of work of the program keeps the runtime from its timers.
+  const WAIT_LATE_MS = 5000;
 
   // ---- Grants ----
   // The lifetime of a grant is a number of days the user chooses (an integer from 1 to 30, 30 by
