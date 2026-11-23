@@ -1,0 +1,80 @@
+# Every hour: the transparency logs of the trusted root of the public instance of Sigstore must be
+# the ones this repository knows. The table of transparency logs of the node program is compiled
+# into it, and a test ties that table to the copy of the trusted root in
+# protocol/tests/fixtures/sigstore-trusted-root.json (docs/protocol.md 10.3). A node hands its
+# delegations to a later release over an entry of a log of its table only, so a release with
+# another table has to be built and endorsed while a log of the tables in service still takes
+# entries. A trusted root that names a log the copy does not name, no longer names a log of the
+# copy, or states another value for a log (the end of its validity among them) opens an issue.
+# A run that could not complete the comparison (the TUF repository of Sigstore could not be read)
+# fails without that issue, and opens another issue only when the comparison stayed incomplete
+# for six runs in a row. A run in which the logs are the ones of the copy closes the open issues
+# of this monitor.
+name: trusted-root-monitor
+on:
+  schedule:
+    - cron: "47 * * * *"
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: trusted-root-monitor
+  cancel-in-progress: false
+jobs:
+  monitor:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OTHER_LOGS_TITLE: "Trusted root of Sigstore: its transparency logs are not the ones this repository knows"
+      INCOMPLETE_TITLE: "Trusted root of Sigstore: the comparison of its transparency logs could not be completed"
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Compare the transparency logs of the trusted root with the ones this repository knows
+        id: compare
+        run: |
+          status=0
+          python3 secure-program/monitor.py --trusted-root --report report.md || status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+      - name: Open the issue of a trusted root with other logs, or bring its text up to date
+        if: steps.compare.outputs.status == '1'
+        run: |
+          number=$(gh issue list --state open --search "in:title \"$OTHER_LOGS_TITLE\"" --json number --jq '.[0].number')
+          if [ -z "$number" ]; then
+            gh issue create --title "$OTHER_LOGS_TITLE" --body-file report.md
+          else
+            # The issue is open: its text follows the report of this run. An hourly comment
+            # would say nothing new while the difference stands.
+            gh issue edit "$number" --body-file report.md
+          fi
+      - name: Open or update the issue of a comparison that stayed incomplete for six runs
+        if: steps.compare.outputs.status != '0' && steps.compare.outputs.status != '1'
+        run: |
+          # The five runs before this one, newest first. This run is still in progress and is not
+          # in the list of completed runs.
+          failed=$(gh run list --workflow trusted-root-monitor.yml --status completed --limit 5 \
+            --json conclusion --jq '[.[] | select(.conclusion == "failure")] | length')
+          if [ "$failed" = "5" ]; then
+            number=$(gh issue list --state open --search "in:title \"$INCOMPLETE_TITLE\"" --json number --jq '.[0].number')
+            if [ -z "$number" ]; then
+              gh issue create --title "$INCOMPLETE_TITLE" --body-file report.md
+            else
+              gh issue edit "$number" --body-file report.md
+            fi
+          fi
+      - name: Close the open issues of the monitor
+        if: steps.compare.outputs.status == '0'
+        run: |
+          for title in "$OTHER_LOGS_TITLE" "$INCOMPLETE_TITLE"; do
+            for number in $(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[].number'); do
+              gh issue close "$number" --comment "The transparency logs of the trusted root of Sigstore are the ones this repository knows: $RUN_URL"
+            done
+          done
+      - name: Fail unless the transparency logs of the trusted root are the ones this repository knows
+        if: steps.compare.outputs.status != '0'
+        run: exit 1

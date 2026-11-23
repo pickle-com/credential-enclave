@@ -1,12 +1,14 @@
 """The monitor of the public transparency log (docs/protocol.md, "The secure program release").
 
     python3 secure-program/monitor.py --repository OWNER/NAME --report PATH
+    python3 secure-program/monitor.py --trusted-root --report PATH
 
-Every entry of Rekor (rekor.sigstore.dev) that the release key of the operator signed must be the
-statement of a release of this repository: an enclave release (a `v*` tag, whose statement is the
-bytes of the `measurements.json` of its GitHub release) or a secure program release (a
-`secure-program-v*` tag, whose statement is `statement.py` of that tag). The script asks the log for
-the entries of the release key, hashes the known statements, compares, and writes a Markdown report.
+The first form compares the entries of the release key with the releases. Every entry of Rekor
+(rekor.sigstore.dev) that the release key of the operator signed must be the statement of a release
+of this repository: an enclave release (a `v*` tag, whose statement is the bytes of the
+`measurements.json` of its GitHub release) or a secure program release (a `secure-program-v*` tag,
+whose statement is `statement.py` of that tag). The script asks the log for the entries of the
+release key, hashes the known statements, compares, and writes a Markdown report.
 
 The exit status tells three results apart:
 
@@ -19,9 +21,33 @@ The exit status tells three results apart:
 
 A statement that could not be read is not the same as an entry that no release explains: the script
 reads a statement again before it gives up (`READ_ATTEMPTS`), and an entry that it could not compare
-with every release is reported as not checked, not as unknown. Standard library only. The structural
-guarantee of the apps does not rest on this monitor: an app loads a program only with its own
-verification of the entry. The monitor tells people about an entry that no release explains.
+with every release is reported as not checked, not as unknown.
+
+The second form compares the transparency logs of the trusted root of the public instance of
+Sigstore with the ones this repository knows (docs/protocol.md 10.3). The table of transparency
+logs of the node program is compiled into it, and a test ties that table to the copy of the trusted
+root in `protocol/tests/fixtures/sigstore-trusted-root.json`. A node hands its delegations to a
+later release only over an entry of a log of its table, so a release with another table has to be
+built and endorsed while a log of the tables in service still takes entries. The script reads the
+trusted root that the TUF repository of Sigstore distributes and compares its `tlogs` with the ones
+of that copy. The exit status:
+
+    0  the transparency logs of the trusted root are the ones of the copy
+    1  the trusted root names a log the copy does not name, no longer names a log of the copy,
+       states another value for a log (the end of its validity among them), or the TUF repository
+       distributes a further trusted root under another name
+    2  the comparison is not complete: the TUF repository could not be read, its metadata is past
+       its time, the trusted root is not the file its metadata names or has another shape than
+       expected, or the script stopped on an error it did not expect
+
+The script reads the metadata of the TUF repository without a check of its signatures, as it reads
+the entries of the log without a check of the signatures of the log: it follows the versions and
+the hash the metadata states, and it takes metadata that is past its time for no answer.
+
+Standard library only. The structural guarantee of the apps and of the nodes does not rest on this
+monitor: an app loads a program only with its own verification of the entry, and a node takes an
+entry only of a log of the table that is compiled into it. The monitor tells people about an entry
+that no release explains, and about a trusted root whose logs this repository does not know.
 """
 
 from __future__ import annotations
@@ -31,6 +57,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -39,14 +66,23 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 import statement as statement_module
 
 REKOR = "https://rekor.sigstore.dev"
 GITHUB_API = "https://api.github.com"
-RELEASE_KEY = Path(__file__).resolve().parents[1] / "enclave" / "release" / "release-key.pem"
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+RELEASE_KEY = REPOSITORY_ROOT / "enclave" / "release" / "release-key.pem"
 STATEMENT_ASSET = "measurements.json"
+# The TUF repository of the public instance of Sigstore, and the target that is its trusted root.
+TUF_REPOSITORY = "https://tuf-repo-cdn.sigstore.dev"
+TRUSTED_ROOT_TARGET = "trusted_root.json"
+# The copy of that trusted root this repository holds: a test of the node program ties the table
+# of transparency logs of the node to it (enclave/src/lineage.rs).
+TRUSTED_ROOT_COPY = REPOSITORY_ROOT / "protocol" / "tests" / "fixtures" / "sigstore-trusted-root.json"
+TRUSTED_ROOT_COPY_NAME = "protocol/tests/fixtures/sigstore-trusted-root.json"
 TIMEOUT_SECONDS = 60
 # A request that failed for a reason that can pass (a gateway error, a timeout) is sent again:
 # this many attempts in all, with these pauses between them.
@@ -56,6 +92,9 @@ RETRY_PAUSES_SECONDS = (2, 5, 15)
 EXIT_EXPLAINED = 0
 EXIT_UNEXPLAINED = 1
 EXIT_INCOMPLETE = 2
+# The comparison of the trusted root: its transparency logs are the ones of the copy, or not.
+EXIT_KNOWN_LOGS = 0
+EXIT_OTHER_LOGS = 1
 
 
 class _DropAuthorizationOnRedirect(urllib.request.HTTPRedirectHandler):
@@ -310,11 +349,231 @@ def render(
     return report
 
 
+@dataclass
+class Distributed:
+    """The trusted root the TUF repository distributes: its bytes, the versions of the metadata
+    that name it (`timestamp`, `snapshot`, `targets`), and the other targets of the repository
+    whose name says that they are a trusted root."""
+
+    content: bytes
+    versions: dict[str, int]
+    other_targets: list[str]
+
+
+def _signed(role: str, document: bytes, now: datetime, version: int | None = None) -> dict:
+    """The `signed` part of the metadata of `role`. Raises ValueError when the document has another
+    shape, is the metadata of another role or of another version than the one that was asked for,
+    or is past its time: metadata that is past its time says nothing about what the repository
+    distributes now."""
+    metadata = json.loads(document)
+    signed = metadata.get("signed") if isinstance(metadata, dict) else None
+    if not isinstance(signed, dict) or signed.get("_type") != role:
+        raise ValueError(f"the {role} metadata of the TUF repository has another shape than expected")
+    if version is not None and signed.get("version") != version:
+        raise ValueError(f"the {role} metadata of the TUF repository is not version {version}")
+    try:
+        expires = datetime.strptime(signed["expires"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"the {role} metadata of the TUF repository states no end of its time") from error
+    if now >= expires:
+        raise ValueError(f"the {role} metadata of the TUF repository is past its time ({signed['expires']})")
+    return signed
+
+
+def _named_version(signed: dict, name: str) -> int:
+    """The version of the metadata file `name` that `signed` names."""
+    meta = signed.get("meta")
+    version = meta.get(name, {}).get("version") if isinstance(meta, dict) else None
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+        raise ValueError(f"the {signed.get('_type')} metadata of the TUF repository names no version of {name}")
+    return version
+
+
+def distributed_trusted_root(now: datetime) -> Distributed:
+    """Reads the trusted root the TUF repository distributes at `now`: the timestamp names the
+    version of the snapshot, the snapshot the version of the targets, and the targets the hash and
+    the length of the trusted root, which the repository serves under that hash. No signature of
+    the metadata is checked. Raises ValueError when the metadata is not what this chain expects or
+    the trusted root is not the file the metadata names, and the error of a request that failed."""
+    timestamp = _signed("timestamp", http_with_retries("GET", f"{TUF_REPOSITORY}/timestamp.json"), now)
+    snapshot_version = _named_version(timestamp, "snapshot.json")
+    snapshot = _signed(
+        "snapshot",
+        http_with_retries("GET", f"{TUF_REPOSITORY}/{snapshot_version}.snapshot.json"),
+        now,
+        snapshot_version,
+    )
+    targets_version = _named_version(snapshot, "targets.json")
+    targets = _signed(
+        "targets",
+        http_with_retries("GET", f"{TUF_REPOSITORY}/{targets_version}.targets.json"),
+        now,
+        targets_version,
+    )
+    listed = targets.get("targets")
+    target = listed.get(TRUSTED_ROOT_TARGET) if isinstance(listed, dict) else None
+    hashes = target.get("hashes") if isinstance(target, dict) else None
+    digest = hashes.get("sha256") if isinstance(hashes, dict) else None
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError(f"the targets metadata of the TUF repository names no {TRUSTED_ROOT_TARGET}")
+    content = http_with_retries("GET", f"{TUF_REPOSITORY}/targets/{digest}.{TRUSTED_ROOT_TARGET}")
+    if hashlib.sha256(content).hexdigest() != digest or len(content) != target.get("length"):
+        raise ValueError("the trusted root of the TUF repository is not the file its metadata names")
+    others = sorted(name for name in listed if name != TRUSTED_ROOT_TARGET and "trusted_root" in name)
+    versions = {"timestamp": timestamp.get("version"), "snapshot": snapshot_version, "targets": targets_version}
+    return Distributed(content=content, versions=versions, other_targets=others)
+
+
+def transparency_logs(root: bytes, name: str) -> dict[str, dict]:
+    """The transparency logs a trusted root names (`tlogs`), by log identifier: the lower-case
+    hexadecimal of `logId.keyId`. Raises ValueError, with `name` for the trusted root, when it has
+    another shape than expected or names one log identifier twice."""
+    try:
+        logs = json.loads(root)["tlogs"]
+        if not isinstance(logs, list):
+            raise TypeError("`tlogs` is not a list")
+        by_identifier: dict[str, dict] = {}
+        for log in logs:
+            identifier = base64.b64decode(log["logId"]["keyId"], validate=True).hex()
+            if not identifier or identifier in by_identifier or not isinstance(log["baseUrl"], str):
+                raise ValueError(f"the log {identifier or 'without an identifier'}")
+            by_identifier[identifier] = log
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"{name} has another shape than expected ({type(error).__name__}: {error})") from error
+    return by_identifier
+
+
+def _validity_end(log: dict) -> str | None:
+    """The end of the validity of the key of a log, when the trusted root states one."""
+    key = log.get("publicKey")
+    valid_for = key.get("validFor") if isinstance(key, dict) else None
+    return valid_for.get("end") if isinstance(valid_for, dict) else None
+
+
+def _without_validity_end(log: dict) -> dict:
+    """A log as the trusted root states it, without the end of the validity of its key."""
+    copy = json.loads(json.dumps(log))
+    key = copy.get("publicKey")
+    valid_for = key.get("validFor") if isinstance(key, dict) else None
+    if isinstance(valid_for, dict):
+        valid_for.pop("end", None)
+    return copy
+
+
+@dataclass
+class LogDifference:
+    """One difference between the transparency logs of the trusted root that is distributed and
+    those of the copy of this repository."""
+
+    address: str
+    identifier: str
+    difference: str
+
+
+def log_differences(distributed: dict[str, dict], known: dict[str, dict]) -> list[LogDifference]:
+    """What the transparency logs of the distributed trusted root state otherwise than those of
+    the copy, in the order of the log identifiers: a log the copy does not name, a log of the copy
+    that the trusted root no longer names, an end of the validity of a log that the copy does not
+    state (or states otherwise), and every other value of a log that differs."""
+    differences: list[LogDifference] = []
+    for identifier in sorted(distributed.keys() | known.keys()):
+        theirs, ours = distributed.get(identifier), known.get(identifier)
+        texts: list[str] = []
+        if ours is None:
+            end = _validity_end(theirs)
+            texts.append("the copy does not name this log" + (f" (the end of its validity: `{end}`)" if end else ""))
+        elif theirs is None:
+            texts.append("the trusted root no longer names this log")
+        else:
+            if _validity_end(theirs) != _validity_end(ours):
+                texts.append(
+                    f"the end of its validity is `{_validity_end(theirs) or 'not stated'}`"
+                    f" (the copy: `{_validity_end(ours) or 'not stated'}`)"
+                )
+            if _without_validity_end(theirs) != _without_validity_end(ours):
+                texts.append(f"another value than in the copy: `{json.dumps(theirs, sort_keys=True)}`")
+        address = (theirs or ours)["baseUrl"]
+        differences += [LogDifference(address=address, identifier=identifier, difference=text) for text in texts]
+    return differences
+
+
+def render_trusted_root(distributed: Distributed, known: bytes, differences: list[LogDifference]) -> list[str]:
+    versions = distributed.versions
+    report = [
+        "# Trusted root of Sigstore: transparency logs",
+        "",
+        f"Read from the TUF repository {TUF_REPOSITORY}: the target `{TRUSTED_ROOT_TARGET}`"
+        f" (SHA-256 `{hashlib.sha256(distributed.content).hexdigest()}`) of the targets metadata of"
+        f" version {versions['targets']} (snapshot {versions['snapshot']}, timestamp {versions['timestamp']})."
+        " The signatures of the metadata were not checked.",
+        "",
+        f"Compared with `{TRUSTED_ROOT_COPY_NAME}` (SHA-256 `{hashlib.sha256(known).hexdigest()}`).",
+        "",
+    ]
+    if not differences and not distributed.other_targets:
+        report.append("The transparency logs of the trusted root are the ones of the copy.")
+        return report
+    report += ["## What differs", ""]
+    if differences:
+        report += ["| Log | Log identifier | Difference |", "| --- | --- | --- |"]
+        report += [f"| {item.address} | `{item.identifier}` | {item.difference} |" for item in differences]
+    if differences and distributed.other_targets:
+        report.append("")
+    report += [
+        f"- the TUF repository distributes a further trusted root under the name `{name}`"
+        for name in distributed.other_targets
+    ]
+    report += [
+        "",
+        "## What follows",
+        "",
+        "The table of transparency logs of the node program is compiled into it (docs/protocol.md"
+        " 10.3, docs/enclave.md 11.1). A node hands its delegations to a later release over an entry"
+        " of a log of its table only, so a release whose table has a log that goes on taking entries"
+        " is built and endorsed while a log of the tables in service still takes entries. Read the"
+        f" trusted root again, replace `{TRUSTED_ROOT_COPY_NAME}`, and bring the table and the test"
+        " of `enclave/src/lineage.rs` in step with it.",
+    ]
+    return report
+
+
+def compare_trusted_root(report_path: str) -> int:
+    """The second form of the script: compares the transparency logs of the trusted root the TUF
+    repository distributes with the ones of the copy of this repository, and writes the report."""
+    heading = ["# Trusted root of Sigstore: transparency logs", ""]
+    try:
+        distributed = distributed_trusted_root(datetime.now(timezone.utc))
+        logs = transparency_logs(distributed.content, "the trusted root of the TUF repository")
+    except (urllib.error.URLError, OSError, ValueError) as error:
+        report = heading + [f"The trusted root could not be read from the TUF repository {TUF_REPOSITORY}: {error}"]
+        Path(report_path).write_text("\n".join(report) + "\n")
+        print("\n".join(report))
+        return EXIT_INCOMPLETE
+    known = TRUSTED_ROOT_COPY.read_bytes()
+    differences = log_differences(logs, transparency_logs(known, f"`{TRUSTED_ROOT_COPY_NAME}`"))
+    report = render_trusted_root(distributed, known, differences)
+    Path(report_path).write_text("\n".join(report) + "\n")
+    print("\n".join(report))
+    return EXIT_OTHER_LOGS if differences or distributed.other_targets else EXIT_KNOWN_LOGS
+
+
 def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description="Compares the entries of the release key with the releases.")
-    parser.add_argument("--repository", required=True, help="OWNER/NAME of this repository on GitHub")
+    parser = argparse.ArgumentParser(
+        description="Compares the entries of the release key with the releases, or the transparency"
+        " logs of the trusted root of Sigstore with the ones this repository knows."
+    )
+    parser.add_argument("--repository", help="OWNER/NAME of this repository on GitHub")
+    parser.add_argument(
+        "--trusted-root",
+        action="store_true",
+        help="compare the transparency logs of the trusted root of Sigstore instead of the entries",
+    )
     parser.add_argument("--report", required=True, help="the Markdown report to write")
     arguments = parser.parse_args(argv)
+    if arguments.trusted_root:
+        return compare_trusted_root(arguments.report)
+    if not arguments.repository:
+        parser.error("--repository is required unless --trusted-root is given")
     pem = RELEASE_KEY.read_bytes()
     token = os.environ.get("GH_TOKEN", "") or os.environ.get("GITHUB_TOKEN", "")
     try:
@@ -334,14 +593,15 @@ def main(argv: list[str]) -> int:
 
 def run(argv: list[str]) -> int:
     """`main`, with a failure that is not a result of the comparison reported as an incomplete
-    comparison. The exit status 1 means one thing only, an entry that no release explains: a run
-    that stopped on an error it did not expect (a `git` command that failed, an answer of another
-    shape) must not end with that status, which is also the status of an uncaught Python error."""
+    comparison. The exit status 1 means one thing only in each form, an entry that no release
+    explains or a trusted root whose logs are not the ones of the copy: a run that stopped on an
+    error it did not expect (a `git` command that failed, an answer of another shape) must not end
+    with that status, which is also the status of an uncaught Python error."""
     try:
         return main(argv)
     except Exception as error:  # noqa: BLE001 - every unexpected failure is an incomplete run
         report = [
-            "# Transparency log monitor",
+            "# Trusted root of Sigstore: transparency logs" if "--trusted-root" in argv else "# Transparency log monitor",
             "",
             f"The monitor stopped before it finished the comparison: {type(error).__name__}: {error}",
         ]
