@@ -1010,8 +1010,8 @@ test("A3: reads the backend holds back mark the log after three days and three r
   assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
 });
 
-test("A3: three blocked rounds within three days do not mark the log", async () => {
-  const fx = S.fixture(source);
+test("A3: the rounds held back of one day count as one: rounds held back at two moments three days apart do not mark the log, a third day of them does, and one round that reads ends the count", async () => {
+  const fx = S.fixture(source, { device: { securityStatus: true } });
   await S.start(fx);
   const world = fx.world;
   world.fault("POST /api/secure/log/read", { status: 500 });
@@ -1020,8 +1020,62 @@ test("A3: three blocked rounds within three days do not mark the log", async () 
     world.advance(10 * 60000);
     await S.event(fx, "foreground");
   }
-  assert.equal(world.reports.slice(-1)[0].blocked_attempts, 6);
+  // Six rounds held back within an hour are the rounds of one day.
+  assert.equal(world.reports.slice(-1)[0].blocked_attempts, 1);
   assert.equal(world.state.log.status, "pending");
+  // Three days and an hour later the rounds of one stay are held back again: the round of the
+  // synchronization, the round the log screen starts, and the round of the next
+  // synchronization. They are the rounds of a second day, and nothing is marked.
+  world.advance(3 * DAY_MS + HOUR_MS);
+  await S.event(fx, "foreground");
+  await S.call(fx, "read_log", {});
+  await world.settle(15000);
+  world.advance(2 * 60000);
+  await S.event(fx, "foreground");
+  assert.equal(world.stored("log.blocked").count, 2);
+  assert.equal(world.state.log.status, "pending");
+  assert.equal(world.securityStatuses.some((told) => told.status === "attention"), false);
+  // A round held back on a third day marks the log.
+  await nextDay(fx);
+  assert.equal(world.stored("log.blocked").count, 3);
+  assert.equal(world.state.log.status, "attention");
+  assert.deepEqual(world.securityStatuses.slice(-1)[0].reasons, ["verification_blocked"]);
+  // One round that reads the store ends the count.
+  world.clearFaults();
+  world.advance(2 * 60000);
+  await S.event(fx, "foreground");
+  assert.equal(world.state.log.status, "verified");
+  assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
+});
+
+test("A3: a request of a round that fails on its way counts as held back by what the backend answers after it: a device that loses its network in the middle of a stay counts nothing, and a backend that answers the next request does", async () => {
+  // The synchronization is answered, and then the network of the device is gone: the request of
+  // the round fails on its way, and so does the account query the round asks after it.
+  const gone = S.fixture(source);
+  await S.start(gone);
+  gone.world.advance(25 * HOUR_MS);
+  let cut = false;
+  gone.world.fault((line) => {
+    if (line.startsWith("POST /api/secure/log/read")) cut = true;
+    return cut;
+  }, "transport");
+  await S.event(gone, "foreground");
+  assert.equal(gone.world.state.log.status, "pending");
+  assert.equal(gone.world.state.log.store, "unreachable");
+  assert.deepEqual(gone.world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  // The same request fails on its way and the backend answers the account query the round asks
+  // after it: the request was held back.
+  const held = S.fixture(source);
+  await S.start(held);
+  held.world.advance(25 * HOUR_MS);
+  held.world.fault("POST /api/secure/log/read", "transport");
+  const asked = held.world.sent("GET /api/secure/account").length;
+  await S.event(held, "foreground");
+  assert.equal(held.world.state.log.store, "blocked");
+  assert.equal(held.world.state.log.store_failure, "read:transport");
+  assert.equal(held.world.stored("log.blocked").count, 1);
+  // (The account query of the synchronization, and the one the round asked after the failure.)
+  assert.equal(held.world.sent("GET /api/secure/account").length, asked + 2);
 });
 
 test("A3: what counts as a read the operator domain holds back", async () => {
@@ -1322,7 +1376,7 @@ test("a round whose time passed judges and writes what it kept before the next r
   assert.equal(world.stored("log.round").unfinished, 0);
 });
 
-test("a device without a network, and a store that fails, leave the log pending and count no blocked round, however long", async () => {
+test("a device without a network, and a store whose requests fail on their way, leave the log pending and count no blocked round, however long; a store that answers with a 5xx status at every attempt, day after day, holds the reads back", async () => {
   const offline = S.fixture(source);
   await S.start(offline);
   offline.world.advance(2 * HOUR_MS);
@@ -1338,13 +1392,35 @@ test("a device without a network, and a store that fails, leave the log pending 
   assert.equal(offline.world.state.log.store, "unreachable");
   assert.deepEqual(offline.world.stored("log.blocked"), { first_ms: 0, count: 0 });
 
+  // The requests to the store fail on their way: the network of the device.
+  const lost = S.fixture(source);
+  await S.start(lost);
+  lost.world.fault("S3 ", "transport");
+  for (let day = 0; day < 5; day += 1) await nextDay(lost);
+  assert.equal(lost.world.state.log.status, "pending");
+  assert.equal(lost.world.state.log.store, "unreachable");
+  assert.equal(lost.world.state.log.store_failure, "listing:transport");
+  assert.deepEqual(lost.world.stored("log.blocked"), { first_ms: 0, count: 0 });
+
+  // The store answers every attempt with a 503, day after day: the reads are held back, as when
+  // the backend answers the route of the listing addresses that way, and on the same day.
   const failing = S.fixture(source);
   await S.start(failing);
   failing.world.fault("S3 ", { status: 503, body: "" });
-  for (let day = 0; day < 5; day += 1) await nextDay(failing);
-  assert.equal(failing.world.state.log.status, "pending");
-  assert.equal(failing.world.state.log.store, "unreachable");
+  const states = [];
+  for (let day = 0; day < 4; day += 1) {
+    await nextDay(failing);
+    states.push(failing.world.state.log.status + ":" + failing.world.state.log.store + ":" + failing.world.reports.slice(-1)[0].blocked_attempts);
+  }
+  assert.deepEqual(states, ["pending:blocked:1", "pending:blocked:2", "pending:blocked:3", "attention:blocked:4"]);
   assert.equal(failing.world.state.log.store_failure, "listing:503");
+  // A store that answers one attempt that way and the next one well holds nothing back, and one
+  // round that reads ends the count.
+  failing.world.clearFaults();
+  failing.world.fault("S3 ", { status: 503, body: "" }, 1);
+  failing.world.advance(2 * 60000);
+  await S.event(failing, "foreground");
+  assert.equal(failing.world.state.log.status, "verified");
   assert.deepEqual(failing.world.stored("log.blocked"), { first_ms: 0, count: 0 });
 });
 
@@ -1424,13 +1500,20 @@ test("a read that ends because the app was suspended counts nothing: a round who
   assert.equal((await ended(page)).code, "log_store_unreachable");
   assert.equal(world.stored("log.denied"), undefined);
   assert.equal(heldReads(world), undefined);
-  // The same failure with the app in the foreground is a read held back: the backend answered
-  // another request of the runtime a moment before.
+  // The same failure with the app in the foreground is a read held back: the backend answers
+  // the account query the read asks after it.
   await S.event(fx, "foreground");
   world.fault("POST /api/secure/log/read", { delay_ms: 5000, fail: "transport" }, 1);
   const again = await untilListed(() => fx.program.procedures.read_log_page({ before_ms: before }));
   assert.equal((await ended(again)).code, "log_store_unreachable");
   assert.equal(world.stored("log.denied").pages.length, 1);
+  // The runtime stops while the request of a later page is on its way, and runs again when the
+  // time of the procedure has passed: the call ends with timeout, the end of its time, and not
+  // with a failure that has no code.
+  world.fault("POST /api/secure/log/read", "hang", 1);
+  const late = await untilListed(() => fx.program.procedures.read_log_page({ before_ms: before }));
+  world.advance(10 * 60000);
+  assert.equal((await ended(late)).code, "timeout");
 });
 
 test("A1: a measurement that held the key marks the log at an event of the app once the device first saw it a day ago and this runtime read within the hour that no later program is served, whatever the reads of the log answer: a runtime states nothing before it has read what is served", async () => {
@@ -3146,7 +3229,7 @@ test("a debug build reads the listing of a node document of the local stack in t
   assert.equal(wrong.world.sent("S3 localhost:4566").filter((request) => request.url.indexOf("n3%2F") >= 0).length, 0);
 });
 
-test("a listing of a node document that goes on beyond its page holds the read back, and one the store fails to answer leaves the round pending without a count", async () => {
+test("a listing of a node document that goes on beyond its page holds the read back, one that fails on its way leaves the round pending without a count, and one the store answers with a 5xx status at every attempt is a read held back", async () => {
   // More than a page of versions under the key of the document, none of them one the program
   // can take for a version of the document: the store does not show that it holds none.
   const long = S.fixture(source);
@@ -3169,18 +3252,25 @@ test("a listing of a node document that goes on beyond its page holds the read b
   vague.world.fault(isDocumentListing, { status: 200, body: "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListVersionsResult></ListVersionsResult>" });
   await nextDay(vague);
   assert.equal(vague.world.state.log.store_failure, "documents:missing");
-  // The store fails: the round is pending, nothing is counted as held back, and the next round
-  // asks again.
+  // The request to the store fails on its way: the round is pending, nothing is counted as held
+  // back, and the next round asks again.
   const failing = S.fixture(source);
   await S.start(failing);
   const third = new bridge.Node(failing.world, { release: "v2.4.0", measurement: failing.measurement, document: false });
   third.record("c", [{ t: "grant_revoked", time_ms: failing.world.now }]);
-  const fault = failing.world.fault(isDocumentListing, { status: 503, body: "" });
+  const fault = failing.world.fault(isDocumentListing, "transport");
   for (let day = 0; day < 5; day += 1) await nextDay(failing);
   assert.equal(failing.world.state.log.status, "pending");
   assert.equal(failing.world.state.log.store, "unreachable");
-  assert.equal(failing.world.state.log.store_failure, "document:503");
+  assert.equal(failing.world.state.log.store_failure, "document:transport");
   assert.deepEqual(failing.world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  // The store answers every attempt with a 503: the store does not show that it holds no
+  // document of the node, so the key of that node is a read held back.
+  fault.respond = { status: 503, body: "" };
+  await nextDay(failing);
+  assert.equal(failing.world.state.log.store, "blocked");
+  assert.equal(failing.world.state.log.store_failure, "document:503");
+  assert.equal(failing.world.stored("log.blocked").count, 1);
   fault.times = 0;
   await nextDay(failing);
   assert.equal(failing.world.state.log.status, "verified");
@@ -5172,7 +5262,8 @@ test("store_secret without a name makes the item only once the value is one an i
   // A step after the item was made fails: the item is removed with one request, without the
   // device owner being asked, and the call ends with the failure of that step.
   const removed = () => world.sent("DELETE /api/secure/vault/secret/").length;
-  world.fault("PUT /api/secure/vault/secret/", { status: 503, body: { code: "unavailable" } }, 1);
+  // (The request is sent once more after an answer that fails for a moment: both fail here.)
+  world.fault("PUT /api/secure/vault/secret/", { status: 503, body: { code: "unavailable" } }, 2);
   assert.deepEqual(await S.call(fx, "store_secret", base), { ok: false, code: "unavailable" });
   assert.equal(world.vault.secrets.size, 0);
   assert.equal(removed(), 1);
@@ -5188,7 +5279,7 @@ test("store_secret without a name makes the item only once the value is one an i
   assert.equal(world.vault.secrets.size, 0);
   assert.equal(removed(), 2);
   // The request that removes the item fails as well: the call ends with the failure of the step.
-  world.fault("PUT /api/secure/vault/secret/", { status: 503, body: { code: "unavailable" } }, 1);
+  world.fault("PUT /api/secure/vault/secret/", { status: 503, body: { code: "unavailable" } }, 2);
   world.fault("DELETE /api/secure/vault/secret/", { status: 500, body: {} }, 1);
   assert.deepEqual(await S.call(fx, "store_secret", base), { ok: false, code: "unavailable" });
   assert.equal(removed(), 3);
@@ -5660,7 +5751,7 @@ test("the account query and the list of the nodes are asked once more after an a
   assert.equal(other.world.sent("POST /api/secure/log/verified").length, reports + 1);
 });
 
-test("a shorter lifetime of the grants in a stale runtime is applied to every node that may hold the grant or to none: with a listed node this program sends no grant command to, the call ends with program_stale and no lifetime changes; a runtime that is not stale and a longer lifetime are as before", async () => {
+test("a shorter lifetime of the grants is applied to every listed node or to none: with a listed node the step has no grant command for, no grant goes out and no lifetime changes, and the call ends with program_stale in a stale runtime and with grant_incomplete in any other; a longer lifetime is as before", async () => {
   const build = async (stale) => {
     const fx = S.fixture(source);
     const world = fx.world;
@@ -5700,21 +5791,62 @@ test("a shorter lifetime of the grants in a stale runtime is applied to every no
   // The same lifetime again, and a longer one, in that stale runtime: as before.
   assert.equal((await S.call(stale.fx, "set_grant_days", { days: 30 })).ok, true);
 
-  // A runtime that is not stale: the lifetime is shortened on the nodes this program hands a
-  // grant to, as before.
+  // A runtime that is not stale, with the same node listed: the node is one the step has no
+  // grant command for, and the call ends with grant_incomplete and everything as it was.
   const fresh = await build(false);
-  const shorter = await S.call(fresh.fx, "set_grant_days", { days: 1 });
-  assert.equal(shorter.ok, true);
-  assert.equal(shorter.value.days, 1);
-  assert.ok(fresh.fx.nodes[0].grants.get(fresh.world.userId).not_after_ms < fresh.world.now + 2 * DAY_MS);
-  // That runtime then learns that it is stale: a longer lifetime is taken as before.
+  const before = fresh.fx.nodes[0].grants.get(fresh.world.userId).not_after_ms;
+  const granted = grantsOf(fresh.fx.nodes[0]);
+  assert.deepEqual(await S.call(fresh.fx, "set_grant_days", { days: 1 }), { ok: false, code: "grant_incomplete" });
+  assert.equal(fresh.world.state.grant_days, 30);
+  assert.equal(readLedger(fresh.fx).ttl_days, 30);
+  assert.equal(fresh.fx.nodes[0].grants.get(fresh.world.userId).not_after_ms, before);
+  assert.equal(grantsOf(fresh.fx.nodes[0]), granted);
+  assert.deepEqual(fresh.later.commands, []);
+  // A longer lifetime is taken as before, in that runtime and once it learned that it is stale.
+  assert.equal((await S.call(fresh.fx, "set_grant_days", { days: 30 })).ok, true);
   fresh.world.account.servedProgram = fresh.fx.version + 1;
   fresh.world.advance(2 * 60000);
   await S.event(fresh.fx, "foreground");
-  const longer = await S.call(fresh.fx, "set_grant_days", { days: 14 });
-  assert.equal(longer.ok, true);
-  assert.equal(longer.value.days, 14);
-  assert.ok(fresh.fx.nodes[0].grants.get(fresh.world.userId).not_after_ms > fresh.world.now + 13 * DAY_MS);
+  // (The lifetime was thirty days already: fourteen is shorter, and the node is still listed.)
+  assert.deepEqual(await S.call(fresh.fx, "set_grant_days", { days: 14 }), { ok: false, code: "program_stale" });
+
+  // Two listed nodes of the release this program lists, and the attestation of one of them does
+  // not arrive, or arrives and does not verify: the lifetime is shortened on neither, and the
+  // call ends with grant_incomplete. With both attestations it is shortened on both.
+  for (const mode of ["silent", "rejected"]) {
+    const two = S.fixture(source, { nodes: 2 });
+    await S.start(two);
+    const world = two.world;
+    world.advance(2 * HOUR_MS);
+    const quiet = two.nodes[1];
+    const ends = () => two.nodes.map((node) => node.grants.get(world.userId).not_after_ms);
+    const kept = ends();
+    if (mode === "silent") {
+      world.fault("GET /api/secure/grants", () => { quiet.alive = true; return undefined; });
+      world.fault("GET /api/secure/nodes", () => { quiet.alive = false; return undefined; });
+    } else {
+      quiet.brokenSignature = true;
+    }
+    assert.deepEqual(await S.call(two, "set_grant_days", { days: 1 }), { ok: false, code: "grant_incomplete" }, mode);
+    quiet.alive = true;
+    assert.deepEqual(ends(), kept, mode);
+    assert.equal(world.state.grant_days, 30, mode);
+    assert.equal(readLedger(two) === null ? 30 : readLedger(two).ttl_days, 30, mode);
+    world.clearFaults();
+    quiet.brokenSignature = false;
+    const shorter = await S.call(two, "set_grant_days", { days: 1 });
+    assert.equal(shorter.ok, true, mode);
+    for (const end of ends()) assert.ok(end < world.now + 2 * DAY_MS, mode);
+    // A longer lifetime with a node whose attestation does not arrive: as before, the call ends
+    // well and the nodes that answered take it.
+    if (mode === "silent") {
+      world.fault("GET /api/secure/grants", () => { quiet.alive = true; return undefined; });
+      world.fault("GET /api/secure/nodes", () => { quiet.alive = false; return undefined; });
+      assert.equal((await S.call(two, "set_grant_days", { days: 9 })).ok, true);
+      quiet.alive = true;
+      assert.ok(two.nodes[0].grants.get(world.userId).not_after_ms > world.now + 8 * DAY_MS);
+    }
+  }
   // A stale runtime without such a node shortens the lifetime.
   const alone = S.fixture(source);
   alone.world.account.servedProgram = alone.version + 1;
@@ -5834,17 +5966,17 @@ test("a runtime that reads a node ledger of a form it does not know hands no gra
       assert.deepEqual(await S.call(fx, name, args), { ok: false, code: "program_stale" }, shape + " " + name);
     }
     assert.deepEqual(commands(fx), before, shape);
-    // The user turns the delegation off on this device: the revoke goes to every listed node,
-    // the ledger item of the later program stays as it is, and the call says program_stale.
+    // The user turns the delegation off on this device: the ledger cannot be written, so no
+    // revoke goes to a node, the ledger stays as it is on both sides, and the call says
+    // program_stale. What the user is told (the call failed) is what is the case.
     assert.deepEqual(await S.call(fx, "set_delegation", { enabled: false }), { ok: false, code: "program_stale" }, shape);
-    assert.deepEqual(commands(fx), { grant: before.grant, revoke: before.revoke + 2 }, shape);
+    assert.deepEqual(commands(fx), before, shape);
     assert.equal(item(world).value, kept, shape);
-    // (The side of the ledger this program reads keeps the time of that switch.)
-    assert.ok(JSON.parse(world.store.get("ledger")).revoked_ms > 0, shape);
+    assert.equal(world.store.get("ledger"), copy, shape);
     // No synchronization after it sends anything to a node.
     world.advance(25 * HOUR_MS);
     await S.event(fx, "foreground");
-    assert.deepEqual(commands(fx), { grant: before.grant, revoke: before.revoke + 2 }, shape);
+    assert.deepEqual(commands(fx), before, shape);
   }
   // An account without a ledger value, and a ledger of the form this program reads: as before.
   const plain = S.fixture(source, { nodes: 1, legacy: 1 });
@@ -6438,4 +6570,584 @@ test("a setting of the delegation that is made while an exchange of the ledger i
   assert.equal(world.state.grant_days, 7);
   assert.equal(node.commands.filter((command) => command.type === "grant").length, handed);
   assert.equal(node.grants.has(world.userId), false);
+});
+
+// ---- The last list before the tag: requests through a network that carries little ----
+
+test("a request for bodies that is not answered in its time, or fails on its way, is asked again for its first key alone: an answer to that stands for the answer of the request, the runtime names less in a request from then on, the rounds read to the end, and none of them counts as held back", async () => {
+  for (const failure of ["timeout", "transport"]) {
+    const fx = S.fixture(source, { device: { securityStatus: true } });
+    await S.start(fx);
+    const world = fx.world;
+    // Forty control entries arrive while the device is away.
+    world.advance(HOUR_MS);
+    for (let i = 0; i < 40; i += 1) {
+      world.advance(1000);
+      fx.nodes[0].record("c", [{ t: "grant_revoked", time_ms: world.now }]);
+    }
+    // A network that carries an answer for one key and none for more: the answer of a request
+    // that names more keys arrives after its time, or its connection is cut.
+    const named = [];
+    world.fault("POST /api/secure/log/bodies", (request) => {
+      const count = JSON.parse(request.body).keys.length;
+      named.push(count);
+      if (count < 2) return undefined;
+      return failure === "timeout" ? { delay_ms: 12000 } : "transport";
+    });
+    world.advance(25 * HOUR_MS);
+    await S.event(fx, "foreground");
+    await world.settle(20 * 60000);
+    assert.equal(world.state.log.status, "verified", failure);
+    assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 }, failure);
+    assert.equal(world.reports.some((report) => report.store === "blocked" || report.store === "unreachable"), false, failure);
+    assert.equal(world.securityStatuses.some((told) => told.status === "attention"), false, failure);
+    // The first request named every key, the request that followed it named its first key alone,
+    // and the requests of the end named one key each.
+    assert.equal(named[0], 40, failure);
+    assert.equal(named[1], 1, failure);
+    assert.ok(named.some((count) => count > 1 && count <= 16), failure);
+    assert.deepEqual(named.slice(-8), [1, 1, 1, 1, 1, 1, 1, 1], failure);
+  }
+});
+
+test("a request for bodies whose first key alone is not answered either stays a request that was not answered: the round is one held back, and a read asks that way once", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  world.advance(HOUR_MS);
+  for (let i = 0; i < 5; i += 1) {
+    world.advance(1000);
+    fx.nodes[0].record("c", [{ t: "grant_revoked", time_ms: world.now }]);
+  }
+  world.fault("POST /api/secure/log/bodies", "hang");
+  world.advance(25 * HOUR_MS);
+  const before = world.sent("POST /api/secure/log/bodies").length;
+  await S.event(fx, "foreground");
+  await world.settle(60000);
+  assert.equal(world.state.log.status, "pending");
+  assert.equal(world.state.log.store, "blocked");
+  assert.equal(world.state.log.store_failure, "bodies:timeout");
+  assert.equal(world.stored("log.blocked").count, 1);
+  // The request of the round, and the one request that asked for its first key alone.
+  const sent = world.sent("POST /api/secure/log/bodies").slice(before).map((request) => JSON.parse(request.body).keys.length);
+  assert.deepEqual(sent, [5, 1]);
+  // A backend that goes on that way marks the log on the fourth day, as before.
+  for (let day = 0; day < 3; day += 1) await nextDay(fx);
+  await world.settle(60000);
+  assert.equal(world.state.log.status, "attention");
+});
+
+test("a request for one key that fails on its way is sent once more, and one that runs out of its time is not", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  world.advance(HOUR_MS);
+  fx.nodes[0].record("c", [{ t: "grant_revoked", time_ms: world.now }]);
+  world.fault("POST /api/secure/log/bodies", "transport", 1);
+  world.advance(25 * HOUR_MS);
+  let before = world.sent("POST /api/secure/log/bodies").length;
+  await S.event(fx, "foreground");
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(world.sent("POST /api/secure/log/bodies").length, before + 2);
+  // The next request of that runtime names every key it has again: nothing was learned of the
+  // network from a request for one key.
+  world.advance(HOUR_MS);
+  for (let i = 0; i < 3; i += 1) {
+    world.advance(1000);
+    fx.nodes[0].record("c", [{ t: "grant_revoked", time_ms: world.now }]);
+  }
+  world.advance(25 * HOUR_MS);
+  before = world.sent("POST /api/secure/log/bodies").length;
+  await S.event(fx, "foreground");
+  assert.deepEqual(world.sent("POST /api/secure/log/bodies").slice(before).map((request) => JSON.parse(request.body).keys.length), [3]);
+  // One key, and its request runs out of its time: it is not sent again.
+  world.advance(HOUR_MS);
+  fx.nodes[0].record("c", [{ t: "grant_revoked", time_ms: world.now }]);
+  world.fault("POST /api/secure/log/bodies", { delay_ms: 12000 }, 1);
+  world.advance(25 * HOUR_MS);
+  before = world.sent("POST /api/secure/log/bodies").length;
+  await S.event(fx, "foreground");
+  await world.settle(30000);
+  assert.equal(world.sent("POST /api/secure/log/bodies").length, before + 1);
+  assert.equal(world.state.log.store_failure, "bodies:timeout");
+});
+
+test("a big key is asked for alone, at the end of its round, with the time its size takes: an answer that arrives within that time is read, the other keys of the round are judged whatever becomes of it, and a key under which a small version lies is no big key", async () => {
+  const scope = "s".repeat(600000);
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  world.advance(HOUR_MS);
+  const big = fx.nodes[0].record("c", [{ t: "connection_created", time_ms: world.now, record_id: "r", provider: "slack", scope: scope }]);
+  world.advance(1000);
+  const small = fx.nodes[0].record("c", [{ t: "grant_revoked", time_ms: world.now }]);
+  // The answer for the big key takes forty seconds (a network that carries little).
+  const requests = [];
+  world.fault("POST /api/secure/log/bodies", (request) => {
+    const keys = JSON.parse(request.body).keys;
+    requests.push(keys);
+    return keys.indexOf(big.key) >= 0 ? { delay_ms: 40000 } : undefined;
+  });
+  world.advance(25 * HOUR_MS);
+  await S.event(fx, "foreground");
+  await world.settle(5 * 60000);
+  assert.deepEqual(requests, [[small.key], [big.key]]);
+  assert.equal(world.state.log.status, "verified");
+  assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  assert.ok(world.stored("log.big")[big.key] >= 600000);
+
+  // The request for a big key is never answered: the entry written beside it (a transfer to a
+  // node of a measurement no list has) is judged in that round all the same.
+  const held = S.fixture(source);
+  await S.start(held);
+  held.world.advance(HOUR_MS);
+  const heavy = held.nodes[0].record("c", [{ t: "connection_created", time_ms: held.world.now, record_id: "r", provider: "slack", scope: scope }]);
+  held.world.advance(1000);
+  const other = bridge.randomMeasurement();
+  const receiver = held.world.addNode({ release: "v9.0.0", measurement: other, offered: false });
+  held.nodes[0].record("c", [{
+    t: "grant_transferred_out", time_ms: held.world.now, to: receiver.id, release: "v9.0.0", pcr0: other.pcr0, pcr1: other.pcr1, pcr2: other.pcr2,
+  }]);
+  held.world.fault("POST /api/secure/log/bodies", (request) => (JSON.parse(request.body).keys.indexOf(heavy.key) >= 0 ? "hang" : undefined));
+  held.world.advance(25 * HOUR_MS);
+  await S.event(held, "foreground");
+  // (Before the wait for the big key has ended.)
+  await held.world.settle(20000);
+  await S.event(held, "background");
+  assert.equal(held.world.state.log.newer_release_nodes, 1);
+  assert.equal(Object.keys(held.world.stored("log.unaccepted")).length, 1);
+  assert.deepEqual(held.world.stored("log.withheld").unjudged, [heavy.key]);
+
+  // A big object someone wrote under the key of a small entry of a node does not make that key
+  // a big one: the listing shows the version the node wrote beside it.
+  const planted = S.fixture(source);
+  await S.start(planted);
+  planted.world.advance(HOUR_MS);
+  const entry = planted.nodes[0].record("c", [{ t: "grant_revoked", time_ms: planted.world.now }]);
+  planted.world.putObject(bridge.shardBucket("prod", planted.world.userId), entry.key, "x".repeat(100000));
+  const asked = [];
+  planted.world.fault("POST /api/secure/log/bodies", (request) => { asked.push(JSON.parse(request.body).keys); return undefined; });
+  planted.world.advance(25 * HOUR_MS);
+  await S.event(planted, "foreground");
+  assert.deepEqual(asked, [[entry.key]]);
+  assert.equal(planted.world.stored("log.big"), undefined);
+  assert.equal(planted.world.state.log.status, "verified");
+});
+
+// ---- The last list before the tag: what the review of the program found ----
+
+/** Starts a runtime on the fixture whose bridge is the one of the model with the functions
+ *  replace(native) returns in the place of its own (a key store whose write fails, an X25519 that
+ *  returns what a given executor would). */
+async function startWith(fx, replace) {
+  const world = fx.world;
+  world.bridgeOpen = false;
+  world.runtime = {};
+  world.timers = [];
+  const native = bridge.makeNative(world);
+  const wrapped = {};
+  for (const name of Object.keys(native)) wrapped[name] = native[name];
+  Object.assign(wrapped, replace(native));
+  const context = require("node:vm").createContext({
+    native: Object.freeze(wrapped), SecureError: bridge.SecureError, console: { log: () => {} },
+  });
+  require("node:vm").runInContext(fx.source, context, { filename: "secure-program.js" });
+  fx.program = context.secureProgram;
+  world.bridgeOpen = true;
+  await world.run(fx.program.onEvent("session_ready", {}));
+  await world.settle(0);
+}
+
+test("a backend that states it has no store of format 3, on a device that knows of none, ends what the screen noted of its later pages: requests of a later page that fail on three days mark nothing there", async () => {
+  const fx = S.fixture(source, { nodes: 0, legacy: 1, device: { securityStatus: true } });
+  const world = fx.world;
+  world.routes.log = "disabled";
+  const node = fx.legacy[0];
+  await S.start(fx);
+  for (let hour = 0; hour < 72; hour += 1) {
+    world.advance(HOUR_MS);
+    for (let i = 0; i < 4; i += 1) node.record("u", [S.providerRequest(world.now - i * 1000, "/gmail/v1/users/me/messages/" + hour + "-" + i)]);
+  }
+  const noted = () => {
+    const denied = world.stored("log.denied");
+    return denied === undefined ? 0 : denied.pages.length;
+  };
+  for (let day = 1; day <= 5; day += 1) {
+    world.advance(DAY_MS);
+    await S.start(fx);
+    await world.settle(3000);
+    // (The round of that start was told that there is no store of format 3.)
+    assert.equal(noted(), 0, "day " + day);
+    await S.call(fx, "read_log", {});
+    await world.settle(8000);
+    await S.call(fx, "read_log", {});
+    const places = world.runtime.log_pages;
+    assert.ok(places.length > 0);
+    // The one request of the second page for its listing addresses fails for a moment.
+    world.fault("POST /api/secure/log/read", { status: 503, body: { detail: "postgresql_unavailable" } }, 1);
+    const page = await S.call(fx, "read_log_page", { before_ms: places[0].before_ms });
+    assert.deepEqual(page, { ok: false, code: "log_store_unreachable" }, "day " + day);
+    assert.equal(noted(), 1, "day " + day);
+    if (day === 5) {
+      // The same page, asked for again and answered with the statement that there is no such
+      // store: what was noted ends with that read.
+      const again = await S.call(fx, "read_log_page", { before_ms: places[0].before_ms });
+      assert.equal(again.ok, true);
+      assert.equal(noted(), 0);
+    }
+    await world.settle(5000);
+    assert.notEqual(world.state.log.status, "attention", "day " + day);
+  }
+  assert.equal(world.securityStatuses.some((told) => told.status === "attention"), false);
+});
+
+test("a request that follows what the user did in a procedure is sent once more after an answer that fails for a moment: the consent of a connection, the value of a vault item, the device owner authentication of a reveal; two such answers end the call, and the request that makes a vault item is sent once", async () => {
+  const moment = { status: 503, body: { detail: "postgresql_unavailable" } };
+  // connect: the user completes the consent in the web session.
+  const linked = S.fixture(source, { nodes: 2 });
+  await S.start(linked);
+  let consents = 0;
+  linked.world.device.webAuth = (args) => {
+    const state = new URL(args.url).searchParams.get("state").split(".")[0];
+    linked.world.connections.get(state).completed = true;
+    consents += 1;
+    return "pickle://oauth?oauth_status=connected&oauth_state=" + state;
+  };
+  linked.world.fault("GET /api/secure/connections/completion", moment, 1);
+  assert.equal((await S.call(linked, "connect", { target: "github" })).ok, true);
+  assert.equal(consents, 1);
+  linked.world.fault("GET /api/secure/connections/completion", moment, 2);
+  assert.deepEqual(await S.call(linked, "connect", { target: "github" }), { ok: false, code: "postgresql_unavailable" });
+
+  // store_secret with a name, and reveal_secret: the user typed the value, and passed the
+  // device owner authentication.
+  const vault = S.fixture(source, { device: { sheets: true, promptAnswer: "typed-value" } });
+  await S.start(vault);
+  const world = vault.world;
+  world.vault.secrets.set("API_KEY", {
+    name: "API_KEY", label: "Key", sites: ["api.example.com"], slots: ["header:authorization"], state: "empty", source: "device",
+  });
+  world.fault("PUT /api/secure/vault/secret/", moment, 1);
+  assert.equal((await S.call(vault, "store_secret", { name: "API_KEY" })).ok, true);
+  assert.equal(world.device.prompts.length, 1);
+  assert.notEqual(world.vault.secrets.get("API_KEY").record, undefined);
+  world.fault("GET /api/secure/vault/secret/", (request) => (world.device.ownerAuths.length > 0 ? moment : undefined), 1);
+  assert.equal((await S.call(vault, "reveal_secret", { name: "API_KEY" })).ok, true);
+  assert.equal(world.device.ownerAuths.length, 1);
+  assert.equal(world.device.presented.length, 1);
+
+  // store_secret without a name: the two requests after the one that made the item.
+  const made = () => world.sent("POST /api/secure/vault/secret").filter((request) => request.path === "/api/secure/vault/secret").length;
+  const added = { label: "New", sites: "api.example.com", slots: "header:authorization" };
+  world.fault("GET /api/secure/vault/secret/SECRET_", moment, 1);
+  assert.equal((await S.call(vault, "store_secret", added)).ok, true);
+  world.fault("PUT /api/secure/vault/secret/SECRET_", moment, 1);
+  assert.equal((await S.call(vault, "store_secret", added)).ok, true);
+  assert.equal(made(), 2);
+  // The request that makes the item is not sent twice.
+  world.fault((line, request) => (request.method || "GET") === "POST" && request.path === "/api/secure/vault/secret", moment, 1);
+  assert.deepEqual(await S.call(vault, "store_secret", added), { ok: false, code: "postgresql_unavailable" });
+  assert.equal(made(), 3);
+});
+
+test("turning the delegation on hands a grant to every listed node, whatever this device keeps of the grants it handed: a revocation another device wrote with a clock behind this one does not leave the nodes without the key", async () => {
+  const fx = S.fixture(source, { nodes: 2 });
+  await S.start(fx);
+  const world = fx.world;
+  const grantsOf = (node) => node.commands.filter((command) => command.type === "grant").length;
+  // An hour later another device of the account, whose clock is two hours behind, turns the
+  // delegation off: the nodes take its revoke, and the revocation time it wrote lies before the
+  // times of the grants this device keeps.
+  world.advance(HOUR_MS);
+  for (const node of fx.nodes) node.grants.delete(world.userId);
+  writeLedger(fx, { revoked_ms: world.now - 2 * HOUR_MS, resumed_ms: 0 }, []);
+  const before = fx.nodes.map(grantsOf);
+  const on = await S.call(fx, "set_delegation", { enabled: true });
+  assert.equal(on.ok, true);
+  assert.deepEqual(fx.nodes.map(grantsOf), before.map((count) => count + 1));
+  for (const node of fx.nodes) assert.equal(node.grants.has(world.userId), true);
+  assert.equal(world.state.grant.state, "active");
+});
+
+test("turning the delegation off writes the revocation time before any revoke goes out: a key store that takes no write ends the call with the switch on and no revoke sent, and a revoke that is not confirmed leaves the switch off for the synchronizations to send it again", async () => {
+  const revokesOf = (fx) => fx.nodes.reduce((sum, node) => sum + node.commands.filter((command) => command.type === "revoke").length, 0);
+  // The ledger says off by the time the first revoke reaches a node.
+  const fx = S.fixture(source, { nodes: 2 });
+  await S.start(fx);
+  fx.world.advance(HOUR_MS);
+  let written = null;
+  fx.world.fault((line) => /^POST \/api\/secure\/nodes\/[^/]+\/messages/.test(line), () => {
+    if (written === null) written = readLedger(fx) === null ? 0 : readLedger(fx).revoked_ms;
+    return undefined;
+  });
+  assert.equal((await S.call(fx, "set_delegation", { enabled: false })).ok, true);
+  assert.ok(written > 0);
+  assert.equal(fx.world.state.grant.state, "off");
+
+  // The key store takes no write of the ledger: the call ends with that failure, no revoke was
+  // sent, and the delegation is on as the user sees it.
+  const failing = S.fixture(source, { nodes: 2 });
+  let fail = false;
+  await startWith(failing, (native) => ({
+    keychainSet: (item) => {
+      if (fail && String(item.service).endsWith(".ledger")) {
+        fail = false;
+        throw new bridge.SecureError("keychain_failed", "the write failed");
+      }
+      return native.keychainSet(item);
+    },
+  }));
+  failing.world.advance(HOUR_MS);
+  fail = true;
+  assert.deepEqual(await S.call(failing, "set_delegation", { enabled: false }), { ok: false, code: "keychain_failed" });
+  assert.equal(revokesOf(failing), 0);
+  assert.equal(failing.world.state.grant.state, "active");
+  failing.world.advance(10 * 60000);
+  await S.event(failing, "push", { reason: "grant_required" });
+  for (const node of failing.nodes) assert.equal(node.grants.has(failing.world.userId), true);
+  assert.equal(revokesOf(failing), 0);
+
+  // The list of the nodes is not answered: the revoke is not confirmed, the switch is off, and
+  // the next synchronization sends the revoke.
+  const unconfirmed = S.fixture(source, { nodes: 2 });
+  await S.start(unconfirmed);
+  unconfirmed.world.advance(HOUR_MS);
+  unconfirmed.world.fault("GET /api/secure/grants", { status: 503, body: { detail: "postgresql_unavailable" } }, 2);
+  assert.deepEqual(await S.call(unconfirmed, "set_delegation", { enabled: false }), { ok: false, code: "revoke_incomplete" });
+  assert.ok(readLedger(unconfirmed).revoked_ms > 0);
+  assert.equal(unconfirmed.world.state.grant.state, "off");
+  assert.equal(revokesOf(unconfirmed), 0);
+  unconfirmed.world.advance(2 * 60000);
+  await S.event(unconfirmed, "foreground");
+  assert.equal(revokesOf(unconfirmed), 2);
+  for (const node of unconfirmed.nodes) assert.equal(node.grants.has(unconfirmed.world.userId), false);
+});
+
+test("create_key: a registration whose answer is lost does not leave the account waiting for a key no device holds: the account query says whether the key is registered, and a key this device made and never kept is replaced by the next key it makes", async () => {
+  const master = (world) => world.keychain.get("com.pickle.client.secure.master-key\n" + world.userId);
+  // The registration reaches the backend and its answer does not reach the device.
+  const lands = (fx) => (request) => {
+    fx.world.api("PUT", request.path, request.query || {}, request.body);
+    return "transport";
+  };
+  const fx = S.fixture(source, { account: false });
+  await S.start(fx);
+  fx.world.fault("PUT /api/secure/account/key", lands(fx), 1);
+  const created = await S.call(fx, "create_key");
+  assert.equal(created.ok, true);
+  assert.equal(created.value.key_state, "present");
+  assert.equal(fx.world.account.key.key_id, created.value.key_id);
+  assert.notEqual(master(fx.world), undefined);
+  assert.equal(fx.world.stored("key.made"), undefined);
+  assert.equal(fx.nodes[0].grants.has(fx.world.userId), true);
+
+  // The account query fails as well: the call ends with the failure of the registration, and the
+  // device keeps the key_id it asked to register.
+  const lost = S.fixture(source, { account: false });
+  await S.start(lost);
+  let cut = false;
+  lost.world.fault("PUT /api/secure/account/key", (request) => { cut = true; return lands(lost)(request); }, 1);
+  lost.world.fault("GET /api/secure/account", () => (cut ? "transport" : undefined), 2);
+  assert.deepEqual(await S.call(lost, "create_key"), { ok: false, code: "transport" });
+  const orphan = lost.world.account.key.key_id;
+  assert.equal(master(lost.world), undefined);
+  assert.deepEqual(lost.world.stored("key.made"), [orphan]);
+  // The next runtime: the key the account has is one this device made and never kept, so no
+  // device holds it. The state is absent, and create_key registers a new key in its place.
+  await S.start(lost);
+  assert.equal(lost.world.state.key_state, "absent");
+  const again = await S.call(lost, "create_key");
+  assert.equal(again.ok, true);
+  assert.equal(again.value.key_state, "present");
+  assert.notEqual(again.value.key_id, orphan);
+  assert.equal(lost.world.account.key.key_id, again.value.key_id);
+  assert.notEqual(master(lost.world), undefined);
+  assert.equal(lost.world.stored("key.made"), undefined);
+
+  // The registration did not reach the backend: the call ends with its failure, and the next
+  // call makes a key as on a new account.
+  const unsent = S.fixture(source, { account: false });
+  await S.start(unsent);
+  unsent.world.fault("PUT /api/secure/account/key", "transport", 1);
+  assert.deepEqual(await S.call(unsent, "create_key"), { ok: false, code: "transport" });
+  assert.equal(unsent.world.account.key, null);
+  assert.equal(master(unsent.world), undefined);
+  assert.equal((await S.call(unsent, "create_key")).value.key_state, "present");
+
+  // Two devices make a key at once: the one whose registration came second keeps nothing, waits
+  // for the key of the other, and forgets the key_id it noted.
+  const second = S.fixture(source, { account: false });
+  await S.start(second);
+  second.world.fault("PUT /api/secure/account/key", () => {
+    second.world.account.key = { sign_pk: "", log_pk: "", key_id: "00112233445566aa" };
+    return undefined;
+  }, 1);
+  const waited = await S.call(second, "create_key");
+  assert.equal(waited.value.key_state, "waiting");
+  assert.equal(master(second.world), undefined);
+  assert.equal(second.world.stored("key.made"), undefined);
+});
+
+test("a device that holds another key than the one of the account asks for the key of the account by a transfer, and forgets what belonged to the key it held when the transfer hands it the key; a message of the other device that gives no shared value ends a transfer as failed", async () => {
+  const giving = S.fixture(source, { device: { ownerAuth: true } });
+  const taking = S.fixture(source);
+  // The backend the two devices share: the routes of the transfer.
+  const transfers = new Map();
+  const answer = (status, body) => ({ status: status, body: body });
+  const backend = (world) => (request) => {
+    const method = request.method || "GET";
+    const body = typeof request.body === "string" && request.body !== "" ? JSON.parse(request.body) : {};
+    if (method === "POST" && request.path === "/api/secure/transfers") {
+      const id = b64u(crypto.randomBytes(16));
+      transfers.set(id, { request_id: id, phase: "requested", device: body.device, expires_ms: world.now + 15 * 60000 });
+      return answer(200, { transfer: transfers.get(id) });
+    }
+    if (method === "GET" && request.path === "/api/secure/transfers") {
+      return answer(200, { transfers: Array.from(transfers.values()).filter((transfer) => transfer.phase === "requested") });
+    }
+    const match = /^\/api\/secure\/transfers\/([^/]+)(?:\/([a-z]+))?$/.exec(request.path);
+    if (match === null) return undefined;
+    const transfer = transfers.get(match[1]);
+    if (transfer === undefined) return answer(404, { code: "not_found" });
+    if (method === "GET" && match[2] === undefined) return answer(200, { transfer: transfer });
+    if (method === "PUT" && match[2] === "approval") Object.assign(transfer, { phase: "approved", yb: body.yb, approver: body.device });
+    else if (method === "PUT" && match[2] === "reply") Object.assign(transfer, { phase: "replied", ya: body.ya, ta: body.ta });
+    else if (method === "PUT" && match[2] === "envelope") Object.assign(transfer, { phase: "sealed", ciphertext: body.ciphertext, tb: body.tb });
+    else if (method === "POST" && match[2] === "ack") transfers.delete(match[1]);
+    else if (method === "POST" && match[2] === "fail") Object.assign(transfer, { phase: "failed", failure: "code_mismatch" });
+    else return answer(400, { code: "invalid_input" });
+    return answer(200, {});
+  };
+  giving.world.fault((line) => line.indexOf("/api/secure/transfers") >= 0, backend(giving.world));
+  taking.world.fault((line) => line.indexOf("/api/secure/transfers") >= 0, backend(taking.world));
+  await S.start(giving);
+  // The device that takes the key holds a key of its own, and kept what belongs to it: the
+  // grants it handed, a ledger with a setting.
+  await S.start(taking);
+  assert.equal((await S.call(taking, "set_grant_days", { days: 7 })).ok, true);
+  assert.notEqual(taking.world.stored("log.grants"), undefined);
+  assert.equal(readLedger(taking).ttl_days, 7);
+  // The account then has the key of the other device registered (that device replaced the key).
+  taking.world.account.key = giving.world.account.key;
+  await S.start(taking);
+  assert.equal(taking.world.state.key_state, "mismatch");
+  // (Something the device kept of the log of the key it holds.)
+  taking.world.store.set("log.denied", JSON.stringify({ pages: [{ t: taking.world.now, before_ms: 5, limit: 50 }], chains: {} }));
+  const begun = await S.call(taking, "begin_transfer", {});
+  assert.equal(begun.ok, true);
+  assert.equal(begun.value.transfer.phase, "requested");
+  await S.event(giving, "push", { reason: "transfer_request" });
+  assert.equal((await S.call(giving, "approve_transfer", {})).value.transfer.phase, "approved");
+  const code = giving.world.runtime.transfer_code;
+  const pass = async (turns) => {
+    for (let turn = 0; turn < turns; turn += 1) {
+      await taking.world.settle(2500);
+      await giving.world.settle(2500);
+    }
+  };
+  await pass(3);
+  assert.equal(taking.world.state.transfer.phase, "code_entry");
+  await S.call(taking, "enter_transfer_code", { code: code });
+  await pass(6);
+  assert.equal(taking.world.state.transfer.phase, "done");
+  assert.equal(taking.world.state.key_state, "present");
+  const item = "com.pickle.client.secure.master-key\n" + taking.world.userId;
+  assert.equal(taking.world.keychain.get(item).value, giving.world.keychain.get(item).value);
+  // What belonged to the key it held is gone: the setting of its ledger, and what it kept of
+  // the log.
+  assert.equal(readLedger(taking).ttl_days, 30);
+  assert.equal(taking.world.stored("log.denied"), undefined);
+
+  // A message that gives no shared value. The executor of this device returns 32 zero bytes for
+  // it (an executor may also fail there): the transfer ends as failed, and nothing is uploaded.
+  const zero = b64u(Buffer.alloc(32));
+  const low = b64u(Buffer.from("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800", "hex"));
+  const weak = (native) => ({ x25519: (scalar, point) => (point === low ? zero : native.x25519(scalar, point)) });
+  const asking = S.fixture(source);
+  asking.world.keychain.delete("com.pickle.client.secure.master-key\n" + asking.world.userId);
+  let sent = 0;
+  asking.world.fault((line) => line.indexOf("/api/secure/transfers") >= 0, (request) => {
+    const method = request.method || "GET";
+    if (method === "POST") return answer(200, { transfer: { request_id: "r1", phase: "requested", expires_ms: asking.world.now + 600000 } });
+    if (method === "PUT") sent += 1;
+    return answer(200, { transfer: { request_id: "r1", phase: "approved", yb: low, approver: { model: "phone" }, expires_ms: asking.world.now + 600000 } });
+  });
+  await startWith(asking, weak);
+  assert.equal(asking.world.state.key_state, "waiting");
+  await S.call(asking, "begin_transfer", {});
+  await asking.world.settle(3000);
+  assert.equal(asking.world.state.transfer.phase, "code_entry");
+  const entered = await S.call(asking, "enter_transfer_code", { code: "123456" });
+  assert.equal(entered.value.transfer.phase, "failed");
+  assert.equal(sent, 0);
+  // The approving device, for the message of the requesting device.
+  const approving = S.fixture(source, { device: { ownerAuth: true } });
+  const calls = [];
+  approving.world.fault((line) => line.indexOf("/api/secure/transfers") >= 0, (request) => {
+    const method = request.method || "GET";
+    calls.push(method + " " + request.path);
+    if (method === "GET" && request.path === "/api/secure/transfers") {
+      return answer(200, { transfers: [{ request_id: "r2", phase: "requested", device: { model: "phone" }, expires_ms: approving.world.now + 600000 }] });
+    }
+    if (method === "GET") {
+      return answer(200, { transfer: { request_id: "r2", phase: "replied", ya: low, ta: b64u(Buffer.alloc(32)), expires_ms: approving.world.now + 600000 } });
+    }
+    return answer(200, {});
+  });
+  await startWith(approving, weak);
+  await S.event(approving, "push", { reason: "transfer_request" });
+  assert.equal((await S.call(approving, "approve_transfer", {})).value.transfer.phase, "approved");
+  await approving.world.settle(3000);
+  assert.equal(approving.world.state.transfer.phase, "failed");
+  assert.ok(calls.indexOf("POST /api/secure/transfers/r2/fail") >= 0);
+  assert.equal(calls.some((line) => line.endsWith("/envelope")), false);
+});
+
+test("the completion of a mail setup by a synchronization does not bring back a setup the user cancelled while it waited: the key store item stays gone, and nothing of that setup is published", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  const item = "com.pickle.client.secure.mail-setup\n" + world.userId;
+  // The backend: the routes of the setup. The setup is captured (the user signed in, and the
+  // app password is sealed to the reception key of the device), and the answer of the query
+  // takes five seconds.
+  let setup = null;
+  world.fault((line) => line.indexOf("/api/secure/connections/naver_mail/setup") >= 0, (request) => {
+    const method = request.method || "GET";
+    if (method === "POST") {
+      const signed = JSON.parse(request.body);
+      const intent = JSON.parse(bytes(signed.payload).toString("utf8"));
+      const sealed = bridge.hpkeSeal(
+        "chacha20poly1305", bytes(intent.recipient_pk), utf8("pickle-app-password-setup-v1"),
+        bridge.sha("sha256", bytes(signed.payload)), utf8(JSON.stringify({ username: "user@naver.com", password: "abcd efgh ijkl" })));
+      setup = {
+        setup_id: intent.id, request: signed, phase: "captured",
+        capture: { enc: b64u(sealed.enc), ct: b64u(sealed.ciphertext) },
+      };
+      return { status: 200, body: { phase: "pending" } };
+    }
+    if (method === "DELETE") {
+      setup = null;
+      return { status: 200, body: {} };
+    }
+    return { status: 200, body: { setup: setup }, delay_ms: 5000 };
+  });
+  assert.equal((await S.call(fx, "begin_app_password_setup", { identity: "user" })).ok, true);
+  assert.equal(world.keychain.has(item), true);
+  // A synchronization begins to complete the setup, and the user cancels it while the query of
+  // the synchronization is on its way. The request that stores the record then fails.
+  world.fault("PUT /api/secure/connections/naver_mail/app-password", { status: 500, body: {} });
+  world.advance(2 * 60000);
+  const sync = Promise.resolve(fx.program.onEvent("foreground", {}));
+  sync.then(() => {}, () => {});
+  await world.settle(1000);
+  assert.equal((await S.call(fx, "cancel_app_password_setup", {})).ok, true);
+  assert.equal(world.keychain.has(item), false);
+  await world.run(sync);
+  await world.settle(10000);
+  assert.equal(world.keychain.has(item), false);
+  assert.equal(world.state.mail_setup, undefined);
+  assert.equal(world.sent("PUT /api/secure/connections/naver_mail/app-password").length, 0);
+  // Another setup can begin at once.
+  assert.equal((await S.call(fx, "begin_app_password_setup", { identity: "other" })).ok, true);
 });
