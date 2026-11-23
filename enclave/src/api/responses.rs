@@ -331,8 +331,9 @@ pub struct Health<'a> {
     pub platform: &'a str,
     /// P
     pub custody: &'a str,
-    /// P: `forward` on a node of the forward role, null on every other node. The role came
-    /// with the operator configuration (E) and is a constant of the source.
+    /// P: `reserve` on a node of the reserve role, `forward` on a node of the forward role,
+    /// null on every other node. The role came with the operator configuration (E) and is a
+    /// constant of the source.
     pub role: Option<&'a str>,
     /// P: node clock.
     pub started_ms: u64,

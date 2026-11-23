@@ -1444,7 +1444,8 @@ impl Node {
     /// The binding of this node (protocol.md 4.1): its two public keys, its release, its log
     /// store when it has one, and its role when that is one a binding names. A node of the
     /// forward role has no log store. A node that has taken no role yet states none, as a
-    /// node of the delegation role does: it is one with the first call of that role.
+    /// node of the delegation role does: it is one with the first call that only a node
+    /// that holds delegations answers.
     pub fn binding(&self) -> Vec<u8> {
         let role = self.role.get().unwrap_or(Role::Delegation);
         let log = match role {

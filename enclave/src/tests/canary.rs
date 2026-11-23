@@ -16,6 +16,9 @@
 //!   that secret occurs in the request to that site, and in no response of the node. That
 //!   holds for a value a node of the delegation role read from a record and handed over
 //!   (`vault/handoff`) as well: it occurs in no response of that node either.
+//! - A node of the reserve role holds the user key of an account and uses no credential. It
+//!   asks for connections to the host of its log store and to no other host, and no marker
+//!   occurs in a response of it.
 //!
 //! The tests reach a node through its router only. Every call goes through the fixture, which
 //! keeps every response for the verdict on C1: the node under test is a private field of the
@@ -31,7 +34,8 @@ use credential_enclave_protocol::totp::totp;
 use serde_json::{json, Value};
 
 use self::fixture::{
-    at, field, node_keys, Canary, Role, FORWARD, FORWARD_NODE, LOG_STORE, NODES, SITE,
+    at, field, node_keys, Canary, Role, FORWARD, FORWARD_NODE, LOG_STORE, NODES, RESERVE,
+    RESERVE_NODE, SITE,
 };
 use crate::testing::{Forwarded, Reply, Seen};
 
@@ -1000,9 +1004,18 @@ mod fixture {
     pub const FORWARD_NODE: &str = "forward node";
     pub const FORWARD: usize = NODES.len();
 
+    /// The name of the node of the reserve role of a fixture, and the number the calls of a
+    /// test name it by: the number behind that of the node of the forward role.
+    pub const RESERVE_NODE: &str = "reserve node";
+    pub const RESERVE: usize = FORWARD + 1;
+
     /// The name of a node by its number.
     fn name_of(node: usize) -> &'static str {
-        NODES.get(node).copied().unwrap_or(FORWARD_NODE)
+        match node {
+            FORWARD => FORWARD_NODE,
+            RESERVE => RESERVE_NODE,
+            _ => NODES.get(node).copied().unwrap_or(RESERVE_NODE),
+        }
     }
 
     /// Plants the two private keys of a node and returns them: the signing seed and the
@@ -1266,8 +1279,8 @@ mod fixture {
     }
 
     /// The fixture: a node whose private keys are planted, a second node for the delegation
-    /// transfer, a node of the forward role with the site of one vault secret, the app of one
-    /// account and the provider stand-in.
+    /// transfer, a node of the forward role with the site of one vault secret, a node of the
+    /// reserve role, the app of one account and the provider stand-in.
     pub struct Canary {
         pub secrets: Arc<Secrets>,
         pub stand_in: Arc<StandIn>,
@@ -1279,6 +1292,9 @@ mod fixture {
         site: Provider,
         /// The node of the forward role. Its platform reaches the site and no provider.
         forward: Harness,
+        /// The node of the reserve role. Its platform reaches every host the two nodes of
+        /// the delegation role reach: what keeps it from a provider is the node itself.
+        reserve: Harness,
         calls: Mutex<Vec<Call>>,
         /// The S256 challenge of every authorization a test began, with its provider.
         challenges: Mutex<Vec<(String, String)>>,
@@ -1319,6 +1335,8 @@ mod fixture {
             let site = Provider::start(&[SITE], move |seen| siting.answer(seen)).await;
             let (sign_seed, seal_private) = node_keys(&secrets, FORWARD_NODE);
             let forward = Harness::with_draws(&site, &[&sign_seed, &seal_private]);
+            let (sign_seed, seal_private) = node_keys(&secrets, RESERVE_NODE);
+            let reserve = Harness::with_draws(&provider, &[&sign_seed, &seal_private]);
             let app = App::new("canary-user", 0xc5);
             let user_key = app.keys.user_key_of(app.custody);
             secrets.add("user key", user_key.as_slice(), &[]);
@@ -1330,6 +1348,7 @@ mod fixture {
                 nodes,
                 site,
                 forward,
+                reserve,
                 calls: Mutex::default(),
                 challenges: Mutex::default(),
                 codes: Mutex::default(),
@@ -1344,10 +1363,14 @@ mod fixture {
             canary
         }
 
-        /// A node by its number: one of the two nodes of the delegation role, or the node
-        /// of the forward role.
+        /// A node by its number: one of the two nodes of the delegation role, the node of
+        /// the forward role, or the node of the reserve role.
         fn node(&self, node: usize) -> &Harness {
-            self.nodes.get(node).unwrap_or(&self.forward)
+            match node {
+                FORWARD => &self.forward,
+                RESERVE => &self.reserve,
+                _ => self.nodes.get(node).unwrap_or(&self.reserve),
+            }
         }
 
         /// The one way to a node: sends a request to its router and keeps the answer.
@@ -1484,6 +1507,26 @@ mod fixture {
             }
             let (meta, body) = frame::decode(&Bytes::from(answer.body)).unwrap();
             Ok(decode_batch(&meta, &body))
+        }
+
+        /// Gives the node of the reserve role its role, with the log store of the tests and
+        /// credentials for it: the node writes its node document and takes delegations.
+        pub async fn take_the_reserve_role(&self) {
+            let log_store = json!({"bucket": LOG_BUCKET, "region": LOG_REGION});
+            let config = json!({"role": "reserve", "log_store": log_store});
+            let (status, response) = self.post_on(RESERVE, "/v1/config", config).await;
+            assert_eq!(status, 200, "{response}");
+            let body = self.log_store_credentials("ASIACANARY");
+            let (status, response) = self
+                .post_on(RESERVE, "/v1/log-store/credentials", body)
+                .await;
+            assert_eq!(status, 200, "{response}");
+            assert!(response["node_document_ms"].as_u64().unwrap() > 0);
+        }
+
+        /// The hosts the node of the reserve role asked its platform for a connection to.
+        pub fn reserve_connections(&self) -> Vec<(String, u16)> {
+            self.reserve.platform.connections()
         }
 
         /// Gives the node of the forward role its role: the operator configuration that
@@ -2051,8 +2094,10 @@ mod fixture {
 
         /// The verdict on C2: every connection a node of the delegation role asked its
         /// platform for went to port 443 of a host of the definitions or of the log store,
-        /// every connection the node of the forward role asked for went to port 443 of the
-        /// site of the vault secret, and each carried one request that a stand-in received.
+        /// every connection the node of the reserve role asked for went to port 443 of the
+        /// host of the log store, every connection the node of the forward role asked for
+        /// went to port 443 of the site of the vault secret, and each carried one request
+        /// that a stand-in received.
         /// Every request went to an address that a definition names, to an object of the log
         /// store or to the site, under the TLS server name of its `Host` header, and a secret
         /// occurs only in requests to the places within its reach. Returns the secrets that
@@ -2073,6 +2118,16 @@ mod fixture {
                 if *port != 443 || !(hosts.contains(host) || host == LOG_HOST) {
                     leaks.push(format!("{host}:{port} is the host of no definition"));
                 }
+            }
+            // A node of the reserve role uses no credential: the one host it reaches is
+            // its log store.
+            for (host, port) in self.reserve.platform.connections() {
+                if port != 443 || host != LOG_HOST {
+                    leaks.push(format!(
+                        "{host}:{port} is not the log store, and the {RESERVE_NODE} asked for it"
+                    ));
+                }
+                connections.push((host, port));
             }
             // A node of the forward role holds no credential of a provider and writes no
             // entry: the one host it reaches is the site of the use it was handed.
@@ -2725,7 +2780,11 @@ async fn walk() -> Canary {
 #[tokio::test]
 async fn the_private_keys_of_a_node_are_the_planted_markers() {
     let canary = Canary::start().await;
-    for (node, name) in NODES.iter().chain([&FORWARD_NODE]).enumerate() {
+    for (node, name) in NODES
+        .iter()
+        .chain([&FORWARD_NODE, &RESERVE_NODE])
+        .enumerate()
+    {
         // The same names give the same values as the ones the fixture planted.
         let (sign_seed, seal_private) = node_keys(&canary.secrets, name);
         let keys = NodeKeys::from_random(&sign_seed, &seal_private);
@@ -2739,6 +2798,120 @@ async fn the_private_keys_of_a_node_are_the_planted_markers() {
         assert_eq!(attested.node, b64u(&keys.sign_public()));
         assert_eq!(attested.seal_public, keys.seal_public());
     }
+    canary.verdict();
+}
+
+#[tokio::test]
+async fn a_node_of_the_reserve_role_holds_the_user_key_and_uses_no_credential() {
+    let canary = Canary::ready().await;
+    let user = canary.app.user_id.clone();
+    let vault = Vault::plant(&canary);
+    let (_, connected) = canary.connect("google_workspace").await;
+    let google = connected["record"].clone();
+    canary.take_the_reserve_role().await;
+
+    // The delegation of the account moves from the first node to the node of the reserve
+    // role: that node holds the user key from here on, and neither node created an entry.
+    let (this, reserve) = (
+        canary.attestation(0).await,
+        canary.attestation(RESERVE).await,
+    );
+    let (status, exported) = canary
+        .post("/v1/peer/export", json!({"peer": reserve}))
+        .await;
+    assert_eq!(status, 200, "{exported}");
+    assert_eq!(exported["logs"], json!([]));
+    let import = json!({"peer": this, "envelope": exported["envelope"]});
+    let (status, imported) = canary.post_on(RESERVE, "/v1/peer/import", import).await;
+    assert_eq!(
+        (status, &imported["accounts"]),
+        (200, &json!([user])),
+        "{imported}"
+    );
+    let (status, state) = canary
+        .post_on(RESERVE, "/v1/status", json!({"user_id": user}))
+        .await;
+    assert_eq!((status, &state["grant"]["state"]), (200, &json!("active")));
+    let health = canary.health(RESERVE).await;
+    assert_eq!(
+        (&health["role"], &health["grants"]),
+        (&json!("reserve"), &json!(1))
+    );
+
+    // Every call that uses a credential is refused by the role of the node, with the
+    // records of the account in its body: the node opens none of them and calls no
+    // provider.
+    let requests_before = canary.requests().len();
+    for (record, field) in [
+        (&vault.password_record, "password"),
+        (&vault.totp_record, "totp"),
+        (&vault.card_record, "number"),
+        (&vault.named_record, "value"),
+    ] {
+        let outcome = canary.release(RESERVE, record, field, None).await;
+        assert_eq!(code(&outcome), (403, "not_allowed"), "{field}");
+    }
+    let with_record = |record: &Value| {
+        json!({
+            "user_id": user, "record": record, "previous": record, "context": "canary",
+            "provider": "google_workspace", "state": "state", "code": "code",
+        })
+    };
+    for path in [
+        "/v1/refresh",
+        "/v1/revoke-token",
+        "/v1/oauth/merge",
+        "/v1/oauth/begin",
+        "/v1/oauth/complete",
+        "/v1/forward",
+        "/v1/forward/batch",
+        "/v1/mail/verify",
+        "/v1/mail/read",
+        "/v1/mail/submit",
+        "/v1/vault/handoff",
+    ] {
+        let outcome = canary.post_on(RESERVE, path, with_record(&google)).await;
+        assert_eq!(code(&outcome), (403, "not_allowed"), "{path}");
+    }
+    let store = json!({
+        "user_id": user, "name": "PAYMENT_PIN", "sites": "any", "slots": ["field"],
+        "value": canary.secrets.text("value for a node of the reserve role", &[]),
+        "context": "canary",
+    });
+    let outcome = canary.post_on(RESERVE, "/v1/vault/store", store).await;
+    assert_eq!(code(&outcome), (403, "not_allowed"));
+    assert_eq!(canary.requests().len(), requests_before);
+    let health = canary.health(RESERVE).await;
+    assert_eq!(
+        (
+            &health["log"]["entries"],
+            &health["log"]["events"],
+            &health["grants"]
+        ),
+        (&json!(0), &json!(0), &json!(1))
+    );
+    // The node asked for connections to the host of its log store, for its node document,
+    // and to no other host.
+    let connections = canary.reserve_connections();
+    assert!(!connections.is_empty());
+    assert!(connections
+        .iter()
+        .all(|(host, port)| host == "s3.us-west-2.amazonaws.com" && *port == 443));
+
+    // The node hands the delegation on to the second node, which uses it.
+    let peer = canary.attestation(1).await;
+    let (status, exported) = canary
+        .post_on(RESERVE, "/v1/peer/export", json!({"peer": peer}))
+        .await;
+    assert_eq!(status, 200, "{exported}");
+    let import = json!({"peer": reserve, "envelope": exported["envelope"]});
+    let (status, imported) = canary.post_on(1, "/v1/peer/import", import).await;
+    assert_eq!(
+        (status, &imported["accounts"]),
+        (200, &json!([user])),
+        "{imported}"
+    );
+    release_the_vault(&canary, 1, &vault).await;
     canary.verdict();
 }
 
