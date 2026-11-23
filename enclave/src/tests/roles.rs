@@ -16,8 +16,11 @@ use credential_enclave_protocol::release::ReleaseMeasurement;
 use credential_enclave_protocol::secret::Secret;
 use credential_enclave_protocol::{limits, purpose};
 use serde_json::{json, Value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::Instant;
 
 use super::{quiet_provider, quiet_provider_and_log_store};
+use crate::api;
 use crate::api::peer::{export_to, import_from};
 use crate::attest::{Peer, Program};
 use crate::log_store::sweep;
@@ -751,6 +754,29 @@ async fn a_node_of_the_reserve_role_answers_no_call_that_uses_a_credential() {
 }
 
 #[tokio::test]
+async fn a_node_of_the_delegation_role_answers_every_call_but_the_call_of_the_forward_role() {
+    let provider = quiet_provider().await;
+    let harness = Harness::configured(&provider).await;
+    let body = to_json(&json!({"user_id": "user-1"}));
+    for (method, path) in crate::api::route_list() {
+        // The node closes with this call.
+        if path == "/v1/close" {
+            continue;
+        }
+        let (status, _, bytes) = harness.send(method.clone(), path, body.clone()).await;
+        let answer: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        let refused_by_role =
+            (status.as_u16(), answer["code"].as_str()) == (403, Some("not_allowed"));
+        assert_eq!(
+            refused_by_role,
+            path == "/v1/vault/send",
+            "{method} {path}: {answer}"
+        );
+    }
+    assert_eq!(harness.health().await["role"], Value::Null);
+}
+
+#[tokio::test]
 async fn a_node_of_the_reserve_role_takes_the_commands_of_an_app_and_writes_control_entries() {
     let provider = quiet_provider_and_log_store().await;
     let reserve = reserve_node_with_log_store(&provider).await;
@@ -822,6 +848,50 @@ async fn a_node_of_the_reserve_role_takes_the_commands_of_an_app_and_writes_cont
     assert!(connections
         .iter()
         .all(|(host, port)| host == LOG_HOST && *port == 443));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_node_of_the_reserve_role_answers_a_call_that_uses_a_credential_before_its_body() {
+    let provider = quiet_provider().await;
+    let reserve = reserve_node(&provider).await;
+    let delegation = Harness::new(&provider);
+
+    // The head of a `forward` call that announces a body of the body limit, 64 MiB, on a
+    // connection the node serves as it serves an accepted one. No byte of the body follows.
+    let head = b"POST /v1/forward HTTP/1.1\r\nHost: node\r\nContent-Length: 67108864\r\n\r\n";
+    let answer = |harness: &Harness| {
+        let (near, mut far) = tokio::io::duplex(64 * 1024);
+        let served = tokio::spawn(api::serve_connection(
+            near,
+            api::router(harness.node.clone()),
+            harness.node.limits.inbound_idle,
+        ));
+        async move {
+            far.write_all(head).await.unwrap();
+            let asked = Instant::now();
+            let mut response = Vec::new();
+            while !response.ends_with(b"\r\n\r\n") {
+                response.push(far.read_u8().await.unwrap());
+            }
+            let head = String::from_utf8(response).unwrap();
+            let status: u16 = head[9..12].parse().unwrap();
+            drop(far);
+            served.await.unwrap();
+            (status, asked.elapsed())
+        }
+    };
+
+    // The node of the reserve role refuses the call at once: it waits for no byte of the
+    // body, so what a caller sends as the body of a call that uses a credential is nothing
+    // the node reads.
+    let (status, waited) = answer(&reserve).await;
+    assert_eq!(status, 403);
+    assert_eq!(waited, std::time::Duration::ZERO);
+    // A node of the delegation role reads the frame of the call: it waits for the body for
+    // the time limit of the bytes of a body, and then fails the call.
+    let (status, waited) = answer(&delegation).await;
+    assert_eq!(status, 400);
+    assert_eq!(waited, delegation.node.limits.inbound_idle);
 }
 
 #[tokio::test]

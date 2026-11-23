@@ -588,6 +588,14 @@ mod tests {
             (reserve.role.as_deref(), reserve.log),
             (Some("reserve"), Some(log))
         );
+        // The longest names of a log store, the role and the longest release tag a node of
+        // this source can have fit the limit of a binding, which a reader of every release
+        // applies before it reads a key.
+        let longest = LogStoreId::parse(&"b".repeat(63), "ap-southeast-99").unwrap();
+        let tag = "v4294967295.4294967295.4294967295-rc.4294967295";
+        let bytes = role_binding(&keys, tag, Some(&longest), Role::Reserve);
+        assert_eq!(bytes.len(), 253 + tag.len());
+        assert!(bytes.len() <= limits::BINDING_BYTES);
         // A node hands a delegation to a node that holds delegations, and to no other one.
         assert!(Role::Delegation.holds_delegations() && Role::Reserve.holds_delegations());
         assert!(!Role::Forward.holds_delegations());
