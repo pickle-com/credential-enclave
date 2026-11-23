@@ -1296,8 +1296,12 @@ test("A3: the listing of a node document is read through the address of that lis
     assert.equal(documentListings(world).length, 0, name);
     assert.equal(world.sent("S3 ").filter((request) => request.url.indexOf("n3") >= 0).length, 0, name);
   };
-  await uncalled("the bucket of the account", (url, hidden, world) =>
-    url.replace(bridge.shardBucket("prod", hidden.id), bridge.shardBucket("prod", world.userId)));
+  await uncalled("the bucket of another owner", (url, hidden, world) => {
+    // The bucket of the account, or of another owner when the node id falls into that one.
+    const own = bridge.shardBucket("prod", hidden.id);
+    const others = [world.userId, "owner-1", "owner-2", "owner-3"].map((owner) => bridge.shardBucket("prod", owner));
+    return url.replace(own, others.find((bucket) => bucket !== own));
+  });
   await uncalled("the bucket the binding names", (url, hidden, world) =>
     url.replace(bridge.shardBucket("prod", hidden.id), world.bucket));
   await uncalled("the prefix of another node id", (url, hidden) =>
