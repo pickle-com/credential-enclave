@@ -1459,6 +1459,41 @@ async fn a_value_is_found_without_what_a_server_strips_at_its_ends() {
 }
 
 #[tokio::test]
+async fn a_value_with_a_space_that_a_site_sends_back_in_an_address_is_not_handed_on() {
+    // A value with spaces. The site answers with a redirect whose address holds the value as
+    // a writer of a form body writes it: `+` for a space, a percent escape for every other
+    // byte it does not write as it is.
+    let value = "correct horse/battery staple=42";
+    for echo in ["location", "body"] {
+        let provider = site(move |seen| {
+            let echoed = seen.header("x-passphrase").unwrap_or_default();
+            let written: String = url::form_urlencoded::byte_serialize(echoed.as_bytes()).collect();
+            let address = format!("/login?reason=unknown&passphrase={written}");
+            match echo {
+                "location" => Reply::with_body(302, &[("location", address.as_str())], b""),
+                _ => Reply::json(401, &json!({"login": address})),
+            }
+        })
+        .await;
+        let forward = forward_node(&provider).await;
+        let request = request_of("GET", "/v1/me", "", "header:x-passphrase", b"");
+        let meta = json!({
+            "envelope": envelope(&forward, &request, value, 1),
+            "headers": [["X-Passphrase", PLACEHOLDER]],
+        });
+        let outcome = forward.vault_send(meta, b"").await;
+        assert_eq!(provider.only().header("x-passphrase"), Some(value));
+        match (echo, outcome) {
+            ("body", Ok(sent)) => {
+                assert_eq!(sent.end["code"], "response_withheld");
+                assert_eq!(sent.body(), b"");
+            }
+            (_, outcome) => assert_eq!(code(&outcome), (502, "response_withheld".to_string())),
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_value_a_site_sends_back_in_a_header_that_is_not_utf8_is_not_handed_on() {
     // A value with characters outside ASCII. The site sends it back in a header, beside a
     // byte that is no UTF-8: the node hands such a header on with one character per byte,

@@ -11,7 +11,8 @@
 //! string escapes decoded once and twice ([`JSON_LAYERS`], for a JSON text inside a JSON
 //! string). Each reading is searched for these
 //! forms of the credential: as it is, base64 or base64url in each of the three byte alignments
-//! and without padding, hexadecimal in lower or upper case. Decoding the escapes finds the
+//! and without padding, hexadecimal in lower or upper case, and for a credential with a space
+//! the credential with `+` in the place of every space. Decoding the escapes finds the
 //! credential under every percent-encoding of it and under every way a writer of JSON escapes
 //! it: encoders do not agree on the bytes they escape or on the case of the digits (one writes
 //! `/` as `\/`, another `=` as `\u003d`), and all of their outputs decode to the same bytes. A
@@ -145,8 +146,15 @@ pub struct Forms(Vec<Secret<Vec<u8>>>);
 
 impl Forms {
     /// The forms of every credential of `credentials`: as it is, base64 and base64url at each
-    /// byte alignment, hexadecimal in both cases. A form shorter than [`SHORTEST_FORM_BYTES`]
-    /// is left out.
+    /// byte alignment, hexadecimal in both cases, and for a credential with a space the
+    /// credential with `+` in the place of every space. A form shorter than
+    /// [`SHORTEST_FORM_BYTES`] is left out.
+    ///
+    /// A query and a form body (`application/x-www-form-urlencoded`) write a space as `+` and
+    /// every other byte they do not write as it is as a percent escape. The readings that
+    /// decode percent escapes leave a `+` as it is, because a `+` of another text is no
+    /// space. So a credential with a space that a site sends back in an address or in a form
+    /// body stands in those readings with `+` for its spaces: that text is a form of its own.
     ///
     /// A credential is searched for without the characters at its ends that a server strips
     /// from a text (`searched_text` of the protocol crate: white space, control characters
@@ -166,6 +174,9 @@ impl Forms {
             }
             forms.push(hex(token, b"0123456789abcdef"));
             forms.push(hex(token, b"0123456789ABCDEF"));
+            if token.contains(&b' ') {
+                forms.push(plus_for_space(token));
+            }
             for form in forms {
                 let form = Secret::new(form);
                 let known = kept
@@ -1004,6 +1015,18 @@ impl Drop for StreamCheck {
     }
 }
 
+/// `bytes` with `+` in the place of every space: how a query and a form body write a text,
+/// but for the bytes they write as percent escapes.
+fn plus_for_space(bytes: &[u8]) -> Vec<u8> {
+    bytes
+        .iter()
+        .map(|byte| match byte {
+            b' ' => b'+',
+            other => *other,
+        })
+        .collect()
+}
+
 fn hex(bytes: &[u8], digits: &[u8; 16]) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -1461,6 +1484,35 @@ mod tests {
             let parted = TOKEN.replacen('/', "/ ", 1);
             assert!(!forms.found_in(parted.as_bytes()), "{stored:?}");
         }
+    }
+
+    #[test]
+    fn a_credential_with_a_space_is_found_with_a_plus_for_each_space() {
+        // A query and a form body write a space as `+`, and every other byte they do not
+        // write as it is as a percent escape.
+        let phrase = "correct horse/battery staple=42";
+        let forms = Forms::of(&[Secret::new(phrase.to_string())]);
+        for sent_back in [
+            // Every space as `+`, the other bytes as they are.
+            "correct+horse/battery+staple=42",
+            // As a writer of a form body writes it.
+            "/next?echo=correct+horse%2Fbattery+staple%3D42&page=2",
+            // That text encoded once more, and again.
+            "/login?next=%2Fnext%3Fecho%3Dcorrect%2Bhorse%252Fbattery%2Bstaple%253D42",
+            "/a?b=%2Flogin%3Fnext%3D%252Fnext%253Fecho%253Dcorrect%252Bhorse%25252Fbattery%252Bstaple%25253D42",
+            // Inside a JSON string, with the escapes of a writer of JSON.
+            "{\"next\":\"\\/next?echo=correct+horse\\/battery+staple\\u003d42\"}",
+            // A space as a percent escape, and as it is.
+            "/next?echo=correct%20horse%2Fbattery%20staple%3D42",
+            "echo: correct horse/battery staple=42",
+        ] {
+            assert!(forms.found_in(sent_back.as_bytes()), "{sent_back}");
+        }
+        // A text with `+` for one space and the other space as it is holds neither form.
+        assert!(!forms.found_in(b"correct+horse/battery staple=42"));
+        // A credential without a space has no such form: its `+` is no space.
+        let forms = Forms::of(&[Secret::new("correct+horse/battery+staple=42".to_string())]);
+        assert!(!forms.found_in(phrase.as_bytes()));
     }
 
     #[test]

@@ -863,8 +863,9 @@ which form it holds. The order of the processing:
     received, with its percent escapes decoded (up to three times, for a value that was
     encoded more than once) and with its JSON string escapes decoded (up to twice, for a JSON
     text inside a JSON string), and each reading is searched for the credential as it is, in
-    base64 or base64url (each of the three byte alignments, without padding) and in hexadecimal
-    (lower or upper case). A header whose bytes are not UTF-8 is searched as those bytes as well.
+    base64 or base64url (each of the three byte alignments, without padding), in hexadecimal
+    (lower or upper case), and, when it holds a space, with `+` in the place of every space. A
+    header whose bytes are not UTF-8 is searched as those bytes as well.
     A header name, which the node hands on in lower case, is searched without regard to the case
     of its letters. The credential is searched for without the characters a server strips at its
     ends (white space, control characters and U+FEFF: protocol.md 10.5). A form shorter than 8
