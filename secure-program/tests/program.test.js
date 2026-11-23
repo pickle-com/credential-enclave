@@ -1487,8 +1487,9 @@ test("a backend that gives the rounds the listings of the first page and not the
   assert.equal(world.state.log.status, "verified");
   assert.equal(heldReads(world), undefined);
   const kept = openRecovered(fx);
-  assert.deepEqual(kept.pages.map((page) => [page[0], page[2], page[3].length]), [[0, false, 4]]);
-  assert.equal(kept.entries.length, 4);
+  // (The entries of a listing page are kept with the page.)
+  assert.deepEqual(kept.pages.map((page) => [page[0], page[2], page[3].length, page[4].length]), [[0, false, 4, 4]]);
+  assert.equal(kept.entries.length, 0);
   // The screen again, its listings held back as before: the page is the one the round read, and
   // the screen asks for no body.
   const bodies = world.sent("POST /api/secure/log/bodies").length;
@@ -1533,7 +1534,7 @@ test("a backend that gives the rounds the listings of the first page and not the
   world.clearFaults();
   const own = await S.call(fx, "read_log", { limit: 50 });
   assert.equal(own.value.status, "verified");
-  assert.deepEqual(openRecovered(fx).pages, []);
+  assert.equal(openRecovered(fx), null);
   assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
   assert.equal(world.stored("log.withheld"), undefined);
   const after = world.sent("POST /api/secure/log/read").length;
@@ -1777,6 +1778,42 @@ test("a runtime that ends in the middle of a read of the log leaves what the dev
   for (const key of ["log.recovered", "log.withheld", "log.denied", "log.cache", "log.round"]) {
     assert.equal(world.store.get(key), undefined, key);
   }
+});
+
+test("the entries of the listing pages the rounds keep take no place from an entry the screen asked for: it stays kept however many entries the rounds read for the first page", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  world.advance(HOUR_MS);
+  const old = fx.nodes[0].record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/drafts", "DELETE")]);
+  world.advance(8 * DAY_MS);
+  for (let i = 0; i < 3; i += 1) {
+    world.advance(60000);
+    fx.nodes[0].record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/messages/" + i, "POST")]);
+  }
+  // The body of one entry of a later page is held back from the screen, and a round reads it.
+  const mode = screenOnly(fx, [], (key) => key === old.key);
+  await onScreen(fx, mode, "read_log", { limit: 3 });
+  await onScreen(fx, mode, "read_log_page", { before_ms: world.runtime.log_pages[0].before_ms });
+  world.advance(2 * 60000);
+  await S.event(fx, "foreground");
+  const id = "3:" + old.key.slice(old.key.indexOf("/u/") + 3);
+  assert.deepEqual(openRecovered(fx).entries.map((item) => item[0]), [id]);
+  // The first listing pages are held back from the screen as well: from then on every round
+  // keeps the first page for the screen, 100 events of it, while 120 entries arrive a day.
+  listingsFromScreen(fx, mode, () => true);
+  await onScreen(fx, mode, "read_log", { limit: 3 });
+  for (let day = 0; day < 6; day += 1) {
+    for (let i = 0; i < 120; i += 1) {
+      world.advance(60000);
+      fx.nodes[0].record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/messages/" + day + "-" + i, "GET")]);
+    }
+    await nextDay(fx);
+    assert.equal(world.state.log.status, "verified", "day " + day);
+  }
+  const kept = openRecovered(fx);
+  assert.deepEqual(kept.entries.map((item) => item[0]), [id]);
+  assert.deepEqual(kept.pages.map((page) => [page[0], page[3].length, page[4].length]), [[0, 100, 100]]);
 });
 
 // ---- The reads of the chains of format 1 and format 2 that are held back from the screen ----

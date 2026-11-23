@@ -207,10 +207,11 @@
   // screen after that read was held back from the screen, unless the screen makes it sooner.
   const LOG_WATCH_MS = 30 * DAY_MS;
   // What the rounds read of the reads of the log screen that were held back, kept for the screen
-  // (log.recovered): the entries kept at most, the events of those entries at most (an entry
-  // holds LOG_ENTRY_EVENTS at most, so one entry is always kept), and the characters kept of one
-  // string of an event. Beyond the limits, what was kept first leaves first.
-  const LOG_RECOVERED_KEYS = 256;
+  // (log.recovered): the entries kept at most because the screen asked for their keys, the
+  // events of those entries at most (an entry holds LOG_ENTRY_EVENTS at most, so one entry is
+  // always kept), and the characters kept of one string of an event. Beyond the limits, what
+  // was kept first leaves first. The entries of a kept listing page are kept with the page.
+  const LOG_RECOVERED_KEYS = 128;
   const LOG_RECOVERED_EVENTS = 512;
   const LOG_RECOVERED_TEXT = 160;
   // The listing pages of the screen the rounds keep at most, and the events of the page a round
@@ -4432,8 +4433,8 @@
       cut: false, over: false, controlKeys: 0, checked: 0, bodies: 0, nodes: new Set(), undocumented: new Set(),
       verified: [], entries: new Map(), junk: new Set(), screenMs: null, withheld: new Set(),
       shown: new Set(), kept: new Set(), settled: new Set(), pagesHeld: new Set(), pagesRead: new Set(),
-      pagesKept: new Map(), store3: known, objectsRead: new Set(), chainsRead: new Set(), nodesRead: false,
-      chainKept: [], found: null,
+      pagesKept: new Map(), pageOf: new Map(), store3: known, objectsRead: new Set(), chainsRead: new Set(),
+      nodesRead: false, chainKept: [], found: null,
     };
     // What the rounds kept for the screen before this round: an entry kept there is not read
     // again.
@@ -4595,6 +4596,7 @@
         run.pagesKept.set(before, { more: page.more, keys: page.chosen });
         const wanted = [];
         for (const parsed of page.chosen) {
+          if (!run.pageOf.has(parsed.key)) run.pageOf.set(parsed.key, before);
           if (had.entries.has("3:" + parsed.tail)) continue;
           if (run.entries.has(parsed.key)) run.kept.add(parsed.key);
           else if (wanted.length < LOG_SCREEN_BODIES) wanted.push({ parsed: parsed, fresh: false, shown: true, keep: true });
@@ -4739,9 +4741,12 @@
         });
       }
       if (run.found !== null) recovered.found = { t: now, ids: run.found.slice(0, 2 * LEGACY_NODES) };
+      // An entry is kept because the screen asked for its key and the read was held back, or
+      // as a part of a listing page the round read again.
       run.kept.forEach(function (key) {
         const record = run.entries.get(key);
-        keepRecovered(recovered, record.parsed, record, run.junk.has(key));
+        const page = withheld.shown.indexOf(key) >= 0 ? undefined : run.pageOf.get(key);
+        keepRecovered(recovered, record.parsed, record, run.junk.has(key), page);
       });
       if (own) recovered.pages = recovered.pages.filter(function (page) { return page.before !== 0; });
       run.pagesKept.forEach(function (page, before) {
@@ -5718,15 +5723,16 @@
   /** What the rounds read for the screen, as this device and key keep it: {entries, pages,
    *  found}. entries is a table from the id of an entry of the screen ("3:" and the tail of a
    *  key of format 3, "2:" and node:seq for an entry of a chain of format 1 or format 2) to
-   *  {t, m, e}: the time it was kept, the time of the entry, and the entry as the screen shows
-   *  it ({id, time_ms, count, items}), or null for an object a round found to be no entry. The
-   *  table is in the order the entries were kept. pages are the listing pages of the screen the
-   *  rounds read again: {before, t, more, keys} (the time the page begins below, 0 for the page
-   *  that begins the two listings; the time it was kept; whether the listings go on below it;
-   *  the keys of the page, the latest first). found is the node prefixes of the bucket of format
-   *  1 and format 2 a round read again ({t, ids}), or null. An entry older than the retention of
-   *  the store is left out. A value of another key, or one that does not open, is no kept
-   *  value. */
+   *  {t, m, e, page}: the time it was kept, the time of the entry, the entry as the screen shows
+   *  it ({id, time_ms, count, items}), or null for an object a round found to be no entry, and,
+   *  for an entry that is kept as part of a listing page and for no other reason, the time that
+   *  page begins below (undefined for an entry kept because the screen asked for its key and the
+   *  read was held back). pages are the listing pages of the screen the rounds read again:
+   *  {before, t, more, keys} (the time the page begins below, 0 for the page that begins the two
+   *  listings; the time it was kept; whether the listings go on below it; the keys of the page,
+   *  the latest first). found is the node prefixes of the bucket of format 1 and format 2 a
+   *  round read again ({t, ids}), or null. An entry older than the retention of the store is
+   *  left out. A value of another key, or one that does not open, is no kept value. */
   function loadRecovered(keys) {
     const recovered = emptyRecovered();
     const sealed = storedJson(STORE_RECOVERED, null);
@@ -5744,16 +5750,19 @@
     }
     if (kept === null || typeof kept !== "object" || kept.v !== 1) return recovered;
     const horizon = native.nowMs() - LOG_RETENTION_DAYS * DAY_MS;
-    for (const item of Array.isArray(kept.entries) ? kept.entries : []) {
-      if (!Array.isArray(item) || typeof item[0] !== "string" || whole(item[2]) < horizon) continue;
-      const entry = item[3];
-      const shaped = entry === null || (typeof entry === "object" && typeof entry.id === "string" && Array.isArray(entry.items));
-      if (!shaped) continue;
-      recovered.entries.set(item[0], {
-        t: whole(item[1]), m: whole(item[2]),
-        e: entry === null ? null : { id: entry.id, time_ms: whole(entry.time_ms), count: whole(entry.count), items: entry.items },
-      });
-    }
+    const take = function (items, page) {
+      for (const item of Array.isArray(items) ? items : []) {
+        if (!Array.isArray(item) || typeof item[0] !== "string" || whole(item[2]) < horizon) continue;
+        const entry = item[3];
+        const shaped = entry === null || (typeof entry === "object" && typeof entry.id === "string" && Array.isArray(entry.items));
+        if (!shaped || (page !== undefined && recovered.entries.has(item[0]))) continue;
+        recovered.entries.set(item[0], {
+          t: whole(item[1]), m: whole(item[2]), page: page,
+          e: entry === null ? null : { id: entry.id, time_ms: whole(entry.time_ms), count: whole(entry.count), items: entry.items },
+        });
+      }
+    };
+    take(kept.entries, undefined);
     for (const item of Array.isArray(kept.pages) ? kept.pages : []) {
       if (!Array.isArray(item) || !Number.isSafeInteger(item[0]) || item[0] < 0 || !Array.isArray(item[3])) continue;
       const parsed = [];
@@ -5762,9 +5771,9 @@
         const key = letter === "c" || letter === "u" ? parseEntryKey(entryPrefix(letter) + name.slice(1), letter) : null;
         if (key !== null) parsed.push(key);
       }
-      if (parsed.length === item[3].length) {
-        recovered.pages.push({ before: item[0], t: whole(item[1]), more: item[2] === true, keys: parsed });
-      }
+      if (parsed.length !== item[3].length) continue;
+      recovered.pages.push({ before: item[0], t: whole(item[1]), more: item[2] === true, keys: parsed });
+      take(item[4], item[0]);
     }
     const found = kept.found;
     if (found !== null && typeof found === "object" && Array.isArray(found.ids)) {
@@ -5776,33 +5785,55 @@
     return recovered;
   }
 
-  /** Writes what the rounds read for the screen. Beyond LOG_RECOVERED_KEYS entries or
-   *  LOG_RECOVERED_EVENTS events, the entries kept first leave first (among the ones kept at the
-   *  same time, the earliest entry), and beyond LOG_RECOVERED_PAGES listing pages the pages kept
-   *  first. Nothing kept: no value. */
+  /** Writes what the rounds read for the screen. The entries kept because the screen asked for
+   *  their keys have limits of their own: beyond LOG_RECOVERED_KEYS of them or
+   *  LOG_RECOVERED_EVENTS events, the ones kept first leave first (among the ones kept at the
+   *  same time, the earliest entry). The entries of a listing page are kept with that page and
+   *  leave with it, so they take no place from the former. Beyond LOG_RECOVERED_PAGES listing
+   *  pages, the pages kept first leave. Nothing kept: no value. */
   function saveRecovered(keys, recovered) {
+    recovered.pages = recovered.pages.slice(-LOG_RECOVERED_PAGES);
+    // The entries kept as parts of listing pages, with each kept page that names them.
+    const paged = new Map();
+    for (const page of recovered.pages) {
+      const held = [];
+      for (const parsed of page.keys) {
+        const kept = recovered.entries.get("3:" + parsed.tail);
+        if (kept !== undefined && kept.page !== undefined) held.push(["3:" + parsed.tail, kept.t, kept.m, kept.e]);
+      }
+      paged.set(page.before, held);
+    }
+    const asked = [];
     let events = 0;
-    recovered.entries.forEach(function (kept) { events += kept.e === null ? 0 : kept.e.items.length; });
-    const leaving = Array.from(recovered.entries.keys()).sort(function (x, y) {
+    recovered.entries.forEach(function (kept, id) {
+      if (kept.page !== undefined) return;
+      asked.push(id);
+      events += kept.e === null ? 0 : kept.e.items.length;
+    });
+    asked.sort(function (x, y) {
       const a = recovered.entries.get(x);
       const b = recovered.entries.get(y);
       return a.t !== b.t ? a.t - b.t : a.m - b.m;
     });
-    for (const id of leaving) {
-      if (recovered.entries.size <= LOG_RECOVERED_KEYS && events <= LOG_RECOVERED_EVENTS) break;
-      const kept = recovered.entries.get(id);
+    let leave = 0;
+    for (; leave < asked.length; leave += 1) {
+      if (asked.length - leave <= LOG_RECOVERED_KEYS && events <= LOG_RECOVERED_EVENTS) break;
+      const kept = recovered.entries.get(asked[leave]);
       events -= kept.e === null ? 0 : kept.e.items.length;
-      recovered.entries.delete(id);
     }
-    recovered.pages = recovered.pages.slice(-LOG_RECOVERED_PAGES);
-    if (recovered.entries.size === 0 && recovered.pages.length === 0 && recovered.found === null) {
+    const entries = asked.slice(leave).map(function (id) {
+      const kept = recovered.entries.get(id);
+      return [id, kept.t, kept.m, kept.e];
+    });
+    if (entries.length === 0 && recovered.pages.length === 0 && recovered.found === null) {
       native.storeSet(STORE_RECOVERED, null);
       return;
     }
-    const entries = [];
-    recovered.entries.forEach(function (kept, id) { entries.push([id, kept.t, kept.m, kept.e]); });
     const pages = recovered.pages.map(function (page) {
-      return [page.before, page.t, page.more, page.keys.map(function (parsed) { return parsed.letter + parsed.tail; })];
+      return [
+        page.before, page.t, page.more, page.keys.map(function (parsed) { return parsed.letter + parsed.tail; }),
+        paged.get(page.before) || [],
+      ];
     });
     const nonce = native.randomBytes(12);
     const ct = native.aeadSeal({
@@ -5831,12 +5862,17 @@
 
   /** Keeps what a round read under a key of format 3 for the screen: the entry as the screen
    *  shows it (record: what readEntries left for the key), or the finding that the object is no
-   *  entry (junk). An entry kept before under that key is replaced and counts as kept now. */
-  function keepRecovered(recovered, parsed, record, junk) {
+   *  entry (junk). page is the time the listing page begins below that the entry is kept as a
+   *  part of, or undefined for an entry kept because the screen asked for its key. An entry kept
+   *  before under that key is replaced and counts as kept now; one that was kept because the
+   *  screen asked for it stays kept for that reason. */
+  function keepRecovered(recovered, parsed, record, junk, page) {
     const id = "3:" + parsed.tail;
+    const before = recovered.entries.get(id);
     recovered.entries.delete(id);
     recovered.entries.set(id, {
       t: native.nowMs(), m: parsed.time_ms, e: junk ? null : clippedEntry(entryOfRecord(parsed, record)),
+      page: before !== undefined && before.page === undefined ? undefined : page,
     });
   }
 
