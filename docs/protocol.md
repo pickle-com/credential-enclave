@@ -1326,7 +1326,7 @@ Test vectors of the assignment; the backend of the operator computes the same fu
 | `LOG_SCREEN_EVENTS`, `LOG_KEEP_EVENTS`, `LOG_SCREEN_WAIT_MS` (the app) | 50, 50 and 3,000: the events of one further page of the log screen, the events of the first page the device keeps, and the time `read_log` waits for the read of the store before it answers from what the device kept |
 | `LOG_SUMMARY_DAYS`, `LOG_SUMMARY_ENTRIES`, `LOG_SUMMARY_REQUESTS` (the app) | 7, 1,000 and 5: the days of the summary of the log screen, the most entries one opening counts into it, and the requests for bodies one opening of the screen sends |
 | `LEGACY_NODES`, `LEGACY_ROUND_PASSES`, `LEGACY_ROUND_BODIES`, `LEGACY_CLOSE_SLACK_MS` (the app) | 64, 4, 64 and 1 day: the chains of formats 1 and 2 one round follows (of more open chains, the ones a round listed longest ago), the passes of listings and the entry bodies it spends on them (one request for the documents of receiving nodes per pass; the receiving nodes that wait for a document count into the entry bodies of a round), and the time after the end of a grant at which the chain of its node is read for the last time |
-| `LEGACY_SEQ_READS`, `LEGACY_PAGE_SEQS` (the app) | 8: the object versions a round reads under one `seq` of a chain for a control entry. 200: the `seq` a listing page of a chain that goes on names at least when it holds what a node wrote and no more |
+| `LEGACY_SEQ_READS`, `LEGACY_SEQ_VERSIONS` (the app) | 8: the object versions a round reads under one `seq` of a chain for a control entry. 5: the object versions per `seq` a listing page of a chain that goes on holds at most, on average, when it holds what a node wrote and no more |
 | `LEGACY_TRANSFER_DOCUMENTS_FROM_MS` (the app) | 1,795,392,000,000 (2026-11-23T00:00:00Z): for an event of this time or later, the receiving node of a transfer that a node of a release before v2.4.0 made is judged by a document that verifies and by nothing else ("Formats 1 and 2") |
 | `LOG_STORE_CONCURRENCY`, `LOG_STORE_OBJECTS` (the app) | 8 and 100: the reads of the bucket of formats 1 and 2 in flight at once, and the object versions one address request names |
 | `LOG_STORE_ATTEMPTS`, `LOG_STORE_RETRY_MS` (the app) | 2 attempts of one request to the store, a pause of 500 milliseconds between them: a transport failure, a 429 and a 5xx status are tried again |
@@ -1659,14 +1659,15 @@ A round that leaves reads undone because there was more to read than one round r
 listing goes on beyond its four pages, more nodes are without a judgement than its document
 requests name, more bodies are to be read than its body requests name, an answer of the bodies
 ends before its last key, the chains of formats 1 and 2 hold more control entries than it reads,
-the listing of such a chain goes on over pages that name few `seq`, or its time of 60 s passes
-before it has read everything) is pending, and the next round reads on from where it stopped: a
-round whose time passes is judged on what it read and keeps what it judged. Eight such rounds read
-32 listing pages, the documents of 1,024 nodes and 6,400 bodies, which an account in normal use
-does not hold within the retention of the store. The rounds of synchronizations that end that way
-in a row are counted, a round that reads everything ends the row, and from the ninth on such a
-round is a round whose reads are held back: someone writes objects under the prefix of the account
-faster than the device reads them, or the answers of the backend never reach their end.
+the listing of such a chain goes on over pages that hold many object versions for each `seq`, or
+its time of 60 s passes before it has read everything) is pending, and the next round reads on
+from where it stopped: a round whose time passes is judged on what it read and keeps what it
+judged. Eight such rounds read 32 listing pages, the documents of 1,024 nodes and 6,400 bodies,
+which an account in normal use does not hold within the retention of the store. The rounds of
+synchronizations that end that way in a row are counted, a round that reads everything ends the
+row, and from the ninth on such a round is a round whose reads are held back: someone writes
+objects under the prefix of the account faster than the device reads them, or the answers of the
+backend never reach their end.
 
 The result of a round is `verified`, `pending` or `attention`. It is `attention` when one of four
 conditions holds, and each holds only in a situation that is a problem:
@@ -1836,8 +1837,9 @@ one object under a `seq`, and one more version when it repeats a write). When no
 is and more are left, the read is held back (`chain:keys`) and the chain is not read past that
 `seq`. The last `seq` of a listing page that goes on is read with the page after it. A chain an
 account used heavily is long, and the rounds read on through it, four listing pages a round,
-without a count; a listing that goes on over pages that name fewer than 200 `seq` is one of the
-reads that leave a round with more to read than it reads ("The round"). Such an event names the receiving node and
+without a count; a listing that goes on over pages that hold more than five object versions for
+each `seq` they name, on average, is one of the reads that leave a round with more to read than
+it reads ("The round"). Such an event names the receiving node and
 no measurement, so the program asks for the document of the receiving node (`POST
 /api/secure/log/documents`: the node document of a node of a release from v2.4.0 on, the
 attestation document the backend kept of a node of an earlier release). A receiving node whose

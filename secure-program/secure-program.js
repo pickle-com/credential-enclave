@@ -258,8 +258,9 @@
   // ---- The chains of format 1 and format 2 (the bucket the binding names) ----
   // The chains one round follows, the nodes one address request names, the passes of listings
   // and the entry bodies one round spends, the object versions it reads under one seq of a
-  // chain for a control entry, the seqs a listing page that goes on names at least when it
-  // holds what a node wrote and no more, the pages of the node discovery listing, the time
+  // chain for a control entry, the object versions per seq a listing page that goes on holds
+  // at most on average when it holds what a node wrote and no more, the pages of the node
+  // discovery listing, the time
   // after the end of a grant at which the chain of its node is read for the last time, the reads
   // of the store in flight at once, the object versions one address request names, the digits of
   // seq and of time_ms in an object key, the listings one call of the screen spends on going down
@@ -270,7 +271,7 @@
   const LEGACY_ROUND_PASSES = 4;
   const LEGACY_ROUND_BODIES = 64;
   const LEGACY_SEQ_READS = 8;
-  const LEGACY_PAGE_SEQS = 200;
+  const LEGACY_SEQ_VERSIONS = 5;
   const LEGACY_DISCOVERY_PAGES = 2;
   const LEGACY_CLOSE_SLACK_MS = DAY_MS;
   const LEGACY_FOUND_INTERVAL_MS = DAY_MS;
@@ -4092,9 +4093,9 @@
     // Each pass lists the chains that have keys left to read: the open chains first, then the
     // chains whose listing went on and the chains of the receiving nodes the pass before found.
     // The first pass also asks for the documents of the nodes that wait.
-    // thin: a listing page that goes on named fewer seqs than LEGACY_PAGE_SEQS. A node writes one
-    // object under a seq, and a version more when it repeats a write, so such a page holds
-    // objects a node did not write.
+    // thin: a listing page that goes on named more than LEGACY_SEQ_VERSIONS object versions for
+    // each seq it names, on average. A node writes one object under a seq, and a version more
+    // when it repeats a write, so such a page holds objects a node did not write.
     let thin = false;
     for (let pass = 0; pass < LEGACY_ROUND_PASSES; pass += 1) {
       if (open.length === 0 && (pass > 0 || waited.length === 0)) break;
@@ -4115,9 +4116,11 @@
         }
         const prefix = accountPrefix() + id + "/";
         const entries = new Map();
+        let versions = 0;
         for (const version of outcome.value.versions) {
           const parts = parseStoreKey(version.key, prefix);
           if (parts === null || parts.seq <= legacy.nodes[id].seq) continue;
+          versions += 1;
           if (!entries.has(parts.seq)) entries.set(parts.seq, []);
           entries.get(parts.seq).push({
             key: version.key, versionId: version.versionId, isLatest: version.isLatest, parts: parts,
@@ -4131,7 +4134,7 @@
         // The last seq of a listing page that goes on may have further object versions on the
         // page after it: it is read with that page, from the seq before it.
         if (more) seqs.pop();
-        if (more && seqs.length < LEGACY_PAGE_SEQS) thin = true;
+        if (more && versions > LEGACY_SEQ_VERSIONS * Math.max(1, seqs.length)) thin = true;
         const plan = { id: id, seqs: seqs, entries: entries, reads: new Map(), crowded: new Set(), stop: 0, more: more };
         for (const seq of seqs) {
           // The object versions whose keys name a control entry, the latest first, up to
@@ -4285,7 +4288,7 @@
     // The chains whose listing still goes on are read on by the next round. A chain of an
     // account in heavy use is long, and a round that reads on through it has not more to read
     // than a round reads in the sense that counts (LOG_UNFINISHED_ROUNDS): only a listing that
-    // goes on over pages that name few seqs does.
+    // goes on over pages that hold many object versions for each seq does.
     if (open.length > 0) {
       run.cut = true;
       if (thin) run.over = true;
