@@ -541,6 +541,19 @@ impl Pipes {
         self.open().len()
     }
 
+    /// A mark between the connections the relay took so far and the connections it takes
+    /// from here on: [`Pipes::held_before`] counts the first kind.
+    pub fn mark(&self) -> u64 {
+        // A place gets its number and enters the map under the lock of the map.
+        let _open = self.open();
+        self.next.load(Ordering::Relaxed)
+    }
+
+    /// The connections the relay took before `mark` and still holds.
+    pub fn held_before(&self, mark: u64) -> usize {
+        self.open().range(..mark).count()
+    }
+
     /// The age of the connection the relay has held longest, and the longest time one of its
     /// connections has moved no byte, in milliseconds. Both are 0 when the relay holds no
     /// connection.
