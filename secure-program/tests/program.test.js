@@ -1007,12 +1007,13 @@ test("A3: a synchronization has rounds follow one another while each ends with m
   const fx = S.fixture(source, { device: { securityStatus: true } });
   await S.start(fx);
   const world = fx.world;
-  // Before every synchronization, 1,100 objects under 1,100 node ids no node has. A round asks
-  // the documents of 128 nodes, and the eight rounds of one synchronization of 1,024: no round
-  // reaches the end of what there is to read.
+  // Before every synchronization, 1,500 objects under 1,500 node ids no node has. A round asks
+  // the documents of 128 nodes for the keys of its listing pages and of 32 more for the keys
+  // the round before left it, and the eight rounds of one synchronization of 1,280 at most: no
+  // round reaches the end of what there is to read.
   const bucket = bridge.shardBucket(world.serverTarget, world.userId);
   const pile = () => {
-    for (let i = 0; i < 1100; i += 1) {
+    for (let i = 0; i < 1500; i += 1) {
       world.advance(10);
       world.putObject(bucket, "a3/" + world.userId + "/c/" + String(bridge.RTIME_MAX - world.now).padStart(13, "0") + "." +
         b64u(crypto.randomBytes(32)) + ".1.grant_revoked." + fx.keys.keyId + "." + b64u(crypto.randomBytes(32)), "x");
@@ -1041,17 +1042,48 @@ test("A3: a synchronization has rounds follow one another while each ends with m
   assert.equal(world.state.log.status, "attention");
   assert.equal(world.stored("log.blocked").count, 4);
   assert.equal(world.stored("log.round").unfinished, 40);
-  // The objects stop arriving: the rounds reach the end, and the first that does clears the mark.
-  for (let turn = 0; turn < 3 && world.state.log.status !== "verified"; turn += 1) {
+  // The objects stop arriving. More of them lie under the prefix than the device remembers
+  // judgements of (4,096), so no walk through the listing ends with every key judged: the mark
+  // stays.
+  for (let turn = 0; turn < 3; turn += 1) {
     world.advance(2 * 60000);
     await S.event(fx, "foreground");
     await world.settle(1000);
   }
-  assert.equal(world.state.log.status, "verified");
-  assert.equal(world.state.log.store, "verified");
-  assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  assert.equal(world.state.log.status, "attention");
+  assert.equal(world.state.log.store, "blocked");
+  assert.equal(world.stored("log.blocked").count, 7);
+});
+
+test("a listing longer than the pages of one round is walked over several rounds, and a walk in which a round left keys unjudged does not end as a reading that read everything: the rounds walk again until every key is judged", async () => {
+  const fx = S.fixture(source, { device: { securityStatus: true } });
+  await S.start(fx);
+  const world = fx.world;
+  // 450 objects under 450 node ids no node has, in listing pages of 100: five pages. A round
+  // reads four pages and asks the documents of 128 nodes for their keys, and of 32 more for the
+  // keys the round before left it.
+  world.pageSize = 100;
+  const bucket = bridge.shardBucket(world.serverTarget, world.userId);
+  for (let i = 0; i < 450; i += 1) {
+    world.advance(10);
+    world.putObject(bucket, "a3/" + world.userId + "/c/" + String(bridge.RTIME_MAX - world.now).padStart(13, "0") + "." +
+      b64u(crypto.randomBytes(32)) + ".1.grant_revoked." + fx.keys.keyId + "." + b64u(crypto.randomBytes(32)), "x");
+  }
+  const before = world.reports.length;
+  const judged = world.stored("log.seen").length;
+  await nextDay(fx);
+  await world.settle(1000);
+  // The second round ends the first walk: it judged every key of the page it listed, and the
+  // round before it left keys of the first four pages unjudged. It does not verify, and neither
+  // does a later round that ends a walk that way.
+  const told = world.reports.slice(before).map((report) => report.status);
+  assert.deepEqual(told, Array(told.length - 1).fill("pending").concat(["verified"]));
+  assert.ok(told.length > 2);
+  assert.equal(world.stored("log.seen").length, judged + 450);
   assert.equal(world.stored("log.round").unfinished, 0);
-  assert.equal(world.securityStatuses.slice(-1)[0].status, "ok");
+  assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  assert.equal(heldReads(world), undefined);
+  assert.ok(world.securityStatuses.every((status) => status.status !== "attention"));
 });
 
 test("an account with more to read than one round reads is read to its end by the rounds that follow one another, and nothing marks the log: a long listing of control entries, entries of more nodes than a round asks the documents of, and more than the rounds of one synchronization read", async () => {
@@ -1230,7 +1262,8 @@ test("a read that ends because the app was suspended counts nothing: a round who
     world.advance(9 * HOUR_MS);
     if (at % 3 === 0) {
       // The user leaves the app while the first request of the round is on its way. The app
-      // tells the program, and the request fails five seconds later, when the runtime runs again.
+      // tells the program, and the round ends its reading there (the request fails five seconds
+      // later, when the runtime runs again).
       world.fault("POST /api/secure/log/read", { delay_ms: 5000, fail: "transport" }, 1);
       const sync = await untilListed(() => fx.program.onEvent("foreground", {}));
       fx.program.onEvent("background", {});
@@ -1248,7 +1281,7 @@ test("a read that ends because the app was suspended counts nothing: a round who
     assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 }, "round " + at);
     assert.equal(world.stored("log.round").unfinished, 0, "round " + at);
   }
-  const three = ["pending:unreachable:read:suspended", "pending:unreachable:read:suspended", "pending:unreachable:round:suspended"];
+  const three = ["pending:unreachable:round:suspended", "pending:unreachable:read:suspended", "pending:unreachable:round:suspended"];
   assert.deepEqual(states, three.concat(three, three, three, three));
   assert.ok(world.securityStatuses.every((told) => told.status !== "attention"));
   // A round the runtime runs to its end verifies.
@@ -1276,6 +1309,250 @@ test("a read that ends because the app was suspended counts nothing: a round who
   const again = await untilListed(() => fx.program.procedures.read_log_page({ before_ms: before }));
   assert.equal((await ended(again)).code, "log_store_unreachable");
   assert.equal(world.stored("log.denied").pages.length, 1);
+});
+
+test("A1: a measurement that held the key marks the log at the next event of the app once the device first saw it a day ago, whatever the backend answers after that", async () => {
+  // Sends an event to the runtime and lets what needs no answer go on.
+  const unanswered = (fx, name) => {
+    Promise.resolve(fx.program.onEvent(name, {})).then(() => {}, () => {});
+    return fx.world.drain();
+  };
+  for (const name of ["session_ready", "foreground", "background", "push"]) {
+    const fx = S.fixture(source, { device: { securityStatus: true } });
+    await S.start(fx);
+    const world = fx.world;
+    const other = bridge.randomMeasurement();
+    const receiver = world.addNode({ release: "v9.0.0", measurement: other, offered: false });
+    fx.nodes[0].record("c", [{
+      t: "grant_transferred_out", time_ms: world.now, to: receiver.id, release: "v9.0.0",
+      pcr0: other.pcr0, pcr1: other.pcr1, pcr2: other.pcr2,
+    }]);
+    await nextDay(fx);
+    assert.equal(world.state.log.status, "pending", name);
+    assert.equal(world.state.log.newer_release_nodes, 1, name);
+    const reports = world.reports.length;
+    // From here on no request of the device is answered. Within the day the log stays pending.
+    world.fault(() => true, "hang");
+    world.advance(HOUR_MS);
+    if (name === "session_ready") S.load(fx);
+    await unanswered(fx, name);
+    assert.equal(world.state.log.status, "pending", name);
+    // A day after the device first saw the measurement, the event itself marks the log: no
+    // request was answered and no round ended (a new runtime judges from what the device kept).
+    world.advance(25 * HOUR_MS);
+    if (name === "session_ready") S.load(fx);
+    await unanswered(fx, name);
+    assert.equal(world.state.log.status, "attention", name);
+    assert.equal(world.state.log.unknown_nodes, 1, name);
+    const told = world.securityStatuses.slice(-1)[0];
+    assert.deepEqual({ status: told.status, reasons: told.reasons }, { status: "attention", reasons: ["unlisted_release"] }, name);
+    assert.equal(world.reports.length, reports, name);
+    // The program that lists the release judges nothing from what the device kept, and its
+    // first round clears the mark.
+    world.clearFaults();
+    await S.start(fx, bridge.withListedRelease(fx.source, "v9.0.0", other, 44));
+    assert.equal(world.state.log.status, "verified", name);
+    assert.equal(world.state.log.unknown_nodes, 0, name);
+  }
+});
+
+test("a receiving node whose document this device has not seen is judged by a round and not at an event of the app: a document a round then reads clears it without a mark", async () => {
+  const fx = S.fixture(source, { device: { securityStatus: true } });
+  await S.start(fx);
+  const world = fx.world;
+  // A transfer whose event names no measurement, to a node of the accepted measurement. The
+  // request for the document of that node gets no document once.
+  const receiver = world.addNode({ release: "v2.4.0", measurement: fx.measurement, offered: false });
+  fx.nodes[0].record("c", [{ t: "grant_transferred_out", time_ms: world.now, to: receiver.id, release: "v2.4.0" }]);
+  withhold(fx, [receiver.id], "missing");
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "pending");
+  assert.equal(world.stored("log.unaccepted")["node:" + receiver.id].held, true);
+  // The device is not used for two days. The receiving node wrote an entry of the account, and
+  // the backend answers after a second.
+  world.clearFaults();
+  world.advance(1000);
+  receiver.record("c", [{ t: "connection_created", time_ms: world.now, record_id: "r1", provider: "slack", scope: "" }]);
+  world.advance(2 * DAY_MS);
+  world.fault("POST /api/secure/log/read", { delay_ms: 1000 });
+  const event = Promise.resolve(fx.program.onEvent("foreground", {}));
+  event.then(() => {}, () => {});
+  await world.drain();
+  assert.equal(world.state.log.status, "pending");
+  await world.run(event);
+  await world.settle(1000);
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(world.stored("log.unaccepted")["node:" + receiver.id], undefined);
+  assert.ok(world.securityStatuses.every((told) => told.status !== "attention"));
+});
+
+test("a round ends its reading when the app goes to the background: it sends nothing more, judges what it read within that event, and leaves the keys it listed and did not judge to the next round, which asks for them before its listing", async () => {
+  const fx = S.fixture(source, { device: { securityStatus: true } });
+  await S.start(fx);
+  const world = fx.world;
+  const judged = world.stored("log.seen").length;
+  // Three control entries of the node of the device, and one of a node of a measurement no list
+  // has (the key of the account is at that node).
+  const written = [];
+  for (const id of ["r1", "r2", "r3"]) {
+    world.advance(1000);
+    written.push(fx.nodes[0].record("c", [{ t: "connection_created", time_ms: world.now, record_id: id, provider: "slack", scope: "" }]));
+  }
+  const later = world.addNode({ release: "v9.0.0", measurement: bridge.randomMeasurement(), offered: false });
+  world.advance(1000);
+  const moved = later.record("c", [{ t: "connection_created", time_ms: world.now, record_id: "r4", provider: "slack", scope: "" }]);
+  // Every request of the reads is answered nine seconds after it was sent, and the user stays in
+  // the app for fifteen seconds at a time.
+  world.fault("POST /api/secure/log/read", { delay_ms: 9000 });
+  world.fault("POST /api/secure/log/bodies", { delay_ms: 9000 });
+  world.fault("POST /api/secure/log/documents", { delay_ms: 9000 });
+  const reads = (from) => world.requests.slice(from).map((request) => String(request.path))
+    .filter((line) => line.startsWith("/api/secure/log/") && !line.endsWith("/verified"))
+    .map((line) => line.slice("/api/secure/log/".length));
+  const stay = async () => {
+    const from = world.requests.length;
+    Promise.resolve(fx.program.onEvent("foreground", {})).then(() => {}, () => {});
+    await world.settle(15000);
+    const sent = reads(from);
+    const reports = world.reports.length;
+    const left = world.requests.length;
+    // The app goes to the background: the round ends within the event (no time of the model
+    // passes), and it sends its report and no read.
+    fx.program.onEvent("background", {});
+    await world.drain();
+    assert.equal(world.reports.length, reports + 1);
+    assert.deepEqual(reads(left), []);
+    // The app is suspended for two minutes.
+    world.advance(2 * 60000);
+    return sent;
+  };
+  world.advance(25 * HOUR_MS);
+  // The first stay: the listing is read, and the app leaves while the documents and the bodies
+  // are on their way. Nothing was judged, and nothing counts. The four keys are left to the next
+  // round: the keys of the node of the accepted measurement first, the earliest first.
+  assert.deepEqual(await stay(), ["read", "documents", "bodies"]);
+  assert.equal(world.state.log.status + ":" + world.state.log.store + ":" + world.state.log.store_failure, "pending:unreachable:round:suspended");
+  assert.deepEqual(heldReads(world), { keys: [], shown: [], pages: [], unjudged: written.map((entry) => entry.key).concat([moved.key]) });
+  assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  assert.equal(world.stored("log.round").unfinished, 0);
+  assert.equal(world.stored("log.seen").length, judged);
+  // The second stay: the round asks for those keys and for no listing. The three entries of the
+  // node of the device are judged, and the document of the other node says of which measurement
+  // it is; its entry is asked for when the app leaves.
+  assert.deepEqual(await stay(), ["documents", "bodies", "bodies"]);
+  assert.deepEqual(heldReads(world), { keys: [], shown: [], pages: [], unjudged: [moved.key] });
+  assert.equal(world.stored("log.seen").length, judged + 3);
+  assert.equal(world.state.log.newer_release_nodes, 0);
+  // The third stay: the entry of the other node is read before the listing is asked for. The key
+  // of the account is at a measurement no list has: pending for a day.
+  assert.deepEqual(await stay(), ["bodies", "read"]);
+  assert.equal(heldReads(world), undefined);
+  assert.equal(world.stored("log.seen").length, judged + 4);
+  assert.equal(world.state.log.status, "pending");
+  assert.equal(world.state.log.newer_release_nodes, 1);
+  assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  assert.ok(world.securityStatuses.every((told) => told.status !== "attention"));
+  // A day later the next event of the app marks the log, however slowly the backend answers.
+  world.advance(25 * HOUR_MS);
+  Promise.resolve(fx.program.onEvent("foreground", {})).then(() => {}, () => {});
+  await world.drain();
+  assert.equal(world.state.log.status, "attention");
+  assert.deepEqual(world.securityStatuses.slice(-1)[0].reasons, ["unlisted_release"]);
+});
+
+test("the keys a round listed and did not judge are kept for the next round, 32 at most: the keys of the nodes of an accepted measurement first and the earliest entry first, and a round that ended with the app in the background is followed by a round at the next return, however soon", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  // Five objects under node ids no node has, and after them 34 control entries of the node of
+  // the device.
+  const bucket = bridge.shardBucket(world.serverTarget, world.userId);
+  for (let i = 0; i < 5; i += 1) {
+    world.advance(1000);
+    world.putObject(bucket, "a3/" + world.userId + "/c/" + String(bridge.RTIME_MAX - world.now).padStart(13, "0") + "." +
+      b64u(crypto.randomBytes(32)) + ".1.grant_revoked." + fx.keys.keyId + "." + b64u(crypto.randomBytes(32)), "x");
+  }
+  const written = [];
+  for (let i = 0; i < 34; i += 1) {
+    world.advance(1000);
+    written.push(fx.nodes[0].record("c", [{ t: "connection_created", time_ms: world.now, record_id: "r" + i, provider: "slack", scope: "" }]));
+  }
+  world.fault("POST /api/secure/log/bodies", { delay_ms: 9000 });
+  world.fault("POST /api/secure/log/documents", { delay_ms: 9000 });
+  world.advance(25 * HOUR_MS);
+  Promise.resolve(fx.program.onEvent("foreground", {})).then(() => {}, () => {});
+  await world.settle(5000);
+  fx.program.onEvent("background", {});
+  await world.drain();
+  assert.deepEqual(heldReads(world).unjudged, written.slice(0, 32).map((entry) => entry.key));
+  // The user returns five seconds later: a round runs, and its first request names those keys.
+  world.clearFaults();
+  world.advance(5000);
+  const before = world.sent("POST /api/secure/log/bodies").length;
+  await S.event(fx, "foreground");
+  await world.settle(1000);
+  assert.deepEqual(JSON.parse(world.sent("POST /api/secure/log/bodies")[before].body).keys, written.slice(0, 32).map((entry) => entry.key));
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(heldReads(world), undefined);
+});
+
+test("the receiving node of a transfer is noted when the reading of the round ends while its document is asked for: the entry of the transfer is judged once, and the node is judged after it", async () => {
+  const fx = S.fixture(source, { device: { securityStatus: true } });
+  await S.start(fx);
+  const world = fx.world;
+  // A transfer whose event names no measurement, to a node of a measurement no list has.
+  const receiver = world.addNode({ release: "v9.0.0", measurement: bridge.randomMeasurement(), offered: false });
+  const transfer = fx.nodes[0].record("c", [{ t: "grant_transferred_out", time_ms: world.now, to: receiver.id, release: "v9.0.0" }]);
+  world.fault("POST /api/secure/log/documents", { delay_ms: 9000 });
+  world.advance(25 * HOUR_MS);
+  Promise.resolve(fx.program.onEvent("foreground", {})).then(() => {}, () => {});
+  await world.settle(5000);
+  assert.equal(JSON.parse(world.sent("POST /api/secure/log/documents").slice(-1)[0].body).nodes[0], receiver.id);
+  fx.program.onEvent("background", {});
+  await world.drain();
+  assert.equal(world.state.log.store_failure, "round:suspended");
+  assert.equal(world.stored("log.unaccepted")["node:" + receiver.id].held, true);
+  assert.equal(world.state.log.newer_release_nodes, 1);
+  // The entry of the transfer is not read again, and a day later the node marks the log.
+  world.clearFaults();
+  world.advance(2 * 60000);
+  const bodies = askedBodies(world).filter((key) => key === transfer.key).length;
+  await S.event(fx, "foreground");
+  assert.equal(askedBodies(world).filter((key) => key === transfer.key).length, bodies);
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "attention");
+  assert.equal(world.state.log.unknown_nodes, 1);
+});
+
+test("a round whose reading ended calls the store no more: the listings of node documents that waited for their turn are not sent", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  // 30 objects under 30 node ids no node has: the round asks the store for one listing of a node
+  // document for each, eight at a time, and the store answers each after nine seconds.
+  const bucket = bridge.shardBucket(world.serverTarget, world.userId);
+  for (let i = 0; i < 30; i += 1) {
+    world.advance(10);
+    world.putObject(bucket, "a3/" + world.userId + "/c/" + String(bridge.RTIME_MAX - world.now).padStart(13, "0") + "." +
+      b64u(crypto.randomBytes(32)) + ".1.grant_revoked." + fx.keys.keyId + "." + b64u(crypto.randomBytes(32)), "x");
+  }
+  world.fault(isDocumentListing, { delay_ms: 9000 });
+  const before = documentListings(world).length;
+  world.advance(25 * HOUR_MS);
+  Promise.resolve(fx.program.onEvent("foreground", {})).then(() => {}, () => {});
+  await world.settle(5000);
+  assert.equal(documentListings(world).length, before + 8);
+  fx.program.onEvent("background", {});
+  await world.drain();
+  await world.settle(60000);
+  assert.equal(documentListings(world).length, before + 8);
+  assert.equal(world.state.log.store_failure, "round:suspended");
+  // The next round reads them all.
+  world.clearFaults();
+  await S.event(fx, "foreground");
+  await world.settle(1000);
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(heldReads(world), undefined);
 });
 
 test("A4: an entry this device verified that left the listing within its retention marks the log, after the listing was read a second time", async () => {
@@ -2654,20 +2931,29 @@ test("a key whose read was held back is asked for before the new keys of a round
   assert.deepEqual(heldReads(world), { keys: [used.key], shown: [used.key], pages: [] });
   assert.equal(world.stored("log.blocked").count, 1);
   // 130 objects under 130 node ids no node has, all later than the entry: one round asks for the
-  // documents of 128 nodes.
+  // documents of 128 nodes for the keys of its listing. The key that was held back has a request
+  // of its own, sent before the round asks for a listing.
   for (let i = 0; i < 130; i += 1) {
     world.advance(1000);
     new bridge.Node(world, { release: "v2.4.0", measurement: fx.measurement, document: false })
       .record("c", [{ t: "grant_revoked", time_ms: world.now }]);
   }
+  const before = world.requests.length;
   await nextDay(fx);
-  const asked = world.sent("POST /api/secure/log/documents").slice(-2).map((request) => JSON.parse(request.body).nodes);
-  assert.equal(asked[0][0], hidden.id);
-  assert.equal(asked[0].length + asked[1].length, 128);
+  const order = world.requests.slice(before).map((request) => String(request.path))
+    .filter((line) => line === "/api/secure/log/documents" || line === "/api/secure/log/read");
+  assert.deepEqual(order.slice(0, 2), ["/api/secure/log/documents", "/api/secure/log/read"]);
+  const asked = world.sent("POST /api/secure/log/documents").slice(-3).map((request) => JSON.parse(request.body).nodes);
+  assert.deepEqual(asked[0], [hidden.id]);
+  assert.equal(asked[1].length + asked[2].length, 128);
   assert.equal(world.state.log.store, "blocked");
   assert.equal(world.state.log.store_failure, "documents:missing");
   assert.equal(world.stored("log.blocked").count, 2);
-  assert.equal(world.reports.slice(-1)[0].undocumented_nodes, 128);
+  assert.equal(world.reports.slice(-1)[0].undocumented_nodes, 129);
+  // The two keys the round listed and had no request left for are kept for the next round, beside
+  // the key that is held back.
+  assert.equal(heldReads(world).keys.length, 1);
+  assert.equal(heldReads(world).unjudged.length, 2);
 });
 
 test("a later page of the screen that finds a read held back hands the key to the rounds, which count it", async () => {
@@ -3777,7 +4063,8 @@ test("an answer of the bodies that reports keys as unread is read as an answer t
   assert.deepEqual(asked(), [written[3].key, written[4].key]);
   assert.equal(world.state.log.store, "blocked");
   assert.equal(world.state.log.store_failure, "bodies:skipped");
-  assert.deepEqual(heldReads(world), { keys: [written[3].key], shown: [], pages: [] });
+  // (The key behind it was listed and not judged: the next round asks for it as well.)
+  assert.deepEqual(heldReads(world), { keys: [written[3].key], shown: [], pages: [], unjudged: [written[4].key] });
   // An unread key in front of a key the answer names.
   world.clearFaults();
   world.fault("POST /api/secure/log/bodies", (request) => {

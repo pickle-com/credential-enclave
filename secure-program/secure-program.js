@@ -100,7 +100,8 @@
   //   log.grants      the nodes this device handed a grant to: {node: {granted_ms, not_after_ms,
   //                   release, first_ms, platform, attempted_ms}}
   //   log.cursor      the newest control key of the last round that covered the whole listing
-  //   log.resume      where a round that was cut short by its page limit goes on
+  //   log.resume      where a round that was cut short by its page limit goes on, and whether a
+  //                   round of that walk through the listing left keys unjudged (left)
   //   log.nodes       what the node documents said: {node: {m, p, r, f, c}} (the digest of the
   //                   measurement, the platform, the release, the time first seen, the time a
   //                   contradiction of its signatures was found)
@@ -117,7 +118,8 @@
   //                   for the first, the time until which the rounds read the first listing pages
   //                   for the screen, and the reads the screen made of the bucket of format 1
   //                   and format 2: the object versions of entries, the listings of chains, the
-  //                   node discovery listing)
+  //                   node discovery listing), and unjudged: [key], the new control keys a round
+  //                   listed and did not come to judge, which the next round asks for first
   //   log.recovered   what the rounds read of the reads of the log screen that were held back,
   //                   kept for the screen, sealed: the entries, the listing pages, the node
   //                   prefixes of the bucket of format 1 and format 2
@@ -215,9 +217,17 @@
   const LOG_MISSING_KEYS = 16;
   const LOG_NODES_KEPT = 256;
   // The reads that were held back that the device keeps for the rounds to make again: the keys
-  // of entries, and the listing pages of the screen.
+  // of entries, and the listing pages of the screen. As many new control keys that a round
+  // listed and did not come to judge are kept beside them for the next round.
   const LOG_WITHHELD_KEYS = 32;
   const LOG_WITHHELD_PAGES = 2;
+  // The requests a round sends for the keys an earlier read left to it, before it asks for a
+  // listing: the documents of the nodes of those keys and of the receiving nodes their entries
+  // name, and the bodies of those keys (the keys whose nodes the device has a judgement of, then
+  // the keys whose nodes those documents judged). They name every key the device keeps for the
+  // rounds, and are not taken from the requests of the listing pages.
+  const LOG_LEFT_DOCUMENT_REQUESTS = 2;
+  const LOG_LEFT_BODY_REQUESTS = 2;
   // The time the rounds go on reading the listing pages that begin the two listings for the
   // screen after that read was held back from the screen, unless the screen makes it sooner.
   const LOG_WATCH_MS = 30 * DAY_MS;
@@ -1268,7 +1278,17 @@
   }
 
   function turnLeft(turn) {
+    if (turn.ended === true) return 0;
     return turn.limitMs === Infinity ? Infinity : turn.limitMs - turnSpent(turn);
+  }
+
+  /** Ends a turn now: it has no time left, and the waits it has open fail with timeout at once
+   *  (a turn takes part when it was made with a list of its waits: enders). */
+  function endTurn(turn) {
+    turn.ended = true;
+    const enders = Array.isArray(turn.enders) ? turn.enders : [];
+    turn.enders = [];
+    for (const end of enders) end();
   }
 
   function timeoutError(what) {
@@ -1352,7 +1372,13 @@
     const timer = expire(turn, limitMs, stop).then(function () { throw marked(timeoutError(what)); });
     guarded.then(noop, noop);
     timer.then(noop, noop);
-    return Promise.race([guarded, timer]);
+    if (!Array.isArray(turn.enders)) return Promise.race([guarded, timer]);
+    // A turn that can be ended (endTurn) ends this wait with it.
+    const ending = new Promise(function (resolve, reject) {
+      turn.enders.push(function () { reject(marked(timeoutError(what))); });
+    });
+    ending.then(noop, noop);
+    return Promise.race([guarded, timer, ending]);
   }
 
   /** An operation that waits for the user: start() returns its promise. The time it takes is not
@@ -2628,11 +2654,13 @@
   /** One GET of the log store: {status, body}. Each attempt has LOG_STORE_TIMEOUT_MS. A failure
    *  of the transport, a timeout, a 429 and a 5xx status are tried again (LOG_STORE_ATTEMPTS
    *  attempts in all, with the pauses of LOG_STORE_RETRY_MS between them); a failure that remains
-   *  is unreachable, with the request named in its detail. */
+   *  is unreachable, with the request named in its detail. A turn that was ended (endTurn) calls
+   *  the store no more: the reads that waited for their turn at the gate fail without a request. */
   async function fetchStore(turn, url, name) {
     for (let attempt = 1; attempt <= LOG_STORE_ATTEMPTS; attempt += 1) {
       let response = null;
       try {
+        if (turn.ended === true) throw timeoutError(name);
         response = await limited(
           turn, native.http({ method: "GET", url: url, timeoutMs: LOG_STORE_TIMEOUT_MS }),
           LOG_STORE_TIMEOUT_MS, name);
@@ -3428,6 +3456,7 @@
         version_id_marker: typeof resume.version_id_marker === "string" ? resume.version_id_marker : "",
         top: typeof resume.top === "string" ? resume.top : "",
         until: typeof resume.until === "string" ? resume.until : "", tail: resume.tail === true,
+        left: resume.left === true,
       } : null,
     };
   }
@@ -3507,11 +3536,18 @@
    *  node discovery listing was held back. watch_ms is the time until which every round of a
    *  synchronization reads the listing pages that begin the two listings for the screen (0: no
    *  such time): from the read of the screen that was held back to LOG_WATCH_MS after it, or to
-   *  the read the screen makes itself. */
+   *  the read the screen makes itself.
+   *  unjudged are reads no one held back: the control keys of format 3 that a round listed and
+   *  did not come to judge (its reading ended with the time of the round or with the app going to
+   *  the background, or its requests were spent), LOG_WITHHELD_KEYS at most, in the order the
+   *  round left them in (runRound). The next round asks for them before it asks for a listing. */
   function loadWithheld() {
     const kept = storedObject(STORE_WITHHELD);
     const keys = (Array.isArray(kept.keys) ? kept.keys : []).filter(function (key) {
       return typeof key === "string" && key !== "";
+    }).slice(0, LOG_WITHHELD_KEYS);
+    const unjudged = (Array.isArray(kept.unjudged) ? kept.unjudged : []).filter(function (key, at, all) {
+      return typeof key === "string" && key !== "" && keys.indexOf(key) < 0 && all.indexOf(key) === at;
     }).slice(0, LOG_WITHHELD_KEYS);
     const prefix = accountPrefix();
     const objects = [];
@@ -3535,6 +3571,7 @@
       }).slice(0, LOG_WITHHELD_CHAINS),
       nodes: kept.nodes === true,
       watch_ms: whole(kept.watch_ms) > native.nowMs() ? whole(kept.watch_ms) : 0,
+      unjudged: unjudged,
     };
   }
 
@@ -3554,10 +3591,12 @@
     return isStoreFailure(failure) && (failure.kind === "blocked" || failure.kind === "silent");
   }
 
-  /** Whether the withheld reads hold a read the rounds have still to make again (the page the
-   *  rounds watch for the screen alone is none: it is read when a round runs). */
+  /** Whether the withheld reads hold a read the rounds have still to make: one that was held
+   *  back, or a key a round left unjudged (the page the rounds watch for the screen alone is
+   *  none: it is read when a round runs). */
   function withheldDue(held) {
-    return held.keys.length > 0 || held.pages.length > 0 || held.objects.length > 0 || held.chains.length > 0 || held.nodes;
+    return held.keys.length > 0 || held.pages.length > 0 || held.objects.length > 0 || held.chains.length > 0 || held.nodes ||
+      held.unjudged.length > 0;
   }
 
   /** The name of an entry of a chain whose object versions were held back: the node id and the
@@ -3576,9 +3615,11 @@
    *  and the names of the entries read), chainsHeld and chainsRead (the listings of chains, and
    *  their names node:after:below), nodesHeld and nodesRead (the node discovery listing)): what
    *  the device kept without what that read settled, then what that read found held back, up to
-   *  the limits. A key older than the retention of the store leaves. The kept value is read at
-   *  the call and written in the same step: a round and a read of the screen may end in either
-   *  order. */
+   *  the limits. A key older than the retention of the store leaves. The keys a round left
+   *  unjudged are the ones the read names (run.unjudged, a round) or the ones the device kept (a
+   *  read of the screen), without the keys that read judged and the keys kept as held back. The
+   *  kept value is read at the call and written in the same step: a round and a read of the
+   *  screen may end in either order. */
   function saveWithheld(run) {
     const kept = loadWithheld();
     const horizon = native.nowMs() - LOG_RETENTION_DAYS * DAY_MS;
@@ -3588,6 +3629,14 @@
       const parsed = parseAccountKey(key);
       if (parsed === null || parsed.time_ms < horizon) continue;
       keys.push(key);
+    }
+    const unjudged = [];
+    for (const key of Array.isArray(run.unjudged) ? run.unjudged : kept.unjudged) {
+      if (run.settled.has(key) || keys.indexOf(key) >= 0 || unjudged.indexOf(key) >= 0) continue;
+      if (unjudged.length >= LOG_WITHHELD_KEYS) break;
+      const parsed = parseAccountKey(key);
+      if (parsed === null || parsed.time_ms < horizon) continue;
+      unjudged.push(key);
     }
     const shown = keys.filter(function (key) { return kept.shown.indexOf(key) >= 0 || run.shown.has(key); });
     const pages = [];
@@ -3625,14 +3674,16 @@
       if (held.chains.length > 0) stored.chains = held.chains;
       if (held.nodes) stored.nodes = true;
       if (held.watch_ms > 0) stored.watch_ms = held.watch_ms;
+      if (held.unjudged.length > 0) stored.unjudged = held.unjudged;
       return stored;
     };
     const next = value({
       keys: keys, shown: shown, pages: pages, objects: objects, chains: chains, nodes: nodes, watch_ms: watch,
+      unjudged: unjudged,
     });
     if (JSON.stringify(next) === JSON.stringify(value(kept))) return;
     const empty = keys.length === 0 && pages.length === 0 && objects.length === 0 && chains.length === 0 && !nodes &&
-      watch === 0;
+      watch === 0 && unjudged.length === 0;
     storeJson(STORE_WITHHELD, empty ? null : next);
   }
 
@@ -3641,6 +3692,7 @@
    *  named the keys it keeps). A listing page that was held back says nothing of that. */
   function storeKnown(log, kept) {
     return log.cursor !== "" || log.seen.list.length > 0 || log.resume !== null || kept.keys.length > 0 ||
+      kept.unjudged.length > 0 ||
       Object.keys(log.grants).some(function (id) { return logFormatOf(log.grants[id].release) === 3; });
   }
 
@@ -3817,6 +3869,15 @@
       run.withheld.add(key);
       if (shown.has(key)) run.shown.add(key);
     };
+    // The failure that ended the reading (null: none). A failure that arrives once the time of
+    // the turn has passed says nothing of the backend (noteFailure throws it). The read then
+    // sends nothing more, judges what was answered before, notes the receiving nodes that the
+    // entries it judged name, and throws that failure at its end.
+    let ended = null;
+    const endedBy = function (thrown) {
+      if (failureCode(thrown) === "cancelled" || turnLeft(turn) > 0) throw thrown;
+      if (ended === null) ended = thrown;
+    };
     const learning = learnNodes(turn, log, run, unknown, budget, "key");
     // The keys whose bodies are asked for: each key once, in the order of items, as many as the
     // requests left to this read carry. A request names the keys an earlier read found held
@@ -3854,8 +3915,13 @@
     // The keys of the nodes this device has a judgement of go out with the request for the
     // documents; the keys of the nodes those documents judged follow them.
     ask(function (node) { return unknown.indexOf(node) < 0; });
-    const left = await learning;
-    ask(function (node) { return nodeVerdict(log.grants, log.nodes, node) !== null; });
+    let left = new Map();
+    try {
+      left = await learning;
+    } catch (thrown) {
+      endedBy(thrown);
+    }
+    if (ended === null) ask(function (node) { return nodeVerdict(log.grants, log.nodes, node) !== null; });
     const bodies = new Map();
     // The keys of the requests that failed: their bodies are missing for that failure, not
     // because the read had more keys than its requests name.
@@ -3866,8 +3932,13 @@
         // A request the backend refused or did not answer: its keys are asked for again by the
         // rounds (a request that failed with the network of the device is one they answer then).
         const failure = heldBack(outcome.error);
-        noteFailure(turn, run, failure);
         for (const key of asked.keys) failed.add(key);
+        try {
+          noteFailure(turn, run, failure);
+        } catch (thrown) {
+          endedBy(thrown);
+          continue;
+        }
         if (failure.kind === "blocked" || failure.kind === "silent") {
           for (const key of asked.keys) hold(key);
         }
@@ -3936,9 +4007,10 @@
       const entry = bodies.get(parsed.key);
       if (entry === undefined) {
         // The body was not asked for (the requests of this read were spent) or the answer ended
-        // before this key: the read has more to read than it read.
+        // before this key: the read has more to read than it read. (A read whose reading ended
+        // with the time of its turn asked for no more.)
         run.cut = true;
-        if (!failed.has(parsed.key)) {
+        if (ended === null && !failed.has(parsed.key)) {
           run.over = true;
           if (shown.has(parsed.key) && requested.has(parsed.key)) unanswered.push(parsed);
         }
@@ -4005,13 +4077,21 @@
       return a.tail < b.tail ? 1 : a.tail > b.tail ? -1 : 0;
     });
     for (const parsed of unanswered) hold(parsed.key);
-    // The receiving nodes of transfers whose events name no measurement: their documents.
+    // The receiving nodes of transfers whose events name no measurement: their documents. A
+    // receiving node that got no judgement is noted whatever kept its document from this read
+    // (the entry of the transfer is judged and is not read again).
     if (transfers.length > 0) {
       const ids = [];
       for (const transfer of transfers) {
         if (ids.indexOf(transfer.to) < 0) ids.push(transfer.to);
       }
-      await learnNodes(turn, log, run, ids, budget, "receiver");
+      if (ended === null) {
+        try {
+          await learnNodes(turn, log, run, ids, budget, "receiver");
+        } catch (thrown) {
+          endedBy(thrown);
+        }
+      }
       for (const transfer of transfers) {
         const verdict = nodeVerdict(log.grants, log.nodes, transfer.to);
         if (verdict === null) noteUnaccepted(log, "node:" + transfer.to, transfer.event.release, transfer.to, true);
@@ -4020,6 +4100,7 @@
         }
       }
     }
+    if (ended !== null) throw ended;
   }
 
   /** The control keys of one listing page that a round has still to judge, and the keys of one
@@ -4376,6 +4457,40 @@
     return logState;
   }
 
+  /** Judges, without a read, the measurements no list of this program has that this device kept
+   *  (A1): a measurement that held the key of this account and that the device first saw
+   *  LOG_RELEASE_GRACE_MS ago or longer marks the log now, at every event of the app, whatever
+   *  the rounds after it read or fail to read. A measurement a list of this program has is left
+   *  to the rounds, which forget it, and so is a node whose document the device has not seen (a
+   *  round that reads the document judges it). The kept state is published as attention and the
+   *  app is told, unless the state says so already. */
+  function judgeKept() {
+    try {
+      const kept = storedObject(STORE_UNACCEPTED);
+      const now = native.nowMs();
+      let established = 0;
+      for (const digest of Object.keys(kept)) {
+        const item = kept[digest];
+        if (item === null || typeof item !== "object" || item.held !== true || digest.slice(0, 5) === "node:") continue;
+        if (buildOfMeasure(digest) !== undefined) continue;
+        const first = whole(item.first_ms);
+        if (first > 0 && first <= now && now - first >= LOG_RELEASE_GRACE_MS) established += 1;
+      }
+      const before = keptLogState();
+      if (established === 0 || before.status === "attention") return;
+      const state = Object.assign({}, before, { status: "attention", unknown_nodes: established, program_version: VERSION });
+      const round = storedObject(STORE_ROUND);
+      const ours = round.v === VERSION;
+      const told = tellStatus("attention", ["unlisted_release"], ours && typeof round.told === "string" ? round.told : "");
+      if (ours) storeJson(STORE_ROUND, Object.assign({}, round, { told: told, state: state }));
+      logState = state;
+      native.publish({ state: { log: state } });
+    } catch (error) {
+      if (failureCode(error) === "cancelled") throw error;
+      native.log("kept judgement: " + failureCode(error));
+    }
+  }
+
   /** Whether a round is due: this program has ended none on this installation, the last one that
    *  completed is LOG_ROUND_INTERVAL_MS old, or the last one did not complete (it ended pending,
    *  or it could not read the store while a mark of an earlier round stood) or a read of the
@@ -4436,9 +4551,11 @@
   /** Whether the backend answered a request of this runtime around a round that began at
    *  startedMs (from LOG_REACH_MS before it): a request of the round that was not answered was
    *  then held back by the operator domain and not lost with the network of the device. When
-   *  nothing answered in that time, the account query is asked once. */
-  async function reachJudged(turn, startedMs) {
+   *  nothing answered in that time, the account query is asked once (ask false: nothing is
+   *  asked, for a round that ended when the app went to the background). */
+  async function reachJudged(turn, startedMs, ask) {
     if (lastAnswerMs >= startedMs - LOG_REACH_MS) return true;
+    if (ask === false) return false;
     try {
       await request(turn, "GET", "/api/secure/account", null, null, LOG_API_TIMEOUT_MS);
       return true;
@@ -4461,9 +4578,12 @@
    *    3 the documents of the nodes this device has no judgement of and, for a node without a
    *      document that verifies, the listing of the versions of its node document from the store,
    *      and 4 the bodies of the keys it has not judged whose nodes it has a judgement of
-   *      (readEntries). The keys an earlier read found held back are read with the first page,
-   *      and the listing pages of the screen an earlier read found held back after the listing
-   *      (log.withheld), each with the entries of the page the screen would show there
+   *      (readEntries). The keys an earlier read left for the rounds (log.withheld: the keys it
+   *      found held back, and the new control keys a round listed and did not come to judge) are
+   *      asked for before step 1, with requests of their own: a round that has the time of one
+   *      answer judges those keys, whatever the time of the listing. The listing pages of the
+   *      screen an earlier read found held back are read after the listing, each with the
+   *      entries of the page the screen would show there
    *    5 the chains of format 1 and format 2 this device follows (followLegacy), and the reads of
    *      that bucket the screen made that an earlier read found held back (rereadChains)
    *    6 the judgement, the published state, the report. What the round read for the screen is
@@ -4474,6 +4594,11 @@
    *  LOG_SYNC_ROUNDS - 1). first says that the round is the first round of a synchronization:
    *  beyond LOG_UNFINISHED_ROUNDS such rounds of synchronizations in a row, a first round that
    *  ends that way counts as a round whose reads are held back.
+   *  A round ends its reading when the app goes to the background (the event background ends
+   *  the turn of the round): it sends nothing more, judges what it read and writes what it kept
+   *  in the same step of the runtime, as a round whose time passed while the runtime did not
+   *  run. The new control keys a round listed and did not judge are kept for the next round
+   *  (log.withheld, unjudged).
    *  A backend that states it has no store of format 3 (the route is absent, or it answers
    *  log_store_disabled) is read as an environment without entries of format 3, unless this device
    *  knows otherwise: it handed a grant to a node of a release that writes format 3, or it read
@@ -4494,7 +4619,7 @@
       verified: [], entries: new Map(), junk: new Set(), screenMs: null, withheld: new Set(),
       shown: new Set(), kept: new Set(), settled: new Set(), pagesHeld: new Set(), pagesRead: new Set(),
       pagesKept: new Map(), pageOf: new Map(), store3: known, objectsRead: new Set(), chainsRead: new Set(),
-      nodesRead: false, chainKept: [], found: null,
+      nodesRead: false, chainKept: [], found: null, listed: [],
     };
     // What the rounds kept for the screen before this round: an entry kept there is not read
     // again.
@@ -4507,6 +4632,8 @@
     // before stopped (a synchronization only: the screen reads the first page).
     let place = origin === "sync" && log.resume !== null ? log.resume
       : { key_marker: "", version_id_marker: "", top: "", until: "", tail: false };
+    // Whether an earlier round of this walk through the listing left keys unjudged.
+    const walkLeft = origin === "sync" && log.resume !== null && log.resume.left === true;
     const pageLimit = origin === "screen" ? 1 : LOG_CONTROL_PAGES;
     // The time of a round is one of the things it has only so much of. A failure that arrives
     // once that time has passed (the failure of the request that was waiting, or of the one
@@ -4514,6 +4641,7 @@
     // counts as one that had more to read than it read. It keeps what it judged, so the next
     // round reads on. A runtime that goes down ends the round.
     let expired = false;
+    let away = false;
     const ranOut = function (failure) {
       if (failureCode(failure) === "cancelled" || turnLeft(turn) > 0) throw failure;
       expired = true;
@@ -4521,12 +4649,36 @@
       // Time that passed while the runtime did not run (the app went to the background during
       // the round, or the time of the round passed later than a running runtime lets it) is not
       // time the round had: it could not read, and has not more to read than a round reads.
-      const away = appBackgroundMs >= started || turnSpent(turn) - turn.limitMs > WAIT_LATE_MS;
+      away = appBackgroundMs >= started || turnSpent(turn) - turn.limitMs > WAIT_LATE_MS;
       if (away) run.unreachable = true;
       else run.over = true;
       if (run.detail === "") run.detail = away ? "round:suspended" : "round:time";
     };
     try {
+      // The keys an earlier read left for the rounds, before any listing (a listing of that
+      // read named them): the keys it found held back, then the new control keys a round listed
+      // and did not come to judge. What the round reads under a key the log screen asked for is
+      // kept for the screen (keep). These keys have requests of their own: they take none from
+      // the listing pages of the round.
+      const left = [];
+      for (const key of withheld.keys) {
+        const parsed = parseAccountKey(key);
+        if (parsed === null) continue;
+        const asked = withheld.shown.indexOf(key) >= 0;
+        left.push({
+          parsed: parsed, fresh: parsed.letter === "c" && !log.seen.set.has(keyDigest(parsed.key)), held: true,
+          keep: asked, shown: asked,
+        });
+      }
+      for (const key of withheld.unjudged) {
+        const parsed = parseEntryKey(key, "c");
+        // (A key that was judged since: the runtime of that round went down before it wrote
+        // the keys it left.)
+        if (parsed === null || log.seen.set.has(keyDigest(parsed.key))) continue;
+        left.push({ parsed: parsed, fresh: true });
+        run.listed.push(parsed);
+      }
+      await readEntries(turn, keys, log, run, left, { documents: LOG_LEFT_DOCUMENT_REQUESTS, bodies: LOG_LEFT_BODY_REQUESTS });
       for (let page = 0; page < pageLimit && !complete; page += 1) {
         const wanted = [{ prefix: "c", key_marker: place.key_marker, version_id_marker: place.version_id_marker }];
         if (origin === "screen") wanted.push({ prefix: "u", key_marker: "", version_id_marker: "" });
@@ -4570,35 +4722,33 @@
           if (listings.length > 1) pages.u = listings[1];
           if (place.top === "" && control.keys.length > 0) place.top = control.keys[0].tail;
         }
-        let items = freshControl(log, run, control);
+        // A key this round found held back before its listing is not asked for again with a
+        // page. (A key it judged there is remembered, and is read with a page only beside
+        // another key of its node and seq.)
+        const items = freshControl(log, run, control).filter(function (item) { return !run.withheld.has(item.parsed.key); });
+        for (const item of items) {
+          if (item.fresh) run.listed.push(item.parsed);
+        }
         if (page === 0) {
-          // With the first page: the keys whose read an earlier read found held back (the listing
-          // of that read named them), and the entries the screen wants read. The keys held back
-          // stand first, so that no number of new keys takes the requests of the round from them.
-          // What the round reads under a key the log screen asked for is kept for the screen
-          // (keep), and a key the screen asks for now is marked as one it asked for (shown).
-          const fresh = new Set(items.map(function (item) { return item.parsed.key; }));
+          // With the first page: the entries the screen wants read. A key the screen asks for
+          // now is marked as one it asked for (shown). What the round read before its listing
+          // under such a key stands for the screen (run.entries).
           const named = new Map();
-          const first = [];
-          for (const key of withheld.keys) {
-            const parsed = parseAccountKey(key);
-            if (parsed === null || named.has(parsed.key)) continue;
-            const asked = withheld.shown.indexOf(key) >= 0;
-            const item = { parsed: parsed, fresh: fresh.has(parsed.key), held: true, keep: asked, shown: asked };
-            named.set(parsed.key, item);
-            first.push(item);
-          }
-          const rest = items.filter(function (item) { return !named.has(item.parsed.key); });
-          for (const item of rest) named.set(item.parsed.key, item);
-          items = first.concat(rest);
+          for (const item of items) named.set(item.parsed.key, item);
           for (const more of typeof extra === "function" ? extra(pages) : []) {
-            const listed = named.get(more.parsed.key);
+            const key = more.parsed.key;
+            const listed = named.get(key);
             if (listed !== undefined) {
               listed.shown = true;
               continue;
             }
+            if (run.withheld.has(key)) {
+              run.shown.add(key);
+              continue;
+            }
+            if (run.settled.has(key)) continue;
             const item = { parsed: more.parsed, fresh: false, shown: true };
-            named.set(more.parsed.key, item);
+            named.set(key, item);
             items.push(item);
           }
         }
@@ -4681,11 +4831,52 @@
     } catch (failure) {
       ranOut(failure);
     }
+    // The new control keys this round listed, or was left by the round before, and did not come
+    // to judge (its reading ended, or its requests were spent) go to the next round, which asks
+    // for them before its listing, as many as the device keeps. The keys of the nodes of an
+    // accepted measurement stand first: an object under the id of such a node is an entry that
+    // node wrote, or its read ends in a count (a body that is not the one the key names, a
+    // signature that does not verify), so nothing that goes uncounted takes those places from
+    // an entry. Within each group the earliest entry stands first.
+    const pending = new Map();
+    for (const parsed of run.listed) {
+      if (log.seen.set.has(keyDigest(parsed.key)) || run.settled.has(parsed.key) || run.withheld.has(parsed.key)) continue;
+      pending.set(parsed.key, parsed);
+    }
+    const accepted = new Map();
+    pending.forEach(function (parsed) {
+      if (accepted.has(parsed.node)) return;
+      const verdict = nodeVerdict(log.grants, log.nodes, parsed.node);
+      accepted.set(parsed.node, verdict !== null && verdict.state === "accepted");
+    });
+    run.unjudged = Array.from(pending.values()).sort(function (a, b) {
+      if (accepted.get(a.node) !== accepted.get(b.node)) return accepted.get(a.node) ? -1 : 1;
+      if (a.time_ms !== b.time_ms) return a.time_ms - b.time_ms;
+      return a.tail < b.tail ? 1 : a.tail > b.tail ? -1 : 0;
+    }).slice(0, LOG_WITHHELD_KEYS).map(function (parsed) { return parsed.key; });
+    // A listing longer than the pages of one round is walked over several rounds, and a later
+    // round of the walk does not list the pages of an earlier one again. A walk in which a round
+    // listed more keys than it judged and left to the next round has not read everything when
+    // it ends: the round that ends it has more to read, and the next round walks again.
+    const leftover = pending.size > run.unjudged.length;
+    if (complete && walkLeft) {
+      run.over = true;
+      run.cut = true;
+    }
     // The judgement. A round whose time ran out asks whether the backend can be reached in a
     // turn of its own.
     const now = native.nowMs();
     const judging = expired ? newTurn(2 * LOG_API_TIMEOUT_MS, "") : turn;
-    const denied = run.blocked || (run.silent && await reachJudged(judging, started));
+    let denied = run.blocked;
+    if (!denied && run.silent) {
+      try {
+        denied = await reachJudged(judging, started, !away);
+      } catch (failure) {
+        // The time of the round passed, or the app went to the background, while the question
+        // was open: it has no answer, and the round is judged on what it read.
+        ranOut(failure);
+      }
+    }
     const unreachable = !denied && (run.unreachable || run.silent);
     // The rounds of a synchronization in a row that left reads undone because there was more to
     // read than a round reads. A round that read everything it had to read ends the row; a round
@@ -4778,12 +4969,12 @@
       // rest then reads the keys that arrived above its start since (tail).
       log.resume = {
         key_marker: place.key_marker, version_id_marker: place.version_id_marker, top: place.top,
-        until: place.until, tail: place.tail || place.until === "",
+        until: place.until, tail: place.tail || place.until === "", left: walkLeft || leftover,
       };
     } else if (run.truncated && log.resume === null && pages.c !== null) {
       log.resume = {
         key_marker: pages.c.next_key_marker, version_id_marker: pages.c.next_version_id_marker,
-        top: place.top, until: "", tail: true,
+        top: place.top, until: "", tail: true, left: leftover,
       };
     }
     if (pages.c !== null || run.verified.length > 0) {
@@ -4835,7 +5026,9 @@
     native.storeSet(STORE_CURSOR, log.cursor === "" ? null : log.cursor);
     storeJson(STORE_RESUME, log.resume);
     storeJson(STORE_ROUND, {
-      v: VERSION, tried_ms: now, last: status, open: incomplete, told: told, state: state,
+      // (A round that ended because the runtime did not run is tried again by the next
+      // synchronization, however soon.)
+      v: VERSION, tried_ms: away ? 0 : now, last: status, open: incomplete, told: told, state: state,
       done_ms: status === "pending" ? (log.round.v === VERSION ? whole(log.round.done_ms) : 0) : now,
       unfinished: unfinished,
     });
@@ -4863,12 +5056,17 @@
   // The round in flight (null: none). A round that a synchronization asks for while one runs takes
   // the result of the one that runs.
   let roundFlight = null;
+  // The turn of the round that reads now (null: none). The event background ends it: the round
+  // then judges what it read and writes what it kept before the app is suspended.
+  let roundTurn = null;
 
   /** Starts a round behind the rounds that run or wait (the round lock) and returns its promise.
    *  The round reads in a turn of its own (LOG_ROUND_LIMIT_MS from its start), and its promise
    *  fails with timeout when that time passes. The lock is held until the round has ended: a
    *  round whose time passed judges and writes what it kept after that (runRound), and no other
-   *  round reads or writes those values in between. first and follow: runRound. */
+   *  round reads or writes those values in between. The turn of the round is one the event
+   *  background ends (roundTurn); the round then ends within the same step of the runtime, and
+   *  its promise gives its result. first and follow: runRound. */
   function startRound(keys, origin, extra, first, follow) {
     let settle = null;
     const flight = new Promise(function (resolve, reject) { settle = { resolve: resolve, reject: reject }; });
@@ -4880,8 +5078,15 @@
     const held = newTurn(LOG_ROUND_LIMIT_MS + 4 * LOG_API_TIMEOUT_MS, "");
     roundLock.run(held, function () {
       const own = newTurn(LOG_ROUND_LIMIT_MS, "");
+      own.enders = [];
+      roundTurn = own;
       const work = runRound(own, keys, origin, extra, first, follow);
-      limited(own, work, Infinity, "procedure").then(settle.resolve, settle.reject);
+      const left = function () {
+        if (roundTurn === own) roundTurn = null;
+      };
+      work.then(left, left);
+      // The wait for the round has the time of the round, in a turn that is not ended with it.
+      limited(newTurn(LOG_ROUND_LIMIT_MS, ""), work, Infinity, "procedure").then(settle.resolve, settle.reject);
       return work;
     }, true).then(ended, function (error) {
       ended();
@@ -9435,15 +9640,21 @@
         // this program: until this program ended a round on this installation, the log is pending.
         if (storedObject(STORE_ROUND).v !== VERSION) native.publish({ state: { log: keptLogState() } });
         outcomes();
+        judgeKept();
         return eventSync(null, true);
       }
       if (name === "foreground") {
         noteBackground(false);
+        judgeKept();
         return eventSync(null, true);
       }
       if (name === "background") {
         appBackgroundMs = native.nowMs();
+        // The round that reads now ends its reading: it judges what it read and writes what it
+        // kept (runRound), before the app is suspended.
+        if (roundTurn !== null) endTurn(roundTurn);
         noteBackground(true);
+        judgeKept();
         return undefined;
       }
       if (name === "push") {
@@ -9451,6 +9662,7 @@
           const turn = newTurn(PROCEDURE_LIMIT_MS, "");
           return userLine.run(turn, function () { return checkTransferRequests(turn); });
         }
+        judgeKept();
         return eventSync(payload !== null && typeof payload === "object" ? payload : {}, false);
       }
       if (name === "account_end") {
