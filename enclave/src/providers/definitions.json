@@ -24,7 +24,7 @@
     ],
     "api": [
       {"host": "gmail.googleapis.com", "prefixes": ["/gmail/v1/", "/upload/gmail/v1/"], "exact": []},
-      {"host": "www.googleapis.com", "prefixes": ["/calendar/v3/", "/drive/v3/", "/upload/drive/v3/", "/download/drive/v3/"], "exact": ["/oauth2/v3/userinfo"]},
+      {"host": "www.googleapis.com", "prefixes": ["/calendar/v3/", "/drive/v3/", "/upload/drive/v3/", "/download/drive/v3/", "/drive/v2/"], "exact": ["/oauth2/v3/userinfo"]},
       {"host": "docs.googleapis.com", "prefixes": ["/v1/documents"], "exact": []},
       {"host": "sheets.googleapis.com", "prefixes": ["/v4/spreadsheets"], "exact": [], "encoded_slash": true},
       {"host": "slides.googleapis.com", "prefixes": ["/v1/presentations"], "exact": []},
@@ -216,7 +216,7 @@
     ],
     "id_token_claims": [],
     "api": [
-      {"host": "api.github.com", "prefixes": ["/user", "/users/", "/repos/", "/search/", "/orgs/", "/rate_limit"], "exact": ["/graphql"]},
+      {"host": "api.github.com", "prefixes": ["/user", "/users/", "/repos/", "/repositories/", "/search/", "/orgs/", "/rate_limit"], "exact": ["/", "/graphql"], "encoded_slash": true},
       {"host": "uploads.github.com", "prefixes": ["/repos/"], "exact": []},
       {"host": "github.com", "prefixes": [], "exact": [], "suffixes": ["/info/refs", "/git-upload-pack", "/git-receive-pack"]}
     ]
