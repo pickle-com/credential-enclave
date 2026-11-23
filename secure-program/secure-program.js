@@ -109,7 +109,9 @@
   //                   held, node}} (held: the key of this account went to a node of it)
   //   log.blocked     the blocked rounds in a row: {first_ms, count}
   //   log.sample      the newest control keys the last round verified (LOG_SAMPLE_KEYS at most)
-  //   log.seen        the digests of the control keys judged (LOG_SEEN_KEYS at most)
+  //   log.seen        the digests of the control keys judged: the index {v, parts: [n]} and one
+  //                   value log.seen.{n} for each part (LOG_SEEN_PARTS parts of LOG_SEEN_PART
+  //                   digests; the oldest part leaves when one more begins)
   //   log.missing     the keys of log.sample that left the listing within their retention
   //   log.withheld    the reads that were held back and are made again by every round: {keys:
   //                   [key], shown: [key], pages: [before_ms], watch_ms, objects, chains, nodes}
@@ -219,7 +221,17 @@
   // older than this is the age of the address (the app was suspended), not a refusal.
   const LOG_URL_FRESH_MS = 240000;
   const LOG_SAMPLE_KEYS = 64;
-  const LOG_SEEN_KEYS = 4096;
+  // The digests of the control keys the device judged are kept in parts: LOG_SEEN_PART digests
+  // each, one value of the program store for each part (log.seen.{n}), and an index that names
+  // the parts, the oldest first (log.seen). LOG_SEEN_PARTS parts are kept: when one more begins,
+  // the oldest leaves with every digest it holds. So the device remembers LOG_SEEN_KEYS
+  // judgements or more: as many as the listing pages of the rounds of one synchronization hold
+  // keys (LOG_SYNC_ROUNDS times LOG_CONTROL_PAGES pages of 1,000). A digest is SEEN_DIGEST_CHARS
+  // characters.
+  const LOG_SEEN_PART = 4096;
+  const LOG_SEEN_PARTS = 9;
+  const LOG_SEEN_KEYS = (LOG_SEEN_PARTS - 1) * LOG_SEEN_PART;
+  const SEEN_DIGEST_CHARS = 12;
   const LOG_MISSING_KEYS = 16;
   const LOG_NODES_KEPT = 256;
   // The reads that were held back that the device keeps for the rounds to make again: the keys
@@ -3460,13 +3472,12 @@
     };
     const blocked = storedObject(STORE_BLOCKED);
     const resume = storedJson(STORE_RESUME, null);
-    const seen = strings(STORE_SEEN, LOG_SEEN_KEYS);
     const missing = storedJson(STORE_MISSING, []);
     const cursor = native.storeGet(STORE_CURSOR);
     return {
       grants: loadGrants(), nodes: loadNodes(), unaccepted: storedObject(STORE_UNACCEPTED),
       blocked: { first_ms: whole(blocked.first_ms), count: whole(blocked.count) },
-      sample: strings(STORE_SAMPLE, LOG_SAMPLE_KEYS), seen: { list: seen, set: new Set(seen) },
+      sample: strings(STORE_SAMPLE, LOG_SAMPLE_KEYS), seen: loadSeen(),
       missing: (Array.isArray(missing) ? missing : []).filter(function (item) {
         return item !== null && typeof item === "object" && typeof item.key === "string";
       }).slice(0, LOG_MISSING_KEYS),
@@ -3481,12 +3492,72 @@
     };
   }
 
-  /** Remembers that a key was judged. Above LOG_SEEN_KEYS digests the ones added first leave. */
+  /** The part numbers the index of the judged keys names, the oldest first. */
+  function seenParts() {
+    const index = storedObject(STORE_SEEN);
+    return (Array.isArray(index.parts) ? index.parts : []).filter(function (number) {
+      return Number.isSafeInteger(number) && number >= 0;
+    }).slice(-LOG_SEEN_PARTS);
+  }
+
+  /** The digests of the control keys this device judged: {set, parts, gone}. parts are the kept
+   *  parts, the oldest first, each {n, text, saved} (its number, its digests one after another,
+   *  and what the program store holds of it), and gone the numbers of the parts that left. */
+  function loadSeen() {
+    const seen = { set: new Set(), parts: [], gone: [] };
+    for (const number of seenParts()) {
+      const kept = native.storeGet(STORE_SEEN + "." + number);
+      const text = typeof kept === "string" ? kept.slice(0, LOG_SEEN_PART * SEEN_DIGEST_CHARS) : "";
+      for (let at = 0; at + SEEN_DIGEST_CHARS <= text.length; at += SEEN_DIGEST_CHARS) {
+        seen.set.add(text.slice(at, at + SEEN_DIGEST_CHARS));
+      }
+      seen.parts.push({ n: number, text: text, saved: text });
+    }
+    return seen;
+  }
+
+  /** Remembers that a key was judged. A part that is full is followed by a new one, and beyond
+   *  LOG_SEEN_PARTS parts the oldest leaves with the digests it holds. */
   function markSeen(log, digest) {
-    if (log.seen.set.has(digest)) return;
-    log.seen.set.add(digest);
-    log.seen.list.push(digest);
-    if (log.seen.list.length > LOG_SEEN_KEYS) log.seen.set.delete(log.seen.list.shift());
+    const seen = log.seen;
+    if (seen.set.has(digest) || digest.length !== SEEN_DIGEST_CHARS) return;
+    seen.set.add(digest);
+    let last = seen.parts.length === 0 ? null : seen.parts[seen.parts.length - 1];
+    if (last === null || last.text.length >= LOG_SEEN_PART * SEEN_DIGEST_CHARS) {
+      last = { n: last === null ? 0 : last.n + 1, text: "", saved: null };
+      seen.parts.push(last);
+      if (seen.parts.length > LOG_SEEN_PARTS) {
+        const gone = seen.parts.shift();
+        for (let at = 0; at + SEEN_DIGEST_CHARS <= gone.text.length; at += SEEN_DIGEST_CHARS) {
+          seen.set.delete(gone.text.slice(at, at + SEEN_DIGEST_CHARS));
+        }
+        seen.gone.push(gone.n);
+      }
+    }
+    last.text += digest;
+  }
+
+  /** Writes the judged keys: the parts that changed, then the parts that left, then the index.
+   *  A runtime that ends in between leaves an index that names a part the store holds nothing
+   *  of, or misses the newest part: the device then remembers fewer judgements, and judges those
+   *  keys again. */
+  function saveSeen(seen) {
+    let changed = seen.gone.length > 0;
+    for (const part of seen.parts) {
+      if (part.saved === part.text) continue;
+      native.storeSet(STORE_SEEN + "." + part.n, part.text);
+      if (part.saved === null) changed = true;
+      part.saved = part.text;
+    }
+    for (const number of seen.gone) native.storeSet(STORE_SEEN + "." + number, null);
+    seen.gone = [];
+    if (changed) storeJson(STORE_SEEN, { v: 2, parts: seen.parts.map(function (part) { return part.n; }) });
+  }
+
+  /** Erases the judged keys from the program store: the parts, then the index. */
+  function forgetSeen() {
+    for (const number of seenParts()) native.storeSet(STORE_SEEN + "." + number, null);
+    native.storeSet(STORE_SEEN, null);
   }
 
   /** Notes a measurement no list of this program has (digest: the digest of the measurement).
@@ -3728,7 +3799,7 @@
    *  a grant to a node of a release that writes format 3, or it read that store (a listing of it
    *  named the keys it keeps). A listing page that was held back says nothing of that. */
   function storeKnown(log, kept) {
-    return log.cursor !== "" || log.seen.list.length > 0 || log.resume !== null || kept.keys.length > 0 ||
+    return log.cursor !== "" || log.seen.set.size > 0 || log.resume !== null || kept.keys.length > 0 ||
       kept.unjudged.length > 0 ||
       Object.keys(log.grants).some(function (id) { return logFormatOf(log.grants[id].release) === 3; });
   }
@@ -5123,7 +5194,7 @@
     storeJson(STORE_UNACCEPTED, log.unaccepted);
     storeJson(STORE_BLOCKED, log.blocked);
     storeJson(STORE_SAMPLE, log.sample);
-    storeJson(STORE_SEEN, log.seen.list);
+    saveSeen(log.seen);
     storeJson(STORE_MISSING, log.missing);
     saveWithheld(run);
     saveLegacy(log.legacy);
@@ -8249,8 +8320,9 @@
    *  grants, the judgements, the kept screen. The ledger of the earlier programs is not carried
    *  over again. */
   function clearLog() {
+    forgetSeen();
     for (const key of [STORE_GRANTS, STORE_CURSOR, STORE_RESUME, STORE_NODES, STORE_UNACCEPTED, STORE_BLOCKED,
-      STORE_SAMPLE, STORE_SEEN, STORE_MISSING, STORE_WITHHELD, STORE_RECOVERED, STORE_DENIED, STORE_LEGACY,
+      STORE_SAMPLE, STORE_MISSING, STORE_WITHHELD, STORE_RECOVERED, STORE_DENIED, STORE_LEGACY,
       STORE_ROUND, STORE_CACHE]) {
       native.storeSet(key, null);
     }
@@ -9535,8 +9607,9 @@
     deleteMasterKey();
     native.keychainDelete(ledgerItem());
     native.keychainDelete(mailSetupItem());
+    forgetSeen();
     for (const key of [LEDGER_STORE_KEY, LEDGER_SHARE_STORE_KEY, SEALING_CHECK_STORE_KEY, STORE_GRANTS,
-      STORE_CURSOR, STORE_RESUME, STORE_NODES, STORE_UNACCEPTED, STORE_BLOCKED, STORE_SAMPLE, STORE_SEEN,
+      STORE_CURSOR, STORE_RESUME, STORE_NODES, STORE_UNACCEPTED, STORE_BLOCKED, STORE_SAMPLE,
       STORE_MISSING, STORE_WITHHELD, STORE_RECOVERED, STORE_DENIED, STORE_LEGACY, STORE_ROUND, STORE_CACHE,
       STORE_MIGRATED, STORE_OUTCOMES, STORE_VAULT_MADE].concat(RETIRED_STORE_KEYS)) {
       native.storeSet(key, null);

@@ -132,6 +132,14 @@ function heldReads(world) {
   return kept.keys.length + kept.pages.length === 0 && Object.keys(kept).length === 3 ? undefined : kept;
 }
 
+/** The number of control keys the device remembers as judged (log.seen: the index and its parts,
+ *  each part the digests of 12 characters one after another). */
+function judgedKeys(world) {
+  const index = world.stored("log.seen");
+  if (index === undefined) return 0;
+  return index.parts.reduce((sum, number) => sum + (world.store.get("log.seen." + number) || "").length / 12, 0);
+}
+
 /** The addresses of the listings of node documents the program called at the store. */
 function documentListings(world) {
   return world.sent("S3 ").map((request) => new URL(request.url))
@@ -1042,17 +1050,21 @@ test("A3: a synchronization has rounds follow one another while each ends with m
   assert.equal(world.state.log.status, "attention");
   assert.equal(world.stored("log.blocked").count, 4);
   assert.equal(world.stored("log.round").unfinished, 40);
-  // The objects stop arriving. More of them lie under the prefix than the device remembers
-  // judgements of (4,096), so no walk through the listing ends with every key judged: the mark
-  // stays.
-  for (let turn = 0; turn < 3; turn += 1) {
+  // The objects stop arriving: the rounds judge the rest, and the walk through the listing that
+  // leaves no key unjudged clears the mark. The device remembers the judgement of every one of
+  // the 7,500 objects (in two parts of the program store).
+  for (let turn = 0; turn < 8 && world.state.log.status !== "verified"; turn += 1) {
     world.advance(2 * 60000);
     await S.event(fx, "foreground");
     await world.settle(1000);
   }
-  assert.equal(world.state.log.status, "attention");
-  assert.equal(world.state.log.store, "blocked");
-  assert.equal(world.stored("log.blocked").count, 7);
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(world.state.log.store, "verified");
+  assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  assert.equal(world.stored("log.round").unfinished, 0);
+  assert.equal(world.securityStatuses.slice(-1)[0].status, "ok");
+  assert.equal(judgedKeys(world), 7501);
+  assert.deepEqual(world.stored("log.seen"), { v: 2, parts: [0, 1] });
 });
 
 test("a listing longer than the pages of one round is walked over several rounds, and a walk in which a round left keys unjudged does not end as a reading that read everything: the rounds walk again until every key is judged", async () => {
@@ -1070,7 +1082,7 @@ test("a listing longer than the pages of one round is walked over several rounds
       b64u(crypto.randomBytes(32)) + ".1.grant_revoked." + fx.keys.keyId + "." + b64u(crypto.randomBytes(32)), "x");
   }
   const before = world.reports.length;
-  const judged = world.stored("log.seen").length;
+  const judged = judgedKeys(world);
   await nextDay(fx);
   await world.settle(1000);
   // The second round ends the first walk: it judged every key of the page it listed, and the
@@ -1079,7 +1091,7 @@ test("a listing longer than the pages of one round is walked over several rounds
   const told = world.reports.slice(before).map((report) => report.status);
   assert.deepEqual(told, Array(told.length - 1).fill("pending").concat(["verified"]));
   assert.ok(told.length > 2);
-  assert.equal(world.stored("log.seen").length, judged + 450);
+  assert.equal(judgedKeys(world), judged + 450);
   assert.equal(world.stored("log.round").unfinished, 0);
   assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
   assert.equal(heldReads(world), undefined);
@@ -1099,7 +1111,7 @@ test("an account with more to read than one round reads is read to its end by th
   await S.start(long);
   await long.world.settle(1000);
   assert.deepEqual(told(long.world), Array(5).fill("pending:truncated:0").concat(["verified:verified:0"]));
-  assert.equal(long.world.stored("log.seen").length, 61);
+  assert.equal(judgedKeys(long.world), 61);
   assert.equal(long.world.stored("log.round").unfinished, 0);
 
   // Control entries of 300 nodes of the accepted measurement that this device has no judgement
@@ -1132,7 +1144,7 @@ test("an account with more to read than one round reads is read to its end by th
   await S.event(deep, "foreground");
   await deep.world.settle(1000);
   assert.deepEqual(told(deep.world).slice(8), Array(7).fill("pending:blocked:1").concat(["verified:verified:0"]));
-  assert.equal(deep.world.stored("log.seen").length, 61);
+  assert.equal(judgedKeys(deep.world), 61);
   assert.deepEqual(deep.world.stored("log.blocked"), { first_ms: 0, count: 0 });
   assert.ok(deep.world.securityStatuses.every((status) => status.status !== "attention"));
 });
@@ -1152,13 +1164,13 @@ test("a round whose time runs out is judged on what it read and keeps it: slow a
   world.fault("S3 " + world.shardHost, { delay_ms: 9000 });
   await S.start(fx);
   assert.equal(world.state.log.status + ":" + world.state.log.store + ":" + world.state.log.store_failure, "pending:truncated:round:time");
-  assert.equal(world.stored("log.seen").length, 6);
+  assert.equal(judgedKeys(world), 6);
   // The rounds that follow run while the app stays in the foreground: each judged the keys of
   // the pages it read, and the next did not read them again.
   await world.settle(10 * 60000);
   assert.deepEqual(world.reports.map((report) => report.status + ":" + report.store + ":" + report.store_failure + ":" + report.keys_checked),
     ["pending:truncated:round:time:6", "pending:truncated:round:time:6", "pending:truncated:round:time:6", "verified:verified::3"]);
-  assert.equal(world.stored("log.seen").length, 21);
+  assert.equal(judgedKeys(world), 21);
   assert.equal(world.stored("log.round").unfinished, 0);
   assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
 });
@@ -1196,7 +1208,7 @@ test("a round whose time passed judges and writes what it kept before the next r
   assert.equal(world.reports[0].store_failure, "round:time");
   // What the first round judged is kept: the rounds after it read on, and the log verifies.
   assert.equal(world.state.log.status, "verified");
-  assert.equal(world.stored("log.seen").length, 21);
+  assert.equal(judgedKeys(world), 21);
   assert.equal(world.stored("log.round").unfinished, 0);
 });
 
@@ -1396,7 +1408,7 @@ test("a round ends its reading when the app goes to the background: it sends not
   const fx = S.fixture(source, { device: { securityStatus: true } });
   await S.start(fx);
   const world = fx.world;
-  const judged = world.stored("log.seen").length;
+  const judged = judgedKeys(world);
   // Three control entries of the node of the device, and one of a node of a measurement no list
   // has (the key of the account is at that node).
   const written = [];
@@ -1441,19 +1453,19 @@ test("a round ends its reading when the app goes to the background: it sends not
   assert.deepEqual(heldReads(world), { keys: [], shown: [], pages: [], unjudged: written.map((entry) => entry.key).concat([moved.key]) });
   assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
   assert.equal(world.stored("log.round").unfinished, 0);
-  assert.equal(world.stored("log.seen").length, judged);
+  assert.equal(judgedKeys(world), judged);
   // The second stay: the round asks for those keys and for no listing. The three entries of the
   // node of the device are judged, and the document of the other node says of which measurement
   // it is; its entry is asked for when the app leaves.
   assert.deepEqual(await stay(), ["documents", "bodies", "bodies"]);
   assert.deepEqual(heldReads(world), { keys: [], shown: [], pages: [], unjudged: [moved.key] });
-  assert.equal(world.stored("log.seen").length, judged + 3);
+  assert.equal(judgedKeys(world), judged + 3);
   assert.equal(world.state.log.newer_release_nodes, 0);
   // The third stay: the entry of the other node is read before the listing is asked for. The key
   // of the account is at a measurement no list has: pending for a day.
   assert.deepEqual(await stay(), ["bodies", "read"]);
   assert.equal(heldReads(world), undefined);
-  assert.equal(world.stored("log.seen").length, judged + 4);
+  assert.equal(judgedKeys(world), judged + 4);
   assert.equal(world.state.log.status, "pending");
   assert.equal(world.state.log.newer_release_nodes, 1);
   assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
@@ -2431,7 +2443,7 @@ test("a runtime that ends in the middle of a read of the log leaves what the dev
   await S.event(fx, "foreground");
   assert.notEqual(world.stored("log.recovered"), undefined);
   await S.event(fx, "account_end", { reason: "account_deleted" });
-  for (const key of ["log.recovered", "log.withheld", "log.denied", "log.cache", "log.round"]) {
+  for (const key of ["log.recovered", "log.withheld", "log.denied", "log.cache", "log.round", "log.seen", "log.seen.0"]) {
     assert.equal(world.store.get(key), undefined, key);
   }
 });
@@ -3635,7 +3647,7 @@ test("a listing longer than the pages of one round is read on by the next round,
   assert.deepEqual(world.reports.map((report) => report.status + ":" + report.store + ":" + report.keys_checked),
     ["pending:truncated:12", "verified:verified:9"]);
   assert.equal(world.state.log.status, "verified");
-  assert.equal(world.stored("log.seen").length, 21);
+  assert.equal(judgedKeys(world), 21);
   // A round after it reads the listing from its start and asks for no body.
   const bodies = world.sent("POST /api/secure/log/bodies").length;
   world.pageSize = 1000;
