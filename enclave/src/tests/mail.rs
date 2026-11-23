@@ -758,13 +758,14 @@ async fn mixed_admission_scenario() -> Value {
     .await;
     let (harness, app, record) = server.harness().await;
     let harness = Arc::new(harness);
-    // A budget with room for two folder listings that wait for their login and for 16 KiB
-    // more: a third mail call is refused while the small HTTP calls still fit. The rest of
-    // the budget of the node is held here.
+    // A budget with room for two folder listings that wait for their login and for 32 KiB
+    // more: a third mail call is refused while the small HTTP calls still fit, each with its
+    // frame and the share of its credential (about 25 KiB before its record is open). The
+    // rest of the budget of the node is held here.
     let listing = frame_of(&record, &json!({"action":"folders"}), b"").len()
         + mail::CALL_BYTES
         + mail::SHARE_STEP_BYTES;
-    let free = 2 * listing + 16 * 1024;
+    let free = 2 * listing + 32 * 1024;
     let _rest = harness
         .node
         .body_budget
