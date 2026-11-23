@@ -20,7 +20,7 @@ use credential_enclave_protocol::secret::Secret;
 use credential_enclave_protocol::ProtocolError;
 use hyper::body::Bytes;
 use serde_json::Value;
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::{OwnedSemaphorePermit, SemaphorePermit};
 
 use super::responses::forward_frame;
 use super::{invalid, read_body, record_of, respond, ApiError, JsonBody};
@@ -63,11 +63,61 @@ const REFUSED_HEADERS: [&str; 3] = [
 ];
 
 pub(super) const TIMEOUT_DEFAULT_MS: u64 = 30_000;
+/// Longest time a `forward` or `forward/batch` call waits to be admitted: for one of the places
+/// of the forward calls of the node and for the share of the body budget its request frame
+/// occupies (enclave.md section 8).
+#[cfg(not(test))]
+pub(crate) const ADMISSION_WAIT: Duration = Duration::from_secs(30);
+/// The tests of the node wait for a shorter time: a test that holds every place does not
+/// take 30 seconds.
+#[cfg(test)]
+pub(crate) const ADMISSION_WAIT: Duration = Duration::from_millis(400);
 pub(super) const TIMEOUT_MIN_MS: u64 = 1_000;
 pub(super) const TIMEOUT_MAX_MS: u64 = 120_000;
 
 pub async fn forward(State(node): State<Arc<Node>>, request: Request) -> Response {
     respond(run(&node, request).await)
+}
+
+/// The admission of a call that takes one of the places of the forward calls of the node
+/// (`forward`, `forward/batch`): its place, and the share of the body budget its request frame
+/// occupies. A call waits for the two together for at most [`ADMISSION_WAIT`], counted from
+/// the moment it began, and ends with `capacity_unavailable` when it has not got them by then.
+/// It has read nothing of its frame at that point: the frame enters memory only under its
+/// share of the budget.
+///
+/// The limit is what bounds the time a connection is held by a call that does nothing yet.
+/// The node reads nothing from the connection of a call that waits, so it does not learn
+/// that the caller of such a call is gone (enclave.md section 8).
+pub(super) struct Admission {
+    until: tokio::time::Instant,
+}
+
+impl Admission {
+    /// The admission of a call that begins now.
+    pub(super) fn begin() -> Admission {
+        Admission {
+            until: tokio::time::Instant::now() + ADMISSION_WAIT,
+        }
+    }
+
+    /// One of the places of the forward calls of the node, held until it is dropped.
+    pub(super) async fn slot<'a>(&self, node: &'a Node) -> Result<SemaphorePermit<'a>, ApiError> {
+        let slot = node.forward_slots.acquire();
+        match tokio::time::timeout_at(self.until, slot).await {
+            Ok(Ok(slot)) => Ok(slot),
+            Ok(Err(_)) => Err(ApiError::internal()),
+            Err(_) => Err(ProtocolError::CapacityUnavailable.into()),
+        }
+    }
+
+    /// `bytes` of the body budget of the node, for the request frame of the call.
+    async fn budget(&self, node: &Node, bytes: usize) -> Result<OwnedSemaphorePermit, ApiError> {
+        match tokio::time::timeout_at(self.until, reserve(node, bytes)).await {
+            Ok(reserved) => reserved,
+            Err(_) => Err(ProtocolError::CapacityUnavailable.into()),
+        }
+    }
 }
 
 /// Takes `bytes` of the body budget of the node, waiting for them.
@@ -294,10 +344,12 @@ pub(super) async fn execute(
 }
 
 /// The frame of a call: its meta (a JSON object) and its payload, read under a reservation of
-/// the body budget for the declared length of the request.
+/// the body budget for the declared length of the request. The call waits for that
+/// reservation within the time of its admission.
 pub(super) async fn read_frame(
     node: &Node,
     request: Request,
+    admission: &Admission,
 ) -> Result<(JsonBody, Bytes, OwnedSemaphorePermit), ApiError> {
     let frame_limit = 4 + META_LIMIT_BYTES + node.limits.body_bytes;
     let declared = request
@@ -308,7 +360,9 @@ pub(super) async fn read_frame(
     if declared.is_some_and(|length| length > frame_limit) {
         return Err(ProtocolError::TooLarge.into());
     }
-    let request_budget = reserve(node, declared.unwrap_or(frame_limit)).await?;
+    let request_budget = admission
+        .budget(node, declared.unwrap_or(frame_limit))
+        .await?;
     let frame_bytes = Bytes::from(read_body(request, frame_limit).await?);
     let (meta, payload) = frame::decode(&frame_bytes)?;
     drop(frame_bytes);
@@ -319,15 +373,13 @@ pub(super) async fn read_frame(
 }
 
 async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
-    // At most 512 forward calls run at the same time. A further call waits for a slot.
-    let _slot = node
-        .forward_slots
-        .acquire()
-        .await
-        .map_err(|_| ApiError::internal())?;
+    // At most 512 forward calls run at the same time. A further call waits for a slot, for
+    // the time of its admission at the longest.
+    let admission = Admission::begin();
+    let _slot = admission.slot(node).await?;
 
     // The request frame enters memory only after its share of the body budget is reserved.
-    let (meta, payload, request_budget) = read_frame(node, request).await?;
+    let (meta, payload, request_budget) = read_frame(node, request, &admission).await?;
     let user_id = meta.user_id()?;
     let record = record_of(&meta, "record")?;
     let context = meta.context()?;

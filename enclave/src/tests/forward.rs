@@ -1381,3 +1381,69 @@ async fn a_get_over_an_idle_connection_that_ends_without_a_response_is_sent_once
     assert_eq!(harness.head_seq("user-1"), 4);
     assert_budget_is_free(&harness);
 }
+
+#[tokio::test]
+async fn a_call_that_is_not_admitted_within_the_limit_ends_and_holds_nothing() {
+    let provider = provider_with_log_store(|_| {
+        Reply::with_body(200, &[("content-type", "application/json")], b"{}")
+    })
+    .await;
+    let harness = Harness::with(
+        &provider,
+        Definitions::embedded(),
+        Limits {
+            forward_concurrency: 1,
+            ..Limits::default()
+        },
+    );
+    harness.use_log_store().await;
+    let app = App::new("user-1", 1);
+    app.grant(&harness).await;
+    let record = google_record(&app);
+    let call = || meta(&app, &record, "GET", PROFILE, json!([]));
+    let stored = provider.stored().len();
+    let requests = provider.requests().len();
+    let wait = crate::api::ADMISSION_WAIT;
+
+    // Another call holds the one place of the forward calls. A call that arrives waits for
+    // the place for the time of its admission, and then ends: it has read nothing of its
+    // frame, created no entry and sent nothing.
+    let place = harness.node.forward_slots.try_acquire().unwrap();
+    let started = Instant::now();
+    assert_eq!(
+        failure(harness.forward(call(), b"").await),
+        (503, "capacity_unavailable".to_string())
+    );
+    assert!(started.elapsed() >= wait, "{:?}", started.elapsed());
+    let batch = json!({
+        "user_id": app.user_id, "record": record, "context": "cli:gog",
+        "requests": [{"method": "GET", "url": PROFILE, "headers": [], "body_bytes": 0}],
+    });
+    let batched = harness.forward_batch(batch, b"").await;
+    assert_eq!(batched.err().map(|(status, _)| status), Some(503));
+    drop(place);
+
+    // The place is free, and the body budget is taken: the call has its place and waits for
+    // the share of its request frame, within the same time. It gives its place back.
+    let all = u32::try_from(harness.node.limits.body_budget_bytes).unwrap();
+    let budget = harness
+        .node
+        .body_budget
+        .clone()
+        .try_acquire_many_owned(all)
+        .unwrap();
+    let started = Instant::now();
+    assert_eq!(
+        failure(harness.forward(call(), b"").await),
+        (503, "capacity_unavailable".to_string())
+    );
+    assert!(started.elapsed() >= wait, "{:?}", started.elapsed());
+    assert_eq!(harness.node.forward_slots.available_permits(), 1);
+    assert_eq!(provider.stored().len(), stored);
+    assert_eq!(provider.requests().len(), requests);
+
+    // A call that is admitted within the time runs as before.
+    drop(budget);
+    assert_eq!(harness.forward(call(), b"").await.unwrap().status, 200);
+    assert_budget_is_free(&harness);
+}

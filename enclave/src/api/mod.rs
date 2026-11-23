@@ -48,6 +48,8 @@ pub mod responses;
 mod revoke;
 mod status;
 
+#[cfg(test)]
+pub(crate) use forward::ADMISSION_WAIT;
 pub use responses::json_ok;
 use responses::{json_error, ErrorBody};
 
