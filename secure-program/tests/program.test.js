@@ -19,8 +19,18 @@ const S = require("./scenarios.js");
 
 const PROGRAM_PATH = path.join(__dirname, "..", "secure-program.js");
 const source = fs.readFileSync(PROGRAM_PATH, "utf8");
-const VECTORS_PATH = process.env.SECURE_PROGRAM_VECTORS || path.join(__dirname, "..", "..", "protocol", "vectors.json");
-const vectors = JSON.parse(fs.readFileSync(VECTORS_PATH, "utf8"));
+// The vectors: protocol/vectors.json of this checkout, or the files SECURE_PROGRAM_VECTORS names
+// (paths separated by commas; a later file adds the vectors the files before it do not have). A
+// test of vectors a file set does not hold is skipped.
+const VECTORS_PATHS = (process.env.SECURE_PROGRAM_VECTORS || path.join(__dirname, "..", "..", "protocol", "vectors.json"))
+  .split(",").map((item) => item.trim()).filter((item) => item !== "");
+const vectors = {};
+for (const file of VECTORS_PATHS) {
+  const read = JSON.parse(fs.readFileSync(file, "utf8"));
+  for (const name of Object.keys(read)) {
+    if (vectors[name] === undefined) vectors[name] = read[name];
+  }
+}
 const { b64u, bytes, utf8, concat } = bridge;
 const { HOUR_MS, DAY_MS } = S;
 
@@ -1137,4 +1147,377 @@ test("the app is told ok, pending and attention, and an attention is not covered
   await S.start(plain);
   assert.equal(plain.world.securityStatuses.length, 0);
   assert.equal(plain.world.state.log.status, "verified");
+});
+
+// ---- The lines, the locks and the time limits ----
+
+/** A web session of a fixture: the user completes the authorization after ms and the session
+ *  returns the callback of the connection. */
+function webSession(fx, ms) {
+  return (args) => fx.world.sleep(ms).then(() => {
+    const nodeState = new URL(args.url).searchParams.get("state").split(".")[0];
+    fx.world.connections.get(nodeState).completed = true;
+    return "pickle://oauth?oauth_status=connected&oauth_state=" + nodeState;
+  });
+}
+
+/** The outcome of a call of a procedure as a value. */
+function outcomeOf(promise) {
+  return promise.then(
+    (value) => ({ ok: true, value: value === undefined ? undefined : JSON.parse(JSON.stringify(value)) }),
+    (error) => ({ ok: false, code: error && error.code ? error.code : String(error) }));
+}
+
+test("the time a user spends in a web session ends no wait: the connection completes, the procedure behind it runs after it, and neither is counted as slow", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  world.device.webAuth = webSession(fx, 10 * 60000);
+  const began = world.now;
+  const results = await world.run(Promise.all([
+    outcomeOf(fx.program.procedures.connect({ target: "google_workspace" })),
+    outcomeOf(fx.program.procedures.store_login({ name: "", username: "user" })),
+  ]));
+  assert.deepEqual(results[0], { ok: true, value: { connection_id: "connection-1", provider: "google_workspace", reward: 0 } });
+  assert.equal(results[1].ok, true);
+  assert.ok(world.now - began >= 10 * 60000);
+  // The calls took ten minutes of the clock and next to nothing of their counted time.
+  await world.settle(10000);
+  assert.equal(world.outcomeReports.length, 0);
+  const kept = world.stored("outcomes");
+  assert.equal(kept.done.connect.calls, 1);
+  assert.equal(kept.done.connect.failed, 0);
+  assert.ok(kept.done.connect.max_ms < 1000);
+  assert.ok(kept.done.store_login.wait_ms < 1000);
+});
+
+test("a request that is not answered fails with timeout at its limit, and the line and the lock go on to the next piece of work", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  world.advance(2 * HOUR_MS);
+  // The account query of a synchronization is never answered: the synchronization holds the lock
+  // of the grants until the limit of the request, then fails; the connection that waited for the
+  // lock goes on.
+  world.fault("GET /api/secure/account", "hang", 1);
+  world.device.webAuth = webSession(fx, 1000);
+  const began = world.now;
+  const sync = outcomeOf(fx.program.procedures.sync({}));
+  const connect = outcomeOf(fx.program.procedures.connect({ target: "google_workspace" }));
+  const results = await world.run(Promise.all([sync, connect]));
+  assert.deepEqual(results[0], { ok: false, code: "timeout" });
+  assert.equal(results[1].ok, true);
+  assert.ok(world.now - began >= 30000 && world.now - began < 40000, String(world.now - began));
+  assert.equal(world.state.error, "timeout");
+  // The next synchronization clears the failure.
+  world.advance(HOUR_MS);
+  await S.event(fx, "foreground");
+  assert.equal(world.state.error, undefined);
+});
+
+test("the three lines do not wait for one another: while the read of the log screen hangs, a procedure of the user and a synchronization end", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  world.advance(2 * HOUR_MS);
+  world.fault("S3 ", "hang");
+  const began = world.now;
+  // read_log answers from what the device kept after its wait, and its read of the store goes on.
+  const shown = await world.run(outcomeOf(fx.program.procedures.read_log({ limit: 50 })));
+  assert.equal(shown.ok, true);
+  assert.equal(shown.value.cached, true);
+  assert.equal(shown.value.status, "pending");
+  assert.ok(world.now - began <= 3500);
+  const stored = await world.run(outcomeOf(fx.program.procedures.store_login({ name: "", username: "user" })));
+  assert.equal(stored.ok, true);
+  const synced = await world.run(outcomeOf(fx.program.procedures.sync({})));
+  assert.equal(synced.ok, true);
+  assert.ok(world.now - began <= 4000, String(world.now - began));
+  // A second page of the screen waits for the line of the screen, and for nothing else.
+  const page = outcomeOf(fx.program.procedures.read_log_page({ before_ms: world.now }));
+  const again = await world.run(outcomeOf(fx.program.procedures.store_login({ name: "", username: "user" })));
+  assert.equal(again.ok, true);
+  world.clearFaults();
+  await world.run(page);
+});
+
+test("a synchronization that waits serves the triggers that arrive while it waits, and the synchronization that runs serves an event of the app that arrives right after its start", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  world.advance(2 * HOUR_MS);
+  const before = world.sent("GET /api/secure/account").length;
+  world.fault("GET /api/secure/account", { delay_ms: 8000 }, 1);
+  const first = fx.program.onEvent("foreground", {});
+  const same = fx.program.onEvent("foreground", {});
+  await world.settle(6000);
+  // Six seconds later the running one is no longer fresh: one more is put on the line, and the
+  // triggers after it join that one.
+  const second = fx.program.onEvent("push", { reason: "refresh" });
+  const third = fx.program.onEvent("push", { reason: "grant_required" });
+  const fourth = fx.program.procedures.sync({});
+  await world.run(Promise.all([first, same, second, third, fourth]));
+  await world.settle(0);
+  assert.equal(world.sent("GET /api/secure/account").length, before + 2);
+  assert.deepEqual(world.syncReports.map((report) => report.reason), ["refresh", "grant_required"]);
+});
+
+// ---- The outcomes of the procedures ----
+
+test("a procedure that failed is reported with its code and its times five seconds later, and what the backend accepted leaves the device", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  world.fault("PUT /api/secure/vault/login", { status: 503, body: { detail: "unavailable" }, delay_ms: 1200 }, 1);
+  const failed = await S.call(fx, "store_login", { name: "", username: "user" });
+  assert.deepEqual(failed, { ok: false, code: "unavailable" });
+  const fine = await S.call(fx, "store_login", { name: "", username: "user" });
+  assert.equal(fine.ok, true);
+  assert.equal(world.outcomeReports.length, 0);
+  await world.settle(5000);
+  assert.equal(world.outcomeReports.length, 1);
+  const report = world.outcomeReports[0];
+  assert.equal(report.program_version, 43);
+  assert.deepEqual(report.bounds_ms, [250, 1000, 3000, 10000, 30000]);
+  assert.ok(report.since_ms <= report.until_ms);
+  const done = report.done.find((item) => item.name === "store_login");
+  assert.equal(done.calls, 2);
+  assert.equal(done.failed, 1);
+  assert.deepEqual(done.classes, [1, 0, 1, 0, 0, 0]);
+  assert.ok(done.max_ms >= 1200 && done.total_ms >= 1200);
+  assert.equal(report.events.length, 1);
+  assert.deepEqual(Object.keys(report.events[0]).sort(), ["at_ms", "code", "name", "total_ms", "wait_ms"]);
+  assert.equal(report.events[0].name, "store_login");
+  assert.equal(report.events[0].code, "unavailable");
+  assert.deepEqual(report.interrupted, []);
+  assert.equal(report.dropped, 0);
+  // The synchronization of the start of the runtime is counted under the name of an event.
+  assert.ok(report.done.some((item) => item.name === "event_sync" && item.failed === 0));
+  // Nothing of the arguments of a call is in a report.
+  assert.ok(JSON.stringify(report).indexOf("user") < 0);
+  const kept = world.stored("outcomes");
+  assert.deepEqual(kept.done, {});
+  assert.deepEqual(kept.events, []);
+});
+
+test("a call the user closed is not counted as failed, and a call cut off with its runtime is reported as interrupted by the next runtime", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  world.device.webAuth = () => null;
+  const closed = await S.call(fx, "connect", { target: "google_workspace" });
+  assert.deepEqual(closed, { ok: false, code: "cancelled" });
+  await world.settle(6000);
+  assert.equal(world.outcomeReports.length, 0);
+  assert.equal(world.stored("outcomes").done.connect.failed, 0);
+  // A call that never ends: the app goes to the background and its process is ended.
+  world.fault("PUT /api/secure/vault/login", "hang");
+  const called = world.now;
+  fx.program.procedures.store_login({ name: "", username: "user" }).then(() => {}, () => {});
+  await world.settle(2000);
+  fx.program.onEvent("background", {});
+  const gone = world.now;
+  world.clearFaults();
+  world.advance(HOUR_MS);
+  await S.start(fx);
+  await world.settle(6000);
+  const report = world.outcomeReports.slice(-1)[0];
+  assert.deepEqual(report.interrupted, [{ name: "store_login", called_ms: called, found_ms: called + 2000 + HOUR_MS, background_ms: gone }]);
+  assert.deepEqual(world.stored("outcomes").interrupted, []);
+});
+
+test("a backend without the route of the outcomes is asked once in a runtime", async () => {
+  const fx = S.fixture(source);
+  fx.world.routes.outcomes = false;
+  await S.start(fx);
+  const world = fx.world;
+  world.fault("PUT /api/secure/vault/login", { status: 503, body: { detail: "unavailable" } });
+  for (let turn = 0; turn < 3; turn += 1) {
+    await S.call(fx, "store_login", { name: "", username: "user" });
+    await world.settle(6000);
+  }
+  assert.equal(world.sent("POST /api/secure/procedures/outcomes").length, 1);
+});
+
+// ---- The vault secrets ----
+
+/** Whether a value occurs in anything the program sent, published, kept or logged. */
+function leaked(world, value) {
+  const sent = world.requests.some((request) => JSON.stringify(request).indexOf(value) >= 0);
+  const published = JSON.stringify([world.state, world.runtime]).indexOf(value) >= 0;
+  const kept = Array.from(world.store.values()).some((text) => text.indexOf(value) >= 0);
+  return sent || published || kept || world.logs.some((line) => line.indexOf(value) >= 0);
+}
+
+test("store_secret seals the value with the name and the reach the backend gave into a record of kind vault_secret, padded to a step, and the value is in no request", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  assert.equal(world.runtime.protected_sheets, false);
+  const value = "sk-live-0123456789abcdefghij";
+  const stored = await S.call(fx, "store_secret", {
+    label: "OpenAI API key", sites: ["api.openai.com"], slots: "header:authorization", value: value,
+  });
+  assert.deepEqual(stored, { ok: true, value: { name: "SECRET_1", state: "ready" } });
+  const item = world.vault.secrets.get("SECRET_1");
+  assert.deepEqual(Object.keys(item.record).sort(), ["ct", "custody", "id", "key_id", "kind", "nonce", "provider", "user_id", "v"]);
+  assert.equal(item.record.kind, "vault_secret");
+  assert.equal(item.record.provider, "vault");
+  assert.equal(item.record.custody, "enclave");
+  const plain = openRecord(fx.keys, item.record);
+  assert.deepEqual(Object.keys(plain.json), ["value", "name", "sites", "slots", "source", "pad"]);
+  assert.deepEqual(
+    { value: plain.json.value, name: plain.json.name, sites: plain.json.sites, slots: plain.json.slots, source: plain.json.source },
+    { value: value, name: "SECRET_1", sites: ["api.openai.com"], slots: ["header:authorization"], source: "device" });
+  assert.ok(/^\.*$/.test(plain.json.pad));
+  assert.equal(plain.bytes.length, 256);
+  assert.equal(leaked(world, value), false);
+  // A longer value takes the next step, and one beyond the last step is refused before any request.
+  const long = await S.call(fx, "store_secret", { name: "SECRET_1", value: "x".repeat(300) });
+  assert.equal(long.ok, true);
+  assert.equal(openRecord(fx.keys, world.vault.secrets.get("SECRET_1").record).bytes.length, 512);
+  const before = world.sent("PUT /api/secure/vault/secret").length;
+  assert.deepEqual(await S.call(fx, "store_secret", { name: "SECRET_1", value: "x".repeat(12300) }), { ok: false, code: "too_large" });
+  assert.deepEqual(await S.call(fx, "store_secret", { name: "SECRET_1", value: "" }), { ok: false, code: "invalid_input" });
+  assert.equal(world.sent("PUT /api/secure/vault/secret").length, before);
+  // A reach of another form that the backend gives is refused: nothing is sealed under it.
+  world.vault.secrets.get("SECRET_1").slots = ["field", "path"];
+  assert.deepEqual(await S.call(fx, "store_secret", { name: "SECRET_1", value: value }), { ok: false, code: "invalid_response" });
+});
+
+test("in a build with the protected sheets the value comes from the input sheet and goes to the display sheet, with the lines of the reach that is sealed", async () => {
+  const fx = S.fixture(source, { device: { sheets: true, locale: "en-US" } });
+  await S.start(fx);
+  const world = fx.world;
+  assert.equal(world.runtime.protected_sheets, true);
+  const value = "4821";
+  world.device.promptAnswer = value;
+  world.vault.secrets.set("COUPAY_PIN", {
+    name: "COUPAY_PIN", label: "Coupay PIN", sites: ["coupang.com"], slots: ["field"], state: "empty", source: "",
+  });
+  // The argument value of a definition is not what is sealed.
+  const stored = await S.call(fx, "store_secret", { name: "COUPAY_PIN", value: "from-the-definition" });
+  assert.deepEqual(stored, { ok: true, value: { name: "COUPAY_PIN", state: "ready" } });
+  assert.deepEqual(world.device.prompts, [{ title: "Coupay PIN", destinations: ["coupang.com and the hosts below it · typed into its pages"] }]);
+  const plain = openRecord(fx.keys, world.vault.secrets.get("COUPAY_PIN").record).json;
+  assert.equal(plain.value, value);
+  assert.deepEqual(plain.sites, ["coupang.com"]);
+  assert.deepEqual(plain.slots, ["field"]);
+  // The display: the device owner is asked before the query, and the result carries no value.
+  const queries = world.sent("GET /api/secure/vault/secret/COUPAY_PIN").length;
+  world.device.ownerAuth = false;
+  assert.deepEqual(await S.call(fx, "reveal_secret", { name: "COUPAY_PIN" }), { ok: false, code: "auth_failed" });
+  assert.equal(world.sent("GET /api/secure/vault/secret/COUPAY_PIN").length, queries);
+  world.device.ownerAuth = true;
+  const shown = await S.call(fx, "reveal_secret", { name: "COUPAY_PIN" });
+  assert.deepEqual(shown, { ok: true, value: { name: "COUPAY_PIN" } });
+  assert.deepEqual(world.device.presented, [{
+    title: "Coupay PIN", value: value, destinations: ["coupang.com and the hosts below it · typed into its pages"],
+  }]);
+  // A sheet the user closed stores nothing and is not a failure of the procedure.
+  world.device.promptAnswer = null;
+  const puts = world.sent("PUT /api/secure/vault/secret").length;
+  assert.deepEqual(await S.call(fx, "store_secret", { name: "COUPAY_PIN" }), { ok: false, code: "cancelled" });
+  assert.equal(world.sent("PUT /api/secure/vault/secret").length, puts);
+});
+
+test("reveal_secret opens a record of kind vault_secret of the name asked for and no other, update_secret seals the value again under the same id with the new reach, and delete_secret asks the device owner first", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  const value = "sk-live-0123456789abcdefghij";
+  await S.call(fx, "store_secret", { label: "key", sites: ["api.openai.com"], slots: ["header:authorization"], value: value });
+  const shown = await S.call(fx, "reveal_secret", { name: "SECRET_1" });
+  assert.deepEqual(shown, {
+    ok: true, value: { name: "SECRET_1", value: value, sites: ["api.openai.com"], slots: ["header:authorization"], source: "device" },
+  });
+  assert.equal(world.device.ownerAuths.length, 1);
+  // A record whose plaintext names another name, and a record of another kind, are not shown.
+  const item = world.vault.secrets.get("SECRET_1");
+  world.vault.secrets.set("OTHER", Object.assign({}, item, { name: "OTHER" }));
+  assert.deepEqual(await S.call(fx, "reveal_secret", { name: "OTHER" }), { ok: false, code: "record_invalid" });
+  world.vault.secrets.set("LOGIN", Object.assign({}, item, { name: "LOGIN", record: makeRecord(fx, "vault_password", { value: "typed-by-the-user" }) }));
+  assert.deepEqual(await S.call(fx, "reveal_secret", { name: "LOGIN" }), { ok: false, code: "record_invalid" });
+  // The reach changes: the same id, the new reach in the plaintext, the source as it was.
+  const id = item.record.id;
+  const changed = await S.call(fx, "update_secret", { name: "SECRET_1", sites: "api.openai.com,files.openai.com", slots: "header:authorization" });
+  assert.deepEqual(changed, { ok: true, value: { name: "SECRET_1", sites: ["api.openai.com", "files.openai.com"], slots: ["header:authorization"] } });
+  const sealed = world.vault.secrets.get("SECRET_1").record;
+  assert.equal(sealed.id, id);
+  const plain = openRecord(fx.keys, sealed).json;
+  assert.deepEqual([plain.value, plain.name, plain.sites, plain.source], [value, "SECRET_1", ["api.openai.com", "files.openai.com"], "device"]);
+  assert.deepEqual(await S.call(fx, "update_secret", { name: "SECRET_1", sites: ["Api.OpenAI.com"], slots: ["field"] }), { ok: false, code: "invalid_input" });
+  // The deletion: no request without the device owner.
+  world.device.ownerAuth = false;
+  assert.deepEqual(await S.call(fx, "delete_secret", { name: "SECRET_1" }), { ok: false, code: "auth_failed" });
+  assert.equal(world.vault.secrets.has("SECRET_1"), true);
+  world.device.ownerAuth = true;
+  assert.deepEqual(await S.call(fx, "delete_secret", { name: "SECRET_1" }), { ok: true, value: { name: "SECRET_1" } });
+  assert.equal(world.vault.secrets.has("SECRET_1"), false);
+  assert.equal(leaked(world, value), false);
+});
+
+test("reveal_login_password shows a password a node made and none the user typed", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  const made = makeRecord(fx, "vault_password", { value: "made-by-the-vault", source: "operator" });
+  const earlier = makeRecord(fx, "vault_password", { value: "made-before", source: "operator" });
+  const typed = makeRecord(fx, "vault_password", { value: "typed-by-the-user" });
+  world.vault.logins.set("shop.example", {
+    current: { made_by: "vault", at: "2026-11-23T05:00:00Z", record: made },
+    history: [{ made_by: "vault", at: "2026-11-01T05:00:00Z", record: earlier }, { made_by: "device", at: "2026-10-01T05:00:00Z" }],
+  });
+  assert.deepEqual(await S.call(fx, "reveal_login_password", { site: "shop.example" }), { ok: true, value: { site: "shop.example", value: "made-by-the-vault" } });
+  assert.deepEqual(await S.call(fx, "reveal_login_password", { site: "shop.example", at: "2026-11-01T05:00:00Z" }), { ok: true, value: { site: "shop.example", value: "made-before" } });
+  assert.deepEqual(await S.call(fx, "reveal_login_password", { site: "shop.example", at: "2026-10-01T05:00:00Z" }), { ok: false, code: "password_unavailable" });
+  // A record of a password the user typed, handed out in the place of one a node made.
+  world.vault.logins.set("shop.example", { current: { made_by: "vault", at: "2026-11-23T05:00:00Z", record: typed }, history: [] });
+  assert.deepEqual(await S.call(fx, "reveal_login_password", { site: "shop.example" }), { ok: false, code: "record_invalid" });
+  assert.equal(world.device.ownerAuths.length, 4);
+});
+
+test("the form of a name, a host, a slot and a reach of a vault secret is the one of the vectors", { skip: vectors.vault_secret === undefined }, async () => {
+  const cases = vectors.vault_secret;
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  // What the backend gives for an item is checked before it enters the plaintext of a record: a
+  // reach or a name of another form fails the call, and nothing is sealed.
+  const accepted = async (name, sites, slots) => {
+    world.clearFaults();
+    world.fault("POST /api/secure/vault/secret", { status: 200, body: { name: name, sites: sites, slots: slots } });
+    world.fault("GET /api/secure/vault/secret/", { status: 200, body: { name: name, label: "", sites: sites, slots: slots, state: "empty", source: "" } });
+    world.fault("PUT /api/secure/vault/secret/", { status: 200, body: { name: name, state: "ready" } });
+    const puts = world.sent("PUT /api/secure/vault/secret/").length;
+    const result = await S.call(fx, "store_secret", { label: "x", sites: ["example.com"], slots: ["field"], value: "v" });
+    assert.equal(world.sent("PUT /api/secure/vault/secret/").length, puts + (result.ok ? 1 : 0));
+    return result.ok;
+  };
+  for (const item of cases.names) assert.equal(await accepted(item.text, ["example.com"], ["field"]), item.valid, "name " + JSON.stringify(item.text));
+  for (const item of cases.hosts) assert.equal(await accepted("NAME", [item.text], ["field"]), item.valid, "host " + JSON.stringify(item.text));
+  for (const item of cases.slots.concat(cases.reserved_headers)) {
+    assert.equal(await accepted("NAME", ["example.com"], [item.text]), item.valid, "slot " + JSON.stringify(item.text));
+  }
+  for (const item of cases.reaches) {
+    assert.equal(await accepted("NAME", item.sites, item.slots), item.valid, "reach " + JSON.stringify([item.sites, item.slots]));
+  }
+  // The record of the vectors opens on the device to the value of the vectors.
+  const record = cases.record;
+  const owner = new bridge.World({ serverTarget: "prod", userId: record.user_id });
+  const masterKey = bytes(vectors.key_derivation.master_key);
+  owner.keychain.set("com.pickle.client.secure.master-key\n" + owner.userId, { value: b64u(masterKey), synchronizable: true });
+  const keys = bridge.deriveAccountKeys(masterKey);
+  owner.account.keys = keys;
+  owner.account.key = { key_id: keys.keyId };
+  const plaintext = JSON.parse(cases.plaintext_text);
+  owner.vault.secrets.set(plaintext.name, {
+    name: plaintext.name, label: "", sites: plaintext.sites, slots: plaintext.slots, state: "ready", source: "device", record: record,
+  });
+  const reader = { world: owner, keys: keys, program: null, source: source };
+  await S.start(reader);
+  const shown = await S.call(reader, "reveal_secret", { name: plaintext.name });
+  assert.deepEqual(shown, {
+    ok: true, value: { name: plaintext.name, value: plaintext.value, sites: plaintext.sites, slots: plaintext.slots, source: plaintext.source },
+  });
 });

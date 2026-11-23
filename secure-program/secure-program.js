@@ -1143,7 +1143,7 @@
    *  counted under (the empty string: not counted). */
   function newTurn(limitMs, name) {
     return {
-      name: typeof name === "string" ? name : "", calledMs: native.nowMs(), startedMs: 0,
+      name: typeof name === "string" ? name : "", calledMs: native.nowMs(), startedMs: 0, waitedMs: 0,
       limitMs: limitMs, interactiveAtCall: interactiveMs(), id: "",
     };
   }
@@ -1276,7 +1276,12 @@
                 turn.calledMs = now;
                 turn.interactiveAtCall = interactiveMs();
               }
-              turn.startedMs = now;
+              // The first line a turn enters is the line it waited for (a lock it takes later is
+              // part of its work).
+              if (turn.startedMs === 0) {
+                turn.startedMs = now;
+                turn.waitedMs = turnSpent(turn);
+              }
               running = limited(turn, Promise.resolve(work()), Infinity, "procedure");
             } catch (error) {
               running = Promise.reject(error);
@@ -5374,7 +5379,7 @@
     const state = outcomes();
     const now = native.nowMs();
     const total = turnSpent(turn);
-    const waited = turn.startedMs === 0 ? total : Math.max(0, turn.startedMs - turn.calledMs);
+    const waited = turn.startedMs === 0 ? total : Math.min(total, whole(turn.waitedMs));
     delete state.open[turn.id];
     let done = state.done[turn.name];
     if (done === undefined || done === null || !Array.isArray(done.classes) ||
