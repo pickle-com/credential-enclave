@@ -22,6 +22,10 @@
 #   - the working directory, the path remapping and the environment below.
 # The build installs no package. The C parts of the `ring` crate need the headers of the C
 # library (`musl-dev`), which this builder image contains: the version is asserted below.
+#
+# The network is there for one step only, the one that downloads the packages `Cargo.lock`
+# names. The step that compiles has none: the build scripts and the procedural macros of the
+# commit and of its dependencies run in it, and they can take nothing from outside the build.
 FROM rust:1.98.1-alpine3.24@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f AS build
 
 # The release tag is compiled into the program and is part of the attestation binding.
@@ -47,7 +51,12 @@ COPY enclave enclave
 COPY host host
 COPY verify verify
 
-RUN cargo build --release --locked --target x86_64-unknown-linux-musl -p credential-enclave \
+# The packages of `Cargo.lock`, from the network. cargo checks every downloaded file against
+# its checksum in `Cargo.lock`, and this command compiles nothing and runs no build script.
+RUN cargo fetch --locked
+
+# The compilation, without a network.
+RUN --network=none cargo build --release --locked --offline --target x86_64-unknown-linux-musl -p credential-enclave \
     && touch -d "@${SOURCE_DATE_EPOCH}" target/x86_64-unknown-linux-musl/release/credential-enclave
 
 FROM scratch AS image
