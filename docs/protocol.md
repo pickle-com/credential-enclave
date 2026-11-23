@@ -1694,8 +1694,8 @@ that ends that way again is a round whose reads are held back: someone writes ob
 prefix of the account faster than the device reads them, or the answers of the backend never
 reach their end. It counts once for its synchronization: the rounds that follow it read on, and
 neither add to the count of the rounds held back nor end it. So such reads mark the log when three
-synchronizations after the first could not reach the end and three days have passed since the
-first of them. Time that passed while the runtime did not run is not time the round had (the app
+or more synchronizations were counted that way and three days have passed since the first of
+them. Time that passed while the runtime did not run is not time the round had (the app
 went to the background during the round, or the time of the round passed more than 5 s later than
 a running runtime lets it): a round that ends that way is pending, is not counted in that row,
 and is followed by none.
