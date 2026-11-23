@@ -375,8 +375,8 @@ pub struct LogStore {
 ///
 /// A connection whose idle time passed carries no further write. The node closes it when the
 /// next write asks for a connection, when the next response of the store ends, and in its
-/// sweep ([`IdleConnections::end_idle`]): a node that writes no further entry holds no
-/// connection to the store for longer than the idle time and one sweep interval.
+/// sweep ([`IdleConnections::end_idle`]): a node that writes no further entry closes it at
+/// its next sweep at the latest.
 #[derive(Default)]
 struct IdleConnections(NodeLock<Vec<IdleConnection>>);
 

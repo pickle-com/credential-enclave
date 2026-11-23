@@ -2170,10 +2170,10 @@ Like everything the host program does, the mark is no part of what a node guaran
 The readiness probe of a pod whose replacement waits for the mark reads `/readyz`. The startup
 probe goes on reading `/healthz` and the liveness probe `/livez`: the two say that the node
 answers and that the enclave runs. A pod that is not ready must still be reached by the backend,
-which sends the configuration, the credentials and the delegations to it: the addresses of the
-pods do not depend on their readiness. A backend that does not set the mark leaves the pods of
-the delegation role and of the reserve role not ready: such a deployment reads `/healthz` for
-the readiness of the pod.
+which sends the credentials of the log store and the delegations to it and then makes the call
+that sets its mark: the addresses of the pods do not depend on their readiness. A backend that
+does not set the mark leaves the pods of the delegation role and of the reserve role not ready:
+such a deployment reads `/healthz` for the readiness of the pod.
 
 ## 10. Stages 2 and 3
 

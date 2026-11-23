@@ -587,8 +587,7 @@ impl Exchange {
 /// A connection whose idle time passed carries no further request. The node closes it when
 /// the next request of its account and host asks for a connection, when the next response of
 /// any account ends, and in its sweep ([`ProviderConnections::end_idle`]): a node that
-/// receives no further call holds no connection for longer than its idle time and one sweep
-/// interval.
+/// receives no further call closes it at its next sweep at the latest.
 #[derive(Default)]
 pub struct ProviderConnections(NodeLock<HashMap<(String, String), IdleSenders>>);
 
