@@ -1316,7 +1316,7 @@ Test vectors of the assignment; the backend of the operator computes the same fu
 | `LOG_DOCUMENT_NODES`, `LOG_DOCUMENT_REQUESTS`, `LOG_BODY_KEYS`, `LOG_ROUND_BODY_REQUESTS` (the app) | 64 and 2: the nodes one request for node documents names, and such requests per round (the store is asked for one listing per node such a request hands out no verifying document for). 200 and 4: the keys one request for bodies names, and such requests per round |
 | `LOG_WITHHELD_KEYS`, `LOG_WITHHELD_PAGES`, `LOG_WITHHELD_OBJECTS`, `LOG_WITHHELD_CHAINS` (the app) | 32, 2, 16 and 8: the keys of entries, the listing pages of the log screen, the entries of chains of formats 1 and 2 and the listings of such chains whose read was held back that the device keeps for the rounds to make again |
 | `LOG_WATCH_MS` (the app) | 30 days: the time every round of a synchronization goes on reading the first listing pages for the log screen after that read was held back from the screen, unless the screen makes it sooner |
-| `LOG_RECOVERED_KEYS`, `LOG_RECOVERED_EVENTS`, `LOG_RECOVERED_TEXT`, `LOG_RECOVERED_PAGES`, `LOG_RECOVERED_PAGE_EVENTS` (the app) | 256, 512 and 256: the entries the rounds keep for the log screen, the events of those entries (an entry holds 128 at most, so one entry is always kept), and the characters kept of one string of an event. 4 and 100: the listing pages they keep, and the events of the page kept of one |
+| `LOG_RECOVERED_KEYS`, `LOG_RECOVERED_EVENTS`, `LOG_RECOVERED_TEXT`, `LOG_RECOVERED_PAGES`, `LOG_RECOVERED_PAGE_EVENTS` (the app) | 256, 512 and 160: the entries the rounds keep for the log screen, the events of those entries (an entry holds 128 at most, so one entry is always kept), and the characters kept of one string of an event. 4 and 100: the listing pages they keep, and the events of the page kept of one |
 | `LOG_DENIED_INTERVAL_MS`, `LOG_DENIED_CHAINS` (the app) | 24 hours: a read held back from the log screen adds to the count the screen keeps of such reads when the last one counted is this old. 8: the chains of formats 1 and 2 whose listings held back the device counts |
 | `LOG_UNFINISHED_ROUNDS` (the app) | 8: the rounds of synchronizations in a row that may end with more to read than a round reads before such a round counts as one whose reads are held back (A3) |
 | `LOG_RELEASE_GRACE_MS` (the app) | 24 hours: the time a measurement no list of the program has may hold the key of the account before it marks the log (A1) |
@@ -1326,6 +1326,7 @@ Test vectors of the assignment; the backend of the operator computes the same fu
 | `LOG_SCREEN_EVENTS`, `LOG_KEEP_EVENTS`, `LOG_SCREEN_WAIT_MS` (the app) | 50, 50 and 3,000: the events of one further page of the log screen, the events of the first page the device keeps, and the time `read_log` waits for the read of the store before it answers from what the device kept |
 | `LOG_SUMMARY_DAYS`, `LOG_SUMMARY_ENTRIES`, `LOG_SUMMARY_REQUESTS` (the app) | 7, 1,000 and 5: the days of the summary of the log screen, the most entries one opening counts into it, and the requests for bodies one opening of the screen sends |
 | `LEGACY_NODES`, `LEGACY_ROUND_PASSES`, `LEGACY_ROUND_BODIES`, `LEGACY_CLOSE_SLACK_MS` (the app) | 64, 4, 64 and 1 day: the chains of formats 1 and 2 one round follows, the passes of listings and the entry bodies it spends on them (one request for the documents of receiving nodes per pass; the receiving nodes that wait for a document count into the entry bodies of a round), and the time after the end of a grant at which the chain of its node is read for the last time |
+| `LEGACY_SEQ_READS`, `LEGACY_PAGE_SEQS` (the app) | 8: the object versions a round reads under one `seq` of a chain for a control entry. 200: the `seq` a listing page of a chain that goes on names at least when it holds what a node wrote and no more |
 | `LEGACY_TRANSFER_DOCUMENTS_FROM_MS` (the app) | 1,795,392,000,000 (2026-11-23T00:00:00Z): for an event of this time or later, the receiving node of a transfer that a node of a release before v2.4.0 made is judged by a document that verifies and by nothing else ("Formats 1 and 2") |
 | `LOG_STORE_CONCURRENCY`, `LOG_STORE_OBJECTS` (the app) | 8 and 100: the reads of the bucket of formats 1 and 2 in flight at once, and the object versions one address request names |
 | `LOG_STORE_ATTEMPTS`, `LOG_STORE_RETRY_MS` (the app) | 2 attempts of one request to the store, a pause of 500 milliseconds between them: a transport failure, a 429 and a 5xx status are tried again |
@@ -1503,7 +1504,7 @@ it is a secret; what names services and addresses is sealed with a key derived f
 | `log.seen` | The digests of the control keys the device judged (4,096 at most) |
 | `log.missing` | The keys of the sample that left the listing within their retention |
 | `log.withheld` | The reads that were held back and that every round makes again. Of format 3: the keys of entries whose document or body was held back, and the keys the log screen asked for that no answer of the bodies reached (32 at most), with a mark on the ones the log screen asked for; the listing pages of the log screen that were held back (2 at most); and the time until which the rounds go on reading the first listing pages for the screen. Of the bucket of formats 1 and 2, as the log screen read it: the entries whose object versions were held back (16 at most), the listings of chains (8 at most), and the listing of the node prefixes |
-| `log.recovered` | What the rounds read of the reads of the log screen that were held back, kept for the screen and sealed (the key of `log.cache`, with associated data of its own): the entries as the screen shows them, each string cut to 256 characters (256 entries and 512 events at most; beyond that the ones kept first leave), the listing pages (4 at most, each the keys of 100 events), and the node prefixes of the bucket of formats 1 and 2 |
+| `log.recovered` | What the rounds read of the reads of the log screen that were held back, kept for the screen and sealed (the key of `log.cache`, with associated data of its own): the entries as the screen shows them, each string cut to 160 characters (256 entries and 512 events at most; beyond that the ones kept first leave), the listing pages (4 at most, each the keys of 100 events), and the node prefixes of the bucket of formats 1 and 2 |
 | `log.denied` | The reads held back from the log screen that the screen counts itself: the later pages of format 3 (the time the last one began below, the events it was asked for, the count, the time of the first and of the last read counted), and per node (8 at most) the listings of its chain of format 1 or 2 |
 | `log.cursor`, `log.resume` | The latest control key of the last round that covered the whole listing, and where a round that its page limit cut short goes on |
 | `log.legacy` | The chains of formats 1 and 2 the device follows: per node the `seq` up to which the control entries were read and the latest end of a grant. And the receiving nodes of transfers whose documents the device has still to judge |
@@ -1657,8 +1658,9 @@ the backend answered another request of the runtime within 60 s.
 A round that leaves reads undone because there was more to read than one round reads (the control
 listing goes on beyond its four pages, more nodes are without a judgement than its document
 requests name, more bodies are to be read than its body requests name, an answer of the bodies
-ends before its last key, the chains of formats 1 and 2 hold more than it follows, or its time of
-60 s passes before it has read everything) is pending, and the next round reads on from where it
+ends before its last key, it follows more chains of formats 1 and 2 or reads more of their control
+entries than a round does, the listing of such a chain goes on over pages that name few `seq`, or
+its time of 60 s passes before it has read everything) is pending, and the next round reads on from where it
 stopped: a round whose time passes is judged on what it read and keeps what it judged. Eight such rounds read 32 listing pages, the
 documents of 1,024 nodes and 6,400 bodies, which an account in normal use does not hold within the
 retention of the store. The rounds of synchronizations that end that way in a row are counted, a
@@ -1827,7 +1829,15 @@ were named by a listing of the store, so that answer holds them back in every ca
 
 A round follows the delegation: for every node of such a release that the device handed a grant
 to, it lists the chain from the `seq` up to which it read, reads the control entries, and follows
-`grant_transferred_out` of the device's own `key_id`. Such an event names the receiving node and
+`grant_transferred_out` of the device's own `key_id`. The operator domain can write objects into
+that bucket as well, so under one `seq` the round reads the object versions whose keys name a
+control entry, the latest first, until one is the entry of the node (eight at most: a node writes
+one object under a `seq`, and one more version when it repeats a write). When none of the eight
+is and more are left, the read is held back (`chain:keys`) and the chain is not read past that
+`seq`. The last `seq` of a listing page that goes on is read with the page after it. A chain an
+account used heavily is long, and the rounds read on through it, four listing pages a round,
+without a count; a listing that goes on over pages that name fewer than 200 `seq` is one of the
+reads that leave a round with more to read than it reads ("The round"). Such an event names the receiving node and
 no measurement, so the program asks for the document of the receiving node (`POST
 /api/secure/log/documents`: the node document of a node of a release from v2.4.0 on, the
 attestation document the backend kept of a node of an earlier release). A receiving node whose

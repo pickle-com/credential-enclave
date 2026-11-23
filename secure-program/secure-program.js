@@ -212,7 +212,7 @@
   // string of an event. Beyond the limits, what was kept first leaves first.
   const LOG_RECOVERED_KEYS = 256;
   const LOG_RECOVERED_EVENTS = 512;
-  const LOG_RECOVERED_TEXT = 256;
+  const LOG_RECOVERED_TEXT = 160;
   // The listing pages of the screen the rounds keep at most, and the events of the page a round
   // keeps of one (the entries of the same millisecond as the last one stay on the page).
   const LOG_RECOVERED_PAGES = 4;
@@ -250,7 +250,9 @@
 
   // ---- The chains of format 1 and format 2 (the bucket the binding names) ----
   // The chains one round follows, the nodes one address request names, the passes of listings
-  // and the entry bodies one round spends, the pages of the node discovery listing, the time
+  // and the entry bodies one round spends, the object versions it reads under one seq of a
+  // chain for a control entry, the seqs a listing page that goes on names at least when it
+  // holds what a node wrote and no more, the pages of the node discovery listing, the time
   // after the end of a grant at which the chain of its node is read for the last time, the reads
   // of the store in flight at once, the object versions one address request names, the digits of
   // seq and of time_ms in an object key, the listings one call of the screen spends on going down
@@ -260,6 +262,8 @@
   const LEGACY_LISTING_NODES = 16;
   const LEGACY_ROUND_PASSES = 4;
   const LEGACY_ROUND_BODIES = 64;
+  const LEGACY_SEQ_READS = 8;
+  const LEGACY_PAGE_SEQS = 200;
   const LEGACY_DISCOVERY_PAGES = 2;
   const LEGACY_CLOSE_SLACK_MS = DAY_MS;
   const LEGACY_FOUND_INTERVAL_MS = DAY_MS;
@@ -4076,6 +4080,10 @@
     // Each pass lists the chains that have keys left to read: the open chains first, then the
     // chains whose listing went on and the chains of the receiving nodes the pass before found.
     // The first pass also asks for the documents of the nodes that wait.
+    // thin: a listing page that goes on named fewer seqs than LEGACY_PAGE_SEQS. A node writes one
+    // object under a seq, and a version more when it repeats a write, so such a page holds
+    // objects a node did not write.
+    let thin = false;
     for (let pass = 0; pass < LEGACY_ROUND_PASSES; pass += 1) {
       if (open.length === 0 && (pass > 0 || waited.length === 0)) break;
       const targets = open.map(function (id) {
@@ -4106,18 +4114,21 @@
         rememberKeys(id, entries);
         run.nodes.add(id);
         const seqs = Array.from(entries.keys()).sort(function (a, b) { return a - b; });
-        const plan = {
-          id: id, seqs: seqs, entries: entries, reads: new Map(), stop: 0,
-          more: outcome.value.truncated && outcome.value.nextKeyMarker !== null,
-        };
+        const more = outcome.value.truncated && outcome.value.nextKeyMarker !== null;
+        // The last seq of a listing page that goes on may have further object versions on the
+        // page after it: it is read with that page, from the seq before it.
+        if (more) seqs.pop();
+        if (more && seqs.length < LEGACY_PAGE_SEQS) thin = true;
+        const plan = { id: id, seqs: seqs, entries: entries, reads: new Map(), crowded: new Set(), stop: 0, more: more };
         for (const seq of seqs) {
-          const candidates = entries.get(seq).slice().sort(function (a, b) {
-            return (b.isLatest ? 1 : 0) - (a.isLatest ? 1 : 0);
-          }).slice(0, 2);
-          const control = candidates.some(function (candidate) {
+          // The object versions whose keys name a control entry, the latest first, up to
+          // LEGACY_SEQ_READS of them: an object someone else wrote under the seq of a control
+          // entry does not take the place of the entry of the node.
+          const shaped = entries.get(seq).filter(function (candidate) {
             return candidate.parts.format === 1 || candidate.parts.kind === "c";
-          });
-          if (!control) continue;
+          }).sort(function (a, b) { return (b.isLatest ? 1 : 0) - (a.isLatest ? 1 : 0); });
+          if (shaped.length === 0) continue;
+          const candidates = shaped.slice(0, LEGACY_SEQ_READS);
           if (bodiesLeft < candidates.length) {
             // The entries of this round are spent: the chain is read on from here by the next.
             plan.stop = seq;
@@ -4127,6 +4138,7 @@
           }
           bodiesLeft -= candidates.length;
           plan.reads.set(seq, candidates);
+          if (shaped.length > candidates.length) plan.crowded.add(seq);
           for (const candidate of candidates) wanted.push(candidate);
         }
         plans.push(plan);
@@ -4165,12 +4177,14 @@
               held = true;
               break;
             }
+            let found = false;
             for (const candidate of candidates) {
               const signed = objects.get(candidate.key + "\n" + candidate.versionId);
               const entry = signed === undefined || signed === null
                 ? null : checkLegacyEntry(signed, plan.id, candidate.parts, keys);
               run.bodies += 1;
               if (entry === null) continue;
+              found = true;
               run.checked += 1;
               if (entry.events !== null) {
                 for (const event of entry.events) {
@@ -4184,6 +4198,15 @@
                   }
                 }
               }
+              break;
+            }
+            if (!found && plan.crowded.has(seq)) {
+              // More object versions under this seq name a control entry than the round reads,
+              // and none of the ones read is the entry of the node: the entry, if the node
+              // wrote one, is held back behind objects someone else wrote there.
+              run.blocked = true;
+              if (run.detail === "") run.detail = "chain:keys";
+              held = true;
               break;
             }
           }
@@ -4246,9 +4269,13 @@
       });
       open = next.slice(0, LEGACY_NODES);
     }
+    // The chains whose listing still goes on are read on by the next round. A chain of an
+    // account in heavy use is long, and a round that reads on through it has not more to read
+    // than a round reads in the sense that counts (LOG_UNFINISHED_ROUNDS): only a listing that
+    // goes on over pages that name few seqs does.
     if (open.length > 0) {
       run.cut = true;
-      run.over = true;
+      if (thin) run.over = true;
     }
   }
 

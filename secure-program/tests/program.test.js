@@ -2640,6 +2640,111 @@ test("a transfer a node of an earlier release made on or after 2026-11-23 to a n
   assert.notEqual(aged.world.stored("log.legacy").nodes[gone.id], undefined);
 });
 
+// ---- Objects someone else wrote into a chain of format 2 ----
+
+/** A fixture whose node of an earlier release handed the delegation on, after 2026-11-23, to a
+ *  node of a measurement no list has (the backend kept its document): {fx, moved}, moved the
+ *  entry of the transfer. Read by a round, the transfer counts for A1. */
+async function movedFromEarlierRelease() {
+  const fx = S.fixture(source, { nodes: 0, legacy: 1, device: { securityStatus: true } });
+  fx.world.now = TRANSFER_DOCUMENTS_FROM_MS + DAY_MS;
+  await S.start(fx);
+  const world = fx.world;
+  const rogue = world.addNode({ release: "v2.3.9", measurement: bridge.randomMeasurement(), format: 2, offered: false });
+  world.keptDocuments.set(rogue.id, registryDocument(rogue));
+  world.advance(HOUR_MS);
+  const moved = fx.legacy[0].record("c", [{ t: "grant_transferred_out", time_ms: world.now, to: rogue.id }]);
+  return { fx: fx, moved: moved };
+}
+
+test("A1: objects someone else wrote under the seq of a transfer in a chain of format 2 do not take the place of the entry of the node, and more of them than a round reads hold the read back", async () => {
+  // Two later versions under the key of the entry, and two keys of use entries under its seq
+  // that sort in front of it: the round reads the versions whose key names a control entry until
+  // one is the entry of the node.
+  const { fx, moved } = await movedFromEarlierRelease();
+  const world = fx.world;
+  world.putObject(world.bucket, moved.key, "not an entry");
+  world.putObject(world.bucket, moved.key, JSON.stringify({ body: "AAAA", sig: "AAAA" }));
+  const prefix = moved.key.slice(0, moved.key.indexOf("-", moved.key.lastIndexOf("/")) + 1);
+  for (const filler of ["A", "B"]) {
+    world.putObject(world.bucket, prefix + "0000000000001-u-001-" + fx.keys.keyId + "-" + filler.repeat(43) + "-" + filler.repeat(43), "x");
+  }
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "pending");
+  assert.equal(world.state.log.newer_release_nodes, 1);
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "attention");
+  assert.equal(world.state.log.unknown_nodes, 1);
+
+  // Nine later versions under the key of the entry: none of the eight the round reads is the
+  // entry of the node, and one more is left. The read is held back, and the chain is not read
+  // past that seq.
+  const crowded = await movedFromEarlierRelease();
+  const other = crowded.fx.world;
+  for (let i = 0; i < 9; i += 1) other.putObject(other.bucket, crowded.moved.key, "not an entry " + i);
+  const reached = other.stored("log.legacy").nodes[crowded.fx.legacy[0].id].seq;
+  const states = [];
+  for (let day = 0; day < 4; day += 1) {
+    await nextDay(crowded.fx);
+    states.push(other.state.log.status + ":" + other.state.log.store + ":" + other.reports.slice(-1)[0].blocked_attempts);
+  }
+  assert.deepEqual(states, ["pending:blocked:1", "pending:blocked:2", "pending:blocked:3", "attention:blocked:4"]);
+  assert.equal(other.state.log.store_failure, "chain:keys");
+  // (Each daily synchronization renewed the grant, and the node wrote an entry for it after the
+  // transfer: the chain is read up to the seq before the transfer and no further.)
+  assert.equal(other.stored("log.legacy").nodes[crowded.fx.legacy[0].id].seq, reached);
+  assert.deepEqual(other.securityStatuses.slice(-1)[0].reasons, ["verification_blocked"]);
+});
+
+test("A3: a chain of format 2 whose listing goes on over pages that name few seqs keeps the rounds from its end and marks the log, and a long chain a node wrote is read on round after round without a count", async () => {
+  // A use entry and then a transfer to a node of a measurement no list has. Under the seq of
+  // the use entry, more objects than the listing pages of a round hold (pages of ten object
+  // versions): the rounds do not reach the transfer.
+  const fx = S.fixture(source, { nodes: 0, legacy: 1, device: { securityStatus: true } });
+  fx.world.now = TRANSFER_DOCUMENTS_FROM_MS + DAY_MS;
+  await S.start(fx);
+  const world = fx.world;
+  const node = fx.legacy[0];
+  const rogue = world.addNode({ release: "v2.3.9", measurement: bridge.randomMeasurement(), format: 2, offered: false });
+  world.keptDocuments.set(rogue.id, registryDocument(rogue));
+  world.advance(HOUR_MS);
+  const before = node.record("u", [S.providerRequest(world.now)]);
+  const moved = node.record("c", [{ t: "grant_transferred_out", time_ms: world.now, to: rogue.id }]);
+  world.pageSize = 10;
+  const prefix = before.key.slice(0, before.key.indexOf("-", before.key.lastIndexOf("/")) + 1);
+  for (let i = 0; i < 60; i += 1) {
+    const filler = String(i).padStart(2, "0") + "A".repeat(41);
+    world.putObject(world.bucket, prefix + "0000000000001-u-001-" + fx.keys.keyId + "-" + filler + "-" + filler, "x");
+  }
+  assert.ok(moved.seq > before.seq);
+  const states = [];
+  for (let day = 0; day < 12; day += 1) {
+    await nextDay(fx);
+    states.push(world.state.log.status + ":" + world.state.log.store + ":" + world.reports.slice(-1)[0].blocked_attempts);
+  }
+  assert.deepEqual(states.slice(0, 8), Array(8).fill("pending:verified:0"));
+  assert.deepEqual(states.slice(8), ["pending:blocked:1", "pending:blocked:2", "pending:blocked:3", "attention:blocked:4"]);
+  assert.equal(world.state.log.store_failure, "round:unfinished");
+  assert.equal(world.state.log.newer_release_nodes, 0);
+
+  // 9,000 entries a node wrote, one object under each seq, in listing pages of 1,000: a round
+  // lists four pages, and the rounds after it read on. Nothing is counted.
+  const long = S.fixture(source, { nodes: 0, legacy: 1 });
+  for (let i = 0; i < 9000; i += 1) {
+    long.world.advance(1000);
+    long.legacy[0].record("u", [S.providerRequest(long.world.now)]);
+  }
+  await S.start(long);
+  const walked = [long.world.state.log.status];
+  for (let day = 0; day < 2; day += 1) {
+    await nextDay(long);
+    walked.push(long.world.state.log.status);
+    assert.equal(long.world.stored("log.round").unfinished, 0, "day " + day);
+    assert.equal(long.world.stored("log.blocked").count, 0, "day " + day);
+  }
+  assert.deepEqual(walked, ["pending", "pending", "verified"]);
+});
+
 test("what does not mark the log: an empty seq, a node that ended without a shutdown, an entry of another key", async () => {
   const fx = S.fixture(source);
   await S.start(fx);
