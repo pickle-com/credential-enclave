@@ -6,13 +6,16 @@
 //! store, a node that took the forward role, and a stand-in for the site. The envelope a test
 //! sends is the one the first node made.
 
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use credential_enclave_protocol::encoding::b64u;
+use credential_enclave_protocol::app::{open_entry_v3, verify_entry_v3};
+use credential_enclave_protocol::encoding::{b64u, Signed};
+use credential_enclave_protocol::keys::shard_hash;
+use credential_enclave_protocol::log::{object_key_v3, EntryLabel};
 use credential_enclave_protocol::secret_use::{open_secret_use, BoundRequest, SecretUseEnvelope};
 use credential_enclave_protocol::{limits, ProtocolError};
 use serde_json::{json, Value};
@@ -1203,6 +1206,204 @@ async fn no_envelope_leaves_before_the_log_store_confirmed_the_entry_of_the_use(
     assert!(chain[1..]
         .iter()
         .all(|events| events.len() == 1 && events[0]["t"] == "provider_request"));
+}
+
+#[tokio::test]
+async fn the_entries_of_the_vault_calls_verify_against_their_keys_in_the_bucket_of_the_account() {
+    let provider = quiet_site().await;
+    let (giving, app) = giving_node(&provider).await;
+    let forward = forward_node(&provider).await;
+    let peer = attestation(&forward).await;
+
+    // The three calls of the vault that create an event, each once: `vault/store` makes a
+    // record, `release` hands its value out, and `vault/handoff` seals the value of a record
+    // of the device for one request.
+    let stored = json!({
+        "user_id": USER, "name": "SIGNUP_PASSWORD", "sites": ["shop.example"],
+        "slots": ["field"], "value": "tr0ub4dor&3", "context": "agent:signup",
+    });
+    let (status, made) = giving.post("/v1/vault/store", stored).await;
+    assert_eq!(status, 200, "{made}");
+    let release = json!({
+        "user_id": USER, "record": made["record"], "field": "value",
+        "origin": "https://shop.example", "context": "browser:fill",
+    });
+    let (status, released) = giving.post("/v1/release", release).await;
+    assert_eq!((status, &released["value"]), (200, &json!("tr0ub4dor&3")));
+    let record = bearer_record(&app, VALUE);
+    let (status, handed) = handoff(&giving, &record, &peer, &bearer_request()).await;
+    assert_eq!(status, 200, "{handed}");
+    assert_eq!(
+        (
+            &made["log"]["seq"],
+            &released["log"]["seq"],
+            &handed["log"]["seq"]
+        ),
+        (&json!(2), &json!(3), &json!(4))
+    );
+
+    // The store holds one object per entry, in the bucket of the account. A control entry is
+    // under the prefix of the control entries and its key names its event, and a use entry is
+    // under the prefix of the use entries and its key carries the number of its events.
+    let chain = provider.chain(USER, &giving.node.node);
+    let labels: Vec<EntryLabel> = chain
+        .iter()
+        .map(|stored| stored.parts().label.clone())
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            EntryLabel::Control("grant_accepted".to_string()),
+            EntryLabel::Control("connection_created".to_string()),
+            EntryLabel::Use(1),
+            EntryLabel::Use(1),
+        ]
+    );
+    let bucket = giving
+        .node
+        .log_store
+        .id()
+        .unwrap()
+        .shard_of(shard_hash(USER))
+        .unwrap();
+    let mut prev = b64u(&[0u8; 32]);
+    let mut events = Vec::new();
+    for stored in &chain {
+        let prefix = match stored.parts().label {
+            EntryLabel::Control(_) => format!("a3/{USER}/c/"),
+            EntryLabel::Use(_) => format!("a3/{USER}/u/"),
+        };
+        assert!(stored.key.starts_with(&prefix), "{}", stored.key);
+        assert_eq!(stored.key, object_key_v3(USER, stored.parts()));
+        assert_eq!(stored.bucket, bucket);
+        // The object is the entry its key names, signed by the node of the key, and it opens
+        // with the log key of the account. Its body carries the hash of the body before it.
+        let entry: Signed = serde_json::from_value(stored.entry.clone()).unwrap();
+        let (body, body_bytes) = verify_entry_v3(USER, stored.parts(), &entry).unwrap();
+        assert_eq!((body.v, &body.prev), (3, &prev));
+        let opened = open_entry_v3(&app.keys.log, &body_bytes).unwrap();
+        assert_eq!(opened.len(), 1);
+        events.push(opened[0].clone());
+        prev = b64u(&stored.parts().body_hash);
+    }
+    let named = |event: &Value| {
+        (
+            event["t"].as_str().unwrap().to_string(),
+            event["name"].as_str().unwrap_or_default().to_string(),
+        )
+    };
+    assert_eq!(
+        events.iter().map(named).collect::<Vec<_>>(),
+        [
+            ("grant_accepted".to_string(), String::new()),
+            (
+                "connection_created".to_string(),
+                "SIGNUP_PASSWORD".to_string()
+            ),
+            ("secret_released".to_string(), "SIGNUP_PASSWORD".to_string()),
+            ("provider_request".to_string(), NAME.to_string()),
+        ]
+    );
+    assert_eq!(
+        (&events[3]["slot"], &events[3]["to"]),
+        (
+            &json!("header:authorization"),
+            &json!(forward.node.node.as_str())
+        )
+    );
+
+    // The store holds the node document of the node that wrote the entries, and none of the
+    // node of the forward role: that node has no log store and wrote nothing to one.
+    let documents: Vec<String> = provider
+        .documents()
+        .into_iter()
+        .map(|document| document.node)
+        .collect();
+    assert_eq!(documents, std::slice::from_ref(&giving.node.node));
+    assert!(forward
+        .platform
+        .connections()
+        .iter()
+        .all(|(host, _)| host != LOG_HOST));
+}
+
+#[tokio::test]
+async fn the_vault_calls_create_no_entry_while_the_store_holds_no_node_document_for_it() {
+    /// One day in milliseconds.
+    const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+    // The store confirms every write but, while the cell is set, the write of a node document.
+    let documents_refused = Arc::new(AtomicBool::new(false));
+    let refused = documents_refused.clone();
+    let provider = Provider::start(&[SITE, LOG_HOST], move |seen| {
+        let of_a_document = seen.server_name == LOG_HOST && seen.target.contains("/n3/");
+        match of_a_document && refused.load(Ordering::SeqCst) {
+            true => Reply::with_body(403, &[("connection", "close")], b"<Error></Error>"),
+            false => Reply::json(200, &json!({"ok": true})),
+        }
+    })
+    .await;
+    let (giving, app) = giving_node(&provider).await;
+    let forward = forward_node(&provider).await;
+    let peer = attestation(&forward).await;
+    let record = bearer_record(&app, VALUE);
+    let for_a_field = named(&app, json!(["shop.example"]), json!(["field"]), VALUE);
+    let stored = json!({
+        "user_id": USER, "name": NAME, "sites": [SITE], "slots": ["header:authorization"],
+        "value": VALUE, "context": CONTEXT,
+    });
+    let release = json!({
+        "user_id": USER, "record": for_a_field, "field": "value",
+        "origin": "https://shop.example", "context": CONTEXT,
+    });
+
+    // 29 days after the node wrote its node document the account renews its grant, which
+    // then outlives the time the node acts on that document. From here on the store refuses
+    // the document.
+    documents_refused.store(true, Ordering::SeqCst);
+    giving.node.clock.advance(29 * DAY_MS);
+    giving.use_log_store().await;
+    app.grant(&giving).await;
+
+    // 31 days after that write the store holds no version of the document that outlives an
+    // entry written now. The grant is in force, and each of the three calls ends with
+    // `log_store_unavailable` before it creates an event: no record, no value and no
+    // envelope leaves, and the account has the one entry of its grant.
+    giving.node.clock.advance(2 * DAY_MS);
+    giving.use_log_store().await;
+    let status = json!({"user_id": USER});
+    assert_eq!(
+        giving.post("/v1/status", status).await.1["grant"]["state"],
+        "active"
+    );
+    let outcomes = [
+        giving.post("/v1/vault/store", stored.clone()).await,
+        giving.post("/v1/release", release.clone()).await,
+        handoff(&giving, &record, &peer, &bearer_request()).await,
+    ];
+    for outcome in &outcomes {
+        assert_eq!(code(outcome), (503, "log_store_unavailable"));
+        assert_eq!(outcome.1.as_object().unwrap().len(), 2);
+    }
+    assert_eq!(giving.last_seq(USER), 1);
+    let account = giving.node.account(USER).unwrap();
+    assert_eq!(lock(&account).pending_entries(), 0);
+    assert_eq!(provider.stored().len(), 1);
+
+    // The store takes the document again and the sweep of the node writes it: the three calls
+    // create their events and act.
+    documents_refused.store(false, Ordering::SeqCst);
+    crate::log_store::sweep(&giving.node).await;
+    let (status, made) = giving.post("/v1/vault/store", stored).await;
+    assert_eq!((status, &made["log"]["seq"]), (200, &json!(2)), "{made}");
+    let (status, released) = giving.post("/v1/release", release).await;
+    assert_eq!((status, &released["value"]), (200, &json!(VALUE)));
+    let (status, handed) = handoff(&giving, &record, &peer, &bearer_request()).await;
+    assert_eq!(
+        (status, &handed["log"]["seq"]),
+        (200, &json!(4)),
+        "{handed}"
+    );
+    assert_eq!(provider.stored().len(), 4);
 }
 
 /// The time of one `vault/handoff` call and of its parts, as the nodes of these tests take it:

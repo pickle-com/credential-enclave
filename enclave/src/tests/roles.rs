@@ -10,8 +10,9 @@ use credential_enclave_protocol::limits;
 use credential_enclave_protocol::secret::Secret;
 use serde_json::{json, Value};
 
-use super::quiet_provider;
-use crate::testing::{operator_config, App, Harness, Provider};
+use super::{quiet_provider, quiet_provider_and_log_store};
+use crate::log_store::sweep;
+use crate::testing::{log_credentials, operator_config, App, Harness, Provider, LOG_HOST};
 
 /// The calls a node of the forward role answers: the four calls of either role, and the one
 /// call of its own role.
@@ -299,4 +300,98 @@ async fn a_node_of_the_delegation_role_hands_no_delegation_to_a_node_of_the_forw
     let outcome = other.post("/v1/peer/import", import).await;
     assert_eq!(code(&outcome), (403, "peer_unverified"));
     assert_eq!(other.health().await["grants"], 0);
+}
+
+#[tokio::test]
+async fn a_node_of_the_forward_role_has_no_log_store_and_writes_nothing_to_one() {
+    // The stand-in answers for the host of the log store of the tests: a write of the node
+    // would arrive there.
+    let provider = quiet_provider_and_log_store().await;
+    let forward = forward_node(&provider).await;
+
+    // The node takes no credentials for a log store: the call is one of the delegation role.
+    let expires_ms = forward.node.now_ms() + 60 * 60 * 1000;
+    let outcome = forward
+        .post("/v1/log-store/credentials", log_credentials(expires_ms))
+        .await;
+    assert_eq!(code(&outcome), (403, "not_allowed"));
+
+    // Neither its configuration nor the sweep of the node writes a node document: the node
+    // has no log store, its binding names none, and its health says so.
+    sweep(&forward.node).await;
+    let (status, configured) = forward.post("/v1/config", json!({"role": "forward"})).await;
+    assert_eq!((status, configured), (200, forward_configured()));
+    sweep(&forward.node).await;
+    assert!(provider.seen().is_empty());
+    assert!(forward
+        .platform
+        .connections()
+        .iter()
+        .all(|(host, _)| host != LOG_HOST));
+    let health = forward.health().await;
+    assert_eq!(health["log_store"], Value::Null);
+    assert_eq!(
+        (&health["log"]["writes"], &health["log"]["entries"]),
+        (&json!(0), &json!(0))
+    );
+    assert_eq!(
+        binding_of(&attestation(&forward).await),
+        forward_binding(&forward.node.keys, "v0.0.0-test")
+    );
+}
+
+#[tokio::test]
+async fn a_transfer_without_an_entry_goes_to_no_node_of_the_forward_role() {
+    // Two nodes of one program that write to the same log store, and a node of the forward
+    // role of that program. A transfer between the first two creates no entry and writes
+    // nothing to the store, so no entry stands between a delegation and a peer: the rule that
+    // keeps a delegation from a node of the forward role is the reading of its binding.
+    let provider = quiet_provider_and_log_store().await;
+    let giving = Harness::new(&provider);
+    let receiving = Harness::new(&provider);
+    giving.use_log_store().await;
+    receiving.use_log_store().await;
+    let forward = forward_node(&provider).await;
+    let app = App::new("user-1", 1);
+    app.grant(&giving).await;
+    assert_eq!(giving.last_seq("user-1"), 1);
+    provider.until_written(1).await;
+
+    // The node of the forward role: its binding names the role and no log store, and the
+    // giving node has one. Each of the two refuses it as a peer (protocol.md 10.1, steps 3a
+    // and 3b), and nothing was written for the refusal.
+    let outcome = giving
+        .post(
+            "/v1/peer/export",
+            json!({"peer": attestation(&forward).await}),
+        )
+        .await;
+    assert_eq!(code(&outcome), (403, "peer_unverified"));
+
+    // The node of the delegation role with the same log store takes the delegation, and
+    // neither node creates an entry for it.
+    let (status, exported) = giving
+        .post(
+            "/v1/peer/export",
+            json!({"peer": attestation(&receiving).await}),
+        )
+        .await;
+    assert_eq!(status, 200, "{exported}");
+    assert_eq!(exported["logs"], json!([]));
+    let import = json!({"peer": attestation(&giving).await, "envelope": exported["envelope"]});
+    let (status, imported) = receiving.post("/v1/peer/import", import.clone()).await;
+    assert_eq!(status, 200, "{imported}");
+    assert_eq!(imported["accounts"], json!(["user-1"]));
+    assert_eq!(imported["logs"], json!([]));
+    assert_eq!(
+        (giving.last_seq("user-1"), receiving.last_seq("user-1")),
+        (1, 0)
+    );
+    assert_eq!(provider.stored().len(), 1);
+
+    // The same envelope is nothing a node of the forward role opens: the call is refused by
+    // the role of the node before the envelope is read.
+    let outcome = forward.post("/v1/peer/import", import).await;
+    assert_eq!(code(&outcome), (403, "not_allowed"));
+    assert_eq!(forward.health().await["grants"], 0);
 }
