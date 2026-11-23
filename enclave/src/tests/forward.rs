@@ -1790,6 +1790,75 @@ async fn a_stream_frees_what_it_holds_at_its_time_limit_whether_or_not_its_calle
 }
 
 #[tokio::test]
+async fn a_stream_holds_the_share_of_its_search_until_its_body_has_ended() {
+    use crate::frame;
+    use crate::provider_response::StreamCheck;
+    use axum::http::Method;
+
+    // The provider answers with the head and a part of the body, and then stays silent.
+    let provider = provider_with_log_store(|_| {
+        let head = b"HTTP/1.1 200 OK\r\ncontent-length: 1000\r\n\r\n".to_vec();
+        let part = b"0123456789".repeat(40);
+        Reply::Pieces(vec![(Duration::ZERO, [head, part].concat())], false)
+    })
+    .await;
+    let (harness, app, record) = ready(&provider).await;
+    let whole = harness.node.limits.body_budget_bytes;
+    let frame_of = |query: &str| {
+        let mut request = stream_meta(&app, &record, "POST", &format!("{PROFILE}?{query}"));
+        request["timeout_ms"] = json!(30000);
+        let mut bytes = frame::encode_head(&request);
+        bytes.extend_from_slice(b"{}");
+        bytes
+    };
+
+    // The response goes on. The share of the request frame is free: the request is on the
+    // wire. The call holds what the search of its response can hold for the token of the
+    // record, and no more: what it took for the longest token a record of that size can hold
+    // is free again.
+    let response = harness
+        .respond(Method::POST, "/v1/forward", frame_of("n=1"))
+        .await;
+    assert_eq!(response.status().as_u16(), 200);
+    let of_the_search = StreamCheck::memory_bound("ya29.injected".len());
+    assert_eq!(
+        harness.node.body_budget.available_permits(),
+        whole - of_the_search
+    );
+    assert_eq!(harness.health().await["load"]["forward_calls"], 1);
+    // The caller goes away: the task of the stream frees the share and the place.
+    drop(response);
+    places_are_free(&harness).await;
+    assert_budget_is_free(&harness);
+
+    // A call that asks for a stream and does not get the share of its search within the time
+    // of its admission ends: it created no entry and sent nothing, and it holds nothing. The
+    // body budget has room for its request frame and for nothing else.
+    let (stored, requests) = (provider.stored().len(), provider.requests().len());
+    let bytes = frame_of("n=2");
+    let taken = u32::try_from(whole - bytes.len()).unwrap();
+    let budget = harness
+        .node
+        .body_budget
+        .clone()
+        .try_acquire_many_owned(taken)
+        .unwrap();
+    let started = Instant::now();
+    let response = harness.respond(Method::POST, "/v1/forward", bytes).await;
+    assert_eq!(response.status().as_u16(), 503);
+    let failure = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let failure: Value = serde_json::from_slice(&failure).unwrap();
+    assert_eq!(failure["code"], "capacity_unavailable");
+    assert!(started.elapsed() >= crate::api::ADMISSION_WAIT);
+    assert_eq!(provider.stored().len(), stored);
+    assert_eq!(provider.requests().len(), requests);
+    drop(budget);
+    assert_budget_is_free(&harness);
+}
+
+#[tokio::test]
 async fn the_stream_key_and_the_time_limit_of_a_stream_are_checked() {
     let provider = quiet_provider_and_log_store().await;
     let (harness, app, record) = ready(&provider).await;

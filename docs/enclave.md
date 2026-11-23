@@ -785,7 +785,10 @@ which form it holds. The order of the processing:
    call takes one of the 512 places of the forward calls and the share of the body budget its
    request frame occupies before it reads the frame, and waits for the two together for at most
    30 seconds (`ADMISSION_WAIT`, section 8): a call that has not got them by then ends with
-   `capacity_unavailable`, having read nothing, created no entry and sent nothing.
+   `capacity_unavailable`, having read nothing, created no entry and sent nothing. A call that
+   asks for a stream takes one share more within the same 30 seconds, after it read its frame:
+   the share of the body budget the search of its response can hold (step 11). Without it the
+   call ends with `capacity_unavailable` as well, having created no entry and sent nothing.
 1. The common front. The kind of the record is `oauth` or `oauth_imported` (any other kind is
    `not_allowed`).
 2. The address check (section 7). A violation is `not_allowed`.
@@ -900,11 +903,20 @@ which form it holds. The order of the processing:
     `complete` false with the `code` `response_withheld`, `provider_unreachable` (the
     connection of the provider failed or ended inside the body) or `timeout`, and the fixed
     `message` of that code. A stream that ends without an end record was cut on its way and
-    is a failure for its caller. The response body of a stream takes no share of the body
-    budget: the node holds the bytes held back, the bytes of one search and four elements of
-    the stream. At the time limit of the call the task frees the connection to the provider
-    and the place of the call among the forward calls whether or not the caller reads the
-    response; it frees them as well when the connection of the caller ends. The sizes of the
+    is a failure for its caller. The response body of a stream is not held in memory and
+    takes no share of the body budget. What the node holds for it is the search (the bytes
+    held back, the bytes that wait for a search, the last bytes of every reading and the
+    forms of the credential) and four elements of the stream. What the search can hold is
+    bounded by the length of the credential (`StreamCheck::memory_bound`: about 62 KiB for a
+    token of 200 bytes and 470 KiB for one of 2,000 bytes), and the call holds that share of
+    the body budget from step 0 to the end of the stream. The token is known once the record
+    is open, under the lock of the account, where a call does not wait: so the call takes
+    the share for the longest token a record of that size can hold (the plaintext of a
+    record is shorter than its ciphertext) and gives back what the token does not need once
+    the record is open. At the time limit of the call the task frees the connection to the
+    provider, that share and the place of the call among the forward calls whether or not
+    the caller reads the response; it frees them as well when the connection of the caller
+    ends. The sizes of the
     parts of a stream depend on the length of the credential (the bytes held back), which
     the size of the request to the provider shows the operator domain as well.
 
@@ -1608,9 +1620,10 @@ The rules:
   requests, so the places are not the bound of the throughput of a node: the provider requests
   in flight and the body budget are). A `forward`, `forward/batch` or `vault/send` call waits
   for its place and for the shares of the body budget it takes before its request leaves (the
-  share its request frame occupies, and for `vault/send` the share the search of its response
-  can hold with the forms of the value: about 31 KiB for a value of 30 bytes and 2.7 MiB for
-  one of 12,000 bytes) for at
+  share its request frame occupies, and for `vault/send` and for a `forward` call that asks
+  for a stream the share the search of its response can hold with the forms of the
+  credential: about 31 KiB for a credential of 30 bytes, 62 KiB for one of 200 bytes and 2.7
+  MiB for a vault value of 12,000 bytes) for at
   most 30 seconds together (`ADMISSION_WAIT`)
   and ends with `capacity_unavailable` when it has not got them by then: the node reads
   nothing from the connection of a call that waits, so it does not learn that the caller of
@@ -1623,7 +1636,7 @@ The rules:
   with the bytes of the response and is free when the connection wrote them: a caller that
   takes a response slowly, or not at all, holds memory the budget counts. The body of a
   response that is handed on as a stream (5.8 step 11) is not held in memory and takes no
-  share.
+  share: its call holds the share of its search instead.
 - Connections from the backend: the node holds a bounded number of them open at the same time
   (`inbound_limit` of `load` of health). It computes the bound at its start from the memory of
   its kernel: one eighth of `MemTotal` divided by what one connection can hold that no other
@@ -1695,7 +1708,7 @@ The limits, as the source states them:
 | Body of a provider request and of a provider response (`forward`); the bodies of the results of a `forward/batch` call together | 64 MiB each |
 | Sum of the bodies in memory | 2 GiB |
 | Concurrent `forward` and `forward/batch` calls | 512 |
-| Wait of a `forward` or `forward/batch` call for its place and for the share of the body budget of its request frame (`ADMISSION_WAIT`) | 30 seconds |
+| Wait of a `forward` or `forward/batch` call for its place, for the share of the body budget of its request frame and, when it asks for a stream, for the share of the search of its response (`ADMISSION_WAIT`) | 30 seconds |
 | Connections from the backend held open at once (`inbound_limit` of health) | One eighth of the memory of the kernel divided by 344,064 bytes, 64 to 16,384: 1,502 in an enclave of 4,096 MiB |
 | Longest wait for the peer of a connection from the backend: for the head of a request, for the next bytes of a request body, for the peer to take bytes of a response (`inbound_idle`) | 60 seconds |
 | Read buffer of the HTTP connection of a caller, and the longest request head | 32 KiB |

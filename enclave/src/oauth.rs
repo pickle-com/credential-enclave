@@ -126,6 +126,12 @@ impl Credential {
     pub fn into_parts(self) -> (Secret<String>, Secret<String>) {
         (self.header, self.token)
     }
+
+    /// The length of the token in bytes: what the search of a response that is handed on as
+    /// a stream holds depends on it (`StreamCheck::memory_bound`).
+    pub fn token_bytes(&self) -> usize {
+        self.token.expose_secret().len()
+    }
 }
 
 /// The PKCE verifier of an authorization in progress. It reaches the token address of the
