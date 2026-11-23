@@ -8,6 +8,13 @@
 # file (EIF) whose measurements identify a release. Do not build it by hand for a release: the
 # measurements depend on the arguments and on the exporter options that `build.sh` passes.
 #
+# The measurements cover the time of the node program in the image, which is the commit time.
+# Two things keep that time the same on a machine with a layer cache and on one without. The
+# stage `build` sets the time of the file it built. And `build.sh` builds the stage `image`
+# anew at every build: the copy of that stage is found in the layer cache by the bytes of the
+# file, so a commit whose node program has the bytes of an earlier build would otherwise get
+# the layer of that build, with the time that build gave the file.
+#
 # Every input of the binary is fixed:
 #   - the builder image, by digest (Rust toolchain, C compiler, C library headers);
 #   - `rust-toolchain.toml` (the same Rust version as the builder image) and `Cargo.lock`;
@@ -19,7 +26,8 @@ FROM rust:1.98.1-alpine3.24@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a68327
 
 # The release tag is compiled into the program and is part of the attestation binding.
 ARG CREDENTIAL_ENCLAVE_RELEASE=dev
-# The time of the commit. BuildKit also stamps the image with it.
+# The time of the commit. The node program gets it as the time of its file, and BuildKit
+# stamps the image with it.
 ARG SOURCE_DATE_EPOCH=0
 
 ENV CARGO_INCREMENTAL=0 \
@@ -39,8 +47,9 @@ COPY enclave enclave
 COPY host host
 COPY verify verify
 
-RUN cargo build --release --locked --target x86_64-unknown-linux-musl -p credential-enclave
+RUN cargo build --release --locked --target x86_64-unknown-linux-musl -p credential-enclave \
+    && touch -d "@${SOURCE_DATE_EPOCH}" target/x86_64-unknown-linux-musl/release/credential-enclave
 
-FROM scratch
+FROM scratch AS image
 COPY --from=build /build/target/x86_64-unknown-linux-musl/release/credential-enclave /credential-enclave
 ENTRYPOINT ["/credential-enclave", "--platform", "nitro"]

@@ -20,7 +20,9 @@
 # The release tag is the `v*` tag of that commit, or `dev`.
 #
 # The identity of a release is PCR0, PCR1 and PCR2 of out/measurements.json. Two builds of one
-# commit, on two machines, give the same three values. They do not give the same enclave image
+# commit, on two machines, give the same three values, whatever layers the BuildKit cache of
+# each machine holds from earlier builds: with `--no-cache` and without it the file
+# out/measurements.json is the same byte for byte. They do not give the same enclave image
 # file: its metadata section holds the build time and is not measured.
 
 set -euo pipefail
@@ -67,6 +69,11 @@ base_digest() {
 
 is_hex() {
     printf '%s' "$1" | grep -Eq "^[0-9a-f]{$2}\$"
+}
+
+# The modification time of a file, in seconds since 1970.
+file_time() {
+    stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"
 }
 
 NO_CACHE=""
@@ -154,11 +161,22 @@ build_eif() {
     say "release $RELEASE, commit $GIT_COMMIT, commit time $SOURCE_DATE_EPOCH"
     WORK=$(mktemp -d "${TMPDIR:-/tmp}/credential-enclave-build.XXXXXX")
 
-    # Rows 1 and 2: the node program in an image built FROM scratch. BuildKit sets the creation
-    # time of the image and the time of its one file to the commit time.
+    # Rows 1 and 2: the node program in an image built FROM scratch. The creation time of the
+    # image and the time of its one file are the commit time, and the measurements cover the
+    # time of the file. The stage `image` is not taken from the layer cache: BuildKit finds the
+    # copy of that stage by the bytes of the file, so a commit whose node program has the bytes
+    # of an earlier build would get the layer of that build, with the time of that build
+    # (`rewrite-timestamp` lowers a time that is later than the commit time and leaves an
+    # earlier one). The stage `build`, which compiles, stays in the cache. With `--no-cache` no
+    # stage is taken from the cache, and buildx takes one of the two options only.
+    local image_stage="--no-cache-filter image"
+    [ -z "$NO_CACHE" ] || image_stage=""
     say "building the enclave image $NODE_IMAGE"
+    # image_stage is empty or two words.
+    # shellcheck disable=SC2086
     build_image build/Dockerfile.enclave \
         "type=docker,name=$NODE_IMAGE,rewrite-timestamp=true" \
+        $image_stage \
         --build-arg "CREDENTIAL_ENCLAVE_RELEASE=$RELEASE" \
         --build-arg "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH"
 
@@ -166,9 +184,14 @@ build_eif() {
     docker cp "$CONTAINER:/credential-enclave" "$WORK/credential-enclave" >&2
     docker rm "$CONTAINER" >/dev/null
     CONTAINER=""
-    local binary
+    local binary stamped
     binary=$(sha256_stdin <"$WORK/credential-enclave")
     say "node program: sha256 $binary"
+    # An image whose file has another time than the commit time would give measurements that
+    # another machine does not reproduce: the build stops instead.
+    stamped=$(file_time "$WORK/credential-enclave")
+    [ "$stamped" = "$SOURCE_DATE_EPOCH" ] ||
+        fail "the node program of the enclave image has the time $stamped, not the commit time $SOURCE_DATE_EPOCH"
 
     # Row 3: nitro-cli turns the enclave image into the enclave image file.
     say "building the assembly tools $TOOLS_IMAGE"

@@ -2487,8 +2487,8 @@ content of `out/measurements.json`) to the standard output, or the name of the h
 
 | Row | What happens | What is fixed |
 | --- | --- | --- |
-| 1 | `Dockerfile.enclave`: in a fixed Rust builder image (Alpine), `cargo build --release --locked --target x86_64-unknown-linux-musl -p credential-enclave`. The result is copied into an image `FROM scratch` with `ENTRYPOINT ["/credential-enclave","--platform","nitro"]` | The digest of the builder image. The build installs no package: the builder image holds the C library headers (`musl-dev`) that the C parts of the crate `ring` need, and the Dockerfile asserts their version and the version of `rustc`. `rust-toolchain.toml`, `Cargo.lock`, the release profile (`opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, `panic = "unwind"`, `strip = true`), `WORKDIR /build`, `SOURCE_DATE_EPOCH` (the time of the commit), `CARGO_INCREMENTAL=0`, `TZ=UTC`, `LC_ALL=C`, `--remap-path-prefix` |
-| 2 | BuildKit creates the image with `SOURCE_DATE_EPOCH` and `--output type=docker,rewrite-timestamp=true` | The version of BuildKit (the digest of its image) |
+| 1 | `Dockerfile.enclave`: in a fixed Rust builder image (Alpine), `cargo build --release --locked --target x86_64-unknown-linux-musl -p credential-enclave`. The result is copied into an image `FROM scratch` with `ENTRYPOINT ["/credential-enclave","--platform","nitro"]` | The digest of the builder image. The build installs no package: the builder image holds the C library headers (`musl-dev`) that the C parts of the crate `ring` need, and the Dockerfile asserts their version and the version of `rustc`. `rust-toolchain.toml`, `Cargo.lock`, the release profile (`opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, `panic = "unwind"`, `strip = true`), `WORKDIR /build`, `SOURCE_DATE_EPOCH` (the time of the commit), `CARGO_INCREMENTAL=0`, `TZ=UTC`, `LC_ALL=C`, `--remap-path-prefix`. The time of the file of the node program, which the stage that compiles sets to the commit time |
+| 2 | BuildKit creates the image with `SOURCE_DATE_EPOCH` and `--output type=docker,rewrite-timestamp=true`. The last stage of `Dockerfile.enclave`, which copies the node program into the image, is built anew at every build (`--no-cache-filter image`), and `build.sh` stops when the file in the image has another time than the commit time | The version of BuildKit (the digest of its image). The time of the one file of the image, which the measurements cover: the commit time, on a machine whose layer cache holds earlier builds as on a machine without a cache |
 | 3 | `Dockerfile.eif`: `amazonlinux:2023`, fixed by digest, with `aws-nitro-enclaves-cli` and `aws-nitro-enclaves-cli-devel` of a fixed version. In it, `nitro-cli build-enclave --docker-uri ... --output-file enclave.eif` | The digest of the base image, the name, version and release of the two packages, and the SHA-256 of the files that `nitro-cli` puts into every enclave image file (`bzImage`, `cmdline`, `init`, `linuxkit`, `nsm.ko`), which the build records |
 | 4 | The output: `out/enclave.eif` and `out/measurements.json` (`{"release","git_commit","pcr0","pcr1","pcr2","inputs":{...}}`). `inputs` names what the three measurements were made of: the digests of the three images, the SHA-256 of `rust-toolchain.toml`, `Cargo.toml`, `Cargo.lock`, the two Dockerfiles and `build.sh`, of the five files of row 3, and of the node binary | |
 | 5 | `Dockerfile.host`: the host program, built with the builder image of row 1 and linked statically, on the base image of row 3 with `nitro-cli`. Files: `/usr/local/bin/credential-enclave-host`, `/opt/credential-enclave/enclave.eif`, `/opt/credential-enclave/measurements.json`. Directories: `/run/nitro_enclaves`, `/var/log/nitro_enclaves`. `ENTRYPOINT ["/usr/local/bin/credential-enclave-host"]` (no argument). The user is root (`nitro-cli` needs it for the enclave device). The host program listens on TCP 8080 and 9091. This image is not measured | |
@@ -2532,6 +2532,17 @@ content of `out/measurements.json`) to the standard output, or the name of the h
 - The test of reproducibility: two builds of the same commit on two machines give the same PCR0,
   PCR1 and PCR2. The `release` workflow builds twice, in two independent jobs, and creates a
   release only when the two results are equal.
+- The measurements of a commit do not depend on the layer cache of the machine that builds it:
+  `build.sh` with `--no-cache` and without it writes the same `out/measurements.json`, byte for
+  byte, also on a machine that built another commit before. The measurements cover the time of
+  the file of the node program in the enclave image. BuildKit finds the layer of a copy in its
+  cache by the bytes of the copied file, and `rewrite-timestamp` lowers a time that is later
+  than `SOURCE_DATE_EPOCH` and leaves an earlier one. So a commit whose node program has the
+  bytes of a commit built before (a commit that changes the host program or a document alone)
+  would take the layer of that earlier build from the cache, with the time that build gave
+  the file. Rows 1 and 2 keep the time at the commit time: the stage that compiles sets it,
+  the stage that copies is not taken from the cache, and the build stops when the image has
+  another time. The stage that compiles stays in the cache.
 - A machine of another architecture runs the linux/amd64 programs of the build under emulation.
   The step of row 3 (`nitro-cli` in a container) has been observed to crash under the QEMU
   emulation of Docker Desktop on an Apple Silicon Mac, so the full build is not stated to work
