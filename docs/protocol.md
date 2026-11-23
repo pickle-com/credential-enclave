@@ -80,7 +80,9 @@ In the examples of this document, `v1.0.0` stands for the release tag of the nod
 | Record encryption | ChaCha20-Poly1305 (RFC 8439), a random nonce of 12 bytes | The output `ct` is the ciphertext followed by the 16-byte tag |
 | Chain | SHA-256 | |
 | TOTP | RFC 6238, HMAC-SHA1, 6 digits, 30 seconds | Only a node computes it |
-| Signature of a release statement, signed entry timestamp of the transparency log (10.3) | ECDSA P-256 with SHA-256, the signature in ASN.1 DER | Only a node verifies them. The two public keys are compiled into the node program |
+| Signature of a release statement, signed entry timestamp of a transparency log of the form Rekor v1 (10.3) | ECDSA P-256 with SHA-256, the signature in ASN.1 DER | Only a node verifies them. The public keys are compiled into the node program |
+| Signature of a transparency log of the form Rekor v2 on a checkpoint (10.3) | Ed25519 over the note of the checkpoint | Only a node verifies it. The public key is compiled into the node program |
+| Inclusion proof of an entry of a transparency log of the form Rekor v2 (10.3) | The Merkle tree of RFC 6962 section 2.1 with SHA-256 | Only a node verifies it |
 | Attestation | Per platform (section 4) | |
 
 The app performs every operation above with native functions of its binary, which call the
@@ -1410,22 +1412,46 @@ witness node accepts only a `seq` that is larger than the last `seq` it holds fo
 
 Purpose: the delegations of the accounts stay when the operator replaces the nodes of one release
 with the nodes of a later release. A giving node hands delegations to a node of a later release
-when the release key of the operator signed the measurements of that release and the public
-transparency log Rekor (rekor.sigstore.dev) recorded that signature. A receiving node takes
-delegations from a node of a release that its own program lists as a predecessor. The payload and
-the envelope are those of 10.1. Such a transfer is on the log of the account: the giving node
-creates the entry `grant_transferred_out` of every grant and hands the grant over after the log
-store confirmed that entry (steps 4a to 5b of 10.1), and the receiving node creates the entry
-`grant_transferred_in` (step 3 of the receiving node). This section states which node of another
-release a node accepts.
+when the release key of the operator signed the measurements of that release and a public
+transparency log of the table of the giving node holds the record of that signature. A receiving
+node takes delegations from a node of a release that its own program lists as a predecessor. The
+payload and the envelope are those of 10.1. Such a transfer is on the log of the account: the
+giving node creates the entry `grant_transferred_out` of every grant and hands the grant over
+after the log store confirmed that entry (steps 4a to 5b of 10.1), and the receiving node creates
+the entry `grant_transferred_in` (step 3 of the receiving node). This section states which node of
+another release a node accepts.
 
 Three values are compiled into the node program, so they are part of its measurement:
 
 | Value | What it is |
 | --- | --- |
 | The release key | The public key of the operator whose signature over a release statement a giving node asks for: ECDSA P-256, as the DER of its SubjectPublicKeyInfo (91 bytes) |
-| The log key | The public key of the transparency log: ECDSA P-256, in the same form. The log identifier is the lower-case hexadecimal SHA-256 of that DER. For Rekor of rekor.sigstore.dev it is `c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d` |
+| The table of transparency logs | The logs whose entries a giving node accepts: each row states the form of its log, the public key of the log and, for a log of the form Rekor v2, its origin. The log identifier of a row follows from these values |
 | The list of predecessors | `[{"release":"v1.1.0-rc.1","pcr0":"<96 hex>","pcr1":"<96 hex>","pcr2":"<96 hex>"}]`: the releases whose nodes a node of this program takes delegations from, each with its measurement |
+
+A transparency log has one of two forms. The form states what the log returns with an entry (which
+is what shows that the log holds the entry), the form of the body of an entry, the kind of the key
+of the log and what its log identifier is.
+
+| Form | The key and the log identifier | What the log returns with an entry | The body of an entry |
+| --- | --- | --- | --- |
+| Rekor v1 | ECDSA P-256, as the DER of its SubjectPublicKeyInfo (91 bytes). The log identifier is the lower-case hexadecimal SHA-256 of that DER | The time at which it took the entry, the index of the entry and the signed entry timestamp: its signature over the entry with that time and that index | A `hashedrekord` of version 0.0.1 |
+| Rekor v2 (a tiled log, c2sp.org/tlog-tiles) | Ed25519, as the DER of its SubjectPublicKeyInfo (44 bytes: 12 bytes in front of the 32 bytes of the key), and the origin of the log: the first line of its checkpoints and the name of its key on them. The log identifier is the lower-case hexadecimal SHA-256 of the UTF-8 bytes of the origin, the byte 0x0A, the byte 0x01 and the 32 bytes of the key: the key ID of the signature of the log on a checkpoint (c2sp.org/signed-note) before it is cut to four bytes | The index of the entry and its inclusion proof: the audit path from the entry to the root of a tree, and a checkpoint, the note of the head of that tree with the signature of the log. The log states no time for the entry and signs no single entry | A `hashedrekord` of version 0.0.2 |
+
+The table of this release has two rows, the transparency logs of the trusted root of the public
+instance of Sigstore (`targets/trusted_root.json` of the repository `sigstore/root-signing`, which
+the TUF repository of Sigstore distributes) as of 2026-11-23:
+
+| Log | Form | Log identifier |
+| --- | --- | --- |
+| `rekor.sigstore.dev` | Rekor v1 | `c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d` |
+| `log2025-1.rekor.sigstore.dev` (this text is its origin) | Rekor v2 | `cf1199155bddd051268d1f16ac5c0c75c009f6fb5a63f4177f8e18d7051e3fa0` |
+
+A node does not start with a table that has no row, with a row whose key is not a key of the form
+of the row (for the form Rekor v2: also a key that is no point of the curve or a point of small
+order), with a row of the form Rekor v2 whose origin is empty or holds a character outside `!` to
+`~` or a `+`, with a row of the form Rekor v1 that states an origin, or with two rows of one log
+identifier.
 
 The release statement of this section is the exact bytes of the file `measurements.json` of the
 later release (enclave.md 11.1). It is not the in-toto statement of section 9. A node reads four
@@ -1433,9 +1459,10 @@ keys of it: the string `release` and the strings `pcr0`, `pcr1` and `pcr2`. It d
 other keys.
 
 The log entry: the operator signs the bytes of the statement with the release key (ECDSA P-256
-with SHA-256, the signature in ASN.1 DER) and records the signature in the log as an entry of the
-kind `hashedrekord`, version 0.0.1. The body of the entry is, after its standard base64 is
-decoded:
+with SHA-256, the signature in ASN.1 DER) and records the signature in a log of the table as an
+entry of the kind `hashedrekord`.
+
+In a log of the form Rekor v1 the body of the entry is, after its standard base64 is decoded:
 
 ```text
 {"apiVersion":"0.0.1","kind":"hashedrekord","spec":{
@@ -1455,15 +1482,64 @@ log key (ECDSA P-256 with SHA-256, ASN.1 DER) over the UTF-8 bytes of
 with the keys in this order, without white space, `<body>` as the standard base64 string the log
 returned, and the two integers in decimal.
 
-The endorsement is the value of the key `endorsement` of `peer/export`:
+In a log of the form Rekor v2 the body of the entry is, after its standard base64 is decoded:
 
 ```text
-endorsement = JSON {"statement": b64u(the bytes of the statement),
-                    "entry": {"body":"<standard base64, exactly as the log returned it>",
-                              "integrated_time":0,"log_index":0,
-                              "log_id":"<64 lower-case hexadecimal characters>",
-                              "signed_entry_timestamp":"<standard base64>"}}
+{"apiVersion":"0.0.2","kind":"hashedrekord","spec":{"hashedRekordV002":{
+   "data":{"algorithm":"SHA2_256","digest":"<standard base64 of the SHA-256 of the statement>"},
+   "signature":{"content":"<standard base64 of the signature>",
+                "verifier":{"keyDetails":"PKIX_ECDSA_P256_SHA_256",
+                            "publicKey":{"rawBytes":"<standard base64 of the DER of the release public key>"}}}}}}
 ```
+
+The log writes the body without white space and with the keys of every object in the order of
+their bytes. The entry is a leaf of the Merkle tree of the log (RFC 6962 section 2.1): the hash
+of the leaf is the SHA-256 of the byte 0x00 and the decoded body, and the hash of an inner node
+is the SHA-256 of the byte 0x01, the hash of its left child and the hash of its right child. The
+log returns the body with the index of the entry, the hashes of the audit path from the leaf to
+the root of a tree (RFC 6962 section 2.1.1) and the checkpoint of that tree. A checkpoint
+(c2sp.org/tlog-checkpoint) is the text
+
+```text
+<the origin of the log>\n
+<the number of leaves of the tree, in decimal>\n
+<standard base64 of the 32 bytes of the root hash>\n
+\n
+— <the origin of the log> <standard base64 of 4 + 64 bytes>\n
+— <the name of a witness> <standard base64>\n
+```
+
+where `\n` is one line feed and every line of the text ends with it, and where each of the lines
+after the empty line begins with U+2014 and a space. The three lines in front of the empty line,
+each with its line feed, are the note. The 4 bytes of the line of the log are the first four bytes
+of its log identifier, and the 64 bytes are the Ed25519 signature of the log key over the UTF-8
+bytes of the note. A checkpoint may hold further lines in the note, behind the root hash, and the
+lines of any number of witnesses.
+
+The endorsement is the value of the key `endorsement` of `peer/export`. Its `entry` has the form
+of its log:
+
+```text
+endorsement = JSON {"statement": b64u(the bytes of the statement), "entry": entry}
+
+entry of a log of the form Rekor v1:
+  {"log_id":"<64 lower-case hexadecimal characters>",
+   "body":"<standard base64, exactly as the log returned it>",
+   "integrated_time":0,"log_index":0,
+   "signed_entry_timestamp":"<standard base64>"}
+
+entry of a log of the form Rekor v2:
+  {"log_id":"<64 lower-case hexadecimal characters>",
+   "body":"<standard base64, exactly as the log returned it>",
+   "inclusion_proof":{"log_index":0,
+                      "hashes":["<64 lower-case hexadecimal characters>", ...],
+                      "checkpoint":"<the checkpoint, exactly as the log returned it, its line feeds included>"}}
+```
+
+`hashes` is the audit path from the leaf upwards. A node reads the keys of the form of the log of
+the entry and no other key: an entry may hold the keys of both forms, and the size of the tree and
+its root hash beside the checkpoint (the form of the release proof of the secure program), which a
+node does not read.
 
 The rules of the giving node (`peer/export` with `endorsement`). Every check must hold. The failure
 code of each of them is `peer_unverified`:
@@ -1471,12 +1547,31 @@ code of each of them is `peer_unverified`:
 | Check | Rule |
 | --- | --- |
 | 1 | The statement is at most 16,384 bytes long and is a JSON object whose `release` is a string and whose `pcr0`, `pcr1` and `pcr2` are 96 lower-case hexadecimal characters each. A statement that holds one of these four keys twice is refused |
-| 2 | `entry.log_id` equals the log identifier of the log key of the node |
-| 3 | `entry.body` consists only of the characters `A` to `Z`, `a` to `z`, `0` to `9`, `+`, `/` and `=`. `entry.signed_entry_timestamp`, decoded with standard base64, is a signature of the log key over the bytes above, built from `entry.body`, `entry.integrated_time`, the log identifier of check 2 and `entry.log_index` |
-| 4 | `entry.body`, decoded with standard base64, is a JSON object with `apiVersion` `"0.0.1"`, `kind` `"hashedrekord"` and `spec.data.hash.algorithm` `"sha256"`. Its `spec.data.hash.value` equals the lower-case hexadecimal SHA-256 of the statement. Its `spec.signature.publicKey.content`, decoded with standard base64 and then as PEM, gives DER bytes that equal the DER of the release key of the node. Its `spec.signature.content`, decoded with standard base64, is a signature of the release key over the bytes of the statement |
-| 5 | `entry.integrated_time` lies at most 300 seconds after the time of the node. The notice period is the age an entry must have before its statement counts: with a notice period above zero, `entry.integrated_time` plus the notice period is not after the time of the node, and the 300 seconds do not shorten the period. The notice period is 0 seconds |
+| 2 | `entry.log_id` equals the log identifier of a log of the table of the node. Checks 3 to 5 are those of the form of that log |
+| 3, Rekor v1 | `entry.integrated_time` and `entry.log_index` are non-negative integers, and `entry.signed_entry_timestamp` is a string. `entry.body` consists only of the characters `A` to `Z`, `a` to `z`, `0` to `9`, `+`, `/` and `=`. `entry.signed_entry_timestamp`, decoded with standard base64, is a signature of the log key over the bytes above, built from `entry.body`, `entry.integrated_time`, the log identifier of check 2 and `entry.log_index` |
+| 3, Rekor v2 | `entry.inclusion_proof` is an object whose `log_index` is a non-negative integer, whose `checkpoint` is a string and whose `hashes` is an array of at most 64 strings. The checkpoint passes the rules below, which give the size of a tree and its root hash. `entry.body` decodes with standard base64, and every element of `hashes` is 64 lower-case hexadecimal characters. `log_index` is below the size, and with `leaf = SHA-256(0x00 ∥ the decoded body)`, `fn = log_index` and `sn = size − 1` the path computation of check 9 of "The secure program release" ends with `sn = 0` and with the root hash of the checkpoint |
+| 4, Rekor v1 | `entry.body`, decoded with standard base64, is a JSON object with `apiVersion` `"0.0.1"`, `kind` `"hashedrekord"` and `spec.data.hash.algorithm` `"sha256"`. Its `spec.data.hash.value` equals the lower-case hexadecimal SHA-256 of the statement. Its `spec.signature.publicKey.content`, decoded with standard base64 and then as PEM, gives DER bytes that equal the DER of the release key of the node. Its `spec.signature.content`, decoded with standard base64, is a signature of the release key over the bytes of the statement |
+| 4, Rekor v2 | The decoded body is a JSON object with `apiVersion` `"0.0.2"` and `kind` `"hashedrekord"`, and with `r = spec.hashedRekordV002`: `r.data.algorithm` is `"SHA2_256"`. `r.data.digest`, decoded with standard base64, equals the SHA-256 of the statement. `r.signature.verifier.keyDetails` is `"PKIX_ECDSA_P256_SHA_256"`, and `r.signature.verifier.publicKey.rawBytes`, decoded with standard base64, equals the DER of the release key of the node. `r.signature.content`, decoded with standard base64, is a signature of the release key over the bytes of the statement. Each of the keys named here is a string or an object as its use says, and a body in which one of them occurs twice in its object is refused. The other keys of the body are not read |
+| 5 | Rekor v1: `entry.integrated_time` lies at most 300 seconds after the time of the node. The notice period is the age an entry must have before its statement counts: with a notice period above zero, `entry.integrated_time` plus the notice period is not after the time of the node, and the 300 seconds do not shorten the period. Rekor v2: the entry states no time, and it counts while the notice period is 0 seconds. The notice period is 0 seconds |
 | 6 | The release of the statement is later than the release of the node, in the order below. A node whose own release is not a release tag (for example `dev`) accepts no endorsement |
 | 7 | The receiving node: its attestation response verifies by step 1 of 10.1 on platform `nitro`, and the platform of this node is `nitro` (a node of platform `local` accepts no endorsement). PCR0, PCR1 and PCR2 of its document equal those of the statement, not those of this node. No PCR is all zero. The `release` of its binding equals the `release` of the statement. Its binding names the log store of this node (step 3a of 10.1) and no role or the role `reserve` (step 3b of 10.1) |
+
+The rules of the checkpoint of check 3 for a log of the form Rekor v2:
+
+- The checkpoint is at most 262,144 bytes long and holds `"\n\n"`. The part before the first
+  `"\n\n"`, followed by one `"\n"`, is the note.
+- The first line of the note equals the origin of the log. The second line is the size of the
+  tree: a decimal number without a leading zero (a lone `0` is a number) that fits an unsigned
+  64-bit integer. The third line, decoded with standard base64, is the 32 bytes of the root hash.
+  Further lines of the note are not read: the signature of the log covers them.
+- A line of the part after the first `"\n\n"` is a line of the log when it is `"— "` (U+2014 and
+  a space), the origin of the log, one space and the standard base64 of bytes whose first four
+  equal the first four bytes of the log identifier. The checkpoint holds at least one line of the
+  log, and in every line of the log the bytes after the first four are an Ed25519 signature of the
+  log key over the UTF-8 bytes of the note (RFC 8032, 64 bytes). A line of the log that is no
+  such signature refuses the checkpoint, also beside one that is.
+- Every other line is not read: the signature of a witness, a line of another key under the
+  name of the log, a line of a name that begins with the origin of the log.
 
 After check 7 the call continues with step 4 of 10.1. A call without `endorsement` follows 10.1.
 When `endorsement` is present, the checks above apply and step 3 of 10.1 does not: a node of the
@@ -1502,16 +1597,38 @@ any other form is not a release tag and has no place in the order.
   when both programs agree: the giving node verified the endorsement of the later release, and the
   program of the later release lists the giving release as a predecessor with the measurement of
   the giving node.
-- A statement counts only with its entry in the public log. A release that received delegations
-  under this section has its statement hash, signed by the release key, in a log from which no
-  entry is removed.
-- The node verifies the signed entry timestamp: the statement of the log, signed with the log key,
-  that it took the entry at that time. The node does not verify an inclusion proof or a checkpoint
-  of the log. That the log holds every entry it signed a timestamp for rests on the operation of
-  Sigstore Rekor.
-- A node holds one log key. When the log signs its entries with another key, a node with the old
-  key verifies no endorsement made after that change and hands no delegation to a later release.
-  The nodes of the later release then receive their delegations from the apps (10.1).
+- A statement counts only with its entry in a public log of the table. A release that received
+  delegations under this section has its statement hash, signed by the release key, in a log from
+  which no entry is removed.
+- Who reads the two logs. `rekor.sigstore.dev` answers a search by public key, and the monitor of
+  this repository reads every entry of the release key in it and compares it with the releases
+  (enclave.md 11.2). `log2025-1.rekor.sigstore.dev` has no search: an entry of the release key in
+  it is found by reading the entries of the log from its tiles, and the monitor of this
+  repository does not read that log. What tells an account that its key went to a release it
+  does not accept is its own log (the item on the entry `grant_transferred_out` below), which
+  rests on no monitor.
+- A node sends no request to a log. The entry and what the log returned with it are bytes of the
+  call, and the verdict depends on them, on the values compiled into the node and, for the time
+  of an entry of a log of the form Rekor v1, on the clock of the node.
+- What the two forms show. The signed entry timestamp is the statement of a log of the form
+  Rekor v1, signed with its key, that it took the entry at that time. A node verifies no
+  inclusion proof of such an entry: that the log holds every entry it signed a timestamp for
+  rests on the operation of Sigstore Rekor. The inclusion proof of an entry of a log of the form
+  Rekor v2 shows that the entry is a leaf of a tree whose head the log signed. Neither shows
+  that the log presents the same tree to every reader: a node reads no signature of a witness.
+- A node verifies an entry of a log of its table and of no other log. An entry that a log holds
+  stays valid after the log stopped taking entries, but the endorsement of a release that is
+  built later needs a log that still takes entries. So the endorsement of a release is recorded
+  in a log that the table of every release in service has. Sigstore, the operator of the two
+  logs of this table, has stated that it replaces a log of the form Rekor v2 by a log with
+  another key and another origin about every six months, and that it will announce the end of
+  the uploads to `rekor.sigstore.dev` one year ahead (the documentation of Rekor v2 and the
+  announcement of its general availability, as of 2026-11-23). When the trusted root of Sigstore
+  names a log that the tables in service do not have, a release whose table has that log is
+  built and endorsed while a log of the tables in service still takes entries. When no log of
+  the table of a node takes entries any more, that node hands no delegation to a release that is
+  endorsed after that, and the nodes of that release receive their delegations from the apps
+  (10.1).
 - An endorsement is a public value and has no end: a node of an earlier release accepts it for as
   long as that node runs. The age of the entry is looked at in check 5 only.
 - The account sees the transfer on its log: the entry `grant_transferred_out` of the giving node
@@ -1520,6 +1637,9 @@ any other form is not a release tag and has no place in the order.
   measurement on the entry is the one the giving node verified: the values of the statement the
   release key signed, which the attestation document of the receiving node states (check 7). A
   giving node of a release before v2.4.0 names the receiving node only.
+- The releases before v2.4.0 hold one log, `rekor.sigstore.dev`, and read the keys of an entry of
+  the form Rekor v1 alone. The endorsement of a release that such a node hands delegations to is
+  recorded in that log.
 
 ### 10.4 The delegation subset
 
@@ -1750,6 +1870,8 @@ redirect. The response passes rule E4 of the egress policy before any part of it
 | Longest release statement (10.3) | 16,384 bytes |
 | Notice period of a release (10.3) | 0 seconds |
 | Longest time by which a log entry lies after the time of the node (10.3) | 300 seconds |
+| Longest checkpoint of the inclusion proof of a log entry (10.3) | 262,144 bytes |
+| Most hashes of the audit path of the inclusion proof of a log entry (10.3) | 64 |
 | Most events in one entry (`ENTRY_EVENTS`) | 128 |
 | Most bytes of the plaintext of one entry (`ENTRY_PLAINTEXT_BYTES`) | 1,048,576 |
 | Events of GET requests without a body that a node remembers for one account at one time (`MERGE_KEYS`, 7.2) | 8,192 |
@@ -1818,6 +1940,7 @@ name ends with `_text` holds the same value again as UTF-8 text.
 | `basic_credentials` | `placeholder_text`, `value_text` and `cases`: values of an `Authorization` header (`authorization_text`) with the `slot` of the half the placeholder is (`basic:user`, `basic:password`, or null for a header a node sends under neither), and `written_text`, the header a node of the forward role writes for the value | The caller of a node tells from a header which of the two slots it is |
 | `header_values` | `placeholder_text`, `refused_schemes` and `cases`: values of the header of a slot `header:<name>` with `valid`, whether a node of the forward role puts the value in the place of the placeholder (10.5) | The same |
 | `transfer` | The keys of the giving node and of the receiving node, `payload_text`, `signed`, `envelope`, `hpke_seed`, the result that the receiving node opened (`grants`), and `cases`: an envelope with a changed ciphertext (`opens: false`), a transfer signed by another key (`signature_valid: false`), an envelope for another node | A receiving node implementation opens the envelope and obtains the same list of grants (10.1) |
+| `endorsement` | The endorsements of one release statement (`statement_text`, of the release `release`) for a giving node with the release key `release_key_pem` and the table `logs`: a log of the form Rekor v1 (`form` `rekor_v1`, `key_pem`, `log_id`) and a log of the form Rekor v2 (`form` `rekor_v2`, `origin`, `key_pem`, `log_id`). `cases`: `name`, the release of the giving node (`own_release`), its clock in seconds (`now_s`), the `endorsement` in the encodings of 10.3 (not all in b64u: the body of an entry is standard base64 and a hash is hexadecimal), `accepted`, and `check`, the number of the check of 10.3 that fails (null for an accepted one). The cases hold an entry of each form that is accepted and, for each of the checks 1 to 6, entries that fail it. The two ECDSA signatures of the vectors (of the release key over the statement, of the log of the form Rekor v1 over its entry) are constants of the generator | A verifier of an endorsement gives `accepted` on every case and, for a refusal, fails at the check `check`. The script of the operator that makes an endorsement verifies its output with the same rules (10.3) |
 
 Of these, the tests of the app use `key_derivation`, `record`, `signed`, `log` and
 `attestation.local`. Opening a `command` and computing a `totp` code are the work of a node. The
@@ -1903,7 +2026,8 @@ same release key and do not mix.
 
 The operator signs the bytes of the statement with the release key (ECDSA P-256 with SHA-256, the
 signature in ASN.1 DER) and records the signature in Rekor (rekor.sigstore.dev) as an entry of the
-kind `hashedrekord`, version 0.0.1: the body of 10.3, with the SHA-256 of the statement in
+kind `hashedrekord`, version 0.0.1: the body of a log of the form Rekor v1 of 10.3, with the
+SHA-256 of the statement in
 `spec.data.hash.value`, the signature in `spec.signature.content` and the PEM of the release public
 key in `spec.signature.publicKey.content`. The log returns the body, the time at which it took the
 entry (`integratedTime`), the global index of the entry (`logIndex`), the log identifier (`logID`),
@@ -1940,7 +2064,7 @@ Two values are compiled into the apps and into the verification tool of this rep
 | Value | What it is |
 | --- | --- |
 | The release key | The public key of the operator, the key of 10.3: `enclave/release/release-key.pem`. The apps hold the DER of its SubjectPublicKeyInfo |
-| The log key table | The public keys of the transparency log, by log identifier (the lower-case hexadecimal SHA-256 of the DER of the key, as in 10.3). The identifier `c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d` maps to `enclave/release/rekor-key.pem`. When the log signs with a new key, an app release adds a row; an app of an older build verifies no entry of the new key |
+| The log key table | The public keys of the transparency log, by log identifier (the lower-case hexadecimal SHA-256 of the DER of the key: the log identifier of a log of the form Rekor v1 of 10.3). The identifier `c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d` maps to `enclave/release/rekor-key.pem`. When the log signs with a new key, an app release adds a row; an app of an older build verifies no entry of the new key. The ten checks below are those of an entry of a log of the form Rekor v1: this table holds no log of the form Rekor v2, and the release proof of a program is an entry of rekor.sigstore.dev |
 
 ### The verification
 

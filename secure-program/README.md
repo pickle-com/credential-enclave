@@ -153,7 +153,8 @@ versions of the program and prints what changed between them (the file of a tag 
   shipped version on. The window closes with every app release that ships a newer program.
 - The apps compile in the public key of the log. When Rekor signs with a new key, an app of an
   older build verifies no entry made after the change and loads no new program until the app is
-  updated (the limit of a node is the same: README of this repository, "A change of the log key").
+  updated (a node has the same limit for the logs of its table: README of this repository, "A log
+  that takes no further entry").
 - The honesty of the log rests on the operation of Sigstore Rekor. An app verifies the inclusion
   proof and the signed checkpoint, so it has shown that the log signed a tree that holds the entry.
   That everyone is shown the same tree is not shown without witnesses.
