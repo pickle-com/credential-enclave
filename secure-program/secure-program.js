@@ -3248,6 +3248,14 @@
     else if (failure.kind === "unreachable") run.unreachable = true;
   }
 
+  /** The failure of a request for the bodies or the node documents of keys the listing of the
+   *  store named: a backend that answers that it has no such route or no such store (absent) holds
+   *  them back, because the listing came from that store. Any other failure is itself. */
+  function heldBack(failure) {
+    if (isStoreFailure(failure) && failure.kind === "absent") return storeFailure("blocked", failure.detail);
+    return failure;
+  }
+
   /** Whether a string is 96 lower-case hexadecimal characters (one PCR). */
   function hex96(value) {
     return typeof value === "string" && /^[0-9a-f]{96}$/.test(value);
@@ -3295,8 +3303,9 @@
     for (const item of requests) {
       const outcome = await item.sent;
       if (!outcome.ok) {
-        noteFailure(turn, run, outcome.error);
-        for (const id of item.ids) left.set(id, outcome.error.kind === "absent" ? "absent" : "unasked");
+        const refused = written ? heldBack(outcome.error) : outcome.error;
+        noteFailure(turn, run, refused);
+        for (const id of item.ids) left.set(id, refused.kind === "absent" ? "absent" : "unasked");
         continue;
       }
       for (const id of item.ids) {
@@ -3374,7 +3383,7 @@
     for (const asked of requests) {
       const outcome = await asked.sent;
       if (!outcome.ok) {
-        noteFailure(turn, run, outcome.error);
+        noteFailure(turn, run, heldBack(outcome.error));
         continue;
       }
       // An answer may end early (the backend bounds the size of an answer): the keys after the
@@ -3530,7 +3539,9 @@
     try {
       again = (await readListings(turn, [{ prefix: "c", key_marker: "", version_id_marker: "" }]))[0];
     } catch (failure) {
-      noteFailure(turn, run, failure);
+      // The first reading of this round came from the store: a backend that now answers that the
+      // store is absent holds the second reading back.
+      noteFailure(turn, run, heldBack(failure));
       return;
     }
     gone = gone.filter(function (tail) { return !again.tails.has(tail); });
@@ -3600,7 +3611,9 @@
         const id = open[at];
         const outcome = listings[at];
         if (!outcome.ok) {
-          noteFailure(turn, run, outcome.error);
+          // The binding of the node of this chain named the store (the device verified it, or a
+          // node it verified handed the delegation on): the store of these chains exists.
+          noteFailure(turn, run, heldBack(outcome.error));
           continue;
         }
         const prefix = accountPrefix() + id + "/";
@@ -3647,7 +3660,7 @@
           batch.forEach(function (value, name) { objects.set(name, value); });
         }
       } catch (failure) {
-        noteFailure(turn, run, failure);
+        noteFailure(turn, run, heldBack(failure));
         objects = null;
       }
       const next = [];
@@ -3922,7 +3935,7 @@
     try {
       await followLegacy(turn, keys, log, run);
     } catch (failure) {
-      noteFailure(turn, run, failure);
+      noteFailure(turn, run, heldBack(failure));
     }
     // The judgement.
     const now = native.nowMs();

@@ -920,6 +920,15 @@ test("A3: what counts as a read the operator domain holds back", async () => {
     const broken = fx.world.addNode({ release: "v2.4.0", measurement: fx.measurement, offered: false, brokenSignature: true });
     broken.record("c", [{ t: "connection_created", time_ms: fx.world.now, record_id: "r", provider: "slack", scope: "" }]);
   }, "documents:rejected");
+  await blocked("the route of the bodies answers that it does not exist, for keys the listing of the store named", async (fx) => {
+    fx.nodes[0].record("c", [{ t: "connection_created", time_ms: fx.world.now, record_id: "r", provider: "slack", scope: "" }]);
+    fx.world.fault("POST /api/secure/log/bodies", { status: 404, body: { detail: "Not Found" } });
+  }, "bodies:Not Found");
+  await blocked("the route of the node documents answers that it does not exist, for a node of a key the listing named", async (fx) => {
+    const other = fx.world.addNode({ release: "v2.4.0", measurement: fx.measurement, offered: false });
+    other.record("c", [{ t: "connection_created", time_ms: fx.world.now, record_id: "r", provider: "slack", scope: "" }]);
+    fx.world.fault("POST /api/secure/log/documents", { status: 404, body: { detail: "Not Found" } });
+  }, "documents:Not Found");
   await blocked("a backend that states it has no store of format 3 after this device handed a grant to a node that writes it", async (fx) => {
     fx.world.routes.log = "disabled";
   }, "read:log_store_disabled");

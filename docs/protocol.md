@@ -1545,6 +1545,13 @@ log screen runs a round with its first page. One round runs at a time.
 5. The chains of formats 1 and 2 the device follows (the last part of this section).
 6. The judgement, the published state, and the report (`POST /api/secure/log/verified`).
 
+A backend that answers the route of the listing addresses with the status 404 and no code of its
+own, or with the code `log_store_disabled`, states that its environment has no store of format 3.
+The round then reads the chains of formats 1 and 2 only. When the device handed a grant to a node
+of a release that writes format 3, or read that store before, the same answer is a read held
+back, and so is that answer from any other route of the reads for keys a listing of the store
+named.
+
 The bodies and the node documents reach the device through the backend. A body cannot be replaced
 (the key of the listing carries its hash) and a node document proves itself, but both can be
 withheld, and the signature of an object reaches the device the same way. So a key of the listing
