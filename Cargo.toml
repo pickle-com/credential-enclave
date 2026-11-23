@@ -23,10 +23,11 @@ sha2 = "0.10"
 x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
 zeroize = "1"
 
-# enclave.md 11.1: the release profile is a build input of the measured binary.
+# enclave.md 11.1: the release profile is a build input of the measured binary. A panic unwinds:
+# what a panic of the node program ends is the rule of enclave/src/faults.rs.
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+panic = "unwind"
 strip = true
