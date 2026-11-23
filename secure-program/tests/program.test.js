@@ -1405,6 +1405,214 @@ test("A3: a key of the screen that an answer of the bodies ends in front of is a
   assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
 });
 
+/** What the rounds kept for the screen of a fixture (log.recovered), opened with the key of the
+ *  account as the program derives it: {v, entries, pages, found}, or null when nothing is kept. */
+function openRecovered(fx) {
+  const sealed = fx.world.stored("log.recovered");
+  if (sealed === undefined) return null;
+  const key = Buffer.from(crypto.hkdfSync("sha256", fx.keys.masterKey, Buffer.alloc(0), utf8("pickle.secure.v1.log-cache"), 32));
+  const aad = utf8("pickle.secure.v1.log-recovered\n" + fx.world.userId + "\n" + fx.keys.keyId);
+  return JSON.parse(bridge.aeadOpen("chacha20poly1305", key, bytes(sealed.nonce), aad, bytes(sealed.ct)).toString("utf8"));
+}
+
+/** Has the backend of a fixture answer the request for listing addresses with an error while
+ *  the log screen is running (mode.screen) and held(pages) says so for the pages it asks for. */
+function listingsFromScreen(fx, mode, held) {
+  return fx.world.fault("POST /api/secure/log/read", (request) => {
+    if (!mode.screen || !held(JSON.parse(request.body).pages)) return undefined;
+    return { status: 503, body: { detail: "log_store_unreachable" } };
+  });
+}
+
+test("a backend that gives the rounds the listings of the first page and not the screen shows the user what the rounds read: the page is made from the listing page a round kept, as new as the last round", async () => {
+  const fx = S.fixture(source, { device: { securityStatus: true } });
+  await S.start(fx);
+  const world = fx.world;
+  for (let i = 0; i < 3; i += 1) {
+    world.advance(HOUR_MS);
+    fx.nodes[0].record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/messages/" + i, "POST")]);
+  }
+  const mode = { screen: false };
+  listingsFromScreen(fx, mode, () => true);
+  // The screen: its listings are held back, it kept nothing, and it shows nothing of format 3.
+  const first = await onScreen(fx, mode, "read_log", { limit: 50 });
+  assert.equal(first.value.status, "pending");
+  assert.deepEqual(shownGroups(first.value), []);
+  assert.equal(world.state.log.store, "blocked");
+  assert.deepEqual(world.stored("log.withheld"), { keys: [], shown: [], pages: [0] });
+  // The next round reads the two listings as the screen asks for them, and the entries of the
+  // page: the count ends, and what it read is kept.
+  world.advance(2 * 60000);
+  await S.event(fx, "foreground");
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(world.stored("log.withheld"), undefined);
+  const kept = openRecovered(fx);
+  assert.deepEqual(kept.pages.map((page) => [page[0], page[2], page[3].length]), [[0, false, 4]]);
+  assert.equal(kept.entries.length, 4);
+  // The screen again, its listings held back as before: the page is the one the round read, and
+  // the screen asks for no body.
+  const bodies = world.sent("POST /api/secure/log/bodies").length;
+  const second = await onScreen(fx, mode, "read_log", { limit: 50 });
+  const groups = shownGroups(second.value);
+  assert.deepEqual(groups.map((group) => group.kind), ["request", "grant_renewed"]);
+  assert.equal(groups[0].count, 3);
+  assert.ok(groups.every((group) => group.verified === true));
+  assert.equal(world.sent("POST /api/secure/log/bodies").length, bodies);
+  // That read of the screen was held back again: the rounds read the page again, and a new entry
+  // is on the screen after the round that follows it. The count never passes one.
+  for (let day = 0; day < 5; day += 1) {
+    world.advance(DAY_MS);
+    fx.nodes[0].record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/drafts/" + day, "DELETE")]);
+    world.advance(HOUR_MS);
+    await S.event(fx, "foreground");
+    assert.equal(world.state.log.status, "verified", "day " + day);
+    const shown = await onScreen(fx, mode, "read_log", { limit: 50 });
+    const requests = shownGroups(shown.value).filter((group) => group.kind === "request");
+    assert.equal(requests.reduce((sum, group) => sum + group.count, 0), 4 + day, "day " + day);
+    assert.equal(world.state.log.status, "pending", "day " + day);
+    assert.equal(world.stored("log.blocked").count, 1, "day " + day);
+  }
+  assert.ok(world.securityStatuses.every((told) => told.status !== "attention"));
+  // The backend gives the screen its listings: the screen reads the page itself, and the listing
+  // page the rounds kept is dropped.
+  world.clearFaults();
+  const own = await S.call(fx, "read_log", { limit: 50 });
+  assert.equal(own.value.status, "verified");
+  assert.deepEqual(openRecovered(fx).pages, []);
+  assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
+});
+
+test("A3: a later page of the screen that is held back is made from the listing page a round kept for it, and later pages that keep being held back where the rounds kept nothing mark the log after three such reads and three days, whatever the rounds read in between", async () => {
+  const fx = S.fixture(source, { device: { securityStatus: true } });
+  await S.start(fx);
+  const world = fx.world;
+  const node = fx.nodes[0];
+  for (let i = 0; i < 4; i += 1) {
+    world.advance(HOUR_MS);
+    node.record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/drafts/" + i, "DELETE")]);
+  }
+  world.advance(8 * DAY_MS);
+  const recent = (count) => {
+    for (let i = 0; i < count; i += 1) {
+      world.advance(60000);
+      node.record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/messages/" + i, "POST")]);
+    }
+  };
+  recent(3);
+  // The backend holds the listings of the later pages back from the screen, and answers every
+  // other request, the ones of the rounds among them.
+  const mode = { screen: false };
+  const fault = listingsFromScreen(fx, mode, (pages) => pages.some((page) => page.key_marker !== ""));
+  const open = async () => {
+    const shown = await onScreen(fx, mode, "read_log", { limit: 3 });
+    assert.equal(shown.value.has_more, true);
+    return world.runtime.log_pages[0].before_ms;
+  };
+  const before = await open();
+  const held = await onScreen(fx, mode, "read_log_page", { before_ms: before });
+  assert.deepEqual(held, { ok: false, code: "log_store_unreachable" });
+  assert.deepEqual(world.stored("log.withheld"), { keys: [], shown: [], pages: [before] });
+  assert.equal(world.stored("log.denied").count, 1);
+  assert.equal(world.stored("log.denied").before_ms, before);
+  // The round reads that page as the screen asks for it and keeps it.
+  world.advance(2 * 60000);
+  await S.event(fx, "foreground");
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(world.stored("log.withheld"), undefined);
+  assert.deepEqual(openRecovered(fx).pages.map((page) => [page[0], page[3].length]), [[before, 5]]);
+  // The same page again, held back again: it is made from what the round kept, and it does not
+  // add to the count.
+  const again = await onScreen(fx, mode, "read_log_page", { before_ms: before });
+  assert.equal(again.ok, true);
+  const deleted = shownGroups(again.value).filter((group) => group.kind === "request" && group.action === "delete");
+  assert.equal(deleted.reduce((sum, group) => sum + group.count, 0), 4);
+  assert.equal(world.stored("log.denied").count, 1);
+  // New entries move the time the second page begins below. The rounds kept no page that begins
+  // there: each such read of the screen is counted, and the rounds that read the page in
+  // between end nothing of that count.
+  const states = [];
+  for (let day = 0; day < 3; day += 1) {
+    world.advance(DAY_MS + HOUR_MS);
+    recent(2);
+    await S.event(fx, "foreground");
+    const moved = await open();
+    assert.ok(moved > before);
+    const page = await onScreen(fx, mode, "read_log_page", { before_ms: moved });
+    assert.deepEqual(page, { ok: false, code: "log_store_unreachable" }, "day " + day);
+    await world.settle(1000);
+    states.push(world.state.log.status + ":" + world.state.log.store + ":" + world.stored("log.denied").count);
+  }
+  assert.deepEqual(states, ["verified:verified:2", "verified:verified:3", "attention:blocked:4"]);
+  assert.deepEqual(world.securityStatuses.slice(-1)[0].reasons, ["verification_blocked"]);
+  // A round that reads everything it asks for does not end it.
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "attention");
+  assert.equal(world.state.log.store, "blocked");
+  assert.equal(world.state.log.store_failure, "page:held");
+  assert.equal(world.state.log.store_failing_ms, world.stored("log.denied").first_ms);
+  assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  // The backend gives the screen the listing of that page: the count ends, and a round that the
+  // read starts clears the mark.
+  fault.times = 0;
+  const last = world.stored("log.denied").before_ms;
+  const served = await S.call(fx, "read_log_page", { before_ms: last });
+  assert.equal(served.ok, true);
+  assert.equal(world.stored("log.denied"), undefined);
+  await world.settle(1000);
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(world.securityStatuses.slice(-1)[0].status, "ok");
+});
+
+test("a later page of the screen that fails for the network of the device, or once for the backend, counts nothing that marks the log: the page the screen reads next ends the count", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  for (let i = 0; i < 6; i += 1) {
+    world.advance(HOUR_MS);
+    fx.nodes[0].record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/messages/" + i, "POST")]);
+  }
+  const first = await S.call(fx, "read_log", { limit: 2 });
+  assert.equal(first.value.has_more, true);
+  const before = world.runtime.log_pages[0].before_ms;
+  // The device has no network, on four days.
+  world.fault(() => true, "transport");
+  for (let day = 0; day < 4; day += 1) {
+    world.advance(DAY_MS);
+    const page = await S.call(fx, "read_log_page", { before_ms: before });
+    assert.deepEqual(page, { ok: false, code: "log_store_unreachable" });
+    await world.settle(40000);
+  }
+  assert.equal(world.stored("log.denied"), undefined);
+  assert.notEqual(world.state.log.status, "attention");
+  world.clearFaults();
+  world.advance(HOUR_MS);
+  await S.event(fx, "foreground");
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(world.stored("log.withheld"), undefined);
+
+  // The backend answers one request for the listings of a later page with an error.
+  const once = S.fixture(source);
+  await S.start(once);
+  for (let i = 0; i < 6; i += 1) {
+    once.world.advance(HOUR_MS);
+    once.nodes[0].record("u", [S.providerRequest(once.world.now, "/gmail/v1/users/me/messages/" + i, "POST")]);
+  }
+  await S.call(once, "read_log", { limit: 2 });
+  const below = once.world.runtime.log_pages[0].before_ms;
+  once.world.fault("POST /api/secure/log/read", { status: 500 }, 1);
+  const failed = await S.call(once, "read_log_page", { before_ms: below });
+  assert.deepEqual(failed, { ok: false, code: "log_store_unreachable" });
+  assert.equal(once.world.stored("log.denied").count, 1);
+  const retried = await S.call(once, "read_log_page", { before_ms: below });
+  assert.equal(retried.ok, true);
+  assert.equal(once.world.stored("log.denied"), undefined);
+  assert.equal(once.world.stored("log.withheld"), undefined);
+  for (let day = 0; day < 4; day += 1) {
+    await nextDay(once);
+    assert.equal(once.world.state.log.status, "verified", "day " + day);
+  }
+});
+
 test("a node whose document the backend hands out is judged without a read of the store, and a document the node registry kept verifies without the nonce of a node document", async () => {
   // The document a node wrote to the store: one request for it, and no listing of the store.
   const fx = S.fixture(source);

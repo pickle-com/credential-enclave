@@ -112,6 +112,8 @@
   //                   pages of the screen by the time they begin below, 0 for the first)
   //   log.recovered   what the rounds read of the reads of the log screen that were held back,
   //                   kept for the screen, sealed
+  //   log.denied      the later pages of the log screen that were held back in a row:
+  //                   {before_ms, limit, count, first_ms, last_ms}
   //   log.legacy      the chains of format 1 and format 2: {nodes: {node: {seq, time_ms, until_ms,
   //                   closed}}, waiting: {node: {until_ms, time_ms}}} (waiting: the receiving
   //                   nodes of transfers whose documents this device has still to judge)
@@ -130,6 +132,7 @@
   const STORE_MISSING = "log.missing";
   const STORE_WITHHELD = "log.withheld";
   const STORE_RECOVERED = "log.recovered";
+  const STORE_DENIED = "log.denied";
   const STORE_LEGACY = "log.legacy";
   const STORE_ROUND = "log.round";
   const STORE_CACHE = "log.cache";
@@ -201,9 +204,13 @@
   // (log.recovered): the entries kept at most, the events of those entries at most (an entry
   // holds LOG_ENTRY_EVENTS at most, so one entry is always kept), and the characters kept of one
   // string of an event. Beyond the limits, what was kept first leaves first.
-  const LOG_RECOVERED_KEYS = 128;
+  const LOG_RECOVERED_KEYS = 256;
   const LOG_RECOVERED_EVENTS = 512;
   const LOG_RECOVERED_TEXT = 256;
+  // The listing pages of the screen the rounds keep at most, and the events of the page a round
+  // keeps of one (the entries of the same millisecond as the last one stay on the page).
+  const LOG_RECOVERED_PAGES = 4;
+  const LOG_RECOVERED_PAGE_EVENTS = 100;
   // The retention of an object of the store (Object Lock, days). The absence of a key older than
   // this says nothing; a key is expected in the listing while it is a day younger than this.
   const LOG_RETENTION_DAYS = 365;
@@ -4292,8 +4299,11 @@
       cut: false, over: false, controlKeys: 0, checked: 0, bodies: 0, nodes: new Set(), undocumented: new Set(),
       verified: [], entries: new Map(), junk: new Set(), screenMs: null, withheld: new Set(),
       shown: new Set(), kept: new Set(), settled: new Set(), pagesHeld: new Set(), pagesRead: new Set(),
-      store3: known,
+      pagesKept: new Map(), store3: known,
     };
+    // What the rounds kept for the screen before this round: an entry kept there is not read
+    // again.
+    const had = loadRecovered(keys);
     const budget = { documents: LOG_DOCUMENT_REQUESTS, bodies: origin === "screen" ? LOG_SUMMARY_REQUESTS : LOG_ROUND_BODY_REQUESTS };
     const pages = { c: null, u: null };
     let absent = false;
@@ -4392,18 +4402,34 @@
     // in the request the screen sends for it. A backend that states it has no store of format 3
     // holds such a page back on a device that knows of that store, and has no such page on a
     // device that knows of none.
+    // What the round reads there is kept for the screen: the page the screen would show below
+    // that time (LOG_RECOVERED_PAGE_EVENTS events), and the entries of that page, which the
+    // round reads as the screen would. An entry of the page whose read is held back, or that no
+    // answer reaches, is a key the rounds ask for again.
     for (const before of withheld.pages) {
       if (run.pagesRead.has(before) || run.pagesHeld.has(before)) continue;
+      let listings = null;
       try {
-        await readListings(turn, screenPages(before));
-        run.pagesRead.add(before);
+        listings = await readListings(turn, screenPages(before));
       } catch (failure) {
         if (isStoreFailure(failure) && failure.kind === "absent" && !run.store3 && turnLeft(turn) > 0) {
           run.pagesRead.add(before);
           continue;
         }
         noteFailure(turn, run, heldBack(failure));
+        continue;
       }
+      run.pagesRead.add(before);
+      const page = choosePage(
+        { c: listings[0], u: listings[1] }, before === 0 ? Infinity : before, LOG_RECOVERED_PAGE_EVENTS);
+      run.pagesKept.set(before, { more: page.more, keys: page.chosen });
+      const wanted = [];
+      for (const parsed of page.chosen) {
+        if (had.entries.has("3:" + parsed.tail)) continue;
+        if (run.entries.has(parsed.key)) run.kept.add(parsed.key);
+        else if (wanted.length < LOG_SCREEN_BODIES) wanted.push({ parsed: parsed, fresh: false, shown: true, keep: true });
+      }
+      await readEntries(turn, keys, log, run, wanted, budget);
     }
     try {
       await followLegacy(turn, keys, log, run);
@@ -4470,7 +4496,11 @@
     } else if (!unreachable) {
       log.blocked = { first_ms: 0, count: 0 };
     }
-    const held = log.blocked.count >= LOG_BLOCKED_ROUNDS && now - log.blocked.first_ms >= LOG_BLOCKED_MS;
+    // The later pages held back from the screen, which the reads of the screen count.
+    const pagesDenied = loadDenied();
+    const deep = heldLong(pagesDenied, now);
+    if (deep && run.detail === "") run.detail = "page:held";
+    const held = deep || (log.blocked.count >= LOG_BLOCKED_ROUNDS && now - log.blocked.first_ms >= LOG_BLOCKED_MS);
     const reasons = [];
     if (established > 0) reasons.push("unlisted_release");
     if (conflicts > 0) reasons.push("conflicting_signatures");
@@ -4485,8 +4515,9 @@
       status: status, verified_ms: status === "pending" ? before.verified_ms : now,
       unverified_nodes: conflicts, missing: log.missing.length, expired: 0, unknown_nodes: established,
       newer_release_nodes: grace,
-      store: blocked ? "blocked" : unreachable ? "unreachable" : run.truncated ? "truncated" : "verified",
-      store_failure: run.detail, store_failing_ms: log.blocked.first_ms, program_version: VERSION,
+      store: blocked || deep ? "blocked" : unreachable ? "unreachable" : run.truncated ? "truncated" : "verified",
+      store_failure: run.detail, program_version: VERSION,
+      store_failing_ms: log.blocked.first_ms !== 0 || !deep ? log.blocked.first_ms : pagesDenied.first_ms,
     };
     // What the device keeps of this round.
     if (complete && !absent && !readFailed) {
@@ -4516,11 +4547,19 @@
     // What this round read under the keys the log screen had asked for is kept for the screen
     // first: a read leaves the withheld ones, and the count of the rounds held back ends, only
     // after what was read is where the screen takes it from.
-    if (run.kept.size > 0) {
+    // A listing page the round read again is kept as well, and a listing page the screen read
+    // itself in this round replaces nothing: what the rounds kept of it is dropped.
+    const own = origin === "screen" && pages.c !== null && had.pages.some(function (page) { return page.before === 0; });
+    if (run.kept.size > 0 || run.pagesKept.size > 0 || own) {
       const recovered = loadRecovered(keys);
       run.kept.forEach(function (key) {
         const record = run.entries.get(key);
         keepRecovered(recovered, record.parsed, record, run.junk.has(key));
+      });
+      if (own) recovered.pages = recovered.pages.filter(function (page) { return page.before !== 0; });
+      run.pagesKept.forEach(function (page, before) {
+        recovered.pages = recovered.pages.filter(function (kept) { return kept.before !== before; });
+        recovered.pages.push({ before: before, t: now, more: page.more, keys: page.keys });
       });
       saveRecovered(keys, recovered);
     }
@@ -5314,19 +5353,25 @@
   // it is written before the read it answers leaves log.withheld.
 
   function emptyRecovered() {
-    return { entries: new Map() };
+    return { entries: new Map(), pages: [], found: null };
   }
 
   function recoveredAad(keys) {
     return encode(utf8(purpose("log-recovered") + "\n" + userId() + "\n" + keys.keyId));
   }
 
-  /** What the rounds read for the screen, as this device and key keep it: {entries}. entries is
-   *  a table from the id of an entry of the screen ("3:" and the tail of a key of format 3) to
+  /** What the rounds read for the screen, as this device and key keep it: {entries, pages,
+   *  found}. entries is a table from the id of an entry of the screen ("3:" and the tail of a
+   *  key of format 3, "2:" and node:seq for an entry of a chain of format 1 or format 2) to
    *  {t, m, e}: the time it was kept, the time of the entry, and the entry as the screen shows
    *  it ({id, time_ms, count, items}), or null for an object a round found to be no entry. The
-   *  table is in the order the entries were kept. An entry older than the retention of the
-   *  store is left out. A value of another key, or one that does not open, is no kept value. */
+   *  table is in the order the entries were kept. pages are the listing pages of the screen the
+   *  rounds read again: {before, t, more, keys} (the time the page begins below, 0 for the page
+   *  that begins the two listings; the time it was kept; whether the listings go on below it;
+   *  the keys of the page, the latest first). found is the node prefixes of the bucket of format
+   *  1 and format 2 a round read again ({t, ids}), or null. An entry older than the retention of
+   *  the store is left out. A value of another key, or one that does not open, is no kept
+   *  value. */
   function loadRecovered(keys) {
     const recovered = emptyRecovered();
     const sealed = storedJson(STORE_RECOVERED, null);
@@ -5354,11 +5399,31 @@
         e: entry === null ? null : { id: entry.id, time_ms: whole(entry.time_ms), count: whole(entry.count), items: entry.items },
       });
     }
+    for (const item of Array.isArray(kept.pages) ? kept.pages : []) {
+      if (!Array.isArray(item) || !Number.isSafeInteger(item[0]) || item[0] < 0 || !Array.isArray(item[3])) continue;
+      const parsed = [];
+      for (const name of item[3]) {
+        const letter = typeof name === "string" ? name.slice(0, 1) : "";
+        const key = letter === "c" || letter === "u" ? parseEntryKey(entryPrefix(letter) + name.slice(1), letter) : null;
+        if (key !== null) parsed.push(key);
+      }
+      if (parsed.length === item[3].length) {
+        recovered.pages.push({ before: item[0], t: whole(item[1]), more: item[2] === true, keys: parsed });
+      }
+    }
+    const found = kept.found;
+    if (found !== null && typeof found === "object" && Array.isArray(found.ids)) {
+      recovered.found = {
+        t: whole(found.t),
+        ids: found.ids.filter(function (id) { return typeof id === "string" && NODE_ID.test(id); }).slice(0, 2 * LEGACY_NODES),
+      };
+    }
     return recovered;
   }
 
   /** Writes what the rounds read for the screen. Beyond LOG_RECOVERED_KEYS entries or
-   *  LOG_RECOVERED_EVENTS events, the entries kept first leave first. Nothing kept: no value. */
+   *  LOG_RECOVERED_EVENTS events, the entries kept first leave first, and beyond
+   *  LOG_RECOVERED_PAGES listing pages the pages kept first. Nothing kept: no value. */
   function saveRecovered(keys, recovered) {
     let events = 0;
     recovered.entries.forEach(function (kept) { events += kept.e === null ? 0 : kept.e.items.length; });
@@ -5368,16 +5433,20 @@
       events -= kept.e === null ? 0 : kept.e.items.length;
       recovered.entries.delete(id);
     }
-    if (recovered.entries.size === 0) {
+    recovered.pages = recovered.pages.slice(-LOG_RECOVERED_PAGES);
+    if (recovered.entries.size === 0 && recovered.pages.length === 0 && recovered.found === null) {
       native.storeSet(STORE_RECOVERED, null);
       return;
     }
     const entries = [];
     recovered.entries.forEach(function (kept, id) { entries.push([id, kept.t, kept.m, kept.e]); });
+    const pages = recovered.pages.map(function (page) {
+      return [page.before, page.t, page.more, page.keys.map(function (parsed) { return parsed.letter + parsed.tail; })];
+    });
     const nonce = native.randomBytes(12);
     const ct = native.aeadSeal({
       alg: "chacha20poly1305", key: keys.cacheKey, nonce: nonce, aad: recoveredAad(keys),
-      plaintext: encode(utf8(JSON.stringify({ v: 1, entries: entries }))),
+      plaintext: encode(utf8(JSON.stringify({ v: 1, entries: entries, pages: pages, found: recovered.found }))),
     });
     storeJson(STORE_RECOVERED, { v: 1, key_id: keys.keyId, nonce: nonce, ct: ct });
   }
@@ -5410,6 +5479,98 @@
     });
   }
 
+  /** The page of the screen for the entries before beforeMs (Infinity: from the start of the two
+   *  listings), made from a listing page the rounds kept: {chosen, more, count, t}, as choosePage
+   *  returns it, with the time the page was kept. A kept page answers when it begins at that time
+   *  or above it and reaches below it: its keys before that time are every key the listings named
+   *  from there down to its last key. Among several, the one kept last. null when no kept page
+   *  covers that time. */
+  function recoveredPage(recovered, beforeMs, limit) {
+    let best = null;
+    for (const page of recovered.pages) {
+      if (page.keys.length === 0 || (page.before !== 0 && page.before < beforeMs)) continue;
+      if (!(beforeMs > page.keys[page.keys.length - 1].time_ms)) continue;
+      if (best === null || page.t > best.t) best = page;
+    }
+    if (best === null) return null;
+    const below = best.keys.filter(function (parsed) { return parsed.time_ms < beforeMs; });
+    const chosen = [];
+    let count = 0;
+    let at = 0;
+    for (; at < below.length; at += 1) {
+      const parsed = below[at];
+      if (count >= limit && parsed.time_ms !== chosen[chosen.length - 1].time_ms) break;
+      chosen.push(parsed);
+      count += parsed.count;
+    }
+    return { chosen: chosen, more: at < below.length || best.more, count: count, t: best.t };
+  }
+
+  /** Forgets the listing page the rounds kept for the page that begins below before (0: the page
+   *  that begins the two listings), once the screen read that page itself. recovered is what the
+   *  caller read; the kept value is read again and written in the same step. */
+  function dropRecoveredPage(keys, recovered, before) {
+    if (!recovered.pages.some(function (page) { return page.before === before; })) return;
+    const kept = loadRecovered(keys);
+    kept.pages = kept.pages.filter(function (page) { return page.before !== before; });
+    saveRecovered(keys, kept);
+  }
+
+  // ---- The later pages held back from the screen (log.denied) ----
+  //
+  // A listing page of the screen is asked for by the time it begins below, and that time moves
+  // with every entry that arrives above it: a listing page the rounds kept answers the read that
+  // was held back and a read near it, and not every later one. So the later pages the operator
+  // domain holds back from the screen are counted by the reads of the screen themselves: a read
+  // of a later page that is held back, and that nothing the rounds kept answers, adds to the
+  // count, whatever the rounds read in between. The count ends when the screen itself reads a
+  // listing that begins at or below the time of the last such read, for at least as many events
+  // (the page that was held back, or a page below it, was then shown). The count marks the log
+  // as the count of the rounds held back does: LOG_BLOCKED_ROUNDS reads, the first of them
+  // LOG_BLOCKED_MS old.
+
+  /** The later pages held back from the screen: {before_ms, limit, count, first_ms, last_ms}
+   *  (the time the page last held back begins below, the most events a page held back was asked
+   *  for, the reads held back in a row, the time of the first and of the last of them), or null
+   *  when there is none or the last one is older than the retention of the store. */
+  function loadDenied() {
+    const kept = storedObject(STORE_DENIED);
+    const now = native.nowMs();
+    if (whole(kept.count) === 0 || whole(kept.before_ms) === 0) return null;
+    if (now - whole(kept.last_ms) >= LOG_RETENTION_DAYS * DAY_MS) return null;
+    return {
+      before_ms: whole(kept.before_ms), limit: whole(kept.limit), count: whole(kept.count),
+      first_ms: Math.min(whole(kept.first_ms), now), last_ms: whole(kept.last_ms),
+    };
+  }
+
+  /** Counts a read of a later page of the screen that was held back. Returns the count. */
+  function denyPage(beforeMs, limit) {
+    const now = native.nowMs();
+    let kept = loadDenied();
+    if (kept === null) kept = { before_ms: beforeMs, limit: limit, count: 0, first_ms: now, last_ms: now };
+    kept.count += 1;
+    kept.before_ms = beforeMs;
+    kept.limit = Math.max(kept.limit, limit);
+    kept.last_ms = now;
+    storeJson(STORE_DENIED, kept);
+    return kept;
+  }
+
+  /** Ends the count of the later pages held back when the screen read the listing of a later
+   *  page itself that begins at or below the time of the last one held back, for as many events
+   *  or more. Returns whether the count it ended marked the log. */
+  function servePage(beforeMs, limit) {
+    const kept = loadDenied();
+    if (kept === null || beforeMs > kept.before_ms || limit < kept.limit) return false;
+    native.storeSet(STORE_DENIED, null);
+    return heldLong(kept, native.nowMs());
+  }
+
+  /** Whether a count of reads held back ({count, first_ms}) marks the log at the time now. */
+  function heldLong(kept, now) {
+    return kept !== null && kept.count >= LOG_BLOCKED_ROUNDS && now - kept.first_ms >= LOG_BLOCKED_MS;
+  }
   // ---- The summary of the last LOG_SUMMARY_DAYS days ----
 
   // The summary tally: what this device counted of the entries of the window, kept with the kept
@@ -5617,11 +5778,17 @@
   /** One later page of the screen: the entries before beforeMs, read without a round. The two
    *  listings of format 3 are read from the marker of that time and the entries of the page from
    *  the backend, each verified as a round verifies it; what the page finds changes no kept
-   *  judgement (the rounds judge). A read the page finds held back (its listings, the document or
-   *  the body of one of its keys) is kept for the rounds, which make it again and count it
-   *  (log.withheld). The entries of the chains of format 1 and format 2 are merged in. Returns
-   *  the page of mergePage. */
+   *  judgement (the rounds judge). An entry the rounds read for the screen (log.recovered) is
+   *  taken from there and not asked for. A read the page finds held back (its listings, the
+   *  document or the body of one of its keys) and a key no answer of the bodies reached are kept
+   *  for the rounds, which make the read again and count it (log.withheld). When the listings of
+   *  the page are held back and the rounds kept a listing page that covers that time, the page is
+   *  made from it; when they kept none, the read counts toward the later pages held back from the
+   *  screen (log.denied), and a listing the screen then reads itself at or below that time ends
+   *  that count. The entries of the chains of format 1 and format 2 are merged in. Returns the
+   *  page of mergePage. */
   async function readPage(turn, keys, cache, beforeMs, limit) {
+    const started = native.nowMs();
     let chosen = { chosen: [], more: false, count: 0 };
     const records = new Map();
     const junk = new Set();
@@ -5635,26 +5802,55 @@
     // What the rounds read for the screen: an entry kept there is not asked for.
     const recovered = loadRecovered(keys);
     let unread = false;
-    let listed = false;
+    let listings = null;
     try {
-      const listings = await readListings(turn, screenPages(beforeMs));
-      listed = true;
-      run.pagesRead.add(beforeMs);
-      chosen = choosePage({ c: listings[0], u: listings[1] }, beforeMs, limit);
-      for (const id of Object.keys(pageNodes)) {
-        if (log.nodes[id] === undefined) log.nodes[id] = pageNodes[id];
-      }
-      const wanted = chosen.chosen.filter(function (parsed) { return !recovered.entries.has("3:" + parsed.tail); })
-        .slice(0, LOG_SCREEN_BODIES).map(function (parsed) { return { parsed: parsed, fresh: false, shown: true }; });
-      await readEntries(turn, keys, log, run, wanted, { documents: 1, bodies: 1 });
-      for (const id of Object.keys(log.nodes)) pageNodes[id] = log.nodes[id];
+      listings = await readListings(turn, screenPages(beforeMs));
     } catch (failure) {
       if (!isStoreFailure(failure) || !(turnLeft(turn) > 0)) throw failure;
       // A backend that states it has no store of format 3 is believed by a device that knows of
       // none; for any other device that answer holds the page back.
       const absent = failure.kind === "absent" && !storeKnown(log, loadWithheld());
-      if (!listed && !absent && (failure.kind === "absent" || heldKind(failure))) run.pagesHeld.add(beforeMs);
-      if (!absent) unread = true;
+      if (!absent) {
+        const refused = failure.kind === "absent" || failure.kind === "blocked";
+        if (refused || failure.kind === "silent") run.pagesHeld.add(beforeMs);
+        const page = recoveredPage(recovered, beforeMs, limit);
+        if (page !== null) {
+          chosen = page;
+        } else {
+          unread = true;
+          // The operator domain held the page back (a request that was not answered counts when
+          // the backend answered another request of this runtime around it), and the rounds
+          // kept nothing that covers it.
+          if (refused || (failure.kind === "silent" && await reachJudged(turn, started))) {
+            if (heldLong(denyPage(beforeMs, limit), native.nowMs())) {
+              // The count reached its mark: a round judges and publishes it now.
+              requestRound(freeTurn(), keys, "sync").then(noop, noop);
+            }
+          }
+        }
+      }
+    }
+    if (listings !== null) {
+      run.pagesRead.add(beforeMs);
+      // The count of the later pages held back ends here; when it marked the log, a round
+      // judges and publishes that now.
+      if (servePage(beforeMs, limit)) requestRound(freeTurn(), keys, "sync").then(noop, noop);
+      dropRecoveredPage(keys, recovered, beforeMs);
+      chosen = choosePage({ c: listings[0], u: listings[1] }, beforeMs, limit);
+    }
+    if (chosen.chosen.length > 0) {
+      try {
+        for (const id of Object.keys(pageNodes)) {
+          if (log.nodes[id] === undefined) log.nodes[id] = pageNodes[id];
+        }
+        const wanted = chosen.chosen.filter(function (parsed) { return !recovered.entries.has("3:" + parsed.tail); })
+          .slice(0, LOG_SCREEN_BODIES).map(function (parsed) { return { parsed: parsed, fresh: false, shown: true }; });
+        await readEntries(turn, keys, log, run, wanted, { documents: 1, bodies: 1 });
+        for (const id of Object.keys(log.nodes)) pageNodes[id] = log.nodes[id];
+      } catch (failure) {
+        if (!isStoreFailure(failure) || !(turnLeft(turn) > 0)) throw failure;
+        unread = true;
+      }
     }
     // A read this page found held back (the page itself, the document or the body of a key) is
     // handed to the rounds, which make it again and count it.
@@ -5679,7 +5875,6 @@
     }
     return mergePage(first, chains.entries, limit, chosen.more || chains.more);
   }
-
   /** The first page of the screen and the summary, read from the store: one round started by the
    *  screen (the first listing pages of the control and of the use prefix, the judgement, and the
    *  bodies of the entries of the page and of the summary in the same requests), then the entries
@@ -5767,9 +5962,32 @@
         truncated = uncounted || beyond;
       }
     } else if (!round.absent) {
-      // The listings of format 3 were not read: the entries of format 3 the device kept stand in.
-      first = cache.entries.filter(function (entry) { return entry.id.slice(0, 2) === "3:"; });
-      more = cache.has_more;
+      // The listings of format 3 were not read. When the rounds read them again since the screen
+      // last read them itself, the page is made from the listing page the rounds kept, with the
+      // entries they kept; an entry of that page they did not keep is shown as not read, and its
+      // key goes to the rounds. Otherwise the entries of format 3 the device kept of the first
+      // page stand in.
+      const page = recoveredPage(recovered, Infinity, limit);
+      if (page !== null && page.t >= cache.saved_ms) {
+        const missing = new Set();
+        for (const parsed of page.chosen) {
+          const kept = recovered.entries.get("3:" + parsed.tail);
+          if (kept === undefined) {
+            first.push(entryOfRecord(parsed, undefined));
+            if (missing.size < LOG_WITHHELD_KEYS) missing.add(parsed.key);
+          } else if (kept.e !== null) {
+            first.push(kept.e);
+          }
+        }
+        more = page.more;
+        if (page.count >= limit && first.length > 0) floorMs = first[first.length - 1].time_ms;
+        if (missing.size > 0) {
+          saveWithheld({ withheld: missing, shown: missing, settled: new Set(), pagesHeld: new Set(), pagesRead: new Set() });
+        }
+      } else {
+        first = cache.entries.filter(function (entry) { return entry.id.slice(0, 2) === "3:"; });
+        more = cache.has_more;
+      }
       truncated = true;
     }
     // The chains of format 1 and format 2: the node prefixes of the account once in
@@ -6770,8 +6988,8 @@
    *  over again. */
   function clearLog() {
     for (const key of [STORE_GRANTS, STORE_CURSOR, STORE_RESUME, STORE_NODES, STORE_UNACCEPTED, STORE_BLOCKED,
-      STORE_SAMPLE, STORE_SEEN, STORE_MISSING, STORE_WITHHELD, STORE_RECOVERED, STORE_LEGACY, STORE_ROUND,
-      STORE_CACHE]) {
+      STORE_SAMPLE, STORE_SEEN, STORE_MISSING, STORE_WITHHELD, STORE_RECOVERED, STORE_DENIED, STORE_LEGACY,
+      STORE_ROUND, STORE_CACHE]) {
       native.storeSet(key, null);
     }
     native.storeSet(STORE_MIGRATED, String(VERSION));
@@ -7883,8 +8101,8 @@
     native.keychainDelete(mailSetupItem());
     for (const key of [LEDGER_STORE_KEY, LEDGER_SHARE_STORE_KEY, SEALING_CHECK_STORE_KEY, STORE_GRANTS,
       STORE_CURSOR, STORE_RESUME, STORE_NODES, STORE_UNACCEPTED, STORE_BLOCKED, STORE_SAMPLE, STORE_SEEN,
-      STORE_MISSING, STORE_WITHHELD, STORE_RECOVERED, STORE_LEGACY, STORE_ROUND, STORE_CACHE, STORE_MIGRATED,
-      STORE_OUTCOMES].concat(RETIRED_STORE_KEYS)) {
+      STORE_MISSING, STORE_WITHHELD, STORE_RECOVERED, STORE_DENIED, STORE_LEGACY, STORE_ROUND, STORE_CACHE,
+      STORE_MIGRATED, STORE_OUTCOMES].concat(RETIRED_STORE_KEYS)) {
       native.storeSet(key, null);
     }
     outcomeState = null;
