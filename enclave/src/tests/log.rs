@@ -1,22 +1,22 @@
 //! The credential log as a node writes it (protocol.md section 7, enclave.md 5.8 and 5.11):
 //! an entry precedes the act it records, the events that arrive during a write form the next
 //! entry (the group commit), identical GET requests share one event, a control event stands in
-//! an entry of its own, the chain verifies from the keys of the store, and the orderly shutdown
-//! ends every chain with a `final` head that covers an open batch.
+//! an entry of its own, every object of the store verifies against its key, and the orderly
+//! shutdown refuses every new call, lets a call in progress run to its end and signs nothing.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use credential_enclave_protocol::app::{open_entry_v2, verify_entry_v2, verify_index, IndexError};
-use credential_enclave_protocol::encoding::{to_json, verify, Signed};
+use credential_enclave_protocol::app::{open_entry_v3, verify_entry_v3, EntryError};
+use credential_enclave_protocol::encoding::{b64u, to_json, Signed};
+use credential_enclave_protocol::limits;
 use credential_enclave_protocol::log::{
-    chain_prefix, parse_object_key, EntryKind, EntryParts, Head, ParsedKey,
+    object_key_v3, parse_object_key_v3, EntryKey, EntryKind, EntryLabel,
 };
 use credential_enclave_protocol::secret::Secret;
-use credential_enclave_protocol::{limits, purpose};
 use serde_json::{json, Value};
 
-use super::{provider, provider_and_log_store, quiet_provider_and_log_store};
+use super::{is_write_of, provider, provider_and_log_store, quiet_provider_and_log_store};
 use crate::state::{lock, Account, Node};
 use crate::testing::{App, Harness, Provider, Reply, Seen, LOG_HOST};
 
@@ -80,8 +80,9 @@ async fn node_with_log_store(provider: &Provider) -> (Harness, App) {
     (harness, app)
 }
 
-/// The parts of the keys of the chain of `user_id` on the node under test, in `seq` order.
-fn keys_of(provider: &Provider, harness: &Harness, user_id: &str) -> Vec<EntryParts> {
+/// The parts of the keys of the entries of `user_id` that the node under test wrote, in `seq`
+/// order.
+fn keys_of(provider: &Provider, harness: &Harness, user_id: &str) -> Vec<EntryKey> {
     provider
         .chain(user_id, &harness.node.node)
         .iter()
@@ -89,27 +90,13 @@ fn keys_of(provider: &Provider, harness: &Harness, user_id: &str) -> Vec<EntryPa
         .collect()
 }
 
-/// The head of the chain of `user_id` for a nonce, as `status` hands it out.
-async fn head_of(harness: &Harness, user_id: &str, nonce: &str) -> Signed {
-    let (status, state) = harness
-        .post("/v1/status", json!({"user_id": user_id, "nonce": nonce}))
-        .await;
-    assert_eq!(status, 200);
-    serde_json::from_value(state["head"].clone()).unwrap()
-}
-
 /// The position of the write of the entry `seq` of `user_id` and the positions of the
 /// provider requests whose target ends with one of `targets`, in the order the stand-in saw
 /// them.
 fn positions(seen: &[Seen], user_id: &str, seq: u64, targets: &[&str]) -> (usize, Vec<usize>) {
-    let name = format!("/{seq:020}-");
     let write = seen
         .iter()
-        .position(|seen| {
-            seen.server_name == LOG_HOST
-                && seen.target.contains(&format!("/accounts/{user_id}/"))
-                && seen.target.contains(&name)
-        })
+        .position(|seen| is_write_of(seen, user_id, seq))
         .expect("the entry was written");
     let requests = targets
         .iter()
@@ -136,7 +123,7 @@ async fn the_entry_is_on_the_chain_before_the_provider_is_called() {
             let account = lock(&account);
             lock(&observed).push((
                 seen.target.clone(),
-                account.head.seq,
+                account.last.seq,
                 account.has_open_events(),
             ));
             // Not a token response: a refresh that reaches this stand-in is refused.
@@ -180,7 +167,7 @@ async fn the_entry_is_on_the_chain_before_the_provider_is_called() {
         lock(&observed).last().unwrap(),
         &("/token".to_string(), 3, false)
     );
-    assert_eq!(harness.head_seq("user-1"), 3);
+    assert_eq!(harness.last_seq("user-1"), 3);
 
     // revoke-token: entry 4 exists when the revocation address is called.
     let (status, revoked) = harness
@@ -216,7 +203,7 @@ async fn a_request_under_a_new_grant_does_not_merge_into_an_event_of_the_grant_b
     // has an event of its own under the new grant.
     app.revoke(&harness).await;
     app.grant(&harness).await;
-    assert_eq!(harness.head_seq("user-1"), 4);
+    assert_eq!(harness.last_seq("user-1"), 4);
     let again = harness
         .forward(get(&app, &record, &address), b"")
         .await
@@ -279,7 +266,7 @@ async fn identical_get_requests_within_300_seconds_share_one_event() {
             .count(),
         2
     );
-    assert_eq!(harness.head_seq("user-1"), 2);
+    assert_eq!(harness.last_seq("user-1"), 2);
 
     // Another query, another path and another record are other requests.
     for (url, seq) in [
@@ -381,7 +368,7 @@ async fn events_that_arrive_during_a_write_form_the_next_entry() {
     let seqs: Vec<u64> = chain.iter().map(|stored| stored.seq()).collect();
     assert_eq!(seqs, [1, 2, 3]);
     assert_eq!(
-        (chain[2].parts().kind, chain[2].parts().count),
+        (chain[2].parts().kind(), chain[2].parts().count()),
         (EntryKind::Use, 3)
     );
     let mut queries: Vec<String> = app
@@ -394,13 +381,13 @@ async fn events_that_arrive_during_a_write_form_the_next_entry() {
     let (write, requests) = positions(&provider.seen(), "user-1", 3, &["?q=b", "?q=c", "?q=d"]);
     assert!(requests.iter().all(|request| *request > write));
 
-    // The counts of health: three entries, five events, three writes, none failed, no open
-    // batch left.
+    // The counts of health: three entries, five events, four writes (the three entries and
+    // the node document), none failed, no open batch left.
     let log = harness.health().await["log"].clone();
     assert_eq!(
         super::seven_counts(&log),
         json!({
-            "entries": 3, "events": 5, "writes": 3, "write_failures": 0, "open_batches": 0,
+            "entries": 3, "events": 5, "writes": 4, "write_failures": 0, "open_batches": 0,
             "batch_calls": 0, "batch_requests": 0,
         })
     );
@@ -430,14 +417,10 @@ async fn a_merged_get_waits_for_the_entry_of_the_event_it_shares() {
         json!({"seq": 2, "index": 0, "created": false})
     );
     let seen = provider.seen();
-    let writes = seen
-        .iter()
-        .filter(|seen| seen.server_name == LOG_HOST)
-        .count();
-    assert_eq!(writes, 2);
+    assert_eq!(provider.stored().len(), 2);
     let (write, requests) = positions(&seen, "user-1", 2, &["/messages", "/messages"]);
     assert!(requests[0] > write);
-    assert_eq!(harness.head_seq("user-1"), 2);
+    assert_eq!(harness.last_seq("user-1"), 2);
 
     // The same GET after the write shares the confirmed event and writes nothing.
     *lock(&pause) = Duration::ZERO;
@@ -457,20 +440,20 @@ async fn a_control_event_closes_the_open_batch_and_stands_alone() {
     *lock(&pause) = Duration::from_millis(400);
 
     // A release writes entry 2. A forward joins the open batch while that write runs, and
-    // then a grant command arrives: the control event closes the batch (entry 3, the event of
-    // the forward) and forms entry 4 of its own.
+    // then a revoke command arrives: the control event closes the batch (entry 3, the event
+    // of the forward) and forms entry 4 of its own.
     let password = app.record("vault_password", "vault", &json!({"value": "hunter2"}));
     let released = release(&harness, &app, &password);
     let rest = async {
         provider.until_written(2).await;
         let forwarded = harness.forward(get(&app, &record, MESSAGES), b"");
-        let granted = async {
+        let revoked = async {
             tokio::time::sleep(Duration::from_millis(60)).await;
-            app.grant(&harness).await
+            app.revoke(&harness).await
         };
-        tokio::join!(forwarded, granted)
+        tokio::join!(forwarded, revoked)
     };
-    let ((status, released), (forwarded, granted)) = tokio::join!(released, rest);
+    let ((status, released), (forwarded, revoked)) = tokio::join!(released, rest);
     assert_eq!(status, 200);
     assert_eq!(
         released["log"],
@@ -481,7 +464,7 @@ async fn a_control_event_closes_the_open_batch_and_stands_alone() {
         json!({"seq": 3, "index": 0, "created": true})
     );
     assert_eq!(
-        granted["log"],
+        revoked["log"],
         json!({"seq": 4, "index": 0, "created": true})
     );
 
@@ -490,7 +473,7 @@ async fn a_control_event_closes_the_open_batch_and_stands_alone() {
         .iter()
         .map(|stored| {
             let parts = stored.parts();
-            (parts.seq, parts.kind, parts.count)
+            (parts.seq, parts.kind(), parts.count())
         })
         .collect();
     assert_eq!(
@@ -502,7 +485,7 @@ async fn a_control_event_closes_the_open_batch_and_stands_alone() {
             (4, EntryKind::Control, 1),
         ]
     );
-    assert_eq!(app.event(&harness, &chain[3].entry)["t"], "grant_accepted");
+    assert_eq!(app.event(&harness, &chain[3].entry)["t"], "grant_revoked");
     assert_eq!(
         app.event(&harness, &chain[2].entry)["t"],
         "provider_request"
@@ -537,19 +520,13 @@ fn create_use_event(harness: &Harness, account: &Mutex<Account>, app: &App, even
 }
 
 /// The parts of the keys of the unconfirmed entries of an account, in order.
-fn unconfirmed_parts(
-    harness: &Harness,
-    account: &Mutex<Account>,
-    user_id: &str,
-) -> Vec<EntryParts> {
+fn unconfirmed_parts(account: &Mutex<Account>, user_id: &str) -> Vec<EntryKey> {
     lock(account)
         .unconfirmed()
         .iter()
         .map(|entry| {
-            match parse_object_key(&entry.key, &chain_prefix(user_id, &harness.node.node)) {
-                Some(ParsedKey::V2(parts)) => parts,
-                other => panic!("a key of format 2: {other:?}"),
-            }
+            parse_object_key_v3(&entry.key, user_id)
+                .unwrap_or_else(|| panic!("a key of format 3: {}", entry.key))
         })
         .collect()
 }
@@ -567,14 +544,14 @@ async fn an_entry_holds_at_most_128_events() {
         let event = json!({"t": "secret_released", "record_id": format!("r{index}")});
         create_use_event(&harness, &account, &app, event);
     }
-    let parts = unconfirmed_parts(&harness, &account, "user-1");
+    let parts = unconfirmed_parts(&account, "user-1");
     assert_eq!(parts.len(), 1);
     assert_eq!(
-        (parts[0].seq, parts[0].kind, parts[0].count as usize),
+        (parts[0].seq, parts[0].kind(), parts[0].count() as usize),
         (1, EntryKind::Use, limits::ENTRY_EVENTS)
     );
     assert_eq!(lock(&account).open.events.len(), 1);
-    assert_eq!(harness.head_seq("user-1"), 1);
+    assert_eq!(harness.last_seq("user-1"), 1);
 
     // The one event that is left forms the next entry when the batch is closed.
     let seq = harness
@@ -582,8 +559,8 @@ async fn an_entry_holds_at_most_128_events() {
         .close_batch(&mut lock(&account), "user-1", harness.node.now_ms())
         .unwrap();
     assert_eq!(seq, Some(2));
-    let parts = unconfirmed_parts(&harness, &account, "user-1");
-    assert_eq!((parts[1].seq, parts[1].count), (2, 1));
+    let parts = unconfirmed_parts(&account, "user-1");
+    assert_eq!((parts[1].seq, parts[1].count()), (2, 1));
     assert!(!lock(&account).has_open_events());
     assert_eq!(
         harness
@@ -617,9 +594,9 @@ async fn an_entry_plaintext_stays_under_the_byte_limit() {
     for index in 0..4 {
         create_use_event(&harness, &account, &app, large(index));
     }
-    let parts = unconfirmed_parts(&harness, &account, "user-1");
+    let parts = unconfirmed_parts(&account, "user-1");
     assert_eq!(parts.len(), 1);
-    assert_eq!((parts[0].seq, parts[0].count), (1, 3));
+    assert_eq!((parts[0].seq, parts[0].count()), (1, 3));
     assert_eq!(lock(&account).open.events.len(), 1);
     let entry = serde_json::to_value(&lock(&account).unconfirmed()[0].entry).unwrap();
     let events = app.events(&harness, &entry);
@@ -628,6 +605,21 @@ async fn an_entry_plaintext_stays_under_the_byte_limit() {
     let four = to_json(&Value::Array((0..4).map(large).collect()));
     assert!(four.len() > limits::ENTRY_PLAINTEXT_BYTES);
     assert_eq!(events[2]["i"], 2);
+
+    // An event that no entry could hold is refused, and the account stays as it was: the
+    // batch keeps its one event and no entry is created.
+    let refused = harness.node.create_event(
+        &mut lock(&account),
+        "user-1",
+        &app.keys.key_id(),
+        &app.keys.log_pk(),
+        harness.node.now_ms(),
+        EntryKind::Use,
+        json!({"t": "secret_released", "context": "x".repeat(limits::ENTRY_PLAINTEXT_BYTES)}),
+    );
+    assert_eq!(refused.err().map(|error| error.code), Some("too_large"));
+    assert_eq!(lock(&account).open.events.len(), 1);
+    assert_eq!(unconfirmed_parts(&account, "user-1").len(), 1);
 }
 
 #[tokio::test]
@@ -712,7 +704,7 @@ async fn event_and_entry_times_do_not_decrease() {
 }
 
 #[tokio::test]
-async fn the_chain_a_node_wrote_verifies_from_the_keys_of_the_store_and_its_head() {
+async fn the_entries_a_node_wrote_verify_against_the_keys_of_the_store() {
     let provider = quiet_provider_and_log_store().await;
     let (harness, app) = node_with_log_store(&provider).await;
     let record = google_record(&app);
@@ -724,53 +716,49 @@ async fn the_chain_a_node_wrote_verifies_from_the_keys_of_the_store_and_its_head
     assert_eq!(release(&harness, &app, &password).await.0, 200);
     app.revoke(&harness).await;
 
-    // The index verification: the keys alone reach the hash of the head.
+    // The keys: two control entries, each named by its event, and two use entries, each with
+    // the number of its events. Every key names the node that wrote the entry.
     let keys = keys_of(&provider, &harness, "user-1");
-    assert_eq!(keys.len(), 4);
-    let kinds: Vec<EntryKind> = keys.iter().map(|parts| parts.kind).collect();
+    let labels: Vec<EntryLabel> = keys.iter().map(|key| key.label.clone()).collect();
     assert_eq!(
-        kinds,
+        labels,
         [
-            EntryKind::Control,
-            EntryKind::Use,
-            EntryKind::Use,
-            EntryKind::Control
+            EntryLabel::Control("grant_accepted".to_string()),
+            EntryLabel::Use(1),
+            EntryLabel::Use(1),
+            EntryLabel::Control("grant_revoked".to_string()),
         ]
     );
-    let head = head_of(&harness, "user-1", "bm9uY2U").await;
-    let end = verify_index(
-        &harness.node_public(),
-        "user-1",
-        &Head::EMPTY,
-        &keys,
-        &head,
-        Some("bm9uY2U"),
-    )
-    .unwrap();
-    assert_eq!(end.seq, 4);
+    assert!(keys.iter().all(|key| key.node == harness.node.node));
+    assert_eq!(
+        keys.iter().map(|key| key.seq).collect::<Vec<_>>(),
+        [1, 2, 3, 4]
+    );
 
-    // The content verification: every object verifies against its key and its predecessor,
-    // and opens to its events.
-    let mut cursor = Head::EMPTY;
+    // Every object verifies against its key and opens to its events, and the body of each
+    // entry carries the hash of the body before it.
+    let mut prev = b64u(&[0u8; 32]);
     let mut kinds = Vec::new();
     for stored in provider.chain("user-1", &harness.node.node) {
         let entry: Signed = serde_json::from_value(stored.entry.clone()).unwrap();
-        let body = verify_entry_v2(
-            &harness.node_public(),
-            "user-1",
-            stored.parts(),
-            Some(&cursor),
-            &entry,
-        )
-        .unwrap();
-        let body_bytes = verify(&harness.node_public(), purpose::LOG_ENTRY_V2, &entry).unwrap();
-        let events = open_entry_v2(&app.keys.log, &body_bytes).unwrap();
+        let (body, body_bytes) = verify_entry_v3("user-1", stored.parts(), &entry).unwrap();
+        assert_eq!((body.v, &body.prev), (3, &prev));
+        let events = open_entry_v3(&app.keys.log, &body_bytes).unwrap();
         assert_eq!(events.len(), body.count as usize);
         kinds.push(events[0]["t"].as_str().unwrap().to_string());
-        cursor = Head {
-            seq: stored.seq(),
-            hash: stored.parts().entry_hash,
-        };
+        prev = b64u(&stored.parts().body_hash);
+        // The key the node wrote is the key of the parts, in the bucket of the account.
+        assert_eq!(stored.key, object_key_v3("user-1", stored.parts()));
+        assert_eq!(
+            Some(stored.bucket.as_str()),
+            harness
+                .node
+                .log_store
+                .id()
+                .unwrap()
+                .shard_of(credential_enclave_protocol::keys::shard_hash("user-1"))
+                .as_deref()
+        );
     }
     assert_eq!(
         kinds,
@@ -781,40 +769,47 @@ async fn the_chain_a_node_wrote_verifies_from_the_keys_of_the_store_and_its_head
             "grant_revoked"
         ]
     );
-    assert_eq!(cursor.seq, 4);
 
-    // Without the key of the middle entry the index has a gap, and a key whose body hash was
-    // changed breaks the chain at its `seq`.
-    let mut missing = keys.clone();
-    missing.remove(1);
+    // A listing of a prefix returns its keys in the order of their bytes: the latest entry
+    // first. The times of the entries of this test do not decrease with `seq`, and two entries
+    // of one millisecond keep either order.
+    for kind in [EntryKind::Control, EntryKind::Use] {
+        let mut listed: Vec<&EntryKey> = keys.iter().filter(|key| key.kind() == kind).collect();
+        listed.sort_by_key(|key| object_key_v3("user-1", key));
+        let times: Vec<u64> = listed.iter().map(|key| key.time_ms).collect();
+        assert!(times.windows(2).all(|pair| pair[0] >= pair[1]), "{times:?}");
+    }
+
+    // An object under a key of other parts is not the entry of that key: another body hash,
+    // another node, another `seq`.
+    let chain = provider.chain("user-1", &harness.node.node);
+    let entry: Signed = serde_json::from_value(chain[1].entry.clone()).unwrap();
+    let mut changed = keys[1].clone();
+    changed.body_hash[0] ^= 1;
     assert_eq!(
-        verify_index(
-            &harness.node_public(),
-            "user-1",
-            &Head::EMPTY,
-            &missing,
-            &head,
-            Some("bm9uY2U"),
-        ),
-        Err(IndexError::Gap { seq: 2 })
+        verify_entry_v3("user-1", &changed, &entry).err(),
+        Some(EntryError::Body)
     );
-    let mut changed = keys.clone();
-    changed[2].body_hash[0] ^= 1;
+    let mut changed = keys[1].clone();
+    changed.node = b64u(&[7u8; 32]);
     assert_eq!(
-        verify_index(
-            &harness.node_public(),
-            "user-1",
-            &Head::EMPTY,
-            &changed,
-            &head,
-            Some("bm9uY2U"),
-        ),
-        Err(IndexError::Broken { seq: 3 })
+        verify_entry_v3("user-1", &changed, &entry).err(),
+        Some(EntryError::Signature)
+    );
+    let mut changed = keys[1].clone();
+    changed.seq = 9;
+    assert_eq!(
+        verify_entry_v3("user-1", &changed, &entry).err(),
+        Some(EntryError::Fields)
+    );
+    assert_eq!(
+        verify_entry_v3("user-2", &keys[1], &entry).err(),
+        Some(EntryError::Fields)
     );
 }
 
 #[tokio::test]
-async fn close_ends_every_chain_with_a_final_head() {
+async fn close_refuses_every_new_call_and_signs_nothing() {
     let provider = quiet_provider_and_log_store().await;
     let harness = Harness::new(&provider);
     harness.use_log_store().await;
@@ -823,20 +818,11 @@ async fn close_ends_every_chain_with_a_final_head() {
     let carol = App::new("carol", 3);
     alice.grant(&harness).await;
     bob.grant(&harness).await;
-    // Carol only revoked: she has a marker and no chain.
+    // Carol only revoked: she has a marker and no entry.
     carol.revoke(&harness).await;
     let password = alice.record("vault_password", "vault", &json!({"value": "hunter2"}));
     release(&harness, &alice, &password).await;
     let token = google_record(&alice);
-
-    // Final heads exist only after close.
-    let (status, failure) = harness
-        .post("/v1/close/heads", json!({"cursor": "", "limit": 1000}))
-        .await;
-    assert_eq!(
-        (status, failure["code"].as_str()),
-        (400, Some("invalid_request"))
-    );
 
     let (status, closed) = harness.post("/v1/close", json!({})).await;
     assert_eq!((status, closed["accounts"].as_u64()), (200, Some(2)));
@@ -845,11 +831,7 @@ async fn close_ends_every_chain_with_a_final_head() {
     assert_eq!(health["accounts"], 2);
 
     // From now on commands and every call that uses a credential are refused.
-    let provider_requests_before = provider
-        .seen()
-        .iter()
-        .filter(|seen| seen.server_name != LOG_HOST)
-        .count();
+    let provider_requests_before = provider.requests().len();
     assert_eq!(
         release(&harness, &alice, &password).await.1["code"],
         "closing"
@@ -897,70 +879,30 @@ async fn close_ends_every_chain_with_a_final_head() {
         )
         .await;
     assert_eq!((status, failure["code"].as_str()), (503, Some("closing")));
-    assert_eq!(
-        provider
-            .seen()
-            .iter()
-            .filter(|seen| seen.server_name != LOG_HOST)
-            .count(),
-        provider_requests_before
-    );
+    assert_eq!(provider.requests().len(), provider_requests_before);
 
-    // One final head per account with a chain, in user_id order, page by page.
-    let (status, first) = harness
-        .post("/v1/close/heads", json!({"cursor": "", "limit": 1}))
-        .await;
-    assert_eq!(status, 200);
-    assert_eq!(first["heads"].as_array().unwrap().len(), 1);
-    assert_eq!(first["next"], "alice");
-    let (_, second) = harness
-        .post("/v1/close/heads", json!({"cursor": "alice", "limit": 1}))
-        .await;
-    assert_eq!(second["heads"].as_array().unwrap().len(), 1);
-    assert_eq!(second["next"], "");
-    let alice_head = harness.verified(purpose::HEAD, &first["heads"][0]);
-    assert_eq!(alice_head["user_id"], "alice");
-    assert_eq!(alice_head["seq"], 2);
-    assert_eq!(alice_head["nonce"], "");
-    assert_eq!(alice_head["final"], true);
-    assert_eq!(
-        harness.verified(purpose::HEAD, &second["heads"][0])["user_id"],
-        "bob"
-    );
-
-    // The final head closes the stored chain: the keys of the store reach its hash.
-    let head: Signed = serde_json::from_value(first["heads"][0].clone()).unwrap();
-    let end = verify_index(
-        &harness.node_public(),
-        "alice",
-        &Head::EMPTY,
-        &keys_of(&provider, &harness, "alice"),
-        &head,
-        None,
-    )
-    .unwrap();
-    assert_eq!(end.seq, 2);
-
-    // A node creates one final head per account: asking again returns the same heads. The
-    // store confirmed every entry, so no head was moved and no account was skipped.
-    let (_, all) = harness
+    // The shutdown is `close` alone. The node signs no head and hands out none: the call
+    // `close/heads` of the releases before does not exist, and `status` reports the grant.
+    let (status, failure) = harness
         .post("/v1/close/heads", json!({"cursor": "", "limit": 1000}))
         .await;
-    assert_eq!(all["heads"], json!([first["heads"][0], second["heads"][0]]));
-    assert_eq!(all["next"], "");
-    assert_eq!((&all["truncated"], &all["skipped"]), (&json!(0), &json!(0)));
-    let (_, past) = harness
-        .post("/v1/close/heads", json!({"cursor": "bob", "limit": 10}))
-        .await;
     assert_eq!(
-        past,
-        json!({"heads": [], "next": "", "truncated": 0, "skipped": 0})
+        (status, failure["code"].as_str()),
+        (404, Some("invalid_request"))
     );
-    assert_eq!(harness.head_seq("alice"), 2);
+    let (status, state) = harness
+        .post("/v1/status", json!({"user_id": "alice"}))
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(state.as_object().unwrap().len(), 1);
+    assert_eq!(state["grant"]["state"], "active");
+    // Nothing was written after `close`: the entries of the two grants and of the release.
+    assert_eq!(provider.stored().len(), 3);
+    assert_eq!(harness.last_seq("alice"), 2);
 }
 
 #[tokio::test]
-async fn final_heads_cover_an_open_batch() {
+async fn a_call_in_progress_when_the_node_closes_runs_to_its_end() {
     let (provider, pause) = paused_store().await;
     let (harness, app) = node_with_log_store(&provider).await;
     let record = google_record(&app);
@@ -968,49 +910,36 @@ async fn final_heads_cover_an_open_batch() {
     *lock(&pause) = Duration::from_millis(400);
 
     // A release writes entry 2. A forward joins the open batch while that write runs. The
-    // orderly shutdown starts in that time: `close/heads` closes the open batch into entry 3,
-    // writes it, and signs a final head that covers it.
+    // orderly shutdown starts in that time. Both calls passed the common front before it:
+    // the writer closes the open batch into entry 3 when its write ends, the forward writes
+    // it, and its request leaves after the store confirmed it.
     let released = release(&harness, &app, &password);
     let rest = async {
         provider.until_written(2).await;
         let forwarded = harness.forward(get(&app, &record, MESSAGES), b"");
         let closed = async {
             tokio::time::sleep(Duration::from_millis(60)).await;
-            let (status, _) = harness.post("/v1/close", json!({})).await;
-            assert_eq!(status, 200);
-            harness
-                .post("/v1/close/heads", json!({"cursor": "", "limit": 10}))
-                .await
+            harness.post("/v1/close", json!({})).await
         };
         tokio::join!(forwarded, closed)
     };
-    let ((status, released), (forwarded, (heads_status, heads))) = tokio::join!(released, rest);
+    let ((status, released), (forwarded, (closed_status, _))) = tokio::join!(released, rest);
+    assert_eq!(closed_status, 200);
     assert_eq!(status, 200);
     assert_eq!(released["log"]["seq"], 2);
-    // The forward passed the common front before the shutdown: its entry is on the chain and
-    // the request leaves after the store confirmed it.
     let forwarded = forwarded.unwrap();
     assert_eq!(
         forwarded.log,
         json!({"seq": 3, "index": 0, "created": true})
     );
-    assert_eq!(heads_status, 200);
-    let head = harness.verified(purpose::HEAD, &heads["heads"][0]);
-    assert_eq!((&head["seq"], &head["final"]), (&json!(3), &json!(true)));
 
     let keys = keys_of(&provider, &harness, "user-1");
     assert_eq!(keys.len(), 3);
-    assert_eq!((keys[2].kind, keys[2].count), (EntryKind::Use, 1));
-    let signed: Signed = serde_json::from_value(heads["heads"][0].clone()).unwrap();
-    let end = verify_index(
-        &harness.node_public(),
-        "user-1",
-        &Head::EMPTY,
-        &keys,
-        &signed,
-        None,
-    )
-    .unwrap();
-    assert_eq!(end.seq, 3);
-    assert!(!lock(&harness.node.account("user-1").unwrap()).has_open_events());
+    assert_eq!((keys[2].kind(), keys[2].count()), (EntryKind::Use, 1));
+    let seen = provider.seen();
+    let (write, requests) = positions(&seen, "user-1", 3, &["/gmail/v1/users/me/messages"]);
+    assert!(write < requests[0]);
+    let account = harness.node.account("user-1").unwrap();
+    assert!(!lock(&account).has_open_events());
+    assert!(lock(&account).unconfirmed().is_empty());
 }

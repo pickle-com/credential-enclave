@@ -63,7 +63,9 @@ pub async fn health(State(node): State<Arc<Node>>) -> Response {
         log_store: node.log_store.id().map(|id| LogStoreState {
             bucket: id.bucket(),
             region: id.region(),
+            shards: id.shards(),
             credentials_expires_ms: node.log_store.credentials_expires_ms(),
+            node_document_ms: node.log_store.document_ms(),
             pending: count(&state.pending_accounts),
             pending_oldest_ms: node.pending_oldest_ms(),
         }),

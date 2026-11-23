@@ -994,9 +994,15 @@ mod fixture {
         /// of its suffixes with at least one segment in front (enclave.md section 7).
         pub fn places(&self, server_name: &str, target: &str) -> Vec<Place> {
             let path = target.split('?').next().unwrap_or_default();
-            // The objects of the log store: the keys of protocol.md 7.6.
+            // The objects of the log store: the keys of protocol.md 7.6 and 7.7, each after the
+            // bucket that is the first part of the path.
             if server_name == LOG_HOST {
-                return match target.starts_with("/v1/accounts/") {
+                let key = target
+                    .strip_prefix('/')
+                    .and_then(|path| path.split_once('/'))
+                    .map(|(_, key)| key)
+                    .unwrap_or_default();
+                return match key.starts_with("a3/") || key.starts_with("n3/") {
                     true => vec![at(Role::LogStore, LOG_STORE)],
                     false => Vec::new(),
                 };
@@ -1665,7 +1671,7 @@ mod fixture {
                     kind
                 })
                 .collect();
-            (kinds, node.head_seq(&self.app.user_id))
+            (kinds, node.last_seq(&self.app.user_id))
         }
 
         /// The requests the stand-in received so far: those of the providers and the writes to
@@ -1940,8 +1946,8 @@ async fn walk() -> Canary {
     let short_nonce = json!({"nonce": b64u(b"short")});
     let outcome = canary.post("/v1/attestation", short_nonce).await;
     assert_eq!(code(&outcome), (400, "invalid_request"));
-    let empty_nonce = json!({"user_id": user, "nonce": ""});
-    let outcome = canary.post("/v1/status", empty_nonce).await;
+    let no_account = json!({"nonce": b64u(b"canary")});
+    let outcome = canary.post("/v1/status", no_account).await;
     assert_eq!(code(&outcome), (400, "invalid_request"));
 
     // Without the configuration no authorization begins, and without a grant no record opens.
@@ -1977,13 +1983,18 @@ async fn walk() -> Canary {
         )
         .await;
     assert_eq!(code(&outcome), (400, "invalid_request"));
-    let stored = json!({"credentials_expires_ms": 4_102_444_800_000u64});
     for node in 0..NODES.len() {
         let body = canary.log_store_credentials("ASIACANARY");
-        let outcome = canary
+        let (status, stored) = canary
             .post_on(node, "/v1/log-store/credentials", body)
             .await;
-        assert_eq!(outcome, (200, stored.clone()));
+        // The call wrote the node document of that node, with the credentials it gave.
+        assert_eq!(
+            (status, &stored["credentials_expires_ms"]),
+            (200, &json!(4_102_444_800_000u64))
+        );
+        assert!(stored["node_document_ms"].as_u64().unwrap() > 0, "{stored}");
+        assert_eq!(stored.as_object().unwrap().len(), 2);
     }
 
     // The commands of the app. An envelope that is sent again is answered with 200 and a
@@ -2122,10 +2133,9 @@ async fn walk() -> Canary {
     assert_eq!(code(&outcome), (400, "invalid_request"));
     let (status, exported) = canary.post("/v1/peer/export", export_to(&peer)).await;
     assert_eq!(status, 200, "{exported}");
-    let (envelope, logs) = (&exported["envelope"], &exported["logs"]);
-    assert_eq!(logs[0]["user_id"], user);
-    let transferred = json!({"seq": logs[0]["seq"], "index": 0});
-    assert_eq!(canary.logged(0, &transferred)["t"], "grant_transferred_out");
+    // The two nodes run one program: the transfer has no entry on either of them.
+    let envelope = &exported["envelope"];
+    assert_eq!(exported["logs"], json!([]));
     let outcome = canary
         .post("/v1/peer/import", import_from(&peer, envelope))
         .await;
@@ -2138,13 +2148,14 @@ async fn walk() -> Canary {
         (200, &json!(1)),
         "{imported}"
     );
-    // The import wrote the entry it created (the second node has credentials for the store),
-    // and the release that follows on that node continues the chain.
-    assert_eq!(imported["logs"], json!([{"user_id": user, "seq": 1}]));
+    // The second node names the account whose grant it took, and the release that follows on
+    // that node is its first entry for the account.
+    assert_eq!(imported["accounts"], json!([user]));
+    assert_eq!(imported["logs"], json!([]));
     release_the_vault(&canary, 1, &vault).await;
     assert_eq!(
         canary.logged(1, &json!({"seq": 1, "index": 0}))["t"],
-        "grant_transferred_in"
+        "secret_released"
     );
     let (status, back) = canary.post_on(1, "/v1/peer/export", export_to(&this)).await;
     assert_eq!(status, 200, "{back}");
@@ -2203,11 +2214,7 @@ async fn walk() -> Canary {
     assert_eq!((status, &canary.reply(&revoked)["ok"]), (200, &json!(true)));
     refusals((409, "grant_revoked"), until_revoked).await;
 
-    // The orderly shutdown. Final heads exist only after `close`, and a closing node takes
-    // no command and no transfer.
-    let page = json!({"cursor": "", "limit": 1000});
-    let outcome = canary.post("/v1/close/heads", page.clone()).await;
-    assert_eq!(code(&outcome), (400, "invalid_request"));
+    // The orderly shutdown: a closing node takes no command and no transfer.
     assert_eq!(canary.post("/v1/close", json!({})).await.0, 200);
     let wrong_method = canary.probe("GET", "/v1/close", json!({})).await;
     assert_eq!(code(&wrong_method), (405, "invalid_request"));
@@ -2216,11 +2223,6 @@ async fn walk() -> Canary {
     assert_eq!(code(&outcome), (503, "closing"));
     let outcome = canary.post("/v1/peer/import", returned).await;
     assert_eq!(code(&outcome), (503, "closing"));
-    let (status, heads) = canary.post("/v1/close/heads", page).await;
-    assert_eq!(
-        (status, heads["heads"].as_array().map(Vec::len)),
-        (200, Some(1))
-    );
     canary.health(0).await;
     canary
 }
@@ -2253,7 +2255,7 @@ async fn the_walk_calls_every_route_in_a_success_case_and_in_a_failure_case() {
         routes.iter().map(owned).collect()
     };
     let routes = routes();
-    assert_eq!(routes.len(), 22);
+    assert_eq!(routes.len(), 21);
     let (mail_success, mail_failure) = super::mail::canary_routes().await;
     let mut called = canary.routes_called(|_| true);
     called.extend(mail_success.clone());

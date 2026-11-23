@@ -11,7 +11,7 @@ use credential_enclave_protocol::ProtocolError;
 
 use super::responses::Configured;
 use super::{invalid, json_ok, respond, ApiError, JsonBody};
-use crate::log_store::LogStoreEndpoint;
+use crate::log_store::{self, LogStoreEndpoint};
 use crate::state::{Node, OperatorConfig, ProviderCredentials};
 
 /// Longest callback address, in bytes.
@@ -29,10 +29,12 @@ pub async fn config(State(node): State<Arc<Node>>, request: Request) -> Response
 /// a log store once. A configuration that names the same one again, or none, leaves it in
 /// place, and a configuration that names another one is `invalid_request` and changes nothing:
 /// the binding of the attestation names the log store, and what a verifier read there holds
-/// for as long as the node lives. A node of the local platform also takes an optional
-/// `endpoint` in `log_store` (enclave.md 5.14): an `http://host:port` or `https://host:port`
-/// origin it writes to in path-style. A node of the nitro platform refuses a configuration
-/// with `endpoint`.
+/// for as long as the node lives. A bucket name of more than 49 characters is `invalid_request`
+/// as well: the buckets the node writes to carry that name between a hash and a number
+/// (protocol.md 7.6), and their names would not be bucket names. A node of the local platform
+/// also takes an optional `endpoint` in `log_store` (enclave.md 5.14): an `http://host:port`
+/// or `https://host:port` origin it writes to in path-style. A node of the nitro platform
+/// refuses a configuration with `endpoint`.
 async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
     let body = JsonBody::read(request).await?;
     let mut endpoint = None;
@@ -105,6 +107,12 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
         );
     }
     if let Some(id) = log_store {
+        if id.shard_bucket(0).is_none() {
+            return Err(ApiError::with_message(
+                ProtocolError::InvalidRequest,
+                "the bucket name of the log store is longer than 49 characters",
+            ));
+        }
         if !node.log_store.set_id(id) || !node.log_store.set_endpoint(endpoint) {
             return Err(ApiError::with_message(
                 ProtocolError::InvalidRequest,
@@ -113,5 +121,12 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
         }
     }
     node.set_config(OperatorConfig { providers: parsed });
-    Ok(json_ok(&Configured { configured: true }))
+    // A node that just received its log store and holds credentials for it writes its node
+    // document now (protocol.md 7.7). The outcome does not change the answer of this call: the
+    // call that gives the credentials and the sweep write the document as well.
+    let node_document_ms = log_store::write_node_document(node).await;
+    Ok(json_ok(&Configured {
+        configured: true,
+        node_document_ms,
+    }))
 }

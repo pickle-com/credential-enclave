@@ -1,39 +1,51 @@
 //! The log store (protocol.md 7.6, enclave.md 5.14): the place outside the node where an entry
 //! is written before the act it describes.
 //!
-//! A node writes every entry of a chain to an Amazon S3 bucket whose objects are locked in
-//! compliance mode: until its retention ends, nobody can delete an object version or shorten
-//! its retention. The node acts only after the store confirmed the entry of the act. TLS ends
+//! A node writes every entry to Amazon S3 buckets whose objects are locked in compliance
+//! mode: until its retention ends, nobody can delete an object version or shorten its
+//! retention. The node acts only after the store confirmed the entry of the act. TLS ends
 //! inside the node, so whoever carries the bytes cannot answer in the place of the store.
+//!
+//! The log store of a node is a set of buckets that follows from the one bucket name of its
+//! binding (`LogStoreId::shard_bucket`). The entries of one account are all in one of them,
+//! the bucket of the hash of its `user_id`. Every bucket is written over connections to one
+//! host, the endpoint of Amazon S3 in the region of the store, with the bucket as the first
+//! part of the path: the idle connections of the node carry the writes of every bucket.
 //!
 //! What this module holds:
 //!
-//! - [`LogStore`]: which bucket the node writes to (set once, part of the binding of the
-//!   attestation) and the credentials of the operator for it;
+//! - [`LogStore`]: which log store the node writes to (set once, part of the binding of the
+//!   attestation), the credentials of the operator for it, and when the store last confirmed
+//!   the node document;
+//! - [`write_node_document`]: the node writes its own attestation document to the store
+//!   before it takes a user key, and again every 30 days (protocol.md 7.7);
 //! - [`admit`], [`confirm`] and [`confirm_each`]: the steps a call takes before it acts;
 //! - `send_to_log_store`, sink K5 of the egress policy: the one function that writes to the
 //!   store. What it writes is a signed entry, whose content is sealed to the log public key
-//!   of the account, signed with the credentials of the operator. No function here takes a
-//!   user key, the plaintext of a record or a token of a provider.
+//!   of the account, or the node document, which holds public values; the request is signed
+//!   with the credentials of the operator. No function here takes a user key, the plaintext
+//!   of a record or a token of a provider.
 //!
 //! A write is confirmed by the status 200 of the store and by nothing else. The node does not
 //! ask the store whether an object of that key exists: the operator domain can write to the
-//! same bucket with the same credentials, and it knows the key of an entry from the head of
-//! the chain as soon as the entry exists. An answer "this key exists" would say nothing about
-//! who wrote the object, what it holds and how long it is kept. A write that is repeated
-//! (the answer of the first one was lost) adds a second version of the same object.
+//! same buckets with the same credentials. An answer "this key exists" would say nothing
+//! about who wrote the object, what it holds and how long it is kept. A write that is
+//! repeated (the answer of the first one was lost) adds a second version of the same object.
+//! An entry the store does not confirm stays in the memory of the node, is written again, and
+//! is gone with the node: its act did not take place.
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use credential_enclave_protocol::encoding::{to_json, Signed};
-use credential_enclave_protocol::keys::LogStoreId;
+use credential_enclave_protocol::encoding::to_json;
+use credential_enclave_protocol::keys::{shard_hash, LogStoreId};
+use credential_enclave_protocol::log::{node_document, node_document_key, node_document_nonce};
 use credential_enclave_protocol::secret::Secret;
 use credential_enclave_protocol::{limits, ProtocolError};
 use hmac::{Hmac, Mac};
@@ -70,6 +82,8 @@ const WRITE_BACKOFF_CAP: Duration = Duration::from_secs(1);
 /// The time a repeated attempt needs to have left in the budget of its entry: an attempt is
 /// repeated only when the time passed, the backoff and this margin fit in the budget.
 const WRITE_RETRY_MARGIN: Duration = Duration::from_secs(1);
+/// One day in milliseconds.
+const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// Longest access key identifier, in characters.
 const ACCESS_KEY_ID_CHARS: usize = 128;
@@ -333,13 +347,19 @@ struct Writer {
 pub struct LogStore {
     /// True on a platform whose nodes do not act without a log store: `nitro`.
     required: bool,
-    /// The bucket and its region. Set once: the binding of the attestation names it, and what
-    /// a verifier read there holds for as long as the node lives.
+    /// The bucket name of the binding and its region. Set once: the binding of the attestation
+    /// names it, and what a verifier read there holds for as long as the node lives. The
+    /// buckets the node writes to follow from this name (`LogStoreId::shard_bucket`).
     id: OnceLock<LogStoreId>,
     /// The endpoint of a node of the local platform, set once with the log store.
     endpoint: OnceLock<Option<LogStoreEndpoint>>,
     credentials: RwLock<Option<Arc<Credentials>>>,
     idle: IdleConnections,
+    /// The node time of the latest write of the node document that the store confirmed, 0
+    /// while it confirmed none (protocol.md 7.7). It only grows.
+    document_ms: AtomicU64,
+    /// Held by the one call that writes the node document at a time.
+    document_writer: tokio::sync::Mutex<()>,
 }
 
 /// The open HTTP/1.1 connections to the log store that carry no write, the most recently used
@@ -379,6 +399,8 @@ impl LogStore {
             endpoint: OnceLock::new(),
             credentials: RwLock::new(None),
             idle: IdleConnections::default(),
+            document_ms: AtomicU64::new(0),
+            document_writer: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -387,10 +409,38 @@ impl LogStore {
         self.id.get()
     }
 
-    /// Names the log store of this node. False when the node has another one: a log store
-    /// does not change.
+    /// Names the log store of this node. False when the node has another one (a log store
+    /// does not change), and when the name is too long for the names of its buckets to be
+    /// bucket names: a node takes a log store it can write to only.
     pub fn set_id(&self, id: LogStoreId) -> bool {
+        if id.shard_bucket(0).is_none() {
+            return false;
+        }
         self.id.get_or_init(|| id.clone()) == &id
+    }
+
+    /// The node time of the latest write of the node document that the store confirmed, 0
+    /// while it confirmed none.
+    pub fn document_ms(&self) -> u64 {
+        self.document_ms.load(Ordering::SeqCst)
+    }
+
+    /// True while the store holds a version of the node document that outlives an entry
+    /// written now: the store confirmed a write of the document less than 31 days ago
+    /// (protocol.md 7.7). The retention of that version ends 400 days after its write, and the
+    /// retention of an entry 365 days after the write of the entry.
+    fn document_covers(&self, now_ms: u64) -> bool {
+        let written_ms = self.document_ms();
+        written_ms != 0
+            && now_ms < written_ms.saturating_add(limits::NODE_DOCUMENT_VALID_DAYS * DAY_MS)
+    }
+
+    /// True when the node document is due: the store confirmed no write of it, or the latest
+    /// one it confirmed is 30 days old.
+    fn document_due(&self, now_ms: u64) -> bool {
+        let written_ms = self.document_ms();
+        written_ms == 0
+            || now_ms >= written_ms.saturating_add(limits::NODE_DOCUMENT_RENEW_DAYS * DAY_MS)
     }
 
     /// Sets the endpoint of the log store (`None` for the host of the bucket). False when the
@@ -422,10 +472,10 @@ impl LogStore {
         self.required || self.id.get().is_some()
     }
 
-    /// What a write needs. `Ok(None)` for a node that runs without a log store (the local
-    /// platform without one in its configuration). `log_store_unavailable` when the node
-    /// lacks the configuration or credentials within their time.
-    fn writer(&self, now_ms: u64) -> Result<Option<Writer>, ProtocolError> {
+    /// Where a write goes and what signs it. `Ok(None)` for a node that runs without a log
+    /// store (the local platform without one in its configuration). `log_store_unavailable`
+    /// when the node lacks the configuration or credentials within their time.
+    fn target(&self, now_ms: u64) -> Result<Option<Writer>, ProtocolError> {
         let Some(id) = self.id.get() else {
             return match self.required {
                 true => Err(ProtocolError::LogStoreUnavailable),
@@ -446,9 +496,38 @@ impl LogStore {
         }))
     }
 
-    /// The node can write to its log store now, or it runs without one.
+    /// What the write of an entry needs: [`LogStore::target`], and a node document in the
+    /// store that outlives the entry (protocol.md 7.7). `log_store_unavailable` without one:
+    /// a node writes no entry that a reader could not trace to an attested node.
+    fn writer(&self, now_ms: u64) -> Result<Option<Writer>, ProtocolError> {
+        let writer = self.target(now_ms)?;
+        if writer.is_some() && !self.document_covers(now_ms) {
+            return Err(ProtocolError::LogStoreUnavailable);
+        }
+        Ok(writer)
+    }
+
+    /// The node can write an entry to its log store now, or it runs without one: it has a log
+    /// store, credentials within their time, and its node document in the store.
     pub fn ensure_ready(&self, now_ms: u64) -> Result<(), ProtocolError> {
         self.writer(now_ms).map(|_| ())
+    }
+
+    /// The log store holds the node document of this node, with a retention that outlives an
+    /// entry written now, or the node runs without a log store. `log_store_unavailable`
+    /// otherwise: a node that has no log store on a platform that requires one, and a node
+    /// whose document the store did not confirm in the last 31 days. A node takes a user key
+    /// from another node under this condition (`peer/import`), which asks for no credentials:
+    /// the transfer of a node of the same measurement writes nothing.
+    pub fn ensure_documented(&self, now_ms: u64) -> Result<(), ProtocolError> {
+        let documented = match self.id.get() {
+            Some(_) => self.document_covers(now_ms),
+            None => !self.required,
+        };
+        match documented {
+            true => Ok(()),
+            false => Err(ProtocolError::LogStoreUnavailable),
+        }
     }
 
     /// The idle connections to the log store at this moment (`log_store` of
@@ -458,50 +537,29 @@ impl LogStore {
     }
 }
 
+/// One object a node writes to its log store: an entry or the node document.
+struct StoreObject {
+    /// The hash that names the bucket of the object among the buckets of the log store
+    /// (protocol.md 7.6): the hash of the `user_id` for an entry, of the node identifier for
+    /// the node document.
+    shard: u16,
+    /// The key of the object.
+    key: String,
+    /// The bytes of the object.
+    body: Bytes,
+    /// The days of the retention of the object, from the write.
+    retention_days: u64,
+}
+
 /// One entry in the hands of a call.
 struct Write {
     seq: u64,
-    /// The key of the object of the entry (protocol.md 7.6).
-    key: String,
-    entry: Signed,
+    /// The object of the entry (protocol.md 7.6).
+    object: StoreObject,
     /// True for an entry an act of the call waits for.
     required: bool,
+    /// True once the store answered a write of the entry by this call with the status 200.
     confirmed: bool,
-    /// True when an attempt of this call may have reached the store without a confirmation
-    /// ([`WriteOutcome::outcome_unknown`]). Copied from the attempts after a round.
-    outcome_unknown: bool,
-    /// Set by an attempt just before its request leaves, cleared when the store answered it
-    /// with a status: while it is set, the request may be with the store. It is read when the
-    /// call that owns the write ends before its round ends (`Claim::drop`), where the round
-    /// has not copied its outcome yet.
-    in_flight: AtomicBool,
-    /// Set by an attempt that ended with the connection closed without a response, passed its
-    /// time limit after the request left, or was answered with a 5xx status: the store may hold
-    /// the object. Never cleared: a later attempt that failed before a byte left changes
-    /// nothing about the earlier one.
-    may_be_stored: AtomicBool,
-}
-
-impl Write {
-    /// True when some attempt of this call may have reached the store without a confirmation:
-    /// an attempt left its request and got no answer yet, or an earlier attempt ended in a
-    /// state where the store may hold the object.
-    fn may_have_reached_the_store(&self) -> bool {
-        self.in_flight.load(Ordering::Relaxed) || self.may_be_stored.load(Ordering::Relaxed)
-    }
-}
-
-/// The end of the attempts of one entry ([`send_to_log_store`]).
-#[derive(Clone, Copy)]
-struct WriteOutcome {
-    /// The store confirmed the entry.
-    confirmed: bool,
-    /// Not confirmed, and an attempt may have reached the store all the same: the connection
-    /// closed without a response, or the attempt passed its time limit after the request may
-    /// have been sent. An attempt that failed before any request byte left the node (the
-    /// connection, the TLS handshake) and an attempt the store answered with a status other
-    /// than 200 did not store the object.
-    outcome_unknown: bool,
 }
 
 /// The entries of one account that a call writes: the entries the call names and the pending
@@ -524,25 +582,18 @@ impl<'a> Claim<'a> {
                 entry.writing = true;
                 writes.push(Write {
                     seq: entry.seq,
-                    key: entry.key.clone(),
-                    entry: entry.entry.clone(),
+                    object: StoreObject {
+                        shard: entry.shard,
+                        key: entry.key.clone(),
+                        body: Bytes::from(to_json(&entry.entry)),
+                        retention_days: limits::LOG_RETENTION_DAYS,
+                    },
                     required,
                     confirmed: false,
-                    outcome_unknown: false,
-                    in_flight: AtomicBool::new(false),
-                    may_be_stored: AtomicBool::new(false),
                 });
             }
         }
         Claim { account, writes }
-    }
-
-    /// True when the store confirmed every entry that an act waits for. An entry that was
-    /// confirmed before is not among the writes.
-    fn holds(&self) -> bool {
-        self.writes
-            .iter()
-            .all(|write| write.confirmed || !write.required)
     }
 }
 
@@ -551,14 +602,14 @@ impl Drop for Claim<'_> {
         let mut account = lock(self.account);
         for write in &self.writes {
             if write.confirmed {
-                account.confirm_entry(write.seq);
+                // The one place an entry becomes a confirmed entry: the store answered this
+                // write of it with the status 200.
+                account.store_confirmed(write.seq);
             } else if let Some(entry) = account
                 .unconfirmed_mut()
                 .find(|entry| entry.seq == write.seq)
             {
                 entry.writing = false;
-                entry.outcome_unknown |=
-                    write.outcome_unknown || write.may_have_reached_the_store();
             }
         }
     }
@@ -593,7 +644,8 @@ pub(crate) async fn join_all<F: Future>(futures: impl Iterator<Item = F>) -> Vec
 
 /// Writes the entries of the claims: the entries an act waits for first, at most 32 writes at
 /// the same time. After a round in which a write failed, no further round starts: the entries
-/// that were not written stay with their accounts.
+/// that were not written stay with their accounts. Nothing is written while the node cannot
+/// write an entry ([`LogStore::ensure_ready`]).
 async fn write_claims(node: &Node, claims: &mut [Claim<'_>]) {
     let mut order: Vec<(usize, usize)> = Vec::new();
     for required in [true, false] {
@@ -612,19 +664,22 @@ async fn write_claims(node: &Node, claims: &mut [Claim<'_>]) {
         return;
     };
     for round in order.chunks(WRITE_CONCURRENCY) {
-        let outcomes = join_all(round.iter().map(|(at, index)| {
-            let claim = &claims[*at];
-            send_to_log_store(node, &writer, &claim.writes[*index])
+        let outcomes = join_all(round.iter().filter_map(|(at, index)| {
+            let write = claims.get(*at)?.writes.get(*index)?;
+            Some(send_to_log_store(node, &writer, &write.object))
         }))
         .await;
-        let failed = outcomes.iter().filter(|outcome| !outcome.confirmed).count();
+        let failed = outcomes.iter().filter(|confirmed| !**confirmed).count();
         node.log_counters
             .write_failures
             .fetch_add(failed as u64, Ordering::Relaxed);
-        for ((at, index), outcome) in round.iter().zip(&outcomes) {
-            let write = &mut claims[*at].writes[*index];
-            write.confirmed = outcome.confirmed;
-            write.outcome_unknown |= outcome.outcome_unknown;
+        for ((at, index), confirmed) in round.iter().zip(&outcomes) {
+            if let Some(write) = claims
+                .get_mut(*at)
+                .and_then(|claim| claim.writes.get_mut(*index))
+            {
+                write.confirmed = *confirmed;
+            }
         }
         if failed > 0 {
             return;
@@ -668,19 +723,18 @@ fn status_failure(status: StatusCode) -> AttemptFailure {
     }
 }
 
-/// Sink K5 of the egress policy: writes one entry to the log store and returns whether the
-/// store confirmed the write and, when it did not, whether an attempt may have reached the store
-/// (its request left and the connection closed or the time limit passed without an answer, or
-/// the store answered with a 5xx status: the orderly shutdown drops no such entry, enclave.md
-/// 5.11).
+/// Sink K5 of the egress policy: writes one object to the log store and returns whether the
+/// store confirmed the write.
 ///
-/// What leaves is the signed entry (its content is sealed to the log public key of the
-/// account) under the key of protocol.md 7.6 ([`object_key`]), with a retention in compliance
-/// mode until 365 days from now, and the request is signed with the credentials of the
-/// operator. The connection goes to `{bucket}.s3.{region}.amazonaws.com`: TLS ends inside the
-/// node and the certificate is verified against the trust roots of the binary.
+/// What leaves is a signed entry (its content is sealed to the log public key of the account)
+/// or the node document (public values), under its key in the bucket of its owner (protocol.md
+/// 7.6 and 7.7), with a retention in compliance mode from now, and the request is signed with
+/// the credentials of the operator. The connection goes to the endpoint of Amazon S3 in the
+/// region of the log store, `s3.{region}.amazonaws.com`: TLS ends inside the node and the
+/// certificate is verified against the trust roots of the binary. The bucket is the first part
+/// of the path, so one connection carries the writes of every bucket of the store.
 ///
-/// The attempts of one entry share a budget of twice the time limit of a write. The first
+/// The attempts of one object share a budget of twice the time limit of a write. The first
 /// attempt goes over an idle connection when there is one, with half the time limit; every
 /// later attempt, and the first when there is no idle connection, opens a new connection
 /// (`Egress::open`, which repeats a failed open itself) with the whole time limit. An attempt
@@ -695,7 +749,7 @@ fn status_failure(status: StatusCode) -> AttemptFailure {
 /// and an attempt that takes longer than its time limit are no confirmation. Every attempt is
 /// counted as a write of `log` of health, every failed attempt under its cause, every repeated
 /// attempt as a retry, and the time to the confirmation of a confirmed attempt in the buckets.
-async fn send_to_log_store(node: &Node, writer: &Writer, write: &Write) -> WriteOutcome {
+async fn send_to_log_store(node: &Node, writer: &Writer, object: &StoreObject) -> bool {
     let counters = &node.log_counters;
     let limit = node.limits.log_write;
     let budget = 2 * limit;
@@ -706,35 +760,17 @@ async fn send_to_log_store(node: &Node, writer: &Writer, write: &Write) -> Write
         counters.writes.fetch_add(1, Ordering::Relaxed);
         let attempt_started = Instant::now();
         let remaining = budget.saturating_sub(started.elapsed());
-        match write_once(node, writer, write, attempts == 1, limit.min(remaining)).await {
+        match write_once(node, writer, object, attempts == 1, limit.min(remaining)).await {
             Ok(()) => {
                 let elapsed_ms =
                     u64::try_from(attempt_started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 counters.record_confirmed(elapsed_ms);
-                return WriteOutcome {
-                    confirmed: true,
-                    outcome_unknown: false,
-                };
+                return true;
             }
             Err((cause, repeated)) => {
                 counters.write_attempt_failures.count(cause);
-                // The request may have reached the store when it left (the connection closed
-                // without a response, or the time limit passed after it left) and when the
-                // store answered with a 5xx status (S3 promises nothing about the object of
-                // such an answer). A time limit that passed while the connection opened, and
-                // every failure before a byte left, say the object is not there.
-                if write.in_flight.load(Ordering::Relaxed)
-                    || matches!(cause, WriteFailure::Status5xx)
-                {
-                    write.may_be_stored.store(true, Ordering::Relaxed);
-                }
-                write.in_flight.store(false, Ordering::Relaxed);
-                let failed = WriteOutcome {
-                    confirmed: false,
-                    outcome_unknown: write.may_be_stored.load(Ordering::Relaxed),
-                };
                 if !repeated {
-                    return failed;
+                    return false;
                 }
                 let backoff = full_jitter(
                     node.platform.as_ref(),
@@ -743,7 +779,7 @@ async fn send_to_log_store(node: &Node, writer: &Writer, write: &Write) -> Write
                     WRITE_BACKOFF_CAP,
                 );
                 if started.elapsed() + backoff + WRITE_RETRY_MARGIN > budget {
-                    return failed;
+                    return false;
                 }
                 counters.write_retries.fetch_add(1, Ordering::Relaxed);
                 tokio::time::sleep(backoff).await;
@@ -752,13 +788,13 @@ async fn send_to_log_store(node: &Node, writer: &Writer, write: &Write) -> Write
     }
 }
 
-/// One attempt of [`send_to_log_store`]: one `PUT` of the entry, over an idle connection when
+/// One attempt of [`send_to_log_store`]: one `PUT` of the object, over an idle connection when
 /// `first` and there is one (with half of `limit`), else over a new connection (with `limit`,
 /// which also bounds the open). `Ok` is the status 200.
 async fn write_once(
     node: &Node,
     writer: &Writer,
-    write: &Write,
+    object: &StoreObject,
     first: bool,
     limit: Duration,
 ) -> Result<(), AttemptFailure> {
@@ -783,15 +819,11 @@ async fn write_once(
             None => open_log_connection(node, writer, attempt_limit).await?,
         };
         let request =
-            put_request(writer, write, node.now_ms()).ok_or((WriteFailure::Connect, false))?;
-        // From here the request may be with the store, until the store answered it. A call
-        // that ends during the wait leaves the flag set.
-        write.in_flight.store(true, Ordering::Relaxed);
+            put_request(writer, object, node.now_ms()).ok_or((WriteFailure::Connect, false))?;
         let response = sender
             .send_request(request)
             .await
             .map_err(|_| (WriteFailure::Closed, true))?;
-        write.in_flight.store(false, Ordering::Relaxed);
         if response.body().is_end_stream() {
             node.log_store.idle.put(sender);
         }
@@ -806,8 +838,9 @@ async fn write_once(
     }
 }
 
-/// A new connection to the log store: to the host of the bucket, or to the endpoint of a node
-/// of the local platform (enclave.md 5.14). `budget` is the time limit of the attempt.
+/// A new connection to the log store: to the endpoint of Amazon S3 in the region of the store,
+/// or to the endpoint of a node of the local platform (enclave.md 5.14). `budget` is the time
+/// limit of the attempt.
 async fn open_log_connection(
     node: &Node,
     writer: &Writer,
@@ -816,7 +849,7 @@ async fn open_log_connection(
     let opened = match &writer.endpoint {
         None => {
             node.egress
-                .open(node.platform.as_ref(), &writer.id.host(), budget)
+                .open(node.platform.as_ref(), &writer.id.regional_host(), budget)
                 .await
         }
         Some(endpoint) => {
@@ -839,24 +872,28 @@ async fn open_log_connection(
     })
 }
 
-/// The request that writes one entry (protocol.md 7.6): `PUT` of the signed entry as the node
-/// carries it in a response, `{"body":"...","sig":"..."}`, under the key of the entry, with
-/// the retention of the object and the checksum S3 requires of a request that sets one. With an
-/// endpoint (a node of the local platform) the request target is path-style:
-/// `/{bucket}/{key}` with the `Host` of the endpoint.
-fn put_request(writer: &Writer, write: &Write, now_ms: u64) -> Option<Request<OnceBody>> {
-    let (path, host) = match &writer.endpoint {
-        None => (object_path(&write.key), writer.id.host()),
-        Some(endpoint) => (
-            format!("/{}{}", writer.id.bucket(), object_path(&write.key)),
-            endpoint.authority(),
-        ),
+/// The request that writes one object (protocol.md 7.6): `PUT` of the bytes of the object under
+/// its key in its bucket, with the retention of the object, the checksum S3 requires of a
+/// request that sets one, and the encryption of the object under a key the store manages
+/// (`AES256`). The request target is path-style, `/{bucket}/{key}`, and the `Host` is the
+/// endpoint of Amazon S3 in the region of the store, or the endpoint of a node of the local
+/// platform. `None` when the log store has no bucket for the object.
+///
+/// The request names the encryption itself, and a header of the request comes before the
+/// default encryption of the bucket. So no key that someone can disable or delete stands
+/// between a reader and an object of the store: a bucket whose default names a key of the key
+/// management service does not put that key on the objects of a node.
+fn put_request(writer: &Writer, object: &StoreObject, now_ms: u64) -> Option<Request<OnceBody>> {
+    let bucket = writer.id.shard_of(object.shard)?;
+    let path = format!("/{bucket}{}", object_path(&object.key));
+    let host = match &writer.endpoint {
+        None => writer.id.regional_host(),
+        Some(endpoint) => endpoint.authority(),
     };
-    let body = to_json(&write.entry);
-    let digest = Sha256::digest(&body);
+    let digest = Sha256::digest(&object.body);
     let payload_sha256 = hex(&digest);
     let amz_date = amz_date(now_ms);
-    let retention_ms = limits::LOG_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+    let retention_ms = object.retention_days.saturating_mul(DAY_MS);
     // The headers of the request, in the order of their names. All of them are signed.
     let headers = [
         ("content-type", "application/json".to_string()),
@@ -869,6 +906,7 @@ fn put_request(writer: &Writer, write: &Write, now_ms: u64) -> Option<Request<On
             "x-amz-object-lock-retain-until-date",
             retain_until(now_ms.saturating_add(retention_ms)),
         ),
+        ("x-amz-server-side-encryption", "AES256".to_string()),
     ];
     let authorization = writer.credentials.authorization(
         writer.id.region(),
@@ -881,7 +919,7 @@ fn put_request(writer: &Writer, write: &Write, now_ms: u64) -> Option<Request<On
     let mut builder = Request::builder()
         .method(Method::PUT)
         .uri(path)
-        .header(CONTENT_LENGTH, body.len());
+        .header(CONTENT_LENGTH, object.body.len());
     for (name, value) in &headers {
         builder = builder.header(*name, value);
     }
@@ -893,8 +931,63 @@ fn put_request(writer: &Writer, write: &Write, now_ms: u64) -> Option<Request<On
     }
     builder
         .header(AUTHORIZATION, authorization)
-        .body(OnceBody::new(Bytes::from(body)))
+        .body(OnceBody::new(object.body.clone()))
         .ok()
+}
+
+/// Writes the node document of this node to its log store when it is due (protocol.md 7.7):
+/// the store confirmed no write of it yet, or the latest write it confirmed is 30 days old.
+/// Returns the node time of the latest confirmed write, 0 while there is none.
+///
+/// The object is the attestation document of the platform over the binding of the node (with
+/// its `log`) and the nonce [`node_document_nonce`], under the key `n3/{node}` in the bucket of
+/// the hash of the node identifier, with a retention of 400 days from the write. Its values
+/// are public: the binding and the measurement of the node. A node takes no user key and
+/// writes no entry before the store confirmed this object ([`LogStore::ensure_ready`]), so a
+/// reader of the store finds, for every entry, the document that says which program holds the
+/// signing key of the entry; the retention of the version a node relies on ends after the
+/// retention of the entries it writes.
+///
+/// Nothing is written on a node without a log store, without credentials within their time,
+/// or while the document is not due. One call at a time writes the document: a call that
+/// finds another one writing waits for it and looks again. The call that names the log store
+/// (`config`), the call that gives the credentials (`log-store/credentials`) and the sweep of
+/// the node make this call.
+pub async fn write_node_document(node: &Node) -> u64 {
+    let store = &node.log_store;
+    let _writing = store.document_writer.lock().await;
+    let now_ms = node.now_ms();
+    if !store.document_due(now_ms) {
+        return store.document_ms();
+    }
+    let Ok(Some(writer)) = store.target(now_ms) else {
+        return store.document_ms();
+    };
+    let nonce = node_document_nonce(&node.keys.sign_public());
+    let Ok(document) = node.platform.attestation(&node.binding(), &nonce) else {
+        return store.document_ms();
+    };
+    let object = StoreObject {
+        shard: shard_hash(&node.node),
+        key: node_document_key(&node.node),
+        body: Bytes::from(node_document(
+            node.platform.name(),
+            &document,
+            &node.node,
+            node.release,
+        )),
+        retention_days: limits::NODE_DOCUMENT_RETENTION_DAYS,
+    };
+    if send_to_log_store(node, &writer, &object).await {
+        // The time read before the write: the retention of the version the store holds ends
+        // no earlier than 400 days after it.
+        store.document_ms.fetch_max(now_ms, Ordering::SeqCst);
+    } else {
+        node.log_counters
+            .write_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    store.document_ms()
 }
 
 /// The sweep of the node (enclave.md section 3): every [`SWEEP_INTERVAL`], for every account, a
@@ -939,6 +1032,9 @@ pub async fn keep_sweeping(node: Arc<Node>) {
 /// pending at one moment (an outage of the store) over two sweeps instead of one burst, and
 /// the rate keeps the recovery from more than doubling the live load on the store.
 pub async fn sweep(node: &Node) {
+    // The node document first: a node whose document the store has not confirmed, or whose
+    // latest confirmed write is 30 days old, writes it here when no call did (protocol.md 7.7).
+    write_node_document(node).await;
     let now_ms = node.now_ms();
     let platform = node.platform.as_ref();
     let mut random = RandomDraws::new(platform);
@@ -1125,7 +1221,12 @@ pub async fn confirm(
     }
     let mut claim = [Claim::take(account, seqs)];
     write_claims(node, &mut claim).await;
-    match claim[0].holds() {
+    // The end of the claim records the answers of the store with the account, and the answer
+    // of this call is read from the account: an entry is confirmed when the store said so,
+    // to this call or to another one that wrote it.
+    drop(claim);
+    let account = lock(account);
+    match seqs.iter().all(|seq| account.is_confirmed(*seq)) {
         true => Ok(()),
         false => Err(ProtocolError::LogStoreUnavailable),
     }
@@ -1149,10 +1250,14 @@ pub async fn confirm_each(
         .map(|(account, seq)| Claim::take(account, &[*seq]))
         .collect();
     write_claims(node, &mut claims).await;
-    let outcome = claims.iter().all(Claim::holds);
     drop(claims);
-    for (account, _) in entries {
-        let notify = lock(account).notify.clone();
+    let mut outcome = true;
+    for (account, seq) in entries {
+        let (confirmed, notify) = {
+            let account = lock(account);
+            (account.is_confirmed(*seq), account.notify.clone())
+        };
+        outcome &= confirmed;
         notify.notify_waiters();
     }
     match outcome {
@@ -1303,7 +1408,26 @@ impl Drop for WriterGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use credential_enclave_protocol::log::object_key;
+    use credential_enclave_protocol::log::{object_key_v3, EntryKey, EntryLabel};
+
+    /// The object of a use entry of two events of the account `user 1`, created at
+    /// 2026-10-01T12:10:45.000Z by the node whose signing public key is 32 bytes of 0x4e.
+    fn entry_object() -> StoreObject {
+        let key = EntryKey {
+            time_ms: 1_790_856_645_000,
+            node: credential_enclave_protocol::encoding::b64u(&[0x4e; 32]),
+            seq: 7,
+            label: EntryLabel::Use(2),
+            key_id: "0123456789abcdef".to_string(),
+            body_hash: [0xfb; 32],
+        };
+        StoreObject {
+            shard: shard_hash("user 1"),
+            key: object_key_v3("user 1", &key),
+            body: Bytes::from_static(br#"{"body":"Ym9keQ","sig":"c2ln"}"#),
+            retention_days: limits::LOG_RETENTION_DAYS,
+        }
+    }
 
     fn credentials(session_token: &str) -> Credentials {
         Credentials::new(
@@ -1429,26 +1553,22 @@ mod tests {
             credentials: Arc::new(credentials("TOKEN")),
             endpoint: None,
         };
-        let write = Write {
-            seq: 7,
-            key: object_key("user 1", "NODE", 7, &[0xfb; 32]),
-            entry: Signed {
-                body: "Ym9keQ".to_string(),
-                sig: "c2ln".to_string(),
-            },
-            required: true,
-            confirmed: false,
-            outcome_unknown: false,
-            in_flight: AtomicBool::new(false),
-            may_be_stored: AtomicBool::new(false),
-        };
+        let object = entry_object();
         // 2026-10-01T12:10:45.123Z.
-        let request = put_request(&writer, &write, 1_790_856_645_123).unwrap();
+        let request = put_request(&writer, &object, 1_790_856_645_123).unwrap();
         let body = br#"{"body":"Ym9keQ","sig":"c2ln"}"#;
         let digest = Sha256::digest(body);
+        // The bucket of the account among the 32 buckets of the log store, as the first part
+        // of the path, and the key with its space percent-encoded.
         let path = concat!(
-            "/v1/accounts/user%201/NODE/",
-            "00000000000000000007--_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s"
+            "/BUCKET/a3/user%201/u/8209143354999.",
+            "Tk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk4.7.2.0123456789abcdef.",
+            "-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s"
+        )
+        .replace("BUCKET", ENTRY_BUCKET);
+        assert_eq!(
+            writer.id.shard_of(shard_hash("user 1")).as_deref(),
+            Some(ENTRY_BUCKET)
         );
         assert_eq!(request.method(), Method::PUT);
         assert_eq!(request.uri().to_string(), path);
@@ -1467,10 +1587,8 @@ mod tests {
             [
                 ("content-length", "30"),
                 ("content-type", "application/json"),
-                (
-                    "host",
-                    "character-credential-log-dev-1.s3.us-west-2.amazonaws.com"
-                ),
+                // The endpoint of Amazon S3 in the region: one host for every bucket.
+                ("host", "s3.us-west-2.amazonaws.com"),
                 ("x-amz-checksum-sha256", STANDARD.encode(digest).as_str()),
                 ("x-amz-content-sha256", hex(&digest).as_str()),
                 ("x-amz-date", "20261001T121045Z"),
@@ -1480,6 +1598,9 @@ mod tests {
                     "x-amz-object-lock-retain-until-date",
                     "2027-10-01T12:10:45Z"
                 ),
+                // The object is encrypted under a key the store manages, whatever the
+                // default encryption of the bucket names.
+                ("x-amz-server-side-encryption", "AES256"),
                 ("x-amz-security-token", "TOKEN"),
                 ("authorization", authorization),
             ]
@@ -1491,7 +1612,7 @@ mod tests {
         assert!(!format!("{:?}", request.headers()).contains("TOKEN"));
         // Every header but the length of the body is
         // signed: signing the headers of the request again gives its `Authorization`.
-        let signed: Vec<(&str, String)> = headers[1..8]
+        let signed: Vec<(&str, String)> = headers[1..9]
             .iter()
             .map(|(name, value)| (*name, value.to_string()))
             .collect();
@@ -1500,15 +1621,15 @@ mod tests {
             writer.credentials.authorization(
                 "us-west-2",
                 "PUT",
-                path,
+                &path,
                 &signed,
                 &hex(&digest),
                 "20261001T121045Z"
             )
         );
         // The signature is the one the AWS SDK for Python computes for this request
-        // (botocore 1.43, `S3SigV4Auth`, with the payload signed): the same credentials, the
-        // same time, the same address, headers and body.
+        // (botocore 1.44, `S3SigV4Auth`, with the payload signed): the same credentials, the same
+        // time, the same address, headers and body.
         assert_eq!(
             authorization,
             concat!(
@@ -1516,8 +1637,8 @@ mod tests {
                 "Credential=AKIAIOSFODNN7EXAMPLE/20261001/us-west-2/s3/aws4_request,",
                 "SignedHeaders=content-type;host;x-amz-checksum-sha256;x-amz-content-sha256;",
                 "x-amz-date;x-amz-object-lock-mode;x-amz-object-lock-retain-until-date;",
-                "x-amz-security-token,",
-                "Signature=8d7747bae7303ef63b4a453ccdbe239070a6a64c50ffb586afb916df2cd3f828"
+                "x-amz-security-token;x-amz-server-side-encryption,",
+                "Signature=a40d27e2808e59e841bb30d9a9c2b1261ff6eb15a132b947782dfce5caf7bd4f"
             )
         );
 
@@ -1529,17 +1650,17 @@ mod tests {
             credentials: Arc::new(credentials("")),
             endpoint: None,
         };
-        let request = put_request(&without_session, &write, 1_790_856_645_123).unwrap();
+        let request = put_request(&without_session, &object, 1_790_856_645_123).unwrap();
         assert!(!request.headers().contains_key(SECURITY_TOKEN));
         let authorization = request.headers()[AUTHORIZATION].to_str().unwrap();
         assert!(authorization.ends_with(concat!(
-            "x-amz-object-lock-retain-until-date,",
-            "Signature=ab38f4ec0f6b975bab74ebf0437982cbbb9f87de54d2703dc04c51d9b51d8735"
+            "x-amz-object-lock-retain-until-date;x-amz-server-side-encryption,",
+            "Signature=b1c37459bc9dced671f44841f26bfcb24fd7f6c172847c42bd750b27ef7bacae"
         )));
-        let path = object_path("v1/accounts/a b/ü$%+=&?#:@/N/1-x");
+        let path = format!("/{ENTRY_BUCKET}{}", object_path("a3/a b/ü$%+=&?#:@/c/1.x"));
         assert_eq!(
             path,
-            "/v1/accounts/a%20b/%C3%BC%24%25%2B%3D%26%3F%23%3A%40/N/1-x"
+            format!("/{ENTRY_BUCKET}/a3/a%20b/%C3%BC%24%25%2B%3D%26%3F%23%3A%40/c/1.x")
         );
         let authorization = writer.credentials.authorization(
             "us-west-2",
@@ -1550,8 +1671,51 @@ mod tests {
             "20261001T121045Z",
         );
         assert!(authorization.ends_with(
-            "Signature=4158355ad822130ed2a001d7f5b2be44e92c716e10bc40539237ff032b19eac8"
+            "Signature=7764384b5f0539846979686ac42b61cebc9f055f1365f140db82aca56329ee71"
         ));
+    }
+
+    /// The bucket of the account `user 1` among the buckets of the log store
+    /// `character-credential-log-dev-1`.
+    const ENTRY_BUCKET: &str = "785f2d9e-character-credential-log-dev-1-0021";
+
+    #[test]
+    fn the_node_document_is_written_with_a_retention_of_400_days() {
+        let id = LogStoreId::parse("character-credential-log-dev-1", "us-west-2").unwrap();
+        let writer = Writer {
+            id,
+            credentials: Arc::new(credentials("")),
+            endpoint: None,
+        };
+        let node = credential_enclave_protocol::encoding::b64u(&[0x4e; 32]);
+        let object = StoreObject {
+            shard: shard_hash(&node),
+            key: node_document_key(&node),
+            body: Bytes::from(node_document("nitro", b"document", &node, "v2.4.0")),
+            retention_days: limits::NODE_DOCUMENT_RETENTION_DAYS,
+        };
+        let request = put_request(&writer, &object, 1_790_856_645_123).unwrap();
+        // The bucket of the node, not of an account.
+        let bucket = writer.id.shard_of(shard_hash(&node)).unwrap();
+        assert_eq!(request.uri().to_string(), format!("/{bucket}/n3/{node}"));
+        assert_eq!(
+            request.headers()["x-amz-object-lock-retain-until-date"],
+            "2027-11-05T12:10:45Z"
+        );
+        assert_eq!(request.headers()["x-amz-object-lock-mode"], "COMPLIANCE");
+        assert_eq!(request.headers()["x-amz-server-side-encryption"], "AES256");
+    }
+
+    #[test]
+    fn a_log_store_without_a_bucket_for_the_object_gives_no_request() {
+        // The name is too long for the names of its buckets to be bucket names.
+        let id = LogStoreId::parse(&"b".repeat(50), "us-west-2").unwrap();
+        let writer = Writer {
+            id,
+            credentials: Arc::new(credentials("")),
+            endpoint: None,
+        };
+        assert!(put_request(&writer, &entry_object(), 1_790_856_645_123).is_none());
     }
 
     #[test]
@@ -1593,25 +1757,24 @@ mod tests {
             credentials: Arc::new(credentials("")),
             endpoint: Some(endpoint),
         };
-        let write = Write {
-            seq: 7,
-            key: object_key("user 1", "NODE", 7, &[0xfb; 32]),
-            entry: Signed {
-                body: "Ym9keQ".to_string(),
-                sig: "c2ln".to_string(),
-            },
-            required: true,
-            confirmed: false,
-            outcome_unknown: false,
-            in_flight: AtomicBool::new(false),
-            may_be_stored: AtomicBool::new(false),
-        };
-        let request = put_request(&writer, &write, 1_790_856_645_123).unwrap();
+        let object = entry_object();
+        let request = put_request(&writer, &object, 1_790_856_645_123).unwrap();
+        // The same path as for Amazon S3, with the bucket of the account among the four
+        // buckets of this log store.
+        let bucket = writer.id.shard_of(shard_hash("user 1")).unwrap();
+        assert!(
+            bucket.ends_with("-character-credential-log-local-1-0001"),
+            "{bucket}"
+        );
         assert_eq!(
             request.uri().to_string(),
-            concat!(
-                "/character-credential-log-local-1/v1/accounts/user%201/NODE/",
-                "00000000000000000007--_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s"
+            format!(
+                concat!(
+                    "/{}/a3/user%201/u/8209143354999.",
+                    "Tk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk4.7.2.0123456789abcdef.",
+                    "-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s"
+                ),
+                bucket
             )
         );
         assert_eq!(
@@ -1669,25 +1832,27 @@ mod tests {
 
     #[test]
     fn the_path_of_an_object_is_its_key_with_every_part_encoded_once() {
-        let key = object_key("user-1", "NODE", 7, &[0xfb; 32]);
-        assert_eq!(object_path(&key), format!("/{key}"));
-        // A key of format 2 has no character that is encoded: its parts are digits, letters,
-        // `-` and `_`.
-        let parts = credential_enclave_protocol::log::EntryParts {
-            seq: 2,
+        // A key of format 3 of an account whose `user_id` is letters, digits and `-` has no
+        // character that is encoded: its parts are digits, letters, `-`, `_` and `.`.
+        let key = EntryKey {
             time_ms: 1_790_000_000_000,
-            kind: credential_enclave_protocol::log::EntryKind::Use,
-            count: 3,
+            node: credential_enclave_protocol::encoding::b64u(&[0x4e; 32]),
+            seq: 2,
+            label: EntryLabel::Control("grant_accepted".to_string()),
             key_id: "0123456789abcdef".to_string(),
             body_hash: [0xfb; 32],
-            entry_hash: [0x3f; 32],
         };
-        let key = credential_enclave_protocol::log::object_key_v2("user-1", "NODE", &parts);
+        let key = object_key_v3("user-1", &key);
         assert_eq!(object_path(&key), format!("/{key}"));
+        let node = credential_enclave_protocol::encoding::b64u(&[0x4e; 32]);
+        assert_eq!(
+            object_path(&node_document_key(&node)),
+            format!("/n3/{node}")
+        );
         // Every part of a key is encoded once, and `/` stays.
         assert_eq!(
-            object_path("v1/accounts/a b/ü$%+=&?#:@/N/1-x"),
-            "/v1/accounts/a%20b/%C3%BC%24%25%2B%3D%26%3F%23%3A%40/N/1-x"
+            object_path("a3/a b/ü$%+=&?#:@/c/1.x"),
+            "/a3/a%20b/%C3%BC%24%25%2B%3D%26%3F%23%3A%40/c/1.x"
         );
         assert_eq!(object_path("A-Za-z0-9-._~"), "/A-Za-z0-9-._~");
     }
@@ -1729,7 +1894,9 @@ mod tests {
         assert!(!optional.tracks());
         assert!(optional.writer(5).unwrap().is_none());
         assert_eq!(optional.ensure_ready(5), Ok(()));
-        // With a log store it needs credentials within their time.
+        assert_eq!(optional.ensure_documented(5), Ok(()));
+        // With a log store it needs credentials within their time, and its node document in
+        // the store.
         assert!(optional.set_id(first.clone()));
         assert!(optional.tracks());
         assert_eq!(optional.id(), Some(&first));
@@ -1740,11 +1907,25 @@ mod tests {
         );
         optional.set_credentials(Credentials::new("ASIAEXAMPLE", "secret", "token", 10).unwrap());
         assert_eq!(optional.credentials_expires_ms(), 10);
+        // The node can sign a write, and writes no entry before its node document.
+        assert!(optional.target(9).unwrap().is_some());
+        assert_eq!(
+            optional.ensure_ready(9),
+            Err(ProtocolError::LogStoreUnavailable)
+        );
+        assert_eq!(
+            optional.ensure_documented(9),
+            Err(ProtocolError::LogStoreUnavailable)
+        );
+        optional.document_ms.store(4, Ordering::SeqCst);
         assert_eq!(optional.ensure_ready(9), Ok(()));
+        assert_eq!(optional.ensure_documented(9), Ok(()));
         assert_eq!(
             optional.ensure_ready(10),
             Err(ProtocolError::LogStoreUnavailable)
         );
+        // The document covers a transfer without credentials within their time.
+        assert_eq!(optional.ensure_documented(10), Ok(()));
         // The same log store again is taken, another one is not.
         assert!(optional.set_id(first.clone()));
         assert!(!optional.set_id(second));
@@ -1757,13 +1938,50 @@ mod tests {
             required.ensure_ready(5),
             Err(ProtocolError::LogStoreUnavailable)
         );
+        assert_eq!(
+            required.ensure_documented(5),
+            Err(ProtocolError::LogStoreUnavailable)
+        );
         required.set_credentials(Credentials::new("ASIAEXAMPLE", "secret", "token", 10).unwrap());
         assert_eq!(
             required.ensure_ready(5),
             Err(ProtocolError::LogStoreUnavailable)
         );
         assert!(required.set_id(first));
+        assert_eq!(
+            required.ensure_ready(5),
+            Err(ProtocolError::LogStoreUnavailable)
+        );
+        required.document_ms.store(4, Ordering::SeqCst);
         assert_eq!(required.ensure_ready(5), Ok(()));
+
+        // A log store whose name is too long for the names of its buckets is not taken.
+        let unnamed = LogStore::new(true);
+        assert!(!unnamed.set_id(LogStoreId::parse(&"b".repeat(50), "us-west-2").unwrap()));
+        assert_eq!(unnamed.id(), None);
+        assert!(unnamed.set_id(LogStoreId::parse(&"b".repeat(49), "us-west-2").unwrap()));
+    }
+
+    #[test]
+    fn the_node_document_covers_31_days_and_is_due_after_30() {
+        let store = LogStore::new(true);
+        // No write confirmed: due, and it covers nothing.
+        assert!(store.document_due(1_000));
+        assert!(!store.document_covers(1_000));
+        let written_ms = 1_790_000_000_000;
+        store.document_ms.store(written_ms, Ordering::SeqCst);
+        let renew_ms = written_ms + 30 * DAY_MS;
+        let end_ms = written_ms + 31 * DAY_MS;
+        assert!(!store.document_due(renew_ms - 1));
+        assert!(store.document_due(renew_ms));
+        assert!(store.document_covers(end_ms - 1));
+        assert!(!store.document_covers(end_ms));
+        // An entry written inside the 31 days is unlocked before the version of the document
+        // the node relied on: its retention ends 365 days after its write, the retention of
+        // the document 400 days after the write of the document.
+        let entry_unlocked_ms = (end_ms - 1) + limits::LOG_RETENTION_DAYS * DAY_MS;
+        let document_unlocked_ms = written_ms + limits::NODE_DOCUMENT_RETENTION_DAYS * DAY_MS;
+        assert!(entry_unlocked_ms < document_unlocked_ms);
     }
 
     #[tokio::test]

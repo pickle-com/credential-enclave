@@ -62,6 +62,13 @@ pub mod purpose {
     pub const LOG_ENTRY_V2: &str = "pickle.secure.v2.log-entry\n";
     /// Prefix of the log chain hash of format 2: `SHA-256(prefix || prev || body_hash)`.
     pub const LOG_CHAIN_V2: &str = "pickle.secure.v2.log-chain\n";
+    /// HPKE info of a log entry of format 3.
+    pub const LOG_ENTRY_SEAL_V3: &str = "pickle.secure.v3.log-entry";
+    /// Signature context of a log entry of format 3.
+    pub const LOG_ENTRY_V3: &str = "pickle.secure.v3.log-entry\n";
+    /// Prefix of the nonce of a node document:
+    /// `SHA-256(prefix || the 32 bytes of the node signing public key)` (7.7).
+    pub const NODE_DOCUMENT: &str = "pickle.secure.v3.node-document\n";
     /// Signature context of a head.
     pub const HEAD: &str = "pickle.secure.v1.head\n";
     /// Signature context of the account key registration (verified by the backend).
@@ -87,11 +94,11 @@ pub mod limits {
     pub const TRANSFER_GRANTS: usize = 1_000;
     /// Most nodes that one grant is handed to by the node that holds it (10.1).
     pub const TRANSFER_PEERS: usize = 64;
-    /// Most events in one entry of format 2 (7.1). An open batch is closed before it would
-    /// hold more.
+    /// Most events in one entry of format 2 or 3 (7.1). An open batch is closed before it
+    /// would hold more.
     pub const ENTRY_EVENTS: usize = 128;
-    /// Most bytes of the plaintext (the JSON array of the events) of one entry of format 2
-    /// (7.1).
+    /// Most bytes of the plaintext (the JSON array of the events) of one entry of format 2 or
+    /// 3 (7.1).
     pub const ENTRY_PLAINTEXT_BYTES: usize = 1_048_576;
     /// Most requests in one `forward/batch` call (enclave.md 5.8b).
     pub const FORWARD_BATCH_REQUESTS: usize = 100;
@@ -127,6 +134,16 @@ pub mod limits {
     /// The age at which the lifecycle rule of the log store removes an entry, and from which a
     /// reader treats an absent entry as expired: 400 days (7.4, 7.6).
     pub const LOG_EXPIRY_DAYS: u64 = 400;
+    /// How long the log store keeps a version of a node document from the moment the node
+    /// writes it: 400 days (7.7).
+    pub const NODE_DOCUMENT_RETENTION_DAYS: u64 = 400;
+    /// The age of the latest confirmed write of its node document at which a node writes the
+    /// document again: 30 days (7.7).
+    pub const NODE_DOCUMENT_RENEW_DAYS: u64 = 30;
+    /// The age of the latest confirmed write of its node document up to which a node takes a
+    /// user key and writes an entry: 31 days (7.7). An entry written inside this time has a
+    /// retention that ends before the retention of that version of the document.
+    pub const NODE_DOCUMENT_VALID_DAYS: u64 = 31;
     /// Longest release statement, in bytes (10.3).
     pub const RELEASE_STATEMENT_BYTES: usize = 16_384;
     /// The notice period of a release: how old the entry of the transparency log must be, by

@@ -39,7 +39,7 @@ mod log_store;
 mod mail;
 mod messages;
 mod oauth;
-mod peer;
+pub(crate) mod peer;
 mod refresh;
 mod release;
 pub mod responses;
@@ -88,7 +88,6 @@ fn routes() -> Vec<Route> {
         route(Method::POST, "/v1/mail/submit", mail::submit),
         route(Method::POST, "/v1/release", release::release),
         route(Method::POST, "/v1/close", close::close),
-        route(Method::POST, "/v1/close/heads", close::heads),
         route(Method::POST, "/v1/peer/export", peer::export),
         route(Method::POST, "/v1/peer/import", peer::import),
         route(Method::POST, "/v1/grants/prune", grants::prune),

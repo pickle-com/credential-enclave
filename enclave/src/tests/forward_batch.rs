@@ -114,7 +114,7 @@ async fn one_entry_names_every_request_before_any_leaves() {
     let chain = provider.chain("user-1", &harness.node.node);
     assert_eq!(chain.len(), 2);
     assert_eq!(
-        (chain[1].parts().kind, chain[1].parts().count as usize),
+        (chain[1].parts().kind(), chain[1].parts().count() as usize),
         (EntryKind::Use, limits::FORWARD_BATCH_REQUESTS)
     );
     let events = app.events(&harness, &chain[1].entry);
@@ -134,13 +134,14 @@ async fn one_entry_names_every_request_before_any_leaves() {
         .collect();
     expected.sort();
     assert_eq!(targets, expected);
-    assert_eq!(harness.head_seq("user-1"), 2);
+    assert_eq!(harness.last_seq("user-1"), 2);
 
+    // The writes are those of the two entries and of the node document.
     let log = harness.health().await["log"].clone();
     assert_eq!(
         super::seven_counts(&log),
         json!({
-            "entries": 2, "events": 101, "writes": 2, "write_failures": 0, "open_batches": 0,
+            "entries": 2, "events": 101, "writes": 3, "write_failures": 0, "open_batches": 0,
             "batch_calls": 1, "batch_requests": 100,
         })
     );
@@ -215,7 +216,7 @@ async fn a_request_that_fails_the_address_check_refuses_the_call_with_its_index(
     );
     assert_eq!(provider.stored().len(), writes);
     assert!(provider_targets(&provider).is_empty());
-    assert_eq!(harness.head_seq("user-1"), 1);
+    assert_eq!(harness.last_seq("user-1"), 1);
     assert_eq!(harness.health().await["log"]["batch_calls"], 0);
 }
 
@@ -242,7 +243,7 @@ async fn a_merged_request_inside_a_batch_shares_the_event() {
     );
     // Two events, three requests sent.
     let chain = provider.chain("user-1", &harness.node.node);
-    assert_eq!(chain[1].parts().count, 2);
+    assert_eq!(chain[1].parts().count(), 2);
     assert_eq!(provider_targets(&provider).len(), 3);
 
     // A later batch with the same request shares the event of the entry that is on the chain.
@@ -254,7 +255,7 @@ async fn a_merged_request_inside_a_batch_shares_the_event() {
         logs_of(&outcomes),
         [json!({"seq": 2, "index": 0, "created": false})]
     );
-    assert_eq!(harness.head_seq("user-1"), 2);
+    assert_eq!(harness.last_seq("user-1"), 2);
 }
 
 #[tokio::test]
@@ -299,7 +300,7 @@ async fn two_entries_when_the_open_batch_reaches_its_cap() {
     let chain = provider.chain("user-1", &harness.node.node);
     let shape: Vec<(u64, u32)> = chain
         .iter()
-        .map(|stored| (stored.seq(), stored.parts().count))
+        .map(|stored| (stored.seq(), stored.parts().count()))
         .collect();
     assert_eq!(shape, [(1, 1), (2, 128), (3, 32)]);
     assert!(writes_precede_requests(&provider, before));
@@ -338,7 +339,7 @@ async fn one_failed_request_leaves_the_others_intact() {
     assert_eq!(
         provider.chain("user-1", &harness.node.node)[1]
             .parts()
-            .count,
+            .count(),
         10
     );
 }
@@ -481,7 +482,7 @@ async fn bodies_are_split_by_body_bytes() {
     huge["requests"][2]["body_bytes"] = json!(u64::MAX);
     let (status, failure) = harness.forward_batch(huge, b"ab").await.err().unwrap();
     assert_eq!((status, &failure["code"]), (400, &json!("invalid_request")));
-    assert_eq!(harness.head_seq("user-1"), 2);
+    assert_eq!(harness.last_seq("user-1"), 2);
 }
 
 #[tokio::test]
@@ -505,7 +506,7 @@ async fn a_batch_of_zero_or_101_requests_is_invalid() {
     meta.as_object_mut().unwrap().remove("requests");
     let (status, _) = harness.forward_batch(meta, b"").await.err().unwrap();
     assert_eq!(status, 400);
-    assert_eq!(harness.head_seq("user-1"), 1);
+    assert_eq!(harness.last_seq("user-1"), 1);
 
     // The front conditions hold for the call as a whole: an account without a grant.
     let stranger = App::new("user-2", 2);

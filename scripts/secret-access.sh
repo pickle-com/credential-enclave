@@ -22,8 +22,8 @@
 #   K2  seal_transfer     user keys leave inside the seal to a verified peer node
 #   K3  send_to_provider  a request, with its secrets, goes to a provider over TLS
 #   K4  hand_out          a vault value becomes part of the response of `release`
-#   K5  send_to_log_store a signed log entry goes to the log store over TLS, in a request
-#                         signed with the credentials of the operator
+#   K5  send_to_log_store a signed log entry, or the node document, goes to the log store
+#                         over TLS, in a request signed with the credentials of the operator
 #
 # The node source is protocol/src and enclave/src without the code that is compiled for tests
 # only and without the vector generator (`protocol/src/bin/`), which is a separate program.

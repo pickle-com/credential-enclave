@@ -76,7 +76,6 @@ operator_response!(
     ForwardBatchMeta,
     Released,
     Closed,
-    Heads,
     Exported,
     Imported,
     Pruned,
@@ -346,8 +345,14 @@ pub struct LogStoreState<'a> {
     pub bucket: &'a str,
     /// E: its region.
     pub region: &'a str,
+    /// P: a constant of the bucket name, the number of buckets that hold the entries the node
+    /// writes.
+    pub shards: u16,
     /// E: the end of the credentials the operator domain gave, 0 when the node holds none.
     pub credentials_expires_ms: u64,
+    /// P: node clock, the time of the latest write of the node document that the store
+    /// confirmed, 0 when it confirmed none.
+    pub node_document_ms: u64,
     /// P: a count, the accounts that have a pending entry.
     pub pending: usize,
     /// P: node clock, the age of the oldest pending entry in milliseconds, 0 when there is
@@ -360,6 +365,9 @@ pub struct LogStoreState<'a> {
 pub struct Configured {
     /// P
     pub configured: bool,
+    /// P: node clock, the time of the latest write of the node document that the store
+    /// confirmed, 0 when it confirmed none or the node has no log store.
+    pub node_document_ms: u64,
 }
 
 /// `POST /v1/log-store/credentials`.
@@ -367,6 +375,9 @@ pub struct Configured {
 pub struct CredentialsStored {
     /// E: the end of the credentials the call gave.
     pub credentials_expires_ms: u64,
+    /// P: node clock, the time of the latest write of the node document that the store
+    /// confirmed, 0 when it confirmed none.
+    pub node_document_ms: u64,
 }
 
 /// `POST /v1/attestation`.
@@ -394,7 +405,7 @@ pub struct Attestation<'a> {
 #[derive(Serialize)]
 pub struct Messages {
     /// S: the body holds P, E and D values (`type`, `ok`, `code`, `node`, `user_id`,
-    /// `challenge`, `key_id`, `not_after_ms`, `head`, `time_ms`).
+    /// `challenge`, `key_id`, `not_after_ms`, `time_ms`).
     pub reply: Signed,
     /// P: the entry and the index of the event the command created, null when it created
     /// none.
@@ -406,9 +417,6 @@ pub struct Messages {
 /// `POST /v1/status`.
 #[derive(Serialize)]
 pub struct Status {
-    /// S: the body holds the end of the chain (P), the nonce of the caller (E) and the node
-    /// clock (P).
-    pub head: Signed,
     /// D: `state`, `key_id`, `custody`, `not_after_ms` of the grant.
     pub grant: GrantStatus,
 }
@@ -533,20 +541,6 @@ pub struct Closed {
     pub accounts: usize,
 }
 
-/// `POST /v1/close/heads`.
-#[derive(Serialize)]
-pub struct Heads {
-    /// S: each body holds the end of a chain (P).
-    pub heads: Vec<Signed>,
-    /// E: the `user_id` the listing continues after.
-    pub next: String,
-    /// P: a count, the accounts of the page whose final head stands at the last entry the
-    /// store confirmed, below pending entries that were dropped.
-    pub truncated: usize,
-    /// P: a count, the accounts of the page that got no final head in this call.
-    pub skipped: usize,
-}
-
 /// `POST /v1/grants/prune`.
 #[derive(Serialize)]
 pub struct Pruned {
@@ -561,7 +555,9 @@ pub struct Pruned {
 pub struct Exported {
     /// C: sealed to the sealing key of the verified peer (sink K2).
     pub envelope: Option<TransferEnvelope>,
-    /// E and P: the entries `grant_transferred_out` this call created.
+    /// E and P: the entries `grant_transferred_out` this call created: one per grant it hands
+    /// to a node of a later release for the first time, none for a transfer to a node of this
+    /// program.
     pub logs: Vec<AccountLogRef>,
     /// E: the `user_id` the listing continues after.
     pub next: String,
@@ -572,7 +568,10 @@ pub struct Exported {
 pub struct Imported {
     /// P: a count.
     pub imported: usize,
-    /// E and P: the entries `grant_transferred_in` this call created.
+    /// E: the `user_id` of every account whose grant this call put in place.
+    pub accounts: Vec<String>,
+    /// E and P: the entries `grant_transferred_in` this call created: one per grant of a
+    /// transfer from an earlier release, none for a transfer from a node of this program.
     pub logs: Vec<AccountLogRef>,
 }
 
