@@ -374,8 +374,9 @@ impl ForRequest {
     ///
     /// What depends on the value is judged here, after the entry. A plaintext that is no JSON
     /// object or holds no string `value`, a value of more than 12,000 bytes or with fewer than
-    /// 8 bytes without the white space at its ends (`is_used_in_requests` of the protocol
-    /// crate: of a shorter text no reflection could be found in a response), for a slot
+    /// 8 bytes without the characters a server strips at its ends (`is_used_in_requests` of
+    /// the protocol crate: of a shorter text no reflection could be found in a response), for
+    /// a slot
     /// `header:<name>`, `basic:user` and `basic:password` a value with a control character
     /// (it would end the line of its header, and the credentials of HTTP Basic hold none),
     /// and for the slot `basic:user` a value with a colon (the first colon of the credentials

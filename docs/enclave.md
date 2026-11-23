@@ -866,7 +866,8 @@ which form it holds. The order of the processing:
     base64 or base64url (each of the three byte alignments, without padding) and in hexadecimal
     (lower or upper case). A header whose bytes are not UTF-8 is searched as those bytes as well.
     A header name, which the node hands on in lower case, is searched without regard to the case
-    of its letters. The credential is searched for without the white space at its ends. A form shorter than 8
+    of its letters. The credential is searched for without the characters a server strips at its
+    ends (white space, control characters and U+FEFF: protocol.md 10.5). A form shorter than 8
     bytes is not searched for. A failed check is
     `response_withheld`: no part of the response leaves. The event `provider_request` is already
     on the chain, because the request went to the provider.
@@ -1069,7 +1070,7 @@ without the operator configuration.
    `context`, `name`, `slot` and `to` (protocol.md 7.2). It is merged with no other event. A call
    that is refused up to here creates no event.
 6. After the log store confirmed the entry: the value has at most 12,000 bytes, of which 8 or
-   more are left without the white space at its ends (protocol.md 10.5), and for a slot of a
+   more are left without the characters a server strips at its ends (protocol.md 10.5), and for a slot of a
    header and for the two slots of HTTP Basic it holds no control character (for `basic:user`, no
    colon either). A value that fails is `record_invalid`: no envelope leaves, and the entry stays.
 7. The node seals the value and the request object to the sealing key of the receiving node

@@ -1419,6 +1419,46 @@ async fn a_value_with_white_space_at_its_ends_is_found_without_it() {
 }
 
 #[tokio::test]
+async fn a_value_is_found_without_what_a_server_strips_at_its_ends() {
+    // A value that was stored with a byte order mark in front of it, as one that was read
+    // from a file, or with a control character at one of its ends. The functions that strip
+    // a text do not remove the same characters in every runtime: the site of this test
+    // removes every character up to U+0020, U+007F and U+FEFF, and sends back what is left.
+    let stored = [
+        format!("\u{feff}{VALUE}"),
+        format!("{VALUE}\u{1f}"),
+        format!("\u{1}\u{feff} {VALUE}\u{7f}"),
+    ];
+    for (index, value) in stored.iter().enumerate() {
+        let provider = site(|seen| {
+            let query = seen.target.split_once('?').map_or("", |(_, query)| query);
+            let read = url::form_urlencoded::parse(query.as_bytes())
+                .find(|(name, _)| name == "key")
+                .map(|(_, value)| value.into_owned())
+                .unwrap_or_default();
+            let read = read.trim_matches(|character: char| {
+                character <= ' ' || character == '\u{7f}' || character == '\u{feff}'
+            });
+            Reply::json(400, &json!({"unknown key": read}))
+        })
+        .await;
+        let forward = forward_node(&provider).await;
+        let query = format!("key={PLACEHOLDER}");
+        let request = request_of("GET", "/v1/me", &query, "query:key", b"");
+        let meta = json!({
+            "envelope": envelope(&forward, &request, value, index as u8),
+            "headers": [],
+        });
+        let sent = forward.vault_send(meta, b"").await.unwrap();
+        // The site received the value as it was stored, and sent it back without its ends.
+        let target = format!("/v1/me?key={}", percent(value));
+        assert_eq!(provider.only().target, target);
+        assert_eq!(sent.end["code"], "response_withheld", "{value:?}");
+        assert_eq!(sent.body(), b"", "{value:?}");
+    }
+}
+
+#[tokio::test]
 async fn a_value_a_site_sends_back_in_a_header_that_is_not_utf8_is_not_handed_on() {
     // A value with characters outside ASCII. The site sends it back in a header, beside a
     // byte that is no UTF-8: the node hands such a header on with one character per byte,

@@ -39,6 +39,7 @@
 use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use credential_enclave_protocol::secret::Secret;
+use credential_enclave_protocol::secret_use::searched_text;
 use memchr::memmem;
 use zeroize::Zeroize;
 
@@ -147,16 +148,17 @@ impl Forms {
     /// byte alignment, hexadecimal in both cases. A form shorter than [`SHORTEST_FORM_BYTES`]
     /// is left out.
     ///
-    /// A credential is searched for without the white space at its ends (the Unicode property
-    /// White_Space). A server reads the value of a header without the white space around it,
-    /// and often strips it from a parameter, so what it sends back of a credential that was
-    /// stored with a space or a line end behind it may be the credential without it. Bytes
-    /// that hold the credential with its white space hold it without as well, in each of
-    /// these forms: the search finds both.
+    /// A credential is searched for without the characters at its ends that a server strips
+    /// from a text (`searched_text` of the protocol crate: white space, control characters
+    /// and U+FEFF). A server reads the value of a header without the white space around it,
+    /// and often strips a parameter, so what it sends back of a credential that was stored
+    /// with a space, a line end or a byte order mark at one of its ends may be the credential
+    /// without it. Bytes that hold the credential with those characters hold it without them
+    /// as well, in each of these forms: the search finds both.
     pub fn of(credentials: &[Secret<String>]) -> Forms {
         let mut kept: Vec<Secret<Vec<u8>>> = Vec::new();
         for credential in credentials {
-            let token = credential.expose_secret().trim().as_bytes();
+            let token = searched_text(credential.expose_secret()).as_bytes();
             let mut forms: Vec<Vec<u8>> = vec![token.to_vec()];
             for alignment in 0..3 {
                 forms.push(base64_inside(&STANDARD_NO_PAD, token, alignment));
@@ -1433,6 +1435,32 @@ mod tests {
         assert_eq!(outcome("x-echo", token), Err(Withheld));
         assert_eq!(outcome("x-echo", &lower), Ok(()));
         assert_eq!(outcome("x-echo-sk-live", "1"), Ok(()));
+    }
+
+    #[test]
+    fn a_credential_is_searched_for_without_what_a_server_strips_at_its_ends() {
+        // A credential that was stored with white space, a byte order mark or a control
+        // character at its ends, and bytes that hold it without them: as it is, and in its
+        // base64 and hexadecimal forms.
+        for stored in [
+            format!("{TOKEN}\n"),
+            format!("  {TOKEN}\t"),
+            format!("\u{feff}{TOKEN}"),
+            format!("{TOKEN}\u{1f}"),
+            format!("\u{1}\u{feff} {TOKEN}\u{7f}\u{3000}"),
+        ] {
+            let forms = Forms::of(&[Secret::new(stored.clone())]);
+            let inside = format!("{{\"unknown key\":\"{TOKEN}\"}}");
+            assert!(forms.found_in(inside.as_bytes()), "{stored:?}");
+            assert!(forms.found_in(STANDARD_NO_PAD.encode(&inside).as_bytes()));
+            assert!(forms.found_in(&hex(inside.as_bytes(), b"0123456789abcdef")));
+            // The credential as it was stored holds the text that is searched for.
+            assert!(forms.found_in(stored.as_bytes()), "{stored:?}");
+            assert!(forms.found_in(STANDARD_NO_PAD.encode(&stored).as_bytes()));
+            // What stands inside a credential is part of it.
+            let parted = TOKEN.replacen('/', "/ ", 1);
+            assert!(!forms.found_in(parted.as_bytes()), "{stored:?}");
+        }
     }
 
     #[test]

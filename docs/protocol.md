@@ -1376,9 +1376,12 @@ enc, ct  = single-shot HPKE to the sealing key of the receiving node,
 - `not_after_ms` is `time_ms` plus 30,000: an envelope can be used for 30 seconds of the time of
   the giving node. `nonce` is 16 fresh random bytes, the number of the use.
 - `value` is the value of the record: at most 12,000 bytes, of which 8 or more are left without
-  the white space at its ends (the Unicode property White_Space). The search of the response to
-  its request looks for the value without that white space, and a text of fewer than 8 bytes is
-  not searched for (egress-policy.md, rule E4), so no node seals or sends a value with fewer.
+  the characters a server strips at its ends. Those are the white space characters (the Unicode
+  property White_Space), the control characters (U+0000 to U+001F and U+007F to U+009F) and
+  U+FEFF, the byte order mark: what the function that strips a text removes in one runtime or
+  another. The search of the response to its request looks for the value without those
+  characters at its ends, and a text of fewer than 8 bytes is not searched for
+  (egress-policy.md, rule E4), so no node seals or sends a value with fewer.
 - The purpose strings are those of this envelope alone. A node opens a delegation transfer (10.1)
   under other ones, so a node of the forward role has no operation that opens a transfer, and a
   node of the delegation role has none that opens this envelope.
@@ -1399,7 +1402,7 @@ enc, ct  = single-shot HPKE to the sealing key of the receiving node,
 | `sig` verifies under the signing key that `envelope.from` names | `bad_signature` |
 | `payload` is a JSON object with `v` 1 and `type` `secret_use` | `unsupported_version`, `invalid_request` |
 | `payload.from` and `payload.to` equal those of the envelope | `wrong_node` |
-| The form of the fields: the two times, a `nonce` of 16 bytes, a `user_id`, a `record_id` of 16 bytes, a `value` of at most 12,000 bytes with 8 or more of them without the white space at its ends, a request object | `invalid_request`, `too_large` for a body above 64 MiB |
+| The form of the fields: the two times, a `nonce` of 16 bytes, a `user_id`, a `record_id` of 16 bytes, a `value` of at most 12,000 bytes with 8 or more of them without the characters a server strips at its ends, a request object | `invalid_request`, `too_large` for a body above 64 MiB |
 | The time of the node is before `not_after_ms`, and `not_after_ms` is at most 60 seconds ahead of it | `bad_expiry` |
 | The body of the call has the length and the SHA-256 the request object states, and the request of the call is the request of the envelope (below) | `invalid_request`, `not_allowed` |
 | The `nonce` was not marked before | `bad_challenge` |
@@ -1537,7 +1540,7 @@ redirect. The response passes rule E4 of the egress policy before any part of it
 | Longest name of such a record, longest name inside a slot | 64 characters, 64 bytes |
 | Longest `value` that `vault/store` takes, longest plaintext of a record it makes | 12,000 bytes, 12,272 bytes |
 | Lengths a device pads the plaintext of a record of kind `vault_secret` to | 256, 512, 1,024, 2,048, 4,096, 8,192 and 12,272 bytes |
-| Value of a vault secret that is used in a request (10.5) | At most 12,000 bytes, 8 or more of them without the white space at its ends |
+| Value of a vault secret that is used in a request (10.5) | At most 12,000 bytes, 8 or more of them without the characters a server strips at its ends (white space, control characters, U+FEFF) |
 | Time an envelope of a use of a vault secret can be used, time a node keeps the mark of a used one | 30 seconds, 60 seconds |
 | Marks of used envelopes a node of the forward role keeps at once | 1,048,576 |
 | Placeholder of a request (10.5) | 16 to 128 characters |

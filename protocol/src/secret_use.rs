@@ -307,21 +307,36 @@ pub fn fits_header(value: &str) -> bool {
     !value.chars().any(char::is_control)
 }
 
+/// True for a character a server strips from the ends of a text it read: a white space
+/// character (the Unicode property White_Space), a control character (U+0000 to U+001F and
+/// U+007F to U+009F), and U+FEFF, the byte order mark.
+///
+/// A server strips a text with the function of its runtime, and the runtimes do not agree on
+/// what that function removes. All of them remove white space. Some remove every character
+/// up to U+0020 (`String.trim` of Java), and some U+FEFF (`trim` of JavaScript). This is what
+/// one of them or another removes.
+fn is_stripped(character: char) -> bool {
+    character.is_whitespace() || character.is_control() || character == '\u{feff}'
+}
+
 /// The value of a vault secret as the search of a response looks for it (egress-policy.md,
-/// rule E4): without the white space at its ends (the Unicode property White_Space).
+/// rule E4): without the characters at its ends that a server strips from a text
+/// ([`is_stripped`]: white space, control characters and U+FEFF).
 ///
 /// A server reads the value of a header without the white space around it, and a server that
 /// reads a parameter or a member of a body often strips it. So what a site sends back of a
-/// value that was stored with a space or a line end at one of its ends may be the value
-/// without it, which is the value that site takes. A response that holds the value with its
-/// white space holds it without as well, in every form the search knows.
+/// value that was stored with a space, a line end or a byte order mark at one of its ends may
+/// be the value without it, which is the value that site takes. A response that holds the
+/// value with those characters holds it without them as well, in every form the search knows,
+/// whichever of them a server removed.
 pub fn searched_text(value: &str) -> &str {
-    value.trim()
+    value.trim_matches(is_stripped)
 }
 
 /// True for a value that is used in a request (10.5): at most 12,000 bytes, of which 8 or
-/// more are left without the white space at its ends ([`searched_text`]). Of a shorter one no
-/// reflection is searched for in the response to its request, so no node seals or sends one.
+/// more are left without the characters a server strips at its ends ([`searched_text`]). Of a
+/// shorter text no reflection is searched for in the response to its request, so no node
+/// seals or sends such a value.
 pub fn is_used_in_requests(value: &str) -> bool {
     value.len() <= limits::SECRET_USE_VALUE_BYTES_MAX
         && searched_text(value).len() >= limits::SECRET_USE_VALUE_BYTES_MIN
@@ -1528,12 +1543,19 @@ mod tests {
     }
 
     #[test]
-    fn a_value_used_in_a_request_has_eight_bytes_without_the_white_space_at_its_ends() {
+    fn a_value_used_in_a_request_has_eight_bytes_without_what_a_server_strips_at_its_ends() {
         for (value, searched) in [
             ("sk-live_0123456789", "sk-live_0123456789"),
             (" sk-live_0123456789\n", "sk-live_0123456789"),
             ("\t\r\n12345678 \u{a0}\u{3000}", "12345678"),
             ("1234 5678", "1234 5678"),
+            // A byte order mark, as a value that was read from a file begins with one, and
+            // control characters that are no white space.
+            ("\u{feff}sk-live_0123456789", "sk-live_0123456789"),
+            ("\u{feff} 12345678\u{1f}\u{1}", "12345678"),
+            ("12345678\u{7f}\u{9c}", "12345678"),
+            // Only the ends: what stands inside a value is part of it.
+            ("1234\u{feff}\u{1f}5678", "1234\u{feff}\u{1f}5678"),
         ] {
             assert_eq!(searched_text(value), searched, "{value:?}");
             assert!(is_used_in_requests(value), "{value:?}");
@@ -1546,11 +1568,14 @@ mod tests {
             "1234567\n\n\n",
             "        ",
             "\u{3000}123456",
+            "\u{feff}1234567",
+            "1234567\u{1f}",
+            "\u{1}\u{feff} 1234567\u{7f}\u{85}",
         ] {
             assert!(!is_used_in_requests(value), "{value:?}");
         }
-        // The longest value, and one byte more. White space counts for the length of a value
-        // and not for the text that is searched for.
+        // The longest value, and one byte more. What a server strips counts for the length
+        // of a value and not for the text that is searched for.
         let longest = "v".repeat(limits::SECRET_USE_VALUE_BYTES_MAX);
         assert!(is_used_in_requests(&longest));
         assert!(!is_used_in_requests(&format!("{longest} ")));
