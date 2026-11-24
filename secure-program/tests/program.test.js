@@ -1030,6 +1030,79 @@ test("a chain of format 2 the ledger of the program before explains is read on f
   assert.deepEqual(world.securityStatuses.slice(-1)[0].reasons, ["unlisted_release"]);
 });
 
+test("a chain of format 1 the ledger of the program before explains is read from its first seq when that program verified it up to an entry of 2026-11-23 or later, so a transfer a node of such a release wrote since is judged; a chain it verified up to an earlier entry, or kept no time of, stays where that program left it", async () => {
+  const fx = S.fixture(source, { nodes: 1, legacy: 0, device: { securityStatus: true } });
+  const world = fx.world;
+  const seal = { logPk: fx.keys.logPk, keyId: fx.keys.keyId };
+  const from = TRANSFER_DOCUMENTS_FROM_MS;
+  const build = bridge.listedMeasurements(source).find((item) => item.release === "v1.5.2");
+  const node = () => world.addNode({ release: "v1.5.2", measurement: build, format: 1, offered: false });
+  const write = (writer, events, timeMs) => writer.write(world.userId, "c", events, Object.assign({ timeMs: timeMs }, seal));
+  const accepted = (timeMs) => [{ t: "grant_accepted", time_ms: timeMs, not_after_ms: timeMs + 30 * DAY_MS, custody: "enclave" }];
+  const moved = (timeMs, to) => [{ t: "grant_transferred_out", time_ms: timeMs, to: to.id }];
+  const receiver = () => {
+    const made = world.addNode({ release: "v2.3.9", measurement: bridge.randomMeasurement(), format: 2, offered: false });
+    world.keptDocuments.set(made.id, registryDocument(made));
+    return made;
+  };
+  const point = (writer) => {
+    const chain = writer.chains.get(world.userId);
+    const last = chain[chain.length - 1];
+    return { seq: last.seq, hash: b64u(last.entryHash), time_ms: last.time_ms };
+  };
+  // A node of release v1.5.2 someone started after that time: it took the grant of the device
+  // from the earlier program, handed the delegation to a node of a measurement no list has two
+  // days after that time, and the earlier program verified its chain a day later, past that
+  // entry, to its final head.
+  const started = node();
+  const first = receiver();
+  write(started, accepted(from + DAY_MS), from + DAY_MS);
+  const transfer = write(started, moved(from + 2 * DAY_MS, first), from + 2 * DAY_MS);
+  write(started, [S.providerRequest(from + 3 * DAY_MS)], from + 3 * DAY_MS);
+  started.shutDown();
+  // A node of that release that ended in October 2026, with a transfer among its entries.
+  const ended = node();
+  const second = receiver();
+  write(ended, accepted(from - 40 * DAY_MS), from - 40 * DAY_MS);
+  write(ended, moved(from - 31 * DAY_MS, second), from - 31 * DAY_MS);
+  write(ended, [S.providerRequest(from - 30 * DAY_MS)], from - 30 * DAY_MS);
+  ended.shutDown();
+  // A node of that release whose verification point the ledger keeps no time of.
+  const untimed = node();
+  write(untimed, accepted(from - 90 * DAY_MS), from - 90 * DAY_MS);
+  write(untimed, [S.providerRequest(from - 89 * DAY_MS)], from - 89 * DAY_MS);
+  untimed.shutDown();
+  const final = (writer) => ({ seq: point(writer).seq, hash: point(writer).hash });
+  writeLedger(fx, {}, [
+    { node: started, fields: { granted_ms: from + DAY_MS, not_after_ms: from + 31 * DAY_MS, gone_ms: from + 3 * DAY_MS, checkpoint: point(started), final: final(started) } },
+    { node: ended, fields: { granted_ms: from - 40 * DAY_MS, not_after_ms: from - 10 * DAY_MS, gone_ms: from - 30 * DAY_MS, checkpoint: point(ended), final: final(ended) } },
+    { node: untimed, fields: { granted_ms: from - 90 * DAY_MS, not_after_ms: from - 60 * DAY_MS, gone_ms: from - 89 * DAY_MS, checkpoint: Object.assign(point(untimed), { time_ms: 0 }), final: final(untimed) } },
+  ]);
+  world.now = from + 5 * DAY_MS;
+  await S.start(fx);
+  await world.settle(60000);
+  const legacy = world.stored("log.legacy");
+  // The chain of the node someone started was read from its first seq, past the transfer, and
+  // the receiving node is one that held the key. The two other chains stay closed where the
+  // earlier program left them, and none of their entries was asked for.
+  assert.ok(legacy.nodes[started.id].seq >= transfer.seq);
+  for (const writer of [ended, untimed]) {
+    assert.equal(legacy.nodes[writer.id].closed, true);
+    assert.equal(legacy.nodes[writer.id].seq, point(writer).seq);
+    assert.equal(listedChains(world).indexOf(writer.id), -1);
+  }
+  const asked = [];
+  for (const request of world.sent("POST /api/secure/log/documents")) asked.push.apply(asked, JSON.parse(request.body).nodes);
+  assert.equal(asked.indexOf(second.id), -1);
+  const held = Object.values(world.stored("log.unaccepted")).filter((item) => item.held === true).map((item) => item.node);
+  assert.deepEqual(held, [first.id]);
+  assert.equal(world.state.log.status, "pending");
+  await nextDay(fx);
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "attention");
+  assert.deepEqual(world.securityStatuses.slice(-1)[0].reasons, ["unlisted_release"]);
+});
+
 test("a grant to a node of a release before v2.4.0 is written into the ledger and shared, for the devices of the account that run an earlier program", async () => {
   const fx = S.fixture(source, { nodes: 1, legacy: 1 });
   await S.start(fx);
