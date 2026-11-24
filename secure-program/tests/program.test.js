@@ -6649,6 +6649,20 @@ test("a request for bodies that is not answered in its time, or fails on its way
     assert.equal(named[1], 1, failure);
     assert.ok(named.some((count) => count > 1 && count <= 16), failure);
     assert.deepEqual(named.slice(-8), [1, 1, 1, 1, 1, 1, 1, 1], failure);
+    // The runtime names less in a request for an hour: entries that arrive within it are asked
+    // for one key in a request, and entries that arrive a day later with every key in one.
+    world.clearFaults();
+    const later = [];
+    world.fault("POST /api/secure/log/bodies", (request) => { later.push(JSON.parse(request.body).keys.length); return undefined; });
+    for (let i = 0; i < 3; i += 1) fx.nodes[0].record("c", [{ t: "grant_revoked", time_ms: world.now + i }], { timeMs: world.now + i });
+    await S.call(fx, "read_log", {});
+    await world.settle(30000);
+    assert.ok(later.length >= 3 && later.every((count) => count === 1), failure + " " + JSON.stringify(later));
+    later.length = 0;
+    world.advance(HOUR_MS);
+    for (let i = 0; i < 3; i += 1) fx.nodes[0].record("c", [{ t: "grant_revoked", time_ms: world.now + i }], { timeMs: world.now + i });
+    await nextDay(fx);
+    assert.deepEqual(later, [3], failure);
   }
 });
 
@@ -6673,8 +6687,21 @@ test("a request for bodies whose first key alone is not answered either stays a 
   // The request of the round, and the one request that asked for its first key alone.
   const sent = world.sent("POST /api/secure/log/bodies").slice(before).map((request) => JSON.parse(request.body).keys.length);
   assert.deepEqual(sent, [5, 1]);
+  // The next day three more entries arrived. The round asks for the five keys it kept and then
+  // for the three new ones, and asks again once: after the request for a first key alone that
+  // stayed without an answer, no other request of that round is asked again.
+  world.advance(HOUR_MS);
+  for (let i = 0; i < 3; i += 1) {
+    world.advance(1000);
+    fx.nodes[0].record("c", [{ t: "grant_revoked", time_ms: world.now }]);
+  }
+  const second = world.sent("POST /api/secure/log/bodies").length;
+  await nextDay(fx);
+  await world.settle(60000);
+  assert.deepEqual(world.sent("POST /api/secure/log/bodies").slice(second).map((request) => JSON.parse(request.body).keys.length), [5, 1, 3]);
+  assert.equal(world.stored("log.blocked").count, 2);
   // A backend that goes on that way marks the log on the fourth day, as before.
-  for (let day = 0; day < 3; day += 1) await nextDay(fx);
+  for (let day = 0; day < 2; day += 1) await nextDay(fx);
   await world.settle(60000);
   assert.equal(world.state.log.status, "attention");
 });
@@ -6759,6 +6786,23 @@ test("a big key is asked for alone, at the end of its round, with the time its s
   assert.equal(held.world.state.log.newer_release_nodes, 1);
   assert.equal(Object.keys(held.world.stored("log.unaccepted")).length, 1);
   assert.deepEqual(held.world.stored("log.withheld").unjudged, [heavy.key]);
+
+  // The key the round left unjudged is asked for by the round of the next runtime, alone again
+  // and with the time its size takes: the device kept its size.
+  held.world.clearFaults();
+  const kept = [];
+  held.world.fault("POST /api/secure/log/bodies", (request) => {
+    const keys = JSON.parse(request.body).keys;
+    kept.push(keys);
+    return keys.indexOf(heavy.key) >= 0 ? { delay_ms: 40000 } : undefined;
+  });
+  held.world.advance(2 * 60000);
+  await S.start(held);
+  await held.world.settle(5 * 60000);
+  assert.deepEqual(kept, [[heavy.key]]);
+  assert.deepEqual(held.world.stored("log.withheld"), undefined);
+  assert.equal(held.world.state.log.newer_release_nodes, 1);
+  assert.equal(held.world.state.log.store, "verified");
 
   // A big object someone wrote under the key of a small entry of a node does not make that key
   // a big one: the listing shows the version the node wrote beside it.
@@ -7518,4 +7562,97 @@ test("a node discovery listing that goes on beyond the pages a round reads of it
   await S.event(fx, "foreground");
   assert.equal(world.state.log.status, "verified");
   assert.equal(world.stored("log.legacy").more, undefined);
+});
+
+test("a round the log screen started that goes on after the screen stopped waiting for it sends its report itself, and what it read is on the screen at the next opening", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  world.advance(HOUR_MS);
+  // A use entry of 600,000 bytes and more: a big key. Its answer takes ninety seconds.
+  const big = fx.nodes[0].record("u", [S.providerRequest(world.now, "/files/" + "x".repeat(600000), "POST")]);
+  world.fault("POST /api/secure/log/bodies", (request) => (JSON.parse(request.body).keys.indexOf(big.key) >= 0 ? { delay_ms: 90000 } : undefined));
+  const reports = world.reports.length;
+  const first = await S.call(fx, "read_log", { limit: 50 });
+  assert.equal(first.ok, true);
+  // The round of the screen waits for the big key at its end, longer than the screen waits for
+  // the round. When it ends, its judgement is reported as that of any round.
+  await world.settle(4 * 60000);
+  assert.equal(world.reports.length, reports + 1);
+  assert.equal(world.reports.slice(-1)[0].status, "verified");
+  assert.equal(world.state.log.status, "verified");
+  assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  // The entry is on the screen at the next opening, read and verified, and is not asked for again.
+  const asked = world.sent("POST /api/secure/log/bodies").filter((request) => JSON.parse(request.body).keys.indexOf(big.key) >= 0).length;
+  const second = await S.call(fx, "read_log", { limit: 50 });
+  const rows = shownGroups(second.value).filter((group) => group.kind === "request");
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].verified, true);
+  assert.equal(world.sent("POST /api/secure/log/bodies").filter((request) => JSON.parse(request.body).keys.indexOf(big.key) >= 0).length, asked);
+});
+
+test("the last key of a listing page that goes on has no size: its versions may go on with the next page, so a big version at the end of a page does not make its key a big one", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  world.advance(HOUR_MS);
+  const older = fx.nodes[0].record("c", [{ t: "grant_revoked", time_ms: world.now }]);
+  world.advance(1000);
+  const newer = fx.nodes[0].record("c", [{ t: "grant_revoked", time_ms: world.now }]);
+  // The first page of the control listing ends with the key of the older entry, shows one big
+  // version under it, and goes on (the other versions of that key lie on the next page).
+  world.fault((line, request) => {
+    if (typeof request.url !== "string") return false;
+    const url = new URL(request.url);
+    return String(url.searchParams.get("prefix")).endsWith("/c/") && url.searchParams.get("key-marker") === null;
+  }, (request) => {
+    const real = world.answer("GET", request, undefined).body;
+    const name = "<Key>" + encodeURIComponent(older.key) + "</Key>";
+    const start = real.lastIndexOf("<Version>", real.indexOf(name));
+    const end = real.indexOf("</Version>", start) + "</Version>".length;
+    const block = real.slice(start, end).replace(/<Size>\d+<\/Size>/, "<Size>100000</Size>");
+    const version = /<VersionId>([^<]+)<\/VersionId>/.exec(block)[1];
+    return {
+      status: 200,
+      body: real.slice(0, start) + block + "<NextKeyMarker>" + encodeURIComponent(older.key) + "</NextKeyMarker>" +
+        "<NextVersionIdMarker>" + version + "</NextVersionIdMarker><IsTruncated>true</IsTruncated></ListVersionsResult>",
+    };
+  }, 1);
+  const asked = [];
+  world.fault("POST /api/secure/log/bodies", (request) => { asked.push(JSON.parse(request.body).keys); return undefined; });
+  world.advance(25 * HOUR_MS);
+  await S.event(fx, "foreground");
+  await world.settle(60000);
+  assert.deepEqual(asked, [[older.key, newer.key]]);
+  assert.equal(world.stored("log.big"), undefined);
+  assert.equal(world.state.log.status, "verified");
+});
+
+test("the lock of the rounds is held while a round waits for a big key at its end: a round the log screen starts meanwhile begins when that round has ended", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  world.advance(HOUR_MS);
+  // A control entry of about 1.4 MB as the store holds it: the round asks for it alone at its
+  // end and waits up to 173 seconds. Its answer takes 150 seconds.
+  const big = fx.nodes[0].record("c", [{ t: "connection_created", time_ms: world.now, record_id: "r", provider: "slack", scope: "s".repeat(800000) }]);
+  world.fault("POST /api/secure/log/bodies", (request) => (JSON.parse(request.body).keys.indexOf(big.key) >= 0 ? { delay_ms: 150000 } : undefined));
+  world.advance(25 * HOUR_MS);
+  const sync = Promise.resolve(fx.program.onEvent("foreground", {}));
+  sync.then(() => {}, () => {});
+  await world.settle(110000);
+  const listings = () => world.sent("POST /api/secure/log/read").length;
+  const before = listings();
+  const rounds = world.reports.length;
+  // The log screen is opened while the round waits: the round it starts waits for the lock.
+  const shown = await S.call(fx, "read_log", { limit: 10 });
+  assert.equal(shown.ok, true);
+  await world.settle(20000);
+  assert.equal(listings(), before);
+  assert.equal(world.reports.length, rounds);
+  // The first round ends with the answer for the big key, and the round of the screen runs.
+  await world.settle(90000);
+  assert.ok(listings() > before);
+  assert.equal(world.state.log.status, "verified");
+  assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
 });
