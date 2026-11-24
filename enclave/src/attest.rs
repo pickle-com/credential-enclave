@@ -151,7 +151,8 @@ pub struct Proofs<'a> {
 ///    the release of that element. `peer/export` passes no element: a node hands nothing to
 ///    an old release.
 /// 3. A measurement that `proofs` show (protocol.md section 9), when the binding of the peer
-///    names the release their statement names.
+///    names the release their statement names, and the measurement is that of no element of
+///    `refused`.
 ///
 /// The measurement of this node is accepted whatever the call carries beside it: release
 /// proofs are not read for a peer of the same program.
@@ -161,6 +162,10 @@ pub struct Accepted<'a> {
     pub measurement: Option<&'a Measurement>,
     /// The old releases whose nodes the call takes.
     pub predecessors: &'a [ReleaseMeasurement],
+    /// The old releases whose measurements release proofs do not make a peer of the call.
+    /// `peer/export` passes the list of old releases of this node: a node hands nothing to
+    /// an old release, whatever proofs a call carries for its measurement.
+    pub refused: &'a [ReleaseMeasurement],
     /// The release proofs the call carries, when it carries any.
     pub proofs: Option<Proofs<'a>>,
 }
@@ -185,6 +190,9 @@ impl Accepted<'_> {
             .any(|earlier| earlier.pcrs == *pcrs && earlier.release == release);
         if listed {
             return Some(other());
+        }
+        if self.refused.iter().any(|old| old.pcrs == *pcrs) {
+            return None;
         }
         let proofs = self.proofs?;
         let stated = verify_release_proofs(proofs.value, pcrs, proofs.trust).ok()?;
@@ -365,6 +373,7 @@ fn forward_node_of(
     let same_program = Accepted {
         measurement,
         predecessors: &[],
+        refused: &[],
         proofs: None,
     };
     let binding = match platform {
@@ -508,6 +517,7 @@ mod tests {
         Accepted {
             measurement,
             predecessors: &[],
+            refused: &[],
             proofs: None,
         }
     }
@@ -518,6 +528,7 @@ mod tests {
         Accepted {
             measurement,
             predecessors: &[],
+            refused: &[],
             proofs: Some(Proofs {
                 value: &case.proofs,
                 trust: &case.trust,
@@ -533,6 +544,7 @@ mod tests {
         Accepted {
             measurement,
             predecessors,
+            refused: &[],
             proofs: None,
         }
     }
@@ -923,6 +935,7 @@ mod tests {
         let by_source = Accepted {
             measurement: Some(&this_node),
             predecessors: &[],
+            refused: &[],
             proofs: Some(Proofs {
                 value: &case.proofs,
                 trust: &source.proofs,
@@ -965,6 +978,7 @@ mod tests {
         let both = Accepted {
             measurement: Some(&this_node),
             predecessors: &listed,
+            refused: &[],
             proofs: Some(Proofs {
                 value: &case.proofs,
                 trust: &case.trust,
@@ -975,6 +989,23 @@ mod tests {
             Some(Program::Release(listed[0].clone()))
         );
         assert_eq!(taken(both, document(case.pcrs, "v9.9.0")), Some(shown));
+        // The old releases a call refuses are no peers under release proofs: `peer/export`
+        // hands nothing to the measurement of an old release, also when proofs hold for it.
+        let refusing = Accepted {
+            measurement: Some(&this_node),
+            predecessors: &[],
+            refused: &listed,
+            proofs: Some(Proofs {
+                value: &case.proofs,
+                trust: &case.trust,
+            }),
+        };
+        assert_eq!(taken(refusing, document(case.pcrs, "v9.9.0")), None);
+        assert_eq!(taken(refusing, document(case.pcrs, "v1.1.0")), None);
+        assert_eq!(
+            taken(refusing, document(this_node.pcrs, "anything")),
+            Some(Program::Same)
+        );
         // A debug-mode measurement is never accepted, whatever the proofs say of it.
         let mut debug = case.pcrs;
         debug[1] = [0; 48];
@@ -1143,6 +1174,7 @@ mod tests {
             let receiving = Accepted {
                 measurement: Some(&this_node),
                 predecessors: &lineage.predecessors,
+                refused: &[],
                 proofs: None,
             };
             assert_eq!(

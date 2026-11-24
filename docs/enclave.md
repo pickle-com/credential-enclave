@@ -1564,6 +1564,13 @@ The rules are those of protocol.md 10.1, 10.3 and 10.4. What this document adds:
 
 - `peer` is the response of `POST /v1/attestation` of that peer, as it is (the nonce is a value
   that the caller chose, and the node does not look at it).
+- A call that carries `release_proofs` takes 2,063,360 bytes of the body budget beside the share
+  of its request before it reads the proofs, and holds them to its end (section 8): the three
+  JSON texts of the proofs stand inside strings of the request, and what their parsed forms hold
+  is under this share. The call waits for it for the time a call with a JSON body waits for its
+  shares and ends with `capacity_unavailable` without it, having verified nothing and created no
+  entry. export refuses a peer whose measurement is that of an element of the list of old
+  releases before it reads the proofs (protocol.md 10.3).
 - `limit` of export is 1 to 1,000 (a larger value is read as 1,000). `after` is the `next` of the
   page before (the empty string for the first page). When a page has no grant to hand over,
   `envelope` is null and `logs` is an empty list. An empty `next` ends the listing.
@@ -2218,6 +2225,7 @@ The limits, as the source states them:
 | Room of the parsed response of a token address, by the same count (`TOKEN_RESPONSE_ROOM_BYTES`) | 1,572,864 bytes: a quarter more than the longest response, and the room of a token object |
 | Longest string a node keeps of the response of a token address beside its tokens, longest name of a member it keeps, and largest `max` of a public field (`TOKEN_RESPONSE_STRING_BYTES`, `PUBLIC_STRING_BYTES`, 6.3 and 6.4) | 8,192 bytes |
 | Share of the body budget of a `refresh` call for its plaintext and the token response, before its record is open and after (`REFRESH_SHARE_BYTES`, `refresh_share`); of an `oauth/complete` call (`TOKEN_RESPONSE_SHARE_BYTES`) | 1,310,720 bytes, the room of its parsed plaintext and 1,048,576 bytes; 1,048,576 bytes |
+| Share of the body budget of a `peer/export` or `peer/import` call that carries `release_proofs`, beside the share of its request, from before the proofs are read to the end of the call (`RELEASE_PROOFS_ROOM_BYTES`); most arrays, objects and commas of one JSON text inside a string of the proofs (`RELEASE_TEXT_MARKS`, protocol.md 9.4) | 2,063,360 bytes: the three texts of the proofs (the statement of at most 16,384 bytes, and the payload and the body, each of at most 49,152 bytes) with a quarter more and three times their bytes for the parser, and for each text 1,024 times 512 bytes and 1,024 bytes; 1,024 |
 | Concurrent `forward` and `forward/batch` calls | 512 |
 | Wait of a `forward`, `forward/batch` or `vault/send` call for its place and for the shares of the body budget it takes before anything of it is recorded or sent: the share of its request frame, of its request and of what it holds of its credential (`ADMISSION_WAIT`) | 30 seconds |
 | Wait of a call with a JSON body for the shares it takes before anything of it is recorded or sent: the share of the body it reads and of its request (of the body budget, or of the command budget for `attestation` and `messages`), and for `refresh` and `oauth/complete` the share of what the call holds of a token response (`REQUEST_WAIT`) | 2 seconds |

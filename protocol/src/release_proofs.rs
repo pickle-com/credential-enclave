@@ -39,7 +39,7 @@ use crate::certificate::Certificate;
 use crate::encoding::b64u_decode;
 use crate::limits;
 use crate::release::{
-    audit_root, hex, hex_bytes, is_sound_json, leaf_hash, pem_der, read_json, read_statement,
+    audit_root, hex, hex_bytes, is_sound_json, leaf_hash, pem_der, read_proof_text, read_statement,
     ReleaseStatement, TransparencyLog,
 };
 
@@ -416,39 +416,22 @@ fn bytes(value: Option<&Value>, key: &str) -> Option<Vec<u8>> {
     STANDARD.decode(text(value, key)?).ok()
 }
 
-/// A count of an attestation: a non-negative integer of at most 2^53 - 1, as a JSON number
-/// or as a text of decimal digits without a leading zero (a lone `0` is one). The bundle of
-/// an attestation writes its times and indexes as such texts.
+/// A count of an attestation: a text of decimal digits without a leading zero (a lone `0` is
+/// one) that names an integer of at most 2^53 - 1. The bundle of an attestation writes its
+/// times and indexes as such texts.
 ///
-/// A JSON number counts by its value: `5.0` and `5e0` are 5, as for every reader that holds a
-/// JSON number as a double. The zero with a sign, a fraction and a negative number are no
-/// count.
+/// A JSON number is no count. The readers of a release proof do not read every text of a
+/// number as the same double, and a count decides what the log signed.
 fn count(value: Option<&Value>) -> Option<u64> {
-    let number = match value? {
-        Value::String(text) => {
-            let digits = text.as_bytes();
-            let plain = (1..=16).contains(&digits.len())
-                && digits.iter().all(u8::is_ascii_digit)
-                && (digits.len() == 1 || digits.first() != Some(&b'0'));
-            if !plain {
-                return None;
-            }
-            text.parse::<u64>().ok()?
-        }
-        Value::Number(number) => match (number.as_u64(), number.as_f64()) {
-            (Some(count), _) => count,
-            (None, Some(float))
-                if float >= 0.0
-                    && !float.is_sign_negative()
-                    && float.fract() == 0.0
-                    && float <= LARGEST_COUNT as f64 =>
-            {
-                float as u64
-            }
-            _ => return None,
-        },
-        _ => return None,
-    };
+    let text = value?.as_str()?;
+    let digits = text.as_bytes();
+    let plain = (1..=16).contains(&digits.len())
+        && digits.iter().all(u8::is_ascii_digit)
+        && (digits.len() == 1 || digits.first() != Some(&b'0'));
+    if !plain {
+        return None;
+    }
+    let number = text.parse::<u64>().ok()?;
     (number <= LARGEST_COUNT).then_some(number)
 }
 
@@ -676,7 +659,7 @@ fn attested_statement(
     let payload = STANDARD
         .decode(payload_text)
         .map_err(|_| ProofError::Payload)?;
-    let in_toto = read_json(&payload)
+    let in_toto = read_proof_text(&payload)
         .filter(Value::is_object)
         .ok_or(ProofError::Payload)?;
     if payload_type != PAYLOAD_TYPE {
@@ -724,7 +707,7 @@ fn attested_statement(
     let body = STANDARD
         .decode(body_text)
         .map_err(|_| ProofError::LogEntry)?;
-    let record = read_json(&body).ok_or(ProofError::LogEntry)?;
+    let record = read_proof_text(&body).ok_or(ProofError::LogEntry)?;
     let record = Some(&record);
     if text(record, "kind") != Some("dsse") || text(record, "apiVersion") != Some("0.0.1") {
         return Err(ProofError::LogEntry);
@@ -869,27 +852,27 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn a_count_is_a_non_negative_integer_below_2_to_the_53_as_a_number_or_as_digits() {
+    fn a_count_is_a_text_of_digits_that_names_an_integer_below_2_to_the_53() {
         let read = |text: &str| count(Some(&serde_json::from_str::<Value>(text).unwrap()));
         for (text, value) in [
-            ("0", 0),
-            ("7", 7),
-            ("4083792535", 4_083_792_535),
-            ("9007199254740991", LARGEST_COUNT),
             ("\"0\"", 0),
             ("\"7\"", 7),
             ("\"4083792535\"", 4_083_792_535),
             ("\"9007199254740991\"", LARGEST_COUNT),
-            // A number counts by its value.
-            ("5.0", 5),
-            ("5e0", 5),
-            ("0.5e1", 5),
-            ("0.0", 0),
-            ("1e3", 1000),
         ] {
             assert_eq!(read(text), Some(value), "{text}");
         }
         for text in [
+            // A JSON number is no count, whatever its value.
+            "0",
+            "7",
+            "4083792535",
+            "9007199254740991",
+            "5.0",
+            "5e0",
+            "0.5e1",
+            "0.0",
+            "1e3",
             "-1",
             "-0",
             "-0.0",

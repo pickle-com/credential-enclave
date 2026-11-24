@@ -741,6 +741,15 @@ PUBLISHED_V230_BUILDER = {
 }
 
 
+# The published release candidate v2.4.0-rc.1 was attested by the job of the build workflow at
+# the commit of that file a node and a secure program no longer list: the node program of
+# that tag hands delegations on by a signature of the operator.
+PUBLISHED_RC1_BUILDER = {
+    "workflow": ".github/workflows/enclave-build.yml",
+    "commit": "3f84e8368fcdf1f89e42ca629670bfe0989b6f13",
+}
+
+
 def trusts() -> dict:
     sigstore_root = pem_file(RELEASE_VALUES / "fulcio-root.pem", "CERTIFICATE")
     sigstore_intermediate = pem_file(RELEASE_VALUES / "fulcio-intermediate.pem", "CERTIFICATE")
@@ -761,6 +770,16 @@ def trusts() -> dict:
             "repository_id": REPOSITORY_ID,
             "owner_id": OWNER_ID,
             "builders": [PUBLISHED_V230_BUILDER],
+        },
+        "sigstore-build-workflow-v2.4.0-rc.1": {
+            "fulcio_root": b64u(sigstore_root),
+            "fulcio_intermediate": b64u(sigstore_intermediate),
+            "log_keys": [b64u(rekor)],
+            "issuer": ISSUER,
+            "repository": REPOSITORY,
+            "repository_id": REPOSITORY_ID,
+            "owner_id": OWNER_ID,
+            "builders": [PUBLISHED_RC1_BUILDER],
         },
     }
 
@@ -963,7 +982,9 @@ def cases_that_hold():
     )
 
     # The times and the indexes as JSON numbers, and as numbers that are written with a
-    # fraction or an exponent and are integers.
+    # fraction or an exponent and are integers: a count is a text of digits, and a JSON number
+    # is none. The readers of a release proof do not read every text of a number as the same
+    # double.
     def numbers(bundle):
         entry = entry_of(bundle)
         for holder, key in [
@@ -974,7 +995,7 @@ def cases_that_hold():
         ]:
             holder[key] = int(holder[key])
 
-    add("times and indexes that are JSON numbers", None, proofs_of("numbers", bundle=numbers))
+    add("times and indexes that are JSON numbers", "V4", proofs_of("numbers", bundle=numbers))
     whole = proofs_of("whole numbers")
     written = compact(whole)
     for name, old, new in [
@@ -983,7 +1004,7 @@ def cases_that_hold():
         ("an index of the tree written with a fraction that is zero", '"inclusionProof":{"logIndex":"5"', '"inclusionProof":{"logIndex":5.0'),
     ]:
         assert written.count(old) == 1, old
-        add(name, None, whole, text=written.replace(old, new))
+        add(name, "V4", whole, text=written.replace(old, new))
     # An object that states a member twice states the last one.
     old = f'"payloadType":"{PAYLOAD_TYPE}"'
     assert written.count(old) == 1
@@ -1887,7 +1908,7 @@ def cases_of_the_log():
     old = '"inclusionProof":{"logIndex":"0"'
     assert written.count(old) == 1
     add("an index that is the zero with a sign", "V4", lone, text=written.replace(old, '"inclusionProof":{"logIndex":-0'))
-    add("an index that is the number zero", None, lone, text=written.replace(old, '"inclusionProof":{"logIndex":0'))
+    add("an index that is the number zero", "V4", lone, text=written.replace(old, '"inclusionProof":{"logIndex":0'))
 
     def checkpoint_of(change):
         def edit(entry):
@@ -1998,10 +2019,26 @@ def cases_of_published_releases():
             change(value["attestation"])
         return value
 
+    # The cases of this release candidate are verified with the certificates of Sigstore, the
+    # key of Rekor and the build workflow at the commit that attested it.
     def source(name, rule, value, **more):
-        add("release v2.4.0-rc.1: " + name, rule, value, trust="source", measurement=more.pop("measurement", measurement), **more)
+        add(
+            "release v2.4.0-rc.1: " + name,
+            rule,
+            value,
+            trust="sigstore-build-workflow-v2.4.0-rc.1",
+            measurement=more.pop("measurement", measurement),
+            **more,
+        )
 
-    source("the published proofs", None, proofs())
+    source("the published proofs, for a trust that names the build workflow at the commit that attested them", None, proofs())
+    add(
+        "release v2.4.0-rc.1: the published proofs, which the build workflow at an earlier commit attested",
+        "V6",
+        proofs(),
+        trust="source",
+        measurement=measurement,
+    )
     add(
         "release v2.4.0-rc.1: the published proofs, for a trust that names another build workflow",
         "V6",

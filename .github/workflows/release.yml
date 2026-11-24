@@ -63,7 +63,7 @@ jobs:
       contents: read
       id-token: write
       attestations: write
-    uses: pickle-com/credential-enclave/.github/workflows/enclave-build.yml@3f84e8368fcdf1f89e42ca629670bfe0989b6f13
+    uses: pickle-com/credential-enclave/.github/workflows/enclave-build.yml@e522d06d8388bee590678963f8940cd7a2b69f5c
 
   rebuild:
     runs-on: ubuntu-24.04

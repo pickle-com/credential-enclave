@@ -1405,7 +1405,7 @@ the same files.
 | The intermediate certificate | The certificate of that authority that the root certificate issued and that issues the certificates of workflow runs (`enclave/release/fulcio-intermediate.pem`). The SHA-256 of its DER is `15d795348226b4649f750f5802592c393bee7cc53c3b86982175b7ad087efe47` |
 | The key of the transparency log | The public key of `rekor.sigstore.dev`, a log of the form Rekor v1: ECDSA P-256, as the DER of its SubjectPublicKeyInfo (91 bytes; `enclave/release/rekor-key.pem`). The log identifier is the SHA-256 of that DER: `c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d` in lower-case hexadecimal |
 | The repository | The address `https://github.com/pickle-com/credential-enclave`, the identifier of the repository (`1400118248`) and the identifier of its owner (`151645824`), as GitHub numbers them. GitHub does not change these identifiers and does not give them to another repository or owner |
-| The list of build workflows | `[{"workflow":"<the path of a workflow file in the repository>","commit":"<40 lower-case hexadecimal characters>"}]` (`enclave/release/builders.json`): the workflow files whose job a verifier takes the attestation of, each at one commit of that file. The list of this release has one element: `.github/workflows/enclave-build.yml` at the commit `3f84e8368fcdf1f89e42ca629670bfe0989b6f13` |
+| The list of build workflows | `[{"workflow":"<the path of a workflow file in the repository>","commit":"<40 lower-case hexadecimal characters>"}]` (`enclave/release/builders.json`): the workflow files whose job a verifier takes the attestation of, each at one commit of that file. The list of this release has one element: `.github/workflows/enclave-build.yml` at the commit `e522d06d8388bee590678963f8940cd7a2b69f5c` |
 
 - The two certificates and the key of the log are those that the trusted root of the public
   instance of Sigstore names (`targets/trusted_root.json` of the repository
@@ -1425,6 +1425,13 @@ the same files.
   that a build workflow outside that list built, a certificate of another certificate authority
   and an entry of another log have no proof this verifier takes: for a node, the nodes of such a
   release receive no delegation from it and are delegated to by the apps (10.1).
+- Every release the job of a listed build workflow attested is a release a verifier takes, so
+  the list names a commit of the build workflow file only when every tag that job attested
+  carries a node program that accepts another release by its proof alone. The release candidate
+  `v2.4.0-rc.1` was attested by the job of `.github/workflows/enclave-build.yml` at the commit
+  `3f84e8368fcdf1f89e42ca629670bfe0989b6f13`, and its node program hands delegations on under a
+  signature of the operator. The list does not name that commit: no node and no secure program
+  of this release takes the proof of that release candidate.
 
 ### 9.4 The checks
 
@@ -1525,10 +1532,17 @@ The forms. Every value is read in one form, and a value in another form is refus
   ones, no half of a surrogate pair and at most 32 arrays and objects inside one another. Of two
   members of one object with the same name the last one counts, except for the five members of a
   release statement, each of which occurs once (V1).
-- A count is a non-negative integer of at most 2^53 − 1. It is written as a string of 1 to 16
-  decimal digits without a leading zero (a lone `0` is a count), which is how a bundle writes its
-  times and indexes, or as a JSON number of that value: a number written with a fraction or an
-  exponent counts by its value, and a zero with a minus sign is no count.
+- A count is a non-negative integer of at most 2^53 − 1, written as a string of 1 to 16 decimal
+  digits without a leading zero (a lone `0` is a count), which is how a bundle writes its times
+  and indexes. A JSON number is no count: the readers of JSON do not read every text of a number
+  as the same double, and a count decides what the log signed.
+- A JSON text inside a string. The release statement, the payload of the envelope and the body of
+  the log entry are JSON texts that stand inside strings of the proofs. A node reads such a text
+  only when it has at most 1,024 arrays, objects and commas outside its strings, counted
+  together: what a parsed text holds in memory grows with these and not with its length, and no
+  signature covers the text at the moment it is read. A text with more of them is refused by the
+  check that reads it (V1, V2, V4). The three texts of a release the build workflow attested
+  have 24, 32 and 13.
 - The length of `attestation` (V2) is the number of bytes of the value written as JSON without
   white space: a string with the two-character escapes of `"`, `\`, backspace, form feed, line
   feed, carriage return and tab, the six-character escape of every other character below U+0020
@@ -1592,6 +1606,16 @@ The forms. Every value is read in one form, and a value in another form is refus
 - Where a value could be read in more than one way, it is refused. Proofs that hold and are
   refused keep the nodes of a release from receiving delegations from other nodes. Proofs that do
   not hold and are accepted hand user keys to an enclave whose source nobody can read.
+- The node program refuses some proofs that the secure program of the apps takes, and none the
+  other way round. Its reader of JSON refuses a whole text that holds, anywhere in it, a number
+  outside the range of a double, an escape of half of a surrogate pair, or more than 128 arrays
+  and objects inside one another: also where a later member of the same name hides that value
+  from a reader that keeps the last member. It refuses a JSON text inside a string of the proofs
+  that has more than 1,024 arrays, objects and commas (9.4, "The forms"). And it verifies the
+  path of the certificate a second time with a library that refuses forms the certificate
+  authority of Sigstore does not issue: a signature of a certificate with SHA-512, a critical
+  extension it does not know, a version other than 3, a unique identifier, and two sets of
+  extensions. The proofs the build workflow makes have none of these.
 
 ## 10. Delegation transfer between nodes and witnessing
 
@@ -1754,8 +1778,10 @@ node is accepted in one of two cases:
 | A measurement with a public build proof | `release_proofs` passes every check of 9.4 for PCR0, PCR1 and PCR2 of the document of the receiving node, and the `release` of the binding of the receiving node equals the `release` of the release statement of the proofs | `grant_transferred_out`, which the log store confirms before the grant is handed over |
 
 A giving node hands nothing to a node of any other measurement: not to a node of an old release
-of its list, and not under a signature of the operator. It does not read the key `endorsement`,
-which the releases before v2.4.0 read.
+of its list, and not under a signature of the operator. A measurement of the list of old releases
+is refused before `release_proofs` is read: proofs that hold for such a measurement do not make
+its node a receiving node. A giving node does not read the key `endorsement`, which the releases
+before v2.4.0 read.
 
 The rule of the receiving node (`peer/import`). In step 1 of the receiving node of 10.1 the
 measurement of the giving node is accepted in one of three cases:

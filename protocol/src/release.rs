@@ -208,6 +208,44 @@ pub(crate) fn read_json(bytes: &[u8]) -> Option<serde_json::Value> {
         .filter(is_sound_json)
 }
 
+/// The arrays, objects and commas of a text, counted together outside its strings: what
+/// decides the room its parsed value takes. A string begins and ends with a quotation mark,
+/// and inside a string a backslash takes the byte behind it with it.
+fn marks_of(text: &[u8]) -> usize {
+    let mut marks = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for byte in text {
+        if in_string {
+            match (escaped, byte) {
+                (true, _) => escaped = false,
+                (false, b'\\') => escaped = true,
+                (false, b'"') => in_string = false,
+                (false, _) => {}
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' | b'{' | b',' => marks = marks.saturating_add(1),
+            _ => {}
+        }
+    }
+    marks
+}
+
+/// Reads a JSON text that release proofs carry inside a string (the release statement, the
+/// payload of the envelope, the body of the log entry): [`read_json`], for a text of at most
+/// [`limits::RELEASE_TEXT_MARKS`] arrays, objects and commas. A text with more of them is not
+/// parsed: no signature covers it at the moment it is read, and what its parsed value would
+/// hold is not bounded by its length.
+pub(crate) fn read_proof_text(bytes: &[u8]) -> Option<serde_json::Value> {
+    if marks_of(bytes) > limits::RELEASE_TEXT_MARKS {
+        return None;
+    }
+    read_json(bytes)
+}
+
 /// Reads a release statement (protocol.md section 9): the bytes of the file
 /// `measurements.json` of a release.
 ///
@@ -220,7 +258,7 @@ pub fn read_statement(statement: &[u8]) -> Option<ReleaseStatement> {
     if statement.len() > limits::RELEASE_STATEMENT_BYTES {
         return None;
     }
-    if !read_json(statement)?.is_object() {
+    if !read_proof_text(statement)?.is_object() {
         return None;
     }
     let Fields::<StatementKeys>(fields, _) = serde_json::from_slice(statement).ok()?;
@@ -503,6 +541,38 @@ mod tests {
         "a1952bc63a9e80a3a46eda48bb60236dfcb030d50bf81f02b5c50d20d42a905d1db7c82d3f1d4c4d5649b20697889d44",
     ];
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn a_text_of_release_proofs_is_read_within_its_marks() {
+        // The marks are the arrays, the objects and the commas outside the strings.
+        assert_eq!(marks_of(b""), 0);
+        assert_eq!(marks_of(br#"{"a":1,"b":[true,null],"c":{}}"#), 6);
+        assert_eq!(marks_of(br#"["a,b","[","{"]"#), 3);
+        assert_eq!(marks_of(br#"["a\",[",1]"#), 2);
+        assert_eq!(marks_of(br#"["a\\",[1],2]"#), 4);
+        // One array of 1,024 elements has 1,024 marks: the array and 1,023 commas.
+        let of = |elements: usize| format!("[{}]", vec!["0"; elements].join(","));
+        assert_eq!(limits::RELEASE_TEXT_MARKS, 1_024);
+        assert_eq!(marks_of(of(1_024).as_bytes()), 1_024);
+        assert!(read_proof_text(of(1_024).as_bytes()).is_some());
+        assert!(read_json(of(1_025).as_bytes()).is_some());
+        assert!(read_proof_text(of(1_025).as_bytes()).is_none());
+        // The marks inside a string are bytes of that string.
+        let long = format!("[\"{}\"]", ",".repeat(4_000));
+        assert!(read_proof_text(long.as_bytes()).is_some());
+        // A statement with more marks is no release statement.
+        let statement = |inputs: usize| {
+            format!(
+                "{{\"release\":\"v1.0.0\",\"git_commit\":\"{COMMIT}\",\"pcr0\":\"{}\",\"pcr1\":\"{}\",\"pcr2\":\"{}\",\"inputs\":{}}}",
+                PCRS[0],
+                PCRS[1],
+                PCRS[2],
+                of(inputs)
+            )
+        };
+        assert!(read_statement(statement(1_018).as_bytes()).is_some());
+        assert!(read_statement(statement(1_019).as_bytes()).is_none());
+    }
 
     /// An ECDSA P-256 key of a test, in the place of the key of a log.
     struct TestKey {

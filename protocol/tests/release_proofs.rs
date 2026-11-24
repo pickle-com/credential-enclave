@@ -143,10 +143,12 @@ fn the_verdict_on_every_case_is_the_verdict_of_the_file() {
 }
 
 #[test]
-fn the_published_proofs_of_a_release_hold_with_the_values_of_this_source() {
+fn the_published_proofs_of_a_release_candidate_hold_for_the_build_workflow_that_attested_them() {
     // The release statement and the bundle of the attestation of release v2.4.0-rc.1, as its
-    // GitHub release holds them: the job of the build workflow of this repository made the
-    // attestation, at the commit the list of build workflows of this source names.
+    // GitHub release holds them. The job of the build workflow made the attestation at an
+    // earlier commit of that file, and the node program of that tag hands delegations on by a
+    // signature of the operator. The list of build workflows of this source does not name
+    // that commit: the proofs hold for a trust that names it, and not for this source.
     let statement = include_bytes!("../vectors/published/v2.4.0-rc.1/measurements.json");
     let bundle: Value = serde_json::from_str(include_str!(
         "../vectors/published/v2.4.0-rc.1/release-statement.sigstore.json"
@@ -158,7 +160,10 @@ fn the_published_proofs_of_a_release_hold_with_the_values_of_this_source() {
         "statement": credential_enclave_protocol::encoding::b64u(statement),
         "attestation": bundle,
     });
-    let release = verify_release_proofs(&proofs, &measurement, &source()).unwrap();
+    let vectors: Value =
+        serde_json::from_str(include_str!("../vectors/release-proofs.json")).unwrap();
+    let attested_by = trust_of(&vectors["trusts"]["sigstore-build-workflow-v2.4.0-rc.1"]).unwrap();
+    let release = verify_release_proofs(&proofs, &measurement, &attested_by).unwrap();
     assert_eq!(release.release, "v2.4.0-rc.1");
     assert_eq!(
         release.git_commit,
@@ -166,4 +171,7 @@ fn the_published_proofs_of_a_release_hold_with_the_values_of_this_source() {
     );
     assert_eq!(release.pcrs, measurement);
     assert_eq!(release.measurement().pcrs, measurement);
+
+    let refused = verify_release_proofs(&proofs, &measurement, &source()).unwrap_err();
+    assert_eq!(refused.check(), 6, "{refused}");
 }

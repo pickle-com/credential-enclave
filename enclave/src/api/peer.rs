@@ -45,9 +45,10 @@ use credential_enclave_protocol::secret::Secret;
 use credential_enclave_protocol::{limits, ProtocolError};
 
 use super::responses::{AccountLogRef, Exported, Imported};
-use super::{json_ok, limit_of, respond, subset_of, ApiError, JsonBody};
+use super::{json_ok, limit_of, respond, subset_of, Admission, ApiError, JsonBody};
 use crate::attest::{verify_peer, Accepted, Peer, Program, Proofs};
 use crate::log_store;
+use crate::room::RELEASE_PROOFS_ROOM_BYTES;
 use crate::state::{
     events, lock, Account, AccountLock, ActiveGrant, EventPlace, GrantState, Handover, Node,
 };
@@ -57,6 +58,26 @@ use credential_enclave_protocol::subset::Subset;
 /// so its place always names an entry.
 fn seq_of(place: &EventPlace) -> Result<u64, ApiError> {
     place.seq().ok_or_else(ApiError::internal)
+}
+
+/// The share of the body budget a call holds while it verifies the release proofs it carries
+/// ([`crate::room::RELEASE_PROOFS_ROOM_BYTES`]), from before the proofs are read to the end of
+/// the call. The share of the request (`Marks::request_share`) counts the marks of the body
+/// of the call, and the three JSON texts of release proofs stand inside strings of that body:
+/// what their parsed values hold is under this share. A call without release proofs holds
+/// none. The call waits for the share within the time of an admission and ends with
+/// `capacity_unavailable` without it: it has verified nothing and created no entry.
+async fn proofs_room(
+    node: &Node,
+    body: &JsonBody,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, ApiError> {
+    if body.get("release_proofs").is_none() {
+        return Ok(None);
+    }
+    let room = Admission::of_request()
+        .budget(node, RELEASE_PROOFS_ROOM_BYTES)
+        .await?;
+    Ok(Some(room))
 }
 
 /// Steps 1 to 3b of protocol.md 10.1: the attestation response of the peer verifies, the peer
@@ -72,12 +93,14 @@ fn verified_peer(
     node: &Node,
     body: &JsonBody,
     predecessors: &[ReleaseMeasurement],
+    refused: &[ReleaseMeasurement],
 ) -> Result<Peer, ApiError> {
     let response = body.object("peer")?;
     let own = node.platform.measurement();
     let accepted = Accepted {
         measurement: own.as_ref(),
         predecessors,
+        refused,
         proofs: body.get("release_proofs").map(|value| Proofs {
             value,
             trust: &node.lineage.proofs,
@@ -136,8 +159,11 @@ async fn run_export(node: &Node, request: Request) -> Result<Response, ApiError>
     let limit = limit_of(&body, limits::TRANSFER_GRANTS)?;
     let subset = subset_of(&body)?;
 
-    // 1 to 3b: a node hands nothing to an old release.
-    let peer = verified_peer(node, &body, &[])?;
+    // The parsed texts of the release proofs of the call are held under a share of their own.
+    let _proofs_room = proofs_room(node, &body).await?;
+    // 1 to 3b: a node hands nothing to an old release, whatever proofs the call carries for
+    // the measurement of one.
+    let peer = verified_peer(node, &body, &[], &node.lineage.predecessors)?;
     Ok(json_ok(
         &export_to(node, &peer, after, limit, subset.as_ref()).await?,
     ))
@@ -382,8 +408,9 @@ async fn run_import(node: &Node, request: Request) -> Result<Response, ApiError>
     let subset = subset_of(&body)?;
     node.ensure_open()?;
 
+    let _proofs_room = proofs_room(node, &body).await?;
     // 1
-    let peer = verified_peer(node, &body, &node.lineage.predecessors)?;
+    let peer = verified_peer(node, &body, &node.lineage.predecessors, &[])?;
     Ok(json_ok(
         &import_from(node, &peer, envelope, subset.as_ref()).await?,
     ))

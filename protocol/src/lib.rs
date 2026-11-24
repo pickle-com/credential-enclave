@@ -199,6 +199,13 @@ pub mod limits {
     /// Longest attestation of release proofs, in bytes of its JSON without white space
     /// (section 9).
     pub const RELEASE_ATTESTATION_BYTES: usize = 65_536;
+    /// Most arrays, objects and commas, counted together outside its strings, of a JSON text
+    /// that release proofs carry inside a string: the release statement, the payload of the
+    /// envelope and the body of the log entry (section 9). What a parsed text holds grows
+    /// with these marks and not with its length, so a node parses such a text into a value
+    /// only within this bound. The three texts of a release the build workflow attested have
+    /// 24, 32 and 13 of them.
+    pub const RELEASE_TEXT_MARKS: usize = 1_024;
     /// Most hashes in the audit path of the inclusion proof of an entry of a transparency log
     /// (section 9): 64, the height of a tree whose number of leaves fits 64 bits.
     pub const RELEASE_PROOF_HASHES: usize = 64;

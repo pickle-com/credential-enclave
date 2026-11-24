@@ -146,9 +146,25 @@ mod tests {
         })
     }
 
+    /// The values of the node program with, in the place of its list of build workflows, the
+    /// build workflow at the commit whose job attested release v2.4.0-rc.1. The node program of
+    /// that tag hands delegations on by a signature of the operator, and the list of this
+    /// source does not name that commit.
+    fn attested_by() -> ProofTrust {
+        ProofTrust::read(
+            FULCIO_ROOT_PEM,
+            FULCIO_INTERMEDIATE_PEM,
+            &[LOG_KEY_PEM],
+            Repository::of_this_source(),
+            br#"[{"workflow":".github/workflows/enclave-build.yml","commit":"3f84e8368fcdf1f89e42ca629670bfe0989b6f13"}]"#,
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn the_published_proofs_of_a_release_hold_with_the_values_of_the_node_program() {
-        let trust = source_trust().unwrap();
+    fn the_published_proofs_of_a_release_candidate_hold_for_the_build_workflow_that_attested_them()
+    {
+        let trust = attested_by();
         let end = judge(&published(), None, &trust);
         assert_eq!(
             (end.status, end.output.as_str(), end.error.as_str()),
@@ -172,11 +188,22 @@ mod tests {
         assert!(end
             .output
             .ends_with("the measurement of measurements.json: ok\n"));
+        // With the values of the node program the proofs fail: its list of build workflows
+        // names another commit of the build workflow file.
+        let end = judge(&published(), None, &source_trust().unwrap());
+        assert_eq!(
+            (end.status, end.output.as_str(), end.error.as_str()),
+            (
+                EXIT_FAILED,
+                "release proofs: failed: V6: the certificate does not state the value asked for in its extension 1.3.6.1.4.1.57264.1.10\n",
+                ""
+            )
+        );
     }
 
     #[test]
     fn proofs_that_do_not_hold_fail_with_the_check_they_break() {
-        let trust = source_trust().unwrap();
+        let trust = attested_by();
         let failed = |proofs: &Value, expected: Option<&Measurements>| {
             let end = judge(proofs, expected, &trust);
             assert_eq!((end.status, end.error.as_str()), (EXIT_FAILED, ""));

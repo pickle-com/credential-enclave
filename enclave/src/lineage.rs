@@ -188,7 +188,7 @@ mod tests {
             builders,
             [(
                 ".github/workflows/enclave-build.yml",
-                "3f84e8368fcdf1f89e42ca629670bfe0989b6f13"
+                "e522d06d8388bee590678963f8940cd7a2b69f5c"
             )]
         );
     }

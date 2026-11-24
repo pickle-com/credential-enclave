@@ -33,6 +33,8 @@
 //! tests below compare the bound with what the parsed values state of their own room, and
 //! the bound was compared with the allocations of the parser outside this repository.
 
+use credential_enclave_protocol::limits;
+
 /// The room an array or an object takes beside the room of its elements after the first: the
 /// buffer of its first elements, the index of an object, and the first key.
 pub const CONTAINER_BYTES: usize = 512;
@@ -52,6 +54,25 @@ const REQUEST_TEXT_COPIES: usize = 10;
 /// How often a call holds the room of the structure of its request, at the most
 /// ([`Marks::request_share`]).
 const REQUEST_STRUCTURE_COPIES: usize = 4;
+
+/// The share of the body budget a call holds, beside the share of its request, while it
+/// verifies release proofs (protocol.md section 9): a bound of what the three JSON texts of
+/// the proofs hold once they are parsed, and of the buffer of the parser while each is read.
+///
+/// The texts stand inside strings of the request (the release statement, the payload of the
+/// envelope and the body of the log entry), so the marks of the request do not count theirs.
+/// The statement is at most `limits::RELEASE_STATEMENT_BYTES` long, and the payload and the
+/// body are base64 texts inside an attestation of at most
+/// `limits::RELEASE_ATTESTATION_BYTES`. Each is parsed only with at most
+/// `limits::RELEASE_TEXT_MARKS` arrays, objects and commas, and each of those takes at most
+/// [`CONTAINER_BYTES`]. Beside the room of the parsed values ([`Marks::value_room`]) the
+/// parser holds up to three times the bytes of a text while it reads it.
+pub const RELEASE_PROOFS_ROOM_BYTES: usize = {
+    let text_bytes =
+        limits::RELEASE_STATEMENT_BYTES + 2 * (limits::RELEASE_ATTESTATION_BYTES / 4 * 3);
+    let structure = 3 * (limits::RELEASE_TEXT_MARKS * CONTAINER_BYTES + BASE_BYTES);
+    text_bytes + text_bytes / 4 + 3 * text_bytes + structure
+};
 
 /// What decides the room of a JSON text in memory: its length, its arrays and objects, and
 /// its commas.
@@ -188,6 +209,32 @@ mod tests {
         // Bytes that are no JSON text: the marks are counted all the same.
         assert_eq!(marks("[[[,,"), (3, 2));
         assert_eq!(marks("]},"), (0, 1));
+    }
+
+    #[test]
+    fn the_room_of_release_proofs_bounds_the_three_parsed_texts_and_the_parser() {
+        assert_eq!(RELEASE_PROOFS_ROOM_BYTES, 2_063_360);
+        // The three texts at their longest, each with the most marks a node parses, all of
+        // them of the kind that takes the most room: the parsed values, and three times the
+        // bytes of the texts for the buffer of the parser.
+        let texts = [
+            limits::RELEASE_STATEMENT_BYTES,
+            limits::RELEASE_ATTESTATION_BYTES / 4 * 3,
+            limits::RELEASE_ATTESTATION_BYTES / 4 * 3,
+        ];
+        let parsed: usize = texts
+            .iter()
+            .map(|bytes| {
+                Marks {
+                    bytes: *bytes,
+                    containers: limits::RELEASE_TEXT_MARKS,
+                    commas: 0,
+                }
+                .value_room()
+            })
+            .sum();
+        let parser: usize = texts.iter().map(|bytes| 3 * bytes).sum();
+        assert_eq!(parsed + parser, RELEASE_PROOFS_ROOM_BYTES);
     }
 
     #[test]
