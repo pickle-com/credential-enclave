@@ -1339,7 +1339,7 @@ Test vectors of the assignment; the backend of the operator computes the same fu
 | `WAIT_LATE_MS` (the app) | 5,000: a wait that ends later than its own limit by more than this ended in a runtime that did not run for a part of it (the app was suspended), and a read of the log that fails that way failed with the device |
 | `LOG_RELEASE_GRACE_MS`, `SERVED_FRESH_MS` (the app) | 24 hours: the time a measurement no list of the program has may hold the key of the account before it marks the log (A1). 1 hour: the age up to which a reading of the served version, or in a build that knows it itself the last check of the app for a new program, says that no later program is served |
 | `LOG_DOUBT_ROUNDS` (the app) | 2: the rounds whose answers carried no signature that verifies for a key before the signatures of its node contradict each other (A2) |
-| `PROOF_BUILD_WORKFLOW`, `PROOF_BUILD_COMMIT`, `PROOF_RELEASE_WORKFLOW` (the app) | The path of the workflow file whose job builds a release and attests its release statement, the commit of that file, and the path of the workflow file that the push of a release tag starts and that calls it: the job the program takes an attestation of, and the workflow that started its run ("The release proofs", P4). A commit of forty zeros is the commit of no file: a program that holds it takes no release proofs |
+| `PROOF_BUILD_WORKFLOW`, `PROOF_BUILD_COMMIT`, `PROOF_RELEASE_WORKFLOW` (the app) | `.github/workflows/release-statement-build.yml`, `3e86688616915309ee409e2cdfae5261aa46fb99` and `.github/workflows/enclave-release.yml`: the path of the workflow file whose job builds a release and attests its release statement, the commit of that file, and the path of the workflow file that the push of a release tag starts and that calls it. They name the job the program takes an attestation of, and the workflow that started its run ("The release proofs", P4) |
 | `PROOF_STATEMENT_BYTES`, `PROOF_ATTESTATION_BYTES`, `PROOF_PATH_HASHES`, `PROOF_DEPLOY_SIGNATURES`, `PROOF_JSON_DEPTH` (the app) | 16,384, 65,536, 64, 8 and 32: the bytes of a release statement, the bytes of the attestation of release proofs as JSON without white space, the hashes of its audit path, the elements of `deploy_signatures`, and the arrays and objects inside one another of a JSON value of release proofs ("The release proofs") |
 | `PROOF_REQUEST_NODES`, `PROOF_RETRY_MS`, `PROOF_REQUEST_MEASURES`, `PROOF_ROUND_REQUESTS`, `PROOF_SEEK_RETRY_MS` (the app) | 4 and 1 hour: the nodes one grant step asks for the release proofs of their release, one of each measurement, and the time after which a node of a measurement is asked again. 8, 4 and 5 minutes: the measurements one request to the backend for release proofs names, such requests per round, and the time after which a round asks for a measurement again |
 | `PROOF_FAILURES`, `PROOF_FAILURE_SPAN_MS`, `PROOF_REFUSED_KEPT` (the app) | 8 and 1 hour: a runtime verifies no further release proofs that a node or a node document presents while this many proofs failed within this time. 8: the measurements for which a runtime remembers the proofs it refused last, which it does not verify again |
@@ -1582,7 +1582,11 @@ The list of accepted releases is a constant of the program, so it holds the rele
 when the program was written. The nodes of a release made after that state a measurement the list
 does not have. Such a measurement is that of an accepted release when release proofs show it:
 values that anyone may hand to the program, and that the program verifies on the device with
-constants of its own. With proofs that pass, the release counts as an element of the list that
+constants of its own. A release has such proofs when the build workflow of this repository built
+it, at the commit of that workflow file the program holds. That file fixes the build method of a
+release by the SHA-256 of four files (below), so a release whose build method is another one (a
+later toolchain, a changed Dockerfile or build script) has no proofs this program takes: it
+reaches a device with a program that lists it, as every release did before. With proofs that pass, the release counts as an element of the list that
 writes to the log store: a node of the measurement receives the grant by the rules of "The nodes
 that receive a grant" (its binding names the log store of the server target), the format of its
 log follows from the name of the release, and its entries, and a transfer of the key of the account
@@ -1646,8 +1650,10 @@ The attestation (P4) is a Sigstore bundle: the certificate Fulcio issued to the 
    `{commit}` its `git_commit`. The build workflow, its commit and the release workflow are three
    constants of the program (`PROOF_BUILD_WORKFLOW`, `PROOF_BUILD_COMMIT`,
    `PROOF_RELEASE_WORKFLOW`): the path of the workflow file whose job builds a release and
-   attests its statement, the commit of that file, and the path of the workflow file that the
-   push of a release tag starts and that calls it (enclave.md 11.2).
+   attests its statement (`.github/workflows/release-statement-build.yml`), the commit of that
+   file (`3e86688616915309ee409e2cdfae5261aa46fb99`), and the path of the workflow file that the
+   push of a release tag starts and that calls it (`.github/workflows/enclave-release.yml`;
+   enclave.md 11.2).
 
    | Number | What it states | Value |
    | --- | --- | --- |
@@ -1831,15 +1837,32 @@ the statement names, in the repository with the identifier above while it was pu
 these measurements. The entry of that attestation is in the public log with its certificate, which
 names that commit and the run.
 
-The program fixes the file of the build workflow by its commit, so the proofs show what that file
-makes its job do (enclave.md 11.2 states its rules): the job compares the files of the build
-method of the commit of the tag with the values its own file holds and stops when one differs, it
-builds the enclave image file from that commit by that method with no network while it compiles,
-it compares the `release` and the `git_commit` of `measurements.json` with the tag and the commit
-of the run, and it attests that statement itself. The measurements are then those of the build of
-the commit the statement names, by a method the commit of the tag did not choose and that took
-nothing from outside while it compiled. A tag whose commit holds another workflow, or another
-build method, gets no attestation the program takes.
+The program fixes the file of the build workflow (`release-statement-build.yml`) by its commit,
+so the proofs show what that file makes its job do (enclave.md 11.2 states its rules). The job
+takes no input and no secret. It checks out the commit of the tag and stops unless the four files
+of the build method in that commit (`build/build.sh`, `build/Dockerfile.enclave`,
+`build/Dockerfile.eif`, `rust-toolchain.toml`) have the SHA-256 its own file states and every
+package of `Cargo.lock` comes from crates.io. It builds the enclave image file with
+`build/build.sh eif`: the fixed files name the images and the packages of the build by digest and
+version, the one step of the build of the node program that has a network downloads the packages
+`Cargo.lock` names by checksum, and the step that compiles has no network. It stops unless
+`measurements.json`, which the build wrote from the image file it made, names the tag as
+`release` and the commit of the run as `git_commit`, and it attests that statement in the same
+job. The measurements are then those of the node program that the fixed build method makes of the
+commit the statement names, of the packages of crates.io its `Cargo.lock` names, and of the
+images and packages the fixed files name: no file of the commit of the tag chose how it was built
+or what was attested, and nothing it runs had a network while it compiled.
+
+A tag whose commit holds another workflow gets no attestation the program takes, and neither does
+a release whose build method is not the fixed one: the job stops before it builds. A release that
+changes one of the four files, or takes a package from another place than crates.io, needs
+another commit of the build workflow, and a program that holds this commit does not take the
+attestations of that one. Such a release reaches a device with a program that lists it.
+
+The subject of the attestation is the enclave image file the job built itself. The program does
+not read it: a device holds no image file, and what it accepts is the predicate, which is the
+statement the release key signed. (The image file of the GitHub release is another build of the
+same commit, with the same measurements.)
 
 The proofs do not show what the source of that commit does: the commit is public, and what its
 code does is for the one who reads it. They do not show that the tag still names that commit, or

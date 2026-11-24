@@ -18,8 +18,11 @@ releases, or is shown to it by release proofs that it verifies on the device (pr
 release proofs"): the signature of the release key over the measurements of the release in the
 public transparency log, a signature of a deploy key of the operator, and the attestation GitHub
 made of those measurements for the job of the build workflow of this repository, at the commit of
-that workflow file the program holds, in a run of the tag of the release. A release of the enclave made after a program so reaches a device that runs that
-program. A release whose proofs fail a check is to that device a release it does not list, and so
+that workflow file the program holds, in a run of the tag of the release. A release of the
+enclave made after a program so reaches a device that runs that program, when its build method is
+the one that workflow file fixes (the four build files by their SHA-256, and packages from
+crates.io alone): a release that changes its build method has no attestation the program takes
+and reaches the device with a program that lists it. A release whose proofs fail a check is to that device a release it does not list, and so
 is a release whose statement states a version of the program above the one the device runs
 (`program_min`). The proofs reach the program with the attestation of a node, in a node document,
 or from the backend for the digest of a measurement.

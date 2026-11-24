@@ -784,11 +784,13 @@
   // (PROOF_RELEASE_WORKFLOW). The job of PROOF_BUILD_WORKFLOW at PROOF_BUILD_COMMIT is the one
   // signer of an attestation this program takes: what that job does is what the file of that
   // commit states, whatever the commit of the tag holds. An attestation that a job of another
-  // workflow file made, or the job of that file at another commit, shows no measurement. (Forty
-  // zeros are the commit of no workflow file: a program that holds them takes no release
-  // proofs.)
-  const PROOF_BUILD_WORKFLOW = ".github/workflows/enclave-release-build.yml";
-  const PROOF_BUILD_COMMIT = "0000000000000000000000000000000000000000";
+  // workflow file made, or the job of that file at another commit, shows no measurement. The
+  // file of that commit fixes the build method of a release (four files of the commit it
+  // builds, by their SHA-256) and builds with no network while it compiles: a release whose
+  // build method is another one has no attestation this program takes, and reaches a device
+  // with a program that lists it.
+  const PROOF_BUILD_WORKFLOW = ".github/workflows/release-statement-build.yml";
+  const PROOF_BUILD_COMMIT = "3e86688616915309ee409e2cdfae5261aa46fb99";
   const PROOF_RELEASE_WORKFLOW = ".github/workflows/enclave-release.yml";
   // The payload type of the envelope of an attestation and the predicate type of the in-toto
   // statement in it, as the build workflow of this repository writes them.
@@ -2246,6 +2248,24 @@
     return statement;
   }
 
+  /** P4: GitHub attested the release statement the program read (stated, the value of
+   *  readReleaseStatement). The statement names the commit the release was built from, the
+   *  attestation verifies under the identity of that release and that commit
+   *  (attestedStatement, trust.identity), and the predicate of its in-toto statement, of the
+   *  type PROOF_PREDICATE_TYPE, states the release, the three PCRs, the program_min and the
+   *  git_commit of the statement. The subject of the in-toto statement is not read: the device
+   *  holds no enclave image file, and what it accepts is the predicate. Throws unproven with
+   *  the first check that fails. */
+  function attestedRelease(attestation, stated, trust) {
+    if (stated.git_commit === null) throw unproven("p4: statement commit");
+    const attested = attestedStatement(attestation, trust.identity(stated.release, stated.git_commit), trust);
+    const predicate = member(attested, "predicate");
+    if (member(attested, "predicateType") !== PROOF_PREDICATE_TYPE) throw unproven("p4: predicate type");
+    for (const name of ["release", "pcr0", "pcr1", "pcr2", "program_min", "git_commit"]) {
+      if (member(predicate, name) !== stated[name]) throw unproven("p4: predicate " + name);
+    }
+  }
+
   /** The verdict of release proofs for a measurement {pcr0, pcr1, pcr2} (96 lower-case
    *  hexadecimal characters each), by a build of the server target target. proofs is {statement,
    *  entry, deploy_signatures, attestation}: the base64url of the bytes of a release statement,
@@ -2258,12 +2278,11 @@
    *    P3  the deploy key of the server target signed the statement (deploySigned);
    *    P2  the release key signed the statement and a transparency log recorded that signature
    *        (releaseRecorded);
-   *    P4  GitHub attested the statement: the statement names the commit the release was
-   *        built from (git_commit), the attestation verifies (attestedStatement) under the
-   *        identity of the job of the build workflow at the commit this program holds, in a run
-   *        the push of the tag of the release started at the commit of the statement
-   *        (trust.identity), and the predicate of its in-toto statement, of the type
-   *        PROOF_PREDICATE_TYPE, states the release, the three PCRs, the program_min and the
+   *    P4  GitHub attested the statement (attestedRelease): the statement names the commit
+   *        the release was built from (git_commit), the attestation verifies under the identity
+   *        of the job of the build workflow at the commit this program holds, in a run the push
+   *        of the tag of the release started at the commit of the statement, and the predicate
+   *        of its in-toto statement states the release, the three PCRs, the program_min and the
    *        git_commit of the statement (no program_min where the statement states none).
    *  Returns {release, programMin}: the release the statement names and the program_min it
    *  states (0 for a statement that states none). The caller decides what a program_min above
@@ -2291,13 +2310,7 @@
     const digest = hex(sha256(statement));
     deploySigned(digest, proofs.deploy_signatures, trust.deployKeys, target);
     releaseRecorded(statement, digest, proofs.entry, trust);
-    if (stated.git_commit === null) throw unproven("p4: statement commit");
-    const attested = attestedStatement(proofs.attestation, trust.identity(stated.release, stated.git_commit), trust);
-    const predicate = member(attested, "predicate");
-    if (member(attested, "predicateType") !== PROOF_PREDICATE_TYPE) throw unproven("p4: predicate type");
-    for (const name of ["release", "pcr0", "pcr1", "pcr2", "program_min", "git_commit"]) {
-      if (member(predicate, name) !== stated[name]) throw unproven("p4: predicate " + name);
-    }
+    attestedRelease(proofs.attestation, stated, trust);
     return { release: stated.release, programMin: stated.program_min === undefined ? 0 : stated.program_min };
   }
 

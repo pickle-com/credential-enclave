@@ -25,8 +25,10 @@
 // commit it holds. For every bundle of the file this file prints what the fourth check (P4)
 // makes of it: each value the certificate states of the run (the extensions
 // 1.3.6.1.4.1.57264.1.{8..22}) beside the value the program requires, the other checks of the
-// bundle, and the predicate beside the statement. With RELEASE_PROOFS_JSON the attestation of
-// the proofs is then the bundle of the file that the program takes. With --statement (the file
+// bundle, and the predicate beside the statement, and then one line: `P4: holds`, or
+// `P4: fails at {check}` with the check at which the program refuses the bundle (for a value of
+// the certificate, `p4: identity {number of the extension}`). With RELEASE_PROOFS_JSON the
+// attestation of the proofs is then the bundle of the file that the program takes. With --statement (the file
 // measurements.json of the release) and no proofs, the file prints that report alone and ends
 // with the status 0 when P4 holds for a bundle of the file.
 //
@@ -145,7 +147,7 @@ if (end < 0 || source.indexOf("function proveRelease(") < 0) {
   console.error("the program holds no verdict of release proofs: " + flags.program);
   process.exit(2);
 }
-if (flags.attestation !== null && source.indexOf("function identityStated(") < 0) {
+if (flags.attestation !== null && (source.indexOf("function identityStated(") < 0 || source.indexOf("function attestedRelease(") < 0)) {
   console.error("the program does not judge the certificate of an attestation as this file reports it: " + flags.program);
   process.exit(2);
 }
@@ -156,6 +158,7 @@ const handed = source.slice(0, end) +
   "    fulcioText: fulcioText, attestedStatement: attestedStatement,\n" +
   "    attestedIdentity: typeof attestedIdentity === \"function\" ? attestedIdentity : null,\n" +
   "    identityStated: typeof identityStated === \"function\" ? identityStated : null,\n" +
+  "    attestedRelease: typeof attestedRelease === \"function\" ? attestedRelease : null,\n" +
   "    predicateType: PROOF_PREDICATE_TYPE };\n" +
   source.slice(end);
 const world = new bridge.World({ serverTarget: flags.target });
@@ -209,11 +212,27 @@ function statedOf(bytes) {
   return decoded === null ? null : verdict.readReleaseStatement(decoded);
 }
 
-/** Prints what P4 makes of one bundle for a statement the program read (stated). Returns
- *  {signer, holds}: whether the certificate is that of the job of the build workflow at the
- *  commit the program holds, and whether P4 holds. */
+/** The check at which the program refuses a bundle as the attestation of a statement it read
+ *  (the fourth check of the program, attestedRelease), or null when P4 holds. */
+function refusalOf(bundle, stated) {
+  try {
+    verdict.attestedRelease(bundle, stated, verdict.releaseTrust());
+    return null;
+  } catch (error) {
+    if (!error || error.code !== "release_unproven") throw error;
+    return error.message;
+  }
+}
+
+/** Prints what P4 makes of one bundle for a statement the program read (stated): the values the
+ *  certificate states, the other checks, the predicate, and one last line with the verdict of
+ *  the program and the check it refuses the bundle at. Returns {signer, holds}: whether the
+ *  certificate is that of the job of the build workflow at the commit the program holds, and
+ *  whether P4 holds. */
 function judgeAttestation(bundle, stated, label) {
   console.log(label + ":");
+  const refusal = refusalOf(bundle, stated);
+  const last = "  P4: " + (refusal === null ? "holds" : "fails at " + refusal);
   let leaf = null;
   try {
     const der = verdict.decodeStrict(bundle.verificationMaterial.certificate.rawBytes, false);
@@ -223,14 +242,12 @@ function judgeAttestation(bundle, stated, label) {
   }
   if (leaf === null) {
     console.log("  no certificate that reads (verificationMaterial.certificate.rawBytes)");
-    console.log("  P4: fails");
+    console.log(last);
     return { signer: false, holds: false };
   }
-  let identity = true;
   let signer = true;
   if (stated.git_commit === null) {
-    console.log("  the statement does not state git_commit once as 40 lower-case hexadecimal characters (p4: statement commit)");
-    identity = false;
+    console.log("  the statement does not state git_commit once as 40 lower-case hexadecimal characters");
   }
   const required = new Map(verdict.attestedIdentity(stated.release, stated.git_commit).map((item) => [item[0], item]));
   for (let number = 8; number <= 22; number += 1) {
@@ -242,40 +259,31 @@ function judgeAttestation(bundle, stated, label) {
       continue;
     }
     const holds = verdict.identityStated(leaf, item);
-    if (!holds) {
-      identity = false;
-      if (number === 9 || number === 10) signer = false;
-    }
+    if (!holds && (number === 9 || number === 10)) signer = false;
     console.log(head + (holds ? ": holds" : ": NOT the value required (" + JSON.stringify(item[1]) + (item[2] === "path" ? " before its last \"@\"" : "") + ")") +
       (holds && item[2] === "path" ? " (the text before its last \"@\")" : ""));
   }
   let statement = null;
-  let others = true;
   try {
     statement = verdict.attestedStatement(bundle, [], verdict.releaseTrust());
     console.log("  the other checks of the bundle (its form, the certificate under the certificate authority at the time of the log entry, " +
       "the signature of the envelope, the entry of the log, its signed entry timestamp, its inclusion proof and its checkpoint): hold");
   } catch (error) {
     if (!error || error.code !== "release_unproven") throw error;
-    others = false;
     console.log("  the other checks of the bundle fail at: " + error.message);
   }
-  let predicate = statement !== null;
   if (statement !== null) {
     if (statement.predicateType !== verdict.predicateType) {
-      predicate = false;
       console.log("  predicate type " + JSON.stringify(statement.predicateType) + ": NOT " + JSON.stringify(verdict.predicateType));
     }
     const stands = statement.predicate !== null && typeof statement.predicate === "object" ? statement.predicate : {};
     const differing = ["release", "pcr0", "pcr1", "pcr2", "program_min", "git_commit"].filter((name) => stands[name] !== stated[name]);
-    if (differing.length > 0) predicate = false;
     console.log("  predicate: " + (differing.length === 0
       ? "its release, pcr0, pcr1, pcr2, program_min and git_commit are those of the statement"
       : "NOT that of the statement in " + differing.join(", ")));
   }
-  const holds = identity && others && predicate;
-  console.log("  P4: " + (holds ? "holds" : "fails"));
-  return { signer: signer, holds: holds };
+  console.log(last);
+  return { signer: signer, holds: refusal === null };
 }
 
 /** Prints the report of every bundle of the file of --attestation for the statement the program

@@ -1414,7 +1414,7 @@ test("prove.js states what the program makes of release proofs, of the attestati
     };
     const report = call(["--statement", statementFile, "--attestation", both]);
     assert.equal(report.status, 0, report.out);
-    assert.ok(/bundle 1:\n(  [^\n]*\n)*  extension  9 \(Build Signer URI\): [^\n]*: NOT the value required[^\n]*\n(  [^\n]*\n)*  P4: fails\n/.test(report.out), report.out);
+    assert.ok(/bundle 1:\n(  [^\n]*\n)*  extension  9 \(Build Signer URI\): [^\n]*: NOT the value required[^\n]*\n(  [^\n]*\n)*  P4: fails at p4: identity 9\n/.test(report.out), report.out);
     assert.ok(/bundle 2:\n(  extension [^\n]*: (holds[^\n]*|not judged)\n)+  the other checks of the bundle [^\n]*: hold\n  predicate: [^\n]*\n  P4: holds\n/.test(report.out), report.out);
     assert.ok(report.out.indexOf("extension 10 (Build Signer Digest): " + JSON.stringify(model.PINS.commit) + ": holds") >= 0, report.out);
     assert.ok(report.out.indexOf("extension 13 (Source Repository Digest): " + JSON.stringify(model.COMMIT) + ": holds") >= 0, report.out);
