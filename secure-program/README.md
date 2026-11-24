@@ -145,16 +145,20 @@ versions of the program and prints what changed between them (the file of a tag 
 
 - The operator can write a program that leaks the master key, sign it and record it. That program
   is a tag of this repository and an entry of the public log under the release key, so it can be
-  read and found, but nothing stops it from being loaded: the notice period between the entry and
-  the loading is zero, as for an enclave release (protocol.md 10.3).
+  read and found, but nothing stops it from being loaded: no notice period lies between the entry
+  and the loading. A node release has the same limit without a key of the operator: a node hands
+  delegations to another release as soon as a call carries the public build proof of that
+  release, and no notice period lies between the entry of the log and the transfer (protocol.md
+  10.3).
 - Serving an older release leaves no new entry. An app loads a served program only when its
   version is at least the version of the program the app ships with and at least the highest
   version that installation has loaded, so a new installation can be served any release from the
   shipped version on. The window closes with every app release that ships a newer program.
 - The apps compile in the public key of the log. When Rekor signs with a new key, an app of an
   older build verifies no entry made after the change and loads no new program until the app is
-  updated (a node has the same limit for the logs of its table: README of this repository, "A log
-  that takes no further entry").
+  updated (a node has the same limit for the key of the log and the two certificates of the
+  certificate authority of Sigstore that are compiled into it: README of this repository, "Values
+  of Sigstore and of the build that change").
 - The honesty of the log rests on the operation of Sigstore Rekor. An app verifies the inclusion
   proof and the signed checkpoint, so it has shown that the log signed a tree that holds the entry.
   That everyone is shown the same tree is not shown without witnesses.

@@ -26,7 +26,7 @@ License 2.0).
   check with the file. It also requires at least five cases of every verdict. `cargo test` runs
   it.
 - The secure program of the apps: `proveRelease` of `secure-program/secure-program.js` must give
-  the verdict of every case as well. Its check loads the program on the model of the bridge
+  the verdict of every case as well. A check of it loads the program on the model of the bridge
   (`secure-program/tests/bridge.js`), parses `release_proofs_text` inside the program, builds a
   trust of the file from `fulcio_root`, `fulcio_intermediate`, `log_keys` and `builders`, takes
   the constants of the program for `source`, and compares the verdict and the release with the
@@ -40,17 +40,34 @@ A case names a trust: a member of `trusts` of the file, or `source`.
 
 - A trust of the file holds the root certificate and the intermediate certificate of a
   certificate authority, the keys of the transparency logs, the issuer of the tokens, the
-  repository with its two identifiers, and a list of build workflows. The private keys behind
-  them are keys of the script: it signs the certificates, the envelopes, the entries and the
-  checkpoints of its cases with them, so every part of a case holds except the one value the
-  case changes, and the check the case names is the one it fails. Every private key follows
-  from a fixed label inside the script. The keys are trusted by nothing but the cases that name
-  them: no program compiles them in.
+  repository with its two identifiers, and a list of build workflows.
+- The trust `test` and the five trusts whose names begin with `test-` hold values of the
+  script. The private keys behind them are keys of the script: it signs the certificates, the
+  envelopes, the entries and the checkpoints of its cases with them, so every part of a case
+  holds except the one value the case changes, and the check the case names is the one it
+  fails. Every private key follows from a fixed label inside the script. The keys are trusted
+  by nothing but the cases that name them: no program compiles them in.
+- The two trusts whose names begin with `sigstore-` hold the two certificates of the
+  certificate authority of Sigstore and the key of Rekor, which the script reads from
+  `enclave/release/`, with a list of build workflows that is not the one of this source.
+  `sigstore-build-workflow-v2.4.0-rc.1` names the build workflow at the commit whose job
+  attested the release candidate `v2.4.0-rc.1`: under it the published proofs of that release
+  candidate pass, and those of the release candidate `v2.4.0-rc.2` are refused at `V6`.
+  `sigstore-release-workflow-v2.3.0` names the release workflow of the tag `v2.3.0` at the
+  commit of that tag: under it the published proofs of the release `v2.3.0` pass, and those of
+  the release candidate `v2.4.0-rc.2` are refused at `V6`.
 - `source` stands for the values of the verifier itself: for the node, the files of
   `enclave/release/` (the two certificates of the certificate authority of Sigstore, the key of
   Rekor, the list of build workflows) and the repository of this source. The cases of this
-  trust are the published proofs of `published/` and those proofs with one value changed. No
-  key of the script signs them, so a changed value is refused by the first check it breaks.
+  trust are made of the published proofs of `published/`. The proofs of the release candidate
+  `v2.4.0-rc.2` pass: the job of the build workflow at the commit the list of this source
+  names attested it. The same proofs with one value changed are refused. No key of the script
+  signs them, so a changed value is refused by the first check it breaks, and a changed value
+  that no check reads (the `inputs` of the statement) leaves the proofs accepted. The proofs
+  of the release candidate `v2.4.0-rc.1` and of the release `v2.3.0`, as they are, are refused
+  at `V6`: the list of build workflows of this source names neither the commit of the build
+  workflow file whose job attested that release candidate nor the release workflow of the tag
+  `v2.3.0`.
 
 ## Writing the file again
 
@@ -62,10 +79,13 @@ python3 protocol/vectors/release_proofs.py --check    # fails when the committed
 The script needs Python 3.11 or later and the package `cryptography` 43 or later, linked with
 OpenSSL 3.2 or later: it signs with deterministic ECDSA (RFC 6979), so a second run writes the
 same bytes. It reads the files of `published/` and the files of `enclave/release/`, and nothing
-else. The workflows of this repository do not run it: `cargo test` and the tests of the secure
-program read the committed file. After a change of the script, of `enclave/release/` or of
-`published/`, the file is written again and committed with the change, and both test suites
-pass with it.
+else. The job `check` of `.github/workflows/check.yml` runs the script with `--check` on every
+push to a branch and on every pull request, in a new Python virtual environment into which it
+installs three packages at fixed versions and nothing else: `cryptography` 50.0.2 and the two
+packages it depends on, `cffi` 2.1.0 and `pycparser` 3.0. `cargo test` reads the committed
+file. After a change of the script, of `enclave/release/` or of `published/`, the file is
+written again and committed with the change, and every verifier that reads the file passes
+with it.
 
 A case is added for a value that two readers could read differently: the bounds of a length, a
 form of a number, a member that occurs twice, an encoding with spare bits. The verdict of a new

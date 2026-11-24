@@ -1,15 +1,19 @@
-# Every hour: the transparency logs of the trusted root of the public instance of Sigstore must be
-# the ones this repository knows. The table of transparency logs of the node program is compiled
-# into it, and a test ties that table to the copy of the trusted root in
-# protocol/tests/fixtures/sigstore-trusted-root.json (docs/protocol.md 10.3). A node hands its
-# delegations to a later release over an entry of a log of its table only, so a release with
-# another table has to be built and endorsed while a log of the tables in service still takes
-# entries. A trusted root that names a log the copy does not name, no longer names a log of the
-# copy, or states another value for a log (the end of its validity among them) opens an issue.
+# Every hour: the transparency logs and the certificate authorities of the trusted root of the
+# public instance of Sigstore must be the ones this repository knows. A node takes the public
+# build proof of another release only under values that are compiled into it: the two
+# certificates of the certificate authority of Sigstore and the key of the transparency log
+# rekor.sigstore.dev (docs/protocol.md 9.3). A test ties those values to the copy of the trusted
+# root in protocol/tests/fixtures/sigstore-trusted-root.json (docs/enclave.md 11.1). A release
+# that is built after the certificate authority changed its certificates, or after that log
+# stopped taking entries or changed its key, has no proof a node in service takes, so a release
+# that holds the new values has to be built and deployed while the proofs of new releases still
+# verify under the values of the nodes in service (docs/protocol.md 10.3). A trusted root that
+# names a log or a certificate authority the copy does not name, no longer names one of the
+# copy, or states another value for one (the end of its validity among them) opens an issue.
 # A run that could not complete the comparison (the TUF repository of Sigstore could not be read)
 # fails without that issue, and opens another issue only when the comparison stayed incomplete
-# for six runs in a row. A run in which the logs are the ones of the copy closes the open issues
-# of this monitor.
+# for six runs in a row. A run in which the logs and the certificate authorities are the ones of
+# the copy closes the open issues of this monitor.
 name: trusted-root-monitor
 on:
   schedule:
@@ -28,25 +32,25 @@ jobs:
       actions: read
     env:
       GH_TOKEN: ${{ github.token }}
-      OTHER_LOGS_TITLE: "Trusted root of Sigstore: its transparency logs are not the ones this repository knows"
-      INCOMPLETE_TITLE: "Trusted root of Sigstore: the comparison of its transparency logs could not be completed"
+      OTHER_ROOT_TITLE: "Trusted root of Sigstore: its transparency logs or certificate authorities are not the ones this repository knows"
+      INCOMPLETE_TITLE: "Trusted root of Sigstore: the comparison of its transparency logs and certificate authorities could not be completed"
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Compare the transparency logs of the trusted root with the ones this repository knows
+      - name: Compare the transparency logs and the certificate authorities of the trusted root with the ones this repository knows
         id: compare
         run: |
           status=0
           python3 secure-program/monitor.py --trusted-root --report report.md || status=$?
           echo "status=$status" >> "$GITHUB_OUTPUT"
-      - name: Open the issue of a trusted root with other logs, or bring its text up to date
+      - name: Open the issue of a trusted root with other logs or certificate authorities, or bring its text up to date
         if: steps.compare.outputs.status == '1'
         run: |
-          number=$(gh issue list --state open --search "in:title \"$OTHER_LOGS_TITLE\"" --json number --jq '.[0].number')
+          number=$(gh issue list --state open --search "in:title \"$OTHER_ROOT_TITLE\"" --json number --jq '.[0].number')
           if [ -z "$number" ]; then
-            gh issue create --title "$OTHER_LOGS_TITLE" --body-file report.md
+            gh issue create --title "$OTHER_ROOT_TITLE" --body-file report.md
           else
             # The issue is open: its text follows the report of this run. An hourly comment
             # would say nothing new while the difference stands.
@@ -70,11 +74,11 @@ jobs:
       - name: Close the open issues of the monitor
         if: steps.compare.outputs.status == '0'
         run: |
-          for title in "$OTHER_LOGS_TITLE" "$INCOMPLETE_TITLE"; do
+          for title in "$OTHER_ROOT_TITLE" "$INCOMPLETE_TITLE"; do
             for number in $(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[].number'); do
-              gh issue close "$number" --comment "The transparency logs of the trusted root of Sigstore are the ones this repository knows: $RUN_URL"
+              gh issue close "$number" --comment "The transparency logs and the certificate authorities of the trusted root of Sigstore are the ones this repository knows: $RUN_URL"
             done
           done
-      - name: Fail unless the transparency logs of the trusted root are the ones this repository knows
+      - name: Fail unless the transparency logs and the certificate authorities of the trusted root are the ones this repository knows
         if: steps.compare.outputs.status != '0'
         run: exit 1
