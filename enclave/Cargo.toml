@@ -1,6 +1,6 @@
 [package]
 name = "credential-enclave"
-version = "2.3.0"
+version = "2.4.0"
 description = "The credential enclave node program"
 edition.workspace = true
 rust-version.workspace = true
@@ -39,8 +39,6 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 url = "2"
 webpki-roots = "0.26"
 zeroize.workspace = true
-async-imap = { version = "0.12.0", default-features = false, features = ["runtime-tokio"] }
-futures-util = "0.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 aws-nitro-enclaves-nsm-api = "0.5"
@@ -51,3 +49,5 @@ tokio-vsock = "0.7"
 
 [dev-dependencies]
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"] }
+# The clock of the runtime a test stops and moves (src/tests/inbound.rs).
+tokio = { version = "1", features = ["test-util"] }

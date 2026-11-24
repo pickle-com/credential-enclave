@@ -9,6 +9,7 @@ use credential_enclave_protocol::statement;
 
 use super::responses::Attestation;
 use super::{invalid, json_ok, respond, ApiError, JsonBody};
+use crate::faults::joined;
 use crate::state::Node;
 
 pub async fn attestation(State(node): State<Arc<Node>>, request: Request) -> Response {
@@ -22,8 +23,12 @@ pub async fn attestation(State(node): State<Arc<Node>>, request: Request) -> Res
 /// The challenge is drawn in this call and signed with the nonce of this call only: the node
 /// signs no challenge statement for a value a caller names. So a statement that verifies for a
 /// nonce proves that its challenge was issued after that nonce was chosen.
+///
+/// The call is one of the two calls of a command: an app asks for a challenge here before
+/// it sends a grant or a revoke. Its request is held under the command budget of the node
+/// (`JsonBody::read_command`).
 async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
-    let body = JsonBody::read(request).await?;
+    let body = JsonBody::read_command(node, request).await?;
     let nonce = b64u_decode(body.text("nonce")?).map_err(|_| invalid("nonce"))?;
     if !(16..=64).contains(&nonce.len()) {
         return Err(invalid("nonce"));
@@ -33,9 +38,8 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
     let user_data = node.binding();
     let platform = node.platform.clone();
     // The attestation device is a blocking call.
-    let document = tokio::task::spawn_blocking(move || platform.attestation(&user_data, &nonce))
-        .await
-        .map_err(|_| ApiError::internal())??;
+    let mut device = tokio::task::spawn_blocking(move || platform.attestation(&user_data, &nonce));
+    let document = joined(&mut device).await.ok_or_else(ApiError::internal)??;
     Ok(json_ok(&Attestation {
         v: 1,
         platform: node.platform.name(),

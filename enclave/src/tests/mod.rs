@@ -8,19 +8,31 @@ use serde_json::{json, Value};
 use crate::providers::{endpoint, Definitions};
 use crate::testing::{Provider, Reply, Seen, LOG_HOST};
 
+mod bounds;
 mod canary;
 mod close;
 mod commands;
+mod faults;
 mod forward;
 mod forward_batch;
 mod grants;
+mod inbound;
 mod log;
 mod log_store;
 mod mail;
+mod mail_connections;
+mod mail_probe;
+mod mail_stand_in;
 mod oauth;
 mod peer;
+mod pools;
 mod records;
+mod roles;
+mod search_reference;
 mod surface;
+mod vault;
+mod vault_handoff;
+mod vault_send;
 
 /// The seven counts of the `log` object of health that a test of the log can fix: the entries,
 /// the events, the writes, the failed writes, the open batches and the two counts of the
@@ -42,6 +54,13 @@ fn seven_counts(log: &Value) -> Value {
     Value::Object(counts)
 }
 
+/// The ordinals that hold the delegation of `user_id` in a pool of `pods` nodes without
+/// groups, `copies` of them (protocol.md 10.4).
+fn assign(user_id: &str, pods: u32, copies: u32) -> Vec<u32> {
+    credential_enclave_protocol::subset::assign(user_id, pods, copies, None, 0)
+        .expect("a pool of 1 to 1,024 nodes with at least one copy")
+}
+
 /// Every host a node can connect to with the embedded definitions: the token addresses, the
 /// revocation addresses and the hosts of the `api` rules.
 fn provider_hosts() -> Vec<String> {
@@ -58,6 +77,16 @@ fn provider_hosts() -> Vec<String> {
         }
     }
     hosts.into_iter().collect()
+}
+
+/// True for the write of the entry `seq` of `user_id` to the log store.
+fn is_write_of(seen: &Seen, user_id: &str, seq: u64) -> bool {
+    seen.server_name == LOG_HOST
+        && seen.method == "PUT"
+        && seen.target.split_once("/a3/").is_some_and(|(_, rest)| {
+            credential_enclave_protocol::log::parse_object_key_v3(&format!("a3/{rest}"), user_id)
+                .is_some_and(|key| key.seq == seq)
+        })
 }
 
 /// A stand-in for every provider host that answers with `handler`.

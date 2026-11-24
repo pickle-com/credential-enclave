@@ -4,6 +4,7 @@
 //! credential-enclave-verify --url https://{api host} --measurements out/measurements.json
 //! credential-enclave-verify --url https://{api host} --pcr0 {hex} --pcr1 {hex} --pcr2 {hex}
 //! credential-enclave-verify --document {file} --nonce {hex} --measurements out/measurements.json
+//! credential-enclave-verify release-proofs release-proofs.json
 //! credential-enclave-verify program --source secure-program/secure-program.js --release secure-program.release.json
 //! ```
 //!
@@ -48,6 +49,10 @@
 //!
 //! Exit status: 0 when every node passed, 1 when at least one node failed, 2 when there is no
 //! result (the arguments, a file, the network, the HTTP status or the response).
+//!
+//! `release-proofs` verifies the public build proof of a release, as a node does
+//! (`release_proofs.rs`), and `program` the release proof of the secure program, as an app
+//! does (`program.rs`).
 
 #![forbid(unsafe_code)]
 #![deny(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
@@ -56,6 +61,7 @@ mod arguments;
 mod evaluate;
 mod fetch;
 mod program;
+mod release_proofs;
 mod render;
 
 use std::io::Write;
@@ -121,6 +127,7 @@ fn run(arguments: &[String]) -> End {
             Ok(end) => end,
             Err(message) => End::no_result(&message),
         },
+        Ok(Command::Proofs(arguments)) => release_proofs::run(&arguments),
         Ok(Command::Program(arguments)) => program::run(&arguments),
         Err(message) => End::no_result(&format!("{message}\n\n{USAGE}")),
     }

@@ -11,7 +11,9 @@ use credential_enclave_protocol::ProtocolError;
 use super::responses::Revoked;
 use super::{json_ok, provider_credentials, record_of, respond, ApiError, JsonBody};
 use crate::log_store;
-use crate::oauth::{self, revoke_request, ClientId, ClientValues, REVOKE_TIMEOUT};
+use crate::oauth::{
+    self, revoke_request, ClientId, ClientValues, OauthPlaintext, Unusable, REVOKE_TIMEOUT,
+};
 use crate::state::{events, lock, Node};
 
 pub async fn revoke_token(State(node): State<Arc<Node>>, request: Request) -> Response {
@@ -29,7 +31,7 @@ pub async fn revoke_token(State(node): State<Arc<Node>>, request: Request) -> Re
 /// entry. The outcome of the call is the `revoked` of the response: one bit, whether the
 /// revocation address answered with a 2xx status. Nothing else of that answer leaves the node.
 async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
-    let body = JsonBody::read(request).await?;
+    let body = JsonBody::read(node, request).await?;
     let user_id = body.user_id()?;
     let record = record_of(&body, "record")?;
     body.context()?;
@@ -49,12 +51,24 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
             .get(&record.provider)
             .ok_or(ProtocolError::ProviderUnknown)?;
         let credentials = provider_credentials(definition, &config, &record.provider)?;
-        let parsed = opened.parse()?;
-        let recorded_client_id = parsed.client_id();
+        // A plaintext, or a token of it, above what a node reads: the node sends no token of
+        // such a record, as of a record without a token, and the entry says so
+        // (`provider_revoke` false).
+        let bounded = opened
+            .parse()
+            .and_then(|parsed| parsed.within_bounds(definition).map(|()| parsed));
+        let parsed = match bounded {
+            Ok(parsed) => Some(parsed),
+            Err(Unusable::Invalid) => return Err(ProtocolError::RecordInvalid.into()),
+            Err(Unusable::AboveBounds) => None,
+        };
+        let recorded_client_id = parsed.as_ref().and_then(OauthPlaintext::client_id);
         let call = match (
             &definition.revoke,
             definition.revoke_destination(),
-            parsed.revocation_token(&definition.token_container),
+            parsed
+                .as_ref()
+                .and_then(|parsed| parsed.revocation_token(&definition.token_container)),
         ) {
             (Some(revoke), Some(destination), Some((token, hint))) => Some(revoke_request(
                 revoke,

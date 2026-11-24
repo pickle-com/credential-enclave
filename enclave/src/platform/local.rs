@@ -75,7 +75,7 @@ impl Platform for LocalPlatform {
         system_time_ms()
     }
 
-    async fn listen(&self) -> Result<Listener, PlatformError> {
+    async fn listen(&self, _connections: usize) -> Result<Listener, PlatformError> {
         TcpListener::bind(("0.0.0.0", LISTEN_PORT))
             .await
             .map(Listener::Tcp)

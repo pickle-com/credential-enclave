@@ -122,13 +122,13 @@ function laterFixture(release, options, node, held) {
 
 // ---- The proofs of a published release, against the constants of the program ----
 
-test("the public build proof of the tag v2.4.0-rc.1 (the first run of the build workflow on GitHub), from public values: the program takes it with its constants as they are, a node of that measurement receives its grant, and the same proof changed in one place is refused by the check of that place", async () => {
-  const real = JSON.parse(fs.readFileSync(path.join(__dirname, "fixtures", "release-proofs-v2.4.0-rc.1.json"), "utf8"));
+test("the public build proof of the tag v2.4.0-rc.2 (a run on GitHub of the build workflow the program lists), from public values: the program takes it with its constants as they are, a node of that measurement receives its grant, and the same proof changed in one place is refused by the check of that place", async () => {
+  const real = JSON.parse(fs.readFileSync(path.join(__dirname, "fixtures", "release-proofs-v2.4.0-rc.2.json"), "utf8"));
   assert.deepEqual(Object.keys(real).sort(), ["attestation", "statement"]);
   const statement = Buffer.from(real.statement, "base64url");
   const stated = JSON.parse(statement.toString("utf8"));
   const measurement = { pcr0: stated.pcr0, pcr1: stated.pcr1, pcr2: stated.pcr2 };
-  assert.equal(stated.release, "v2.4.0-rc.1");
+  assert.equal(stated.release, "v2.4.0-rc.2");
   // The measurement is in no list of the program.
   assert.equal(bridge.listedMeasurements(source).concat(bridge.listedMeasurements(source, "PRERELEASE_BUILDS"))
     .some((item) => item.pcr0 === stated.pcr0), false);
@@ -154,7 +154,7 @@ test("the public build proof of the tag v2.4.0-rc.1 (the first run of the build 
   assert.equal(shown.world.state.grant.state, "active");
   assert.equal(shown.world.state.log.status, "verified");
   assert.deepEqual(proofRequests(shown.world), [digestOf(measurement)]);
-  assert.deepEqual(keptProven(shown.world), ["v2.4.0-rc.1"]);
+  assert.deepEqual(keptProven(shown.world), ["v2.4.0-rc.2"]);
   assert.equal(shown.world.stored("log.grants")[shown.nodes[0].id].format, 3);
   // Without the proofs the node receives no grant.
   const bare = await run(source, null);
@@ -242,7 +242,7 @@ test("the public build proof of the tag v2.4.0-rc.1 (the first run of the build 
     assert.equal(fx.nodes[0].grants.has(fx.world.userId), reason === null, name);
   }
   // The build workflow the program of this checkout takes is the one of those proofs.
-  assert.deepEqual(model.buildersOf(source), [{ workflow: ".github/workflows/enclave-build.yml", commit: "3f84e8368fcdf1f89e42ca629670bfe0989b6f13" }]);
+  assert.deepEqual(model.buildersOf(source), [{ workflow: ".github/workflows/enclave-build.yml", commit: "e522d06d8388bee590678963f8940cd7a2b69f5c" }]);
 });
 
 // ---- Proofs that differ in one place from proofs that hold ----
@@ -1168,12 +1168,12 @@ test("the device keeps the verdicts of 256 measurements, the ones made last: a v
 test("prove.js ends with the status 0 for release proofs the program takes and with 1 for proofs it refuses, with the check that refuses them, and states what the program makes of the attestation response of a node of that release", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "prove-"));
   const run = (args) => child.spawnSync(process.execPath, [path.join(__dirname, "prove.js")].concat(args), { encoding: "utf8" });
-  const real = path.join(__dirname, "fixtures", "release-proofs-v2.4.0-rc.1.json");
+  const real = path.join(__dirname, "fixtures", "release-proofs-v2.4.0-rc.2.json");
   // The proofs of a published release, with one argument (the call of the release workflow).
   const held = run([real]);
   assert.equal(held.status, 0, held.stdout + held.stderr);
-  assert.ok(held.stdout.endsWith("program version " + VERSION + ": the proofs show release v2.4.0-rc.1\n"), held.stdout);
-  assert.match(held.stdout, /extension {2}9 \(Build Signer URI\): "https:\/\/github\.com\/pickle-com\/credential-enclave\/\.github\/workflows\/enclave-build\.yml@3f84e8368fcdf1f89e42ca629670bfe0989b6f13": holds/);
+  assert.ok(held.stdout.endsWith("program version " + VERSION + ": the proofs show release v2.4.0-rc.2\n"), held.stdout);
+  assert.match(held.stdout, /extension {2}9 \(Build Signer URI\): "https:\/\/github\.com\/pickle-com\/credential-enclave\/\.github\/workflows\/enclave-build\.yml@e522d06d8388bee590678963f8940cd7a2b69f5c": holds/);
   assert.match(held.stdout, /extension 18 \(Build Config URI\): .*: not judged/);
   // The same proofs from the two files a build leaves: the statement and the bundle.
   const proofs = JSON.parse(fs.readFileSync(real, "utf8"));

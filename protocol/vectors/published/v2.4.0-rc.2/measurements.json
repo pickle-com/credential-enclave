@@ -1,0 +1,27 @@
+{
+  "release": "v2.4.0-rc.2",
+  "git_commit": "ebf4358294a6a1e92db804ab3286684b232f8981",
+  "pcr0": "0d92c7d5c9e00f526eaff129a548e33ce6324330b8b3c3e655dcac9a3d05978cff0f7d4c92fc39bc99a9123a15a2658e",
+  "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+  "pcr2": "de865be1108c177b010827f6cbf983366d5bc375ece626473ff3d05002840ae453606f68c385370701b2ae4148e8b3ed",
+  "inputs": {
+    "image/toolchain": "7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f",
+    "image/buildkit": "cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea",
+    "image/cargo": "7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f",
+    "image/amazonlinux": "5b29412077a463b4a3a8fbc99a8cdf4b929f38a3ecc8dac10328d8f36b0099b8",
+    "file/rust-toolchain.toml": "0bf007546885bfdc84484863a3b2dd936a89627191998d987cd798759e3935f1",
+    "file/Cargo.toml": "89446cf0f77dc10ff37f29c9cc4bf3c5497fc754cabc8feda5f47e569e057908",
+    "file/Cargo.lock": "65ad00fe4da1722c6bd1f4e6fe767f8aefcf2b40545aa9ecaec46e2580f43cee",
+    "file/build/Dockerfile.enclave": "ffec1cb10903052e62fed311e64616dabf5271c6ae9d9f8a52edcf0e39bca05b",
+    "file/build/inputs.json": "36e53df5a4555960f0452cab5ea3871b1b91b85944f0e7c0a484e2625285916c",
+    "procedure/enclave-build.sh": "d067e5f2a1178c62bd5e753c77fba6a7726bb4689dfd9b27896252d6d3266f87",
+    "procedure/Dockerfile.vendor": "20faf96d2cc41f4cc891247bde3e05b9dec4d42287f05caa2fea56780d729936",
+    "procedure/Dockerfile.eif": "1af5160da66a283ca3fb0a8e8db256a93f4118fea26e314c5c283addb1e37309",
+    "blob/bzImage": "210eda749c1308eb60671a579d24db5e8a3477cb7a247cf313c286b09fe2d857",
+    "blob/cmdline": "10d7d9dd205d4596d45997d17434f26207525f129d171a51f9859b1af9f4a07a",
+    "blob/init": "c4acb866e8925c171b43517f3a88a6989f5a2da3a6d3e6594f75bedc6d116a27",
+    "blob/linuxkit": "e57bb1779b348da7eae118a8e0a034d2aa4c28205c07db07dea8285ff206bb69",
+    "blob/nsm.ko": "6bd2b09422c2f2f58c6ecf1cfd55216bea9b99a6d591261a9eca40027291316b",
+    "binary/credential-enclave": "80995e407b0890ec41c3a2fe964feeaf856ab9fd07daf80e250bcc4a81f8fd76"
+  }
+}

@@ -5,14 +5,34 @@
 //! the bytes between the node and a TCP connection to that host, or it answers `ERR\n` and
 //! closes. TLS ends inside the node: the relay sees ciphertext only.
 //!
-//! The relay connects to port 443 of the hosts the provider definitions name, to the host of
-//! the log store when the environment names one, and the two fixed Naver mail endpoints.
-//! This list is a second
-//! line: the node itself sends credentials only to the addresses of its definitions, which are
-//! part of the measured binary, and log entries only to its log store.
+//! What the relay connects to depends on the role of the node of its pod ([`Reach`]).
+//!
+//! For a node of the delegation role the relay connects to port 443 of the hosts the provider
+//! definitions name, to the host of the log store when the environment names one, and the two
+//! fixed Naver mail endpoints. This list is a second line: the node itself sends credentials
+//! only to the addresses of its definitions, which are part of the measured binary, and log
+//! entries only to its log store.
+//!
+//! For a node of the reserve role the relay connects to port 443 of the host of the log store
+//! when the environment names one, and to nothing else: such a node uses no credential, so it
+//! calls no provider and no mail endpoint, and what it writes is its node document and the
+//! entries of the commands and transfers it takes.
+//!
+//! For a node of the forward role the relay connects to port 443 of any host, at a public
+//! IPv4 address only. Such a node sends the value of a vault secret to the site the record of
+//! the secret names, a host the account chose, so no list names it. What the relay keeps the
+//! node from is the network of the operator: a name that resolves to a loopback, private,
+//! link local or otherwise special address (the addresses of the cluster, of the VPC and of
+//! the instance metadata service among them) is refused, and the relay connects to the
+//! address it checked.
+//!
+//! The relay holds at most [`relay::EGRESS_PIPES`] connections of the node at once: a
+//! connection above that is answered `ERR\n` without a provider connection. A connection it
+//! holds ends within the limits of a pipe ([`relay::pipe`]).
 
 use std::collections::BTreeSet;
 use std::io;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,7 +41,7 @@ use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpSocket;
 
-use crate::relay::{self, AcceptFailure, BoxFuture, Stream, VsockListener};
+use crate::relay::{self, AcceptFailure, BoxFuture, Pipes, Stream, VsockListener};
 
 /// The vsock port of the egress relay.
 pub const EGRESS_PORT: u32 = 8443;
@@ -64,6 +84,9 @@ fn host_of(address: &str) -> Option<&str> {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Allowlist {
     hosts: BTreeSet<String>,
+    /// True when the relay also connects to the two fixed Naver mail endpoints: the list of a
+    /// node that calls providers.
+    mail: bool,
 }
 
 impl Allowlist {
@@ -108,11 +131,22 @@ impl Allowlist {
                 }
             }
         }
-        Ok(Allowlist { hosts })
+        Ok(Allowlist { hosts, mail: true })
     }
 
-    /// The list with the host of the log store of the node added:
-    /// `{bucket}.s3.{region}.amazonaws.com`.
+    /// The list of a node that calls no provider: no host of a definition and no mail
+    /// endpoint. With the host of the log store ([`Allowlist::with_log_store`]) it is the
+    /// list of a node of the reserve role.
+    pub fn without_providers() -> Allowlist {
+        Allowlist {
+            hosts: BTreeSet::new(),
+            mail: false,
+        }
+    }
+
+    /// The list with the host of the log store of the node added: the endpoint of Amazon S3 in
+    /// the region of the store, `s3.{region}.amazonaws.com`, which the node writes every
+    /// bucket of its log store through.
     pub fn with_log_store(mut self, host: String) -> Allowlist {
         self.hosts.insert(host);
         self
@@ -121,16 +155,120 @@ impl Allowlist {
     /// True when the relay connects to `host:port`.
     pub fn allows(&self, host: &str, port: u16) -> bool {
         (port == PROVIDER_PORT && self.hosts.contains(host))
-            || matches!(
-                (host, port),
-                ("imap.naver.com", 993) | ("smtp.naver.com", 465)
-            )
+            || (self.mail
+                && matches!(
+                    (host, port),
+                    ("imap.naver.com", 993) | ("smtp.naver.com", 465)
+                ))
     }
 
     /// The number of HTTP hosts, excluding the two fixed mail endpoints.
     pub fn len(&self) -> usize {
         self.hosts.len()
     }
+}
+
+/// What the relay connects to (enclave.md section 9). The role of the node of the pod decides
+/// it, and it does not change while the host program runs.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Reach {
+    /// The relay of a node that holds delegations: port 443 of the hosts of the list. For a
+    /// node of the delegation role the list holds the provider hosts and the log store, and
+    /// the relay connects to the two mail endpoints as well. For a node of the reserve role
+    /// the list holds the log store alone.
+    Listed(Allowlist),
+    /// The relay of a node of the forward role: port 443 of any host, at a public IPv4
+    /// address.
+    PublicHosts,
+}
+
+/// Which addresses of a host the relay connects to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Addresses {
+    /// Every address the name of a listed host resolves to.
+    Any,
+    /// The public IPv4 addresses the name resolves to ([`is_public`]), and no other one.
+    Public,
+}
+
+impl Reach {
+    /// Whether the relay connects to `host:port`, and to which of its addresses. `None` for
+    /// a target the relay refuses before it looks the name up.
+    ///
+    /// The relay of a node of the forward role takes port 443 of a DNS name of two labels or
+    /// more whose last label begins with a letter, the form a node gives the host of a site
+    /// (protocol.md section 6): a text in the form of an IP address, in any notation of its
+    /// numbers, is no name of a site, and a name of one label is a name of the network of the
+    /// pod.
+    pub fn of(&self, host: &str, port: u16) -> Option<Addresses> {
+        match self {
+            Reach::Listed(allowlist) => allowlist.allows(host, port).then_some(Addresses::Any),
+            Reach::PublicHosts => {
+                let last = host.rsplit('.').next().unwrap_or_default();
+                let named = host.contains('.')
+                    && last
+                        .bytes()
+                        .next()
+                        .is_some_and(|byte| byte.is_ascii_lowercase());
+                (port == PROVIDER_PORT && named).then_some(Addresses::Public)
+            }
+        }
+    }
+
+    /// Why a target is refused, for the line of the log.
+    fn refusal(&self) -> &'static str {
+        match self {
+            Reach::Listed(_) => "not a host of the list",
+            Reach::PublicHosts => "not port 443 of a host at a public address",
+        }
+    }
+}
+
+/// True for an IPv4 address of the public internet: an address outside the ranges the IANA
+/// special-purpose registry reserves.
+fn is_public_v4(address: Ipv4Addr) -> bool {
+    let [first, second, third, _] = address.octets();
+    let special = match first {
+        // "This network", private use, loopback.
+        0 | 10 | 127 => true,
+        // Shared address space of carrier-grade NAT, 100.64.0.0/10.
+        100 => (64..=127).contains(&second),
+        // Link local, 169.254.0.0/16: the instance metadata service is here.
+        169 => second == 254,
+        // Private use, 172.16.0.0/12.
+        172 => (16..=31).contains(&second),
+        // 192.0.0.0/24 protocol assignments, 192.0.2.0/24 documentation, 192.88.99.0/24 the
+        // former 6to4 relays, 192.168.0.0/16 private use.
+        192 => matches!((second, third), (0, 0) | (0, 2) | (88, 99)) || second == 168,
+        // 198.18.0.0/15 benchmarking, 198.51.100.0/24 documentation.
+        198 => matches!(second, 18 | 19) || (second, third) == (51, 100),
+        // 203.0.113.0/24 documentation.
+        203 => (second, third) == (0, 113),
+        // Multicast, reserved, broadcast.
+        224..=255 => true,
+        _ => false,
+    };
+    !special
+}
+
+/// True for an address the relay of a node of the forward role connects to: a public IPv4
+/// address.
+///
+/// The relay connects to no IPv6 address. A global IPv6 address may be an address of the
+/// network of the operator itself (the IPv6 range of a VPC is a range of global addresses),
+/// and nothing in an address tells the two apart.
+pub fn is_public(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(v4) => is_public_v4(v4),
+        IpAddr::V6(_) => false,
+    }
+}
+
+/// The addresses of `resolved` the relay connects to, in their order.
+fn chosen(resolved: impl Iterator<Item = SocketAddr>, addresses: Addresses) -> Vec<SocketAddr> {
+    resolved
+        .filter(|address| addresses == Addresses::Any || is_public(address.ip()))
+        .collect()
 }
 
 /// Reads the target of a first line (without its line end). The line is exactly
@@ -153,30 +291,66 @@ pub fn parse_connect(line: &[u8]) -> Option<(&str, u16)> {
     Some((host, port.parse().ok()?))
 }
 
-/// Opens connections to providers.
+/// Why no connection to a host was opened.
+#[derive(Debug)]
+pub enum ConnectFailure {
+    /// The name resolved, and none of its addresses is one the relay connects to: every one
+    /// of them is outside the public internet.
+    NotPublic,
+    /// The name lookup or the connection failed.
+    Io(io::Error),
+}
+
+impl From<io::Error> for ConnectFailure {
+    fn from(error: io::Error) -> ConnectFailure {
+        ConnectFailure::Io(error)
+    }
+}
+
+/// Opens connections to providers and to sites.
 pub trait Outbound: Send + Sync + 'static {
-    /// Opens a byte pipe to `host:port`.
-    fn connect<'a>(&'a self, host: &'a str, port: u16) -> BoxFuture<'a, io::Result<Stream>>;
+    /// Opens a byte pipe to `host:port`, at one of the addresses `addresses` admits.
+    fn connect<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+        addresses: Addresses,
+    ) -> BoxFuture<'a, Result<Stream, ConnectFailure>>;
 }
 
 /// TCP connections with the name lookup of the parent instance.
 pub struct TcpOutbound;
 
 impl Outbound for TcpOutbound {
-    fn connect<'a>(&'a self, host: &'a str, port: u16) -> BoxFuture<'a, io::Result<Stream>> {
+    fn connect<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+        addresses: Addresses,
+    ) -> BoxFuture<'a, Result<Stream, ConnectFailure>> {
         Box::pin(async move {
+            // The name of a site is looked up as the name it is, from the root: the search
+            // list of the pod would try it as a name inside the cluster first.
+            let resolved: Vec<SocketAddr> = match addresses {
+                Addresses::Any => tokio::net::lookup_host((host, port)).await?.collect(),
+                Addresses::Public => tokio::net::lookup_host((format!("{host}."), port))
+                    .await?
+                    .collect(),
+            };
+            // The relay connects to an address it checked: the name is not looked up again.
+            let admitted = chosen(resolved.iter().copied(), addresses);
+            if admitted.is_empty() && !resolved.is_empty() {
+                return Err(ConnectFailure::NotPublic);
+            }
             let mut last_error = io::Error::from(io::ErrorKind::NotFound);
-            for address in tokio::net::lookup_host((host, port)).await? {
+            for address in admitted {
                 let socket = if address.is_ipv4() {
                     TcpSocket::new_v4()
                 } else {
                     TcpSocket::new_v6()
                 };
                 let connected = match socket {
-                    Ok(socket) => match socket.set_keepalive(true) {
-                        Ok(()) => socket.connect(address).await,
-                        Err(error) => Err(error),
-                    },
+                    Ok(socket) => socket.connect(address).await,
                     Err(error) => Err(error),
                 };
                 match connected {
@@ -187,7 +361,7 @@ impl Outbound for TcpOutbound {
                     Err(error) => last_error = error,
                 }
             }
-            Err(last_error)
+            Err(ConnectFailure::Io(last_error))
         })
     }
 }
@@ -199,17 +373,28 @@ pub enum Outcome {
     Relayed,
     /// The first line was not a `CONNECT` line, was too long or did not arrive in time.
     Malformed,
-    /// The target is not port 443 of a host of the list.
+    /// The relay does not connect to the target: it is not port 443 of a host of the list
+    /// or, for the relay of a node of the forward role, not port 443 of a host at a public
+    /// address.
     NotAllowed(String),
     /// The provider could not be reached: the host and the failure of the name lookup or of the
     /// connection.
     Unreachable(String, String),
+    /// The relay held [`relay::EGRESS_PIPES`] connections of the node: the target is on the
+    /// list and was not dialed.
+    OverLimit,
 }
 
 impl Outcome {
     /// The values of the `outcome` label of `credential_enclave_host_egress_relays_total`, in
     /// the order of the variants.
-    pub const LABELS: [&'static str; 4] = ["relayed", "malformed", "not_allowed", "unreachable"];
+    pub const LABELS: [&'static str; 5] = [
+        "relayed",
+        "malformed",
+        "not_allowed",
+        "unreachable",
+        "over_limit",
+    ];
 
     /// The position of the outcome in [`Outcome::LABELS`].
     fn index(&self) -> usize {
@@ -218,66 +403,78 @@ impl Outcome {
             Outcome::Malformed => 1,
             Outcome::NotAllowed(_) => 2,
             Outcome::Unreachable(..) => 3,
+            Outcome::OverLimit => 4,
         }
     }
 }
 
-/// The counts of the egress relay since the host program started. The relay writes them and
-/// the status surface reads them for `/metrics` (enclave.md section 9).
-#[derive(Debug, Default)]
+/// The counts of the egress relay since the host program started, and the connections it
+/// holds. The relay writes them and the status surface reads them for `/metrics` (enclave.md
+/// section 9).
+#[derive(Debug)]
 pub struct EgressCounters {
     /// Failed accepts by class, in the order of [`AcceptFailure::ALL`].
     accept_errors: [AtomicU64; 3],
     /// Served connections of the node by outcome, in the order of [`Outcome::LABELS`].
-    relays: [AtomicU64; 4],
-    /// Connections whose bytes the relay moves at this moment.
-    relays_inflight: AtomicU64,
+    relays: [AtomicU64; 5],
+    /// The connections of the node the relay holds, at most [`relay::EGRESS_PIPES`]: those it
+    /// opens a provider connection for and those whose bytes it moves.
+    pipes: Arc<Pipes>,
+}
+
+impl Default for EgressCounters {
+    fn default() -> EgressCounters {
+        EgressCounters::holding(relay::EGRESS_PIPES)
+    }
 }
 
 impl EgressCounters {
+    /// The counts of a relay that holds at most `limit` connections of the node at once.
+    pub fn holding(limit: usize) -> EgressCounters {
+        EgressCounters {
+            accept_errors: Default::default(),
+            relays: Default::default(),
+            pipes: Pipes::new(limit),
+        }
+    }
+
     fn count_accept_error(&self, failure: AcceptFailure) {
-        self.accept_errors[failure as usize].fetch_add(1, Ordering::Relaxed);
+        // One counter per class, in the order of the classes.
+        if let Some(count) = self.accept_errors.get(failure as usize) {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn count_relay(&self, outcome: &Outcome) {
-        self.relays[outcome.index()].fetch_add(1, Ordering::Relaxed);
+        // One counter per outcome, in the order of the labels.
+        if let Some(count) = self.relays.get(outcome.index()) {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// The failed accepts by class: the value of the `cause` label and the count.
     pub fn accept_errors(&self) -> [(&'static str, u64); 3] {
-        std::array::from_fn(|index| {
-            let count = self.accept_errors[index].load(Ordering::Relaxed);
-            (AcceptFailure::ALL[index].label(), count)
+        let mut classes = AcceptFailure::ALL.iter().zip(&self.accept_errors);
+        std::array::from_fn(|_| {
+            classes.next().map_or(("", 0), |(class, count)| {
+                (class.label(), count.load(Ordering::Relaxed))
+            })
         })
     }
 
     /// The served connections by outcome: the value of the `outcome` label and the count.
-    pub fn relays(&self) -> [(&'static str, u64); 4] {
-        std::array::from_fn(|index| {
-            let count = self.relays[index].load(Ordering::Relaxed);
-            (Outcome::LABELS[index], count)
+    pub fn relays(&self) -> [(&'static str, u64); 5] {
+        let mut outcomes = Outcome::LABELS.iter().zip(&self.relays);
+        std::array::from_fn(|_| {
+            outcomes.next().map_or(("", 0), |(label, count)| {
+                (*label, count.load(Ordering::Relaxed))
+            })
         })
     }
 
-    /// The connections whose bytes the relay moves at this moment.
-    pub fn relays_inflight(&self) -> u64 {
-        self.relays_inflight.load(Ordering::Relaxed)
-    }
-}
-
-/// Holds one unit of `relays_inflight` while a pipe moves bytes.
-struct Inflight<'a>(&'a AtomicU64);
-
-impl<'a> Inflight<'a> {
-    fn new(gauge: &'a AtomicU64) -> Inflight<'a> {
-        gauge.fetch_add(1, Ordering::Relaxed);
-        Inflight(gauge)
-    }
-}
-
-impl Drop for Inflight<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+    /// The connections of the node the relay holds, and how its pipes ended.
+    pub fn pipes(&self) -> &Pipes {
+        &self.pipes
     }
 }
 
@@ -309,26 +506,27 @@ where
     outcome
 }
 
-/// Serves one connection of the node: reads the `CONNECT` line, checks the target against the
-/// list, opens the provider connection, answers and relays. The outcome is counted, and the
-/// connection holds one unit of the inflight gauge while its bytes move.
+/// Serves one connection of the node: reads the `CONNECT` line, checks the target against
+/// what the relay connects to, takes a place among the connections the relay holds, opens the
+/// connection, answers and relays. The outcome is counted, and the connection holds its place
+/// from the check of its target until its pipe has ended.
 pub async fn relay<S>(
     inbound: S,
-    allowlist: &Allowlist,
+    reach: &Reach,
     outbound: &dyn Outbound,
     counters: &EgressCounters,
 ) -> Outcome
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let outcome = serve_connection(inbound, allowlist, outbound, counters).await;
+    let outcome = serve_connection(inbound, reach, outbound, counters).await;
     counters.count_relay(&outcome);
     outcome
 }
 
 async fn serve_connection<S>(
     mut inbound: S,
-    allowlist: &Allowlist,
+    reach: &Reach,
     outbound: &dyn Outbound,
     counters: &EgressCounters,
 ) -> Outcome
@@ -342,14 +540,23 @@ where
     let Some((host, port)) = parse_connect(&line) else {
         return refuse(inbound, Outcome::Malformed).await;
     };
-    if !allowlist.allows(host, port) {
+    let Some(addresses) = reach.of(host, port) else {
         return refuse(inbound, Outcome::NotAllowed(format!("{host}:{port}"))).await;
-    }
-    let provider =
-        tokio::time::timeout(PROVIDER_CONNECT_TIMEOUT, outbound.connect(host, port)).await;
+    };
+    let Some(place) = counters.pipes.admit() else {
+        return refuse(inbound, Outcome::OverLimit).await;
+    };
+    let provider = tokio::time::timeout(
+        PROVIDER_CONNECT_TIMEOUT,
+        outbound.connect(host, port, addresses),
+    )
+    .await;
     let provider = match provider {
         Ok(Ok(provider)) => provider,
-        Ok(Err(error)) => {
+        Ok(Err(ConnectFailure::NotPublic)) => {
+            return refuse(inbound, Outcome::NotAllowed(format!("{host}:{port}"))).await;
+        }
+        Ok(Err(ConnectFailure::Io(error))) => {
             let outcome = Outcome::Unreachable(host.to_string(), error.to_string());
             return refuse(inbound, outcome).await;
         }
@@ -361,17 +568,20 @@ where
     if inbound.write_all(REPLY_OK).await.is_err() || inbound.flush().await.is_err() {
         return Outcome::Relayed;
     }
-    let _inflight = Inflight::new(&counters.relays_inflight);
-    relay::pipe(inbound, provider).await;
+    // What the node still sends to a provider that closed stays unread: the node learns of
+    // the close from the end of the connection, and nobody waits for a reply to those bytes.
+    relay::pipe(inbound, provider, &place, relay::Relay::Egress).await;
     Outcome::Relayed
 }
 
-/// The egress relay: serves every connection of `listener`. A refused connection leaves one
-/// line in the output of the host program. A failed accept is counted by its class, and the
-/// next accept follows at once or after a pause as the class asks (`relay::AcceptFailure`).
+/// The egress relay: serves every connection of `listener`. A connection refused for its
+/// line, its target or its provider leaves one line in the output of the host program; a
+/// connection refused because the relay holds its limit is counted only. A failed accept is
+/// counted by its class, and the next accept follows at once or after a pause as the class
+/// asks (`relay::AcceptFailure`).
 pub async fn serve(
     listener: VsockListener,
-    allowlist: Arc<Allowlist>,
+    reach: Arc<Reach>,
     outbound: Arc<dyn Outbound>,
     counters: Arc<EgressCounters>,
 ) {
@@ -385,17 +595,17 @@ pub async fn serve(
                 continue;
             }
         };
-        let allowlist = allowlist.clone();
+        let reach = reach.clone();
         let outbound = outbound.clone();
         let counters = counters.clone();
         tokio::spawn(async move {
-            match relay(inbound, &allowlist, outbound.as_ref(), &counters).await {
-                Outcome::Relayed => {}
+            match relay(inbound, &reach, outbound.as_ref(), &counters).await {
+                Outcome::Relayed | Outcome::OverLimit => {}
                 Outcome::Malformed => {
                     crate::log("egress: refused a connection without a valid CONNECT line");
                 }
                 Outcome::NotAllowed(target) => {
-                    crate::log(&format!("egress: refused {target}: not a host of the list"));
+                    crate::log(&format!("egress: refused {target}: {}", reach.refusal()));
                 }
                 Outcome::Unreachable(host, reason) => {
                     crate::log(&format!("egress: cannot reach {host}: {reason}"));
@@ -435,12 +645,21 @@ mod tests {
         Allowlist::from_definitions(DEFINITIONS).unwrap()
     }
 
+    /// The reach of the relay of a node of the delegation role.
+    fn listed() -> Reach {
+        Reach::Listed(allowlist())
+    }
+
     /// A provider stand-in: every connection is one end of an in-memory pipe, and the test
     /// holds the other end.
     #[derive(Default)]
     struct Providers {
         reachable: bool,
+        /// The hosts whose names resolve to addresses outside the public internet.
+        private: Vec<&'static str>,
         dialed: Mutex<Vec<(String, u16)>>,
+        /// The addresses the relay asked for, per connection.
+        asked: Mutex<Vec<Addresses>>,
         far_ends: Mutex<Vec<DuplexStream>>,
     }
 
@@ -450,6 +669,19 @@ mod tests {
                 reachable: true,
                 ..Providers::default()
             }
+        }
+
+        /// Reachable hosts, of which `private` resolve to addresses of a private network.
+        fn with_private(private: &[&'static str]) -> Providers {
+            Providers {
+                reachable: true,
+                private: private.to_vec(),
+                ..Providers::default()
+            }
+        }
+
+        fn asked(&self) -> Vec<Addresses> {
+            self.asked.lock().unwrap().clone()
         }
 
         fn dialed(&self) -> Vec<(String, u16)> {
@@ -462,11 +694,20 @@ mod tests {
     }
 
     impl Outbound for Providers {
-        fn connect<'a>(&'a self, host: &'a str, port: u16) -> BoxFuture<'a, io::Result<Stream>> {
+        fn connect<'a>(
+            &'a self,
+            host: &'a str,
+            port: u16,
+            addresses: Addresses,
+        ) -> BoxFuture<'a, Result<Stream, ConnectFailure>> {
             Box::pin(async move {
                 self.dialed.lock().unwrap().push((host.to_string(), port));
+                self.asked.lock().unwrap().push(addresses);
+                if addresses == Addresses::Public && self.private.contains(&host) {
+                    return Err(ConnectFailure::NotPublic);
+                }
                 if !self.reachable {
-                    return Err(io::Error::from(io::ErrorKind::ConnectionRefused));
+                    return Err(io::Error::from(io::ErrorKind::ConnectionRefused).into());
                 }
                 let (near, far) = tokio::io::duplex(1024);
                 self.far_ends.lock().unwrap().push(far);
@@ -486,7 +727,16 @@ mod tests {
     async fn refused(first_bytes: &[u8], providers: &Providers) -> (Vec<u8>, Outcome) {
         let (mut node, inbound) = tokio::io::duplex(1024);
         node.write_all(first_bytes).await.unwrap();
-        let outcome = relay(inbound, &allowlist(), providers, &EgressCounters::default()).await;
+        let outcome = relay(inbound, &listed(), providers, &EgressCounters::default()).await;
+        (read_all(&mut node).await, outcome)
+    }
+
+    /// The same for the relay of a node of the forward role.
+    async fn refused_in_the_open(first_bytes: &[u8], providers: &Providers) -> (Vec<u8>, Outcome) {
+        let (mut node, inbound) = tokio::io::duplex(1024);
+        node.write_all(first_bytes).await.unwrap();
+        let counters = EgressCounters::default();
+        let outcome = relay(inbound, &Reach::PublicHosts, providers, &counters).await;
         (read_all(&mut node).await, outcome)
     }
 
@@ -523,20 +773,53 @@ mod tests {
 
     #[test]
     fn the_host_of_the_log_store_is_added_to_the_list() {
-        let host = "character-credential-log-dev-1.s3.us-west-2.amazonaws.com";
+        let host = "s3.us-west-2.amazonaws.com";
         assert!(!allowlist().allows(host, 443));
         let list = allowlist().with_log_store(host.to_string());
         assert_eq!(list.len(), 7);
         assert!(list.allows(host, 443));
         assert!(list.allows("api.first.example", 443));
-        // That host only: no other bucket, no other region, no other port.
-        assert!(!list.allows("another-bucket.s3.us-west-2.amazonaws.com", 443));
+        // That host only: no host of one bucket, no other region, no other port.
         assert!(!list.allows(
-            "character-credential-log-dev-1.s3.eu-west-1.amazonaws.com",
+            "character-credential-log-dev-1.s3.us-west-2.amazonaws.com",
             443
         ));
-        assert!(!list.allows("s3.us-west-2.amazonaws.com", 443));
+        assert!(!list.allows("s3.eu-west-1.amazonaws.com", 443));
+        assert!(!list.allows("s3.amazonaws.com", 443));
         assert!(!list.allows(host, 80));
+    }
+
+    #[test]
+    fn the_list_of_a_node_of_the_reserve_role_holds_the_log_store_alone() {
+        let host = "s3.us-west-2.amazonaws.com";
+        let list = Allowlist::without_providers().with_log_store(host.to_string());
+        assert_eq!(list.len(), 1);
+        assert!(list.allows(host, 443));
+        assert!(!list.allows(host, 80));
+        // No host of a provider definition, no mail endpoint, and no bucket of the store by
+        // its own name.
+        let providers = allowlist();
+        for provider in &providers.hosts {
+            assert!(providers.allows(provider, 443), "{provider}");
+            assert!(!list.allows(provider, 443), "{provider}");
+        }
+        assert!(providers.allows("imap.naver.com", 993) && providers.allows("smtp.naver.com", 465));
+        assert!(!list.allows("imap.naver.com", 993));
+        assert!(!list.allows("smtp.naver.com", 465));
+        assert!(!list.allows(
+            "character-credential-log-dev-1.s3.us-west-2.amazonaws.com",
+            443
+        ));
+        let reach = Reach::Listed(list);
+        assert_eq!(reach.of(host, 443), Some(Addresses::Any));
+        assert_eq!(reach.of("oauth2.googleapis.com", 443), None);
+        assert_eq!(reach.of("example.com", 443), None);
+        // A pod of the reserve role without a log store in its environment: the relay
+        // connects to nothing.
+        let nothing = Allowlist::without_providers();
+        assert_eq!(nothing.len(), 0);
+        assert!(!nothing.allows(host, 443));
+        assert!(!nothing.allows("imap.naver.com", 993));
     }
 
     #[test]
@@ -626,9 +909,9 @@ mod tests {
         let (mut node, inbound) = tokio::io::duplex(1024);
         let relayed = {
             let (providers, counters) = (providers.clone(), counters.clone());
-            tokio::spawn(async move {
-                relay(inbound, &allowlist(), providers.as_ref(), &counters).await
-            })
+            tokio::spawn(
+                async move { relay(inbound, &listed(), providers.as_ref(), &counters).await },
+            )
         };
 
         // The node sends the line and, right behind it, the first bytes for the provider.
@@ -645,10 +928,10 @@ mod tests {
         let mut buffer = [0u8; 12];
         provider.read_exact(&mut buffer).await.unwrap();
         assert_eq!(&buffer, b"client hello");
-        // The bytes move: the connection holds one unit of the inflight gauge, and the outcome
-        // is not counted yet.
-        assert_eq!(counters.relays_inflight(), 1);
-        assert_eq!(counters.relays().map(|(_, count)| count), [0, 0, 0, 0]);
+        // The bytes move: the connection holds one place of the relay, and the outcome is not
+        // counted yet.
+        assert_eq!(counters.pipes().held(), 1);
+        assert_eq!(counters.relays().map(|(_, count)| count), [0, 0, 0, 0, 0]);
 
         provider.write_all(b"server hello").await.unwrap();
         node.read_exact(&mut buffer).await.unwrap();
@@ -660,14 +943,89 @@ mod tests {
         node.shutdown().await.unwrap();
         assert_eq!(read_all(&mut provider).await, b"");
         assert_eq!(relayed.await.unwrap(), Outcome::Relayed);
-        assert_eq!(counters.relays_inflight(), 0);
+        assert_eq!(counters.pipes().held(), 0);
         assert_eq!(
             counters.relays(),
             [
                 ("relayed", 1),
                 ("malformed", 0),
                 ("not_allowed", 0),
-                ("unreachable", 0)
+                ("unreachable", 0),
+                ("over_limit", 0)
+            ]
+        );
+        assert_eq!(
+            counters.pipes().ended(),
+            [
+                ("closed", 1),
+                ("failed", 0),
+                ("idle", 0),
+                ("half_closed", 0)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connection_above_the_limit_of_the_relay_is_answered_err_and_never_dialed() {
+        let providers = Arc::new(Providers::reachable());
+        let counters = Arc::new(EgressCounters::holding(1));
+        let (mut node, inbound) = tokio::io::duplex(1024);
+        let relayed = {
+            let (providers, counters) = (providers.clone(), counters.clone());
+            tokio::spawn(
+                async move { relay(inbound, &listed(), providers.as_ref(), &counters).await },
+            )
+        };
+        node.write_all(b"CONNECT api.first.example:443\n")
+            .await
+            .unwrap();
+        let mut reply = [0u8; 3];
+        node.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"OK\n");
+        assert_eq!(counters.pipes().held(), 1);
+
+        // The relay holds its one connection: the next one is refused with the answer of a
+        // target the relay does not connect to, and no provider is dialed for it.
+        let (mut second, inbound) = tokio::io::duplex(1024);
+        second
+            .write_all(b"CONNECT api.second.example:443\n")
+            .await
+            .unwrap();
+        let outcome = relay(inbound, &listed(), providers.as_ref(), &counters).await;
+        assert_eq!(outcome, Outcome::OverLimit);
+        assert_eq!(read_all(&mut second).await, b"ERR\n");
+        assert_eq!(providers.dialed(), [("api.first.example".to_string(), 443)]);
+        assert_eq!(counters.pipes().held(), 1);
+
+        // The first connection ends: its place is free.
+        let mut provider = providers.take_far_end();
+        provider.shutdown().await.unwrap();
+        node.shutdown().await.unwrap();
+        assert_eq!(relayed.await.unwrap(), Outcome::Relayed);
+        assert_eq!(counters.pipes().held(), 0);
+        let (mut third, inbound) = tokio::io::duplex(1024);
+        third
+            .write_all(b"CONNECT api.second.example:443\n")
+            .await
+            .unwrap();
+        let relayed = {
+            let (providers, counters) = (providers.clone(), counters.clone());
+            tokio::spawn(
+                async move { relay(inbound, &listed(), providers.as_ref(), &counters).await },
+            )
+        };
+        third.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"OK\n");
+        drop((third, providers.take_far_end()));
+        assert_eq!(relayed.await.unwrap(), Outcome::Relayed);
+        assert_eq!(
+            counters.relays(),
+            [
+                ("relayed", 2),
+                ("malformed", 0),
+                ("not_allowed", 0),
+                ("unreachable", 0),
+                ("over_limit", 1)
             ]
         );
     }
@@ -687,7 +1045,7 @@ mod tests {
         ] {
             let (mut node, inbound) = tokio::io::duplex(1024);
             node.write_all(line).await.unwrap();
-            relay(inbound, &allowlist(), providers, &counters).await;
+            relay(inbound, &listed(), providers, &counters).await;
         }
         assert_eq!(
             counters.relays(),
@@ -695,10 +1053,11 @@ mod tests {
                 ("relayed", 0),
                 ("malformed", 1),
                 ("not_allowed", 2),
-                ("unreachable", 3)
+                ("unreachable", 3),
+                ("over_limit", 0)
             ]
         );
-        assert_eq!(counters.relays_inflight(), 0);
+        assert_eq!(counters.pipes().held(), 0);
         assert_eq!(
             counters.accept_errors(),
             [("aborted", 0), ("resources", 0), ("other", 0)]
@@ -766,13 +1125,7 @@ mod tests {
         node.write_all(b"CONNECT api.first.exam").await.unwrap();
         node.shutdown().await.unwrap();
         assert_eq!(
-            relay(
-                inbound,
-                &allowlist(),
-                &providers,
-                &EgressCounters::default()
-            )
-            .await,
+            relay(inbound, &listed(), &providers, &EgressCounters::default()).await,
             Outcome::Malformed
         );
         assert!(providers.dialed().is_empty());
@@ -785,13 +1138,7 @@ mod tests {
         node.write_all(b"CONNECT api.first.example:443")
             .await
             .unwrap();
-        let outcome = relay(
-            inbound,
-            &allowlist(),
-            &providers,
-            &EgressCounters::default(),
-        )
-        .await;
+        let outcome = relay(inbound, &listed(), &providers, &EgressCounters::default()).await;
         assert_eq!(outcome, Outcome::Malformed);
         assert_eq!(read_all(&mut node).await, b"ERR\n");
     }
@@ -815,7 +1162,12 @@ mod tests {
     struct Hanging;
 
     impl Outbound for Hanging {
-        fn connect<'a>(&'a self, _host: &'a str, _port: u16) -> BoxFuture<'a, io::Result<Stream>> {
+        fn connect<'a>(
+            &'a self,
+            _host: &'a str,
+            _port: u16,
+            _addresses: Addresses,
+        ) -> BoxFuture<'a, Result<Stream, ConnectFailure>> {
             Box::pin(std::future::pending())
         }
     }
@@ -827,7 +1179,7 @@ mod tests {
             .await
             .unwrap();
         let started = tokio::time::Instant::now();
-        let outcome = relay(inbound, &allowlist(), &Hanging, &EgressCounters::default()).await;
+        let outcome = relay(inbound, &listed(), &Hanging, &EgressCounters::default()).await;
         assert!(started.elapsed() >= PROVIDER_CONNECT_TIMEOUT);
         assert_eq!(
             outcome,
@@ -839,6 +1191,214 @@ mod tests {
         assert_eq!(read_all(&mut node).await, b"ERR\n");
     }
 
+    #[test]
+    fn the_relay_of_a_forward_node_takes_port_443_of_a_named_host() {
+        let reach = Reach::PublicHosts;
+        for host in [
+            "api.openai.com",
+            "example.com",
+            "a-b.c9.example",
+            // A name is judged by the addresses it resolves to, when the relay looks it up.
+            "metadata.google.internal",
+            "kubernetes.default.svc.cluster.local",
+        ] {
+            assert_eq!(reach.of(host, 443), Some(Addresses::Public), "{host}");
+        }
+        for (host, port) in [
+            // Port 443 only: no other port of a site, and no mail endpoint.
+            ("example.com", 80),
+            ("example.com", 8443),
+            ("example.com", 0),
+            ("imap.naver.com", 993),
+            ("smtp.naver.com", 465),
+            // No name of one label, and no IP address.
+            ("localhost", 443),
+            ("kubernetes", 443),
+            ("169.254.169.254", 443),
+            ("10.0.0.1", 443),
+            ("127.0.0.1", 443),
+            ("1.1.1.1", 443),
+            ("example.123", 443),
+        ] {
+            assert_eq!(reach.of(host, port), None, "{host}:{port}");
+        }
+        // The relay of a node of the delegation role takes the hosts of its list, at every
+        // address their names resolve to, and the two mail endpoints.
+        assert_eq!(listed().of("api.first.example", 443), Some(Addresses::Any));
+        assert_eq!(listed().of("imap.naver.com", 993), Some(Addresses::Any));
+        assert_eq!(listed().of("example.com", 443), None);
+    }
+
+    #[test]
+    fn a_public_address_is_an_ipv4_address_outside_the_special_ranges() {
+        for address in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "52.94.236.248",
+            "100.63.255.255",
+            "100.128.0.0",
+            "169.253.255.255",
+            "172.15.255.255",
+            "172.32.0.0",
+            "192.0.1.1",
+            "192.167.255.255",
+            "198.17.255.255",
+            "198.20.0.0",
+            "203.0.112.255",
+            "223.255.255.255",
+        ] {
+            assert!(is_public(address.parse().unwrap()), "{address}");
+        }
+        for address in [
+            // Loopback and "this network".
+            "127.0.0.1",
+            "127.255.255.254",
+            "0.0.0.0",
+            "0.1.2.3",
+            // Private use: the addresses of a cluster and of a VPC.
+            "10.0.0.1",
+            "10.255.255.255",
+            "172.16.0.1",
+            "172.20.0.10",
+            "172.31.255.255",
+            "192.168.0.1",
+            // The shared address space of carrier-grade NAT.
+            "100.64.0.1",
+            "100.127.255.255",
+            // Link local: the instance metadata service and the resolver of a VPC.
+            "169.254.169.254",
+            "169.254.169.253",
+            "169.254.170.2",
+            // Protocol assignments, documentation, benchmarking, the former 6to4 relays.
+            "192.0.0.1",
+            "192.0.2.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "198.18.0.1",
+            "198.19.255.255",
+            "192.88.99.1",
+            // Multicast, reserved, broadcast.
+            "224.0.0.1",
+            "239.255.255.255",
+            "240.0.0.1",
+            "255.255.255.255",
+            // No IPv6 address: a global one may be an address of the network of the operator,
+            // and the others are no addresses of a site.
+            "2606:4700:4700::1111",
+            "2a00:1450:4001:81b::200e",
+            "::1",
+            "::",
+            "fe80::1",
+            "fd00:ec2::254",
+            "::ffff:8.8.8.8",
+            "::ffff:10.0.0.1",
+            "64:ff9b::808:808",
+            "ff02::1",
+        ] {
+            assert!(!is_public(address.parse().unwrap()), "{address}");
+        }
+    }
+
+    #[test]
+    fn of_the_addresses_of_a_name_the_public_ones_are_chosen() {
+        let resolved: Vec<SocketAddr> = [
+            "10.0.0.5:443",
+            "93.184.216.34:443",
+            "[fd00:ec2::254]:443",
+            "[2606:2800:220:1::1]:443",
+            "169.254.169.254:443",
+            "151.101.1.69:443",
+        ]
+        .iter()
+        .map(|address| address.parse().unwrap())
+        .collect();
+        let public: Vec<String> = chosen(resolved.iter().copied(), Addresses::Public)
+            .iter()
+            .map(SocketAddr::to_string)
+            .collect();
+        assert_eq!(public, ["93.184.216.34:443", "151.101.1.69:443"]);
+        assert_eq!(chosen(resolved.iter().copied(), Addresses::Any), resolved);
+        // A name that resolves to no public address has no address the relay connects to.
+        let private = resolved.iter().copied().filter(|a| !is_public(a.ip()));
+        assert!(chosen(private, Addresses::Public).is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_relay_of_a_forward_node_connects_to_a_site_at_a_public_address() {
+        let providers = Arc::new(Providers::with_private(&["intranet.example"]));
+        let counters = Arc::new(EgressCounters::default());
+        let (mut node, inbound) = tokio::io::duplex(1024);
+        let relayed = {
+            let (providers, counters) = (providers.clone(), counters.clone());
+            tokio::spawn(async move {
+                relay(inbound, &Reach::PublicHosts, providers.as_ref(), &counters).await
+            })
+        };
+        // A host no list names: the site of a vault secret.
+        node.write_all(b"CONNECT api.site.example:443\nclient hello")
+            .await
+            .unwrap();
+        let mut reply = [0u8; 3];
+        node.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"OK\n");
+        assert_eq!(providers.dialed(), [("api.site.example".to_string(), 443)]);
+        // The relay asked for a public address of the name.
+        assert_eq!(providers.asked(), [Addresses::Public]);
+        let mut site = providers.take_far_end();
+        let mut buffer = [0u8; 12];
+        site.read_exact(&mut buffer).await.unwrap();
+        assert_eq!(&buffer, b"client hello");
+        site.shutdown().await.unwrap();
+        node.shutdown().await.unwrap();
+        assert_eq!(relayed.await.unwrap(), Outcome::Relayed);
+    }
+
+    #[tokio::test]
+    async fn the_relay_of_a_forward_node_refuses_what_is_not_a_site_at_a_public_address() {
+        let providers = Providers::with_private(&["intranet.example", "metadata.internal"]);
+        // A name that resolves to addresses of a private network: the relay looked it up and
+        // connected to none of them.
+        for host in ["intranet.example", "metadata.internal"] {
+            let line = format!("CONNECT {host}:443\n");
+            let (reply, outcome) = refused_in_the_open(line.as_bytes(), &providers).await;
+            assert_eq!(reply, b"ERR\n", "{host}");
+            assert_eq!(outcome, Outcome::NotAllowed(format!("{host}:443")));
+        }
+        assert_eq!(providers.dialed().len(), 2);
+        assert!(providers.far_ends.lock().unwrap().is_empty());
+        // A target the relay refuses before it looks a name up: another port, a mail
+        // endpoint, a name of one label, an IP address in any notation of its numbers, and a
+        // name whose last label does not begin with a letter.
+        for target in [
+            "api.site.example:80",
+            "api.site.example:8443",
+            "imap.naver.com:993",
+            "localhost:443",
+            "169.254.169.254:443",
+            "10.0.0.1:443",
+            "1.1.1.1:443",
+            "127.1:443",
+            "0x7f.0x0.0x0.0x1:443",
+            "0177.0.0.01:443",
+            "api.site.3xample:443",
+            "api.site.-example:443",
+        ] {
+            let line = format!("CONNECT {target}\n");
+            let (reply, outcome) = refused_in_the_open(line.as_bytes(), &providers).await;
+            assert_eq!(reply, b"ERR\n", "{target}");
+            assert_eq!(outcome, Outcome::NotAllowed(target.to_string()), "{target}");
+        }
+        assert_eq!(providers.dialed().len(), 2);
+        // The relay of a node of the delegation role keeps its list: a site is no host of it.
+        let (reply, outcome) = refused(b"CONNECT api.site.example:443\n", &providers).await;
+        assert_eq!(reply, b"ERR\n");
+        assert_eq!(
+            outcome,
+            Outcome::NotAllowed("api.site.example:443".to_string())
+        );
+        assert_eq!(providers.dialed().len(), 2);
+    }
+
     #[tokio::test]
     async fn the_tcp_outbound_connects_by_name() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -847,7 +1407,10 @@ mod tests {
             let (mut stream, _) = listener.accept().await.unwrap();
             stream.write_all(b"hello").await.unwrap();
         });
-        let mut stream = TcpOutbound.connect("localhost", port).await.unwrap();
+        let mut stream = TcpOutbound
+            .connect("localhost", port, Addresses::Any)
+            .await
+            .unwrap();
         let mut buffer = [0u8; 5];
         stream.read_exact(&mut buffer).await.unwrap();
         assert_eq!(&buffer, b"hello");

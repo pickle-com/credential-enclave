@@ -10,22 +10,25 @@
 //!   instead of the public roots.
 //!
 //! The same stand-in plays the log store when a test gives it a certificate for [`LOG_HOST`]:
-//! a node of these tests reaches Amazon S3 as it reaches a provider.
+//! a node of these tests reaches Amazon S3 as it reaches a provider. Every bucket of a log
+//! store is written through that one host, with the bucket as the first part of the path.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::http::{Method, Request, StatusCode};
+use axum::http::{Method, Request, Response, StatusCode};
 use axum::Router;
 use credential_enclave_protocol::app::{self, AccountKeys};
 use credential_enclave_protocol::encoding::{b64u, b64u_decode, to_json, verify, Signed};
 use credential_enclave_protocol::keys::{Binding, Custody};
-use credential_enclave_protocol::log::{chain_prefix, parse_object_key, EntryParts, ParsedKey};
+use credential_enclave_protocol::log::{parse_object_key_v3, EntryKey};
 use credential_enclave_protocol::record::{open_record, seal_record, Record};
+use credential_enclave_protocol::release::{ReleaseMeasurement, TransparencyLog};
+use credential_enclave_protocol::release_proofs::{Builder, ProofTrust, Repository};
 use credential_enclave_protocol::{limits, purpose};
 use hyper::body::Bytes;
 use hyper::service::Service;
@@ -40,12 +43,157 @@ use tokio_rustls::TlsAcceptor;
 use crate::api;
 use crate::clock::Clock;
 use crate::egress::Egress;
+use crate::faults::{self, Lock};
 use crate::frame;
-use crate::lineage::{Lineage, LOG_KEY_PEM, RELEASE_KEY_PEM};
+use crate::lineage::Lineage;
 use crate::platform::local::{kernel_random, local_document, system_time_ms};
 use crate::platform::{ConnectError, Listener, Measurement, Platform, PlatformError, Stream};
 use crate::providers::Definitions;
 use crate::state::{lock, Limits, Node};
+
+/// Release proofs of `protocol/vectors/release-proofs.json` (protocol.md section 9), with what
+/// the file says of them.
+pub struct ProofCase {
+    /// The proofs: the value of the key `release_proofs` of a call.
+    pub proofs: Value,
+    /// The measurement the proofs are verified for.
+    pub pcrs: [[u8; 48]; 3],
+    /// The release the statement of the proofs names. Empty for proofs that do not hold.
+    pub release: String,
+    /// What the proofs are verified with: the certificates, the log keys, the repository and
+    /// the build workflows of the trust the case names.
+    pub trust: ProofTrust,
+}
+
+/// The case `name` of `protocol/vectors/release-proofs.json`, whose trust is one of the
+/// file.
+pub fn proof_case(name: &str) -> ProofCase {
+    let vectors: Value =
+        serde_json::from_str(include_str!("../../protocol/vectors/release-proofs.json")).unwrap();
+    let case = vectors["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|case| case["name"] == name)
+        .unwrap_or_else(|| panic!("no case {name}"));
+    let stated = &vectors["trusts"][case["trust"].as_str().unwrap()];
+    let bytes = |value: &Value| b64u_decode(value.as_str().unwrap()).unwrap();
+    let text = |value: &Value| value.as_str().unwrap().to_string();
+    let trust = ProofTrust::new(
+        &bytes(&stated["fulcio_root"]),
+        &bytes(&stated["fulcio_intermediate"]),
+        stated["log_keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|key| TransparencyLog::rekor_v1(&bytes(key)).unwrap())
+            .collect(),
+        Repository {
+            address: text(&stated["repository"]),
+            id: text(&stated["repository_id"]),
+            owner_id: text(&stated["owner_id"]),
+        },
+        stated["builders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|builder| {
+                Builder::new(
+                    builder["workflow"].as_str().unwrap(),
+                    builder["commit"].as_str().unwrap(),
+                )
+                .unwrap()
+            })
+            .collect(),
+    )
+    .unwrap();
+    let pcr = |key: &str| -> [u8; 48] {
+        let text = case["measurement"][key].as_str().unwrap();
+        let digits: Vec<u8> = (0..text.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap())
+            .collect();
+        digits.try_into().unwrap()
+    };
+    ProofCase {
+        proofs: serde_json::from_str(case["release_proofs_text"].as_str().unwrap()).unwrap(),
+        pcrs: [pcr("pcr0"), pcr("pcr1"), pcr("pcr2")],
+        release: case["release"].as_str().unwrap_or_default().to_string(),
+        trust,
+    }
+}
+
+/// A lock of a test: the state of a stand-in or of a test platform, behind a plain mutex. A
+/// test whose thread panicked under one goes on reading what the lock guards. The node program
+/// has no lock of this kind: its locks are those of `crate::faults::Lock`.
+impl<T> Lock for Mutex<T> {
+    type State = T;
+
+    fn acquire(&self) -> MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// What a test panics with on purpose, inside the node: the test platform raises it at the
+/// place a test asked for ([`TestPlatform::fault_at_draw`], [`TestPlatform::fault_attestation`]).
+pub struct ScriptedFault;
+
+/// Makes this test process count its panics as a node does (`faults::count_panic`), and keeps
+/// the faults the tests script out of the test output. Every other panic is reported as
+/// before: the failure of a test still says where it failed.
+pub fn quiet_panics() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let report = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic| {
+            faults::count_panic();
+            if !panic.payload().is::<ScriptedFault>() {
+                report(panic);
+            }
+        }));
+    });
+}
+
+/// The environment variable that tells a test that it runs in a process of its own
+/// ([`in_own_process`]), and which part of the test that process is to run.
+pub const OWN_PROCESS: &str = "CREDENTIAL_ENCLAVE_TEST_OWN_PROCESS";
+
+/// How a process ended.
+#[derive(Debug)]
+pub struct Ended {
+    /// The exit status of a process that returned one.
+    pub code: Option<i32>,
+    /// The signal that ended a process that returned none.
+    pub signal: Option<i32>,
+    /// What the process wrote to its standard error.
+    pub stderr: String,
+}
+
+impl Ended {
+    /// True for a process that ended itself without unwinding: `abort` raises `SIGABRT`,
+    /// signal 6.
+    pub fn aborted(&self) -> bool {
+        self.signal == Some(6)
+    }
+}
+
+/// Runs the test `test` of this test program alone, in a process of its own, with
+/// [`OWN_PROCESS`] set to `part`, and returns how that process ended. A test that ends the
+/// process it runs in (as a node ends on a fault it cannot contain) calls itself this way: the
+/// part that ends runs in the other process, and the test judges how it ended.
+pub fn in_own_process(test: &str, part: &str) -> Ended {
+    use std::os::unix::process::ExitStatusExt;
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([test, "--exact", "--nocapture", "--test-threads=1"])
+        .env(OWN_PROCESS, part)
+        .output()
+        .unwrap();
+    Ended {
+        code: output.status.code(),
+        signal: output.status.signal(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
 
 /// A platform for tests: the local attestation document, and provider connections that end at
 /// the stand-in registered for the host.
@@ -70,9 +218,29 @@ pub struct TestPlatform {
     refusals: Mutex<usize>,
     /// A pause before every connection is opened or refused.
     connect_pause: Mutex<Duration>,
+    /// The draws of the random source that pass before one panics: with `Some(0)` the next
+    /// draw panics. `None` when no draw is to panic.
+    fault_at_draw: Mutex<Option<usize>>,
+    /// True while the attestation device panics.
+    fault_attestation: AtomicBool,
 }
 
 impl TestPlatform {
+    /// Makes the random source panic once: the draw after the next `passing` draws panics
+    /// with [`ScriptedFault`], and the draws after it are answered again. The node draws
+    /// randomness at known places of a call, so a test puts a panic at one of them: the first
+    /// draw of `attestation` (the challenge) is outside every lock, and the first draw of a
+    /// call that creates an event (the seed of its entry) is inside the lock of its account.
+    pub fn fault_at_draw(&self, passing: usize) {
+        *lock(&self.fault_at_draw) = Some(passing);
+    }
+
+    /// Makes the attestation device panic with [`ScriptedFault`] at every request, or answer
+    /// again.
+    pub fn fault_attestation(&self, faulty: bool) {
+        self.fault_attestation.store(faulty, Ordering::SeqCst);
+    }
+
     /// A platform that reports the name `nitro`, the custody `enclave` and `measurement`.
     pub fn measured(measurement: Measurement) -> TestPlatform {
         TestPlatform {
@@ -141,10 +309,22 @@ impl Platform for TestPlatform {
     }
 
     fn attestation(&self, user_data: &[u8], nonce: &[u8]) -> Result<Vec<u8>, PlatformError> {
+        if self.fault_attestation.load(Ordering::SeqCst) {
+            std::panic::panic_any(ScriptedFault);
+        }
         Ok(local_document(user_data, nonce, system_time_ms()?))
     }
 
     fn fill_random(&self, out: &mut [u8]) -> Result<(), PlatformError> {
+        let fault = {
+            let mut at = lock(&self.fault_at_draw);
+            let fault = *at == Some(0);
+            *at = at.and_then(|passing| passing.checked_sub(1));
+            fault
+        };
+        if fault {
+            std::panic::panic_any(ScriptedFault);
+        }
         if let Some(draw) = lock(&self.draws).pop_front() {
             if draw.len() != out.len() {
                 return Err(PlatformError("a scripted draw has another length"));
@@ -159,7 +339,7 @@ impl Platform for TestPlatform {
         system_time_ms()
     }
 
-    async fn listen(&self) -> Result<Listener, PlatformError> {
+    async fn listen(&self, _connections: usize) -> Result<Listener, PlatformError> {
         TcpListener::bind("127.0.0.1:0")
             .await
             .map(Listener::Tcp)
@@ -262,6 +442,13 @@ pub enum Reply {
     KeepAlive(Duration, Vec<u8>),
     /// The raw bytes of an HTTP/1.1 response, sent after a pause.
     Late(Duration, Vec<u8>),
+    /// The raw bytes of an HTTP/1.1 response in pieces, each written and flushed after its
+    /// pause. With `close`, the connection ends after the last piece; without it, the
+    /// connection stays open and silent.
+    Pieces(Vec<(Duration, Vec<u8>)>, bool),
+    /// The raw bytes of an HTTP/1.1 response, after which the connection ends without the
+    /// closing alert of TLS: what whoever carries the bytes of a connection can do to it.
+    Abrupt(Vec<u8>),
     /// No answer: the connection stays open and silent.
     Hang,
 }
@@ -281,8 +468,45 @@ impl Reply {
         match self {
             Reply::Raw(bytes) | Reply::Late(_, bytes) => Reply::Late(pause, bytes),
             Reply::KeepAlive(_, bytes) => Reply::KeepAlive(pause, bytes),
+            Reply::Pieces(pieces, close) => Reply::Pieces(pieces, close),
+            Reply::Abrupt(bytes) => Reply::Abrupt(bytes),
             Reply::Hang => Reply::Hang,
         }
+    }
+
+    /// A response under `Transfer-Encoding: chunked` with the given headers, whose body
+    /// arrives in `chunks`: the head and the first chunk at once, every further chunk
+    /// `pause` after the one before, and then the end of the body.
+    pub fn chunked(
+        status: u16,
+        headers: &[(&str, &str)],
+        chunks: &[&[u8]],
+        pause: Duration,
+    ) -> Reply {
+        let mut head = format!("HTTP/1.1 {status} Status\r\n").into_bytes();
+        for (name, value) in headers {
+            head.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+        }
+        head.extend_from_slice(b"transfer-encoding: chunked\r\n\r\n");
+        let mut pieces = Vec::new();
+        for (index, chunk) in chunks.iter().enumerate() {
+            let mut piece = match index {
+                0 => std::mem::take(&mut head),
+                _ => Vec::new(),
+            };
+            piece.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            piece.extend_from_slice(chunk);
+            piece.extend_from_slice(b"\r\n");
+            let wait = match index {
+                0 => Duration::ZERO,
+                _ => pause,
+            };
+            pieces.push((wait, piece));
+        }
+        let mut last = head;
+        last.extend_from_slice(b"0\r\n\r\n");
+        pieces.push((pause, last));
+        Reply::Pieces(pieces, true)
     }
 
     /// The same response, on a connection that stays open for the next request.
@@ -292,6 +516,8 @@ impl Reply {
             Reply::Late(pause, bytes) | Reply::KeepAlive(pause, bytes) => {
                 Reply::KeepAlive(pause, bytes)
             }
+            Reply::Pieces(pieces, _) => Reply::Pieces(pieces, false),
+            Reply::Abrupt(bytes) => Reply::Abrupt(bytes),
             Reply::Hang => Reply::Hang,
         }
     }
@@ -317,38 +543,55 @@ struct InFlight {
     most: AtomicUsize,
 }
 
-/// One write the log store stand-in received: an object of the store, read back from the
-/// request target and the request body.
+/// One write of an entry the log store stand-in received: an object of the store, read back
+/// from the request target and the request body.
 #[derive(Clone, Debug)]
 pub struct Stored {
-    /// The `user_id` of the chain.
+    /// The bucket the object was written to: the first part of the path.
+    pub bucket: String,
+    /// The `user_id` of the account.
     pub user_id: String,
-    /// The node of the chain.
+    /// The node that created the entry.
     pub node: String,
     /// The key of the object (protocol.md 7.6).
     pub key: String,
     /// The key read by its shape.
-    pub parsed: ParsedKey,
+    pub parsed: EntryKey,
     /// The object: the signed entry.
     pub entry: Value,
 }
 
 impl Stored {
-    /// The parts of a key of format 2.
-    pub fn parts(&self) -> &EntryParts {
-        match &self.parsed {
-            ParsedKey::V2(parts) => parts,
-            ParsedKey::V1 { .. } => panic!("a key of format 1 in the store of a node under test"),
-        }
+    /// The parts of the key.
+    pub fn parts(&self) -> &EntryKey {
+        &self.parsed
     }
 
     /// The `seq` of the entry.
     pub fn seq(&self) -> u64 {
-        match &self.parsed {
-            ParsedKey::V2(parts) => parts.seq,
-            ParsedKey::V1 { seq, .. } => *seq,
-        }
+        self.parsed.seq
     }
+}
+
+/// One write of a node document the log store stand-in received.
+#[derive(Clone, Debug)]
+pub struct StoredDocument {
+    /// The bucket the object was written to.
+    pub bucket: String,
+    /// The node of the key `n3/{node}`.
+    pub node: String,
+    /// The object.
+    pub document: Value,
+    /// The value of `x-amz-object-lock-retain-until-date` of the write.
+    pub retain_until: String,
+}
+
+/// The connections a stand-in holds open, and the word that ends the ones that wait for a
+/// request.
+#[derive(Default)]
+struct Connections {
+    open: AtomicUsize,
+    closing: tokio::sync::Notify,
 }
 
 /// A provider stand-in: a TLS server on the loopback interface with a certificate for the
@@ -357,6 +600,7 @@ pub struct Provider {
     pub address: SocketAddr,
     seen: Arc<Mutex<Vec<Seen>>>,
     in_flight: Arc<InFlight>,
+    connections: Arc<Connections>,
     authority: CertificateDer<'static>,
     hosts: Vec<String>,
 }
@@ -404,9 +648,11 @@ impl Provider {
         let address = listener.local_addr().unwrap();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let in_flight = Arc::new(InFlight::default());
+        let connections = Arc::new(Connections::default());
         let handler: Handler = Arc::new(handler);
         let recorded = seen.clone();
         let counted = in_flight.clone();
+        let held = connections.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -416,8 +662,11 @@ impl Provider {
                 let handler = handler.clone();
                 let recorded = recorded.clone();
                 let counted = counted.clone();
+                let held = held.clone();
                 tokio::spawn(async move {
-                    let _ = serve_one(acceptor, stream, handler, recorded, counted).await;
+                    held.open.fetch_add(1, Ordering::SeqCst);
+                    let _ = serve_one(acceptor, stream, handler, recorded, counted, &held).await;
+                    held.open.fetch_sub(1, Ordering::SeqCst);
                 });
             }
         });
@@ -425,9 +674,22 @@ impl Provider {
             address,
             seen,
             in_flight,
+            connections,
             authority: authority.der().clone(),
             hosts: names,
         }
+    }
+
+    /// The connections the stand-in holds open at this moment: from the moment it accepted
+    /// one to the moment that connection ended, from either side.
+    pub fn open_connections(&self) -> usize {
+        self.connections.open.load(Ordering::SeqCst)
+    }
+
+    /// Ends every connection of the stand-in that waits for a request, from the side of the
+    /// stand-in: what a server does with a connection it kept open for long enough.
+    pub fn close_idle_connections(&self) {
+        self.connections.closing.notify_waiters();
     }
 
     /// The trust roots that accept this stand-in only.
@@ -458,13 +720,20 @@ impl Provider {
         self.in_flight.most.load(Ordering::SeqCst)
     }
 
-    /// The writes to the log store received so far, in the order they arrived: every `PUT`
-    /// whose target names an object under `v1/accounts/`, read back as an object of the store.
+    /// The writes of entries to the log store received so far, in the order they arrived:
+    /// every `PUT` whose target names an object under `a3/`, read back as an object of the
+    /// store.
     pub fn stored(&self) -> Vec<Stored> {
         stored_of(&self.seen())
     }
 
-    /// Waits until the log store received `count` writes.
+    /// The writes of node documents to the log store received so far, in the order they
+    /// arrived: every `PUT` whose target names an object under `n3/`.
+    pub fn documents(&self) -> Vec<StoredDocument> {
+        documents_of(&self.seen())
+    }
+
+    /// Waits until the log store received `count` writes of entries.
     pub async fn until_written(&self, count: usize) {
         for _ in 0..1000 {
             if self.stored().len() >= count {
@@ -475,8 +744,8 @@ impl Provider {
         panic!("the log store did not receive {count} writes");
     }
 
-    /// The objects of the chain of `user_id` on `node`, one per `seq` (the last write of a
-    /// `seq` when it was written more than once), in the order of `seq`.
+    /// The entries of `user_id` that `node` wrote, one per `seq` (the last write of a `seq`
+    /// when it was written more than once), in the order of `seq`.
     pub fn chain(&self, user_id: &str, node: &str) -> Vec<Stored> {
         let mut by_seq: std::collections::BTreeMap<u64, Stored> = Default::default();
         for stored in self.stored() {
@@ -502,24 +771,48 @@ impl Provider {
     }
 }
 
-/// The objects of the store among `seen`: every `PUT` whose target names an object under
-/// `v1/accounts/`.
+/// The bucket and the key of a write to the log store: the target `/{bucket}/{key}` of a `PUT`
+/// whose key starts with `prefix`. The `user_id` of the tests holds no character a path
+/// encodes, so the key is the text of the target.
+fn object_of<'a>(seen: &'a Seen, prefix: &str) -> Option<(&'a str, &'a str)> {
+    if seen.method != "PUT" {
+        return None;
+    }
+    let (bucket, key) = seen.target.strip_prefix('/')?.split_once('/')?;
+    key.starts_with(prefix).then_some((bucket, key))
+}
+
+/// The entries among `seen`: every `PUT` whose target names an object under `a3/`.
 fn stored_of(seen: &[Seen]) -> Vec<Stored> {
     seen.iter()
-        .filter(|seen| seen.method == "PUT")
         .filter_map(|seen| {
-            let at = seen.target.find("v1/accounts/")?;
-            let key = seen.target[at..].to_string();
-            let mut names = key["v1/accounts/".len()..].splitn(3, '/');
-            let user_id = names.next()?.to_string();
-            let node = names.next()?.to_string();
-            let parsed = parse_object_key(&key, &chain_prefix(&user_id, &node))?;
+            let (bucket, key) = object_of(seen, "a3/")?;
+            let user_id = key.strip_prefix("a3/")?.split('/').next()?;
+            let parsed = parse_object_key_v3(key, user_id)?;
             Some(Stored {
-                user_id,
-                node,
-                key,
+                bucket: bucket.to_string(),
+                user_id: user_id.to_string(),
+                node: parsed.node.clone(),
+                key: key.to_string(),
                 parsed,
                 entry: serde_json::from_slice(&seen.body).ok()?,
+            })
+        })
+        .collect()
+}
+
+/// The node documents among `seen`: every `PUT` whose target names an object under `n3/`.
+fn documents_of(seen: &[Seen]) -> Vec<StoredDocument> {
+    seen.iter()
+        .filter_map(|seen| {
+            let (bucket, key) = object_of(seen, "n3/")?;
+            Some(StoredDocument {
+                bucket: bucket.to_string(),
+                node: key.strip_prefix("n3/")?.to_string(),
+                document: serde_json::from_slice(&seen.body).ok()?,
+                retain_until: seen
+                    .header("x-amz-object-lock-retain-until-date")?
+                    .to_string(),
             })
         })
         .collect()
@@ -541,6 +834,7 @@ impl PlainStore {
         let handler: Handler = Arc::new(handler);
         let recorded = seen.clone();
         let in_flight = Arc::new(InFlight::default());
+        let connections = Arc::new(Connections::default());
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -549,8 +843,17 @@ impl PlainStore {
                 let handler = handler.clone();
                 let recorded = recorded.clone();
                 let in_flight = in_flight.clone();
+                let connections = connections.clone();
                 tokio::spawn(async move {
-                    let _ = serve_stream(stream, String::new(), handler, recorded, in_flight).await;
+                    let _ = serve_stream(
+                        stream,
+                        String::new(),
+                        handler,
+                        recorded,
+                        in_flight,
+                        &connections,
+                    )
+                    .await;
                 });
             }
         });
@@ -562,9 +865,14 @@ impl PlainStore {
         lock(&self.seen).clone()
     }
 
-    /// The writes received so far, read back as objects of the store.
+    /// The writes of entries received so far, read back as objects of the store.
     pub fn stored(&self) -> Vec<Stored> {
         stored_of(&self.seen())
+    }
+
+    /// The writes of node documents received so far.
+    pub fn documents(&self) -> Vec<StoredDocument> {
+        documents_of(&self.seen())
     }
 }
 
@@ -574,6 +882,7 @@ async fn serve_one(
     handler: Handler,
     recorded: Arc<Mutex<Vec<Seen>>>,
     in_flight: Arc<InFlight>,
+    connections: &Connections,
 ) -> std::io::Result<()> {
     let tls = acceptor.accept(stream).await?;
     let server_name = tls
@@ -582,16 +891,18 @@ async fn serve_one(
         .server_name()
         .unwrap_or_default()
         .to_string();
-    serve_stream(tls, server_name, handler, recorded, in_flight).await
+    serve_stream(tls, server_name, handler, recorded, in_flight, connections).await
 }
 
-/// Serves the requests of one connection, TLS or plain, until it ends.
+/// Serves the requests of one connection, TLS or plain, until it ends. A connection that
+/// waits for a request ends when the stand-in is told to close its idle connections.
 async fn serve_stream<IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     mut tls: IO,
     server_name: String,
     handler: Handler,
     recorded: Arc<Mutex<Vec<Seen>>>,
     in_flight: Arc<InFlight>,
+    connections: &Connections,
 ) -> std::io::Result<()> {
     /// Counts one request from its reading to its reply, also when the connection ends.
     struct Counted(Arc<InFlight>);
@@ -614,7 +925,14 @@ async fn serve_stream<IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                 break position + 4;
             }
             let mut chunk = [0u8; 4096];
-            let read = tls.read(&mut chunk).await?;
+            let read = tokio::select! {
+                read = tls.read(&mut chunk) => read?,
+                // No byte of a request has arrived: the connection is idle.
+                _ = connections.closing.notified(), if buffer.is_empty() => {
+                    tls.shutdown().await?;
+                    return Ok(());
+                }
+            };
             if read == 0 {
                 return Ok(());
             }
@@ -670,6 +988,25 @@ async fn serve_stream<IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                 tls.write_all(&bytes).await?;
                 tls.flush().await?;
             }
+            Reply::Pieces(pieces, close) => {
+                for (pause, bytes) in pieces {
+                    tokio::time::sleep(pause).await;
+                    tls.write_all(&bytes).await?;
+                    tls.flush().await?;
+                }
+                if close {
+                    tls.shutdown().await?;
+                } else {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                }
+                return Ok(());
+            }
+            Reply::Abrupt(bytes) => {
+                tls.write_all(&bytes).await?;
+                tls.flush().await?;
+                // The stream is dropped without its shutdown: no closing alert is written.
+                return Ok(());
+            }
             Reply::Hang => {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
                 return Ok(());
@@ -683,8 +1020,8 @@ async fn serve_stream<IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
 pub const LOG_BUCKET: &str = "credential-log-test-1";
 /// The region of that bucket.
 pub const LOG_REGION: &str = "us-west-2";
-/// The host a node with that log store writes to.
-pub const LOG_HOST: &str = "credential-log-test-1.s3.us-west-2.amazonaws.com";
+/// The host a node with that log store writes to: the endpoint of Amazon S3 in the region.
+pub const LOG_HOST: &str = "s3.us-west-2.amazonaws.com";
 /// The session token of the credentials the tests give a node for its log store.
 pub const LOG_SESSION_TOKEN: &str = "test/session+token/of+the/log/store==";
 /// The secret access key of those credentials.
@@ -734,6 +1071,63 @@ impl Forwarded {
             .iter()
             .find(|(header, _)| header == name)
             .map(|(_, value)| value.as_str())
+    }
+}
+
+/// The 200 response that is a stream (of a `forward` call that asked for one, of a
+/// `vault/send` call), read to its end.
+#[derive(Clone, Debug)]
+pub struct Streamed {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    /// The `log` object of the head: where the event of the request is. Null for a
+    /// `vault/send` call, whose head has none.
+    pub log: Value,
+    /// The parts of the body, in order.
+    pub parts: Vec<Vec<u8>>,
+    /// The end record.
+    pub end: Value,
+}
+
+impl Streamed {
+    /// The bytes of the body that were handed on.
+    pub fn body(&self) -> Vec<u8> {
+        self.parts.concat()
+    }
+
+    /// The value of a response header of the provider.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(header, _)| header == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// Reads the bytes of a stream (`frame`, the stream form): the head, the parts and the end
+/// record. Panics when the bytes are not a stream that ends with an end record.
+pub fn read_stream(bytes: &[u8]) -> Streamed {
+    let length = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+    let meta_length = length(0);
+    let meta: Value = serde_json::from_slice(&bytes[4..4 + meta_length]).unwrap();
+    let mut at = 4 + meta_length;
+    let mut parts = Vec::new();
+    loop {
+        let part_length = length(at);
+        at += 4;
+        if part_length == 0 {
+            break;
+        }
+        assert!(part_length <= frame::STREAM_PART_LIMIT_BYTES);
+        parts.push(bytes[at..at + part_length].to_vec());
+        at += part_length;
+    }
+    Streamed {
+        status: meta["status"].as_u64().unwrap() as u16,
+        headers: header_pairs(&meta["headers"]),
+        log: meta["log"].clone(),
+        parts,
+        end: serde_json::from_slice(&bytes[at..]).unwrap(),
     }
 }
 
@@ -792,7 +1186,14 @@ fn header_pairs(value: &Value) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-/// The release of a node under test. It is not a release tag (protocol.md 10.3).
+/// The share of the body budget a call holds for the request `request`, the JSON body of a
+/// call or the meta of a frame, written the way [`Harness`] writes it
+/// (`Marks::request_share`).
+pub fn request_share(request: &Value) -> usize {
+    crate::room::Marks::of(&to_json(request)).request_share()
+}
+
+/// The release of a node under test: the name of no tag of the repository.
 const RELEASE: &str = "v0.0.0-test";
 
 /// A node under test.
@@ -825,11 +1226,44 @@ impl Harness {
         )
     }
 
+    /// A node of custody `enclave` with `measurement` that verifies the release proofs of
+    /// another release with `proofs` and lists the old releases `predecessors`, in the place
+    /// of the values of the source.
+    pub fn measured_with(
+        provider: &Provider,
+        measurement: Measurement,
+        proofs: ProofTrust,
+        predecessors: Vec<ReleaseMeasurement>,
+    ) -> Harness {
+        Harness::started(
+            TestPlatform::measured(measurement),
+            provider,
+            Definitions::embedded(),
+            Limits::default(),
+            Lineage {
+                proofs,
+                predecessors,
+            },
+        )
+    }
+
     fn on(
         platform: TestPlatform,
         provider: &Provider,
         definitions: Definitions,
         limits: Limits,
+    ) -> Harness {
+        // The certificates, the keys and the lists of the source.
+        let lineage = Lineage::embedded().unwrap();
+        Harness::started(platform, provider, definitions, limits, lineage)
+    }
+
+    fn started(
+        platform: TestPlatform,
+        provider: &Provider,
+        definitions: Definitions,
+        limits: Limits,
+        lineage: Lineage,
     ) -> Harness {
         let platform = Arc::new(platform);
         provider.route(&platform);
@@ -843,9 +1277,7 @@ impl Harness {
                 definitions,
                 egress,
                 RELEASE,
-                // The keys of the source. The release of the tests is not a release tag, so
-                // the node has no predecessor.
-                Lineage::read(RELEASE_KEY_PEM, LOG_KEY_PEM, b"[]", RELEASE).unwrap(),
+                lineage,
                 limits,
             )
             .unwrap(),
@@ -877,7 +1309,7 @@ impl Harness {
                 Definitions::embedded(),
                 egress,
                 RELEASE,
-                Lineage::read(RELEASE_KEY_PEM, LOG_KEY_PEM, b"[]", RELEASE).unwrap(),
+                Lineage::embedded().unwrap(),
                 limits,
             )
             .unwrap(),
@@ -900,7 +1332,8 @@ impl Harness {
     }
 
     /// Gives the node the operator configuration with the log store of the tests, and
-    /// credentials for it that end in 12 hours.
+    /// credentials for it that end in 12 hours. The call that gives the credentials writes the
+    /// node document: with a store that confirms it, the node takes grants from here on.
     pub async fn use_log_store(&self) {
         self.use_log_store_with(json!({"bucket": LOG_BUCKET, "region": LOG_REGION}))
             .await;
@@ -983,6 +1416,24 @@ impl Harness {
         })
     }
 
+    /// A `forward` call whose meta asks for a stream. `Err` carries the status and the failure
+    /// body of a call that failed before the head of the provider response.
+    pub async fn forward_stream(
+        &self,
+        meta: Value,
+        payload: &[u8],
+    ) -> Result<Streamed, (u16, Value)> {
+        let mut request = frame::encode_head(&meta);
+        request.extend_from_slice(payload);
+        let (status, content_type, bytes) = self.send(Method::POST, "/v1/forward", request).await;
+        if status != StatusCode::OK {
+            assert_eq!(content_type, "application/json");
+            return Err((status.as_u16(), serde_json::from_slice(&bytes).unwrap()));
+        }
+        assert_eq!(content_type, frame::STREAM_CONTENT_TYPE);
+        Ok(read_stream(&bytes))
+    }
+
     /// A `forward/batch` call. `meta` carries `requests` and `payload` their bodies one after
     /// another. `Err` carries the status and the failure body.
     pub async fn forward_batch(
@@ -1003,6 +1454,36 @@ impl Harness {
         Ok(decode_batch(&meta, &payload))
     }
 
+    /// A `vault/send` call. `Err` carries the status and the failure body of a call that sent
+    /// no response of a host on.
+    pub async fn vault_send(&self, meta: Value, payload: &[u8]) -> Result<Streamed, (u16, Value)> {
+        let mut request = frame::encode_head(&meta);
+        request.extend_from_slice(payload);
+        let (status, content_type, bytes) =
+            self.send(Method::POST, "/v1/vault/send", request).await;
+        if status != StatusCode::OK {
+            assert_eq!(content_type, "application/json");
+            return Err((status.as_u16(), serde_json::from_slice(&bytes).unwrap()));
+        }
+        assert_eq!(content_type, frame::STREAM_CONTENT_TYPE);
+        Ok(read_stream(&bytes))
+    }
+
+    /// Sends one request to the router and returns the response as the router gives it: the
+    /// body has not been read.
+    pub async fn respond(&self, method: Method, path: &str, body: Vec<u8>) -> Response<Body> {
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-length", body.len())
+            .body(Body::from(body))
+            .unwrap();
+        TowerToHyperService::new(self.router.clone())
+            .call(request)
+            .await
+            .unwrap()
+    }
+
     /// The node signing public key.
     pub fn node_public(&self) -> [u8; 32] {
         self.node.keys.sign_public()
@@ -1015,11 +1496,11 @@ impl Harness {
         serde_json::from_slice(&body).unwrap()
     }
 
-    /// The `seq` of the end of the chain of an account.
-    pub fn head_seq(&self, user_id: &str) -> u64 {
+    /// The `seq` of the last entry the node created for an account, 0 when it created none.
+    pub fn last_seq(&self, user_id: &str) -> u64 {
         self.node
             .account(user_id)
-            .map_or(0, |account| lock(&account).head.seq)
+            .map_or(0, |account| lock(&account).last.seq)
     }
 }
 
@@ -1242,12 +1723,12 @@ impl App {
         serde_json::from_slice(&plaintext).unwrap()
     }
 
-    /// Verifies the node signature of an entry of format 2 and opens its events with the log
+    /// Verifies the node signature of an entry of format 3 and opens its events with the log
     /// key, in the order of their creation.
     pub fn events(&self, harness: &Harness, entry: &Value) -> Vec<Value> {
         let signed: Signed = serde_json::from_value(entry.clone()).unwrap();
-        let body = verify(&harness.node_public(), purpose::LOG_ENTRY_V2, &signed).unwrap();
-        app::open_entry_v2(&self.keys.log, &body).unwrap()
+        let body = verify(&harness.node_public(), purpose::LOG_ENTRY_V3, &signed).unwrap();
+        app::open_entry_v3(&self.keys.log, &body).unwrap()
     }
 
     /// The one event of an entry that holds one event.
@@ -1257,9 +1738,9 @@ impl App {
         events.pop().unwrap()
     }
 
-    /// The body of an entry of format 2.
+    /// The body of an entry of format 3.
     pub fn entry_body(&self, harness: &Harness, entry: &Value) -> Value {
-        harness.verified(purpose::LOG_ENTRY_V2, entry)
+        harness.verified(purpose::LOG_ENTRY_V3, entry)
     }
 
     /// The event a `log` object of a response names, read from the log store stand-in: the
@@ -1277,9 +1758,9 @@ impl App {
         self.events(harness, &stored.entry).remove(index)
     }
 
-    /// The events of the chain of this account on the node of `harness`, as the log store
-    /// stand-in received them: one row per entry in the order of `seq`, each row the events
-    /// of that entry in order.
+    /// The events of the entries of this account that the node of `harness` wrote, as the log
+    /// store stand-in received them: one row per entry in the order of `seq`, each row the
+    /// events of that entry in order.
     pub fn stored_events(&self, harness: &Harness, provider: &Provider) -> Vec<Vec<Value>> {
         provider
             .chain(&self.user_id, &harness.node.node)

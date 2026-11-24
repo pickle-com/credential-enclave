@@ -2,9 +2,9 @@
 //! `docs/egress-policy.md`).
 //!
 //! A response body is a value of a type that implements [`OperatorResponse`], and the functions
-//! that turn a value into a response ([`json_ok`], [`forward_frame`], the failure body of
-//! [`super::ApiError`]) take nothing else. The trait is implemented in this file only: its
-//! supertrait is private to it. So this file lists everything the operator domain can receive
+//! that turn a value into a response ([`json_ok`], [`forward_frame`], [`forward_stream`],
+//! [`send_stream`], the failure body of [`super::ApiError`]) take nothing else. The trait is
+//! implemented in this file only: its supertrait is private to it. So this file lists everything the operator domain can receive
 //! from a node. Adding a response type means changing this file.
 //!
 //! Every field carries the class of its value:
@@ -34,6 +34,7 @@ use axum::response::Response;
 use credential_enclave_protocol::encoding::{to_json, Signed};
 use credential_enclave_protocol::envelope::TransferEnvelope;
 use credential_enclave_protocol::record::Record;
+use credential_enclave_protocol::secret_use::SecretUseEnvelope;
 use hyper::body::{Body as HttpBody, Bytes, Frame, SizeHint};
 use serde::Serialize;
 use tokio::sync::OwnedSemaphorePermit;
@@ -42,7 +43,7 @@ use crate::frame;
 use crate::oauth::PublicFields;
 use crate::provider_response::CheckedResponse;
 use crate::state::GrantStatus;
-use crate::vault::ReleasedValue;
+use crate::vault::HandedOut;
 
 mod sealed {
     pub trait Sealed {}
@@ -75,8 +76,11 @@ operator_response!(
     ForwardMeta,
     ForwardBatchMeta,
     Released,
+    Stored,
+    HandedOff,
+    SendMeta,
+    StreamEnd,
     Closed,
-    Heads,
     Exported,
     Imported,
     Pruned,
@@ -219,6 +223,8 @@ pub struct IdleReuseCounts {
     pub provider: u64,
     /// P: writes to the log store over an idle connection to it.
     pub log_store: u64,
+    /// P: mail reads that went over a kept session of their record.
+    pub mail: u64,
 }
 
 /// `refresh` of `GET /v1/health`: the token address calls of `refresh` that the node continued
@@ -250,6 +256,9 @@ pub struct LateRefreshCounts {
 pub struct StateCounts {
     /// P: a count, the kept `refresh` responses over every account.
     pub kept_refreshes: usize,
+    /// P: a size, the bytes the node counts for those responses: the sum its bound of kept
+    /// responses is about.
+    pub kept_refresh_bytes: usize,
     /// P: a count, the merge keys over every account.
     pub merge_keys: usize,
     /// P: a count, the entries the log store has not confirmed over every account.
@@ -265,6 +274,9 @@ pub struct IdleConnectionCounts {
     pub provider: usize,
     /// P: a count, the idle connections to the log store.
     pub log_store: usize,
+    /// P: a count, the authenticated IMAP sessions the node keeps between the reads of a
+    /// record, over every account.
+    pub mail: usize,
 }
 
 /// `load` of `GET /v1/health`: the load of the node at the moment of the call.
@@ -280,6 +292,9 @@ pub struct Load {
     /// P: a count, the connections from the backend closed at accept because the bound of
     /// open connections was reached, since the node started.
     pub inbound_refused: u64,
+    /// P: a count, the bound of open connections from the backend in force: the node computed
+    /// it at its start from the memory of the kernel it runs in.
+    pub inbound_limit: usize,
     /// P: the CPU time in user mode of the kernel the node runs in since it booted, in
     /// milliseconds. Null when the kernel exposes no procfs value.
     pub cpu_user_ms: Option<u64>,
@@ -298,6 +313,22 @@ pub struct Load {
     /// P: a count, the soft limit of open file descriptors of the node process in force. Null
     /// when the platform has no such limit.
     pub descriptors_limit: Option<u64>,
+    /// P: a count, the connections the node is done with and keeps open until their peer
+    /// reported the end of its bytes, at this moment. Null on a platform that closes a
+    /// connection when the node is done with it.
+    pub lingering_connections: Option<usize>,
+    /// P: a count, the connections the node closed before their peer had reported its end,
+    /// since the node started. Null in the same way.
+    pub lingering_cut: Option<u64>,
+    /// P: a count, the panics of the node program since it started: each ended a call or a
+    /// task, or halted an account, and none ended the node.
+    pub contained_panics: u64,
+    /// P: a count, the accounts the node halted since it started: a panic began while the
+    /// lock of their state was held.
+    pub halted_accounts: usize,
+    /// P: a count, the kept `refresh` responses the node dropped before their time because
+    /// the sum of its kept responses was above its bound, since the node started.
+    pub kept_refreshes_dropped: u64,
 }
 
 /// `GET /v1/health`.
@@ -311,6 +342,10 @@ pub struct Health<'a> {
     pub platform: &'a str,
     /// P
     pub custody: &'a str,
+    /// P: `reserve` on a node of the reserve role, `forward` on a node of the forward role,
+    /// null on every other node. The role came with the operator configuration (E) and is a
+    /// constant of the source.
+    pub role: Option<&'a str>,
     /// P: node clock.
     pub started_ms: u64,
     /// P: node clock.
@@ -325,6 +360,9 @@ pub struct Health<'a> {
     pub grants: usize,
     /// P: mail providers compiled into the measured program.
     pub mail_providers: &'a [&'a str],
+    /// P: what the program of the node does, by the names of enclave.md 5.1: a constant of
+    /// the source.
+    pub capabilities: &'a [&'a str],
     /// E and P: the log store of the node, null when it has none.
     pub log_store: Option<LogStoreState<'a>>,
     /// P: the counts of the log.
@@ -346,8 +384,14 @@ pub struct LogStoreState<'a> {
     pub bucket: &'a str,
     /// E: its region.
     pub region: &'a str,
+    /// P: a constant of the bucket name, the number of buckets that hold the entries the node
+    /// writes.
+    pub shards: u16,
     /// E: the end of the credentials the operator domain gave, 0 when the node holds none.
     pub credentials_expires_ms: u64,
+    /// P: node clock, the time of the latest write of the node document that the store
+    /// confirmed, 0 when it confirmed none.
+    pub node_document_ms: u64,
     /// P: a count, the accounts that have a pending entry.
     pub pending: usize,
     /// P: node clock, the age of the oldest pending entry in milliseconds, 0 when there is
@@ -360,6 +404,9 @@ pub struct LogStoreState<'a> {
 pub struct Configured {
     /// P
     pub configured: bool,
+    /// P: node clock, the time of the latest write of the node document that the store
+    /// confirmed, 0 when it confirmed none or the node has no log store.
+    pub node_document_ms: u64,
 }
 
 /// `POST /v1/log-store/credentials`.
@@ -367,6 +414,9 @@ pub struct Configured {
 pub struct CredentialsStored {
     /// E: the end of the credentials the call gave.
     pub credentials_expires_ms: u64,
+    /// P: node clock, the time of the latest write of the node document that the store
+    /// confirmed, 0 when it confirmed none.
+    pub node_document_ms: u64,
 }
 
 /// `POST /v1/attestation`.
@@ -394,7 +444,7 @@ pub struct Attestation<'a> {
 #[derive(Serialize)]
 pub struct Messages {
     /// S: the body holds P, E and D values (`type`, `ok`, `code`, `node`, `user_id`,
-    /// `challenge`, `key_id`, `not_after_ms`, `head`, `time_ms`).
+    /// `challenge`, `key_id`, `not_after_ms`, `time_ms`).
     pub reply: Signed,
     /// P: the entry and the index of the event the command created, null when it created
     /// none.
@@ -406,9 +456,6 @@ pub struct Messages {
 /// `POST /v1/status`.
 #[derive(Serialize)]
 pub struct Status {
-    /// S: the body holds the end of the chain (P), the nonce of the caller (E) and the node
-    /// clock (P).
-    pub head: Signed,
     /// D: `state`, `key_id`, `custody`, `not_after_ms` of the grant.
     pub grant: GrantStatus,
 }
@@ -451,9 +498,8 @@ pub struct Merged {
     pub public: PublicFields,
 }
 
-/// `POST /v1/refresh`. A node keeps the value of a successful refresh for a repeated call
-/// with the same record, so the type is cloned.
-#[derive(Clone, Serialize)]
+/// `POST /v1/refresh`.
+#[derive(Serialize)]
 pub struct Refreshed {
     /// C
     pub record: Record,
@@ -461,6 +507,27 @@ pub struct Refreshed {
     pub public: PublicFields,
     /// P
     pub log: LogRef,
+}
+
+impl Refreshed {
+    /// The body of the response as the node sends it.
+    pub fn body(&self) -> RefreshedBody {
+        RefreshedBody(Bytes::from(to_json(self).into_boxed_slice()))
+    }
+}
+
+/// The body of a successful `refresh` response: the JSON of a [`Refreshed`], which only
+/// [`Refreshed::body`] creates. A node keeps it for a repeated call with the same record
+/// (enclave.md 5.7), so the first call and a repeated one are answered with the same bytes.
+/// The buffer holds those bytes and no room beyond them, and a copy of the value shares it.
+#[derive(Clone)]
+pub struct RefreshedBody(Bytes);
+
+impl RefreshedBody {
+    /// The number of the bytes of the body.
+    pub fn bytes(&self) -> usize {
+        self.0.len()
+    }
 }
 
 /// `POST /v1/revoke-token`.
@@ -482,6 +549,130 @@ pub struct ForwardMeta {
     headers: Vec<(String, String)>,
     /// P: the event of the request, null for a mail call that created no event of its own.
     log: Option<LogRef>,
+}
+
+/// The end record of a stream (the stream form of `POST /v1/forward`, enclave.md 5.8, and
+/// `POST /v1/vault/send`, enclave.md 5.16).
+#[derive(Serialize)]
+pub struct StreamEnd {
+    /// P: true when every byte of the provider body was handed on.
+    complete: bool,
+    /// P: a failure code of protocol.md section 11, when the body was cut.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'static str>,
+    /// P: a fixed string of the source (rule E5), when the body was cut.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<&'static str>,
+}
+
+impl StreamEnd {
+    /// The end of a body that was handed on whole.
+    pub fn complete() -> StreamEnd {
+        StreamEnd {
+            complete: true,
+            code: None,
+            message: None,
+        }
+    }
+
+    /// The end of a body that was cut: the code and the fixed message of the failure.
+    pub fn cut(code: &'static str, message: &'static str) -> StreamEnd {
+        StreamEnd {
+            complete: false,
+            code: Some(code),
+            message: Some(message),
+        }
+    }
+}
+
+/// One element of the body of a stream, as the task that reads the provider hands it to the
+/// response body.
+pub enum StreamElement {
+    /// Bytes of a part: a length prefix, or the bytes of the part (R, after the search of rule
+    /// E4).
+    Part(Bytes),
+    /// The mark of the end and the end record: nothing follows.
+    End(Bytes),
+}
+
+/// The response body of a stream (the stream form of `forward`, `vault/send`): the head, then
+/// what the task that reads the provider hands over, until the end record. A task that ended without an end record
+/// passed the time limit of the call while this body was not read: the body ends with the end
+/// record of that failure.
+struct StreamBody {
+    head: Option<Bytes>,
+    elements: tokio::sync::mpsc::Receiver<StreamElement>,
+    /// The end record of a call whose task ended without one.
+    late: Option<Bytes>,
+}
+
+impl HttpBody for StreamBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+        if let Some(head) = self.head.take() {
+            return Poll::Ready(Some(Ok(Frame::data(head))));
+        }
+        let Some(late) = self.late.clone() else {
+            return Poll::Ready(None);
+        };
+        match std::task::ready!(self.elements.poll_recv(context)) {
+            Some(StreamElement::Part(bytes)) => Poll::Ready(Some(Ok(Frame::data(bytes)))),
+            Some(StreamElement::End(bytes)) => {
+                self.late = None;
+                Poll::Ready(Some(Ok(Frame::data(bytes))))
+            }
+            None => {
+                self.late = None;
+                Poll::Ready(Some(Ok(Frame::data(late))))
+            }
+        }
+    }
+}
+
+/// The 200 response of the stream form of `forward`: the head of a provider response whose
+/// headers passed the checks of rule E4, the place of the event of the request, and the parts
+/// of the body as `elements` hands them over. `late` is the end record of a call whose task
+/// ended without one.
+pub fn forward_stream(
+    status: u16,
+    headers: Vec<(String, String)>,
+    log: Option<LogRef>,
+    elements: tokio::sync::mpsc::Receiver<StreamElement>,
+    late: StreamEnd,
+) -> Response {
+    let meta = ForwardMeta {
+        status,
+        headers,
+        log,
+    };
+    stream_response(&meta, elements, late)
+}
+
+/// The 200 response that is a stream: `meta` as the head, then what `elements` hands over,
+/// until the end record. `late` is the end record of a call whose task ended without one.
+fn stream_response<T: OperatorResponse>(
+    meta: &T,
+    elements: tokio::sync::mpsc::Receiver<StreamElement>,
+    late: StreamEnd,
+) -> Response {
+    let head = frame::encode_head(meta);
+    let body = StreamBody {
+        head: Some(Bytes::from(head)),
+        elements,
+        late: Some(Bytes::from(frame::encode_stream_end(&late))),
+    };
+    let mut response = Response::new(Body::new(body));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static(frame::STREAM_CONTENT_TYPE),
+    );
+    response
 }
 
 /// The meta of a `POST /v1/forward/batch` response frame. The payload of the frame is the
@@ -520,8 +711,33 @@ pub enum BatchResult {
 /// `POST /v1/release`.
 #[derive(Serialize)]
 pub struct Released {
-    /// V
-    pub value: ReleasedValue,
+    /// V: the value under the key `value`, or, for a call that named a key to seal it to,
+    /// the value under the seal of that key under the key `sealed`. The caller chose the key:
+    /// a sealed value is a value the operator domain reads.
+    #[serde(flatten)]
+    pub handed_out: HandedOut,
+    /// P
+    pub log: LogRef,
+}
+
+/// `POST /v1/vault/store`.
+#[derive(Serialize)]
+pub struct Stored {
+    /// C: encrypted under the user key. Its plaintext holds the value and, for a record of
+    /// kind `vault_secret`, the name, the sites and the slots the call gave (E), and the
+    /// source `operator` (P). Its `id` and its nonce are node randomness (P).
+    pub record: Record,
+    /// P
+    pub log: LogRef,
+}
+
+/// `POST /v1/vault/handoff`.
+#[derive(Serialize)]
+pub struct HandedOff {
+    /// C: one use of a vault secret, the value and the request it is for, sealed to the
+    /// sealing key of the verified node of the forward role (sink K8). `from` and `to` are the
+    /// identifiers of the two nodes (P).
+    pub envelope: SecretUseEnvelope,
     /// P
     pub log: LogRef,
 }
@@ -531,20 +747,6 @@ pub struct Released {
 pub struct Closed {
     /// P: a count.
     pub accounts: usize,
-}
-
-/// `POST /v1/close/heads`.
-#[derive(Serialize)]
-pub struct Heads {
-    /// S: each body holds the end of a chain (P).
-    pub heads: Vec<Signed>,
-    /// E: the `user_id` the listing continues after.
-    pub next: String,
-    /// P: a count, the accounts of the page whose final head stands at the last entry the
-    /// store confirmed, below pending entries that were dropped.
-    pub truncated: usize,
-    /// P: a count, the accounts of the page that got no final head in this call.
-    pub skipped: usize,
 }
 
 /// `POST /v1/grants/prune`.
@@ -561,7 +763,9 @@ pub struct Pruned {
 pub struct Exported {
     /// C: sealed to the sealing key of the verified peer (sink K2).
     pub envelope: Option<TransferEnvelope>,
-    /// E and P: the entries `grant_transferred_out` this call created.
+    /// E and P: the entries `grant_transferred_out` this call created: one per grant it hands
+    /// to a node of another release for the first time, none for a transfer to a node of this
+    /// program.
     pub logs: Vec<AccountLogRef>,
     /// E: the `user_id` the listing continues after.
     pub next: String,
@@ -570,9 +774,14 @@ pub struct Exported {
 /// `POST /v1/peer/import`.
 #[derive(Serialize)]
 pub struct Imported {
-    /// P: a count.
+    /// P: a count, the grants this call put in place.
     pub imported: usize,
-    /// E and P: the entries `grant_transferred_in` this call created.
+    /// E: the `user_id` of every account whose grant of the transfer this node holds when
+    /// the call ends: this call put it in place, or the node held the grant of the same
+    /// signing key already.
+    pub accounts: Vec<String>,
+    /// E and P: the entries `grant_transferred_in` this call created: one per grant of a
+    /// transfer from another release, none for a transfer from a node of this program.
     pub logs: Vec<AccountLogRef>,
 }
 
@@ -594,8 +803,8 @@ pub struct ErrorBody<'a> {
     pub index: Option<usize>,
 }
 
-pub(super) fn json_bytes(status: StatusCode, body: Vec<u8>) -> Response {
-    let mut response = Response::new(Body::from(body));
+pub(super) fn json_bytes(status: StatusCode, body: impl Into<Body>) -> Response {
+    let mut response = Response::new(body.into());
     *response.status_mut() = status;
     response
         .headers_mut()
@@ -608,17 +817,42 @@ pub fn json_ok<T: OperatorResponse>(value: &T) -> Response {
     json_bytes(StatusCode::OK, to_json(value))
 }
 
+/// A 200 response with the body of a `refresh` response.
+pub fn json_refreshed(body: &RefreshedBody) -> Response {
+    json_bytes(StatusCode::OK, body.0.clone())
+}
+
 /// A failure response.
 pub(super) fn json_error(status: StatusCode, body: &ErrorBody<'_>) -> Response {
     json_bytes(status, to_json(body))
 }
 
-/// A response frame of `forward`: the meta, then the provider body. The share of the body
-/// budget that the provider body occupies is held until the frame was written out.
+/// A response frame of `forward`: the meta, then the provider body. Every part keeps the
+/// share of the body budget that the provider body occupies ([`BudgetedPart`]), so the share
+/// is held until the frame was written out.
 struct FrameBody {
     parts: VecDeque<Bytes>,
     remaining: u64,
-    _budget: OwnedSemaphorePermit,
+}
+
+/// A part of a response frame together with the share of the body budget of the node the
+/// frame occupies. The share is free when the last part of the frame is dropped.
+///
+/// The body of a response is handed to the HTTP connection of the caller, which drops the
+/// body object as soon as it has taken every part, before a byte is written. What it keeps
+/// until its stream took the bytes is the parts themselves (a stream that writes several
+/// buffers in one write: `crate::platform::Attempted`, and a TCP stream). So the share
+/// travels with the bytes, and a peer that takes a response slowly, or not at all, holds
+/// memory the budget counts: for as long as the node waits for it (`inbound_idle`).
+struct BudgetedPart {
+    bytes: Bytes,
+    _budget: std::sync::Arc<OwnedSemaphorePermit>,
+}
+
+impl AsRef<[u8]> for BudgetedPart {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 impl HttpBody for FrameBody {
@@ -695,13 +929,41 @@ pub fn forward_batch_frame(results: Vec<BatchResult>, budget: OwnedSemaphorePerm
     frame_response(parts, budget)
 }
 
+/// The meta of a `POST /v1/vault/send` response: the head of the response of the host.
+#[derive(Serialize)]
+pub struct SendMeta {
+    /// R
+    status: u16,
+    /// R
+    headers: Vec<(String, String)>,
+}
+
+/// The 200 response of `vault/send` (enclave.md 5.16), a stream: the head of a response of
+/// the host whose headers passed the checks of rule E4, and the parts of the body as
+/// `elements` hands them over. `late` is the end record of a call whose task ended without
+/// one.
+pub fn send_stream(
+    status: u16,
+    headers: Vec<(String, String)>,
+    elements: tokio::sync::mpsc::Receiver<StreamElement>,
+    late: StreamEnd,
+) -> Response {
+    stream_response(&SendMeta { status, headers }, elements, late)
+}
+
 fn frame_response(parts: Vec<Bytes>, budget: OwnedSemaphorePermit) -> Response {
     let remaining = parts.iter().map(|part| part.len() as u64).sum();
-    let frame_body = FrameBody {
-        parts: VecDeque::from(parts),
-        remaining,
-        _budget: budget,
-    };
+    let budget = std::sync::Arc::new(budget);
+    let parts = parts
+        .into_iter()
+        .map(|bytes| {
+            Bytes::from_owner(BudgetedPart {
+                bytes,
+                _budget: budget.clone(),
+            })
+        })
+        .collect();
+    let frame_body = FrameBody { parts, remaining };
     let mut response = Response::new(Body::new(frame_body));
     *response.status_mut() = StatusCode::OK;
     response

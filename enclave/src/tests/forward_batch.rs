@@ -114,7 +114,7 @@ async fn one_entry_names_every_request_before_any_leaves() {
     let chain = provider.chain("user-1", &harness.node.node);
     assert_eq!(chain.len(), 2);
     assert_eq!(
-        (chain[1].parts().kind, chain[1].parts().count as usize),
+        (chain[1].parts().kind(), chain[1].parts().count() as usize),
         (EntryKind::Use, limits::FORWARD_BATCH_REQUESTS)
     );
     let events = app.events(&harness, &chain[1].entry);
@@ -134,13 +134,14 @@ async fn one_entry_names_every_request_before_any_leaves() {
         .collect();
     expected.sort();
     assert_eq!(targets, expected);
-    assert_eq!(harness.head_seq("user-1"), 2);
+    assert_eq!(harness.last_seq("user-1"), 2);
 
+    // The writes are those of the two entries and of the node document.
     let log = harness.health().await["log"].clone();
     assert_eq!(
         super::seven_counts(&log),
         json!({
-            "entries": 2, "events": 101, "writes": 2, "write_failures": 0, "open_batches": 0,
+            "entries": 2, "events": 101, "writes": 3, "write_failures": 0, "open_batches": 0,
             "batch_calls": 1, "batch_requests": 100,
         })
     );
@@ -215,7 +216,7 @@ async fn a_request_that_fails_the_address_check_refuses_the_call_with_its_index(
     );
     assert_eq!(provider.stored().len(), writes);
     assert!(provider_targets(&provider).is_empty());
-    assert_eq!(harness.head_seq("user-1"), 1);
+    assert_eq!(harness.last_seq("user-1"), 1);
     assert_eq!(harness.health().await["log"]["batch_calls"], 0);
 }
 
@@ -242,7 +243,7 @@ async fn a_merged_request_inside_a_batch_shares_the_event() {
     );
     // Two events, three requests sent.
     let chain = provider.chain("user-1", &harness.node.node);
-    assert_eq!(chain[1].parts().count, 2);
+    assert_eq!(chain[1].parts().count(), 2);
     assert_eq!(provider_targets(&provider).len(), 3);
 
     // A later batch with the same request shares the event of the entry that is on the chain.
@@ -254,7 +255,7 @@ async fn a_merged_request_inside_a_batch_shares_the_event() {
         logs_of(&outcomes),
         [json!({"seq": 2, "index": 0, "created": false})]
     );
-    assert_eq!(harness.head_seq("user-1"), 2);
+    assert_eq!(harness.last_seq("user-1"), 2);
 }
 
 #[tokio::test]
@@ -299,7 +300,7 @@ async fn two_entries_when_the_open_batch_reaches_its_cap() {
     let chain = provider.chain("user-1", &harness.node.node);
     let shape: Vec<(u64, u32)> = chain
         .iter()
-        .map(|stored| (stored.seq(), stored.parts().count))
+        .map(|stored| (stored.seq(), stored.parts().count()))
         .collect();
     assert_eq!(shape, [(1, 1), (2, 128), (3, 32)]);
     assert!(writes_precede_requests(&provider, before));
@@ -338,7 +339,7 @@ async fn one_failed_request_leaves_the_others_intact() {
     assert_eq!(
         provider.chain("user-1", &harness.node.node)[1]
             .parts()
-            .count,
+            .count(),
         10
     );
 }
@@ -481,7 +482,7 @@ async fn bodies_are_split_by_body_bytes() {
     huge["requests"][2]["body_bytes"] = json!(u64::MAX);
     let (status, failure) = harness.forward_batch(huge, b"ab").await.err().unwrap();
     assert_eq!((status, &failure["code"]), (400, &json!("invalid_request")));
-    assert_eq!(harness.head_seq("user-1"), 2);
+    assert_eq!(harness.last_seq("user-1"), 2);
 }
 
 #[tokio::test]
@@ -505,7 +506,7 @@ async fn a_batch_of_zero_or_101_requests_is_invalid() {
     meta.as_object_mut().unwrap().remove("requests");
     let (status, _) = harness.forward_batch(meta, b"").await.err().unwrap();
     assert_eq!(status, 400);
-    assert_eq!(harness.head_seq("user-1"), 1);
+    assert_eq!(harness.last_seq("user-1"), 1);
 
     // The front conditions hold for the call as a whole: an account without a grant.
     let stranger = App::new("user-2", 2);
@@ -518,4 +519,91 @@ async fn a_batch_of_zero_or_101_requests_is_invalid() {
         .err()
         .unwrap();
     assert_eq!((status, &failure["code"]), (409, &json!("grant_required")));
+}
+
+#[tokio::test]
+async fn a_batch_holds_the_share_of_its_credential_until_its_responses_are_checked() {
+    use axum::http::Method;
+
+    // The provider answers every request with the head and a part of the body, and then
+    // stays silent.
+    let provider = provider_with_log_store(|_| {
+        let head = b"HTTP/1.1 200 OK\r\ncontent-length: 1000\r\n\r\n".to_vec();
+        let part = b"0123456789".repeat(40);
+        Reply::Pieces(vec![(Duration::ZERO, [head, part].concat())], false)
+    })
+    .await;
+    let (harness, app, record) = node_with_log_store(&provider).await;
+    let whole = harness.node.limits.body_budget_bytes;
+    // The frame of a call, and the share of the body budget of its request.
+    let frame_of = |count: usize| {
+        let mut meta = batch(&app, &record, &messages(count));
+        meta["timeout_ms"] = json!(30000);
+        (
+            crate::frame::encode_head(&meta),
+            crate::testing::request_share(&meta),
+        )
+    };
+
+    // Eight requests, of which six are sent at a time: no body of a response ends, so the
+    // call waits. It holds the shares of six response bodies, by their declared lengths, the
+    // share of its request, and the share of its credential: what the search of one response
+    // can hold for the token of the record, the copies of that token of its eight requests,
+    // and those of the six that are being sent. What it took for the longest token a record
+    // of that size can hold is free again.
+    let in_flight = limits::FORWARD_BATCH_CONCURRENCY;
+    let of_the_credential = crate::api::credential_share("ya29.injected".len(), 8, in_flight);
+    let (bytes, of_the_request) = frame_of(8);
+    let left = whole - in_flight * 1_000 - of_the_credential - of_the_request;
+    {
+        let call = harness.respond(Method::POST, "/v1/forward/batch", bytes);
+        tokio::pin!(call);
+        let mut free = whole;
+        for _ in 0..4_000 {
+            tokio::select! {
+                _ = &mut call => panic!("the call ended before its responses did"),
+                () = tokio::time::sleep(Duration::from_millis(5)) => {}
+            }
+            free = harness.node.body_budget.available_permits();
+            if free == left {
+                break;
+            }
+        }
+        assert_eq!(free, left);
+        assert_eq!(provider_targets(&provider).len(), in_flight);
+        // The caller goes away here: the call ends and holds nothing.
+    }
+    assert_eq!(
+        harness.node.forward_slots.available_permits(),
+        harness.node.limits.forward_concurrency
+    );
+    assert_eq!(harness.node.body_budget.available_permits(), whole);
+
+    // A call that does not get the share of its credential within the time of its admission
+    // ends: it created no entry and sent nothing, and it holds nothing. The body budget has
+    // room for its request frame and for the share of its request, and for nothing else.
+    let (stored, sent) = (provider.stored().len(), provider_targets(&provider).len());
+    let (bytes, of_the_request) = frame_of(8);
+    let taken = u32::try_from(whole - bytes.len() - of_the_request).unwrap();
+    let budget = harness
+        .node
+        .body_budget
+        .clone()
+        .try_acquire_many_owned(taken)
+        .unwrap();
+    let started = Instant::now();
+    let response = harness
+        .respond(Method::POST, "/v1/forward/batch", bytes)
+        .await;
+    assert_eq!(response.status().as_u16(), 503);
+    let failure = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let failure: Value = serde_json::from_slice(&failure).unwrap();
+    assert_eq!(failure["code"], "capacity_unavailable");
+    assert!(started.elapsed() >= crate::api::ADMISSION_WAIT);
+    assert_eq!(provider.stored().len(), stored);
+    assert_eq!(provider_targets(&provider).len(), sent);
+    drop(budget);
+    assert_eq!(harness.node.body_budget.available_permits(), whole);
 }

@@ -87,7 +87,7 @@ where
 
 #[cfg(target_os = "linux")]
 mod enclave {
-    use std::sync::Mutex;
+    use std::sync::{Mutex, PoisonError};
 
     use aws_nitro_enclaves_nsm_api::api::{Request, Response};
     use aws_nitro_enclaves_nsm_api::driver::{nsm_exit, nsm_init, nsm_process_request};
@@ -95,17 +95,20 @@ mod enclave {
 
     use super::{attestation_measurement, attestation_timestamp, open_tunnel};
     use crate::platform::local::kernel_random;
+    use std::sync::Arc;
+
     use crate::platform::{
-        ConnectError, Listener, Measurement, Platform, PlatformError, Stream, LISTEN_PORT,
+        ConnectError, Lingerers, Lingering, Listener, Measurement, Platform, PlatformError, Stream,
+        LISTEN_PORT,
     };
 
     /// The vsock CID of the parent instance.
     const PARENT_CID: u32 = 3;
     /// The vsock port of the egress relay in the host program.
     const EGRESS_PORT: u32 = 8443;
-    /// The queue of connections that wait for accept on the listener of the node (enclave.md
-    /// section 8).
-    const LISTEN_BACKLOG: i32 = 1024;
+    /// The kernel file that caps the queue of connections that wait for accept on every
+    /// listener (enclave.md section 8).
+    const SOMAXCONN: &str = "/proc/sys/net/core/somaxconn";
     /// The kernel file that names the active hardware random source.
     const RNG_CURRENT: &str = "/sys/class/misc/hw_random/rng_current";
     /// The hardware random source of the Nitro Secure Module.
@@ -140,11 +143,17 @@ mod enclave {
         }
     }
 
-    /// The nitro platform. Holds the descriptor of `/dev/nsm` for the life of the process, and
-    /// the measurement of the enclave it runs in.
+    /// The nitro platform. Holds the descriptor of `/dev/nsm` for the life of the process,
+    /// the measurement of the enclave it runs in, and the vsock connections the node is done
+    /// with that wait for the end of their peer (`crate::platform::Lingering`): the
+    /// connections it accepted and the connections it opened to the egress relay.
+    ///
+    /// The lock around the descriptor makes the requests to the device take turns. It guards
+    /// no state a request changes: the descriptor is the same before and after a request.
     pub struct NitroPlatform {
         nsm: Mutex<Nsm>,
         measurement: Measurement,
+        lingerers: Arc<Lingerers>,
     }
 
     impl NitroPlatform {
@@ -169,6 +178,7 @@ mod enclave {
             Ok(NitroPlatform {
                 nsm: Mutex::new(nsm),
                 measurement,
+                lingerers: Lingerers::new(),
             })
         }
 
@@ -177,9 +187,14 @@ mod enclave {
             user_data: Option<&[u8]>,
             nonce: Option<&[u8]>,
         ) -> Result<Vec<u8>, PlatformError> {
+            // A panic inside one request to the device (the encoding of the request, the
+            // reading of its answer) leaves the descriptor as it was, so the lock is used
+            // as it is after one: the next request is made, the clock is corrected and the
+            // node attests. This is the one lock of the program that is no lock of state
+            // (`crate::faults::Lock`).
             self.nsm
                 .lock()
-                .map_err(|_| PlatformError("the NSM descriptor lock is poisoned"))?
+                .unwrap_or_else(PoisonError::into_inner)
                 .document(user_data, nonce)
         }
     }
@@ -209,27 +224,40 @@ mod enclave {
             attestation_timestamp(&self.document(None, None)?)
         }
 
-        async fn listen(&self) -> Result<Listener, PlatformError> {
+        async fn listen(&self, connections: usize) -> Result<Listener, PlatformError> {
             let listener =
                 VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, u32::from(LISTEN_PORT)))
                     .map_err(|_| PlatformError("cannot listen on vsock port 8080"))?;
-            // The queue of connections that wait for accept: the library binds with a queue
-            // of 128, and a second `listen` call widens it to LISTEN_BACKLOG (the kernel of
-            // the enclave resets a connection request that finds the queue full). A kernel
-            // that refuses the length leaves the queue at 128, and the listener works as
-            // before.
-            let _ = socket2::SockRef::from(&listener).listen(LISTEN_BACKLOG);
-            Ok(Listener::Vsock(listener))
+            // The queue of connections that wait for accept holds as many as the node holds
+            // connections: the kernel of the enclave resets a connection request that finds
+            // the queue full, and the node has a place for every connection below its bound.
+            // The library binds with a queue of 128, and the kernel caps the queue of every
+            // listener at `net.core.somaxconn`, whose default in the kernel of an enclave is
+            // 128, whatever a `listen` call asks for. So the node, the first process of the
+            // enclave, raises the cap and then asks for the queue with a second `listen`
+            // call. A kernel that refuses one of the two leaves the queue shorter, and the
+            // listener works as before.
+            let _ = std::fs::write(SOMAXCONN, connections.to_string());
+            let _ = socket2::SockRef::from(&listener)
+                .listen(i32::try_from(connections).unwrap_or(i32::MAX));
+            Ok(Listener::Vsock(listener, self.lingerers.clone()))
         }
 
         async fn connect(&self, host: &str, port: u16) -> Result<Stream, ConnectError> {
-            let mut stream = VsockStream::connect(VsockAddr::new(PARENT_CID, EGRESS_PORT))
+            let stream = VsockStream::connect(VsockAddr::new(PARENT_CID, EGRESS_PORT))
                 .await
                 .map_err(|_| {
                     ConnectError::Transport("cannot reach the egress relay of the parent")
                 })?;
+            // The connection is closed only after the egress relay reported the end of its
+            // bytes: a provider can be in the middle of a response when the node is done.
+            let mut stream = Lingering::new(stream, self.lingerers.clone());
             open_tunnel(&mut stream, host, port).await?;
             Ok(Box::new(stream))
+        }
+
+        fn lingering(&self) -> Option<(usize, u64)> {
+            Some((self.lingerers.waiting(), self.lingerers.cut()))
         }
     }
 }

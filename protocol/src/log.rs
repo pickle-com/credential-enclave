@@ -1,13 +1,19 @@
 //! The credential log (protocol.md section 7): signed entries that only the account can read,
-//! chained per (node, account), and the signed head of a chain.
+//! and the objects of the log store that hold them.
 //!
-//! The log has two formats. Format 2 ([`EntryBody`], [`append_batch`], [`object_key_v2`]) is
-//! the format of the releases from v2.0.0 on: one entry holds the events of one or more acts
-//! of one account, and the key of its object carries the hash of the body and the hash of the
-//! chain, so a reader verifies the chain from the keys of a listing. Format 1 ([`EntryBodyV1`],
-//! [`append`], [`object_key`]) is the format of the releases before: one entry holds one event
-//! and the key carries the chain hash of the body. A node writes format 2 and a reader reads
-//! both; the shape of a key tells the format ([`parse_object_key`]).
+//! The log has three formats. Format 3 ([`EntryBody`] with `v` 3, [`append_v3`],
+//! [`object_key_v3`]) is the format of the releases from v2.4.0 on: one entry holds the events
+//! of one or more acts of one account, the key of its object carries the time of the entry,
+//! the node that created it and the hash of its body, and the keys of one account sort from the
+//! latest entry to the earliest. A node of that format also writes its own attestation document
+//! to the store ([`NodeDocument`]). Format 2 ([`EntryBody`] with `v` 2, [`append_batch`],
+//! [`object_key_v2`]) is the format of the releases from v2.0.0 to v2.3.0: the entries of one
+//! (node, account) pair form a chain, the key of an object carries the hash of the body and the
+//! hash of the chain, and the node signed the end of the chain ([`signed_head`]). Format 1
+//! ([`EntryBodyV1`], [`append`], [`object_key`]) is the format of the releases before v2.0.0:
+//! one entry holds one event and the key carries the chain hash of the body. A node writes
+//! format 3 and a reader reads all three; the shape of a key tells the format
+//! ([`parse_object_key_v3`], [`parse_object_key`]).
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -35,8 +41,10 @@ impl Head {
     };
 }
 
-/// The body of a log entry of format 2 (7.1). `kind` is the letter of the kind of the entry
-/// (`c` or `u`) and `count` the number of events in the plaintext.
+/// The body of a log entry of format 2 and of format 3 (7.1): `v` is 2 or 3. `kind` is the
+/// letter of the kind of the entry (`c` or `u`) and `count` the number of events in the
+/// plaintext. `prev` is the `entry_hash` of the entry before in format 2 and the `body_hash` of
+/// the entry before in format 3.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryBody {
     pub v: u8,
@@ -83,9 +91,9 @@ pub struct HeadBody {
     pub is_final: bool,
 }
 
-/// The two kinds of entry of format 2 (7.1). A control entry holds one control event (the
-/// life of a grant or of a connection) and is never merged with another event. A use entry
-/// holds the use events that arrived while the write before it ran.
+/// The two kinds of entry of format 2 and of format 3 (7.1). A control entry holds one control
+/// event (the life of a grant or of a connection) and is never merged with another event. A use
+/// entry holds the use events that arrived while the write before it ran.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EntryKind {
     Control,
@@ -289,8 +297,8 @@ pub fn parse_object_key(key: &str, prefix: &str) -> Option<ParsedKey> {
     }
     match rest.len() {
         V1_LENGTH => {
-            let (seq, hash) = (&rest[..SEQ_DIGITS], &rest[SEQ_DIGITS + 1..]);
-            if &rest[SEQ_DIGITS..SEQ_DIGITS + 1] != "-" {
+            let (seq, hash) = (rest.get(..SEQ_DIGITS)?, rest.get(SEQ_DIGITS + 1..)?);
+            if rest.get(SEQ_DIGITS..SEQ_DIGITS + 1)? != "-" {
                 return None;
             }
             let seq: u64 = digits(seq)?;
@@ -312,20 +320,23 @@ pub fn parse_object_key(key: &str, prefix: &str) -> Option<ParsedKey> {
                 HASH_CHARS,
                 HASH_CHARS,
             ] {
-                fields.push(&rest[at..at + width]);
+                fields.push(rest.get(at..at + width)?);
                 at += width;
                 if at < rest.len() {
-                    if &rest[at..at + 1] != "-" {
+                    if rest.get(at..at + 1)? != "-" {
                         return None;
                     }
                     at += 1;
                 }
             }
-            let seq: u64 = digits(fields[0])?;
-            let time_ms: u64 = digits(fields[1])?;
-            let kind = EntryKind::parse(fields[2].chars().next()?)?;
-            let count: u32 = digits(fields[3])?;
-            let key_id = fields[4];
+            let [seq, time_ms, kind, count, key_id, body_hash, entry_hash] = fields.as_slice()
+            else {
+                return None;
+            };
+            let seq: u64 = digits(seq)?;
+            let time_ms: u64 = digits(time_ms)?;
+            let kind = EntryKind::parse(kind.chars().next()?)?;
+            let count: u32 = digits(count)?;
             if seq == 0
                 || count == 0
                 || count as usize > limits::ENTRY_EVENTS
@@ -340,9 +351,9 @@ pub fn parse_object_key(key: &str, prefix: &str) -> Option<ParsedKey> {
                 time_ms,
                 kind,
                 count,
-                key_id: key_id.to_string(),
-                body_hash: b64u_decode_array::<32>(fields[5]).ok()?,
-                entry_hash: b64u_decode_array::<32>(fields[6]).ok()?,
+                key_id: (*key_id).to_string(),
+                body_hash: b64u_decode_array::<32>(body_hash).ok()?,
+                entry_hash: b64u_decode_array::<32>(entry_hash).ok()?,
             }))
         }
         _ => None,
@@ -367,6 +378,12 @@ pub fn parse_object_key(key: &str, prefix: &str) -> Option<ParsedKey> {
 /// [`crate::envelope::open_command`] rejects a grant with such a key, so a `log_pk` taken from
 /// an accepted grant never panics here.
 #[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::expect_used,
+    reason = "no call of a node reaches this function: a node writes format 3 (`append_v3`). \
+              The generator of the test vectors and the tests of a reader call it, with a log \
+              public key they made"
+)]
 pub fn append(
     keys: &NodeKeys,
     head: &Head,
@@ -423,6 +440,12 @@ pub fn append(
 /// event, and when HPKE cannot seal to `log_pk`. A node checks the first three before it closes
 /// a batch, and a `log_pk` of an accepted grant can be sealed to.
 #[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::expect_used,
+    reason = "no call of a node reaches this function: a node writes format 3 (`append_v3`). \
+              The generator of the test vectors and the tests of a reader call it, with a log \
+              public key they made"
+)]
 pub fn append_batch(
     keys: &NodeKeys,
     head: &Head,
@@ -492,9 +515,322 @@ pub fn append_batch(
     )
 }
 
-/// Signs the head of the chain of `user_id` on this node. `nonce` is the value the requester
-/// gave. A head with `is_final` true carries the empty string as its nonce: a node creates one
-/// per account in its orderly shutdown and writes no entry for that account afterwards.
+/// The last entry a node created for an account in format 3: its `seq` and the hash of its
+/// body. The next entry carries that hash as `prev`. Before the first entry the `seq` is 0 and
+/// the hash is 32 zero bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Last {
+    pub seq: u64,
+    pub body_hash: [u8; 32],
+}
+
+impl Last {
+    /// The state of a (node, account) pair without an entry.
+    pub const NONE: Last = Last {
+        seq: 0,
+        body_hash: [0u8; 32],
+    };
+}
+
+/// What the key of an entry of format 3 says about the content of the entry (7.6): the name of
+/// the one event of a control entry, or the number of events of a use entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EntryLabel {
+    Control(String),
+    Use(u32),
+}
+
+/// What the key of an entry of format 3 carries after the prefix of its account (7.6). A reader
+/// that holds the key knows the time, the node and the kind of the entry before it reads the
+/// object, and verifies the object it reads against `body_hash`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EntryKey {
+    /// The `time_ms` of the body of the entry.
+    pub time_ms: u64,
+    /// The identifier of the node that created the entry.
+    pub node: String,
+    /// The `seq` of the entry among the entries of that node for the account.
+    pub seq: u64,
+    pub label: EntryLabel,
+    pub key_id: String,
+    pub body_hash: [u8; 32],
+}
+
+impl EntryKey {
+    /// The kind of the entry.
+    pub fn kind(&self) -> EntryKind {
+        match self.label {
+            EntryLabel::Control(_) => EntryKind::Control,
+            EntryLabel::Use(_) => EntryKind::Use,
+        }
+    }
+
+    /// The number of events of the entry: 1 for a control entry.
+    pub fn count(&self) -> u32 {
+        match self.label {
+            EntryLabel::Control(_) => 1,
+            EntryLabel::Use(count) => count,
+        }
+    }
+}
+
+/// The largest `time_ms` a key of format 3 writes: 13 decimal digits.
+pub const RTIME_MAX: u64 = 9_999_999_999_999;
+
+/// The first part of the name of an entry of format 3: `9999999999999 − time_ms`, written as 13
+/// decimal digits. A listing of a prefix returns its keys in the order of their bytes, so with
+/// this part in front the first page of a listing holds the latest entries.
+pub fn rtime(time_ms: u64) -> u64 {
+    RTIME_MAX.saturating_sub(time_ms)
+}
+
+/// The prefix of the entries of format 3 of one account and one kind (7.6): `a3/{user_id}/c/`
+/// for the control entries, `a3/{user_id}/u/` for the use entries.
+pub fn entry_prefix_v3(user_id: &str, kind: EntryKind) -> String {
+    format!("a3/{user_id}/{}/", kind.letter())
+}
+
+/// The key of the object of an entry of format 3 in the log store (7.6):
+///
+/// ```text
+/// a3/{user_id}/c/{rtime}.{node}.{seq}.{event}.{key_id}.{body_hash}     a control entry
+/// a3/{user_id}/u/{rtime}.{node}.{seq}.{count}.{key_id}.{body_hash}     a use entry
+/// ```
+///
+/// `rtime` is [`rtime`] of the `time_ms` of the entry as 13 decimal digits, `seq` and `count`
+/// are decimal without zeros in front, `event` is the `t` of the one event of a control entry
+/// and `body_hash` the b64u of the SHA-256 of the body. The parts are joined by `.`, which is no
+/// character of a b64u value, of a `key_id`, of a number or of an event name.
+pub fn object_key_v3(user_id: &str, key: &EntryKey) -> String {
+    let label = match &key.label {
+        EntryLabel::Control(event) => event.clone(),
+        EntryLabel::Use(count) => count.to_string(),
+    };
+    format!(
+        "{}{:013}.{}.{}.{label}.{}.{}",
+        entry_prefix_v3(user_id, key.kind()),
+        rtime(key.time_ms),
+        key.node,
+        key.seq,
+        key.key_id,
+        b64u(&key.body_hash)
+    )
+}
+
+/// True for the name of an event as a key of format 3 writes it: 1 to 64 lower-case letters,
+/// digits and `_`.
+fn is_event_name(text: &str) -> bool {
+    (1..=64).contains(&text.len())
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+/// A decimal number as a key of format 3 writes it: digits without a zero in front.
+fn plain_number(text: &str) -> Option<u64> {
+    if text.starts_with('0') {
+        return None;
+    }
+    digits(text)
+}
+
+/// The 32 bytes of a b64u part of a key, when the part is the one way to write them.
+fn key_bytes(text: &str) -> Option<[u8; 32]> {
+    let bytes = b64u_decode_array::<32>(text).ok()?;
+    (b64u(&bytes) == text).then_some(bytes)
+}
+
+/// Reads a key of the log store as the key of an entry of format 3 of the account `user_id`
+/// (7.6). Any other shape is `None`: a key of another account, a first part that is not 13
+/// digits, a `node` or a `body_hash` that is not the b64u of 32 bytes, a `seq` of 0 or with a
+/// zero in front, a `count` outside 1 to [`limits::ENTRY_EVENTS`], an event name of another
+/// form than 1 to 64 lower-case letters, digits and `_`, and a `key_id` that is not 16
+/// lower-case hexadecimal characters. Such a key is not an entry, and a reader leaves it out.
+pub fn parse_object_key_v3(key: &str, user_id: &str) -> Option<EntryKey> {
+    let rest = key
+        .strip_prefix("a3/")?
+        .strip_prefix(user_id)?
+        .strip_prefix('/')?;
+    let (kind, rest) = match (rest.strip_prefix("c/"), rest.strip_prefix("u/")) {
+        (Some(rest), _) => (EntryKind::Control, rest),
+        (_, Some(rest)) => (EntryKind::Use, rest),
+        _ => return None,
+    };
+    let parts: Vec<&str> = rest.split('.').collect();
+    let [time, node, seq, label, key_id, hash] = parts.as_slice() else {
+        return None;
+    };
+    if time.len() != TIME_DIGITS {
+        return None;
+    }
+    let time: u64 = digits(time)?;
+    let seq = plain_number(seq).filter(|seq| *seq > 0)?;
+    let label = match kind {
+        EntryKind::Control => {
+            if !is_event_name(label) {
+                return None;
+            }
+            EntryLabel::Control((*label).to_string())
+        }
+        EntryKind::Use => {
+            let count = plain_number(label)
+                .filter(|count| (1..=limits::ENTRY_EVENTS as u64).contains(count))?;
+            EntryLabel::Use(u32::try_from(count).ok()?)
+        }
+    };
+    let hexadecimal = key_id.len() == KEY_ID_CHARS
+        && key_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if !hexadecimal {
+        return None;
+    }
+    key_bytes(node)?;
+    Some(EntryKey {
+        time_ms: RTIME_MAX.checked_sub(time)?,
+        node: (*node).to_string(),
+        seq,
+        label,
+        key_id: (*key_id).to_string(),
+        body_hash: key_bytes(hash)?,
+    })
+}
+
+/// Format 3: creates the entry that follows `last` from the events of an open batch (a use
+/// entry) or from one control event (a control entry), and returns it with the new last entry
+/// and the parts of its key.
+///
+/// The body is that of format 2 with `"v":3`, and its `prev` is the hash of the body of the
+/// entry before (32 zero bytes for the first entry of the node for the account). The plaintext
+/// is the JSON array of `events` in the order given, sealed to `log_pk` with single-shot HPKE:
+/// info `pickle.secure.v3.log-entry`, AAD [`entry_aad`]. `time_ms` is the time the batch was
+/// closed and `hpke_seed` is as in [`append`]. The signature context is
+/// `pickle.secure.v3.log-entry\n`.
+///
+/// `None` when `events` is empty or longer than [`limits::ENTRY_EVENTS`], when the plaintext is
+/// longer than [`limits::ENTRY_PLAINTEXT_BYTES`], when `time_ms` is beyond [`RTIME_MAX`], when a
+/// control entry is given another number of events than one or an event whose `t` is not an
+/// event name, and when HPKE cannot seal to `log_pk` (a point of small order): no entry exists
+/// then, and the act that waits for it does not take place.
+#[allow(clippy::too_many_arguments)]
+pub fn append_v3(
+    keys: &NodeKeys,
+    last: &Last,
+    user_id: &str,
+    key_id: &str,
+    log_pk: &[u8; 32],
+    time_ms: u64,
+    kind: EntryKind,
+    events: &[serde_json::Value],
+    hpke_seed: &Secret<[u8; 32]>,
+) -> Option<(Signed, Last, EntryKey)> {
+    if events.is_empty() || events.len() > limits::ENTRY_EVENTS || time_ms > RTIME_MAX {
+        return None;
+    }
+    let count = u32::try_from(events.len()).ok()?;
+    let label = match (kind, events) {
+        (EntryKind::Use, _) => EntryLabel::Use(count),
+        (EntryKind::Control, [event]) => {
+            let name = event.get("t")?.as_str()?;
+            if !is_event_name(name) {
+                return None;
+            }
+            EntryLabel::Control(name.to_string())
+        }
+        (EntryKind::Control, _) => return None,
+    };
+    let node = keys.node();
+    let seq = last.seq.checked_add(1)?;
+    let plaintext = Zeroizing::new(to_json(&serde_json::Value::Array(events.to_vec())));
+    if plaintext.len() > limits::ENTRY_PLAINTEXT_BYTES {
+        return None;
+    }
+    let (enc, ct) = hpke_seal(
+        log_pk,
+        purpose::LOG_ENTRY_SEAL_V3.as_bytes(),
+        &entry_aad(&node, user_id, key_id, seq),
+        &plaintext,
+        hpke_seed.expose_secret(),
+    )
+    .ok()?;
+    let body = to_json(&EntryBody {
+        v: 3,
+        node: node.clone(),
+        user_id: user_id.to_string(),
+        key_id: key_id.to_string(),
+        seq,
+        prev: b64u(&last.body_hash),
+        time_ms,
+        kind: kind.letter().to_string(),
+        count,
+        enc: b64u(&enc),
+        ct: b64u(&ct),
+    });
+    let body_hash = body_hash(&body);
+    let key = EntryKey {
+        time_ms,
+        node,
+        seq,
+        label,
+        key_id: key_id.to_string(),
+        body_hash,
+    };
+    Some((
+        keys.sign(purpose::LOG_ENTRY_V3, &body),
+        Last { seq, body_hash },
+        key,
+    ))
+}
+
+/// The node document (7.7): the attestation document of a node as the node itself wrote it to
+/// its log store. It has the keys of an attestation response (4.2) without the challenge. A
+/// reader of the store verifies with it that the signing key of the entries of `node` was
+/// created inside an enclave of the measurement the document states.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeDocument {
+    pub v: u8,
+    pub platform: String,
+    /// b64u of the document of the platform: a Nitro attestation document, or a local document.
+    pub document: String,
+    pub node: String,
+    pub release: String,
+}
+
+/// The key of the node document of `node` in the log store (7.7): `n3/{node}`. Its bucket is
+/// the bucket of the hash of the node identifier ([`crate::keys::shard_hash`]).
+pub fn node_document_key(node: &str) -> String {
+    format!("n3/{node}")
+}
+
+/// The nonce of the document of the platform inside a node document (7.7):
+/// `SHA-256("pickle.secure.v3.node-document\n" || the 32 bytes of the node signing public
+/// key)`. No requester chose it: a reader computes it from the node identifier, and a document
+/// with this nonce was made by the node for its node document.
+pub fn node_document_nonce(sign_public: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(purpose::NODE_DOCUMENT.as_bytes());
+    hasher.update(sign_public);
+    hasher.finalize().into()
+}
+
+/// The bytes of the node document of a node: the JSON of [`NodeDocument`] with the keys in
+/// the order `v`, `platform`, `document`, `node`, `release`. `document` is the document of the
+/// platform over the binding of the node and the nonce [`node_document_nonce`].
+pub fn node_document(platform: &str, document: &[u8], node: &str, release: &str) -> Vec<u8> {
+    to_json(&NodeDocument {
+        v: 1,
+        platform: platform.to_string(),
+        document: b64u(document),
+        node: node.to_string(),
+        release: release.to_string(),
+    })
+}
+
+/// Signs the head of a chain of format 1 or 2 of `user_id` (7.3), as a node of a release
+/// before v2.4.0 did. A node of format 3 signs no head: the vectors and the tests of a reader
+/// of the earlier formats use this function. `nonce` is the value the requester gave. A head
+/// with `is_final` true carries the empty string as its nonce: a node of those releases created
+/// one per account in its orderly shutdown.
 pub fn signed_head(
     keys: &NodeKeys,
     user_id: &str,
@@ -1229,6 +1565,268 @@ mod tests {
             EntryKind::Use,
             &events,
             &Secret::new([1; 32]),
+        );
+    }
+
+    /// The parts of the key of a use entry of two events.
+    fn use_key() -> EntryKey {
+        EntryKey {
+            time_ms: 1_790_000_000_000,
+            node: b64u(&[0x4e; 32]),
+            seq: 7,
+            label: EntryLabel::Use(2),
+            key_id: "0123456789abcdef".to_string(),
+            body_hash: [0xfb; 32],
+        }
+    }
+
+    #[test]
+    fn the_key_of_an_entry_of_format_3_starts_with_the_time_counted_down() {
+        let key = use_key();
+        let node = b64u(&[0x4e; 32]);
+        let hash = "-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s";
+        assert_eq!(
+            object_key_v3("user-1", &key),
+            format!("a3/user-1/u/8209999999999.{node}.7.2.0123456789abcdef.{hash}")
+        );
+        let control = EntryKey {
+            label: EntryLabel::Control("grant_accepted".to_string()),
+            seq: 1,
+            ..key.clone()
+        };
+        assert_eq!(
+            object_key_v3("user-1", &control),
+            format!("a3/user-1/c/8209999999999.{node}.1.grant_accepted.0123456789abcdef.{hash}")
+        );
+        assert_eq!((control.kind(), control.count()), (EntryKind::Control, 1));
+        assert_eq!((key.kind(), key.count()), (EntryKind::Use, 2));
+        // The first part has 13 digits at every time, so the keys of one prefix sort by time
+        // alone, the latest first.
+        assert_eq!((rtime(0), rtime(RTIME_MAX)), (RTIME_MAX, 0));
+        let at = |time_ms: u64| {
+            object_key_v3(
+                "u",
+                &EntryKey {
+                    time_ms,
+                    ..use_key()
+                },
+            )
+        };
+        assert!(at(0).starts_with("a3/u/u/9999999999999."));
+        assert!(at(RTIME_MAX).starts_with("a3/u/u/0000000000000."));
+        assert!(at(2_000) < at(1_999) && at(1_999) < at(1));
+        // A key reads back to its parts, also for a `user_id` that holds the separators.
+        for user_id in ["user-1", "a/b", "a.b", "사용자 1", "a3/x/c"] {
+            for parts in [&key, &control] {
+                let text = object_key_v3(user_id, parts);
+                assert_eq!(parse_object_key_v3(&text, user_id).as_ref(), Some(parts));
+            }
+        }
+    }
+
+    #[test]
+    fn a_key_of_another_shape_is_not_a_key_of_format_3() {
+        let key = object_key_v3("user-1", &use_key());
+        assert!(parse_object_key_v3(&key, "user-1").is_some());
+        let node = b64u(&[0x4e; 32]);
+        let hash = b64u(&[0xfb; 32]);
+        let with = |rest: &str| format!("a3/user-1/u/{rest}");
+        for other in [
+            // Another account, another prefix, another kind letter.
+            key.replacen("user-1", "user-2", 1),
+            key.replacen("a3/", "a4/", 1),
+            key.replacen("/u/", "/x/", 1),
+            // A part too few and a part too many.
+            with(&format!("8209999999999.{node}.7.2.0123456789abcdef")),
+            with(&format!(
+                "8209999999999.{node}.7.2.0123456789abcdef.{hash}.x"
+            )),
+            // A time of other than 13 digits.
+            with(&format!("820999999999.{node}.7.2.0123456789abcdef.{hash}")),
+            with(&format!(
+                "82099999999990.{node}.7.2.0123456789abcdef.{hash}"
+            )),
+            with(&format!("82099999x9999.{node}.7.2.0123456789abcdef.{hash}")),
+            // A node that is not the b64u of 32 bytes.
+            with(&format!("8209999999999.NODE.7.2.0123456789abcdef.{hash}")),
+            // A `seq` of 0, with a zero in front, with a sign.
+            with(&format!("8209999999999.{node}.0.2.0123456789abcdef.{hash}")),
+            with(&format!(
+                "8209999999999.{node}.07.2.0123456789abcdef.{hash}"
+            )),
+            with(&format!(
+                "8209999999999.{node}.+7.2.0123456789abcdef.{hash}"
+            )),
+            // A `count` of 0 and one above the cap of an entry.
+            with(&format!("8209999999999.{node}.7.0.0123456789abcdef.{hash}")),
+            with(&format!(
+                "8209999999999.{node}.7.129.0123456789abcdef.{hash}"
+            )),
+            // A `key_id` of another length, and one in upper case.
+            with(&format!("8209999999999.{node}.7.2.0123456789abcde.{hash}")),
+            with(&format!("8209999999999.{node}.7.2.0123456789ABCDEF.{hash}")),
+            // A hash of another length, and a second way to write the same 32 bytes.
+            with(&format!(
+                "8209999999999.{node}.7.2.0123456789abcdef.{}",
+                &hash[..42]
+            )),
+            with(&format!(
+                "8209999999999.{node}.7.2.0123456789abcdef.{}t",
+                &hash[..42]
+            )),
+        ] {
+            assert_eq!(parse_object_key_v3(&other, "user-1"), None, "{other}");
+        }
+        // The event name of a control key: lower-case letters, digits and `_`, 1 to 64.
+        let control = |event: &str| {
+            format!("a3/user-1/c/8209999999999.{node}.1.{event}.0123456789abcdef.{hash}")
+        };
+        for event in ["grant_accepted", "a", "event_2", &"e".repeat(64)] {
+            assert!(
+                parse_object_key_v3(&control(event), "user-1").is_some(),
+                "{event}"
+            );
+        }
+        for event in [
+            "",
+            "Grant",
+            "grant-accepted",
+            "grant accepted",
+            &"e".repeat(65),
+        ] {
+            assert_eq!(
+                parse_object_key_v3(&control(event), "user-1"),
+                None,
+                "{event}"
+            );
+        }
+        // A key of the two earlier formats is no key of format 3, and the reverse.
+        let earlier = object_key("user-1", &node, 7, &[0xfb; 32]);
+        assert_eq!(parse_object_key_v3(&earlier, "user-1"), None);
+        assert_eq!(parse_object_key(&key, &chain_prefix("user-1", &node)), None);
+    }
+
+    #[test]
+    fn an_entry_of_format_3_carries_the_hash_of_the_body_before_it() {
+        let keys = node();
+        let account = app::derive_account_keys(&[0x33; 32]);
+        let append = |last: &Last, kind: EntryKind, events: &[serde_json::Value]| {
+            append_v3(
+                &keys,
+                last,
+                "user-1",
+                &account.key_id(),
+                &account.log_pk(),
+                5_000,
+                kind,
+                events,
+                &Secret::new([0x44; 32]),
+            )
+        };
+        let (first, last, key) = append(
+            &Last::NONE,
+            EntryKind::Control,
+            &[json!({"t": "grant_revoked", "time_ms": 5_000})],
+        )
+        .unwrap();
+        let body_bytes = verify(&keys.sign_public(), purpose::LOG_ENTRY_V3, &first).unwrap();
+        // The body has the keys of format 2 in their order, with the version 3.
+        let text = String::from_utf8(body_bytes.clone()).unwrap();
+        assert!(text.starts_with(&format!(
+            "{{\"v\":3,\"node\":\"{}\",\"user_id\":\"user-1\",\"key_id\":\"{}\",\"seq\":1,\"prev\":\"{}\",\"time_ms\":5000,\"kind\":\"c\",\"count\":1,\"enc\":\"",
+            keys.node(),
+            account.key_id(),
+            b64u(&[0u8; 32])
+        )));
+        assert_eq!(
+            last,
+            Last {
+                seq: 1,
+                body_hash: body_hash(&body_bytes)
+            }
+        );
+        assert_eq!(
+            key,
+            EntryKey {
+                time_ms: 5_000,
+                node: keys.node(),
+                seq: 1,
+                label: EntryLabel::Control("grant_revoked".to_string()),
+                key_id: account.key_id(),
+                body_hash: last.body_hash,
+            }
+        );
+        // A signature of format 3 does not verify as one of format 2.
+        assert!(verify(&keys.sign_public(), purpose::LOG_ENTRY_V2, &first).is_err());
+        let use_events = [
+            json!({"t": "secret_released", "time_ms": 5_000}),
+            json!({"t": "totp_issued", "time_ms": 5_000}),
+        ];
+        let (second, next, key) = append(&last, EntryKind::Use, &use_events).unwrap();
+        let body: EntryBody = serde_json::from_slice(
+            &verify(&keys.sign_public(), purpose::LOG_ENTRY_V3, &second).unwrap(),
+        )
+        .unwrap();
+        assert_eq!((body.seq, body.prev), (2, b64u(&last.body_hash)));
+        assert_eq!((next.seq, &key.label), (2, &EntryLabel::Use(2)));
+        // Only the log key of the grant opens it, to the events in their order.
+        let (_, bytes) = app::verify_entry_v3("user-1", &key, &second).unwrap();
+        assert_eq!(
+            app::open_entry_v3(&account.log, &bytes).unwrap(),
+            use_events
+        );
+        let other = app::derive_account_keys(&[0x34; 32]);
+        assert!(app::open_entry_v3(&other.log, &bytes).is_err());
+
+        // What is no entry: no event, too many events, a control entry of two events or of an
+        // event without a name, a plaintext above its cap, a time beyond the 13 digits of a
+        // key, and a log key HPKE cannot seal to. Nothing panics.
+        let event = json!({"t": "secret_released", "time_ms": 5_000});
+        assert!(append(&last, EntryKind::Use, &[]).is_none());
+        let many = vec![event.clone(); limits::ENTRY_EVENTS + 1];
+        assert!(append(&last, EntryKind::Use, &many).is_none());
+        assert!(append(&last, EntryKind::Use, &many[..limits::ENTRY_EVENTS]).is_some());
+        assert!(append(&last, EntryKind::Control, &many[..2]).is_none());
+        assert!(append(&last, EntryKind::Control, &[json!({"time_ms": 1})]).is_none());
+        assert!(append(&last, EntryKind::Control, &[json!({"t": "Not A Name"})]).is_none());
+        let large =
+            json!({"t": "secret_released", "context": "x".repeat(limits::ENTRY_PLAINTEXT_BYTES)});
+        assert!(append(&last, EntryKind::Use, &[large]).is_none());
+        let sealed = |time_ms: u64, log_pk: &[u8; 32]| {
+            append_v3(
+                &keys,
+                &last,
+                "user-1",
+                &account.key_id(),
+                log_pk,
+                time_ms,
+                EntryKind::Use,
+                std::slice::from_ref(&event),
+                &Secret::new([0x44; 32]),
+            )
+        };
+        assert!(sealed(RTIME_MAX, &account.log_pk()).is_some());
+        assert!(sealed(RTIME_MAX + 1, &account.log_pk()).is_none());
+        assert!(sealed(5_000, &[0u8; 32]).is_none());
+    }
+
+    #[test]
+    fn the_node_document_has_a_key_and_a_nonce_of_its_node() {
+        let keys = node();
+        assert_eq!(
+            node_document_key(&keys.node()),
+            format!("n3/{}", keys.node())
+        );
+        let nonce = node_document_nonce(&keys.sign_public());
+        let mut hasher = Sha256::new();
+        hasher.update(b"pickle.secure.v3.node-document\n");
+        hasher.update(keys.sign_public());
+        assert_eq!(nonce, <[u8; 32]>::from(hasher.finalize()));
+        assert_ne!(nonce, node_document_nonce(&[0u8; 32]));
+        // The object has the keys of an attestation response without the challenge, in order.
+        assert_eq!(
+            String::from_utf8(node_document("nitro", b"document", "NODE", "v2.4.0")).unwrap(),
+            r#"{"v":1,"platform":"nitro","document":"ZG9jdW1lbnQ","node":"NODE","release":"v2.4.0"}"#
         );
     }
 }

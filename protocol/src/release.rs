@@ -1,209 +1,146 @@
-//! The delegation transfer to a later release (protocol.md 10.3): the release statement, the
-//! entry of the public transparency log that records its signature, the order of releases and
-//! the list of predecessors.
+//! Releases (protocol.md section 9 and 10.3): the release statement, the list of the old
+//! releases of a program, and a transparency log with what it returns to show that it holds an
+//! entry.
 //!
-//! A node hands delegations to a node of a later release when the release key of the operator
-//! signed the measurements of that release and the transparency log Rekor recorded that
-//! signature. A node takes delegations from a node of a release that its own program lists as
-//! a predecessor. What is decided here is whether an endorsement holds, how two releases are
-//! ordered and what a list of predecessors states. Which peer a node then accepts is decided
-//! where the attestation of that peer is verified (`enclave/src/attest.rs`).
+//! A release is a tag of the public repository and the enclave image file built from the
+//! commit of that tag. Its identity is its measurement: PCR0, PCR1 and PCR2. The release
+//! statement is the file `measurements.json` of the release, which states its name, its commit
+//! and its measurement. Which measurement a node accepts for a peer is decided where the
+//! attestation of that peer is verified (`enclave/src/attest.rs`), with the proof of
+//! `release_proofs.rs` or with the list of old releases read here.
 //!
-//! The release key and the key of the log are arguments: the node program passes the two keys
-//! that are compiled into it.
+//! A transparency log of this module has the form Rekor v1 (`rekor.sigstore.dev`). The log
+//! answers an upload with a signed entry timestamp, its signature over the entry and the time
+//! it took it, and with an inclusion proof: the audit path from the entry to the root of a
+//! tree whose head it signed (a checkpoint).
+//!
+//! The keys of the logs are arguments: the node program passes the table that is compiled
+//! into it. Nothing here sends a request to a log or reads a clock: a verdict depends on the
+//! bytes of the call and on these compiled values.
 
-use std::cmp::Ordering;
 use std::fmt;
+use std::marker::PhantomData;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_ASN1};
 use serde::de::{Error as _, IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use sha2::{Digest, Sha256};
 
+use crate::certificate::{ecdsa_verifies, Curve, Hash, P256_SPKI_PREFIX};
 use crate::limits;
 
-/// Why the endorsement of a later release was not accepted. A node answers every one of them
-/// with `peer_unverified`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum EndorsementError {
-    /// Check 1: the statement is longer than 16,384 bytes or does not state a release and
-    /// three measurements.
-    Statement,
-    /// Check 2: the entry is not of the log whose key the node holds.
-    LogId,
-    /// Check 3: the signed entry timestamp is not the signature of the log over this entry.
-    EntrySignature,
-    /// Check 4: the body of the entry is not a `hashedrekord` of version 0.0.1 over a SHA-256
-    /// hash.
-    EntryBody,
-    /// Check 4: the hash of the entry is not the hash of the statement.
-    StatementHash,
-    /// Check 4: the public key of the entry is not the release key.
-    ReleaseKey,
-    /// Check 4: the signature of the entry is not the signature of the release key over the
-    /// statement.
-    ReleaseSignature,
-    /// Check 5: the time of the entry lies too far after the clock of the node, or the notice
-    /// period has not passed.
-    EntryTime,
-    /// Check 6: the release of the statement is not later than the release of the node, or
-    /// one of the two is not a release tag.
-    ReleaseOrder,
-}
-
-/// A release tag: `v{major}.{minor}.{patch}`, or `v{major}.{minor}.{patch}-rc.{n}` for a
-/// release candidate. Every number is decimal without a leading zero (a lone `0` is a number)
-/// and fits 32 bits.
-///
-/// Releases are ordered by (major, minor, patch). Of two releases with the same three numbers,
-/// a release candidate is earlier than the release without `-rc.{n}`, and the candidate with
-/// the smaller `n` is the earlier one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Release {
-    major: u32,
-    minor: u32,
-    patch: u32,
-    candidate: Option<u32>,
-}
-
-impl Release {
-    /// Reads a release tag. `None` for every other text, for example `dev`.
-    pub fn parse(tag: &str) -> Option<Release> {
-        let numbers = tag.strip_prefix('v')?;
-        let (numbers, candidate) = match numbers.split_once('-') {
-            None => (numbers, None),
-            Some((numbers, suffix)) => (numbers, Some(number(suffix.strip_prefix("rc.")?)?)),
-        };
-        let mut parts = numbers.split('.');
-        let release = Release {
-            major: number(parts.next()?)?,
-            minor: number(parts.next()?)?,
-            patch: number(parts.next()?)?,
-            candidate,
-        };
-        match parts.next() {
-            None => Some(release),
-            Some(_) => None,
-        }
-    }
-
-    /// The position of the release in the order: a release without a candidate number comes
-    /// after every candidate of the same three numbers.
-    fn position(&self) -> (u32, u32, u32, bool, u32) {
-        (
-            self.major,
-            self.minor,
-            self.patch,
-            self.candidate.is_none(),
-            self.candidate.unwrap_or(0),
-        )
-    }
-}
-
-impl Ord for Release {
-    fn cmp(&self, other: &Release) -> Ordering {
-        self.position().cmp(&other.position())
-    }
-}
-
-impl PartialOrd for Release {
-    fn partial_cmp(&self, other: &Release) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-/// A decimal number of a release tag: digits only, no leading zero, at most `u32::MAX`.
-fn number(text: &str) -> Option<u32> {
-    let digits = text.as_bytes();
-    let plain = !digits.is_empty()
-        && digits.iter().all(u8::is_ascii_digit)
-        && (digits.len() == 1 || digits[0] != b'0');
-    if !plain {
-        return None;
-    }
-    text.parse().ok()
-}
-
-/// A release and the measurement of its enclave image: what a release statement states, and
-/// one element of a list of predecessors.
+/// A release and the measurement of its enclave image: one element of a list of old releases,
+/// and what the entry of a delegation transfer names of the node that received a key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReleaseMeasurement {
-    /// The release tag.
+    /// The name of the release: its tag.
     pub release: String,
     /// PCR0, PCR1 and PCR2 of the enclave image of that release.
     pub pcrs: [[u8; 48]; 3],
 }
 
-/// The four values of a JSON object that names a release and its measurement, as text:
-/// `release`, `pcr0`, `pcr1`, `pcr2`.
-struct MeasurementFields([String; 4]);
+/// What a release statement states of its release.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReleaseStatement {
+    /// The name of the release: its tag.
+    pub release: String,
+    /// The commit of that tag: 40 lower-case hexadecimal characters.
+    pub git_commit: String,
+    /// PCR0, PCR1 and PCR2 of the enclave image of that release.
+    pub pcrs: [[u8; 48]; 3],
+}
 
-const MEASUREMENT_KEYS: [&str; 4] = ["release", "pcr0", "pcr1", "pcr2"];
+impl ReleaseStatement {
+    /// The release and its measurement.
+    pub fn measurement(&self) -> ReleaseMeasurement {
+        ReleaseMeasurement {
+            release: self.release.clone(),
+            pcrs: self.pcrs,
+        }
+    }
+}
 
-impl<'de> Deserialize<'de> for MeasurementFields {
-    /// Reads a JSON object in which each of the four keys occurs once and holds a string.
-    /// Other keys are passed over. A value that is not an object, a key of the four that
-    /// occurs twice and a value of the four that is not a string are refused: the object states
-    /// one release and one measurement.
+/// The keys of a JSON object that names a release and its measurement.
+trait Keys {
+    const KEYS: &'static [&'static str];
+}
+
+/// The keys of an element of a list of old releases.
+struct MeasurementKeys;
+
+impl Keys for MeasurementKeys {
+    const KEYS: &'static [&'static str] = &["release", "pcr0", "pcr1", "pcr2"];
+}
+
+/// The keys of a release statement.
+struct StatementKeys;
+
+impl Keys for StatementKeys {
+    const KEYS: &'static [&'static str] = &["release", "git_commit", "pcr0", "pcr1", "pcr2"];
+}
+
+/// The values of the keys `K` of a JSON object, as text and in the order of `K`.
+struct Fields<K>(Vec<String>, PhantomData<K>);
+
+impl<'de, K: Keys> Deserialize<'de> for Fields<K> {
+    /// Reads a JSON object in which each of the keys occurs once and holds a string. Other
+    /// keys are passed over. A value that is not an object, a key of `K` that occurs twice
+    /// and a value of a key of `K` that is not a string are refused: the object states one
+    /// value for each key.
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Fields;
+        struct Reader<K>(PhantomData<K>);
 
-        impl<'de> Visitor<'de> for Fields {
-            type Value = MeasurementFields;
+        impl<'de, K: Keys> Visitor<'de> for Reader<K> {
+            type Value = Fields<K>;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("an object with release, pcr0, pcr1 and pcr2")
+                write!(formatter, "an object with {}", K::KEYS.join(", "))
             }
 
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-                let mut values: [Option<String>; 4] = [None, None, None, None];
+                let mut values: Vec<Option<String>> = vec![None; K::KEYS.len()];
                 while let Some(key) = map.next_key::<String>()? {
-                    match MEASUREMENT_KEYS.iter().position(|name| *name == key) {
-                        Some(index) if values[index].is_some() => {
-                            return Err(A::Error::duplicate_field(MEASUREMENT_KEYS[index]));
-                        }
-                        Some(index) => values[index] = Some(map.next_value()?),
+                    // The value of one of the keys, with the name of that key.
+                    let named = K::KEYS
+                        .iter()
+                        .zip(values.iter_mut())
+                        .find(|(name, _)| **name == key);
+                    match named {
+                        Some((name, Some(_))) => return Err(A::Error::duplicate_field(name)),
+                        Some((_, value)) => *value = Some(map.next_value()?),
                         None => {
                             map.next_value::<IgnoredAny>()?;
                         }
                     }
                 }
-                let mut fields: [String; 4] = Default::default();
-                for (index, value) in values.into_iter().enumerate() {
-                    fields[index] =
-                        value.ok_or_else(|| A::Error::missing_field(MEASUREMENT_KEYS[index]))?;
-                }
-                Ok(MeasurementFields(fields))
+                let fields = values
+                    .into_iter()
+                    .zip(K::KEYS)
+                    .map(|(value, name)| value.ok_or_else(|| A::Error::missing_field(name)))
+                    .collect::<Result<Vec<String>, A::Error>>()?;
+                Ok(Fields(fields, PhantomData))
             }
         }
 
-        deserializer.deserialize_map(Fields)
-    }
-}
-
-impl MeasurementFields {
-    /// The release and the measurement the object states, when each PCR is 96 lower-case
-    /// hexadecimal characters.
-    fn read(self) -> Option<ReleaseMeasurement> {
-        let [release, pcr0, pcr1, pcr2] = self.0;
-        Some(ReleaseMeasurement {
-            release,
-            pcrs: [pcr(&pcr0)?, pcr(&pcr1)?, pcr(&pcr2)?],
-        })
+        deserializer.deserialize_map(Reader(PhantomData))
     }
 }
 
 /// Reads a PCR: 96 lower-case hexadecimal characters.
 fn pcr(text: &str) -> Option<[u8; 48]> {
+    hex_bytes(text)
+}
+
+/// Reads `N` bytes from twice as many lower-case hexadecimal characters.
+pub(crate) fn hex_bytes<const N: usize>(text: &str) -> Option<[u8; N]> {
     let (pairs, []) = text.as_bytes().as_chunks::<2>() else {
         return None;
     };
-    if pairs.len() != 48 {
+    if pairs.len() != N {
         return None;
     }
-    let mut value = [0u8; 48];
+    let mut value = [0u8; N];
     for (byte, [high, low]) in value.iter_mut().zip(pairs) {
         *byte = (nibble(*high)? << 4) | nibble(*low)?;
     }
@@ -218,93 +155,168 @@ fn nibble(digit: u8) -> Option<u8> {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
+/// Lower-case hexadecimal.
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Reads a release statement (protocol.md 10.3): the bytes of the file `measurements.json` of
-/// a release. They are at most 16,384 bytes and a JSON object whose `release` is a string and
-/// whose `pcr0`, `pcr1` and `pcr2` are 96 lower-case hexadecimal characters each. The other
-/// keys of the object are not read. A statement in which one of the four keys occurs twice is
-/// refused.
-pub fn read_statement(statement: &[u8]) -> Option<ReleaseMeasurement> {
+/// True when `name` has the form of the name of a release: the tag of a release begins with
+/// `v` and holds, after it, one character or more of `A` to `Z`, `a` to `z`, `0` to `9`, `.`,
+/// `_` and `-`.
+pub fn is_release_name(name: &str) -> bool {
+    name.strip_prefix('v').is_some_and(|rest| {
+        !rest.is_empty()
+            && rest
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    })
+}
+
+/// The measurement three PCR texts state, when each is 96 lower-case hexadecimal characters
+/// and none is all zero: a PCR that is all zero is the value of a debug-mode enclave, whatever
+/// that enclave runs, and the measurement of no release.
+fn measurement(pcr0: &str, pcr1: &str, pcr2: &str) -> Option<[[u8; 48]; 3]> {
+    let pcrs = [pcr(pcr0)?, pcr(pcr1)?, pcr(pcr2)?];
+    pcrs.iter().all(|pcr| pcr != &[0u8; 48]).then_some(pcrs)
+}
+
+/// The most arrays and objects inside one another of a JSON value of a release proof.
+const JSON_DEPTH: usize = 32;
+
+/// True when a JSON value holds at most 32 arrays and objects inside one another. Every
+/// reader of a release proof reads such a value the same way.
+pub(crate) fn is_sound_json(value: &serde_json::Value) -> bool {
+    fn within(value: &serde_json::Value, depth: usize) -> bool {
+        match value {
+            serde_json::Value::Array(items) => {
+                depth < JSON_DEPTH && items.iter().all(|item| within(item, depth + 1))
+            }
+            serde_json::Value::Object(members) => {
+                depth < JSON_DEPTH && members.values().all(|item| within(item, depth + 1))
+            }
+            _ => true,
+        }
+    }
+    within(value, 0)
+}
+
+/// Reads a text of JSON: UTF-8 bytes that are one JSON value [`is_sound_json`] takes.
+pub(crate) fn read_json(bytes: &[u8]) -> Option<serde_json::Value> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .filter(is_sound_json)
+}
+
+/// The arrays, objects and commas of a text, counted together outside its strings: what
+/// decides the room its parsed value takes. A string begins and ends with a quotation mark,
+/// and inside a string a backslash takes the byte behind it with it.
+fn marks_of(text: &[u8]) -> usize {
+    let mut marks = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for byte in text {
+        if in_string {
+            match (escaped, byte) {
+                (true, _) => escaped = false,
+                (false, b'\\') => escaped = true,
+                (false, b'"') => in_string = false,
+                (false, _) => {}
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' | b'{' | b',' => marks = marks.saturating_add(1),
+            _ => {}
+        }
+    }
+    marks
+}
+
+/// Reads a JSON text that release proofs carry inside a string (the release statement, the
+/// payload of the envelope, the body of the log entry): [`read_json`], for a text of at most
+/// [`limits::RELEASE_TEXT_MARKS`] arrays, objects and commas. A text with more of them is not
+/// parsed: no signature covers it at the moment it is read, and what its parsed value would
+/// hold is not bounded by its length.
+pub(crate) fn read_proof_text(bytes: &[u8]) -> Option<serde_json::Value> {
+    if marks_of(bytes) > limits::RELEASE_TEXT_MARKS {
+        return None;
+    }
+    read_json(bytes)
+}
+
+/// Reads a release statement (protocol.md section 9): the bytes of the file
+/// `measurements.json` of a release.
+///
+/// They are at most 16,384 bytes of UTF-8 and a JSON object that states `release`,
+/// `git_commit`, `pcr0`, `pcr1` and `pcr2` once each, as strings: `release` the name of a
+/// release ([`is_release_name`]), `git_commit` 40 lower-case hexadecimal characters, and each
+/// PCR 96 lower-case hexadecimal characters that are not all zero. The other keys of the
+/// object are not read. The object holds at most 32 arrays and objects inside one another.
+pub fn read_statement(statement: &[u8]) -> Option<ReleaseStatement> {
     if statement.len() > limits::RELEASE_STATEMENT_BYTES {
         return None;
     }
-    serde_json::from_slice::<MeasurementFields>(statement)
-        .ok()?
-        .read()
+    if !read_proof_text(statement)?.is_object() {
+        return None;
+    }
+    let Fields::<StatementKeys>(fields, _) = serde_json::from_slice(statement).ok()?;
+    let [release, git_commit, pcr0, pcr1, pcr2] = <[String; 5]>::try_from(fields).ok()?;
+    if !is_release_name(&release) {
+        return None;
+    }
+    hex_bytes::<20>(&git_commit)?;
+    Some(ReleaseStatement {
+        pcrs: measurement(&pcr0, &pcr1, &pcr2)?,
+        release,
+        git_commit,
+    })
 }
 
-/// Reads a list of predecessors for a program of the release `own_release` (protocol.md 10.3):
-/// a JSON array of `{"release":"...","pcr0":"<96 hex>","pcr1":"<96 hex>","pcr2":"<96 hex>"}`.
+/// Reads a list of old releases (protocol.md 10.3): a JSON array of
+/// `{"release":"...","pcr0":"<96 hex>","pcr1":"<96 hex>","pcr2":"<96 hex>"}`.
 ///
-/// `None` when the list does not have that form, when the release of an element is not a
-/// release tag or is not earlier than `own_release`, and when a PCR of an element is all zero
-/// (the measurement of a debug-mode enclave). A program whose own release is not a release tag
-/// (for example `dev`) has no predecessor: every list but the empty one is `None` for it.
-pub fn read_predecessors(list: &[u8], own_release: &str) -> Option<Vec<ReleaseMeasurement>> {
-    let elements: Vec<MeasurementFields> = serde_json::from_slice(list).ok()?;
-    let own = Release::parse(own_release);
+/// `None` when the list does not have that form, when the release of an element is not the
+/// name of a release, and when a PCR of an element is all zero (the measurement of a
+/// debug-mode enclave).
+pub fn read_predecessors(list: &[u8]) -> Option<Vec<ReleaseMeasurement>> {
+    let elements: Vec<Fields<MeasurementKeys>> = serde_json::from_slice(list).ok()?;
     elements
         .into_iter()
-        .map(|fields| {
-            let element = fields.read()?;
-            let earlier = Release::parse(&element.release)? < own?;
-            let measured = element.pcrs.iter().all(|pcr| pcr != &[0u8; 48]);
-            (earlier && measured).then_some(element)
+        .map(|Fields(fields, _)| {
+            let [release, pcr0, pcr1, pcr2] = <[String; 4]>::try_from(fields).ok()?;
+            is_release_name(&release).then_some(())?;
+            Some(ReleaseMeasurement {
+                pcrs: measurement(&pcr0, &pcr1, &pcr2)?,
+                release,
+            })
         })
         .collect()
 }
 
-/// The first 26 bytes of the SubjectPublicKeyInfo (DER) of an ECDSA P-256 public key: the
-/// algorithm `id-ecPublicKey` with the curve `prime256v1` and the header of the bit string.
-/// The 65 bytes of the uncompressed point follow them.
-const P256_SPKI_PREFIX: [u8; 26] = [
-    0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a,
-    0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
-];
-
 /// The length of the SubjectPublicKeyInfo (DER) of an ECDSA P-256 public key.
 const P256_SPKI_BYTES: usize = 91;
 
-const PEM_BEGIN: &str = "-----BEGIN PUBLIC KEY-----";
-const PEM_END: &str = "-----END PUBLIC KEY-----";
-
-/// The uncompressed point of an ECDSA P-256 public key given as the DER of its
-/// SubjectPublicKeyInfo: 91 bytes that start with the fixed 26 bytes of that form. Every other
-/// input is `None`.
-fn p256_point(spki_der: &[u8]) -> Option<&[u8]> {
-    if spki_der.len() != P256_SPKI_BYTES {
-        return None;
-    }
-    spki_der
-        .strip_prefix(&P256_SPKI_PREFIX)
-        .filter(|point| point.first() == Some(&0x04))
-}
-
 /// True when `spki_der` is the DER of the SubjectPublicKeyInfo of an ECDSA P-256 public key
-/// with an uncompressed point: the only form of a key that [`verify_endorsement`] verifies a
-/// signature with.
+/// with an uncompressed point: the form of the key of a transparency log.
 pub fn is_p256_public_key(spki_der: &[u8]) -> bool {
-    p256_point(spki_der).is_some()
+    spki_der.len() == P256_SPKI_BYTES
+        && spki_der
+            .strip_prefix(&P256_SPKI_PREFIX)
+            .is_some_and(|point| point.first() == Some(&0x04))
 }
 
-/// True when `signature_der` is an ASN.1 DER ECDSA P-256 SHA-256 signature of the key
-/// `spki_der` over `message`.
-fn p256_verifies(spki_der: &[u8], message: &[u8], signature_der: &[u8]) -> bool {
-    p256_point(spki_der).is_some_and(|point| {
-        UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, point)
-            .verify(message, signature_der)
-            .is_ok()
-    })
-}
-
-/// Reads the DER bytes of a PEM `PUBLIC KEY`: the standard base64 between the line
-/// `-----BEGIN PUBLIC KEY-----` and the line `-----END PUBLIC KEY-----`, without its white
-/// space.
-pub fn public_key_der(pem: &str) -> Option<Vec<u8>> {
-    let inner = pem.trim().strip_prefix(PEM_BEGIN)?.strip_suffix(PEM_END)?;
+/// Reads the DER bytes of a PEM text of the kind `label` (`PUBLIC KEY`, `CERTIFICATE`): the
+/// standard base64 between the line `-----BEGIN {label}-----` and the line
+/// `-----END {label}-----`, without its white space.
+pub fn pem_der(pem: &str, label: &str) -> Option<Vec<u8>> {
+    let begin = format!("-----BEGIN {label}-----");
+    let end = format!("-----END {label}-----");
+    let inner = pem
+        .trim()
+        .strip_prefix(begin.as_str())?
+        .strip_suffix(end.as_str())?;
     let base64: Vec<u8> = inner
         .bytes()
         .filter(|byte| !byte.is_ascii_whitespace())
@@ -312,42 +324,138 @@ pub fn public_key_der(pem: &str) -> Option<Vec<u8>> {
     STANDARD.decode(base64).ok()
 }
 
-/// The identifier of a transparency log: the lower-case hexadecimal SHA-256 of the DER of its
-/// public key.
+/// Reads the DER bytes of a PEM `PUBLIC KEY`.
+pub fn public_key_der(pem: &str) -> Option<Vec<u8>> {
+    pem_der(pem, "PUBLIC KEY")
+}
+
+/// The identifier of a transparency log of the form Rekor v1: the lower-case hexadecimal
+/// SHA-256 of the DER of its public key.
 pub fn log_id(log_key_der: &[u8]) -> String {
     hex(&Sha256::digest(log_key_der))
 }
 
-/// The two public keys an endorsement is verified with, each as the DER of its
-/// SubjectPublicKeyInfo (ECDSA P-256).
-#[derive(Clone, Copy, Debug)]
-pub struct ReleaseKeys<'a> {
-    /// The release key of the operator.
-    pub release: &'a [u8],
-    /// The key of the transparency log.
-    pub log: &'a [u8],
+/// A transparency log whose entries a node accepts: one row of the table of logs that is
+/// compiled into the node program. The log has the form Rekor v1: its key is ECDSA P-256, and
+/// its identifier is the SHA-256 of the DER of that key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransparencyLog {
+    /// The identifier of the log. Its first four bytes name the key of the log on a
+    /// checkpoint.
+    id: [u8; 32],
+    /// The DER of the SubjectPublicKeyInfo of the key.
+    spki: Vec<u8>,
 }
 
-/// An entry of the transparency log, as an endorsement carries it.
-#[derive(Clone, Copy, Debug)]
-pub struct LogEntry<'a> {
-    /// The body of the entry, in standard base64, exactly as the log returned it.
-    pub body: &'a str,
-    /// The time at which the log took the entry, in Unix epoch seconds.
-    pub integrated_time: u64,
-    /// The index of the entry in the log.
-    pub log_index: u64,
+impl TransparencyLog {
+    /// A log of the form Rekor v1 with the key `spki_der`. `None` when the key is not the
+    /// SubjectPublicKeyInfo of an ECDSA P-256 public key with an uncompressed point.
+    pub fn rekor_v1(spki_der: &[u8]) -> Option<TransparencyLog> {
+        is_p256_public_key(spki_der).then(|| TransparencyLog {
+            id: Sha256::digest(spki_der).into(),
+            spki: spki_der.to_vec(),
+        })
+    }
+
     /// The identifier of the log: 64 lower-case hexadecimal characters.
-    pub log_id: &'a str,
-    /// The signed entry timestamp: the signature of the log over the entry, in standard
-    /// base64.
-    pub signed_entry_timestamp: &'a str,
+    pub fn id(&self) -> String {
+        hex(&self.id)
+    }
+
+    /// True when `identifier` is the 32 bytes of the identifier of the log.
+    pub fn has_id(&self, identifier: &[u8]) -> bool {
+        self.id == identifier
+    }
+
+    /// True when `signature` (ASN.1 DER) is the ECDSA P-256 SHA-256 signature of the key of
+    /// the log over `message`.
+    fn signed(&self, message: &[u8], signature: &[u8]) -> bool {
+        ecdsa_verifies(
+            &self.spki,
+            Some(Curve::P256),
+            Hash::Sha256,
+            message,
+            signature,
+        )
+    }
+
+    /// True when `timestamp` (ASN.1 DER) is the signed entry timestamp of the log for the
+    /// entry with the body `body` (standard base64, exactly as the log returned it) that the
+    /// log took at `integrated_time` (Unix epoch seconds) with the index `log_index`: the
+    /// signature of the log key over the bytes of [`signed_entry`]. A body with a character
+    /// outside the base64 alphabet has no signed entry timestamp.
+    pub fn promised(
+        &self,
+        body: &str,
+        integrated_time: u64,
+        log_index: u64,
+        timestamp: &[u8],
+    ) -> bool {
+        signed_entry(body, integrated_time, &self.id(), log_index)
+            .is_some_and(|signed| self.signed(signed.as_bytes(), timestamp))
+    }
+
+    /// True when `checkpoint` is the note of the head of the tree of `size` leaves with the
+    /// root hash `root` that the log signed (c2sp.org/tlog-checkpoint, c2sp.org/signed-note).
+    ///
+    /// The checkpoint holds an empty line. The part before the first empty line, with the
+    /// line feed that ends it, is the note. Its first line is not empty (the origin of the
+    /// log, which names the tree and is not compared), its second line is `size` in decimal
+    /// and its third line the standard base64 of `root`. Its further lines are not read (the
+    /// signature of the log covers them).
+    ///
+    /// A line after the empty line is a line of the log when it is `— ` (U+2014 and a
+    /// space), a name, a space and the standard base64 of more than four bytes that begin
+    /// with the first four bytes of the identifier of the log. There is at least one line of
+    /// the log, and the bytes after the first four of every line of the log are an ECDSA
+    /// signature of the log key over the note. Every other line (the signature of a witness,
+    /// of another key) is not read.
+    pub fn signed_tree_head(&self, checkpoint: &str, size: u64, root: &[u8; 32]) -> bool {
+        let Some((text, signatures)) = checkpoint.split_once("\n\n") else {
+            return false;
+        };
+        let mut lines = text.split('\n');
+        let (Some(origin), Some(stated_size), Some(stated_root)) =
+            (lines.next(), lines.next(), lines.next())
+        else {
+            return false;
+        };
+        if origin.is_empty()
+            || stated_size != size.to_string()
+            || STANDARD.decode(stated_root).ok().as_deref() != Some(root.as_slice())
+        {
+            return false;
+        }
+        let note = format!("{text}\n");
+        let mut signed = false;
+        for line in signatures.split('\n') {
+            let of_key = line
+                .strip_prefix("\u{2014} ")
+                .and_then(|line| line.split_once(' '))
+                .filter(|(name, _)| !name.is_empty())
+                .and_then(|(_, signature)| STANDARD.decode(signature).ok());
+            let Some(of_key) = of_key else {
+                continue;
+            };
+            let Some((key_id, signature)) = of_key.split_first_chunk::<4>() else {
+                continue;
+            };
+            if signature.is_empty() || !self.id.starts_with(key_id) {
+                continue;
+            }
+            if !self.signed(note.as_bytes(), signature) {
+                return false;
+            }
+            signed = true;
+        }
+        signed
+    }
 }
 
-/// The bytes the log signed for an entry: the JSON object of `body`, `integratedTime`, `logID`
-/// and `logIndex`, with its keys in this order and without white space. `None` when `body`
-/// holds a character outside the base64 alphabet: such a character could end the string of
-/// the body and state other values for the keys that follow it.
+/// The bytes a log of the form Rekor v1 signed for an entry: the JSON object of `body`,
+/// `integratedTime`, `logID` and `logIndex`, with its keys in this order and without white
+/// space. `None` when `body` holds a character outside the base64 alphabet: such a character
+/// could end the string of the body and state other values for the keys that follow it.
 ///
 /// `log_id` is the identifier the node computed from the key of the log, not a text of the
 /// entry.
@@ -362,118 +470,55 @@ fn signed_entry(body: &str, integrated_time: u64, log_id: &str, log_index: u64) 
     })
 }
 
-/// Check 4 of [`verify_endorsement`]: the body of the entry is a `hashedrekord` of version
-/// 0.0.1 that holds the SHA-256 of `statement`, the release key and a signature of that key
-/// over `statement`.
-fn verify_body(
-    body: &str,
-    statement: &[u8],
-    release_key_der: &[u8],
-) -> Result<(), EndorsementError> {
-    let body = STANDARD
-        .decode(body)
-        .map_err(|_| EndorsementError::EntryBody)?;
-    let body: serde_json::Value =
-        serde_json::from_slice(&body).map_err(|_| EndorsementError::EntryBody)?;
-    let text = |path: &[&str]| {
-        path.iter()
-            .try_fold(&body, |value, key| value.get(key))
-            .and_then(serde_json::Value::as_str)
-    };
-    if text(&["apiVersion"]) != Some("0.0.1")
-        || text(&["kind"]) != Some("hashedrekord")
-        || text(&["spec", "data", "hash", "algorithm"]) != Some("sha256")
-    {
-        return Err(EndorsementError::EntryBody);
-    }
-    if text(&["spec", "data", "hash", "value"]) != Some(hex(&Sha256::digest(statement)).as_str()) {
-        return Err(EndorsementError::StatementHash);
-    }
-    let key = text(&["spec", "signature", "publicKey", "content"])
-        .and_then(|content| STANDARD.decode(content).ok())
-        .and_then(|pem| public_key_der(std::str::from_utf8(&pem).ok()?));
-    if key.as_deref() != Some(release_key_der) {
-        return Err(EndorsementError::ReleaseKey);
-    }
-    let signature = text(&["spec", "signature", "content"])
-        .and_then(|content| STANDARD.decode(content).ok())
-        .ok_or(EndorsementError::ReleaseSignature)?;
-    if !p256_verifies(release_key_der, statement, &signature) {
-        return Err(EndorsementError::ReleaseSignature);
-    }
-    Ok(())
+/// The hash of the leaf of an entry in the Merkle tree of a log (RFC 6962 section 2.1): the
+/// SHA-256 of the byte 0x00 and the decoded body of the entry.
+pub fn leaf_hash(body: &[u8]) -> [u8; 32] {
+    let mut hashed = Sha256::new();
+    hashed.update([0x00]);
+    hashed.update(body);
+    hashed.finalize().into()
 }
 
-/// Check 5 of [`verify_endorsement`]: an entry counts when its time lies at most 300 seconds
-/// after the clock of the node and, with a notice period, when the entry is at least as old
-/// as that period by the clock of the node. The 300 seconds allow for a clock of the node that
-/// is behind the clock of the log. They do not shorten a notice period.
-///
-/// Both comparisons are made on differences, so no sum leaves the range of the type.
-fn entry_time_counts(integrated_time: u64, now_s: u64, notice_s: u64) -> bool {
-    let not_ahead = integrated_time.saturating_sub(now_s) <= limits::RELEASE_ENTRY_AHEAD_SECONDS;
-    let old_enough = notice_s == 0
-        || now_s
-            .checked_sub(integrated_time)
-            .is_some_and(|age| age >= notice_s);
-    not_ahead && old_enough
+/// The hash of an inner node of a Merkle tree (RFC 6962 section 2.1): the SHA-256 of the byte
+/// 0x01, the hash of the left child and the hash of the right child.
+fn node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut hashed = Sha256::new();
+    hashed.update([0x01]);
+    hashed.update(left);
+    hashed.update(right);
+    hashed.finalize().into()
 }
 
-/// Verifies the endorsement of a later release for a node of the release `own_release` whose
-/// clock shows `now_s` (Unix epoch seconds), and returns the release and the measurement the
-/// statement states (protocol.md 10.3, checks 1 to 6 of the giving node).
-///
-/// | Check | Rule | Failure |
-/// | --- | --- | --- |
-/// | 1 | `statement` is a release statement by [`read_statement`] | `Statement` |
-/// | 2 | `log_id` of the entry is the identifier of the log key | `LogId` |
-/// | 3 | `body` holds only characters of the base64 alphabet, and the signed entry timestamp is a signature of the log key over the entry | `EntrySignature` |
-/// | 4 | `body` is a `hashedrekord` of version 0.0.1 with the SHA-256 of `statement`, with the release key, and with a signature of the release key over `statement` | `EntryBody`, `StatementHash`, `ReleaseKey`, `ReleaseSignature` |
-/// | 5 | the time of the entry lies at most 300 seconds after `now_s`, and the notice period has passed | `EntryTime` |
-/// | 6 | the release of the statement is later than `own_release` | `ReleaseOrder` |
-///
-/// Both signatures are ECDSA P-256 with SHA-256 in ASN.1 DER. A key of `keys` that is not the
-/// SubjectPublicKeyInfo of an ECDSA P-256 public key verifies nothing.
-///
-/// Check 7, the attestation of the node that receives the delegations, is the caller's: the
-/// measurement of that node is the measurement this function returns, and its binding names
-/// the release this function returns.
-pub fn verify_endorsement(
-    statement: &[u8],
-    entry: &LogEntry<'_>,
-    keys: &ReleaseKeys<'_>,
-    own_release: &str,
-    now_s: u64,
-) -> Result<ReleaseMeasurement, EndorsementError> {
-    // 1
-    let later = read_statement(statement).ok_or(EndorsementError::Statement)?;
-    // 2
-    let log_id = log_id(keys.log);
-    if entry.log_id != log_id {
-        return Err(EndorsementError::LogId);
+/// The root of the tree of `size` leaves in which the leaf `index` has the hash `leaf`, by
+/// the audit path `path` from that leaf upwards (RFC 6962 section 2.1.1, in the steps of RFC
+/// 9162 section 2.1.3.2). `None` when the index is not below the size, and when the path is
+/// shorter or longer than the way from that leaf to the root.
+pub fn audit_root(leaf: [u8; 32], index: u64, size: u64, path: &[[u8; 32]]) -> Option<[u8; 32]> {
+    if index >= size {
+        return None;
     }
-    // 3
-    let signed = signed_entry(entry.body, entry.integrated_time, &log_id, entry.log_index)
-        .ok_or(EndorsementError::EntrySignature)?;
-    let timestamp = STANDARD
-        .decode(entry.signed_entry_timestamp)
-        .map_err(|_| EndorsementError::EntrySignature)?;
-    if !p256_verifies(keys.log, signed.as_bytes(), &timestamp) {
-        return Err(EndorsementError::EntrySignature);
+    let mut root = leaf;
+    // The index of the node on the way up, and the index of the last node of its level.
+    let (mut node, mut last) = (index, size - 1);
+    for sibling in path {
+        if last == 0 {
+            return None;
+        }
+        if !node.is_multiple_of(2) || node == last {
+            root = node_hash(sibling, &root);
+            // A node that is the last of its level and a left child has no sibling on the
+            // levels below the one where it becomes a right child.
+            while node.is_multiple_of(2) && node != 0 {
+                node >>= 1;
+                last >>= 1;
+            }
+        } else {
+            root = node_hash(&root, sibling);
+        }
+        node >>= 1;
+        last >>= 1;
     }
-    // 4
-    verify_body(entry.body, statement, keys.release)?;
-    // 5
-    if !entry_time_counts(entry.integrated_time, now_s, limits::RELEASE_NOTICE_SECONDS) {
-        return Err(EndorsementError::EntryTime);
-    }
-    // 6
-    let own = Release::parse(own_release).ok_or(EndorsementError::ReleaseOrder)?;
-    let stated = Release::parse(&later.release).ok_or(EndorsementError::ReleaseOrder)?;
-    if stated <= own {
-        return Err(EndorsementError::ReleaseOrder);
-    }
-    Ok(later)
+    (last == 0).then_some(root)
 }
 
 #[cfg(test)]
@@ -486,18 +531,50 @@ mod tests {
     /// The public key of the transparency log Rekor of rekor.sigstore.dev, as the node program
     /// holds it.
     const REKOR_KEY_PEM: &str = include_str!("../../enclave/release/rekor-key.pem");
-    /// The entry of that log with the index 150,000,000, in the form of the `entry` of an
-    /// endorsement.
+    /// The entry of that log with the index 150,000,000: `body`, `integrated_time`,
+    /// `log_index`, `log_id` and `signed_entry_timestamp`.
     const REKOR_ENTRY: &str = include_str!("../tests/fixtures/rekor-entry-150000000.json");
 
-    const NOW_S: u64 = 1_790_000_000;
     const PCRS: [&str; 3] = [
         "904d4e19f2cece358d8c0bcfdb278573decfcc739ce320c587c59d9ee73f5db594cd0c8e73539a087138e069223d8f47",
         "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
         "a1952bc63a9e80a3a46eda48bb60236dfcb030d50bf81f02b5c50d20d42a905d1db7c82d3f1d4c4d5649b20697889d44",
     ];
+    const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
-    /// An ECDSA P-256 key of a test, in the place of the release key or of the log key.
+    #[test]
+    fn a_text_of_release_proofs_is_read_within_its_marks() {
+        // The marks are the arrays, the objects and the commas outside the strings.
+        assert_eq!(marks_of(b""), 0);
+        assert_eq!(marks_of(br#"{"a":1,"b":[true,null],"c":{}}"#), 6);
+        assert_eq!(marks_of(br#"["a,b","[","{"]"#), 3);
+        assert_eq!(marks_of(br#"["a\",[",1]"#), 2);
+        assert_eq!(marks_of(br#"["a\\",[1],2]"#), 4);
+        // One array of 1,024 elements has 1,024 marks: the array and 1,023 commas.
+        let of = |elements: usize| format!("[{}]", vec!["0"; elements].join(","));
+        assert_eq!(limits::RELEASE_TEXT_MARKS, 1_024);
+        assert_eq!(marks_of(of(1_024).as_bytes()), 1_024);
+        assert!(read_proof_text(of(1_024).as_bytes()).is_some());
+        assert!(read_json(of(1_025).as_bytes()).is_some());
+        assert!(read_proof_text(of(1_025).as_bytes()).is_none());
+        // The marks inside a string are bytes of that string.
+        let long = format!("[\"{}\"]", ",".repeat(4_000));
+        assert!(read_proof_text(long.as_bytes()).is_some());
+        // A statement with more marks is no release statement.
+        let statement = |inputs: usize| {
+            format!(
+                "{{\"release\":\"v1.0.0\",\"git_commit\":\"{COMMIT}\",\"pcr0\":\"{}\",\"pcr1\":\"{}\",\"pcr2\":\"{}\",\"inputs\":{}}}",
+                PCRS[0],
+                PCRS[1],
+                PCRS[2],
+                of(inputs)
+            )
+        };
+        assert!(read_statement(statement(1_018).as_bytes()).is_some());
+        assert!(read_statement(statement(1_019).as_bytes()).is_none());
+    }
+
+    /// An ECDSA P-256 key of a test, in the place of the key of a log.
     struct TestKey {
         pair: EcdsaKeyPair,
         spki: Vec<u8>,
@@ -516,10 +593,13 @@ mod tests {
             TestKey { pair, spki }
         }
 
-        /// The standard base64 of the ASN.1 DER signature of this key over `message`.
-        fn sign(&self, message: &[u8]) -> String {
-            let signature = self.pair.sign(&SystemRandom::new(), message).unwrap();
-            STANDARD.encode(signature.as_ref())
+        /// The ASN.1 DER signature of this key over `message`.
+        fn sign(&self, message: &[u8]) -> Vec<u8> {
+            self.pair
+                .sign(&SystemRandom::new(), message)
+                .unwrap()
+                .as_ref()
+                .to_vec()
         }
 
         /// The PEM of the public key, in lines of 64 characters.
@@ -530,669 +610,256 @@ mod tests {
                 .chunks(64)
                 .map(|line| std::str::from_utf8(line).unwrap())
                 .collect();
-            format!("{PEM_BEGIN}\n{}\n{PEM_END}\n", lines.join("\n"))
-        }
-    }
-
-    /// The `measurements.json` of a release, with keys a node does not read.
-    fn statement_of(release: &str) -> Vec<u8> {
-        format!(
-            "{{\n  \"release\": \"{release}\",\n  \"git_commit\": \"0123abc\",\n  \"pcr0\": \"{}\",\n  \"pcr1\": \"{}\",\n  \"pcr2\": \"{}\",\n  \"inputs\": {{\"Cargo.lock\": \"aa\"}}\n}}\n",
-            PCRS[0], PCRS[1], PCRS[2]
-        )
-        .into_bytes()
-    }
-
-    /// The body of a `hashedrekord` entry in standard base64: the hash of `hashed`, the PEM
-    /// `key_pem` and the signature `signature`.
-    fn body_of(hashed: &[u8], key_pem: &str, signature: &str) -> String {
-        STANDARD.encode(
-            json!({
-                "apiVersion": "0.0.1",
-                "kind": "hashedrekord",
-                "spec": {
-                    "data": {"hash": {"algorithm": "sha256", "value": hex(&Sha256::digest(hashed))}},
-                    "signature": {
-                        "content": signature,
-                        "publicKey": {"content": STANDARD.encode(key_pem)},
-                    },
-                },
-            })
-            .to_string(),
-        )
-    }
-
-    /// An endorsement as a call carries it, and the keys it verifies with.
-    struct Endorsement {
-        release_key: TestKey,
-        log_key: TestKey,
-        statement: Vec<u8>,
-        body: String,
-        integrated_time: u64,
-        log_index: u64,
-        log_id: String,
-        signed_entry_timestamp: String,
-    }
-
-    impl Endorsement {
-        /// A valid endorsement of the release `release`: the release key signed the
-        /// statement, and the log took the entry an hour before `NOW_S`.
-        fn of(release: &str) -> Endorsement {
-            let release_key = TestKey::new();
-            let statement = statement_of(release);
-            let body = body_of(
-                &statement,
-                &release_key.pem(),
-                &release_key.sign(&statement),
-            );
-            let mut endorsement = Endorsement {
-                release_key,
-                log_key: TestKey::new(),
-                statement,
-                body,
-                integrated_time: NOW_S - 3_600,
-                log_index: 150_000_001,
-                log_id: String::new(),
-                signed_entry_timestamp: String::new(),
-            };
-            endorsement.log_id = log_id(&endorsement.log_key.spki);
-            endorsement.log_signs();
-            endorsement
-        }
-
-        /// The log signs the entry as it stands.
-        fn log_signs(&mut self) {
-            let signed = format!(
-                "{{\"body\":\"{}\",\"integratedTime\":{},\"logID\":\"{}\",\"logIndex\":{}}}",
-                self.body, self.integrated_time, self.log_id, self.log_index
-            );
-            self.signed_entry_timestamp = self.log_key.sign(signed.as_bytes());
-        }
-
-        fn verify(
-            &self,
-            own_release: &str,
-            now_s: u64,
-        ) -> Result<ReleaseMeasurement, EndorsementError> {
-            verify_endorsement(
-                &self.statement,
-                &LogEntry {
-                    body: &self.body,
-                    integrated_time: self.integrated_time,
-                    log_index: self.log_index,
-                    log_id: &self.log_id,
-                    signed_entry_timestamp: &self.signed_entry_timestamp,
-                },
-                &ReleaseKeys {
-                    release: &self.release_key.spki,
-                    log: &self.log_key.spki,
-                },
-                own_release,
-                now_s,
+            format!(
+                "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
+                lines.join("\n")
             )
         }
 
-        fn result(&self) -> Result<ReleaseMeasurement, EndorsementError> {
-            self.verify("v1.1.0", NOW_S)
+        fn log(&self) -> TransparencyLog {
+            TransparencyLog::rekor_v1(&self.spki).unwrap()
         }
     }
 
-    #[test]
-    fn a_release_statement_that_the_release_key_signed_and_the_log_recorded_is_accepted() {
-        let endorsement = Endorsement::of("v1.2.0");
-        let later = endorsement.result().unwrap();
-        assert_eq!(later.release, "v1.2.0");
-        assert_eq!(hex(&later.pcrs[0]), PCRS[0]);
-        assert_eq!(hex(&later.pcrs[1]), PCRS[1]);
-        assert_eq!(hex(&later.pcrs[2]), PCRS[2]);
+    /// The `measurements.json` of a release, with keys a reader does not read.
+    fn statement_of(release: &str) -> serde_json::Value {
+        json!({
+            "release": release, "git_commit": COMMIT,
+            "pcr0": PCRS[0], "pcr1": PCRS[1], "pcr2": PCRS[2],
+            "inputs": {"file/Cargo.lock": "aa"},
+        })
+    }
+
+    fn read(statement: &serde_json::Value) -> Option<ReleaseStatement> {
+        read_statement(statement.to_string().as_bytes())
     }
 
     #[test]
-    fn an_entry_of_another_log_is_refused() {
-        // The identifier of another log, with everything else in place.
-        let mut endorsement = Endorsement::of("v1.2.0");
-        endorsement.log_id = log_id(&TestKey::new().spki);
-        assert_eq!(endorsement.result(), Err(EndorsementError::LogId));
-        // An upper-case identifier is not the identifier.
-        let mut endorsement = Endorsement::of("v1.2.0");
-        endorsement.log_id = endorsement.log_id.to_uppercase();
-        assert_eq!(endorsement.result(), Err(EndorsementError::LogId));
-
-        // The entry of another log under the identifier of this one: that log signed it, with
-        // the identifier of this log in the signed bytes.
-        let mut endorsement = Endorsement::of("v1.2.0");
-        let other = TestKey::new();
-        let own = std::mem::replace(&mut endorsement.log_key, other);
-        endorsement.log_signs();
-        endorsement.log_key = own;
-        assert_eq!(endorsement.result(), Err(EndorsementError::EntrySignature));
-    }
-
-    #[test]
-    fn a_signed_entry_timestamp_over_another_entry_is_refused() {
-        let refused = |change: fn(&mut Endorsement)| {
-            let mut endorsement = Endorsement::of("v1.2.0");
-            change(&mut endorsement);
-            endorsement.result()
-        };
-        // Another integrated time and another index than the log signed.
+    fn a_release_statement_states_a_release_its_commit_and_its_measurement() {
+        let stated = read(&statement_of("v1.2.0")).unwrap();
+        assert_eq!(stated.release, "v1.2.0");
+        assert_eq!(stated.git_commit, COMMIT);
         assert_eq!(
-            refused(|endorsement| endorsement.integrated_time += 1),
-            Err(EndorsementError::EntrySignature)
+            stated.pcrs.map(|pcr| hex(&pcr)),
+            PCRS.map(|pcr| pcr.to_string())
         );
         assert_eq!(
-            refused(|endorsement| endorsement.log_index += 1),
-            Err(EndorsementError::EntrySignature)
+            stated.measurement(),
+            ReleaseMeasurement {
+                release: "v1.2.0".to_string(),
+                pcrs: stated.pcrs
+            }
         );
-        // Another body than the log signed: a valid body for the same statement, made with
-        // the same release key.
-        assert_eq!(
-            refused(|endorsement| {
-                endorsement.body = body_of(
-                    &endorsement.statement,
-                    &endorsement.release_key.pem(),
-                    &endorsement.release_key.sign(&endorsement.statement),
-                );
-            }),
-            Err(EndorsementError::EntrySignature)
-        );
-        // A timestamp that is not base64, not a signature, and the signature of another key.
-        assert_eq!(
-            refused(|endorsement| endorsement.signed_entry_timestamp = "not base64!".to_string()),
-            Err(EndorsementError::EntrySignature)
-        );
-        assert_eq!(
-            refused(|endorsement| endorsement.signed_entry_timestamp = STANDARD.encode([0u8; 70])),
-            Err(EndorsementError::EntrySignature)
-        );
-        assert_eq!(
-            refused(|endorsement| {
-                let signed = signed_entry(
-                    &endorsement.body,
-                    endorsement.integrated_time,
-                    &endorsement.log_id,
-                    endorsement.log_index,
-                )
-                .unwrap();
-                endorsement.signed_entry_timestamp =
-                    endorsement.release_key.sign(signed.as_bytes());
-            }),
-            Err(EndorsementError::EntrySignature)
-        );
-    }
-
-    #[test]
-    fn a_body_with_a_character_outside_the_base64_alphabet_is_refused() {
-        // The log signs whatever bytes the entry gives: the node does not put such a body into
-        // the signed bytes at all.
-        for character in ["\"", "\\", " ", "\n", "-", "_", ",", "}", "é"] {
-            let mut endorsement = Endorsement::of("v1.2.0");
-            endorsement.body.push_str(character);
-            endorsement.log_signs();
-            assert_eq!(
-                endorsement.result(),
-                Err(EndorsementError::EntrySignature),
-                "{character:?}"
-            );
-        }
-        assert_eq!(signed_entry("ab\"cd", 1, "id", 2), None);
-        assert_eq!(
-            signed_entry("AZaz09+/=", 1, "id", 2).as_deref(),
-            Some(r#"{"body":"AZaz09+/=","integratedTime":1,"logID":"id","logIndex":2}"#)
-        );
-
-        // A body that states other values after its own end verifies under no reading: the
-        // log would have signed the same bytes for the entry with these other values.
-        let mut endorsement = Endorsement::of("v1.2.0");
-        let body = endorsement.body.clone();
-        endorsement.body = format!("{body}\",\"integratedTime\":1,\"x\":\"");
-        endorsement.log_signs();
-        assert_eq!(endorsement.result(), Err(EndorsementError::EntrySignature));
-    }
-
-    #[test]
-    fn a_body_that_is_not_the_record_of_this_statement_under_the_release_key_is_refused() {
-        // Each body is in an entry the log signed: only the body decides.
-        let refused = |body: fn(&Endorsement) -> String| {
-            let mut endorsement = Endorsement::of("v1.2.0");
-            endorsement.body = body(&endorsement);
-            endorsement.log_signs();
-            endorsement.result()
-        };
-        let changed = |endorsement: &Endorsement, change: fn(&mut serde_json::Value)| {
-            let mut body: serde_json::Value =
-                serde_json::from_slice(&STANDARD.decode(&endorsement.body).unwrap()).unwrap();
-            change(&mut body);
-            STANDARD.encode(body.to_string())
-        };
-
-        // The hash of another statement, signed by the release key.
-        assert_eq!(
-            refused(|endorsement| {
-                let other = statement_of("v1.3.0");
-                body_of(
-                    &other,
-                    &endorsement.release_key.pem(),
-                    &endorsement.release_key.sign(&other),
-                )
-            }),
-            Err(EndorsementError::StatementHash)
-        );
-        // Another public key, with the signature of that key over the statement.
-        assert_eq!(
-            refused(|endorsement| {
-                let other = TestKey::new();
-                body_of(
-                    &endorsement.statement,
-                    &other.pem(),
-                    &other.sign(&endorsement.statement),
-                )
-            }),
-            Err(EndorsementError::ReleaseKey)
-        );
-        // The release key as the public key, with the signature of another key.
-        assert_eq!(
-            refused(|endorsement| {
-                body_of(
-                    &endorsement.statement,
-                    &endorsement.release_key.pem(),
-                    &TestKey::new().sign(&endorsement.statement),
-                )
-            }),
-            Err(EndorsementError::ReleaseSignature)
-        );
-        // The signature of the release key over other bytes, and no signature.
-        assert_eq!(
-            refused(|endorsement| {
-                body_of(
-                    &endorsement.statement,
-                    &endorsement.release_key.pem(),
-                    &endorsement.release_key.sign(b"other bytes"),
-                )
-            }),
-            Err(EndorsementError::ReleaseSignature)
-        );
-        assert_eq!(
-            refused(|endorsement| body_of(
-                &endorsement.statement,
-                &endorsement.release_key.pem(),
-                "not base64!"
-            )),
-            Err(EndorsementError::ReleaseSignature)
-        );
-        // A public key that is not a PEM, and one that is the DER without the PEM lines.
-        assert_eq!(
-            refused(|endorsement| body_of(
-                &endorsement.statement,
-                "not a key",
-                &endorsement.release_key.sign(&endorsement.statement)
-            )),
-            Err(EndorsementError::ReleaseKey)
-        );
-        assert_eq!(
-            refused(|endorsement| body_of(
-                &endorsement.statement,
-                &STANDARD.encode(&endorsement.release_key.spki),
-                &endorsement.release_key.sign(&endorsement.statement)
-            )),
-            Err(EndorsementError::ReleaseKey)
-        );
-
-        // Another kind, version or hash algorithm, a missing part, and a body that is not a
-        // JSON object or not base64.
-        type Change = fn(&mut serde_json::Value);
-        let forms: [(Change, EndorsementError); 7] = [
-            (
-                |body| body["kind"] = json!("rekord"),
-                EndorsementError::EntryBody,
-            ),
-            (
-                |body| body["apiVersion"] = json!("0.0.2"),
-                EndorsementError::EntryBody,
-            ),
-            (
-                |body| body["spec"]["data"]["hash"]["algorithm"] = json!("sha512"),
-                EndorsementError::EntryBody,
-            ),
-            (
-                |body| body["spec"]["data"]["hash"]["value"] = json!(7),
-                EndorsementError::StatementHash,
-            ),
-            (
-                |body| {
-                    let value = body["spec"]["data"]["hash"]["value"]
-                        .as_str()
-                        .unwrap()
-                        .to_uppercase();
-                    body["spec"]["data"]["hash"]["value"] = json!(value);
-                },
-                EndorsementError::StatementHash,
-            ),
-            (
-                |body| {
-                    body["spec"]["signature"]
-                        .as_object_mut()
-                        .unwrap()
-                        .remove("publicKey");
-                },
-                EndorsementError::ReleaseKey,
-            ),
-            (
-                |body| {
-                    body["spec"]["signature"]
-                        .as_object_mut()
-                        .unwrap()
-                        .remove("content");
-                },
-                EndorsementError::ReleaseSignature,
-            ),
-        ];
-        for (index, (change, failure)) in forms.into_iter().enumerate() {
-            let mut endorsement = Endorsement::of("v1.2.0");
-            endorsement.body = changed(&endorsement, change);
-            endorsement.log_signs();
-            assert_eq!(endorsement.result(), Err(failure), "{index}");
-        }
-        for body in [
-            STANDARD.encode("[]"),
-            STANDARD.encode("text"),
-            String::new(),
-            "AAA".to_string(),
-        ] {
-            let mut endorsement = Endorsement::of("v1.2.0");
-            endorsement.body = body.clone();
-            endorsement.log_signs();
-            assert_eq!(
-                endorsement.result(),
-                Err(EndorsementError::EntryBody),
-                "{body}"
-            );
-        }
-    }
-
-    /// An endorsement of the statement `statement`, signed and recorded like a valid one.
-    fn endorsement_of_statement(statement: Vec<u8>) -> Endorsement {
-        let mut endorsement = Endorsement::of("v1.2.0");
-        endorsement.body = body_of(
-            &statement,
-            &endorsement.release_key.pem(),
-            &endorsement.release_key.sign(&statement),
-        );
-        endorsement.statement = statement;
-        endorsement.log_signs();
-        endorsement
+        // The file as a build writes it: indented, with a line feed at its end.
+        let written = serde_json::to_string_pretty(&statement_of("v1.2.0")).unwrap() + "\n";
+        assert_eq!(read_statement(written.as_bytes()), Some(stated));
     }
 
     #[test]
     fn a_statement_with_a_missing_or_malformed_field_is_refused() {
         let with = |change: fn(&mut serde_json::Value)| {
-            let mut statement: serde_json::Value =
-                serde_json::from_slice(&statement_of("v1.2.0")).unwrap();
+            let mut statement = statement_of("v1.2.0");
             change(&mut statement);
-            statement.to_string().into_bytes()
+            read(&statement)
         };
-        assert!(endorsement_of_statement(with(|_| {})).result().is_ok());
+        assert!(with(|_| {}).is_some());
 
-        let changes: [fn(&mut serde_json::Value); 11] = [
+        let changes: [fn(&mut serde_json::Value); 22] = [
             |statement| {
-                statement.as_object_mut().unwrap().remove("release");
+                statement.as_object_mut().unwrap().shift_remove("release");
             },
             |statement| {
-                statement.as_object_mut().unwrap().remove("pcr0");
+                statement
+                    .as_object_mut()
+                    .unwrap()
+                    .shift_remove("git_commit");
             },
             |statement| {
-                statement.as_object_mut().unwrap().remove("pcr2");
+                statement.as_object_mut().unwrap().shift_remove("pcr0");
+            },
+            |statement| {
+                statement.as_object_mut().unwrap().shift_remove("pcr2");
             },
             |statement| statement["release"] = json!(1),
             |statement| statement["pcr1"] = json!(null),
+            |statement| statement["git_commit"] = json!(7),
+            // A commit of 39 and of 41 characters, in upper case, and the name of a branch.
+            |statement| statement["git_commit"] = json!(COMMIT[1..]),
+            |statement| statement["git_commit"] = json!(format!("{COMMIT}0")),
+            |statement| statement["git_commit"] = json!(COMMIT.to_uppercase()),
+            |statement| statement["git_commit"] = json!("main"),
             // 94 and 98 characters, an upper-case character, a character that is no digit.
             |statement| statement["pcr0"] = json!(PCRS[0][2..]),
             |statement| statement["pcr1"] = json!(format!("{}00", PCRS[1])),
             |statement| statement["pcr2"] = json!(PCRS[2].to_uppercase()),
             |statement| statement["pcr0"] = json!(PCRS[0].replacen('9', "g", 1)),
             |statement| statement["pcr1"] = json!([PCRS[1]]),
+            // The measurement of a debug-mode enclave.
+            |statement| statement["pcr0"] = json!("0".repeat(96)),
+            |statement| statement["pcr1"] = json!("0".repeat(96)),
+            |statement| statement["pcr2"] = json!("0".repeat(96)),
+            // A release that is not the name of a release.
+            |statement| statement["release"] = json!("dev"),
+            |statement| statement["release"] = json!("v1.2.0 "),
             |statement| *statement = json!([statement.clone()]),
         ];
         for (index, change) in changes.into_iter().enumerate() {
-            assert_eq!(
-                endorsement_of_statement(with(change)).result(),
-                Err(EndorsementError::Statement),
-                "{index}"
-            );
+            assert_eq!(with(change), None, "{index}");
         }
-        // Not JSON, not an object, and a text after the object.
+        // Not JSON, not an object, a text after the object, bytes that are not UTF-8 inside
+        // a string no reader reads, and a byte order mark.
+        let text = statement_of("v1.2.0").to_string();
+        let not_utf8 = [&text.as_bytes()[..text.len() - 1], b",\"note\":\"\xff\"}"].concat();
+        assert!(std::str::from_utf8(&not_utf8).is_err());
         for statement in [
             &b"not json"[..],
             b"\"text\"",
             b"",
-            &[statement_of("v1.2.0"), b"x".to_vec()].concat(),
+            &[text.as_bytes(), b"x"].concat(),
+            &not_utf8,
+            &[b"\xef\xbb\xbf", text.as_bytes()].concat(),
         ] {
-            assert_eq!(
-                endorsement_of_statement(statement.to_vec()).result(),
-                Err(EndorsementError::Statement)
-            );
+            assert_eq!(read_statement(statement), None);
         }
-        // The four values in an array, in the order of the keys.
-        let array = format!(r#"["v1.2.0","{}","{}","{}"]"#, PCRS[0], PCRS[1], PCRS[2]);
-        assert_eq!(
-            endorsement_of_statement(array.into_bytes()).result(),
-            Err(EndorsementError::Statement)
-        );
-        // A key of the four that occurs twice: the statement states two values for it.
-        let twice = format!(
-            r#"{{"release":"v1.2.0","pcr0":"{}","pcr1":"{}","pcr2":"{}","pcr0":"{}"}}"#,
-            PCRS[0], PCRS[1], PCRS[2], PCRS[0]
-        );
-        assert_eq!(
-            endorsement_of_statement(twice.into_bytes()).result(),
-            Err(EndorsementError::Statement)
-        );
+        // A key of the five that occurs twice: the statement states two values for it. An
+        // escaped key is that key.
+        for twice in [
+            format!(r#"{{"pcr0":"{}",{}"#, PCRS[0], &text[1..]),
+            format!(r#"{{"pcr\u0030":"{}",{}"#, PCRS[0], &text[1..]),
+            format!(r#"{},"release":"v1.2.0"}}"#, &text[..text.len() - 1]),
+            format!(r#"{},"git_commit":"{COMMIT}"}}"#, &text[..text.len() - 1]),
+        ] {
+            assert!(serde_json::from_str::<serde_json::Value>(&twice).is_ok());
+            assert_eq!(read_statement(twice.as_bytes()), None, "{twice}");
+        }
         // Another key that occurs twice is not read.
-        let other_twice = format!(
-            r#"{{"release":"v1.2.0","note":1,"pcr0":"{}","pcr1":"{}","pcr2":"{}","note":2}}"#,
-            PCRS[0], PCRS[1], PCRS[2]
-        );
-        assert!(endorsement_of_statement(other_twice.into_bytes())
-            .result()
-            .is_ok());
+        let other_twice = format!(r#"{{"note":1,{},"note":2}}"#, &text[1..text.len() - 1]);
+        assert!(read_statement(other_twice.as_bytes()).is_some());
     }
 
     #[test]
-    fn a_statement_of_more_than_16384_bytes_is_refused() {
+    fn a_statement_of_more_than_16384_bytes_or_of_more_than_32_levels_is_refused() {
         // White space after the object fills the statement to an exact length.
         let filled = |length: usize| {
-            let mut statement = statement_of("v1.2.0");
+            let mut statement = statement_of("v1.2.0").to_string().into_bytes();
             assert!(statement.len() < length);
             statement.resize(length, b' ');
             statement
         };
         assert_eq!(limits::RELEASE_STATEMENT_BYTES, 16_384);
-        assert!(endorsement_of_statement(filled(16_384)).result().is_ok());
-        assert_eq!(
-            endorsement_of_statement(filled(16_385)).result(),
-            Err(EndorsementError::Statement)
-        );
-    }
+        assert!(read_statement(&filled(16_384)).is_some());
+        assert_eq!(read_statement(&filled(16_385)), None);
 
-    #[test]
-    fn an_entry_whose_time_lies_more_than_300_seconds_ahead_is_refused() {
-        let at = |integrated_time: u64| {
-            let mut endorsement = Endorsement::of("v1.2.0");
-            endorsement.integrated_time = integrated_time;
-            endorsement.log_signs();
-            endorsement.result()
+        // The object of the statement is the first level: a key no reader reads may hold 31
+        // arrays inside one another, and not 32.
+        let nested = |levels: usize| {
+            let mut statement = statement_of("v1.2.0");
+            statement["note"] = (0..levels).fold(json!(1), |inner, _| json!([inner]));
+            read(&statement)
         };
-        assert!(at(0).is_ok());
-        assert!(at(NOW_S).is_ok());
-        assert!(at(NOW_S + 300).is_ok());
-        assert_eq!(at(NOW_S + 301), Err(EndorsementError::EntryTime));
-        assert_eq!(at(u64::MAX), Err(EndorsementError::EntryTime));
-
-        // The notice period of this release is zero: an entry counts from the moment the log
-        // took it.
-        assert_eq!(limits::RELEASE_NOTICE_SECONDS, 0);
-        assert_eq!(limits::RELEASE_ENTRY_AHEAD_SECONDS, 300);
-        assert!(entry_time_counts(1_300, 1_000, 0));
-        assert!(!entry_time_counts(1_301, 1_000, 0));
-        // With a notice period, the entry is that old by the clock of the node. The 300
-        // seconds do not shorten the period.
-        assert!(entry_time_counts(1_000, 1_600, 600));
-        assert!(!entry_time_counts(1_001, 1_600, 600));
-        assert!(!entry_time_counts(1_300, 1_600, 600));
-        assert!(!entry_time_counts(1_600, 1_600, 1));
-        assert!(entry_time_counts(1_599, 1_600, 1));
-        // The largest values of the type compare like every other value.
-        assert!(!entry_time_counts(u64::MAX, 1_600, 600));
-        assert!(entry_time_counts(u64::MAX, u64::MAX, 0));
-        assert!(!entry_time_counts(u64::MAX, u64::MAX, 1));
-        assert!(entry_time_counts(u64::MAX, u64::MAX - 300, 0));
-        assert!(!entry_time_counts(u64::MAX, u64::MAX - 301, 0));
-        assert!(entry_time_counts(u64::MAX - 600, u64::MAX, 600));
-        assert!(!entry_time_counts(u64::MAX - 599, u64::MAX, 600));
+        assert!(nested(31).is_some());
+        assert_eq!(nested(32), None);
+        assert!(is_sound_json(&json!(1)));
+        assert!(is_sound_json(&json!({"a": [{"b": []}]})));
     }
 
     #[test]
-    fn a_release_that_is_not_later_than_the_own_release_is_refused() {
-        // (own release, release of the statement, accepted)
-        let cases = [
-            ("v1.1.0", "v1.1.1", true),
-            ("v1.1.0", "v1.2.0", true),
-            ("v1.1.0", "v2.0.0", true),
-            ("v1.1.0", "v1.10.0", true),
-            ("v1.9.0", "v1.10.0", true),
-            ("v1.1.0-rc.1", "v1.1.0-rc.2", true),
-            ("v1.1.0-rc.9", "v1.1.0-rc.10", true),
-            ("v1.1.0-rc.2", "v1.1.0", true),
-            ("v1.1.0", "v1.1.1-rc.1", true),
-            ("v1.1.0", "v1.1.0", false),
-            ("v1.1.0", "v1.0.9", false),
-            ("v1.1.0", "v1.0.0", false),
-            ("v1.1.0", "v0.9.9", false),
-            ("v1.1.0", "v1.1.0-rc.1", false),
-            ("v1.1.0-rc.2", "v1.1.0-rc.2", false),
-            ("v1.1.0-rc.2", "v1.1.0-rc.1", false),
-            ("v1.1.0-rc.1", "v1.0.0", false),
-            ("v2.0.0-rc.1", "v1.9.9", false),
-            // An own release that is not a release tag accepts no endorsement.
-            ("dev", "v1.2.0", false),
-            ("", "v1.2.0", false),
-            ("v0.0.0-test", "v1.2.0", false),
-            ("1.1.0", "v1.2.0", false),
-            // A statement whose release is not a release tag.
-            ("v1.1.0", "dev", false),
-            ("v1.1.0", "v1.2", false),
-            ("v1.1.0", "v1.2.0-beta.1", false),
-            ("v1.1.0", "v01.2.0", false),
-        ];
-        let mut endorsements = std::collections::HashMap::new();
-        for (own, stated, accepted) in cases {
-            let endorsement = endorsements
-                .entry(stated)
-                .or_insert_with(|| Endorsement::of(stated));
-            let result = endorsement.verify(own, NOW_S);
-            if accepted {
-                assert_eq!(result.unwrap().release, stated, "{own} {stated}");
-            } else {
-                assert_eq!(
-                    result,
-                    Err(EndorsementError::ReleaseOrder),
-                    "{own} {stated}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_release_tag_has_three_numbers_and_at_most_a_candidate_number() {
-        let release = |major, minor, patch, candidate| Release {
-            major,
-            minor,
-            patch,
-            candidate,
-        };
-        assert_eq!(Release::parse("v1.2.3"), Some(release(1, 2, 3, None)));
-        assert_eq!(Release::parse("v0.0.0"), Some(release(0, 0, 0, None)));
-        assert_eq!(
-            Release::parse("v10.20.30-rc.40"),
-            Some(release(10, 20, 30, Some(40)))
-        );
-        assert_eq!(
-            Release::parse("v1.1.0-rc.0"),
-            Some(release(1, 1, 0, Some(0)))
-        );
-        assert_eq!(
-            Release::parse("v4294967295.0.0"),
-            Some(release(u32::MAX, 0, 0, None))
-        );
-        for tag in [
-            "",
-            "v",
-            "dev",
-            "1.2.3",
-            "V1.2.3",
-            "v1",
-            "v1.2",
-            "v1.2.3.4",
-            "v1.2.",
-            "v1..3",
-            "v.2.3",
-            "v01.2.3",
-            "v1.02.3",
-            "v1.2.03",
-            "v1.2.3-rc.01",
-            "v1.2.3-rc.",
-            "v1.2.3-rc",
-            "v1.2.3-",
-            "v1.2.3-rc.1.2",
-            "v1.2.3-rc.1-rc.2",
-            "v1.2.3-RC.1",
-            "v1.2.3-beta.1",
-            "v1.2.3+1",
-            "v+1.2.3",
-            "v1.2.-3",
-            "v1.2.3 ",
-            " v1.2.3",
-            "v1.2.3\n",
-            "v4294967296.0.0",
-            "v1.2.3-rc.4294967296",
-            "v１.2.3",
-            "v0.0.0-test",
-            "v0.0.0-diag.local",
+    fn the_name_of_a_release_begins_with_v_and_holds_the_characters_of_a_tag() {
+        for name in [
+            "v1.2.3",
+            "v2.4.0-rc.1",
+            "v0",
+            "vA_b-c.9",
+            "v2026.11.24",
+            "vv",
         ] {
-            assert_eq!(Release::parse(tag), None, "{tag:?}");
+            assert!(is_release_name(name), "{name}");
+        }
+        for name in [
+            "", "v", "dev", "1.2.3", "V1.2.3", "v1.2.3 ", " v1.2.3", "v1.2.3\n", "v1.2.3+1",
+            "v1/2", "v1@2", "v１.2.3", "vé",
+        ] {
+            assert!(!is_release_name(name), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_list_of_old_releases_names_releases_and_their_measurements() {
+        let element = |release: &str| json!({"release": release, "pcr0": PCRS[0], "pcr1": PCRS[1], "pcr2": PCRS[2]});
+        let read = |list: serde_json::Value| read_predecessors(list.to_string().as_bytes());
+
+        assert_eq!(read_predecessors(b"[]"), Some(Vec::new()));
+        assert_eq!(read_predecessors(b" [ ]\n"), Some(Vec::new()));
+        // The releases of the list, in its order. No release of the list is compared with
+        // another one or with the release of the program that holds the list.
+        let list = read(json!([
+            element("v2.0.0"),
+            element("v1.1.0-rc.1"),
+            element("v9.0.0")
+        ]))
+        .unwrap();
+        assert_eq!(
+            list.iter()
+                .map(|element| element.release.as_str())
+                .collect::<Vec<_>>(),
+            ["v2.0.0", "v1.1.0-rc.1", "v9.0.0"]
+        );
+        for predecessor in &list {
+            assert_eq!(
+                predecessor.pcrs.map(|pcr| hex(&pcr)),
+                PCRS.map(|pcr| pcr.to_string())
+            );
         }
 
-        // The order: the three numbers as numbers, then a candidate before the release, then
-        // the candidate number.
-        let order = [
-            "v0.0.0",
-            "v0.0.1",
-            "v0.1.0",
-            "v1.0.0-rc.0",
-            "v1.0.0-rc.1",
-            "v1.0.0-rc.2",
-            "v1.0.0-rc.10",
-            "v1.0.0",
-            "v1.0.1-rc.1",
-            "v1.0.1",
-            "v1.0.2",
-            "v1.0.10",
-            "v1.1.0",
-            "v1.2.0",
-            "v1.10.0",
-            "v2.0.0-rc.1",
-            "v2.0.0",
-            "v10.0.0",
+        // Malformed elements and lists.
+        let with = |change: fn(&mut serde_json::Value)| {
+            let mut value = element("v1.0.0");
+            change(&mut value);
+            json!([value])
+        };
+        assert!(read(with(|_| {})).is_some());
+        let changes: [fn(&mut serde_json::Value); 12] = [
+            |element| element["release"] = json!("dev"),
+            |element| element["release"] = json!("1.0.0"),
+            |element| element["release"] = json!(1),
+            |element| {
+                element.as_object_mut().unwrap().shift_remove("release");
+            },
+            |element| {
+                element.as_object_mut().unwrap().shift_remove("pcr1");
+            },
+            |element| element["pcr0"] = json!(PCRS[0][1..]),
+            |element| element["pcr1"] = json!(PCRS[1].to_uppercase()),
+            |element| element["pcr2"] = json!(format!("{}0", PCRS[2])),
+            |element| element["pcr2"] = json!(7),
+            // The measurement of a debug-mode enclave.
+            |element| element["pcr0"] = json!("0".repeat(96)),
+            |element| element["pcr2"] = json!("0".repeat(96)),
+            |element| *element = json!([element["release"], PCRS[0], PCRS[1], PCRS[2]]),
         ];
-        for (index, earlier) in order.iter().enumerate() {
-            let earlier = Release::parse(earlier).unwrap();
-            assert_eq!(earlier.cmp(&earlier), Ordering::Equal);
-            for later in &order[index + 1..] {
-                let later = Release::parse(later).unwrap();
-                assert!(earlier < later, "{earlier:?} {later:?}");
-                assert!(later > earlier, "{earlier:?} {later:?}");
-            }
+        for (index, change) in changes.into_iter().enumerate() {
+            assert_eq!(read(with(change)), None, "{index}");
         }
+        // One such element refuses the whole list.
+        assert_eq!(read(json!([element("v1.0.0"), element("dev")])), None);
+        for list in [
+            &b""[..],
+            b"{}",
+            b"null",
+            b"[",
+            b"[]x",
+            b"[null]",
+            b"[\"v1.0.0\"]",
+            b"not json",
+        ] {
+            assert_eq!(read_predecessors(list), None);
+        }
+        // An element that names a key twice.
+        let twice = format!(
+            r#"[{{"release":"v1.0.0","release":"v1.0.1","pcr0":"{}","pcr1":"{}","pcr2":"{}"}}]"#,
+            PCRS[0], PCRS[1], PCRS[2]
+        );
+        assert_eq!(read_predecessors(twice.as_bytes()), None);
     }
 
     #[test]
@@ -1204,62 +871,73 @@ mod tests {
             log_id(&log_key),
             "c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d"
         );
+        let log = TransparencyLog::rekor_v1(&log_key).unwrap();
+        assert_eq!(log.id(), log_id(&log_key));
+        assert!(log.has_id(&Sha256::digest(&log_key)));
+        assert!(!log.has_id(&Sha256::digest(&log_key)[..31]));
 
         let entry: serde_json::Value = serde_json::from_str(REKOR_ENTRY).unwrap();
         let body = entry["body"].as_str().unwrap();
         let integrated_time = entry["integrated_time"].as_u64().unwrap();
         let log_index = entry["log_index"].as_u64().unwrap();
-        assert_eq!(entry["log_id"], log_id(&log_key));
+        assert_eq!(entry["log_id"], log.id());
         assert_eq!((integrated_time, log_index), (1_732_051_154, 150_000_000));
         let timestamp = STANDARD
             .decode(entry["signed_entry_timestamp"].as_str().unwrap())
             .unwrap();
 
-        // The bytes the log signed: this is the form check 3 builds.
-        let signed = signed_entry(body, integrated_time, &log_id(&log_key), log_index).unwrap();
+        // The bytes the log signed.
+        let signed = signed_entry(body, integrated_time, &log.id(), log_index).unwrap();
         assert!(signed.starts_with("{\"body\":\"eyJhcGlWZXJzaW9uIjoiMC4wLjEi"));
         assert!(signed.ends_with(
             "\",\"integratedTime\":1732051154,\"logID\":\"c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d\",\"logIndex\":150000000}"
         ));
-        assert!(p256_verifies(&log_key, signed.as_bytes(), &timestamp));
-        // Another time, another index and another key do not verify.
-        for other in [
-            signed_entry(body, integrated_time + 1, &log_id(&log_key), log_index).unwrap(),
-            signed_entry(body, integrated_time, &log_id(&log_key), log_index + 1).unwrap(),
-        ] {
-            assert!(!p256_verifies(&log_key, other.as_bytes(), &timestamp));
-        }
-        assert!(!p256_verifies(
-            &TestKey::new().spki,
-            signed.as_bytes(),
+        assert!(log.promised(body, integrated_time, log_index, &timestamp));
+        // Another time, another index, another body and another key do not verify.
+        assert!(!log.promised(body, integrated_time + 1, log_index, &timestamp));
+        assert!(!log.promised(body, integrated_time, log_index + 1, &timestamp));
+        assert!(!log.promised(
+            &format!("{body}AAAA"),
+            integrated_time,
+            log_index,
             &timestamp
         ));
-
-        // The entry is a `hashedrekord` of another signer. As the endorsement of a statement
-        // it passes checks 2 and 3 and fails check 4: its hash is not the hash of the
-        // statement.
-        let statement = statement_of("v1.2.0");
-        let result = verify_endorsement(
-            &statement,
-            &LogEntry {
-                body,
-                integrated_time,
-                log_index,
-                log_id: entry["log_id"].as_str().unwrap(),
-                signed_entry_timestamp: entry["signed_entry_timestamp"].as_str().unwrap(),
-            },
-            &ReleaseKeys {
-                release: &TestKey::new().spki,
-                log: &log_key,
-            },
-            "v1.1.0",
-            NOW_S,
-        );
-        assert_eq!(result, Err(EndorsementError::StatementHash));
+        assert!(!TestKey::new()
+            .log()
+            .promised(body, integrated_time, log_index, &timestamp));
+        // Bytes behind the signature.
+        let longer = [&timestamp[..], &[0u8]].concat();
+        assert!(!log.promised(body, integrated_time, log_index, &longer));
     }
 
     #[test]
-    fn a_public_key_is_read_from_its_pem_and_used_as_a_p256_key_only() {
+    fn a_body_with_a_character_outside_the_base64_alphabet_has_no_signed_entry_timestamp() {
+        // The log signs whatever bytes the entry gives: such a body is not put into the signed
+        // bytes at all.
+        let key = TestKey::new();
+        let log = key.log();
+        for character in ["\"", "\\", " ", "\n", "-", "_", ",", "}", "é"] {
+            let body = format!("AAAA{character}");
+            let signed = format!(
+                "{{\"body\":\"{body}\",\"integratedTime\":1,\"logID\":\"{}\",\"logIndex\":2}}",
+                log.id()
+            );
+            assert!(
+                !log.promised(&body, 1, 2, &key.sign(signed.as_bytes())),
+                "{character:?}"
+            );
+        }
+        assert_eq!(signed_entry("ab\"cd", 1, "id", 2), None);
+        assert_eq!(
+            signed_entry("AZaz09+/=", 1, "id", 2).as_deref(),
+            Some(r#"{"body":"AZaz09+/=","integratedTime":1,"logID":"id","logIndex":2}"#)
+        );
+        let signed = signed_entry("AAAA", 1, &log.id(), 2).unwrap();
+        assert!(log.promised("AAAA", 1, 2, &key.sign(signed.as_bytes())));
+    }
+
+    #[test]
+    fn a_public_key_and_a_certificate_are_read_from_their_pem() {
         let key = TestKey::new();
         assert_eq!(public_key_der(&key.pem()).as_deref(), Some(&key.spki[..]));
         // Without the last line break, with other line breaks and with white space around.
@@ -1275,6 +953,7 @@ mod tests {
         for text in [
             "",
             "-----BEGIN PUBLIC KEY-----",
+            "-----BEGIN PUBLIC KEY-----END PUBLIC KEY-----",
             &pem.replace("PUBLIC KEY", "EC PUBLIC KEY"),
             &pem.replace("-----END PUBLIC KEY-----", ""),
             &pem.replace(
@@ -1286,15 +965,37 @@ mod tests {
         ] {
             assert_eq!(public_key_der(text), None, "{text:?}");
         }
+        // The PEM of another kind is read under the name of its kind only.
+        let certificate = pem.replace("PUBLIC KEY", "CERTIFICATE");
+        assert_eq!(
+            pem_der(&certificate, "CERTIFICATE").as_deref(),
+            Some(&key.spki[..])
+        );
+        assert_eq!(pem_der(&certificate, "PUBLIC KEY"), None);
+        assert_eq!(pem_der(&pem, "CERTIFICATE"), None);
+        // The base64 between the two lines has its padding and no bits of no byte.
+        let begin = "-----BEGIN PUBLIC KEY-----";
+        let end = "-----END PUBLIC KEY-----";
+        assert_eq!(
+            pem_der(&format!("{begin}AAAA{end}"), "PUBLIC KEY"),
+            Some(vec![0, 0, 0])
+        );
+        assert_eq!(
+            pem_der(&format!("{begin}{end}"), "PUBLIC KEY"),
+            Some(Vec::new())
+        );
+        for inner in ["AAA", "AA=", "AB==", "AAAA=", "AA==AAAA"] {
+            assert_eq!(
+                pem_der(&format!("{begin}{inner}{end}"), "PUBLIC KEY"),
+                None,
+                "{inner}"
+            );
+        }
 
-        // A key that is not the SubjectPublicKeyInfo of a P-256 key verifies nothing: one
+        // A key that is not the SubjectPublicKeyInfo of a P-256 key is the key of no log: one
         // byte less, one byte more, another curve identifier, a compressed point, the bare
         // point.
-        let message = b"message";
-        let signature = STANDARD.decode(key.sign(message)).unwrap();
         assert!(is_p256_public_key(&key.spki));
-        assert!(p256_verifies(&key.spki, message, &signature));
-        assert!(!p256_verifies(&key.spki, b"another message", &signature));
         let mut other_curve = key.spki.clone();
         other_curve[22] = 0x06;
         let mut compressed = key.spki.clone();
@@ -1308,132 +1009,154 @@ mod tests {
             &[],
         ] {
             assert!(!is_p256_public_key(spki));
-            assert!(!p256_verifies(spki, message, &signature));
+            assert!(TransparencyLog::rekor_v1(spki).is_none());
         }
-        // A point that is not on the curve has the form of a key and verifies nothing.
-        let mut off_curve = key.spki.clone();
-        off_curve[90] ^= 1;
-        assert!(is_p256_public_key(&off_curve));
-        assert!(!p256_verifies(&off_curve, message, &signature));
+    }
 
-        // An endorsement under a log key or a release key of another form is refused.
-        let mut endorsement = Endorsement::of("v1.2.0");
-        endorsement.release_key.spki.push(0);
-        assert_eq!(endorsement.result(), Err(EndorsementError::ReleaseKey));
-        // Also when the entry names the same bytes as its public key: the signature of the
-        // private key verifies under no key of that form.
-        endorsement.body = body_of(
-            &endorsement.statement,
-            &endorsement.release_key.pem(),
-            &endorsement.release_key.sign(&endorsement.statement),
-        );
-        endorsement.log_signs();
-        assert_eq!(
-            endorsement.result(),
-            Err(EndorsementError::ReleaseSignature)
-        );
-        let mut endorsement = Endorsement::of("v1.2.0");
-        endorsement.log_key.spki[26] = 0x02;
-        endorsement.log_id = log_id(&endorsement.log_key.spki);
-        assert_eq!(endorsement.result(), Err(EndorsementError::EntrySignature));
+    /// The Merkle tree hash of leaf hashes (RFC 6962 section 2.1), by its recursive
+    /// definition.
+    fn tree_hash(leaves: &[[u8; 32]]) -> [u8; 32] {
+        match leaves {
+            [leaf] => *leaf,
+            _ => {
+                // The largest power of two below the number of leaves.
+                let split = leaves.len().next_power_of_two() / 2;
+                node_hash(&tree_hash(&leaves[..split]), &tree_hash(&leaves[split..]))
+            }
+        }
+    }
+
+    /// The audit path of the leaf `index` (RFC 6962 section 2.1.1), by its recursive
+    /// definition.
+    fn audit_path(index: usize, leaves: &[[u8; 32]]) -> Vec<[u8; 32]> {
+        if leaves.len() == 1 {
+            return Vec::new();
+        }
+        let split = leaves.len().next_power_of_two() / 2;
+        if index < split {
+            let mut path = audit_path(index, &leaves[..split]);
+            path.push(tree_hash(&leaves[split..]));
+            path
+        } else {
+            let mut path = audit_path(index - split, &leaves[split..]);
+            path.push(tree_hash(&leaves[..split]));
+            path
+        }
     }
 
     #[test]
-    fn a_list_of_predecessors_names_earlier_releases_and_their_measurements() {
-        let element = |release: &str| json!({"release": release, "pcr0": PCRS[0], "pcr1": PCRS[1], "pcr2": PCRS[2]});
-        let read = |list: serde_json::Value, own: &str| {
-            read_predecessors(list.to_string().as_bytes(), own)
+    fn the_audit_path_of_every_leaf_of_a_tree_leads_to_its_root() {
+        for size in 1..=70usize {
+            let leaves: Vec<[u8; 32]> = (0..size)
+                .map(|leaf| leaf_hash(format!("leaf {leaf}").as_bytes()))
+                .collect();
+            let root = tree_hash(&leaves);
+            for index in 0..size {
+                let path = audit_path(index, &leaves);
+                let leaf = leaves[index];
+                let (index, size) = (index as u64, size as u64);
+                assert_eq!(
+                    audit_root(leaf, index, size, &path),
+                    Some(root),
+                    "{index} of {size}"
+                );
+                // Another leaf, and a path without its last hash and with one hash more.
+                assert_ne!(
+                    audit_root([0x5a; 32], index, size, &path),
+                    Some(root),
+                    "{index} of {size}"
+                );
+                if let Some((_, shorter)) = path.split_last() {
+                    assert_eq!(audit_root(leaf, index, size, shorter), None);
+                }
+                let longer = [&path[..], &[[0x11; 32]]].concat();
+                assert_eq!(audit_root(leaf, index, size, &longer), None);
+            }
+            // An index that is not below the size.
+            assert_eq!(audit_root(leaves[0], size as u64, size as u64, &[]), None);
+        }
+        assert_eq!(audit_root([1; 32], 0, 0, &[]), None);
+        assert_eq!(audit_root([1; 32], 0, 1, &[]), Some([1; 32]));
+        assert_eq!(audit_root([1; 32], u64::MAX, u64::MAX, &[]), None);
+    }
+
+    /// The checkpoint of a tree of `size` leaves with the root `root`, signed by `key` under
+    /// the key ID of `named`.
+    fn checkpoint_of(key: &TestKey, named: &TransparencyLog, size: u64, root: &[u8; 32]) -> String {
+        let note = format!("log.test - 7\n{size}\n{}\n", STANDARD.encode(root));
+        let signature = [&named.id[..4], &key.sign(note.as_bytes())].concat();
+        format!("{note}\n\u{2014} log.test {}\n", STANDARD.encode(signature))
+    }
+
+    #[test]
+    fn a_checkpoint_is_the_note_of_a_tree_head_that_the_log_signed() {
+        let key = TestKey::new();
+        let log = key.log();
+        let root = [0x42u8; 32];
+        let checkpoint = checkpoint_of(&key, &log, 11, &root);
+        assert!(log.signed_tree_head(&checkpoint, 11, &root));
+        // Another size and another root than the note states.
+        assert!(!log.signed_tree_head(&checkpoint, 12, &root));
+        assert!(!log.signed_tree_head(&checkpoint, 11, &[0x43; 32]));
+        // The checkpoint of another key, also under the key ID of this log.
+        let other = TestKey::new();
+        assert!(!log.signed_tree_head(&checkpoint_of(&other, &other.log(), 11, &root), 11, &root));
+        assert!(!log.signed_tree_head(&checkpoint_of(&other, &log, 11, &root), 11, &root));
+        // A changed note under the signature of the log.
+        assert!(!log.signed_tree_head(
+            &checkpoint.replace("log.test - 7", "log.test - 8"),
+            11,
+            &root
+        ));
+        // No empty line, no line of the log, a note of two lines, a note without an origin, a
+        // size with a leading zero.
+        let (note, lines) = checkpoint.split_once("\n\n").unwrap();
+        assert!(!log.signed_tree_head(&format!("{note}\n{lines}"), 11, &root));
+        assert!(!log.signed_tree_head(&format!("{note}\n\n"), 11, &root));
+        assert!(!log.signed_tree_head(&format!("log.test - 7\n11\n\n{lines}"), 11, &root));
+        let signed_as = |note: &str| {
+            let signature = [&log.id[..4], &key.sign(note.as_bytes())].concat();
+            format!("{note}\n\u{2014} log.test {}\n", STANDARD.encode(signature))
         };
+        let root_text = STANDARD.encode(root);
+        assert!(log.signed_tree_head(&signed_as(&format!("o\n11\n{root_text}\n")), 11, &root));
+        assert!(!log.signed_tree_head(&signed_as(&format!("\n11\n{root_text}\n")), 11, &root));
+        assert!(!log.signed_tree_head(&signed_as(&format!("o\n011\n{root_text}\n")), 11, &root));
+        assert!(!log.signed_tree_head(&signed_as(&format!("o\n11\n{root_text}=\n")), 11, &root));
+        // A further line of the note is not read: the signature of the log covers it.
+        assert!(log.signed_tree_head(
+            &signed_as(&format!("o\n11\n{root_text}\n1795000100\n")),
+            11,
+            &root
+        ));
 
-        // The empty list, for every release.
-        for own in ["v1.1.0", "dev", ""] {
-            assert_eq!(read_predecessors(b"[]", own), Some(Vec::new()));
-            assert_eq!(read_predecessors(b" [ ]\n", own), Some(Vec::new()));
-        }
-        // Earlier releases, in the order of the list.
-        let list = read(json!([element("v1.0.0"), element("v1.1.0-rc.1")]), "v1.1.0").unwrap();
-        assert_eq!(list.len(), 2);
-        assert_eq!(list[0].release, "v1.0.0");
-        assert_eq!(list[1].release, "v1.1.0-rc.1");
-        for predecessor in &list {
-            assert_eq!(hex(&predecessor.pcrs[0]), PCRS[0]);
-            assert_eq!(hex(&predecessor.pcrs[1]), PCRS[1]);
-            assert_eq!(hex(&predecessor.pcrs[2]), PCRS[2]);
-        }
-
-        // An element whose release is not earlier than the own release: the same release, a
-        // later one, and the release of a candidate that the own release precedes.
-        for (release, own) in [
-            ("v1.1.0", "v1.1.0"),
-            ("v1.1.1", "v1.1.0"),
-            ("v2.0.0", "v1.1.0"),
-            ("v1.1.0", "v1.1.0-rc.1"),
-            ("v1.1.0-rc.2", "v1.1.0-rc.1"),
-            ("v1.1.0-rc.1", "v1.1.0-rc.1"),
+        // The line of a witness and a line of another key under the name of the log are not
+        // read. A second line of the key of the log that is no signature of it refuses the
+        // checkpoint.
+        let witness = checkpoint_of(&other, &other.log(), 11, &root);
+        let (_, witness_line) = witness.split_once("\n\n").unwrap();
+        assert!(log.signed_tree_head(&format!("{checkpoint}{witness_line}"), 11, &root));
+        let forged = checkpoint_of(&other, &log, 11, &root);
+        let (_, forged_line) = forged.split_once("\n\n").unwrap();
+        assert!(!log.signed_tree_head(&format!("{checkpoint}{forged_line}"), 11, &root));
+        assert!(!log.signed_tree_head(&format!("{note}\n\n{forged_line}{lines}"), 11, &root));
+        // A line without a name, without the dash, with a signature that is no base64 and with
+        // the four bytes of the key ID alone is no line of the log.
+        let encoded = lines.trim_end().rsplit(' ').next().unwrap();
+        for line in [
+            format!("\u{2014}  {encoded}\n"),
+            format!("- log.test {encoded}\n"),
+            format!("\u{2014} log.test {encoded}!\n"),
+            format!("\u{2014} log.test {}\n", STANDARD.encode(&log.id[..4])),
         ] {
-            assert_eq!(
-                read(json!([element(release)]), own),
-                None,
-                "{release} {own}"
+            assert!(
+                !log.signed_tree_head(&format!("{note}\n\n{line}"), 11, &root),
+                "{line}"
             );
-            // One such element refuses the whole list.
-            assert_eq!(
-                read(json!([element("v1.0.0"), element(release)]), own),
-                None,
-                "{release} {own}"
+            assert!(
+                log.signed_tree_head(&format!("{note}\n\n{line}{lines}"), 11, &root),
+                "{line}"
             );
         }
-        // A program whose own release is not a release tag has no predecessor.
-        for own in ["dev", "", "v0.0.0-test"] {
-            assert_eq!(read(json!([element("v1.0.0")]), own), None, "{own}");
-        }
-
-        // Malformed elements and lists.
-        let with = |change: fn(&mut serde_json::Value)| {
-            let mut value = element("v1.0.0");
-            change(&mut value);
-            json!([value])
-        };
-        assert!(read(with(|_| {}), "v1.1.0").is_some());
-        let changes: [fn(&mut serde_json::Value); 12] = [
-            |element| element["release"] = json!("dev"),
-            |element| element["release"] = json!("1.0.0"),
-            |element| element["release"] = json!(1),
-            |element| {
-                element.as_object_mut().unwrap().remove("release");
-            },
-            |element| {
-                element.as_object_mut().unwrap().remove("pcr1");
-            },
-            |element| element["pcr0"] = json!(PCRS[0][1..]),
-            |element| element["pcr1"] = json!(PCRS[1].to_uppercase()),
-            |element| element["pcr2"] = json!(format!("{}0", PCRS[2])),
-            |element| element["pcr2"] = json!(7),
-            // The measurement of a debug-mode enclave.
-            |element| element["pcr0"] = json!("0".repeat(96)),
-            |element| element["pcr2"] = json!("0".repeat(96)),
-            |element| *element = json!([element["release"], PCRS[0], PCRS[1], PCRS[2]]),
-        ];
-        for (index, change) in changes.into_iter().enumerate() {
-            assert_eq!(read(with(change), "v1.1.0"), None, "{index}");
-        }
-        for list in [
-            &b""[..],
-            b"{}",
-            b"null",
-            b"[",
-            b"[]x",
-            b"[null]",
-            b"[\"v1.0.0\"]",
-            b"not json",
-        ] {
-            assert_eq!(read_predecessors(list, "v1.1.0"), None);
-        }
-        // An element that names a key twice.
-        let twice = format!(
-            r#"[{{"release":"v1.0.0","release":"v1.0.1","pcr0":"{}","pcr1":"{}","pcr2":"{}"}}]"#,
-            PCRS[0], PCRS[1], PCRS[2]
-        );
-        assert_eq!(read_predecessors(twice.as_bytes(), "v1.1.0"), None);
     }
 }

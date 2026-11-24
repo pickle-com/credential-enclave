@@ -9,7 +9,7 @@ use zeroize::Zeroizing;
 use crate::encoding::{b64u, b64u_decode};
 use crate::keys::{record_key, Custody};
 use crate::secret::Secret;
-use crate::{is_valid_name, purpose, ProtocolError};
+use crate::{is_valid_name, limits, purpose, ProtocolError};
 
 /// How a credential is used (rule E6 of the egress policy).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -19,6 +19,11 @@ pub enum UseMode {
     /// The node hands the value to the caller, after the log entry of that release is on the
     /// chain.
     Release,
+    /// The record says it itself: its plaintext lists the slots its value may be put into
+    /// ([`crate::vault_secret`]). A record with the slot `field` is released. A record with
+    /// slots of a request is used inside a node of the forward role, and no call hands its
+    /// value out.
+    BySlot,
 }
 
 /// The kinds of a record (protocol.md section 6). The kind is part of the AAD of a record, so
@@ -30,15 +35,21 @@ pub enum UseMode {
 /// | --- | --- | --- | --- |
 /// | `oauth` | the node, from the response of a token address | enclave-use | `forward`, `refresh`, `revoke-token`, `oauth/merge` |
 /// | `oauth_imported` | the device of the account, from a token the operator domain held before it used this node | enclave-use | `forward`, `refresh`, `revoke-token` |
-/// | `vault_password` | the device of the account | release | `release` (field `password`) |
+/// | `vault_password` | the device of the account, or a node from a value its caller gave (`vault/store`) | release | `release` (field `password`) |
 /// | `vault_totp` | the device of the account | enclave-use (the seed stays, the code leaves) | `release` (field `totp`) |
 /// | `vault_card` | the device of the account | release | `release` (fields `card_number`, `card_cvc`) |
+/// | `vault_secret` | the device of the account, or a node from a value its caller gave (`vault/store`) | by the slots of the record | `release` (field `value`, for a record with the slot `field`), `vault/handoff` (for a record with slots of a request) |
 ///
-/// No call takes a plaintext from the caller and makes a record of it. A node creates a
-/// record of kind `oauth` from a token response it received itself, and writes an existing
-/// record of kind `oauth` or `oauth_imported` again after a refresh, under the same kind.
-/// The token of an `oauth_imported` record was known to the operator domain before the
-/// device encrypted it: such a record does not say that its token never left a node.
+/// No call takes a token from the caller and makes a record of it. A node creates a record
+/// of kind `oauth` from a token response it received itself, and writes an existing record of
+/// kind `oauth` or `oauth_imported` again after a refresh, under the same kind. The token of
+/// an `oauth_imported` record was known to the operator domain before the device encrypted
+/// it: such a record does not say that its token never left a node.
+///
+/// One call takes a value from the caller and makes a record of it: `vault/store`, for the
+/// kinds `vault_secret` and `vault_password`. The plaintext of that record says so
+/// (`"source":"operator"`), and a node writes no other source: a record a node made of a value
+/// of its caller is told apart from a record the device of the account made.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
     Oauth,
@@ -47,17 +58,19 @@ pub enum Kind {
     VaultPassword,
     VaultTotp,
     VaultCard,
+    VaultSecret,
 }
 
 impl Kind {
     /// Every kind.
-    pub const ALL: [Kind; 6] = [
+    pub const ALL: [Kind; 7] = [
         Kind::Oauth,
         Kind::OauthImported,
         Kind::AppPassword,
         Kind::VaultPassword,
         Kind::VaultTotp,
         Kind::VaultCard,
+        Kind::VaultSecret,
     ];
 
     /// The name the protocol writes.
@@ -69,6 +82,7 @@ impl Kind {
             Kind::VaultPassword => "vault_password",
             Kind::VaultTotp => "vault_totp",
             Kind::VaultCard => "vault_card",
+            Kind::VaultSecret => "vault_secret",
         }
     }
 
@@ -84,6 +98,7 @@ impl Kind {
                 UseMode::EnclaveUse
             }
             Kind::VaultPassword | Kind::VaultCard => UseMode::Release,
+            Kind::VaultSecret => UseMode::BySlot,
         }
     }
 }
@@ -106,12 +121,22 @@ pub struct Record {
 
 impl Record {
     /// Reads a record from parsed JSON. A `v` other than the integer 1 is
-    /// `unsupported_version`. A missing or non-string field is `record_invalid`. Keys the
-    /// protocol does not define are ignored.
+    /// `unsupported_version`. A missing or non-string field is `record_invalid`, and so is a
+    /// `ct` of more than [`limits::RECORD_CT_CHARS`] characters: a reader makes no copy of
+    /// such a record and does not open it. The length of a ciphertext says nothing of what
+    /// it holds, so this judgement needs no key. Keys the protocol does not define are
+    /// ignored.
     pub fn from_value(value: &serde_json::Value) -> Result<Record, ProtocolError> {
         let object = value.as_object().ok_or(ProtocolError::RecordInvalid)?;
         if object.get("v").and_then(serde_json::Value::as_u64) != Some(1) {
             return Err(ProtocolError::UnsupportedVersion);
+        }
+        let ct_chars = object
+            .get("ct")
+            .and_then(serde_json::Value::as_str)
+            .map_or(0, str::len);
+        if ct_chars > limits::RECORD_CT_CHARS {
+            return Err(ProtocolError::RecordInvalid);
         }
         let text = |key: &str| {
             object
@@ -186,10 +211,11 @@ pub fn open_record(
     {
         return Err(ProtocolError::RecordInvalid);
     }
-    let nonce = b64u_decode(&record.nonce).map_err(|_| ProtocolError::RecordInvalid)?;
-    if nonce.len() != 12 {
-        return Err(ProtocolError::RecordInvalid);
-    }
+    // The nonce is twelve bytes: a value of another length is no nonce of this cipher.
+    let nonce: [u8; 12] = b64u_decode(&record.nonce)
+        .ok()
+        .and_then(|nonce| nonce.try_into().ok())
+        .ok_or(ProtocolError::RecordInvalid)?;
     let ct = b64u_decode(&record.ct).map_err(|_| ProtocolError::RecordInvalid)?;
     let key = record_key(user_key, &id);
     let aad = record_aad(
@@ -202,7 +228,7 @@ pub fn open_record(
     );
     ChaCha20Poly1305::new(Key::from_slice(key.as_slice()))
         .decrypt(
-            Nonce::from_slice(&nonce),
+            &Nonce::from(nonce),
             Payload {
                 msg: &ct,
                 aad: &aad,
@@ -217,6 +243,11 @@ pub fn open_record(
 /// `nonce` are fresh random bytes. Writing the same `id` again (a token refresh) uses a new
 /// nonce and keeps `id`, `kind` and `provider`.
 #[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::expect_used,
+    reason = "the cipher refuses a plaintext of more than 2^38 bytes and nothing else: the \
+              plaintext of a record is a token response or a vault value, far below that"
+)]
 pub fn seal_record(
     user_key: &[u8; 32],
     id: &[u8; 16],
@@ -479,6 +510,45 @@ mod tests {
     }
 
     #[test]
+    fn a_record_is_read_up_to_the_longest_ciphertext() {
+        let sealed = |plaintext_bytes: usize| {
+            seal_record(
+                &USER_KEY,
+                &[0x31; 16],
+                &[0x41; 12],
+                "user-1",
+                KEY_ID,
+                Custody::Enclave,
+                "oauth",
+                "google_workspace",
+                &vec![b'p'; plaintext_bytes],
+            )
+        };
+        let read = |record: &Record| {
+            Record::from_value(&serde_json::from_slice(&to_json(record)).unwrap())
+        };
+        // The longest plaintext gives the longest `ct`: its bytes and the tag of 16 bytes,
+        // four characters for three bytes.
+        let longest = sealed(limits::RECORD_PLAINTEXT_BYTES);
+        assert_eq!(limits::RECORD_PLAINTEXT_BYTES, 65_536);
+        assert_eq!(limits::RECORD_CT_CHARS, 87_403);
+        assert_eq!(longest.ct.len(), limits::RECORD_CT_CHARS);
+        let opened = open_record(&USER_KEY, &read(&longest).unwrap()).unwrap();
+        assert_eq!(opened.len(), limits::RECORD_PLAINTEXT_BYTES);
+        // One byte more of plaintext is one character more of `ct`: the record is not read.
+        let longer = sealed(limits::RECORD_PLAINTEXT_BYTES + 1);
+        assert_eq!(longer.ct.len(), limits::RECORD_CT_CHARS + 1);
+        assert_eq!(read(&longer), Err(ProtocolError::RecordInvalid));
+        // The version of a record is judged first.
+        let mut other_version = serde_json::to_value(&longer).unwrap();
+        other_version["v"] = serde_json::json!(2);
+        assert_eq!(
+            Record::from_value(&other_version),
+            Err(ProtocolError::UnsupportedVersion)
+        );
+    }
+
+    #[test]
     fn kinds_have_the_names_and_use_modes_of_the_egress_policy() {
         let table = [
             (Kind::Oauth, "oauth", UseMode::EnclaveUse),
@@ -487,6 +557,7 @@ mod tests {
             (Kind::VaultPassword, "vault_password", UseMode::Release),
             (Kind::VaultTotp, "vault_totp", UseMode::EnclaveUse),
             (Kind::VaultCard, "vault_card", UseMode::Release),
+            (Kind::VaultSecret, "vault_secret", UseMode::BySlot),
         ];
         assert_eq!(table.len(), Kind::ALL.len());
         for (kind, name, use_mode) in table {
@@ -494,7 +565,15 @@ mod tests {
             assert_eq!(Kind::parse(name), Some(kind));
             assert_eq!(kind.use_mode(), use_mode);
         }
-        for other in ["", "oauth_operator", "api_key", "OAuth", "oauth ", "vault"] {
+        for other in [
+            "",
+            "oauth_operator",
+            "api_key",
+            "OAuth",
+            "oauth ",
+            "vault",
+            "secret",
+        ] {
             assert_eq!(Kind::parse(other), None, "{other:?}");
         }
     }

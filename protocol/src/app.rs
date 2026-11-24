@@ -1,6 +1,7 @@
 //! The app side of the protocol: account key derivation, the check of a challenge statement,
-//! command sealing, log entry opening and chain verification (protocol.md sections 3, 4.4,
-//! 5.1, 5.2 and 7.4).
+//! command sealing, the reading of the objects of the log store (the entries of format 3 and
+//! the node document), and the opening and the chain verification of the entries of the two
+//! earlier formats (protocol.md sections 3, 4.4, 5.1, 5.2, 7.4 and 7.7).
 //!
 //! The node program never calls this module. The test vector generator and the tests use it to
 //! play the part of the app, and a third party can use it to check a node from outside.
@@ -10,12 +11,15 @@ use serde::Serialize;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
-use crate::encoding::{b64u, b64u_decode, to_json, verify, Signed};
+use crate::attestation::{
+    read_binding, read_local_document, verify_nitro_document, AttestationError, NodeBinding,
+};
+use crate::encoding::{b64u, b64u_decode, b64u_decode_array, to_json, verify, Signed};
 use crate::envelope::{hpke_open, hpke_seal, Envelope};
 use crate::keys::{hkdf_sha256, key_id, node_id, Custody};
 use crate::log::{
-    body_hash, entry_aad, entry_hash, entry_hash_v2, EntryBody, EntryBodyV1, EntryParts, Head,
-    HeadBody,
+    body_hash, entry_aad, entry_hash, entry_hash_v2, node_document_nonce, EntryBody, EntryBodyV1,
+    EntryKey, EntryParts, Head, HeadBody, NodeDocument,
 };
 use crate::statement::ChallengeBody;
 use crate::{limits, purpose, ProtocolError};
@@ -251,6 +255,156 @@ pub fn open_entry_v2(
         return Err(ProtocolError::InvalidRequest);
     }
     Ok(events)
+}
+
+/// Opens the events of a log entry of format 3 with the log decryption private key. `body` is
+/// the verified body of the entry ([`verify_entry_v3`]). The plaintext is the JSON array of
+/// the events in the order of their creation; an array of another length than `count` is
+/// `invalid_request`.
+pub fn open_entry_v3(
+    log_private: &StaticSecret,
+    body: &[u8],
+) -> Result<Vec<serde_json::Value>, ProtocolError> {
+    let entry: EntryBody =
+        serde_json::from_slice(body).map_err(|_| ProtocolError::InvalidRequest)?;
+    if entry.v != 3 {
+        return Err(ProtocolError::UnsupportedVersion);
+    }
+    let enc = b64u_decode(&entry.enc)?;
+    let ct = b64u_decode(&entry.ct)?;
+    let plaintext = hpke_open(
+        log_private,
+        &enc,
+        purpose::LOG_ENTRY_SEAL_V3.as_bytes(),
+        &entry_aad(&entry.node, &entry.user_id, &entry.key_id, entry.seq),
+        &ct,
+    )?;
+    let events: Vec<serde_json::Value> =
+        serde_json::from_slice(&plaintext).map_err(|_| ProtocolError::InvalidRequest)?;
+    if events.len() != entry.count as usize {
+        return Err(ProtocolError::InvalidRequest);
+    }
+    Ok(events)
+}
+
+/// Why an object of the log store is not the entry of format 3 that its key names (protocol.md
+/// 7.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntryError {
+    /// The object does not hold the body the key names: the SHA-256 of its body is not the
+    /// `body_hash` of the key. The operator domain can write to the store under any key, so
+    /// such an object is not an entry of the node; another version of the object may be.
+    Body,
+    /// The object holds the body the key names, and the signature does not verify under the
+    /// signing key of the node of the key.
+    Signature,
+    /// The signature verifies, and a field of the body (`v`, `node`, `user_id`, `key_id`,
+    /// `seq`, `time_ms`, `kind` or `count`) is not what the key and the account state.
+    Fields,
+}
+
+/// Verifies the object of a key of format 3 (protocol.md 7.4): the SHA-256 of the body against
+/// the `body_hash` of the key, the signature under the signing key that the node identifier of
+/// the key is, and the body fields `v`, `node`, `user_id`, `key_id`, `seq`, `time_ms`, `kind`
+/// and `count` against the key and `user_id`. Returns the body and its bytes (the input of
+/// [`open_entry_v3`]).
+///
+/// The function does not judge the node: whether the signing key of `key.node` was created
+/// inside an enclave of an accepted measurement is what the node document says
+/// ([`read_node_document`]).
+pub fn verify_entry_v3(
+    user_id: &str,
+    key: &EntryKey,
+    entry: &Signed,
+) -> Result<(EntryBody, Vec<u8>), EntryError> {
+    let body_bytes = b64u_decode(&entry.body).map_err(|_| EntryError::Body)?;
+    if body_hash(&body_bytes) != key.body_hash {
+        return Err(EntryError::Body);
+    }
+    let node_sign_public = b64u_decode_array::<32>(&key.node).map_err(|_| EntryError::Signature)?;
+    verify(&node_sign_public, purpose::LOG_ENTRY_V3, entry).map_err(|_| EntryError::Signature)?;
+    let body: EntryBody = serde_json::from_slice(&body_bytes).map_err(|_| EntryError::Fields)?;
+    if body.v != 3
+        || body.node != key.node
+        || body.user_id != user_id
+        || body.key_id != key.key_id
+        || body.seq != key.seq
+        || body.time_ms != key.time_ms
+        || body.kind != key.kind().letter().to_string()
+        || body.count != key.count()
+    {
+        return Err(EntryError::Fields);
+    }
+    Ok((body, body_bytes))
+}
+
+/// What a node document states about its node (protocol.md 7.7).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeFacts {
+    /// The platform of the node: `nitro` or `local`.
+    pub platform: String,
+    /// PCR0, PCR1 and PCR2 of the enclave the document was made in. `None` on the local
+    /// platform, whose document states no measurement and proves nothing.
+    pub pcrs: Option<[[u8; 48]; 3]>,
+    /// The binding of the node: its two public keys, its release, its log store and its role.
+    pub binding: NodeBinding,
+    /// The time of the document of the platform, in Unix epoch milliseconds.
+    pub time_ms: u64,
+}
+
+/// Reads the node document of `node` from the bytes of its object (protocol.md 7.7) and returns
+/// what it states.
+///
+/// | Check | Failure |
+/// | --- | --- |
+/// | the object is `{"v":1,"platform","document","node","release"}` and its `node` is `node` | `Malformed` |
+/// | platform `nitro`: the document verifies by protocol.md 4.3 steps 1 to 5 against `root_der`, and its nonce is [`node_document_nonce`] of the signing key that `node` is | `Malformed`, `Untrusted`, `Forged`, `NonceMismatch` |
+/// | platform `local`: the document is a local document whose nonce is that value | `Malformed`, `NonceMismatch` |
+/// | the user data of the document is a binding whose signing public key is the key that `node` is, and whose release is the `release` of the object | `Malformed` |
+///
+/// The caller decides what it accepts, as for an attestation response: the measurement (never
+/// one with a PCR that is all zero), the platform, and the log store of the binding.
+pub fn read_node_document(
+    object: &[u8],
+    node: &str,
+    root_der: &[u8],
+) -> Result<NodeFacts, AttestationError> {
+    let malformed = AttestationError::Malformed;
+    let stored: NodeDocument = serde_json::from_slice(object).map_err(|_| malformed)?;
+    let sign_public = b64u_decode_array::<32>(node).map_err(|_| malformed)?;
+    if stored.v != 1 || stored.node != node {
+        return Err(malformed);
+    }
+    let document = b64u_decode(&stored.document).map_err(|_| malformed)?;
+    let nonce = node_document_nonce(&sign_public);
+    let (pcrs, binding, time_ms) = match stored.platform.as_str() {
+        "nitro" => {
+            let nitro = verify_nitro_document(&document, root_der, Some(&nonce))?;
+            let binding = nitro.user_data.as_deref().ok_or(malformed)?;
+            (
+                Some([nitro.pcr0, nitro.pcr1, nitro.pcr2]),
+                read_binding(binding)?,
+                nitro.timestamp_ms,
+            )
+        }
+        "local" => {
+            let local = read_local_document(&document)?;
+            if local.nonce != nonce {
+                return Err(AttestationError::NonceMismatch);
+            }
+            (None, read_binding(&local.binding)?, local.time_ms)
+        }
+        _ => return Err(malformed),
+    };
+    if binding.sign_public != sign_public || binding.release != stored.release {
+        return Err(malformed);
+    }
+    Ok(NodeFacts {
+        platform: stored.platform,
+        pcrs,
+        binding,
+        time_ms,
+    })
 }
 
 /// Why a chain failed the verification of protocol.md 7.4.

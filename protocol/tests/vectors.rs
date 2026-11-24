@@ -3,15 +3,18 @@
 
 use std::process::Command;
 
-use credential_enclave_protocol::app::{self, ChainError, IndexError};
-use credential_enclave_protocol::attestation::{read_binding, read_local_document, NodeBinding};
+use credential_enclave_protocol::app::{self, ChainError, EntryError, IndexError};
+use credential_enclave_protocol::attestation::{
+    read_binding, read_local_document, NodeBinding, AWS_NITRO_ROOT_G1,
+};
 use credential_enclave_protocol::encoding::{b64u, b64u_decode, verify, Signed};
 use credential_enclave_protocol::envelope::{self, Envelope, TransferEnvelope, TransferGrant};
-use credential_enclave_protocol::keys::{self, Custody, NodeKeys};
-use credential_enclave_protocol::log::{self, EntryKind, EntryParts, Head, ParsedKey};
+use credential_enclave_protocol::keys::{self, Custody, LogStoreId, NodeKeys};
+use credential_enclave_protocol::log::{self, EntryKind, EntryParts, Head, Last, ParsedKey};
 use credential_enclave_protocol::purpose;
 use credential_enclave_protocol::record::{open_record, record_aad, seal_record, Record};
 use credential_enclave_protocol::secret::Secret;
+use credential_enclave_protocol::subset;
 use credential_enclave_protocol::totp::totp;
 use ed25519_dalek::SigningKey;
 use serde_json::Value;
@@ -537,6 +540,175 @@ fn log_chain_of_format_1() {
 }
 
 #[test]
+fn log_of_format_3() {
+    let vector = &vectors()["log_v3"];
+    let log_private = StaticSecret::from(array::<32>(vector, "log_private"));
+    let user_id = text(vector, "user_id");
+    assert_eq!(text(vector, "hpke_info_text"), purpose::LOG_ENTRY_SEAL_V3);
+    assert_eq!(
+        text(vector, "signature_context_text"),
+        purpose::LOG_ENTRY_V3
+    );
+    assert_eq!(
+        text(vector, "control_prefix"),
+        log::entry_prefix_v3(user_id, EntryKind::Control)
+    );
+    assert_eq!(
+        text(vector, "use_prefix"),
+        log::entry_prefix_v3(user_id, EntryKind::Use)
+    );
+    let entries = vector["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 4);
+    assert_eq!(vector["verifies"], true);
+
+    // Every object verifies against the parts of its key, which its key gives back, and opens
+    // to its events. The body of an entry carries the hash of the body before it.
+    let mut prev = b64u(&[0u8; 32]);
+    let mut listed: Vec<Vec<String>> = vec![Vec::new(), Vec::new()];
+    for entry in entries {
+        let key = log::parse_object_key_v3(text(entry, "key"), user_id).expect("a key");
+        assert_eq!(log::object_key_v3(user_id, &key), text(entry, "key"));
+        assert_eq!(key.node, text(vector, "node"));
+        assert_eq!(key.key_id, text(vector, "key_id"));
+        assert_eq!(key.seq, entry["seq"].as_u64().unwrap());
+        assert_eq!(key.time_ms, entry["time_ms"].as_u64().unwrap());
+        assert_eq!(key.kind().letter().to_string(), text(entry, "kind"));
+        assert_eq!(u64::from(key.count()), entry["count"].as_u64().unwrap());
+        assert_eq!(b64u(&key.body_hash), text(entry, "body_hash"));
+        let (body, body_bytes) =
+            app::verify_entry_v3(user_id, &key, &signed(&entry["entry"])).unwrap();
+        assert_eq!(body_bytes, text(entry, "body_text").as_bytes());
+        assert_eq!((body.v, &body.prev), (3, &prev));
+        let events = app::open_entry_v3(&log_private, &body_bytes).unwrap();
+        let expected: Vec<Value> = serde_json::from_str(text(entry, "events_text")).unwrap();
+        assert_eq!(events, expected);
+        // The event name of a control key is the `t` of its one event.
+        if let log::EntryLabel::Control(event) = &key.label {
+            assert_eq!(events[0]["t"], event.as_str());
+        }
+        prev = b64u(&key.body_hash);
+        listed[usize::from(key.kind() == EntryKind::Use)].push(text(entry, "key").to_string());
+    }
+    // A listing returns the keys of a prefix in the order of their bytes: the latest first.
+    for (keys, name) in listed.iter_mut().zip(["control_listing", "use_listing"]) {
+        keys.sort();
+        let expected: Vec<&str> = vector[name]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|key| key.as_str().unwrap())
+            .collect();
+        assert_eq!(keys, &expected);
+        let times: Vec<u64> = keys
+            .iter()
+            .map(|key| log::parse_object_key_v3(key, user_id).unwrap().time_ms)
+            .collect();
+        assert!(times.windows(2).all(|pair| pair[0] > pair[1]), "{times:?}");
+    }
+
+    // An object that is not the entry of its key.
+    let rejected = vector["rejected"].as_array().unwrap();
+    assert_eq!(rejected.len(), 3);
+    for case in rejected {
+        let key = log::parse_object_key_v3(text(case, "key"), user_id).expect("a key");
+        let outcome = match app::verify_entry_v3(user_id, &key, &signed(&case["entry"])) {
+            Ok(_) => "ok",
+            Err(EntryError::Body) => "body",
+            Err(EntryError::Signature) => "signature",
+            Err(EntryError::Fields) => "fields",
+        };
+        assert_eq!(outcome, text(case, "result"), "{}", text(case, "name"));
+        assert_ne!(outcome, "ok");
+    }
+    // Strings that are not keys of the account.
+    assert_eq!(vector["a_key_of_not_keys_parses"], false);
+    for key in vector["not_keys"].as_array().unwrap() {
+        let key = key.as_str().unwrap();
+        assert!(log::parse_object_key_v3(key, user_id).is_none(), "{key}");
+    }
+
+    // The node document: its key, its bucket, its nonce, and what a reader accepts.
+    let document = &vector["node_document"];
+    let node = text(vector, "node");
+    let node_public: [u8; 32] = array(vector, "node_sign_pk");
+    assert_eq!(text(document, "key"), log::node_document_key(node));
+    assert_eq!(text(document, "nonce_prefix_text"), purpose::NODE_DOCUMENT);
+    assert_eq!(
+        array::<32>(document, "nonce"),
+        log::node_document_nonce(&node_public)
+    );
+    let facts = app::read_node_document(
+        text(document, "object_text").as_bytes(),
+        node,
+        AWS_NITRO_ROOT_G1,
+    )
+    .unwrap();
+    assert_eq!(document["accepted"], true);
+    assert_eq!((facts.platform.as_str(), facts.pcrs), ("local", None));
+    assert_eq!(facts.binding.sign_public, node_public);
+    let store = facts.binding.log.expect("the binding names the log store");
+    assert_eq!(
+        store.shard_of(keys::shard_hash(node)).as_deref(),
+        Some(text(document, "bucket"))
+    );
+    for case in document["rejected"].as_array().unwrap() {
+        let accepted = app::read_node_document(
+            text(case, "object_text").as_bytes(),
+            text(case, "node"),
+            AWS_NITRO_ROOT_G1,
+        )
+        .is_ok();
+        assert!(!accepted, "{}", text(case, "name"));
+        assert_eq!(case["accepted"], false);
+    }
+}
+
+#[test]
+fn log_store_buckets() {
+    let vector = &vectors()["log_store"];
+    let stores = vector["stores"].as_array().unwrap();
+    assert_eq!(stores.len(), 5);
+    let mut counts = Vec::new();
+    for case in stores {
+        let store = LogStoreId::parse(text(case, "bucket"), text(case, "region")).unwrap();
+        let shards = store.shards();
+        assert_eq!(u64::from(shards), case["shards"].as_u64().unwrap());
+        assert!(shards.is_power_of_two());
+        assert_eq!(store.regional_host(), text(case, "host"));
+        assert_eq!(
+            store.shard_bucket(0).as_deref(),
+            Some(text(case, "first_bucket"))
+        );
+        assert_eq!(
+            store.shard_bucket(shards - 1).as_deref(),
+            Some(text(case, "last_bucket"))
+        );
+        assert_eq!(store.shard_bucket(shards), None);
+        for owner in case["owners"].as_array().unwrap() {
+            let hash = keys::shard_hash(text(owner, "owner"));
+            assert_eq!(u64::from(hash), owner["hash"].as_u64().unwrap());
+            assert_eq!(u64::from(hash % shards), owner["index"].as_u64().unwrap());
+            assert_eq!(store.shard_of(hash).as_deref(), Some(text(owner, "bucket")));
+        }
+        // Every bucket of a store has a bucket name of its own.
+        let names: std::collections::BTreeSet<String> = (0..shards)
+            .map(|index| store.shard_bucket(index).unwrap())
+            .collect();
+        assert_eq!(names.len(), usize::from(shards));
+        assert!(names
+            .iter()
+            .all(|name| LogStoreId::parse(name, "us-west-2").is_some()));
+        counts.push(shards);
+    }
+    assert_eq!(counts, [1024, 32, 32, 4, 32]);
+    // The longest name of a log store that has buckets, and a name one character longer.
+    let longest = &vector["longest_name"];
+    assert_eq!(text(longest, "bucket").len(), keys::LOG_STORE_NAME_CHARS);
+    assert_eq!(text(longest, "first_bucket").len(), 63);
+    assert_eq!(vector["name_without_buckets"]["first_bucket"], Value::Null);
+}
+
+#[test]
 fn log_entries_are_reproducible_from_their_seeds() {
     let all = vectors();
     let command = &all["command"];
@@ -544,6 +716,34 @@ fn log_entries_are_reproducible_from_their_seeds() {
         &array(command, "node_sign_seed"),
         &array(command, "node_seal_private"),
     );
+
+    // Format 3: the entry and its key follow from the events, the seed and the entry before.
+    let vector = &all["log_v3"];
+    assert_eq!(text(vector, "node"), node.node());
+    let mut last = Last::NONE;
+    for entry in vector["entries"].as_array().unwrap() {
+        let events: Vec<Value> = serde_json::from_str(text(entry, "events_text")).unwrap();
+        let kind = EntryKind::parse(text(entry, "kind").chars().next().unwrap()).unwrap();
+        let (created, next, key) = log::append_v3(
+            &node,
+            &last,
+            text(vector, "user_id"),
+            text(vector, "key_id"),
+            &array(vector, "log_pk"),
+            entry["time_ms"].as_u64().unwrap(),
+            kind,
+            &events,
+            &Secret::new(array(entry, "hpke_seed")),
+        )
+        .unwrap();
+        assert_eq!(created, signed(&entry["entry"]));
+        assert_eq!(next.seq, entry["seq"].as_u64().unwrap());
+        assert_eq!(
+            log::object_key_v3(text(vector, "user_id"), &key),
+            text(entry, "key")
+        );
+        last = next;
+    }
 
     // Format 2: the entry and its key follow from the events, the seed and the chain before.
     let vector = &all["log"];
@@ -778,4 +978,223 @@ fn totp_codes() {
             text(case, "code")
         );
     }
+}
+
+#[test]
+fn delegation_subset() {
+    let all = vectors();
+    let vector = &all["subset"];
+    let numbers = |value: &Value| -> Vec<u32> {
+        let numbers = value.as_array().expect("an array of numbers");
+        numbers
+            .iter()
+            .map(|number| u32::try_from(number.as_u64().unwrap()).unwrap())
+            .collect()
+    };
+    let names = |value: &Value| -> Vec<String> {
+        let names = value.as_array().expect("an array of names");
+        names
+            .iter()
+            .map(|name| name.as_str().unwrap().to_string())
+            .collect()
+    };
+    let placement_of = |value: &Value| -> (subset::Placement, Option<Vec<String>>) {
+        let number = |key: &str| u32::try_from(value[key].as_u64().unwrap()).unwrap();
+        let groups = value.get("groups").map(names);
+        let listed: Option<Vec<&str>> = groups
+            .as_ref()
+            .map(|groups| groups.iter().map(String::as_str).collect());
+        let placement = subset::Placement::new(
+            number("pods"),
+            number("copies"),
+            listed.as_deref(),
+            number("skip"),
+        )
+        .expect("the values of a case are a placement");
+        (placement, groups)
+    };
+
+    let cases = vector["cases"].as_array().unwrap();
+    assert_eq!(cases.len(), 16);
+    let mut grouped = 0;
+    for case in cases {
+        let user_id = text(case, "user_id");
+        let (placement, groups) = placement_of(case);
+        assert_eq!(
+            placement.assign(user_id),
+            numbers(&case["assign"]),
+            "{case}"
+        );
+        let pods = placement.pods();
+        match &groups {
+            None => {
+                let ranked = numbers(&case["ranked"]);
+                assert_eq!(placement.ranked(user_id, None), ranked, "{case}");
+                // The nodes of the account are the first `copies` ordinals of that order.
+                let copies = case["copies"].as_u64().unwrap() as usize;
+                let first = &ranked[..copies.min(ranked.len())];
+                assert_eq!(numbers(&case["assign"]), first, "{case}");
+            }
+            Some(groups) => {
+                grouped += 1;
+                let order = names(&case["group_order"]);
+                assert_eq!(placement.group_order(user_id), order, "{case}");
+                let ranked = case["group_ranked"].as_array().unwrap();
+                assert_eq!(ranked.len(), order.len());
+                // The nodes of the account: the ordinal that ranks first in each of its
+                // `copies` groups from the position `skip` on.
+                let skip = case["skip"].as_u64().unwrap() as usize;
+                let copies = case["copies"].as_u64().unwrap() as usize;
+                let mut expected = Vec::new();
+                for (position, (group, ordinals)) in order.iter().zip(ranked).enumerate() {
+                    let ordinals = numbers(ordinals);
+                    assert_eq!(placement.ranked(user_id, Some(group)), ordinals, "{case}");
+                    assert!(ordinals
+                        .iter()
+                        .all(|ordinal| &groups[*ordinal as usize] == group));
+                    if (skip..skip + copies).contains(&position) {
+                        expected.push(ordinals[0]);
+                    }
+                }
+                assert_eq!(numbers(&case["assign"]), expected, "{case}");
+            }
+        }
+        // The share of a node: the answer for every ordinal of the pool.
+        for pod in 0..pods {
+            let holds = numbers(&case["assign"]).contains(&pod);
+            assert_eq!(placement.holds(user_id, pod), holds, "{case} {pod}");
+        }
+    }
+    assert_eq!(grouped, 9);
+
+    // The first six cases are the vectors of the releases before v2.4.0, and a `skip` without
+    // groups changes nothing.
+    let assigned = |index: usize| -> std::collections::BTreeSet<u32> {
+        numbers(&cases[index]["assign"]).into_iter().collect()
+    };
+    let set = |ordinals: &[u32]| ordinals.iter().copied().collect();
+    assert_eq!(assigned(0), set(&[0, 1]));
+    assert_eq!(assigned(1), set(&[2, 6]));
+    assert_eq!(assigned(2), set(&[0, 2, 3]));
+    assert_eq!(assigned(3), set(&[1]));
+    assert_eq!(assigned(4), set(&[0, 4]));
+    assert_eq!(assigned(5), set(&[0, 1]));
+    assert_eq!(cases[6]["skip"], 2);
+    assert_eq!(cases[6]["assign"], cases[2]["assign"]);
+
+    // Two pools with the same groups: three nodes of an account, in three groups.
+    let pools = &vector["pools"];
+    let (calls, calls_groups) = placement_of(&pools["calls"]);
+    let (reserve, reserve_groups) = placement_of(&pools["reserve"]);
+    let (calls_groups, reserve_groups) = (calls_groups.unwrap(), reserve_groups.unwrap());
+    let accounts = pools["accounts"].as_array().unwrap();
+    assert_eq!(accounts.len(), 6);
+    for account in accounts {
+        let user_id = text(account, "user_id");
+        let (of_calls, of_reserve) = (numbers(&account["calls"]), numbers(&account["reserve"]));
+        assert_eq!(calls.assign(user_id), of_calls, "{account}");
+        assert_eq!(reserve.assign(user_id), of_reserve, "{account}");
+        assert_eq!((of_calls.len(), of_reserve.len()), (2, 1));
+        let mut groups: Vec<String> = of_calls
+            .iter()
+            .map(|ordinal| calls_groups[*ordinal as usize].clone())
+            .collect();
+        groups.push(reserve_groups[of_reserve[0] as usize].clone());
+        assert_eq!(groups, names(&account["groups"]), "{account}");
+        let distinct: std::collections::BTreeSet<&String> = groups.iter().collect();
+        assert_eq!(distinct.len(), 3, "{account}");
+    }
+
+    let objects = vector["objects"].as_array().unwrap();
+    assert_eq!(objects.len(), 38);
+    for object in objects {
+        let valid = object["valid"].as_bool().unwrap();
+        assert_eq!(
+            subset::Subset::from_value(&object["subset"]).is_some(),
+            valid,
+            "{object}"
+        );
+    }
+    assert_eq!(
+        objects
+            .iter()
+            .filter(|object| object["valid"] == true)
+            .count(),
+        11
+    );
+
+    // The spans: the number of an account, the accounts a `subset` with a span holds, a fleet
+    // whose spans divide the numbers, and the form of a span.
+    let spans = &vector["spans"];
+    let span_numbers = spans["numbers"].as_array().unwrap();
+    assert_eq!(span_numbers.len(), 6);
+    for account in span_numbers {
+        let user_id = text(account, "user_id");
+        assert_eq!(
+            u64::from(subset::span_number(user_id)),
+            account["number"].as_u64().unwrap(),
+            "{account}"
+        );
+    }
+    assert_eq!(span_numbers[0]["number"], 2_518_581_323u32);
+    let held = spans["contains"].as_array().unwrap();
+    assert_eq!(held.len(), 14);
+    for case in held {
+        let read = subset::Subset::from_value(&case["subset"]).expect("a subset object");
+        let user_id = text(case, "user_id");
+        assert_eq!(
+            read.contains(user_id),
+            case["contains"].as_bool().unwrap(),
+            "{case}"
+        );
+        // An account a subset with a span holds is one its assignment holds.
+        if read.contains(user_id) {
+            assert!(read.placement().holds(user_id, read.pod()), "{case}");
+        }
+    }
+    assert_eq!(
+        held.iter().filter(|case| case["contains"] == true).count(),
+        7
+    );
+    let fleet = &spans["fleet"];
+    let pools = fleet["pools"].as_object().unwrap();
+    assert_eq!(pools.len(), 3);
+    let span_of = |value: &Value| -> subset::Span {
+        let ends = numbers(value);
+        subset::Span::new(ends[0], ends[1]).expect("a span")
+    };
+    // The three spans follow one another from the smallest number to the largest.
+    let mut ordered: Vec<subset::Span> = pools.values().map(span_of).collect();
+    ordered.sort_by_key(subset::Span::first);
+    assert_eq!((ordered[0].first(), ordered[2].last()), (0, u32::MAX));
+    assert_eq!(ordered[0].last() + 1, ordered[1].first());
+    assert_eq!(ordered[1].last() + 1, ordered[2].first());
+    let fleet_accounts = fleet["accounts"].as_array().unwrap();
+    assert_eq!(fleet_accounts.len(), 6);
+    for account in fleet_accounts {
+        let user_id = text(account, "user_id");
+        let holding: Vec<&String> = pools
+            .iter()
+            .filter(|(_, span)| span_of(span).holds(user_id))
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(holding, [text(account, "pool")], "{account}");
+    }
+    let span_objects = spans["objects"].as_array().unwrap();
+    assert_eq!(span_objects.len(), 17);
+    for object in span_objects {
+        let valid = object["valid"].as_bool().unwrap();
+        assert_eq!(
+            subset::Subset::from_value(&object["subset"]).is_some(),
+            valid,
+            "{object}"
+        );
+    }
+    assert_eq!(
+        span_objects
+            .iter()
+            .filter(|object| object["valid"] == true)
+            .count(),
+        5
+    );
 }

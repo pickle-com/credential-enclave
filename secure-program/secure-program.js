@@ -856,7 +856,7 @@
   // file is one of the commit of the tag). A build workflow of another commit is one more element
   // of this list, in a program that is served before a release is built with it.
   const PROOF_BUILDERS = [
-    { workflow: ".github/workflows/enclave-build.yml", commit: "3f84e8368fcdf1f89e42ca629670bfe0989b6f13" },
+    { workflow: ".github/workflows/enclave-build.yml", commit: "e522d06d8388bee590678963f8940cd7a2b69f5c" },
   ];
   // The payload type of the envelope of an attestation and the predicate type of the in-toto
   // statement in it, as the build workflow of this repository writes them.

@@ -49,14 +49,20 @@ pub fn node_id(sign_public: &[u8; 32]) -> String {
 pub fn key_id(sign_pk: &[u8; 32]) -> String {
     let digest = Sha256::digest(sign_pk);
     let mut text = String::with_capacity(16);
-    for byte in &digest[..8] {
-        text.push(char::from_digit(u32::from(byte >> 4), 16).expect("nibble"));
-        text.push(char::from_digit(u32::from(byte & 0x0f), 16).expect("nibble"));
+    for byte in digest.iter().take(8) {
+        for half in [byte >> 4, byte & 0x0f] {
+            text.extend(char::from_digit(u32::from(half), 16));
+        }
     }
     text
 }
 
 /// HKDF-SHA256 with a 32-byte output (RFC 5869). An empty `salt` is the zero-length salt.
+#[expect(
+    clippy::expect_used,
+    reason = "HKDF-SHA256 refuses an output of more than 8,160 bytes and nothing else: the \
+              output here is the 32 bytes of the array, whatever the three arguments are"
+)]
 pub fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &str) -> Zeroizing<[u8; 32]> {
     let mut output = Zeroizing::new([0u8; 32]);
     Hkdf::<Sha256>::new(Some(salt), ikm)
@@ -143,10 +149,88 @@ impl LogStoreId {
         &self.region
     }
 
-    /// The host a node writes to: `{bucket}.s3.{region}.amazonaws.com`.
+    /// The host of the bucket that the binding names: `{bucket}.s3.{region}.amazonaws.com`. The
+    /// entries of format 1 and of format 2 are in that bucket, and a reader lists them there.
     pub fn host(&self) -> String {
         format!("{}.s3.{}.amazonaws.com", self.bucket, self.region)
     }
+
+    /// The host a node of format 3 connects to: the endpoint of Amazon S3 in the region of the
+    /// log store, `s3.{region}.amazonaws.com`. Every bucket of the log store is written over
+    /// connections to this one host, with the bucket as the first part of the path.
+    pub fn regional_host(&self) -> String {
+        format!("s3.{}.amazonaws.com", self.region)
+    }
+
+    /// The number of buckets that hold the entries of format 3 of this log store (protocol.md
+    /// 7.6). It is a constant of the name of the log store: a reader computes the bucket of an
+    /// account from the name its program holds, and a node from the name of its binding.
+    pub fn shards(&self) -> u16 {
+        LOG_STORE_SHARDS
+            .iter()
+            .find(|(bucket, _)| *bucket == self.bucket)
+            .map_or(LOG_STORE_SHARDS_DEFAULT, |(_, shards)| *shards)
+    }
+
+    /// The bucket that holds the objects of format 3 of the owner with the hash `owner`
+    /// ([`shard_hash`] of a `user_id` for the entries of an account, of a node identifier for a
+    /// node document): bucket number `owner mod shards`.
+    ///
+    /// `None` when the name of the log store is too long for the names of its buckets to be
+    /// bucket names (more than [`LOG_STORE_NAME_CHARS`] characters): such a log store has no
+    /// bucket of format 3, and a node does not take it.
+    pub fn shard_of(&self, owner: u16) -> Option<String> {
+        self.shard_bucket(owner % self.shards())
+    }
+
+    /// The name of bucket number `index` of this log store (protocol.md 7.6):
+    /// `{h8}-{bucket}-{index}`, where `index` is written as four decimal digits and `h8` is the
+    /// first 8 characters of the lower-case hexadecimal SHA-256 of `{bucket}-{index}`. The
+    /// hash in front spreads the names of the buckets of one log store over the name space of
+    /// the store. `None` for an index at or above [`LogStoreId::shards`] and for a log store
+    /// whose name is longer than [`LOG_STORE_NAME_CHARS`] characters.
+    pub fn shard_bucket(&self, index: u16) -> Option<String> {
+        if index >= self.shards() || self.bucket.len() > LOG_STORE_NAME_CHARS {
+            return None;
+        }
+        let tail = format!("{}-{index:04}", self.bucket);
+        let digest = Sha256::digest(tail.as_bytes());
+        let mut name = String::with_capacity(9 + tail.len());
+        for byte in digest.iter().take(4) {
+            for half in [byte >> 4, byte & 0x0f] {
+                name.extend(char::from_digit(u32::from(half), 16));
+            }
+        }
+        name.push('-');
+        name.push_str(&tail);
+        Some(name)
+    }
+}
+
+/// The log stores whose number of buckets of format 3 is not the default, by the bucket name of
+/// their binding (protocol.md 7.6). Every number is a power of two.
+const LOG_STORE_SHARDS: [(&str, u16); 2] = [
+    ("character-credential-log-prod-1", 1024),
+    ("character-credential-log-local-1", 4),
+];
+
+/// The number of buckets of format 3 of every other log store.
+const LOG_STORE_SHARDS_DEFAULT: u16 = 32;
+
+/// Longest bucket name of a binding whose buckets of format 3 have bucket names: the 63
+/// characters of a bucket name without the hash, the two `-` and the four digits around it.
+pub const LOG_STORE_NAME_CHARS: usize = 49;
+
+/// The hash that places the objects of an owner in a bucket of a log store (protocol.md 7.6):
+/// the first two bytes of `SHA-256(UTF-8(owner))` as a big-endian unsigned integer. `owner` is
+/// the `user_id` of an account or the identifier of a node.
+pub fn shard_hash(owner: &str) -> u16 {
+    let digest = Sha256::digest(owner.as_bytes());
+    let mut first = [0u8; 2];
+    for (byte, digest_byte) in first.iter_mut().zip(digest.iter()) {
+        *byte = *digest_byte;
+    }
+    u16::from_be_bytes(first)
 }
 
 /// The binding document of protocol.md section 4.1.
@@ -159,20 +243,94 @@ pub struct Binding {
     /// The log store of the node. A node without one writes no `log` key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log: Option<LogStoreId>,
+    /// The role of the node: `reserve` or `forward`. A node of the delegation role writes no
+    /// `role` key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 /// `binding` = `UTF-8(JSON {"v":1,"sign":b64u(node signing public key),
 /// "seal":b64u(node sealing public key),"release":<release>})`, and for a node with a log store
 /// the key `"log":{"bucket":"...","region":"..."}` after them. The platform attestation carries
-/// these bytes as its user data.
+/// these bytes as its user data. This is the binding of a node of the delegation role: it has
+/// no `role` key.
 pub fn binding(keys: &NodeKeys, release: &str, log: Option<&LogStoreId>) -> Vec<u8> {
+    role_binding(keys, release, log, Role::Delegation)
+}
+
+/// The binding of a node of `role`: the keys of [`binding`], and behind them the key `role`
+/// when the role is one a binding names ([`Role::binding_value`]).
+pub fn role_binding(
+    keys: &NodeKeys,
+    release: &str,
+    log: Option<&LogStoreId>,
+    role: Role,
+) -> Vec<u8> {
     to_json(&Binding {
         v: 1,
         sign: b64u(&keys.sign_public()),
         seal: b64u(&keys.seal_public()),
         release: release.to_string(),
         log: log.cloned(),
+        role: role.binding_value().map(str::to_string),
     })
+}
+
+/// The role of a node, as its binding states it (protocol.md 4.1). A node takes its role
+/// once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Role {
+    /// The node holds the delegations of accounts: user keys, and with them every record. It
+    /// connects to the addresses of its provider definitions and to its log store only.
+    Delegation,
+    /// The node holds the delegations of accounts as well, and gives and takes delegation
+    /// transfers: its binding names the role `reserve`. A node that hands a delegation on
+    /// tells such a node from a node of the forward role by that value.
+    Reserve,
+    /// The node holds no delegation and opens no record. It takes one vault value at a time,
+    /// sealed to it by a node of the delegation role together with the one request the value
+    /// is for, and sends that request to the host the request names (protocol.md 10.5).
+    Forward,
+}
+
+impl Role {
+    /// The value of the key `role` of a binding: `reserve` for the reserve role, `forward` for
+    /// the forward role. A node of the delegation role writes no such key.
+    pub const fn binding_value(self) -> Option<&'static str> {
+        match self {
+            Role::Delegation => None,
+            Role::Reserve => Some("reserve"),
+            Role::Forward => Some("forward"),
+        }
+    }
+
+    /// The role a binding states with its key `role`: the delegation role without the key, the
+    /// reserve role with the value `reserve`, the forward role with the value `forward`. Any
+    /// other value names no role this release knows.
+    pub fn of_binding(value: Option<&str>) -> Option<Role> {
+        match value {
+            None => Some(Role::Delegation),
+            Some("reserve") => Some(Role::Reserve),
+            Some("forward") => Some(Role::Forward),
+            Some(_) => None,
+        }
+    }
+
+    /// True for a role under which a node holds delegations: a node hands a delegation to a
+    /// node of such a role, and to no other node (protocol.md 10.1).
+    pub const fn holds_delegations(self) -> bool {
+        match self {
+            Role::Delegation | Role::Reserve => true,
+            Role::Forward => false,
+        }
+    }
+}
+
+/// The binding of a node of the forward role: the keys of [`binding`] and `"role":"forward"`
+/// after the release. A node of the forward role writes no log entry and has no log store, so
+/// its binding has no `log` key.
+pub fn forward_binding(keys: &NodeKeys, release: &str) -> Vec<u8> {
+    role_binding(keys, release, None, Role::Forward)
 }
 
 #[cfg(test)]
@@ -333,6 +491,116 @@ mod tests {
                 LogStoreId::parse(bucket, region).is_none(),
                 "{bucket} {region}"
             );
+        }
+    }
+
+    #[test]
+    fn a_log_store_has_its_buckets_of_format_3() {
+        let store = |bucket: &str| LogStoreId::parse(bucket, "us-west-2").unwrap();
+        let prod = store("character-credential-log-prod-1");
+        assert_eq!(
+            prod.host(),
+            "character-credential-log-prod-1.s3.us-west-2.amazonaws.com"
+        );
+        assert_eq!(prod.regional_host(), "s3.us-west-2.amazonaws.com");
+        // The number of buckets is a constant of the name: a power of two.
+        assert_eq!(prod.shards(), 1024);
+        assert_eq!(store("character-credential-log-local-1").shards(), 4);
+        for other in [
+            "character-credential-log-dev-1",
+            "character-credential-log-alpha-1",
+            "character-credential-log-yolo-3",
+            "character-credential-log-prod-2",
+            "another-bucket",
+        ] {
+            assert_eq!(store(other).shards(), 32, "{other}");
+        }
+        // The name of a bucket: the first 8 hexadecimal characters of the SHA-256 of the name
+        // of the log store and the number, in front of them.
+        let name = prod.shard_bucket(7).unwrap();
+        let tail = "character-credential-log-prod-1-0007";
+        let digest = Sha256::digest(tail.as_bytes());
+        let hash: String = digest[..4]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(name, format!("{hash}-{tail}"));
+        assert_eq!(prod.shard_bucket(1023).unwrap().len(), 8 + 1 + tail.len());
+        assert_eq!(prod.shard_bucket(1024), None);
+        // The names of the buckets of one store start apart, and two stores share no bucket.
+        let starts: std::collections::BTreeSet<String> = (0..1024)
+            .map(|index| prod.shard_bucket(index).unwrap()[..4].to_string())
+            .collect();
+        assert!(starts.len() > 900, "{}", starts.len());
+        let dev = store("character-credential-log-dev-1");
+        assert_ne!(prod.shard_bucket(0), dev.shard_bucket(0));
+
+        // The bucket of an owner: the first two bytes of the SHA-256 of its name, modulo the
+        // number of buckets.
+        let digest = Sha256::digest("user-1".as_bytes());
+        let hash = u16::from_be_bytes([digest[0], digest[1]]);
+        assert_eq!(shard_hash("user-1"), hash);
+        assert_eq!(prod.shard_of(hash), prod.shard_bucket(hash % 1024));
+        assert_eq!(dev.shard_of(hash), dev.shard_bucket(hash % 32));
+        // A log store whose name leaves no room for the hash and the number has no bucket.
+        assert!(store(&"b".repeat(LOG_STORE_NAME_CHARS))
+            .shard_bucket(0)
+            .is_some());
+        assert_eq!(
+            store(&"b".repeat(LOG_STORE_NAME_CHARS + 1)).shard_bucket(0),
+            None
+        );
+        assert_eq!(store(&"b".repeat(63)).shard_of(hash), None);
+    }
+
+    #[test]
+    fn the_binding_of_the_forward_role_names_the_role_and_no_log_store() {
+        let keys = NodeKeys::from_random(&[1u8; 32], &[2u8; 32]);
+        let bytes = forward_binding(&keys, "v1.0.0");
+        assert_eq!(
+            String::from_utf8(bytes.clone()).unwrap(),
+            format!(
+                "{{\"v\":1,\"sign\":\"{}\",\"seal\":\"{}\",\"release\":\"v1.0.0\",\"role\":\"forward\"}}",
+                b64u(&keys.sign_public()),
+                b64u(&keys.seal_public())
+            )
+        );
+        assert!(bytes.len() <= limits::BINDING_BYTES);
+        let read: Binding = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(read.role.as_deref(), Some("forward"));
+        assert_eq!(read.log, None);
+        // The binding of a node of the delegation role has no such key.
+        let delegation: Binding = serde_json::from_slice(&binding(&keys, "v1.0.0", None)).unwrap();
+        assert_eq!(delegation.role, None);
+
+        assert_eq!(Role::Delegation.binding_value(), None);
+        assert_eq!(Role::Reserve.binding_value(), Some("reserve"));
+        assert_eq!(Role::Forward.binding_value(), Some("forward"));
+        assert_eq!(Role::of_binding(None), Some(Role::Delegation));
+        assert_eq!(Role::of_binding(Some("reserve")), Some(Role::Reserve));
+        assert_eq!(Role::of_binding(Some("forward")), Some(Role::Forward));
+        // A binding names the reserve role behind its log store.
+        let log = LogStoreId::parse("log-bucket", "us-west-2").unwrap();
+        let reserve: Binding =
+            serde_json::from_slice(&role_binding(&keys, "v1.0.0", Some(&log), Role::Reserve))
+                .unwrap();
+        assert_eq!(
+            (reserve.role.as_deref(), reserve.log),
+            (Some("reserve"), Some(log))
+        );
+        // The longest names of a log store, the role and the longest release tag a node of
+        // this source can have fit the limit of a binding, which a reader of every release
+        // applies before it reads a key.
+        let longest = LogStoreId::parse(&"b".repeat(63), "ap-southeast-99").unwrap();
+        let tag = "v4294967295.4294967295.4294967295-rc.4294967295";
+        let bytes = role_binding(&keys, tag, Some(&longest), Role::Reserve);
+        assert_eq!(bytes.len(), 253 + tag.len());
+        assert!(bytes.len() <= limits::BINDING_BYTES);
+        // A node hands a delegation to a node that holds delegations, and to no other one.
+        assert!(Role::Delegation.holds_delegations() && Role::Reserve.holds_delegations());
+        assert!(!Role::Forward.holds_delegations());
+        for other in ["", "Forward", "delegation", "forward ", "witness"] {
+            assert_eq!(Role::of_binding(Some(other)), None, "{other:?}");
         }
     }
 }

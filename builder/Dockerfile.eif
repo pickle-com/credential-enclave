@@ -1,16 +1,20 @@
-# The tools of the enclave image file assembly (enclave.md 11.1, row 3): `nitro-cli` and the
+# The tools of the enclave image file assembly (enclave.md 11.1, step 5): `nitro-cli` and the
 # files it puts into every enclave image file (kernel, kernel command line, init, the NSM
 # driver, linuxkit).
 #
-# `build/build.sh` runs this image with the socket of the Docker daemon and calls
+# `builder/enclave-build.sh` runs this image with the socket of the Docker daemon and calls
 #
 #   nitro-cli build-enclave --docker-uri {enclave image} --output-file enclave.eif
+#   nitro-cli describe-eif --eif-path enclave.eif
+#
+# This file belongs to the procedure of the build, not to the commit that is built: the kernel
+# of an enclave and the tool that measures it are those of the commit of the build workflow.
 #
 # The base image is fixed by digest. An Amazon Linux 2023 image reads packages from the
 # repository version it was released with, so the two packages below, fixed by name, version
-# and release, and everything they depend on are the same in every build. `build.sh` records
-# the SHA-256 of the kernel, the command line, init, the NSM driver and linuxkit in
-# `measurements.json`.
+# and release, and everything they depend on are the same in every build.
+# `enclave-build.sh` records the SHA-256 of the kernel, the command line, init, the NSM driver
+# and linuxkit in `measurements.json`.
 FROM amazonlinux:2023@sha256:5b29412077a463b4a3a8fbc99a8cdf4b929f38a3ecc8dac10328d8f36b0099b8
 
 RUN dnf install -y --setopt=install_weak_deps=False \
