@@ -126,16 +126,15 @@ function withoutListedRelease(text, release) {
 
 // ---- The proofs of a published release, against the constants of the program ----
 
-test("the release proofs of release v2.3.0, from public values, show its measurement to a program that lists the releases before it: the node receives the grant", async () => {
+test("the release proofs of release v2.3.0, from public values: a job of the release workflow made the attestation, which the program does not take, and every other check holds with the constants of the program", async () => {
   const fixture = JSON.parse(fs.readFileSync(path.join(__dirname, "fixtures", "release-proofs-v2.3.0.json"), "utf8"));
   const statement = Buffer.from(fixture.statement, "base64url");
   const stated = JSON.parse(statement.toString("utf8"));
   const measurement = { pcr0: stated.pcr0, pcr1: stated.pcr1, pcr2: stated.pcr2 };
   assert.deepEqual(bridge.listedMeasurements(source).filter((item) => item.release === "v2.3.0").map((item) => item.pcr0), [stated.pcr0]);
-  // The program keeps its release key, its log key, its certificates of the certificate
-  // authority and the identity it asks of an attestation. The deploy keys are those of the test
-  // (the deploy keys of the operator sign no release statement here), and the element of
-  // v2.3.0 is taken out of the list.
+  // The program keeps its release key, its log key and its certificates of the certificate
+  // authority. The deploy keys are those of the test (the deploy keys of the operator sign no
+  // release statement here), and the element of v2.3.0 is taken out of the list.
   const deploy = { prod: model.ed25519KeyPair(), dev: model.ed25519KeyPair() };
   const program = model.withDeployKeys(withoutListedRelease(source, "v2.3.0"), deploy);
   const proofs = (keyId, key) => ({
@@ -154,7 +153,28 @@ test("the release proofs of release v2.3.0, from public values, show its measure
     await S.start(fx);
     return fx;
   };
-  const shown = await run(program, "prod", proofs("prod", deploy.prod));
+  // The attestation of the published release is that of a job of the release workflow at the
+  // tag. The program takes the attestation of the job of the build workflow at the commit it
+  // holds, and no other: the proofs are refused at the workflow of the job. Every check before
+  // it held: the statement, the order of releases, the deploy signature, the record of the
+  // signature of the release key in the log, and the certificate under the certificate
+  // authority the program holds, at the time of the log entry.
+  const refused = await run(program, "prod", proofs("prod", deploy.prod));
+  assert.deepEqual(refusals(refused.world), ["p4: identity 9"]);
+  assert.equal(refused.nodes[0].grants.has(refused.world.userId), false);
+  assert.equal(refused.legacy[0].grants.has(refused.world.userId), true);
+  assert.deepEqual(keptProven(refused.world), []);
+  // A program that holds the workflow file and the commit of that certificate in the place of
+  // its own (the release workflow as the workflow of the job and as the workflow that started
+  // the run, and the commit of the tag as the commit of the workflow file): every check holds
+  // with the public values, the checks behind the workflow of the job included (the commit of
+  // the statement, the signature of the envelope, the entry of the log, its signed entry
+  // timestamp, its inclusion proof and its checkpoint, and the predicate).
+  const withSigner = (text) => model.withConstant(model.withConstant(model.withConstant(text,
+    "PROOF_BUILD_WORKFLOW", JSON.stringify(".github/workflows/release.yml")),
+    "PROOF_BUILD_COMMIT", JSON.stringify(stated.git_commit)),
+    "PROOF_RELEASE_WORKFLOW", JSON.stringify(".github/workflows/release.yml"));
+  const shown = await run(withSigner(program), "prod", proofs("prod", deploy.prod));
   assert.deepEqual(refusals(shown.world), []);
   assert.equal(shown.nodes[0].grants.has(shown.world.userId), true);
   assert.equal(shown.legacy[0].grants.has(shown.world.userId), true);
@@ -162,9 +182,9 @@ test("the release proofs of release v2.3.0, from public values, show its measure
   assert.deepEqual(attestationRequests(shown.world).map((request) => [request.nodes.length, request.proofs]), [[2, undefined], [1, "1"]]);
   assert.deepEqual(keptProven(shown.world), [{ release: "v2.3.0", proofs: true }]);
   // The same proofs for a build of the server target dev: the deploy key dev signs.
-  const dev = await run(program, "dev", proofs("dev", deploy.dev));
+  const dev = await run(withSigner(program), "dev", proofs("dev", deploy.dev));
   assert.equal(dev.nodes[0].grants.has(dev.world.userId), true);
-  const unsigned = await run(program, "dev", proofs("prod", deploy.prod));
+  const unsigned = await run(withSigner(program), "dev", proofs("prod", deploy.prod));
   assert.deepEqual(refusals(unsigned.world), ["p3: signature"]);
   assert.equal(unsigned.nodes[0].grants.has(unsigned.world.userId), false);
   // Under the deploy keys of the program the signature of the test key is none.
@@ -178,7 +198,7 @@ test("the release proofs of release v2.3.0, from public values, show its measure
   assert.deepEqual(attestationRequests(listed.world).map((request) => request.proofs), [undefined]);
   assert.deepEqual(keptProven(listed.world), []);
   // Another measurement than the one the statement names.
-  const other = await run(program, "prod", proofs("prod", deploy.prod));
+  const other = await run(withSigner(program), "prod", proofs("prod", deploy.prod));
   const stranger = other.world.addNode({ release: "v2.3.0", measurement: bridge.randomMeasurement() });
   other.world.advance(2 * HOUR_MS);
   await S.event(other, "foreground");
@@ -269,12 +289,13 @@ test("release proofs that hold hand the node its grant, and proofs that differ f
     null, "shape", "p1: statement", "p1: release tag", "p1: measurement", "p5: release order", "p3: shape", "p3: signature",
     "p2: entry", "p2: log", "p2: promise", "p2: signed entry timestamp", "p2: body", "p2: statement hash", "p2: release key",
     "p2: release signature", "p4: shape", "p4: size", "p4: payload", "p4: certificate", "p4: certificate validity",
-    "p4: certificate authority", "p4: certificate issuer", "p4: certificate root", "p4: identity 8", "p4: identity 9",
-    "p4: identity 11", "p4: identity 12", "p4: identity 14", "p4: identity 15", "p4: identity 17", "p4: identity 18",
+    "p4: statement commit", "p4: certificate authority", "p4: certificate issuer", "p4: certificate root", "p4: identity 8",
+    "p4: identity 9", "p4: identity 10", "p4: identity 11", "p4: identity 12", "p4: identity 13", "p4: identity 14",
+    "p4: identity 15", "p4: identity 17", "p4: identity 18",
     "p4: identity 20", "p4: identity 22", "p4: signature", "p4: log", "p4: log entry kind", "p4: log entry payload",
     "p4: log entry signature", "p4: log entry certificate", "p4: signed entry timestamp", "p4: inclusion proof",
     "p4: checkpoint", "p4: predicate type", "p4: predicate release", "p4: predicate pcr0", "p4: predicate pcr1", "p4: predicate pcr2",
-    "p4: predicate program_min",
+    "p4: predicate program_min", "p4: predicate git_commit",
   ]) {
     assert.ok(seen.get(reason) >= 1, "cases of " + reason);
   }
@@ -310,6 +331,8 @@ test("the program reads a release statement and the entry of its record as a nod
     try {
       const read = JSON.parse(statement.toString("utf8"));
       attested = { release: read.release, pcr0: read.pcr0, pcr1: read.pcr1, pcr2: read.pcr2 };
+      // The certificate and the predicate of the attestation state the commit of the statement.
+      if (typeof read.git_commit === "string") attested.git_commit = read.git_commit;
     } catch (error) {
       // A statement that is no JSON is refused before its attestation is read.
     }
@@ -1288,7 +1311,7 @@ test("the grant step that asks a node the device knows for the release proofs of
 
 // ---- The file prove.js ----
 
-test("prove.js states what the program makes of release proofs and of the attestation response of a node: the measurement of the document beside that of the statement, the binding, and whether the node receives a grant", () => {
+test("prove.js states what the program makes of release proofs, of the attestation response of a node (the measurement of the document beside that of the statement, the binding, and whether the node receives a grant) and of the attestations of a release statement (each value of the certificate beside the one the program requires)", () => {
   const { spawnSync } = require("node:child_process");
   const os = require("node:os");
   const folder = fs.mkdtempSync(path.join(os.tmpdir(), "prove-"));
@@ -1372,6 +1395,46 @@ test("prove.js states what the program makes of release proofs and of the attest
     assert.equal(unread.status, 1, unread.out);
     assert.ok(unread.out.indexOf("refused: p1: statement") >= 0, unread.out);
     assert.ok(unread.out.indexOf("the program hands this node no grant") >= 0, unread.out);
+
+    // The attestations of a release statement. A release holds the attestation a job of the
+    // release workflow made beside the one of the job of the build workflow: the file reports
+    // what the fourth check makes of each, value by value of the certificate, and the program
+    // takes the one of the job of the build workflow at the commit it holds.
+    const stated = Object.assign({ release: "v2.5.0", git_commit: model.COMMIT }, measurement);
+    const published = model.attestationOf(parties, stated, {
+      identity: { 9: model.REPOSITORY + "/" + model.PINS.caller + "@refs/tags/v2.5.0", 10: model.COMMIT },
+    });
+    const built = JSON.parse(fs.readFileSync(proofs, "utf8")).attestation;
+    const both = write("attestations.json", { attestations: [{ bundle: published }, { bundle: built }] });
+    const statementFile = path.join(folder, "measurements.json");
+    fs.writeFileSync(statementFile, model.statementOf("v2.5.0", measurement));
+    const call = (args) => {
+      const ended = spawnSync(process.execPath, [path.join(__dirname, "prove.js")].concat(args, ["--program", program]), { encoding: "utf8" });
+      return { status: ended.status, out: ended.stdout + ended.stderr };
+    };
+    const report = call(["--statement", statementFile, "--attestation", both]);
+    assert.equal(report.status, 0, report.out);
+    assert.ok(/bundle 1:\n(  [^\n]*\n)*  extension  9 \(Build Signer URI\): [^\n]*: NOT the value required[^\n]*\n(  [^\n]*\n)*  P4: fails\n/.test(report.out), report.out);
+    assert.ok(/bundle 2:\n(  extension [^\n]*: (holds[^\n]*|not judged)\n)+  the other checks of the bundle [^\n]*: hold\n  predicate: [^\n]*\n  P4: holds\n/.test(report.out), report.out);
+    assert.ok(report.out.indexOf("extension 10 (Build Signer Digest): " + JSON.stringify(model.PINS.commit) + ": holds") >= 0, report.out);
+    assert.ok(report.out.indexOf("extension 13 (Source Repository Digest): " + JSON.stringify(model.COMMIT) + ": holds") >= 0, report.out);
+    // The attestation of the job of the release workflow alone: P4 holds for no bundle.
+    const one = call(["--statement", statementFile, "--attestation", write("published.json", published)]);
+    assert.equal(one.status, 1, one.out);
+    assert.ok(one.out.indexOf("no bundle of the job of the build workflow at the commit the program holds") >= 0, one.out);
+    // Proofs that carry that attestation are refused, and with the file of both the program
+    // takes the other one.
+    const carried = write("carried.json", Object.assign(JSON.parse(fs.readFileSync(proofs, "utf8")), { attestation: published }));
+    const without = call([carried]);
+    assert.equal(without.status, 1, without.out);
+    assert.ok(without.out.indexOf("refused: p4: identity 9") >= 0, without.out);
+    const chosen = call([carried, "--attestation", both]);
+    assert.equal(chosen.status, 0, chosen.out);
+    assert.ok(chosen.out.indexOf("the proofs show release v2.5.0 (program_min 0)") >= 0, chosen.out);
+    // Bundles one a line are read as well.
+    const lines = path.join(folder, "bundles.jsonl");
+    fs.writeFileSync(lines, JSON.stringify(published) + "\n" + JSON.stringify(built) + "\n");
+    assert.equal(call(["--statement", statementFile, "--attestation", lines]).status, 0);
   } finally {
     fs.rmSync(folder, { recursive: true, force: true });
   }

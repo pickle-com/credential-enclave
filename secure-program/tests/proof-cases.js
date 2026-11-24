@@ -298,17 +298,31 @@ function proofCases(release, listed, version) {
   add("a root and an intermediate that ended before the time of the log entry", "p4: certificate validity",
     model.proofsOf(expired, release, measurement), { constants: expired });
   const identity = model.identityOf(release);
+  const pins = model.PINS;
+  const build = model.REPOSITORY + "/" + pins.workflow;
+  const caller = model.REPOSITORY + "/" + pins.caller;
+  /** A commit that differs from commit in its first character. */
+  const otherCommit = (commit) => (commit[0] === "0" ? "1" : "0") + commit.slice(1);
   const others = {
     8: ["https://gitlab.com"],
-    9: [model.REPOSITORY + "/.github/workflows/other.yml@refs/tags/" + release,
-      model.REPOSITORY + "/.github/workflows/release.yml@refs/heads/main",
-      "https://github.com/someone/credential-enclave/.github/workflows/release.yml@refs/tags/" + release],
+    // The workflow of the job that signed: another workflow file of the repository at the
+    // commit the program holds, the build workflow of a repository of another owner, the
+    // release workflow itself at the tag (a job that no workflow called), the build workflow
+    // without a ref and with an empty one, and a file whose name begins with its name.
+    9: [model.REPOSITORY + "/.github/workflows/other.yml@" + pins.commit,
+      "https://github.com/someone/credential-enclave/" + pins.workflow + "@" + pins.commit,
+      caller + "@refs/tags/" + release, build, build + "@", build + "@other.yml@" + pins.commit],
+    10: [otherCommit(pins.commit), pins.commit.slice(1)],
     11: ["self-hosted"],
     12: ["https://github.com/someone/credential-enclave", model.REPOSITORY + "/"],
+    13: [otherCommit(model.COMMIT), model.COMMIT.slice(1)],
     14: ["refs/heads/main", "refs/tags/" + release + "-rc.1", "refs/heads/tags/" + release],
     15: ["1400118249"],
     17: ["151645825"],
-    18: [model.REPOSITORY + "/.github/workflows/caller.yml@refs/tags/" + release],
+    // The workflow that started the run: another workflow file at the tag, the release
+    // workflow at a branch and at a commit, and that of a repository of another owner.
+    18: [model.REPOSITORY + "/.github/workflows/caller.yml@refs/tags/" + release, caller + "@refs/heads/main",
+      caller + "@" + pins.commit, "https://github.com/someone/credential-enclave/" + pins.caller + "@refs/tags/" + release],
     20: ["workflow_dispatch", "release"],
     22: ["private", "internal"],
   };
@@ -324,8 +338,44 @@ function proofCases(release, listed, version) {
     identity: { 11: null },
     certificate: { extensions: [der.sequence(der.oid("1.3.6.1.4.1.57264.1.11"), der.octets(Buffer.from("github-hosted")))] },
   }), { identity: 11 });
-  add("the attestation of another release", "p4: identity 9",
+  // What follows the last "@" of the extension 9 names the ref the caller wrote: it is not
+  // judged, and the commit of the workflow file is (the extension 10).
+  add("the build workflow named by a branch whose head is the commit the program holds", null,
+    attested({ identity: { 9: build + "@refs/heads/main" } }));
+  add("the build workflow named by a tag at the commit the program holds", null,
+    attested({ identity: { 9: build + "@refs/tags/" + release } }));
+  add("the build workflow called at another commit", "p4: identity 10",
+    attested({ identity: { 9: build + "@" + otherCommit(pins.commit), 10: otherCommit(pins.commit) } }), { identity: 10 });
+  add("the build workflow called by a branch whose head is another commit", "p4: identity 10",
+    attested({ identity: { 9: build + "@refs/heads/main", 10: otherCommit(pins.commit) } }), { identity: 10 });
+  add("the attestation of a job of the release workflow itself, which no workflow called", "p4: identity 9",
+    attested({ identity: { 9: caller + "@refs/tags/" + release, 10: model.COMMIT } }), { identity: 9 });
+  add("the attestation of a run in another repository, whose workflow called the build workflow", "p4: identity 12", attested({
+    identity: {
+      12: "https://github.com/another-owner/another-repository", 15: "999999991", 16: "https://github.com/another-owner",
+      17: "999999992", 18: "https://github.com/another-owner/another-repository/.github/workflows/release.yml@refs/tags/" + release,
+      21: "https://github.com/another-owner/another-repository/actions/runs/1/attempts/1",
+    },
+  }), { identity: 12 });
+  add("the attestation of another release", "p4: identity 14",
     proofsOf({ attested: Object.assign({ release: release.replace(/\d+$/, "9") }, measurement) }));
+
+  // ---- P4: the commit the statement names ----
+  const plain = JSON.parse(statementOf().toString());
+  delete plain.git_commit;
+  add("a statement without git_commit", "p4: statement commit", ofStatement(Buffer.from(JSON.stringify(plain, null, 2) + "\n", "utf8")));
+  add("a statement that states git_commit twice", "p4: statement commit", ofStatement(Buffer.from(
+    statementOf().toString().replace("{", "{\n  \"git_commit\": " + JSON.stringify(model.COMMIT) + ","), "utf8")));
+  for (const [name, value] of [
+    ["in upper case", model.COMMIT.toUpperCase()], ["of 39 characters", model.COMMIT.slice(1)], ["a number", 7], ["null", null],
+    ["the name of a branch", "main"],
+  ]) {
+    add("a statement whose git_commit is " + name, "p4: statement commit", ofStatement(statementOf({ git_commit: value })));
+  }
+  add("a predicate of another git_commit than the statement", "p4: predicate git_commit",
+    attested({ predicate: Object.assign({ release: release }, measurement, { git_commit: otherCommit(model.COMMIT) }) }));
+  add("a predicate without the git_commit of the statement", "p4: predicate git_commit",
+    attested({ predicate: Object.assign({ release: release }, measurement) }));
   add("an envelope another key signed", "p4: signature", attested({ signer: model.ecKeyPair("prime256v1") }));
   add("a certificate with a key on P-384", "p4: signature", attested({ curve: "secp384r1" }));
   add("a log entry of a log the program does not know", "p4: log", attested({ log: otherLog }));

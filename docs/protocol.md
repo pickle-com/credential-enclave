@@ -267,8 +267,9 @@ than the program (4.5: the list is a constant of the signed program). The app ap
 such a document as well (a node of this deployment writes to the log store of the environment).
 When release proofs show the measurement of the document to the program ("The release proofs" in
 "The program of the app": the release key signed the measurements of the release and the public
-log recorded that, a deploy key signed them, GitHub attested them for the release workflow at the
-tag of the release in this repository, and the release is later than the listed ones), the
+log recorded that, a deploy key signed them, GitHub attested them for the job of the build workflow
+of this repository, at the commit of that workflow file the program holds, in a run of the tag of
+the release, and the release is later than the listed ones), the
 release is an accepted one for that program, as an element of its list is, unless its release
 statement states a program later than that one. Without such proofs
 the app hands the node no key, as for any measurement outside the list, and does not count the
@@ -975,10 +976,11 @@ response that is the empty string counts as absent (the old value stays).
      SHA-256).
   2. Verify the certificate chain up to the pinned Fulcio root (the time of the verification is
      the time of the Rekor entry).
-  3. Check in the extensions of the certificate: the issuer
+  3. Check in the extensions of the certificate the identity of the run: the issuer
      `https://token.actions.githubusercontent.com`, the repository `pickle-com/credential-enclave`,
-     the workflow `.github/workflows/release.yml`, and a ref that is a tag starting with
-     `refs/tags/v`.
+     the workflow of the job that signed, and a ref that is a tag starting with `refs/tags/v`.
+     The app requires the values of "The release proofs" in "The program of the app": the job of
+     the build workflow at the commit of that workflow file the program holds.
   4. Verify the proof of the Rekor entry (the signed entry time, or the inclusion proof and the
      checkpoint signature) with the pinned Rekor public key.
   5. Read the `predicateType` of the statement and the measurements of its `predicate`.
@@ -1337,6 +1339,7 @@ Test vectors of the assignment; the backend of the operator computes the same fu
 | `WAIT_LATE_MS` (the app) | 5,000: a wait that ends later than its own limit by more than this ended in a runtime that did not run for a part of it (the app was suspended), and a read of the log that fails that way failed with the device |
 | `LOG_RELEASE_GRACE_MS`, `SERVED_FRESH_MS` (the app) | 24 hours: the time a measurement no list of the program has may hold the key of the account before it marks the log (A1). 1 hour: the age up to which a reading of the served version, or in a build that knows it itself the last check of the app for a new program, says that no later program is served |
 | `LOG_DOUBT_ROUNDS` (the app) | 2: the rounds whose answers carried no signature that verifies for a key before the signatures of its node contradict each other (A2) |
+| `PROOF_BUILD_WORKFLOW`, `PROOF_BUILD_COMMIT`, `PROOF_RELEASE_WORKFLOW` (the app) | The path of the workflow file whose job builds a release and attests its release statement, the commit of that file, and the path of the workflow file that the push of a release tag starts and that calls it: the job the program takes an attestation of, and the workflow that started its run ("The release proofs", P4). A commit of forty zeros is the commit of no file: a program that holds it takes no release proofs |
 | `PROOF_STATEMENT_BYTES`, `PROOF_ATTESTATION_BYTES`, `PROOF_PATH_HASHES`, `PROOF_DEPLOY_SIGNATURES`, `PROOF_JSON_DEPTH` (the app) | 16,384, 65,536, 64, 8 and 32: the bytes of a release statement, the bytes of the attestation of release proofs as JSON without white space, the hashes of its audit path, the elements of `deploy_signatures`, and the arrays and objects inside one another of a JSON value of release proofs ("The release proofs") |
 | `PROOF_REQUEST_NODES`, `PROOF_RETRY_MS`, `PROOF_REQUEST_MEASURES`, `PROOF_ROUND_REQUESTS`, `PROOF_SEEK_RETRY_MS` (the app) | 4 and 1 hour: the nodes one grant step asks for the release proofs of their release, one of each measurement, and the time after which a node of a measurement is asked again. 8, 4 and 5 minutes: the measurements one request to the backend for release proofs names, such requests per round, and the time after which a round asks for a measurement again |
 | `PROOF_FAILURES`, `PROOF_FAILURE_SPAN_MS`, `PROOF_REFUSED_KEPT` (the app) | 8 and 1 hour: a runtime verifies no further release proofs that a node or a node document presents while this many proofs failed within this time. 8: the measurements for which a runtime remembers the proofs it refused last, which it does not verify again |
@@ -1601,8 +1604,10 @@ release_proofs = {"statement": b64u(the bytes of the release statement),
 `statement` and `entry` are the endorsement of 10.3 for a log of the form Rekor v1: the release
 statement is the bytes of the file `measurements.json` of the release, and the entry is what the
 log returned for the record of the signature of the release key over those bytes. `attestation` is
-the bundle the release workflow of this repository attaches to the GitHub release of the tag as
-`release-statement.sigstore.json` (enclave.md 11.2). The program does not read other members.
+the Sigstore bundle of the attestation that the job of the build workflow of this repository made
+of the release statement (enclave.md 11.2). A release may hold other attestations of the same
+statement, made by a job of another workflow: the program takes none of them (P4). The program
+does not read other members.
 
 Every check must hold, for a measurement M (PCR0, PCR1 and PCR2 of a document that verified by
 4.3, or of a measurement that an entry of an accepted node names):
@@ -1612,7 +1617,7 @@ Every check must hold, for a measurement M (PCR0, PCR1 and PCR2 of a document th
 | P1 | The statement is at most 16,384 bytes long and a JSON object that states `release`, `pcr0`, `pcr1` and `pcr2` once each: `release` a release tag (10.3), each PCR 96 lower-case hexadecimal characters that are not all zero (a PCR that is all zero is the value of an enclave in debug mode, whatever it runs). The three PCRs equal those of M. The statement may state `program_min`, once: a non-negative integer below 2^53, written as decimal digits without a leading zero (a lone `0` is one) and with neither a fraction nor an exponent. Other members of the statement are not read |
 | P2 | The release key signed the statement and a transparency log of the program recorded that signature: checks 2, 3 and 4 of 10.3 for a log of the form Rekor v1, with the release key and the log key the program holds. The time of the entry is compared with no clock (check 5 of 10.3 asks the clock of a node, and the notice period is 0 seconds) |
 | P3 | `deploy_signatures` has at most 8 elements, each with the texts `key_id` and `signature`. Exactly one element names the key id of the server target of the build (`prod` for the server target `prod`, `dev` for every other), and its signature is the Ed25519 signature of that deploy key over the UTF-8 bytes of `pickle-enclave-release-statement-v1`, a line feed, the lower-case hexadecimal SHA-256 of the statement and a line feed. The deploy keys are the keys with which the apps verify the deploy signature of a served program, by the same rule of the key id. The deploy signature of a program covers `pickle-secure-program-v1`, a line feed and the program, so neither signature is one of the other kind |
-| P4 | GitHub attested the statement: the attestation verifies by the rules below, under the identity of the release workflow at the tag `release` of the statement, and its in-toto statement has the predicate type `https://pickle.com/credential-enclave/release/v1` and a predicate whose `release`, `pcr0`, `pcr1`, `pcr2` and `program_min` equal those of the statement (a predicate states no `program_min` where the statement states none) |
+| P4 | GitHub attested the statement. The statement states `git_commit` once, 40 lower-case hexadecimal characters: the commit the release was built from. The attestation verifies by the rules below, under the identity of the job of the build workflow at the commit of that workflow file the program holds, in a run that the push of the tag `release` of the statement started at the commit `git_commit` of the statement. Its in-toto statement has the predicate type `https://pickle.com/credential-enclave/release/v1` and a predicate whose `release`, `pcr0`, `pcr1`, `pcr2`, `program_min` and `git_commit` equal those of the statement (a predicate states no `program_min` where the statement states none) |
 | P5 | The release of the statement is later than every release of the list of accepted releases of the program, in the order of releases (10.3) |
 
 The attestation (P4) is a Sigstore bundle: the certificate Fulcio issued to the workflow run
@@ -1637,18 +1642,25 @@ The attestation (P4) is a Sigstore bundle: the certificate Fulcio issued to the 
    network is asked.
 4. The identity. The certificate states each of these values in its extension
    `1.3.6.1.4.1.57264.1.{number}`, whose value is the DER of one UTF8String. A certificate without
-   one of them, or with another value, is refused. `{tag}` is the release of the statement.
+   one of them, or with another value, is refused. `{tag}` is the release of the statement and
+   `{commit}` its `git_commit`. The build workflow, its commit and the release workflow are three
+   constants of the program (`PROOF_BUILD_WORKFLOW`, `PROOF_BUILD_COMMIT`,
+   `PROOF_RELEASE_WORKFLOW`): the path of the workflow file whose job builds a release and
+   attests its statement, the commit of that file, and the path of the workflow file that the
+   push of a release tag starts and that calls it (enclave.md 11.2).
 
    | Number | What it states | Value |
    | --- | --- | --- |
    | 8 | The issuer of the token the certificate was issued for | `https://token.actions.githubusercontent.com` |
-   | 9 | The workflow that signed | `https://github.com/pickle-com/credential-enclave/.github/workflows/release.yml@refs/tags/{tag}` |
+   | 9 | The workflow of the job that signed | `https://github.com/pickle-com/credential-enclave/{build workflow}@{ref}`: the text before the last `@` is the address of the repository, `/` and the path of the build workflow. The ref behind it is what the calling workflow wrote; it is not empty and is not judged |
+   | 10 | The commit of the file of that workflow | The commit of the build workflow the program holds |
    | 11 | The runner | `github-hosted` |
-   | 12 | The repository | `https://github.com/pickle-com/credential-enclave` |
+   | 12 | The repository the run took place in | `https://github.com/pickle-com/credential-enclave` |
+   | 13 | The commit that started the run | `{commit}` |
    | 14 | The ref of the run | `refs/tags/{tag}` |
-   | 15 | The identifier of the repository | `1400118248` |
-   | 17 | The identifier of the owner of the repository | `151645824` |
-   | 18 | The workflow that started the run | The value of 9 |
+   | 15 | The identifier of that repository | `1400118248` |
+   | 17 | The identifier of the owner of that repository | `151645824` |
+   | 18 | The workflow that started the run | `https://github.com/pickle-com/credential-enclave/{release workflow}@refs/tags/{tag}` |
    | 20 | What started the run | `push` |
    | 22 | The visibility of the repository when the certificate was issued | `public` |
 
@@ -1673,15 +1685,23 @@ certificate is on the log the program verifies, whose entry holds the certificat
 the indexes of an attestation are non-negative integers, or decimal digits in a text without a
 leading zero, below 2^53.
 
-The identity of step 4 is what ties an attestation to this repository. 9 and 18 together say that
-the release workflow at the tag signed and that it was started as itself: a workflow another
-workflow calls shares the run of its caller, and runs with what the caller hands it. 11 says that a
-runner GitHub hosts ran the job: a runner the owner of a repository registers signs whatever its
-owner hands it, under the same workflow and the same tag. 15 and 17 name the repository and its
-owner by identifiers that do not change and are not given to another repository: the address of 12
-alone would also be that of a repository made later under the same name. 20 says that the push of
-the tag started the run: a run started another way takes inputs that are not public. 14 and 22
-say that the run was of the tag, in a repository that was public then.
+The identity of step 4 is what ties an attestation to this repository and to one workflow file.
+9 and 10 say that the job of the build workflow signed, as the file of that workflow is at the
+commit the program holds. What that job does is what that file states, so the commit of a tag
+decides nothing of it: an attestation a job of a workflow file of the tag made (the release
+workflow itself, or any other file) states that file in 9 and is refused, and so is the build
+workflow at any other commit (10). The text behind the last `@` of 9 names the ref the calling
+workflow wrote for the build workflow. The program does not judge it: 10 states the commit that
+ref led to, and the file of a commit is the same file whatever names the commit. 13 says that the
+run was started at the commit the statement names, 14 that it was the run of the tag of the
+release, and 18 that the release workflow of this repository at that tag started it. 11 says that
+a runner GitHub hosts ran the job: a runner the owner of a repository registers signs whatever
+its owner hands it, under the same workflow and the same tag. 12, 15 and 17 name the repository
+the run took place in, by its address and by identifiers that do not change and are not given to
+another repository: a workflow of another repository may call the build workflow, and the
+certificate of that run states that repository. 20 says that the push of the tag started the run:
+a run started another way takes inputs that are not public. 22 says that the repository was public
+then.
 
 The formats are read in one form. Base64 is the standard alphabet with its padding, or the
 URL-safe alphabet without padding where a value is b64u, and a text whose last character carries
@@ -1805,23 +1825,36 @@ measurements a runtime asks for the proofs once.
 What the proofs show, and what they do not. A release whose proofs pass has: the signature of the
 release key over its measurements in the public log, where the monitor of this repository reads
 every entry of that key (enclave.md 11.2); a signature of a deploy key of the operator; and an
-attestation that a job of the file `.github/workflows/release.yml`, as that file is at the tag in
-the repository with the identifier above, ran on a runner GitHub hosts, started by the push of the
-tag, while the repository was public, and attested these measurements. The entry of that
-attestation is in the public log with its certificate, which names the commit of the tag and the
-run. The proofs do not show what that file and the files of that commit do. A tag whose workflow
-or build attests measurements of other code is a public commit that anyone can read and build
-again, and whose measurements then differ from the attested ones; a tag that is moved or deleted
-afterwards leaves the two entries of the log, which name a commit that is not the one of the tag.
-A workflow that reads values that are not public (a cache, a secret or a variable of the
-repository, an action or an image it names by a tag, a runner image of the owner) shows that
-reference in its file. The proofs rest on GitHub (the token of the run and its claims), on Fulcio
-and on the log of Sigstore, as the release proof of the program does.
+attestation that the job of the build workflow, as the file of that workflow is at the commit the
+program holds, ran on a runner GitHub hosts, in a run the push of the tag started at the commit
+the statement names, in the repository with the identifier above while it was public, and attested
+these measurements. The entry of that attestation is in the public log with its certificate, which
+names that commit and the run.
+
+The program fixes the file of the build workflow by its commit, so the proofs show what that file
+makes its job do (enclave.md 11.2 states its rules): the job compares the files of the build
+method of the commit of the tag with the values its own file holds and stops when one differs, it
+builds the enclave image file from that commit by that method with no network while it compiles,
+it compares the `release` and the `git_commit` of `measurements.json` with the tag and the commit
+of the run, and it attests that statement itself. The measurements are then those of the build of
+the commit the statement names, by a method the commit of the tag did not choose and that took
+nothing from outside while it compiled. A tag whose commit holds another workflow, or another
+build method, gets no attestation the program takes.
+
+The proofs do not show what the source of that commit does: the commit is public, and what its
+code does is for the one who reads it. They do not show that the tag still names that commit, or
+that the commit is still in the repository: the operator can remove a tag and a commit
+afterwards, and what stays is the hash of the commit in the certificate and in the entries of the
+public log. What the build workflow reads at its fixed commit beyond the commit of the tag (the
+actions and the images its file names, the image of the runner) is named in that file. The proofs
+rest on GitHub (the token of the run and its claims, and that a called workflow is the file of the
+commit the token names), on Fulcio and on the log of Sigstore, as the release proof of the program
+does.
 
 When a constant of the program no longer fits (the log key or the certificates of Sigstore
-change, the repository moves), the proofs of a release made after that fail on a device that runs
-this program, and its nodes are nodes of a later release to it: the release reaches that device
-with a program that lists it.
+change, the repository moves, the build workflow is another file or another commit), the proofs
+of a release made after that fail on a device that runs this program, and its nodes are nodes of
+a later release to it: the release reaches that device with a program that lists it.
 
 ### What the device keeps
 

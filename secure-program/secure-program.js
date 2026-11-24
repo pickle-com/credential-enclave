@@ -713,9 +713,10 @@
   // when release proofs pass every check of proveRelease for it: a release statement names the
   // measurement, the release key of the operator signed the statement and a public transparency
   // log recorded that signature, the deploy key of this server target signed the statement,
-  // GitHub attested the statement for a run of the release workflow of the public repository at
-  // the tag of the release, and the release is later than every release of ACCEPTED_RELEASES.
-  // The values below are what those checks are made with.
+  // GitHub attested the statement for the job of the build workflow of the public repository, at
+  // the commit of that workflow file this program holds, in a run the push of the tag of the
+  // release started at the commit the statement names, and the release is later than every
+  // release of ACCEPTED_RELEASES. The values below are what those checks are made with.
   //
   // The release key of the operator: ECDSA P-256, the DER of its SubjectPublicKeyInfo. It is
   // enclave/release/release-key.pem of this repository, the key whose signature a node asks for
@@ -777,9 +778,20 @@
   const PROOF_REPOSITORY = "https://github.com/pickle-com/credential-enclave";
   const PROOF_REPOSITORY_ID = "1400118248";
   const PROOF_OWNER_ID = "151645824";
-  const PROOF_WORKFLOW = ".github/workflows/release.yml";
+  // The workflow whose job builds the enclave image file of a release and attests its release
+  // statement (PROOF_BUILD_WORKFLOW), the commit of that workflow file (PROOF_BUILD_COMMIT), and
+  // the workflow that the push of the tag of a release starts and that calls it
+  // (PROOF_RELEASE_WORKFLOW). The job of PROOF_BUILD_WORKFLOW at PROOF_BUILD_COMMIT is the one
+  // signer of an attestation this program takes: what that job does is what the file of that
+  // commit states, whatever the commit of the tag holds. An attestation that a job of another
+  // workflow file made, or the job of that file at another commit, shows no measurement. (Forty
+  // zeros are the commit of no workflow file: a program that holds them takes no release
+  // proofs.)
+  const PROOF_BUILD_WORKFLOW = ".github/workflows/enclave-release-build.yml";
+  const PROOF_BUILD_COMMIT = "0000000000000000000000000000000000000000";
+  const PROOF_RELEASE_WORKFLOW = ".github/workflows/enclave-release.yml";
   // The payload type of the envelope of an attestation and the predicate type of the in-toto
-  // statement in it, as the release workflow of this repository writes them.
+  // statement in it, as the build workflow of this repository writes them.
   const PROOF_PAYLOAD_TYPE = "application/vnd.in-toto+json";
   const PROOF_PREDICATE_TYPE = "https://pickle.com/credential-enclave/release/v1";
   // The limits of release proofs: the bytes of a release statement, the bytes of an attestation
@@ -1953,9 +1965,12 @@
    *  lower-case hexadecimal characters that are not all zero. The statement may state
    *  program_min, once: the lowest version of the program that reads what the nodes of the
    *  release write, written as decimal digits without a leading zero (a lone 0 is one) and a
-   *  number the program holds exactly. The other members are not read. Returns {release, pcr0,
-   *  pcr1, pcr2, program_min} (program_min undefined for a statement that states none), or
-   *  null. */
+   *  number the program holds exactly. git_commit is the commit the release was built from: it
+   *  is read when the statement states it once as 40 lower-case hexadecimal characters, and is
+   *  no ground to refuse the statement here (P4 requires it; a node reads a statement without
+   *  it). The other members are not read. Returns {release, pcr0, pcr1, pcr2, program_min,
+   *  git_commit} (program_min undefined for a statement that states none, git_commit null for
+   *  a statement that does not state it so), or null. */
   function readReleaseStatement(bytes) {
     if (bytes.length > PROOF_STATEMENT_BYTES) return null;
     const value = parseJson(bytes);
@@ -1982,6 +1997,8 @@
       if (times("program_min") !== 1 || stands === null || !/^(0|[1-9][0-9]{0,15})$/.test(written.program_min)) return null;
       read.program_min = stands;
     }
+    const commit = member(value, "git_commit");
+    read.git_commit = times("git_commit") === 1 && typeof commit === "string" && /^[0-9a-f]{40}$/.test(commit) ? commit : null;
     return read;
   }
 
@@ -2062,21 +2079,43 @@
   }
 
   /** The values the certificate of the attestation of the release statement of release states,
-   *  by the number of its extension 1.3.6.1.4.1.57264.1.{number}: the issuer of the token
-   *  (GitHub Actions), the workflow that signed (9) and the workflow that started the run (18:
-   *  the release workflow at the tag, started as itself and not called by another workflow), a
-   *  runner GitHub hosts (11: a runner of the owner of a repository signs what that owner hands
-   *  it), the repository by its address and by its identifier and that of its owner (12, 15,
-   *  17), the tag of the release as the ref (14), the push of that tag as what started the run
-   *  (20: a run started otherwise takes inputs that are not public), and a repository that was
-   *  public (22). */
-  function attestedIdentity(release) {
-    const workflow = PROOF_REPOSITORY + "/" + PROOF_WORKFLOW + "@refs/tags/" + release;
+   *  by the number of its extension 1.3.6.1.4.1.57264.1.{number}; commit is the git_commit of
+   *  the statement. Each element is [number, value], or [number, value, "path"] for a value the
+   *  extension states before its last "@":
+   *     8  the issuer of the token (GitHub Actions);
+   *     9  the workflow of the job that signed: the build workflow of this repository. What
+   *        follows the last "@" names the ref the caller wrote, which is not judged: the commit
+   *        of the file is;
+   *    10  the commit of that workflow file: the one this program holds. The file of that
+   *        commit states what the job does, so the commit of the tag does not;
+   *    11  a runner GitHub hosts (a runner of the owner of a repository signs what that owner
+   *        hands it);
+   *    12, 15, 17  the repository the run took place in, by its address and by its identifier
+   *        and that of its owner (another repository may call the build workflow);
+   *    13  the commit that started the run: the commit the statement names;
+   *    14  the tag of the release as the ref;
+   *    18  the workflow that started the run: the release workflow of this repository at the
+   *        tag;
+   *    20  the push of that tag as what started the run (a run started otherwise takes inputs
+   *        that are not public);
+   *    22  a repository that was public. */
+  function attestedIdentity(release, commit) {
+    const ref = "refs/tags/" + release;
     return [
-      [8, PROOF_TOKEN_ISSUER], [9, workflow], [11, "github-hosted"], [12, PROOF_REPOSITORY],
-      [14, "refs/tags/" + release], [15, PROOF_REPOSITORY_ID], [17, PROOF_OWNER_ID], [18, workflow],
-      [20, "push"], [22, "public"],
+      [8, PROOF_TOKEN_ISSUER], [9, PROOF_REPOSITORY + "/" + PROOF_BUILD_WORKFLOW, "path"], [10, PROOF_BUILD_COMMIT],
+      [11, "github-hosted"], [12, PROOF_REPOSITORY], [13, commit], [14, ref], [15, PROOF_REPOSITORY_ID],
+      [17, PROOF_OWNER_ID], [18, PROOF_REPOSITORY + "/" + PROOF_RELEASE_WORKFLOW + "@" + ref], [20, "push"], [22, "public"],
     ];
+  }
+
+  /** Whether a certificate states one element of attestedIdentity. A value that is no text is
+   *  stated by no certificate. */
+  function identityStated(certificate, item) {
+    const text = fulcioText(certificate, item[0]);
+    if (typeof item[1] !== "string" || typeof text !== "string") return false;
+    if (item[2] !== "path") return text === item[1];
+    const at = text.lastIndexOf("@");
+    return at >= 0 && at < text.length - 1 && text.slice(0, at) === item[1];
   }
 
   /** The bytes the signature of a DSSE envelope covers (its pre-authentication encoding). */
@@ -2142,7 +2181,7 @@
     if (!issuedBy(trust.intermediate, trust.root)) throw unproven("p4: certificate root");
 
     for (const item of identity) {
-      if (fulcioText(leaf, item[0]) !== item[1]) throw unproven("p4: identity " + item[0]);
+      if (!identityStated(leaf, item)) throw unproven("p4: identity " + item[0]);
     }
 
     const signature = decodeStrict(member(signatures[0], "sig"), false);
@@ -2219,11 +2258,13 @@
    *    P3  the deploy key of the server target signed the statement (deploySigned);
    *    P2  the release key signed the statement and a transparency log recorded that signature
    *        (releaseRecorded);
-   *    P4  GitHub attested the statement: the attestation verifies (attestedStatement) under
-   *        the identity of the release workflow at the tag of the release (trust.identity), and
-   *        the predicate of its in-toto statement, of the type PROOF_PREDICATE_TYPE, states the
-   *        release, the three PCRs and the program_min of the statement (no program_min where
-   *        the statement states none).
+   *    P4  GitHub attested the statement: the statement names the commit the release was
+   *        built from (git_commit), the attestation verifies (attestedStatement) under the
+   *        identity of the job of the build workflow at the commit this program holds, in a run
+   *        the push of the tag of the release started at the commit of the statement
+   *        (trust.identity), and the predicate of its in-toto statement, of the type
+   *        PROOF_PREDICATE_TYPE, states the release, the three PCRs, the program_min and the
+   *        git_commit of the statement (no program_min where the statement states none).
    *  Returns {release, programMin}: the release the statement names and the program_min it
    *  states (0 for a statement that states none). The caller decides what a program_min above
    *  the version of the program means (proveBuild). Throws unproven for proofs that fail a
@@ -2250,10 +2291,11 @@
     const digest = hex(sha256(statement));
     deploySigned(digest, proofs.deploy_signatures, trust.deployKeys, target);
     releaseRecorded(statement, digest, proofs.entry, trust);
-    const attested = attestedStatement(proofs.attestation, trust.identity(stated.release), trust);
+    if (stated.git_commit === null) throw unproven("p4: statement commit");
+    const attested = attestedStatement(proofs.attestation, trust.identity(stated.release, stated.git_commit), trust);
     const predicate = member(attested, "predicate");
     if (member(attested, "predicateType") !== PROOF_PREDICATE_TYPE) throw unproven("p4: predicate type");
-    for (const name of ["release", "pcr0", "pcr1", "pcr2", "program_min"]) {
+    for (const name of ["release", "pcr0", "pcr1", "pcr2", "program_min", "git_commit"]) {
       if (member(predicate, name) !== stated[name]) throw unproven("p4: predicate " + name);
     }
     return { release: stated.release, programMin: stated.program_min === undefined ? 0 : stated.program_min };

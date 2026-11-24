@@ -17,8 +17,8 @@ The program hands a grant to a node whose measurement is an element of its list 
 releases, or is shown to it by release proofs that it verifies on the device (protocol.md, "The
 release proofs"): the signature of the release key over the measurements of the release in the
 public transparency log, a signature of a deploy key of the operator, and the attestation GitHub
-made of those measurements for a run of the release workflow of this repository at the tag of the
-release. A release of the enclave made after a program so reaches a device that runs that
+made of those measurements for the job of the build workflow of this repository, at the commit of
+that workflow file the program holds, in a run of the tag of the release. A release of the enclave made after a program so reaches a device that runs that
 program. A release whose proofs fail a check is to that device a release it does not list, and so
 is a release whose statement states a version of the program above the one the device runs
 (`program_min`). The proofs reach the program with the attestation of a node, in a node document,
@@ -240,7 +240,8 @@ proofs"). `tests/proofs.js` is the model of the parties that make such proofs: a
 release key and deploy keys, a transparency log of the form Rekor v1 with its tree and its
 checkpoints, a certificate authority that issues the certificate of a workflow run as Fulcio does
 (X.509 in DER, written by the encoder of that file), and the attestation of a release statement
-as the release workflow makes it. Every key is made there, and the program of a test runs with
+as the job of the build workflow makes it (the workflow file and the commit the program of the
+checkout holds). Every key is made there, and the program of a test runs with
 those keys and certificates in the place of its constants. `tests/proof-cases.js` states proofs
 that hold and proofs that differ from them in one place, each with the check that refuses them;
 the test runs every case through a synchronization and compares whether the node received the
@@ -250,17 +251,35 @@ installation that kept nothing; a closed node whose proofs the backend hands out
 of its measurement; a release whose statement states a later program; and proofs that reach the
 device after it read the entries of a node. `tests/fixtures/release-proofs-v2.3.0.json` holds the proofs of
 a published release from public values (its `measurements.json`, the entry of that statement on
-rekor.sigstore.dev, and its `release-statement.sigstore.json`): they run against the constants of
-the program as they are, with the deploy keys of the test and without the element of that release
-in the list. The endorsement cases of `protocol/vectors.json` run through the program as well: the
+rekor.sigstore.dev, and its `release-statement.sigstore.json`, the attestation of a job of the
+release workflow): they run against the constants of the program as they are, with the deploy
+keys of the test and without the element of that release in the list. The program refuses them at
+the workflow of the job, and a program that holds the workflow and the commit of that certificate
+passes every check. The endorsement cases of `protocol/vectors.json` run through the program as well: the
 program reads a release statement and the entry of its record as a node does.
 
 `tests/prove.js` prints what the program makes of release proofs read from a file
-(`node secure-program/tests/prove.js RELEASE_PROOFS_JSON [--node ATTESTATION_RESPONSE_JSON]...
-[--target prod|dev|alpha] [--program PROGRAM_JS]`): the verdict of the program of this checkout,
-or of the source `--program` names, with its constants as they are and for a build of the server
-target named. Release proofs are public values, so whoever makes or carries them can ask a version
-of the program for its verdict before a node of the release takes a key.
+(`node secure-program/tests/prove.js RELEASE_PROOFS_JSON [--attestation ATTESTATIONS_JSON]
+[--node ATTESTATION_RESPONSE_JSON]... [--target prod|dev|alpha] [--program PROGRAM_JS]`): the
+verdict of the program of this checkout, or of the source `--program` names, with its constants as
+they are and for a build of the server target named. Release proofs are public values, so whoever
+makes or carries them can ask a version of the program for its verdict before a node of the
+release takes a key.
+
+A release may hold several attestations of its release statement: a job of the release workflow
+makes one, and the job of the build workflow another, which is the one the program takes
+(protocol.md, "The release proofs", P4). `--attestation` names a file with attestations: one
+Sigstore bundle, bundles one a line, or the answer of the attestation API of GitHub
+(`{attestations: [{bundle}]}`). For every bundle the file prints what P4 makes of it: each value
+the certificate states of the run (the extensions `1.3.6.1.4.1.57264.1.{8..22}`) beside the value
+the program requires, the other checks of the bundle as one line (the certificate under the
+certificate authority at the time of the log entry, the signature of the envelope, the entry of
+the log, its signed entry timestamp, its inclusion proof and its checkpoint), and the predicate
+beside the statement. With `RELEASE_PROOFS_JSON` the attestation of the proofs is then the bundle
+of that file the program takes. Without proofs,
+`node secure-program/tests/prove.js --statement MEASUREMENTS_JSON --attestation ATTESTATIONS_JSON
+[--program PROGRAM_JS]` prints that report alone for the file `measurements.json` of a release,
+and its status is 0 when P4 holds for a bundle of the file.
 
 The verdict on the proofs is that of the five checks on the proofs alone. The measurement a node
 presents and the binding of that node are read from the attestation of the node: `--node` names a

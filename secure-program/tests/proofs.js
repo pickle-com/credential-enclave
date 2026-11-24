@@ -11,6 +11,8 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
 
 // ---- Bytes ----
 
@@ -249,6 +251,25 @@ function makeParties() {
 
 const DEPLOY_CONTEXT = "pickle-enclave-release-statement-v1\n";
 const REPOSITORY = "https://github.com/pickle-com/credential-enclave";
+
+/** What a program holds of the signer of an attestation: {workflow, commit, caller}, the path of
+ *  the build workflow, the commit of that workflow file and the path of the workflow that calls
+ *  it (the constants PROOF_BUILD_WORKFLOW, PROOF_BUILD_COMMIT and PROOF_RELEASE_WORKFLOW of the
+ *  source). */
+function pinsOf(source) {
+  const read = (name) => {
+    const match = new RegExp("\\n  const " + name + " = \"([^\"\\n]*)\";\\n").exec(source);
+    if (match === null) throw new Error("the program has no constant " + name);
+    return match[1];
+  };
+  return { workflow: read("PROOF_BUILD_WORKFLOW"), commit: read("PROOF_BUILD_COMMIT"), caller: read("PROOF_RELEASE_WORKFLOW") };
+}
+
+// The values of the program of this checkout: the attestations of this model are those of the
+// job that program takes.
+const PINS = pinsOf(fs.readFileSync(path.join(__dirname, "..", "secure-program.js"), "utf8"));
+// The commit a release of this model is built from (the git_commit of its statement).
+const COMMIT = "5ca1ab1e5ca1ab1e5ca1ab1e5ca1ab1e5ca1ab1e";
 const PREDICATE_TYPE = "https://pickle.com/credential-enclave/release/v1";
 const PAYLOAD_TYPE = "application/vnd.in-toto+json";
 
@@ -256,7 +277,7 @@ const PAYLOAD_TYPE = "application/vnd.in-toto+json";
  *  writes it. */
 function statementOf(release, measurement, more) {
   return Buffer.from(JSON.stringify(Object.assign({
-    release: release, git_commit: "0000000000000000000000000000000000000000",
+    release: release, git_commit: COMMIT,
     pcr0: measurement.pcr0, pcr1: measurement.pcr1, pcr2: measurement.pcr2, inputs: {},
   }, more || {}), null, 2) + "\n", "utf8");
 }
@@ -301,22 +322,26 @@ function recordedEntry(parties, statement, options) {
 }
 
 /** The values the certificate of the attestation of the release statement of a release states,
- *  by the number of its extension. */
-function identityOf(release) {
-  const workflow = REPOSITORY + "/.github/workflows/release.yml@refs/tags/" + release;
+ *  by the number of its extension: the certificate of the job of the build workflow, called at
+ *  the commit the program holds by the release workflow, in a run the push of the tag of the
+ *  release started at commit (the commit of this model when absent). */
+function identityOf(release, commit) {
+  const ref = "refs/tags/" + release;
+  const built = commit === undefined ? COMMIT : commit;
   return {
-    8: "https://token.actions.githubusercontent.com", 9: workflow, 10: "0000000000000000000000000000000000000000",
-    11: "github-hosted", 12: REPOSITORY, 13: "0000000000000000000000000000000000000000", 14: "refs/tags/" + release,
-    15: "1400118248", 16: "https://github.com/pickle-com", 17: "151645824", 18: workflow,
-    19: "0000000000000000000000000000000000000000", 20: "push",
+    8: "https://token.actions.githubusercontent.com", 9: REPOSITORY + "/" + PINS.workflow + "@" + PINS.commit, 10: PINS.commit,
+    11: "github-hosted", 12: REPOSITORY, 13: built, 14: ref,
+    15: "1400118248", 16: "https://github.com/pickle-com", 17: "151645824", 18: REPOSITORY + "/" + PINS.caller + "@" + ref,
+    19: built, 20: "push",
     21: REPOSITORY + "/actions/runs/1/attempts/1", 22: "public",
   };
 }
 
-/** The attestation of a release statement as the release workflow makes it: a Sigstore bundle
- *  with the certificate of the run, the envelope of the in-toto statement and the entry of the
- *  log. stated is {release, pcr0, pcr1, pcr2}, the values of the predicate. options change one
- *  part:
+/** The attestation of a release statement as the job of the build workflow makes it: a Sigstore
+ *  bundle with the certificate of the run, the envelope of the in-toto statement and the entry
+ *  of the log. stated is {release, pcr0, pcr1, pcr2, program_min, git_commit}, the values of
+ *  the predicate (program_min and git_commit when it has them); the certificate states
+ *  git_commit as the commit that started the run. options change one part:
  *    identity      {number: text or null}: replaces or leaves out extensions of the certificate
  *    certificate   options of certificate() for the certificate of the run
  *    issuer        the authority that issues the certificate (parties.authority)
@@ -332,7 +357,7 @@ function attestationOf(parties, stated, options) {
   const given = options || {};
   const log = given.log || parties.log;
   const key = ecKeyPair(given.curve || "prime256v1");
-  const texts = identityOf(stated.release);
+  const texts = identityOf(stated.release, stated.git_commit);
   for (const number of Object.keys(given.identity || {})) {
     if (given.identity[number] === null) delete texts[number];
     else texts[number] = given.identity[number];
@@ -344,7 +369,8 @@ function attestationOf(parties, stated, options) {
     predicateType: given.predicateType === undefined ? PREDICATE_TYPE : given.predicateType,
     predicate: given.predicate || Object.assign(
       { release: stated.release, pcr0: stated.pcr0, pcr1: stated.pcr1, pcr2: stated.pcr2 },
-      stated.program_min === undefined ? {} : { program_min: stated.program_min }),
+      stated.program_min === undefined ? {} : { program_min: stated.program_min },
+      stated.git_commit === undefined ? {} : { git_commit: stated.git_commit }),
   };
   const payload = Buffer.from(JSON.stringify(statement), "utf8");
   const payloadType = given.payloadType === undefined ? PAYLOAD_TYPE : given.payloadType;
@@ -385,12 +411,23 @@ function attestationOf(parties, stated, options) {
   return bundle;
 }
 
+/** The git_commit a release statement (bytes) states, or undefined. */
+function commitOf(statement) {
+  try {
+    const value = JSON.parse(statement.toString("utf8"));
+    return value !== null && typeof value === "object" && typeof value.git_commit === "string" ? value.git_commit : undefined;
+  } catch (error) {
+    return undefined;
+  }
+}
+
 /** The release proofs of a release with a measurement, by the parties: {statement, entry,
  *  deploy_signatures, attestation}. options:
  *    statement     the bytes of the release statement (statementOf(release, measurement))
  *    entry         options of recordedEntry
  *    deploy        the value of deploy_signatures (one signature of each deploy key)
- *    attested      the values of the predicate of the attestation (those of the statement)
+ *    attested      the values of the predicate of the attestation (those of the statement).
+ *                  Values that name no git_commit take the one of the statement
  *    attestation   options of attestationOf */
 function proofsOf(parties, release, measurement, options) {
   const given = options || {};
@@ -404,7 +441,9 @@ function proofsOf(parties, release, measurement, options) {
       { key_id: "dev", signature: deploySignature(parties.deploy.dev, statement) },
       { key_id: "prod", signature: deploySignature(parties.deploy.prod, statement) },
     ],
-    attestation: attestationOf(parties, given.attested || Object.assign({ release: release }, measurement, stated), given.attestation),
+    attestation: attestationOf(parties, Object.assign(
+      commitOf(statement) === undefined ? {} : { git_commit: commitOf(statement) },
+      given.attested || Object.assign({ release: release }, measurement, stated)), given.attestation),
   };
 }
 
@@ -436,5 +475,5 @@ function withDeployKeys(source, deploy) {
 module.exports = {
   b64, b64u, sha256, der, pem, ecKeyPair, ecdsaSign, certificate, makeAuthority, makeLog, treeHash, auditPath,
   ed25519KeyPair, makeParties, statementOf, deploySignature, recordedEntry, identityOf, attestationOf, proofsOf,
-  withParties, withConstant, withDeployKeys, DEPLOY_CONTEXT, REPOSITORY, PREDICATE_TYPE, PAYLOAD_TYPE,
+  withParties, withConstant, withDeployKeys, pinsOf, PINS, COMMIT, DEPLOY_CONTEXT, REPOSITORY, PREDICATE_TYPE, PAYLOAD_TYPE,
 };
