@@ -2004,7 +2004,7 @@ requests name, more bodies are to be read than its body requests name, an answer
 ends before its last key, a request was answered for its first item alone, more big keys wait
 than it asks for at its end, the chains of formats 1 and 2 hold more control entries than it
 reads (512), more of those chains are open than it follows (64),
-the listing of such a chain goes on over pages that hold many object versions for each `seq`,
+the listing of such a chain goes on beyond the four pages a round reads of it,
 the node discovery listing goes on beyond its two pages, or
 its time of 60 s passes before it has read everything) is pending, and the next round reads on
 from where it stopped: a round whose time passes is judged on what it read and keeps what it
@@ -2020,8 +2020,9 @@ as none, when all of this holds:
 
 - it ended because it came to one of the numbers a round reads (the listing pages, the documents
   and the bodies its requests name, an answer of the bodies that ended before its last key, the
-  control entries of chains, the chains a round follows, the pages of the node discovery
-  listing, the big keys at its end), and not because its time passed;
+  control entries of chains, the chains a round follows, the pages of the listing of a chain,
+  the pages of the node discovery listing, the big keys at its end), and not because its time
+  passed;
 - none of its reads failed or stayed without an answer, a request that was asked again for its
   first item and answered then among them;
 - it read no object that no node wrote (an object under a node id the store holds no node
@@ -2042,11 +2043,12 @@ not answered, objects no node wrote that take the reads of a round, a round that
 new and read no listing on, rounds that read only entries written after the row began and still
 do not reach the end (entries arrive faster than the device reads them), and every round that
 leaves reads undone once 32 rounds of the row caught up. Nodes of accepted releases can be made
-to write control entries of an account without the user (the delegation handed on from node to
-node), as many as someone likes, and no number of them puts the judgement of the other entries
-off for longer than those rounds: 32 is four times the rounds the largest account in normal use
-takes to read (a round reads 512 control entries of chains or 800 of format 3, so 32 rounds read
-16,384 or 25,600).
+to write entries of an account without the user (the delegation handed on from node to node, a
+call of a node), as many as someone likes, and no number of them puts the judgement of the other
+entries off for longer than those rounds: 32 is four times the rounds the largest account in
+normal use takes to read (a round reads 512 control entries of chains or 800 of format 3, and
+reads a chain on over 4,000 object versions, so 32 rounds read 16,384 or 25,600 control entries,
+and read one chain on over 128,000 object versions).
 
 Beyond eight rounds of a row that counted, the first round of a synchronization
 that counts again is a round whose reads are held back: someone writes objects under the
@@ -2439,10 +2441,12 @@ the entry the node writes there later is read. A listing page that goes on and s
 writing nowhere cannot be read on, and the read is held back (`chain:keys`); a page a node wrote
 always shows it in its last `seq`s.
 
-A chain an account used heavily is long, and the rounds read on through it, four listing pages a
-round, without a count; a listing that goes on over pages that hold more than five object
-versions for each `seq` they name, on average, is one of the reads that leave a round with more
-to read than it reads ("The round"). The event of a transfer names the receiving node and
+A chain an account used heavily is long. A round reads it on over four listing pages, and a
+round that ends with the listing of a chain still going on has more to read than it read ("The
+round"): the next round follows at once, and a round that read on through what the node wrote
+there catches up, 32 rounds of a row at most. A listing that goes on over pages that hold more
+than five object versions for each `seq` they name, on average, holds objects no node wrote, and
+a round that ends that way counts. The event of a transfer names the receiving node and
 no measurement, so the program asks for the document of the receiving node (`POST
 /api/secure/log/documents`: the node document of a node of a release from v2.4.0 on, the
 attestation document the backend kept of a node of an earlier release). A receiving node whose

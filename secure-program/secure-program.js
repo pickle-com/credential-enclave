@@ -260,7 +260,8 @@
   // A round that leaves reads undone because there was more to read than one round reads (more
   // listing pages, more nodes without a judgement, more bodies than its requests name, an answer
   // of the bodies that ended before its last key, more names in the node discovery listing than
-  // its pages hold, more than fits its time) is not complete, and the next round reads on. A
+  // its pages hold, a chain whose listing goes on beyond the pages a round reads of it, more
+  // than fits its time) is not complete, and the next round reads on. A
   // synchronization has the next round follow at once, LOG_SYNC_ROUNDS rounds in a row at most:
   // a device with much to read (a new device, a device that was off for long) reads it during
   // its stays in the app, and not one round a day.
@@ -288,6 +289,9 @@
   // comes back to the control entries of the whole retention of that account reads them in 8
   // rounds at most. Four times that is 32, the rounds of four synchronizations
   // (LOG_SYNC_ROUNDS), which read 16,384 control entries of chains or 25,600 of format 3.
+  // A round reads a chain on over LEGACY_ROUND_PASSES pages of its listing (4,000 object
+  // versions, the use entries of the chain among them): the 14,707 entries of that account are
+  // read on in 4 rounds, and 32 rounds read one chain on over 128,000 object versions.
   const LOG_CATCHING_ROUNDS = 32;
   // A check of the app for a new program that failed without a response counts as kept from
   // the app by the operator domain when the backend answered a request of this runtime within
@@ -5642,17 +5646,17 @@
         run.rest = true;
       }
     }
-    // The chains whose listing still goes on are read on by the next round. A chain of an
-    // account in heavy use is long, and a round that reads on through it has not more to read
-    // than a round reads in the sense that counts (LOG_UNFINISHED_ROUNDS): only a listing that
-    // goes on over pages that hold many object versions for each seq does.
+    // The chains whose listing still goes on are read on by the next round: the round has more
+    // to read than it read (LEGACY_ROUND_PASSES pages of the listing of a chain), and the next
+    // round follows at once. A chain of an account in heavy use is long, and a round that read
+    // on through what its node wrote there is one that catches up (run.walked, runRound): it
+    // adds nothing to the row, LOG_CATCHING_ROUNDS rounds of a row at most. A listing that goes
+    // on over pages that hold many object versions for each seq holds objects no node wrote
+    // (run.spoiled), and such a round counts.
     if (open.length > 0) {
       run.cut = true;
-      if (thin) {
-        run.over = true;
-        // (Such pages hold objects no node wrote.)
-        run.spoiled += 1;
-      }
+      run.over = true;
+      if (thin) run.spoiled += 1;
     }
     // A chain that is found and read to its end is remembered by a digest of its node id (a
     // chain of a node this device handed a grant to stays among the chains it keeps).
@@ -6431,8 +6435,8 @@
     //   it ended because it came to one of the numbers a round reads (the listing pages, the
     //   documents and the bodies its requests name, an answer of the bodies that ended before
     //   its last key, the control entries of chains, the chains a round follows, the pages of
-    //   the node discovery listing, the big keys asked for at its end), and not because its
-    //   time passed (expired);
+    //   the listing of a chain, the pages of the node discovery listing, the big keys asked for
+    //   at its end), and not because its time passed (expired);
     //   no read of it failed or stayed without an answer, a request that was asked again for
     //   its first item and answered then among them (run.lagged);
     //   it read no object that no node wrote (spoiled);
