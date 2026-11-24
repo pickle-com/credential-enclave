@@ -360,6 +360,9 @@ pub struct Health<'a> {
     pub grants: usize,
     /// P: mail providers compiled into the measured program.
     pub mail_providers: &'a [&'a str],
+    /// P: what the program of the node does, by the names of enclave.md 5.1: a constant of
+    /// the source.
+    pub capabilities: &'a [&'a str],
     /// E and P: the log store of the node, null when it has none.
     pub log_store: Option<LogStoreState<'a>>,
     /// P: the counts of the log.
@@ -761,7 +764,7 @@ pub struct Exported {
     /// C: sealed to the sealing key of the verified peer (sink K2).
     pub envelope: Option<TransferEnvelope>,
     /// E and P: the entries `grant_transferred_out` this call created: one per grant it hands
-    /// to a node of a later release for the first time, none for a transfer to a node of this
+    /// to a node of another release for the first time, none for a transfer to a node of this
     /// program.
     pub logs: Vec<AccountLogRef>,
     /// E: the `user_id` the listing continues after.
@@ -778,7 +781,7 @@ pub struct Imported {
     /// signing key already.
     pub accounts: Vec<String>,
     /// E and P: the entries `grant_transferred_in` this call created: one per grant of a
-    /// transfer from an earlier release, none for a transfer from a node of this program.
+    /// transfer from another release, none for a transfer from a node of this program.
     pub logs: Vec<AccountLogRef>,
 }
 

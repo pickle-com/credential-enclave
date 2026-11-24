@@ -1,130 +1,113 @@
-//! The other releases of this program that a node exchanges delegations with (protocol.md 10.3,
-//! enclave.md 5.13): the later releases it hands delegations to, and the earlier releases it
-//! takes them from.
+//! What a node knows of the other releases of its program (protocol.md section 9 and 10.3,
+//! enclave.md 5.13): the values it verifies the release proofs of another release with, and
+//! the old releases it takes delegations from.
 //!
-//! The files of `enclave/release/` are compiled into the program, so they are part of its
+//! These files of `enclave/release/` are compiled into the program, so they are part of its
 //! measurement:
 //!
 //! | File | What it is |
 //! | --- | --- |
-//! | `release-key.pem` | the release key of the operator: the public key whose signature over the measurements of a later release a giving node asks for |
+//! | `fulcio-root.pem`, `fulcio-intermediate.pem` | the root certificate and the intermediate certificate of the certificate authority of the public instance of Sigstore (Fulcio), which issues the certificate of an attestation |
 //! | `rekor-key.pem` | the public key of the transparency log Rekor of `rekor.sigstore.dev`, a log of the form Rekor v1 |
-//! | `predecessors.json` | the releases whose nodes a receiving node takes delegations from, each with its measurement |
+//! | `builders.json` | the build workflows whose attestation of a release statement a node takes: the path of each workflow file in the repository and the commit of that file |
+//! | `predecessors.json` | the old releases, the ones built before the build workflow existed: the releases without release proofs whose nodes a receiving node takes delegations from, each with its measurement |
 //!
-//! The log key is the row of the table of transparency logs ([`LOGS`]): a giving node asks
-//! for an entry of a log of the table that records the signature of the release key, with what
-//! the log returned to show that it holds the entry. A log has a row when the trusted root of
-//! the public instance of Sigstore names it and the monitor of this repository reads the
-//! entries of the release key in it (protocol.md 10.3). A release adds the row of a further
-//! log.
+//! The repository whose tags are the releases is the one of this source
+//! ([`Repository::of_this_source`]).
 //!
-//! A program whose release key, whose table or whose list of predecessors does not have its
-//! form does not start.
+//! None of these values is a value of one release: a release is built, tagged and deployed
+//! without a change to them. They change when the certificate authority or the log of Sigstore
+//! does, and when the build workflow does (protocol.md section 9).
+//!
+//! `release-key.pem` of that directory is not compiled into the program. It is the public half
+//! of the release key of the operator, which the monitor of this repository and the tool
+//! `credential-enclave-verify program` read. A node of this source asks for no signature of
+//! that key.
+//!
+//! A program whose certificates, whose log keys or whose lists do not have their form does not
+//! start.
 
-use credential_enclave_protocol::release::{
-    is_p256_public_key, public_key_der, read_predecessors, LogForm, ReleaseKeys,
-    ReleaseMeasurement, TransparencyLog,
-};
+use credential_enclave_protocol::release::{read_predecessors, ReleaseMeasurement};
+use credential_enclave_protocol::release_proofs::{ProofTrust, Repository, TrustError};
 
 use crate::platform::PlatformError;
 
-/// The release key of the operator (ECDSA P-256, SubjectPublicKeyInfo PEM).
-pub const RELEASE_KEY_PEM: &str = include_str!("../release/release-key.pem");
-/// The list of predecessors of this source.
+/// The root certificate of the certificate authority of Sigstore (X.509, PEM).
+pub const FULCIO_ROOT_PEM: &str = include_str!("../release/fulcio-root.pem");
+/// The intermediate certificate of the certificate authority of Sigstore (X.509, PEM).
+pub const FULCIO_INTERMEDIATE_PEM: &str = include_str!("../release/fulcio-intermediate.pem");
+/// The keys of the transparency logs of this source (SubjectPublicKeyInfo PEM, ECDSA P-256):
+/// `rekor.sigstore.dev`, the one log of the form Rekor v1 that the trusted root of the public
+/// instance of Sigstore names.
+pub const LOG_KEYS_PEM: [&str; 1] = [include_str!("../release/rekor-key.pem")];
+/// The list of build workflows of this source.
+pub const BUILDERS: &str = include_str!("../release/builders.json");
+/// The list of old releases of this source.
 const PREDECESSORS: &str = include_str!("../release/predecessors.json");
-
-/// A row of the table of transparency logs, as the source states it.
-pub struct LogSource {
-    /// The form of the log.
-    pub form: LogForm,
-    /// The origin of a log of the form Rekor v2: the first line of its checkpoints and the
-    /// name of its key on them. A log of the form Rekor v1 is named by its key alone, and its
-    /// row states the empty string.
-    pub origin: &'static str,
-    /// The public key of the log (SubjectPublicKeyInfo PEM): ECDSA P-256 for the form Rekor
-    /// v1, Ed25519 for the form Rekor v2.
-    pub key_pem: &'static str,
-}
-
-/// The table of transparency logs of this source: `rekor.sigstore.dev`, the one log of the
-/// trusted root of the public instance of Sigstore whose entries of the release key the
-/// monitor of this repository reads.
-pub const LOGS: [LogSource; 1] = [LogSource {
-    form: LogForm::RekorV1,
-    origin: "",
-    key_pem: include_str!("../release/rekor-key.pem"),
-}];
 
 /// What a node knows about the other releases of its program.
 pub struct Lineage {
-    /// The DER of the release key.
-    release_key: Vec<u8>,
-    /// The transparency logs whose entries this node accepts.
-    logs: Vec<TransparencyLog>,
-    /// The releases this node takes delegations from, each with its measurement.
+    /// What the release proofs of another release are verified with.
+    pub proofs: ProofTrust,
+    /// The old releases this node takes delegations from, each with its measurement.
     pub predecessors: Vec<ReleaseMeasurement>,
 }
 
 impl Lineage {
-    /// The key, the table of logs and the list of predecessors that are compiled into this
-    /// program, for a node of the release `release`.
-    pub fn embedded(release: &str) -> Result<Lineage, PlatformError> {
-        Lineage::read(RELEASE_KEY_PEM, &LOGS, PREDECESSORS.as_bytes(), release)
+    /// The certificates, the log keys and the lists that are compiled into this program.
+    pub fn embedded() -> Result<Lineage, PlatformError> {
+        Lineage::read(
+            FULCIO_ROOT_PEM,
+            FULCIO_INTERMEDIATE_PEM,
+            &LOG_KEYS_PEM,
+            BUILDERS.as_bytes(),
+            PREDECESSORS.as_bytes(),
+        )
     }
 
-    /// Reads the release key from its PEM, the table of logs from its rows and the list of
-    /// predecessors from its JSON, for a node of the release `release`.
+    /// Reads the two certificates of the certificate authority and the keys of the logs from
+    /// their PEM, and the list of build workflows and the list of old releases from their
+    /// JSON.
     ///
-    /// A release key that is not an ECDSA P-256 public key is refused. The table is refused
-    /// when it has no row, when the key of a row is not a key of the form of that row, when a
-    /// row of the form Rekor v2 states no origin or a row of the form Rekor v1 states one, and
-    /// when two rows have the same identifier. The list is refused when it is malformed and
-    /// when it names a release that is not earlier than `release`. A node whose own release is
-    /// not a release tag (`dev`) starts with the empty list only.
+    /// The certificates are refused when one of them is not an X.509 certificate of a
+    /// certificate authority and when the root did not issue the intermediate. The keys are
+    /// refused when there is none, when one is not an ECDSA P-256 public key, and when two of
+    /// them are one key. The list of build workflows is refused when it is malformed or names
+    /// one build workflow twice, and the list of old releases when it is malformed
+    /// (`credential_enclave_protocol::release_proofs`, `credential_enclave_protocol::release`).
     pub fn read(
-        release_key_pem: &str,
-        logs: &[LogSource],
+        root_pem: &str,
+        intermediate_pem: &str,
+        log_keys_pem: &[&str],
+        builders: &[u8],
         predecessors: &[u8],
-        release: &str,
     ) -> Result<Lineage, PlatformError> {
-        const TABLE: PlatformError = PlatformError(
-            "the table of transparency logs of this build is empty, names a log twice or holds a row whose key or origin is not of the form of its log",
-        );
-        let release_key = public_key_der(release_key_pem)
-            .filter(|der| is_p256_public_key(der))
-            .ok_or(PlatformError(
-                "the release key of this build is not an ECDSA P-256 public key",
-            ))?;
-        let mut table: Vec<TransparencyLog> = Vec::with_capacity(logs.len());
-        for source in logs {
-            let log = public_key_der(source.key_pem)
-                .and_then(|der| match source.form {
-                    LogForm::RekorV1 if source.origin.is_empty() => TransparencyLog::rekor_v1(&der),
-                    LogForm::RekorV1 => None,
-                    LogForm::RekorV2 => TransparencyLog::rekor_v2(source.origin, &der),
-                })
-                .filter(|log| table.iter().all(|other| other.id() != log.id()))
-                .ok_or(TABLE)?;
-            table.push(log);
-        }
-        if table.is_empty() {
-            return Err(TABLE);
-        }
+        let proofs = ProofTrust::read(
+            root_pem,
+            intermediate_pem,
+            log_keys_pem,
+            Repository::of_this_source(),
+            builders,
+        )
+        .map_err(|error| {
+            PlatformError(match error {
+                TrustError::Certificates => {
+                    "the certificates of the certificate authority of this build are not the root certificate and the intermediate certificate it issued, or the transparency logs of this build are none or one log twice"
+                }
+                TrustError::LogKey => {
+                    "a transparency log key of this build is not an ECDSA P-256 public key"
+                }
+                TrustError::Builders => {
+                    "the list of build workflows of this build is malformed or names a build workflow twice"
+                }
+            })
+        })?;
         Ok(Lineage {
-            release_key,
-            logs: table,
-            predecessors: read_predecessors(predecessors, release).ok_or(PlatformError(
-                "the predecessor list of this build is malformed or names a release that is not earlier than this one",
+            proofs,
+            predecessors: read_predecessors(predecessors).ok_or(PlatformError(
+                "the list of old releases of this build is malformed",
             ))?,
         })
-    }
-
-    /// The release key and the table of logs an endorsement is verified with.
-    pub fn keys(&self) -> ReleaseKeys<'_> {
-        ReleaseKeys {
-            release: &self.release_key,
-            logs: &self.logs,
-        }
     }
 }
 
@@ -132,7 +115,9 @@ impl Lineage {
 mod tests {
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
-    use credential_enclave_protocol::release::{verify_endorsement, LogEntry};
+    use sha2::{Digest, Sha256};
+
+    use credential_enclave_protocol::release::{pem_der, TransparencyLog};
 
     use super::*;
 
@@ -143,14 +128,12 @@ mod tests {
     const TRUSTED_ROOT: &str =
         include_str!("../../protocol/tests/fixtures/sigstore-trusted-root.json");
 
-    /// The log of the form Rekor v2 that the trusted root names, `log2025-1.rekor.sigstore.dev`.
-    /// The table of this source has no row for it: the log offers no search for the entries of
-    /// a key, and the monitor of this repository does not read it.
-    const LOG2025_1: LogSource = LogSource {
-        form: LogForm::RekorV2,
-        origin: "log2025-1.rekor.sigstore.dev",
-        key_pem: include_str!("../../protocol/tests/fixtures/rekor-log2025-1-key.pem"),
-    };
+    /// The key of the log of the form Rekor v2 that the trusted root names,
+    /// `log2025-1.rekor.sigstore.dev`. This source has no key for it: the attestation of a
+    /// release statement is recorded in the log of the form Rekor v1, which the monitor of
+    /// this repository reads.
+    const LOG2025_1_KEY_PEM: &str =
+        include_str!("../../protocol/tests/fixtures/rekor-log2025-1-key.pem");
 
     fn refused(result: Result<Lineage, PlatformError>) -> bool {
         result.is_err()
@@ -160,97 +143,83 @@ mod tests {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
+    fn embedded() -> Lineage {
+        Lineage::embedded().unwrap_or_else(|PlatformError(reason)| panic!("{reason}"))
+    }
+
     #[test]
-    fn the_release_key_of_this_source_is_a_p256_key_and_its_log_is_rekor_of_sigstore() {
-        // The release of this source is the version of the crate: its list of predecessors
-        // is valid for that release.
-        let release = concat!("v", env!("CARGO_PKG_VERSION"));
-        let lineage =
-            Lineage::embedded(release).unwrap_or_else(|PlatformError(reason)| panic!("{reason}"));
-        assert_eq!(lineage.release_key.len(), 91);
-        assert_eq!(lineage.keys().release, &lineage.release_key[..]);
+    fn the_values_of_this_source_are_those_of_sigstore_and_of_this_repository() {
+        let lineage = embedded();
         // The identifier of the log, as the log itself states it in every entry: the hash of
         // its key.
-        let logs: Vec<(LogForm, Option<&str>, String)> = lineage
-            .keys()
-            .logs
+        let logs: Vec<String> = lineage
+            .proofs
+            .logs()
             .iter()
-            .map(|log| (log.form(), log.origin(), log.id()))
+            .map(TransparencyLog::id)
             .collect();
         assert_eq!(
             logs,
+            ["c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d"]
+        );
+        // The two certificates, by the SHA-256 of their DER.
+        let digest = |pem: &str| hex(&Sha256::digest(pem_der(pem, "CERTIFICATE").unwrap()));
+        assert_eq!(
+            digest(FULCIO_ROOT_PEM),
+            "3ba7b6cc4e95469d4d334b49cb257ad8537076fa84b0ca87ff4ecfe6a54680c1"
+        );
+        assert_eq!(
+            digest(FULCIO_INTERMEDIATE_PEM),
+            "15d795348226b4649f750f5802592c393bee7cc53c3b86982175b7ad087efe47"
+        );
+        assert_eq!(*lineage.proofs.repository(), Repository::of_this_source());
+        assert_eq!(
+            lineage.proofs.repository().address,
+            "https://github.com/pickle-com/credential-enclave"
+        );
+        // The build workflow of this repository, at the commit of its file.
+        let builders: Vec<(&str, &str)> = lineage
+            .proofs
+            .builders()
+            .iter()
+            .map(|builder| (builder.workflow(), builder.commit()))
+            .collect();
+        assert_eq!(
+            builders,
             [(
-                LogForm::RekorV1,
-                None,
-                "c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d".to_string()
+                ".github/workflows/enclave-build.yml",
+                "3f84e8368fcdf1f89e42ca629670bfe0989b6f13"
             )]
         );
-        for predecessor in &lineage.predecessors {
-            assert_ne!(predecessor.release, release);
-        }
     }
 
     #[test]
-    fn the_endorsement_of_a_release_of_this_program_holds_under_the_keys_of_this_source() {
-        // The endorsement of release v1.5.2: the statement of that release, and the entry of
-        // Rekor that records the signature of the release key over it, as the log returned
-        // it. A node of this source reads it as the nodes of the releases before it did.
-        let statement = credential_enclave_protocol::encoding::b64u_decode(
-            include_str!("../../verify/tests/fixtures/endorsement-v1.5.2-statement.b64u").trim(),
-        )
-        .unwrap();
-        let logged: serde_json::Value = serde_json::from_str(include_str!(
-            "../../verify/tests/fixtures/rekor-entry-3267788759.json"
-        ))
-        .unwrap();
-        let logged = logged.as_object().unwrap().values().next().unwrap();
-        let entry = serde_json::json!({
-            "log_id": logged["logID"],
-            "body": logged["body"],
-            "integrated_time": logged["integratedTime"],
-            "log_index": logged["logIndex"],
-            "signed_entry_timestamp": logged["verification"]["signedEntryTimestamp"],
-        });
-        let integrated_time = logged["integratedTime"].as_u64().unwrap();
-        // The release key and the table of logs of this source, for a node of release v1.5.1
-        // (the list of predecessors of this source names releases after that one).
-        let lineage = Lineage::read(RELEASE_KEY_PEM, &LOGS, b"[]", "v1.5.1")
-            .unwrap_or_else(|PlatformError(reason)| panic!("{reason}"));
-        let verify = |own_release: &str, now_s: u64| {
-            verify_endorsement(
-                &statement,
-                &LogEntry::read(&entry).unwrap(),
-                &lineage.keys(),
-                own_release,
-                now_s,
-            )
-        };
-        let later = verify("v1.5.1", integrated_time + 3_600).unwrap();
-        assert_eq!(later.release, "v1.5.2");
+    fn the_list_of_old_releases_holds_the_releases_built_before_the_build_workflow() {
+        // The list is the one of the releases that have no release proofs. It gains no
+        // element: a release built by the build workflow is accepted by its proofs.
+        let lineage = embedded();
+        let releases: Vec<&str> = lineage
+            .predecessors
+            .iter()
+            .map(|predecessor| predecessor.release.as_str())
+            .collect();
         assert_eq!(
-            hex(&later.pcrs[0]),
-            "edf5a93aec5f096f0bcd6717a2ffcf4265404cf121c1c0a40be66682e7d5f6e0d1a54b841e96e0f91d6ec806aa861143"
+            releases,
+            ["v1.5.2", "v2.0.0", "v2.0.1", "v2.1.0", "v2.2.0", "v2.3.0"]
         );
-        // A node of that release or of a later one hands nothing to it, and a clock that is
-        // more than 300 seconds behind the time of the entry does not count it.
-        assert!(verify("v1.5.2", integrated_time + 3_600).is_err());
-        assert!(verify("v2.4.0", integrated_time + 3_600).is_err());
-        assert!(verify("v1.5.1", integrated_time - 301).is_err());
-        assert!(verify("v1.5.1", integrated_time - 300).is_ok());
     }
 
     #[test]
-    fn the_table_of_logs_is_the_transparency_logs_of_the_trusted_root_that_the_monitor_reads() {
-        // Every transparency log the trusted root names is a row of the table or the one log
-        // the monitor does not read, with its key, and the identifier of a row of its form is
-        // the log identifier the trusted root states. A trusted root that names a further log
-        // fails this test until the log has a row or is stated here as a log without one, and
-        // the table has no row beyond the logs of the trusted root.
+    fn the_values_of_this_source_are_those_of_the_trusted_root_of_sigstore() {
+        // Every transparency log the trusted root names is a log of this source or the one
+        // log this source has no key for, and the identifier of a log of this source is the
+        // log identifier the trusted root states. A trusted root that names a further log
+        // fails this test until this source holds its key or states it here as a log without
+        // one, and this source holds no key beyond the logs of the trusted root.
         let root: serde_json::Value = serde_json::from_str(TRUSTED_ROOT).unwrap();
         let tlogs = root["tlogs"].as_array().unwrap();
-        let known: Vec<&LogSource> = LOGS.iter().chain([&LOG2025_1]).collect();
-        assert_eq!(tlogs.len(), known.len());
-        let mut without_a_row = Vec::new();
+        assert_eq!(tlogs.len(), LOG_KEYS_PEM.len() + 1);
+        let mut without_a_key = Vec::new();
         for tlog in tlogs {
             let address = tlog["baseUrl"].as_str().unwrap();
             let key = STANDARD
@@ -259,116 +228,168 @@ mod tests {
             let stated = STANDARD
                 .decode(tlog["logId"]["keyId"].as_str().unwrap())
                 .unwrap();
-            let source = known
+            let own = LOG_KEYS_PEM
                 .iter()
-                .find(|source| public_key_der(source.key_pem).as_deref() == Some(&key[..]))
-                .unwrap_or_else(|| panic!("{address}: no row and no stated log has the key"));
-            if LOGS.iter().all(|row| row.key_pem != source.key_pem) {
-                without_a_row.push(address);
+                .any(|pem| pem_der(pem, "PUBLIC KEY").as_deref() == Some(&key[..]));
+            if !own {
+                assert_eq!(
+                    pem_der(LOG2025_1_KEY_PEM, "PUBLIC KEY").as_deref(),
+                    Some(&key[..]),
+                    "{address}: this source has no key for the log and does not state it"
+                );
+                without_a_key.push(address);
+                continue;
             }
-            let (form, origin) = match tlog["publicKey"]["keyDetails"].as_str().unwrap() {
-                "PKIX_ECDSA_P256_SHA_256" => (LogForm::RekorV1, ""),
-                // The origin of a log of the form Rekor v2 is its address without the scheme.
-                "PKIX_ED25519" => (LogForm::RekorV2, address.strip_prefix("https://").unwrap()),
-                other => panic!("{address}: a key of the kind {other}"),
-            };
-            assert_eq!((source.form, source.origin), (form, origin), "{address}");
-            let log = match form {
-                LogForm::RekorV1 => TransparencyLog::rekor_v1(&key),
-                LogForm::RekorV2 => TransparencyLog::rekor_v2(origin, &key),
-            }
-            .unwrap();
+            assert_eq!(
+                tlog["publicKey"]["keyDetails"], "PKIX_ECDSA_P256_SHA_256",
+                "{address}"
+            );
+            let log = TransparencyLog::rekor_v1(&key).unwrap();
             assert_eq!(log.id(), hex(&stated), "{address}");
         }
-        assert_eq!(without_a_row, ["https://log2025-1.rekor.sigstore.dev"]);
+        assert_eq!(without_a_key, ["https://log2025-1.rekor.sigstore.dev"]);
+
+        // The two certificates of this source are the chain of the one certificate authority
+        // of the trusted root that has no end: the intermediate certificate first, then the
+        // root certificate.
+        let authorities: Vec<&serde_json::Value> = root["certificateAuthorities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|authority| authority["validFor"].get("end").is_none())
+            .collect();
+        assert_eq!(authorities.len(), 1);
+        assert_eq!(authorities[0]["uri"], "https://fulcio.sigstore.dev");
+        let chain: Vec<Vec<u8>> = authorities[0]["certChain"]["certificates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|certificate| {
+                STANDARD
+                    .decode(certificate["rawBytes"].as_str().unwrap())
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            chain,
+            [
+                pem_der(FULCIO_INTERMEDIATE_PEM, "CERTIFICATE").unwrap(),
+                pem_der(FULCIO_ROOT_PEM, "CERTIFICATE").unwrap(),
+            ]
+        );
     }
 
     #[test]
-    fn a_node_does_not_start_with_a_malformed_key_table_or_list() {
-        let read = |release_key: &str, list: &str, release: &str| {
-            Lineage::read(release_key, &LOGS, list.as_bytes(), release)
+    fn a_node_does_not_start_with_malformed_certificates_keys_or_lists() {
+        let [log_key] = LOG_KEYS_PEM;
+        let read = |root: &str, intermediate: &str, keys: &[&str], builders: &str, list: &str| {
+            Lineage::read(
+                root,
+                intermediate,
+                keys,
+                builders.as_bytes(),
+                list.as_bytes(),
+            )
         };
         let element = |release: &str| {
             format!(r#"{{"release":"{release}","pcr0":"{PCR}","pcr1":"{PCR}","pcr2":"{PCR}"}}"#)
         };
-        let list = format!("[{}]", element("v1.0.0"));
+        let list = format!("[{},{}]", element("v1.0.0"), element("v9.0.0"));
+        let builder = r#"[{"workflow":".github/workflows/build.yml","commit":"0123456789abcdef0123456789abcdef01234567"}]"#;
 
-        let lineage = read(RELEASE_KEY_PEM, &list, "v1.1.0")
-            .unwrap_or_else(|PlatformError(reason)| panic!("{reason}"));
-        assert_eq!(lineage.predecessors.len(), 1);
-        assert_eq!(lineage.predecessors[0].release, "v1.0.0");
-        assert_eq!(lineage.keys().logs.len(), 1);
-        assert!(!refused(read(RELEASE_KEY_PEM, "[]", "dev")));
+        let lineage = read(
+            FULCIO_ROOT_PEM,
+            FULCIO_INTERMEDIATE_PEM,
+            &[log_key],
+            builder,
+            &list,
+        )
+        .unwrap_or_else(|PlatformError(reason)| panic!("{reason}"));
+        // The list of old releases is read as it is: no release of it is compared with
+        // another one, or with the release of the node.
+        assert_eq!(lineage.predecessors.len(), 2);
+        assert_eq!(lineage.predecessors[1].release, "v9.0.0");
+        assert_eq!(lineage.proofs.builders().len(), 1);
+        assert_eq!(lineage.proofs.logs().len(), 1);
+        // A node with no build workflow and no old release starts: it accepts the nodes of
+        // its own measurement alone.
+        let alone = read(
+            FULCIO_ROOT_PEM,
+            FULCIO_INTERMEDIATE_PEM,
+            &[log_key],
+            "[]",
+            "[]",
+        );
+        assert!(!refused(alone));
 
-        // A release key that is not a PEM public key, or not a P-256 key.
-        let [p256] = LOGS.map(|source| source.key_pem);
-        let (origin, ed25519) = (LOG2025_1.origin, LOG2025_1.key_pem);
-        for key in ["", "not a key", ed25519] {
-            assert!(refused(read(key, "[]", "v1.1.0")), "{key}");
-        }
-
-        // A table without a row, with a key that is not of the form of its row, with a log of
-        // the form Rekor v2 that states no origin, with a log of the form Rekor v1 that states
-        // one, and with one log in two rows.
-        let table = |rows: &[(LogForm, &'static str, &'static str)]| {
-            let rows: Vec<LogSource> = rows
-                .iter()
-                .map(|(form, origin, key_pem)| LogSource {
-                    form: *form,
-                    origin,
-                    key_pem,
-                })
-                .collect();
-            Lineage::read(RELEASE_KEY_PEM, &rows, b"[]", "v1.1.0")
-        };
-        assert!(!refused(table(&[(LogForm::RekorV1, "", p256)])));
-        assert!(!refused(table(&[(LogForm::RekorV2, origin, ed25519)])));
-        assert!(!refused(table(&[
-            (LogForm::RekorV2, origin, ed25519),
-            (LogForm::RekorV1, "", p256),
-        ])));
-        // One key under two origins is two logs.
-        assert!(!refused(table(&[
-            (LogForm::RekorV2, origin, ed25519),
-            (LogForm::RekorV2, "log2026-1.rekor.sigstore.dev", ed25519),
-        ])));
-        for rows in [
-            &[][..],
-            &[(LogForm::RekorV1, "", ed25519)],
-            &[(LogForm::RekorV2, origin, p256)],
-            &[(LogForm::RekorV1, "", "not a key")],
-            &[(LogForm::RekorV2, "", ed25519)],
-            &[(LogForm::RekorV2, "an origin", ed25519)],
-            &[(LogForm::RekorV1, origin, p256)],
-            &[(LogForm::RekorV1, "", p256), (LogForm::RekorV1, "", p256)],
-            &[
-                (LogForm::RekorV2, origin, ed25519),
-                (LogForm::RekorV1, "", p256),
-                (LogForm::RekorV2, origin, ed25519),
-            ],
+        // Certificates that are not a root and an intermediate it issued: the two in the
+        // place of each other, the intermediate twice, a text that is no PEM, the PEM of a
+        // key.
+        for (root, intermediate) in [
+            (FULCIO_INTERMEDIATE_PEM, FULCIO_ROOT_PEM),
+            (FULCIO_INTERMEDIATE_PEM, FULCIO_INTERMEDIATE_PEM),
+            ("", FULCIO_INTERMEDIATE_PEM),
+            (FULCIO_ROOT_PEM, "not a certificate"),
+            (log_key, FULCIO_INTERMEDIATE_PEM),
         ] {
-            assert!(refused(table(rows)), "{} rows", rows.len());
+            assert!(refused(read(root, intermediate, &[log_key], "[]", "[]")));
         }
-
-        // A list that is not a list, an element that is malformed, an element whose release
-        // is not earlier than the release of the node, and a list for a node whose release is
-        // not a release tag.
-        for (list, release) in [
-            ("", "v1.1.0"),
-            ("{}", "v1.1.0"),
-            (r#"[{"release":"v1.0.0"}]"#, "v1.1.0"),
-            (&format!("[{}]", element("v1.1.0")), "v1.1.0"),
-            (&format!("[{}]", element("v1.2.0")), "v1.1.0"),
-            (
-                &format!("[{},{}]", element("v1.0.0"), element("v1.1.0")),
-                "v1.1.0",
-            ),
-            (&list, "dev"),
-            (&list, "v1.0.0"),
+        // No log, a key that is not a P-256 key, and one log twice.
+        for keys in [
+            &[][..],
+            &[LOG2025_1_KEY_PEM],
+            &["not a key"],
+            &[FULCIO_ROOT_PEM],
+            &[log_key, log_key],
         ] {
             assert!(
-                refused(read(RELEASE_KEY_PEM, list, release)),
-                "{list} {release}"
+                refused(read(
+                    FULCIO_ROOT_PEM,
+                    FULCIO_INTERMEDIATE_PEM,
+                    keys,
+                    "[]",
+                    "[]"
+                )),
+                "{} keys",
+                keys.len()
+            );
+        }
+        // A list of build workflows that is not a list, with a malformed element, and with
+        // one build workflow twice.
+        for builders in [
+            "",
+            "{}",
+            r#"[{"workflow":".github/workflows/build.yml"}]"#,
+            r#"[{"workflow":".github/workflows/build.yml","commit":"main"}]"#,
+            &format!("[{0},{0}]", &builder[1..builder.len() - 1]),
+        ] {
+            assert!(
+                refused(read(
+                    FULCIO_ROOT_PEM,
+                    FULCIO_INTERMEDIATE_PEM,
+                    &[log_key],
+                    builders,
+                    "[]"
+                )),
+                "{builders}"
+            );
+        }
+        // A list of old releases that is not a list, and one with a malformed element.
+        for list in [
+            "",
+            "{}",
+            r#"[{"release":"v1.0.0"}]"#,
+            &format!("[{}]", element("dev")),
+        ] {
+            assert!(
+                refused(read(
+                    FULCIO_ROOT_PEM,
+                    FULCIO_INTERMEDIATE_PEM,
+                    &[log_key],
+                    "[]",
+                    list
+                )),
+                "{list}"
             );
         }
     }

@@ -18,8 +18,34 @@ use crate::faults;
 use crate::load;
 use crate::state::Node;
 
+/// What the program of this source does, by name (enclave.md 5.1). A caller of a node reads
+/// from this list which calls it sends to the node and in which form, and reads no order of
+/// releases from the name of a release. A later release adds names and takes none away.
+///
+/// | Name | What a node of this program does |
+/// | --- | --- |
+/// | `log_format_3` | writes its entries in format 3 to the buckets of its log store, and returns no head with the response of a call |
+/// | `peer_proofs` | reads the `release_proofs` of `peer/export` and `peer/import`, and no endorsement |
+/// | `internal_inert` | answers `internal` only for a call that did not act |
+/// | `release_sealed` | seals the value of `release` to the key the call names |
+/// | `vault` | takes the calls under `vault/` |
+/// | `drain_paged` | hands its delegations on in the pages of `peer/export` |
+/// | `subset_groups` | reads `groups` and `skip` of a `subset` |
+/// | `subset_span` | reads `span` of a `subset` |
+pub const CAPABILITIES: [&str; 8] = [
+    "log_format_3",
+    "peer_proofs",
+    "internal_inert",
+    "release_sealed",
+    "vault",
+    "drain_paged",
+    "subset_groups",
+    "subset_span",
+];
+
 /// The diagnostic values of a node. `role` is `reserve` on a node of the reserve role,
-/// `forward` on a node of the forward role and null on every other node. `accounts` counts
+/// `forward` on a node of the forward role and null on every other node. `capabilities` is
+/// [`CAPABILITIES`]. `accounts` counts
 /// the accounts that have a chain on this
 /// node and `grants` the accounts that have a grant within its time (the operator domain reads
 /// it to see that a delegation transfer arrived). `log_store` is null on a node without a log
@@ -72,6 +98,7 @@ pub async fn health(State(node): State<Arc<Node>>) -> Response {
         accounts: node.account_count(),
         grants: count(&state.grants),
         mail_providers: &["naver_mail"],
+        capabilities: &CAPABILITIES,
         log_store: node.log_store.id().map(|id| LogStoreState {
             bucket: id.bucket(),
             region: id.region(),

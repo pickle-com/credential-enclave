@@ -27,6 +27,8 @@ use credential_enclave_protocol::encoding::{b64u, b64u_decode, to_json, verify, 
 use credential_enclave_protocol::keys::{Binding, Custody};
 use credential_enclave_protocol::log::{parse_object_key_v3, EntryKey};
 use credential_enclave_protocol::record::{open_record, seal_record, Record};
+use credential_enclave_protocol::release::{ReleaseMeasurement, TransparencyLog};
+use credential_enclave_protocol::release_proofs::{Builder, ProofTrust, Repository};
 use credential_enclave_protocol::{limits, purpose};
 use hyper::body::Bytes;
 use hyper::service::Service;
@@ -43,11 +45,83 @@ use crate::clock::Clock;
 use crate::egress::Egress;
 use crate::faults::{self, Lock};
 use crate::frame;
-use crate::lineage::{Lineage, LOGS, RELEASE_KEY_PEM};
+use crate::lineage::Lineage;
 use crate::platform::local::{kernel_random, local_document, system_time_ms};
 use crate::platform::{ConnectError, Listener, Measurement, Platform, PlatformError, Stream};
 use crate::providers::Definitions;
 use crate::state::{lock, Limits, Node};
+
+/// Release proofs of `protocol/vectors/release-proofs.json` (protocol.md section 9), with what
+/// the file says of them.
+pub struct ProofCase {
+    /// The proofs: the value of the key `release_proofs` of a call.
+    pub proofs: Value,
+    /// The measurement the proofs are verified for.
+    pub pcrs: [[u8; 48]; 3],
+    /// The release the statement of the proofs names. Empty for proofs that do not hold.
+    pub release: String,
+    /// What the proofs are verified with: the certificates, the log keys, the repository and
+    /// the build workflows of the trust the case names.
+    pub trust: ProofTrust,
+}
+
+/// The case `name` of `protocol/vectors/release-proofs.json`, whose trust is one of the
+/// file.
+pub fn proof_case(name: &str) -> ProofCase {
+    let vectors: Value =
+        serde_json::from_str(include_str!("../../protocol/vectors/release-proofs.json")).unwrap();
+    let case = vectors["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|case| case["name"] == name)
+        .unwrap_or_else(|| panic!("no case {name}"));
+    let stated = &vectors["trusts"][case["trust"].as_str().unwrap()];
+    let bytes = |value: &Value| b64u_decode(value.as_str().unwrap()).unwrap();
+    let text = |value: &Value| value.as_str().unwrap().to_string();
+    let trust = ProofTrust::new(
+        &bytes(&stated["fulcio_root"]),
+        &bytes(&stated["fulcio_intermediate"]),
+        stated["log_keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|key| TransparencyLog::rekor_v1(&bytes(key)).unwrap())
+            .collect(),
+        Repository {
+            address: text(&stated["repository"]),
+            id: text(&stated["repository_id"]),
+            owner_id: text(&stated["owner_id"]),
+        },
+        stated["builders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|builder| {
+                Builder::new(
+                    builder["workflow"].as_str().unwrap(),
+                    builder["commit"].as_str().unwrap(),
+                )
+                .unwrap()
+            })
+            .collect(),
+    )
+    .unwrap();
+    let pcr = |key: &str| -> [u8; 48] {
+        let text = case["measurement"][key].as_str().unwrap();
+        let digits: Vec<u8> = (0..text.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap())
+            .collect();
+        digits.try_into().unwrap()
+    };
+    ProofCase {
+        proofs: serde_json::from_str(case["release_proofs_text"].as_str().unwrap()).unwrap(),
+        pcrs: [pcr("pcr0"), pcr("pcr1"), pcr("pcr2")],
+        release: case["release"].as_str().unwrap_or_default().to_string(),
+        trust,
+    }
+}
 
 /// A lock of a test: the state of a stand-in or of a test platform, behind a plain mutex. A
 /// test whose thread panicked under one goes on reading what the lock guards. The node program
@@ -1119,7 +1193,7 @@ pub fn request_share(request: &Value) -> usize {
     crate::room::Marks::of(&to_json(request)).request_share()
 }
 
-/// The release of a node under test. It is not a release tag (protocol.md 10.3).
+/// The release of a node under test: the name of no tag of the repository.
 const RELEASE: &str = "v0.0.0-test";
 
 /// A node under test.
@@ -1152,11 +1226,44 @@ impl Harness {
         )
     }
 
+    /// A node of custody `enclave` with `measurement` that verifies the release proofs of
+    /// another release with `proofs` and lists the old releases `predecessors`, in the place
+    /// of the values of the source.
+    pub fn measured_with(
+        provider: &Provider,
+        measurement: Measurement,
+        proofs: ProofTrust,
+        predecessors: Vec<ReleaseMeasurement>,
+    ) -> Harness {
+        Harness::started(
+            TestPlatform::measured(measurement),
+            provider,
+            Definitions::embedded(),
+            Limits::default(),
+            Lineage {
+                proofs,
+                predecessors,
+            },
+        )
+    }
+
     fn on(
         platform: TestPlatform,
         provider: &Provider,
         definitions: Definitions,
         limits: Limits,
+    ) -> Harness {
+        // The certificates, the keys and the lists of the source.
+        let lineage = Lineage::embedded().unwrap();
+        Harness::started(platform, provider, definitions, limits, lineage)
+    }
+
+    fn started(
+        platform: TestPlatform,
+        provider: &Provider,
+        definitions: Definitions,
+        limits: Limits,
+        lineage: Lineage,
     ) -> Harness {
         let platform = Arc::new(platform);
         provider.route(&platform);
@@ -1170,9 +1277,7 @@ impl Harness {
                 definitions,
                 egress,
                 RELEASE,
-                // The keys of the source. The release of the tests is not a release tag, so
-                // the node has no predecessor.
-                Lineage::read(RELEASE_KEY_PEM, &LOGS, b"[]", RELEASE).unwrap(),
+                lineage,
                 limits,
             )
             .unwrap(),
@@ -1204,7 +1309,7 @@ impl Harness {
                 Definitions::embedded(),
                 egress,
                 RELEASE,
-                Lineage::read(RELEASE_KEY_PEM, &LOGS, b"[]", RELEASE).unwrap(),
+                Lineage::embedded().unwrap(),
                 limits,
             )
             .unwrap(),

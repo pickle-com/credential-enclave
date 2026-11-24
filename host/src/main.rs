@@ -490,6 +490,8 @@ fn forward_setup() -> Setup {
 async fn run() -> Result<(), String> {
     log(&format!("version {}", env!("CARGO_PKG_VERSION")));
     log(&launch::release_line(Path::new(launch::MEASUREMENTS_PATH)));
+    let (release_proofs, line) = launch::release_proofs(Path::new(launch::RELEASE_PROOFS_PATH));
+    log(&line);
     match descriptors::raise_limit() {
         Some((soft, hard)) => log(&format!("descriptors: limit {soft}, hard limit {hard}")),
         None => log("descriptors: the platform has no limit of open descriptors"),
@@ -549,6 +551,7 @@ async fn run() -> Result<(), String> {
             inbound: inbound_counters.clone(),
             watch: watch.clone(),
             readiness: readiness.clone(),
+            release_proofs: release_proofs.map(hyper::body::Bytes::from),
         }),
     )));
     tokio::spawn(vital(egress::serve(

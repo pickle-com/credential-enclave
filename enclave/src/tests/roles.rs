@@ -1054,22 +1054,21 @@ async fn a_node_of_the_reserve_role_takes_and_gives_the_transfers_of_another_rel
     later.use_log_store().await;
     let app = App::new("user-1", 1);
     app.grant(&earlier).await;
-    let release = |release: &str, pcr: u8| ReleaseMeasurement {
-        release: release.to_string(),
-        pcrs: [[pcr; 48], [pcr + 1; 48], [pcr + 2; 48]],
-    };
-    let as_release = |harness: &Harness, release: &str| {
-        Peer::accepted_for_tests(&harness.node.keys, Program::Release(release.to_string()))
+    let as_release = |harness: &Harness, release: &str, pcr: u8| {
+        let other = ReleaseMeasurement {
+            release: release.to_string(),
+            pcrs: [[pcr; 48], [pcr + 1; 48], [pcr + 2; 48]],
+        };
+        Peer::accepted_for_tests(&harness.node.keys, Program::Release(other))
     };
 
-    // A node of an earlier release hands the delegation to the node of the reserve role
-    // under the statement of its release: the transfer is on the log of the account on both
-    // nodes, and the entry of the node of the reserve role is a control entry.
-    let statement = release("v9.0.0", 0x11);
+    // A node of another release hands the delegation to the node of the reserve role, whose
+    // measurement the release proofs of its release show: the transfer is on the log of the
+    // account on both nodes, and the entry of the node of the reserve role is a control
+    // entry.
     let exported = export_to(
         &earlier.node,
-        &as_release(&reserve, "v9.0.0"),
-        Some(&statement),
+        &as_release(&reserve, "v9.0.0", 0x11),
         "",
         1000,
         None,
@@ -1079,7 +1078,7 @@ async fn a_node_of_the_reserve_role_takes_and_gives_the_transfers_of_another_rel
     let envelope = serde_json::to_value(&exported.envelope).unwrap();
     let imported = import_from(
         &reserve.node,
-        &as_release(&earlier, "v2.3.0"),
+        &as_release(&earlier, "v2.3.0", 0x31),
         &envelope,
         None,
     )
@@ -1097,14 +1096,12 @@ async fn a_node_of_the_reserve_role_takes_and_gives_the_transfers_of_another_rel
         )
     );
 
-    // The node of the reserve role hands the delegation on to a node of a later release:
+    // The node of the reserve role hands the delegation on to a node of a further release:
     // the entry that names that node, its release and its measurement is in the store
     // before the grant leaves.
-    let statement = release("v9.1.0", 0x21);
     let exported = export_to(
         &reserve.node,
-        &as_release(&later, "v9.1.0"),
-        Some(&statement),
+        &as_release(&later, "v9.1.0", 0x21),
         "",
         1000,
         None,

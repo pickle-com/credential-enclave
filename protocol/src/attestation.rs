@@ -277,8 +277,9 @@ fn parse_nitro_document(
 }
 
 /// The certificates of an attestation document are not TLS certificates, and protocol.md 4.3
-/// names no extended key usage: every purpose is accepted. A malformed extension is not.
-struct AnyKeyPurpose;
+/// names no extended key usage: every purpose is accepted. A malformed extension is not. The
+/// certificate of a release proof is validated with the same rule (`release_proofs.rs`).
+pub(crate) struct AnyKeyPurpose;
 
 impl ExtendedKeyUsageValidator for AnyKeyPurpose {
     fn validate(&self, purposes: KeyPurposeIdIter<'_, '_>) -> Result<(), webpki::Error> {

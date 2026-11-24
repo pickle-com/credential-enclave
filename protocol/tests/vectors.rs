@@ -13,9 +13,6 @@ use credential_enclave_protocol::keys::{self, Custody, LogStoreId, NodeKeys};
 use credential_enclave_protocol::log::{self, EntryKind, EntryParts, Head, Last, ParsedKey};
 use credential_enclave_protocol::purpose;
 use credential_enclave_protocol::record::{open_record, record_aad, seal_record, Record};
-use credential_enclave_protocol::release::{
-    public_key_der, verify_endorsement, LogEntry, LogForm, ReleaseKeys, TransparencyLog,
-};
 use credential_enclave_protocol::secret::Secret;
 use credential_enclave_protocol::subset;
 use credential_enclave_protocol::totp::totp;
@@ -981,79 +978,6 @@ fn totp_codes() {
             text(case, "code")
         );
     }
-}
-
-#[test]
-fn endorsements() {
-    let vector = &vectors()["endorsement"];
-    let release_key = public_key_der(text(vector, "release_key_pem")).unwrap();
-    // The table of the giving node: one log of each form.
-    let logs: Vec<TransparencyLog> = vector["logs"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|row| {
-            let key = public_key_der(text(row, "key_pem")).unwrap();
-            let log = match text(row, "form") {
-                "rekor_v1" => TransparencyLog::rekor_v1(&key),
-                "rekor_v2" => TransparencyLog::rekor_v2(text(row, "origin"), &key),
-                other => panic!("a log of the form {other}"),
-            }
-            .unwrap();
-            assert_eq!(log.id(), text(row, "log_id"));
-            log
-        })
-        .collect();
-    assert_eq!(
-        logs.iter().map(TransparencyLog::form).collect::<Vec<_>>(),
-        [LogForm::RekorV1, LogForm::RekorV2]
-    );
-    let keys = ReleaseKeys {
-        release: &release_key,
-        logs: &logs,
-    };
-    let cases = vector["cases"].as_array().unwrap();
-    // An entry of each form holds, and every check has a case that fails it.
-    let mut failed = std::collections::BTreeSet::new();
-    let mut accepted = std::collections::BTreeSet::new();
-    for case in cases {
-        let name = text(case, "name");
-        let endorsement = &case["endorsement"];
-        let entry = LogEntry::read(&endorsement["entry"]).unwrap();
-        let statement = bytes(endorsement, "statement");
-        let verdict = verify_endorsement(
-            &statement,
-            &entry,
-            &keys,
-            text(case, "own_release"),
-            case["now_s"].as_u64().unwrap(),
-        );
-        assert_eq!(
-            verdict.is_ok(),
-            case["accepted"].as_bool().unwrap(),
-            "{name}"
-        );
-        assert_eq!(
-            verdict
-                .as_ref()
-                .err()
-                .map(|failure| u64::from(failure.check())),
-            case["check"].as_u64(),
-            "{name}"
-        );
-        match verdict {
-            Ok(later) => {
-                assert_eq!(later.release, text(vector, "release"), "{name}");
-                assert_eq!(statement, text(vector, "statement_text").as_bytes());
-                accepted.insert(text(&endorsement["entry"], "log_id"));
-            }
-            Err(failure) => {
-                failed.insert(failure.check());
-            }
-        }
-    }
-    assert_eq!(failed.into_iter().collect::<Vec<_>>(), [1, 2, 3, 4, 5, 6]);
-    assert_eq!(accepted.len(), 2);
 }
 
 #[test]
