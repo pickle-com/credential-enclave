@@ -8,6 +8,7 @@
 "use strict";
 
 const bridge = require("./bridge.js");
+const model = require("./proofs.js");
 
 const HOUR_MS = 3600000;
 const DAY_MS = bridge.DAY_MS;
@@ -15,36 +16,46 @@ const DAY_MS = bridge.DAY_MS;
 /** A fixture: a world with an account whose key state is present, and the program that runs on
  *  it. options:
  *    target      the server target of the world (prod)
- *    legacy      the number of nodes of the latest release the checked-out program lists among
- *                the releases that write format 2 (the releases before v2.4.0); 0 when absent
- *    nodes       the number of nodes of release v2.4.0 (format 3), listed by the program of the
- *                fixture under a measurement of the fixture; 1 when absent
+ *    legacy      the number of nodes of the latest release the checked-out program lists (a
+ *                release whose nodes write format 2); 0 when absent
+ *    nodes       the number of nodes of release v2.4.0 (format 3), of a measurement of the
+ *                fixture that no list has; 1 when absent
+ *    proofs      false for a backend that holds no release proofs of release v2.4.0
  *    account     false for a device without a master key and an account without a registered key
  *    device      the build of the device (bridge.js World.device)
  *    served      what the backend says of the program it serves (served_program_version of the
  *                account query): the version of the program of the fixture when absent (a backend
  *                that serves this program), and null for a backend that names no version
- *  Returns {world, keys, source, release, measurement, latest, nodes, legacy, version}: source is
- *  the program with release v2.4.0 listed, and version the VERSION of the program. */
+ *  Release v2.4.0 is accepted as a release of the public repository is: by its release proofs.
+ *  The fixture has parties that make release proofs (proofs.js), the backend of the world holds
+ *  the proofs of release v2.4.0 for the measurement of the fixture, and the program of the
+ *  fixture holds the keys and the certificates of those parties in the place of its constants.
+ *  (A program without release proofs, one before v43, lists the release in the place of that.)
+ *  Returns {world, keys, source, release, measurement, latest, nodes, legacy, version, parties}:
+ *  source is that program, and version the VERSION of the program. */
 function fixture(source, options) {
   const given = options || {};
   const world = new bridge.World({ serverTarget: given.target || "prod", device: given.device });
   const keys = given.account === false ? null : world.createAccount();
   const version = Number(/const VERSION = (\d+);/.exec(source)[1]);
   world.account.servedProgram = given.served === undefined ? version : given.served === null ? undefined : given.served;
-  const listed = bridge.listedMeasurements(source).filter((item) => !bridge.writesFormat3(item.release));
+  const listed = bridge.listedMeasurements(source);
   const latest = listed[listed.length - 1];
   const measurement = bridge.randomMeasurement();
+  const proven = source.indexOf("\n  const PROOF_BUILDERS = ") >= 0;
+  const parties = proven ? model.makeParties() : null;
   const out = {
-    world: world, keys: keys, source: bridge.withListedRelease(source, "v2.4.0", measurement),
+    world: world, keys: keys,
+    source: proven ? model.withParties(source, parties) : bridge.withListedRelease(source, "v2.4.0", measurement),
     release: "v2.4.0", measurement: measurement, latest: latest, nodes: [], legacy: [], program: null,
-    version: version,
+    version: version, parties: parties,
   };
+  if (proven && given.proofs !== false) world.releaseProofs.set("v2.4.0", model.proofsOf(parties, "v2.4.0", measurement));
   for (let i = 0; i < (given.legacy === undefined ? 0 : given.legacy); i += 1) {
     out.legacy.push(world.addNode({ release: latest.release, measurement: latest }));
   }
   for (let i = 0; i < (given.nodes === undefined ? 1 : given.nodes); i += 1) {
-    out.nodes.push(world.addNode({ release: "v2.4.0", measurement: measurement }));
+    out.nodes.push(world.addNode({ release: "v2.4.0", measurement: measurement, format: 3 }));
   }
   return out;
 }

@@ -15,6 +15,8 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
 const vm = require("node:vm");
 
 // ---- Bytes ----
@@ -332,32 +334,43 @@ function shardBucket(env, owner) {
   return sha("sha256", utf8(tail)).subarray(0, 4).toString("hex") + "-" + tail;
 }
 
-/** Whether a release writes format 3 (from v2.4.0 on). */
-function writesFormat3(release) {
-  const match = /^v(\d+)\.(\d+)\.(\d+)/.exec(release);
-  if (match === null) return false;
-  const major = Number(match[1]);
-  return major > 2 || (major === 2 && Number(match[2]) >= 4);
+// The measurements of the lists of the program of this checkout (ACCEPTED_RELEASES and
+// PRERELEASE_BUILDS), read at the first use: the builds whose nodes write a chain of format 1 or
+// format 2.
+let listedBuilds = null;
+
+/** The format a node of the model writes when its fixture names none: the format of the element
+ *  of the lists of the program whose measurement the node has (a node of platform local: whose
+ *  release name it has), and format 3 for every other node. The name of a release decides
+ *  nothing for a nitro node: a node with the name of a listed release and another measurement
+ *  writes format 3. A node of a listed build writes a chain of format 2 in this model. */
+function formatOf(platform, release, measurement) {
+  if (listedBuilds === null) {
+    const source = fs.readFileSync(path.join(__dirname, "..", "secure-program.js"), "utf8");
+    listedBuilds = listedMeasurements(source).concat(listedMeasurements(source, "PRERELEASE_BUILDS"));
+  }
+  const listed = listedBuilds.some((build) => platform === "local"
+    ? build.release === release
+    : measurement !== undefined && build.pcr0 === measurement.pcr0 && build.pcr1 === measurement.pcr1 && build.pcr2 === measurement.pcr2);
+  return listed ? 2 : 3;
 }
 
 /** One enclave node of the model: its keys, its release and measurement, the entries it wrote for
  *  the accounts and the grants it holds. The node id is the b64u of its signing public key. A node
- *  of a release from v2.4.0 on writes format 3 and its node document; a node of an earlier release
- *  writes a chain of format 2 into the bucket its binding names. */
+ *  that writes format 3 writes its node document as well; a node of a listed build writes a chain
+ *  of format 2 into the bucket its binding names (formatOf, unless the fixture names the format). */
 class Node {
   constructor(world, options) {
     this.world = world;
     this.release = options.release;
     this.measurement = options.measurement;
     this.platform = options.platform || "nitro";
-    this.format = options.format || (writesFormat3(options.release) ? 3 : 2);
+    this.format = options.format || formatOf(this.platform, options.release, options.measurement);
     this.role = options.role;
-    // The lowest version of the program whose grant command the node takes (the program_min of
-    // its binding); undefined for a binding that states none.
-    this.programMin = options.programMin;
-    // The release proofs the node document of this node carries (release_proofs); undefined for
-    // a document without them.
-    this.documentProofs = options.documentProofs;
+    // Further members of the binding of this node (a member this program does not read).
+    this.bindingMore = options.bindingMore;
+    // Further members of the node document of this node (a member this program does not read).
+    this.documentMore = options.documentMore;
     // The log store the binding names: the store of the world unless the fixture names another
     // (or null for a binding without log).
     this.log = options.log === undefined ? { bucket: world.bucket, region: world.region } : options.log;
@@ -386,8 +399,7 @@ class Node {
     const binding = { v: 1, sign: b64u(this.signPk), seal: b64u(this.sealPk), release: this.release };
     if (this.log !== null) binding.log = this.log;
     if (this.role !== undefined) binding.role = this.role;
-    if (this.programMin !== undefined) binding.program_min = this.programMin;
-    return binding;
+    return Object.assign(binding, this.bindingMore === undefined ? {} : this.bindingMore);
   }
 
   /** The document of the platform over the binding of this node and nonce (bytes). */
@@ -442,8 +454,7 @@ class Node {
       v: 1, platform: this.platform, document: b64u(this.platformDocument(nonce)), node: this.id,
       release: this.release,
     };
-    if (this.documentProofs !== undefined) object.release_proofs = this.documentProofs;
-    return object;
+    return Object.assign(object, this.documentMore === undefined ? {} : this.documentMore);
   }
 
   writeDocument() {
@@ -662,15 +673,17 @@ class World {
     this.ledgerUploads = 0;
     // The attestation documents the backend kept of the nodes of releases before v2.4.0.
     this.keptDocuments = new Map();
-    // The release proofs the backend holds, by release: it hands them out with the attestation
-    // of a node of that release when a request asks for them (the query proofs), or with every
-    // attestation when proofsUnasked is set, and for the measurement their statement states
-    // when a request names its digest (GET /api/secure/release-proofs; routes.proofs false: a
-    // backend without that route). measureProofs holds what the backend hands out for a digest
-    // in the place of that (by the digest of a measurement).
+    // The release proofs the backend holds, by release: it hands them out for the measurement
+    // their statement states when a request names its digest (GET /api/secure/release-proofs
+    // with the query measurement; routes.proofs false: a backend without that route). With
+    // proofsWrapped the answer holds them as its member release_proofs. measureProofs holds
+    // what the backend hands out for a digest in the place of that (by the digest of a
+    // measurement). attestationMore: further members of every attestation response (members
+    // this program does not read).
     this.releaseProofs = new Map();
-    this.proofsUnasked = false;
+    this.proofsWrapped = false;
     this.measureProofs = new Map();
+    this.attestationMore = null;
     this.routes.proofs = true;
   }
 
@@ -939,18 +952,17 @@ class World {
         const wanted = query.nodes.split(",");
         nodes = wanted.map((id) => this.nodes.get(id)).filter((node) => node !== undefined && node.alive);
       }
-      const proofs = query.proofs === "1" || this.proofsUnasked;
       return json(200, {
         nodes: nodes.map((node, index) => {
           const response = Object.assign(node.attestation(query.nonce), { pod: index });
-          if (proofs && this.releaseProofs.has(node.release)) response.release_proofs = this.releaseProofs.get(node.release);
+          if (typeof this.attestationMore === "function") Object.assign(response, this.attestationMore(node));
           return response;
         }),
       });
     }
     if (method === "GET" && path === "/api/secure/release-proofs") {
       if (!this.routes.proofs) return absent();
-      const wanted = typeof query.measures === "string" && query.measures !== "" ? query.measures.split(",") : [];
+      const digest = typeof query.measurement === "string" ? query.measurement : "";
       // The digest of the measurement a statement states: the base64url SHA-256 of its three
       // PCR values in hexadecimal, one after another.
       const held = new Map();
@@ -962,12 +974,9 @@ class World {
           // (Proofs without a statement that reads are handed out for no measurement.)
         }
       }
-      const answer = [];
-      for (const digest of wanted) {
-        const proofs = this.measureProofs.has(digest) ? this.measureProofs.get(digest) : held.get(digest);
-        if (proofs !== undefined) answer.push({ measure: digest, release_proofs: proofs });
-      }
-      return json(200, { proofs: answer });
+      const proofs = this.measureProofs.has(digest) ? this.measureProofs.get(digest) : held.get(digest);
+      if (proofs === undefined) return json(404, { detail: "release_proofs_not_found" });
+      return json(200, this.proofsWrapped ? { release_proofs: proofs } : proofs);
     }
     const nodeRoute = /^\/api\/secure\/nodes\/([A-Za-z0-9_-]{43})\/(messages|status)$/.exec(path);
     if (nodeRoute !== null && method === "POST") {
@@ -1527,16 +1536,21 @@ function loadProgram(source, world) {
   return program;
 }
 
-/** The measurements of ACCEPTED_RELEASES of a program source, in the order of the list, each with
- *  log_store (true when the element says so: the node writes the log entry to the log store). */
-function listedMeasurements(source) {
-  const start = source.indexOf("const ACCEPTED_RELEASES = [");
+/** The measurements of a list of a program source (ACCEPTED_RELEASES unless name gives another:
+ *  PRERELEASE_BUILDS), in the order of the list, each with the marks of the log of its nodes:
+ *  log_format (0 for an element that states none) and log_store (true when the element says so:
+ *  the node writes the log entry to the log store). */
+function listedMeasurements(source, name) {
+  const start = source.indexOf("const " + (name || "ACCEPTED_RELEASES") + " = [");
   const end = source.indexOf("];", start);
-  const pattern = /release: "([^"]+)",\s*pcr0: "([0-9a-f]{96})",\s*pcr1: "([0-9a-f]{96})",\s*pcr2: "([0-9a-f]{96})",(\s*log_store: true,)?/g;
+  const pattern = /release: "([^"]+)",\s*pcr0: "([0-9a-f]{96})",\s*pcr1: "([0-9a-f]{96})",\s*pcr2: "([0-9a-f]{96})",(\s*log_format: ([0-9]+),)?(\s*log_store: true,)?/g;
   const out = [];
   let match = pattern.exec(source.slice(start, end));
   while (match !== null) {
-    out.push({ release: match[1], pcr0: match[2], pcr1: match[3], pcr2: match[4], log_store: match[5] !== undefined });
+    out.push({
+      release: match[1], pcr0: match[2], pcr1: match[3], pcr2: match[4],
+      log_format: match[6] === undefined ? 0 : Number(match[6]), log_store: match[7] !== undefined,
+    });
     match = pattern.exec(source.slice(start, end));
   }
   return out;
@@ -1557,9 +1571,11 @@ function randomMeasurement() {
   };
 }
 
-/** The source of a program that lists one more release: the same program with one more element at
- *  the end of ACCEPTED_RELEASES, and the version given when one is given (the program the operator
- *  serves once it lists the release). */
+/** The source of a program whose list holds one more measurement: the same program with one
+ *  more element at the end of ACCEPTED_RELEASES, without log_format (its nodes write format 3),
+ *  and with the version given when one is given. The list of the program is closed (a release
+ *  after its elements is accepted by its release proofs); a test uses such a source where it
+ *  needs a program that accepts a measurement without proofs. */
 function withListedRelease(source, release, measurement, version) {
   const start = source.indexOf("const ACCEPTED_RELEASES = [");
   const end = source.indexOf("  ];", start);
@@ -1576,5 +1592,5 @@ module.exports = {
   aeadSeal, aeadOpen, hpkeSeal, hpkeOpen, hpkeDeriveKeyPair,
   cbor, SecureError, signedValue, deriveAccountKeys,
   Node, World, makeNative, loadProgram, listedMeasurements, declaredVersion, randomMeasurement,
-  withListedRelease, writesFormat3, shardBucket, SHARDS, DAY_MS, RTIME_MAX,
+  withListedRelease, formatOf, shardBucket, SHARDS, DAY_MS, RTIME_MAX,
 };

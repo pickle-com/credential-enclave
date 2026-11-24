@@ -1,10 +1,10 @@
 // The model of the parties that make release proofs, for the tests of the secure program
-// (docs/protocol.md, "The release proofs"): an operator with a release key and deploy keys, a
-// transparency log of the form Rekor v1 (it signs an entry timestamp, holds its entries in a
-// Merkle tree and signs the head of that tree), a certificate authority that issues a certificate
-// to a workflow run as Fulcio does, and the release workflow that attests a release statement
-// with the key of such a certificate. Every key is made here and signs what a test asks for, so a
-// test can state proofs that hold and proofs that differ from them in one place.
+// (docs/protocol.md, "The release proofs"): a transparency log of the form Rekor v1 (it signs an
+// entry timestamp, holds its entries in a Merkle tree and signs the head of that tree), a
+// certificate authority that issues a certificate to a workflow run as Fulcio does, and the build
+// workflow that attests a release statement with the key of such a certificate. Every key is made
+// here and signs what a test asks for, so a test can state proofs that hold and proofs that
+// differ from them in one place.
 //
 // The crypto is that of Node. The certificates are X.509 in DER, written by the small encoder of
 // this file with the fields and extensions the program reads.
@@ -231,38 +231,36 @@ function makeLog(origin) {
   return log;
 }
 
-// ---- The operator ----
+// ---- The parties ----
 
-function ed25519KeyPair() {
-  const pair = crypto.generateKeyPairSync("ed25519");
-  return { privateKey: pair.privateKey, publicKey: b64u(pair.publicKey.export({ format: "der", type: "spki" }).subarray(12)) };
-}
-
-/** The parties of release proofs: the release key and the deploy keys of an operator, a
- *  transparency log and a certificate authority. */
+/** The parties of release proofs: a transparency log and a certificate authority. */
 function makeParties() {
-  return {
-    release: ecKeyPair("prime256v1"),
-    deploy: { prod: ed25519KeyPair(), dev: ed25519KeyPair() },
-    log: makeLog(),
-    authority: makeAuthority(),
-  };
+  return { log: makeLog(), authority: makeAuthority() };
 }
 
-const DEPLOY_CONTEXT = "pickle-enclave-release-statement-v1\n";
 const REPOSITORY = "https://github.com/pickle-com/credential-enclave";
 
-/** What a program holds of the signer of an attestation: {workflow, commit, caller}, the path of
- *  the build workflow, the commit of that workflow file and the path of the workflow that calls
- *  it (the constants PROOF_BUILD_WORKFLOW, PROOF_BUILD_COMMIT and PROOF_RELEASE_WORKFLOW of the
- *  source). */
+/** The build workflows a program takes as the signer of an attestation: [{workflow, commit}],
+ *  the elements of the constant PROOF_BUILDERS of the source. */
+function buildersOf(source) {
+  const match = /\n  const PROOF_BUILDERS = \[([\s\S]*?)\n  \];\n/.exec(source);
+  if (match === null) throw new Error("the program has no constant PROOF_BUILDERS");
+  const builders = [];
+  const pattern = /\{\s*workflow: "([^"\n]*)",\s*commit: "([^"\n]*)"\s*\}/g;
+  let element = pattern.exec(match[1]);
+  while (element !== null) {
+    builders.push({ workflow: element[1], commit: element[2] });
+    element = pattern.exec(match[1]);
+  }
+  return builders;
+}
+
+/** What a program holds of the first build workflow it takes: {workflow, commit, caller}. caller
+ *  is the path of the workflow that calls it in this model (a value no program judges). */
 function pinsOf(source) {
-  const read = (name) => {
-    const match = new RegExp("\\n  const " + name + " = \"([^\"\\n]*)\";\\n").exec(source);
-    if (match === null) throw new Error("the program has no constant " + name);
-    return match[1];
-  };
-  return { workflow: read("PROOF_BUILD_WORKFLOW"), commit: read("PROOF_BUILD_COMMIT"), caller: read("PROOF_RELEASE_WORKFLOW") };
+  const builders = buildersOf(source);
+  if (builders.length === 0) throw new Error("the program takes no build workflow");
+  return { workflow: builders[0].workflow, commit: builders[0].commit, caller: ".github/workflows/release.yml" };
 }
 
 // The values of the program of this checkout: the attestations of this model are those of the
@@ -280,45 +278,6 @@ function statementOf(release, measurement, more) {
     release: release, git_commit: COMMIT,
     pcr0: measurement.pcr0, pcr1: measurement.pcr1, pcr2: measurement.pcr2, inputs: {},
   }, more || {}), null, 2) + "\n", "utf8");
-}
-
-/** The deploy signature of a key over a statement: standard base64. */
-function deploySignature(key, statement, context) {
-  const message = Buffer.from((context === undefined ? DEPLOY_CONTEXT : context) + sha256(statement).toString("hex") + "\n", "utf8");
-  return b64(crypto.sign(null, message, key.privateKey));
-}
-
-/** The entry of a transparency log that records the signature of the release key over a
- *  statement, as an endorsement carries it (docs/protocol.md 10.3). options change one part:
- *    signer        the key pair that signs (the release key)
- *    signed        the bytes it signs (the statement)
- *    hashed        the bytes whose hash the record states (the statement)
- *    loggedKey     the PEM the record names (that of signer)
- *    log           the log that takes the entry (parties.log)
- *    record        (record) => void: changes the record before the log takes it
- *    integratedTime, logIndex  what the log states for the entry */
-function recordedEntry(parties, statement, options) {
-  const given = options || {};
-  const signer = given.signer || parties.release;
-  const log = given.log || parties.log;
-  const record = {
-    apiVersion: "0.0.1", kind: "hashedrekord",
-    spec: {
-      data: { hash: { algorithm: "sha256", value: sha256(given.hashed || statement).toString("hex") } },
-      signature: {
-        content: b64(ecdsaSign(signer, "sha256", given.signed || statement)),
-        publicKey: { content: b64(Buffer.from(given.loggedKey || signer.pem, "utf8")) },
-      },
-    },
-  };
-  if (given.record) given.record(record);
-  const body = b64(Buffer.from(JSON.stringify(record), "utf8"));
-  const integratedTime = given.integratedTime === undefined ? 1795000000 : given.integratedTime;
-  const logIndex = given.logIndex === undefined ? 4100000000 : given.logIndex;
-  return {
-    log_id: log.id, body: body, integrated_time: integratedTime, log_index: logIndex,
-    signed_entry_timestamp: log.promise(body, integratedTime, logIndex),
-  };
 }
 
 /** The values the certificate of the attestation of the release statement of a release states,
@@ -339,9 +298,9 @@ function identityOf(release, commit) {
 
 /** The attestation of a release statement as the job of the build workflow makes it: a Sigstore
  *  bundle with the certificate of the run, the envelope of the in-toto statement and the entry
- *  of the log. stated is {release, pcr0, pcr1, pcr2, program_min, git_commit}, the values of
- *  the predicate (program_min and git_commit when it has them); the certificate states
- *  git_commit as the commit that started the run. options change one part:
+ *  of the log. stated is {release, pcr0, pcr1, pcr2, git_commit}, the values of the predicate
+ *  (git_commit when it has one); the certificate states git_commit as the commit that started
+ *  the run. options change one part:
  *    identity      {number: text or null}: replaces or leaves out extensions of the certificate
  *    certificate   options of certificate() for the certificate of the run
  *    issuer        the authority that issues the certificate (parties.authority)
@@ -369,8 +328,7 @@ function attestationOf(parties, stated, options) {
     predicateType: given.predicateType === undefined ? PREDICATE_TYPE : given.predicateType,
     predicate: given.predicate || Object.assign(
       { release: stated.release, pcr0: stated.pcr0, pcr1: stated.pcr1, pcr2: stated.pcr2 },
-      stated.program_min === undefined ? {} : { program_min: stated.program_min },
-      stated.git_commit === undefined ? {} : { git_commit: stated.git_commit }),
+      stated.git_commit === undefined ? {} : { git_commit: stated.git_commit }, { inputs: {} }),
   };
   const payload = Buffer.from(JSON.stringify(statement), "utf8");
   const payloadType = given.payloadType === undefined ? PAYLOAD_TYPE : given.payloadType;
@@ -421,42 +379,31 @@ function commitOf(statement) {
   }
 }
 
-/** The release proofs of a release with a measurement, by the parties: {statement, entry,
- *  deploy_signatures, attestation}. options:
+/** The release proofs of a release with a measurement, by the parties: {statement,
+ *  attestation}. options:
  *    statement     the bytes of the release statement (statementOf(release, measurement))
- *    entry         options of recordedEntry
- *    deploy        the value of deploy_signatures (one signature of each deploy key)
  *    attested      the values of the predicate of the attestation (those of the statement).
  *                  Values that name no git_commit take the one of the statement
  *    attestation   options of attestationOf */
 function proofsOf(parties, release, measurement, options) {
   const given = options || {};
-  // programMin: the statement states that program_min, and the attestation states it with it.
-  const stated = given.programMin === undefined ? {} : { program_min: given.programMin };
-  const statement = given.statement || statementOf(release, measurement, stated);
+  const statement = given.statement || statementOf(release, measurement);
   return {
     statement: b64u(statement),
-    entry: recordedEntry(parties, statement, given.entry),
-    deploy_signatures: given.deploy || [
-      { key_id: "dev", signature: deploySignature(parties.deploy.dev, statement) },
-      { key_id: "prod", signature: deploySignature(parties.deploy.prod, statement) },
-    ],
     attestation: attestationOf(parties, Object.assign(
       commitOf(statement) === undefined ? {} : { git_commit: commitOf(statement) },
-      given.attested || Object.assign({ release: release }, measurement, stated)), given.attestation),
+      given.attested || Object.assign({ release: release }, measurement)), given.attestation),
   };
 }
 
 /** The source of a program whose constants of the release proofs are those of the parties: the
- *  same program with the release key, the log keys, the two certificates of the certificate
- *  authority and the deploy keys of the parties in the place of those of the operator, Sigstore
- *  and Rekor. logs replaces the log keys ([spki]: the key of parties.log when absent). */
+ *  same program with the log keys and the two certificates of the certificate authority of the
+ *  parties in the place of those of Sigstore and Rekor. logs replaces the log keys ([spki]: the
+ *  key of parties.log when absent). */
 function withParties(source, parties, logs) {
-  let patched = withConstant(source, "RELEASE_KEY", JSON.stringify(b64u(parties.release.spki)));
-  patched = withConstant(patched, "PROOF_LOG_KEYS", JSON.stringify((logs || [parties.log.key.spki]).map(b64u)));
+  let patched = withConstant(source, "PROOF_LOG_KEYS", JSON.stringify((logs || [parties.log.key.spki]).map(b64u)));
   patched = withConstant(patched, "FULCIO_ROOT", JSON.stringify(b64u(parties.authority.root)));
-  patched = withConstant(patched, "FULCIO_INTERMEDIATE", JSON.stringify(b64u(parties.authority.intermediate)));
-  return withDeployKeys(patched, parties.deploy);
+  return withConstant(patched, "FULCIO_INTERMEDIATE", JSON.stringify(b64u(parties.authority.intermediate)));
 }
 
 /** The source of a program whose constant name has the value given (a JavaScript expression). */
@@ -466,14 +413,14 @@ function withConstant(source, name, value) {
   return source.replace(pattern, (match, head) => head + " " + value + ";\n");
 }
 
-/** The source of a program whose deploy keys are the two given ({prod, dev}, each a key pair of
- *  ed25519KeyPair): the same program with them in the place of the deploy keys of the operator. */
-function withDeployKeys(source, deploy) {
-  return withConstant(source, "DEPLOY_KEYS", JSON.stringify({ prod: deploy.prod.publicKey, dev: deploy.dev.publicKey }));
+/** The source of a program that takes the build workflows given ([{workflow, commit}]) as the
+ *  signers of an attestation. */
+function withBuilders(source, builders) {
+  return withConstant(source, "PROOF_BUILDERS", JSON.stringify(builders));
 }
 
 module.exports = {
   b64, b64u, sha256, der, pem, ecKeyPair, ecdsaSign, certificate, makeAuthority, makeLog, treeHash, auditPath,
-  ed25519KeyPair, makeParties, statementOf, deploySignature, recordedEntry, identityOf, attestationOf, proofsOf,
-  withParties, withConstant, withDeployKeys, pinsOf, PINS, COMMIT, DEPLOY_CONTEXT, REPOSITORY, PREDICATE_TYPE, PAYLOAD_TYPE,
+  makeParties, statementOf, identityOf, attestationOf, proofsOf, commitOf,
+  withParties, withConstant, withBuilders, buildersOf, pinsOf, PINS, COMMIT, REPOSITORY, PREDICATE_TYPE, PAYLOAD_TYPE,
 };

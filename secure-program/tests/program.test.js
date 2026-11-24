@@ -16,6 +16,7 @@ const test = require("node:test");
 
 const bridge = require("./bridge.js");
 const S = require("./scenarios.js");
+const model = require("./proofs.js");
 
 const PROGRAM_PATH = path.join(__dirname, "..", "secure-program.js");
 const source = fs.readFileSync(PROGRAM_PATH, "utf8");
@@ -687,27 +688,48 @@ test("a node of platform local is accepted by a build for the local stack, a deb
   }
 });
 
-test("a node of a release the program does not list and no release proofs show receives no grant, is asked for its attestation and once more for the release proofs of its release, and leaves the log pending for a day", async () => {
+test("a node of a measurement no list has and no release proofs show receives no grant: it is asked for its attestation once, the backend is asked for the release proofs of its measurement, and the log is pending for a day; release proofs the backend comes to hold hand the node its grant", async () => {
   const fx = S.fixture(source);
   const world = fx.world;
   const later = world.addNode({ release: "v2.5.0", measurement: bridge.randomMeasurement() });
+  const digest = b64u(crypto.createHash("sha256").update(later.measurement.pcr0 + later.measurement.pcr1 + later.measurement.pcr2).digest());
+  const asked = () => world.sent("GET /api/secure/release-proofs").filter((request) => request.query.measurement === digest).length;
   await S.start(fx);
   assert.equal(later.grants.has(world.userId), false);
   assert.equal(world.state.grant.state, "active");
   assert.equal(world.state.log.status, "pending");
   assert.equal(world.state.log.newer_release_nodes, 1);
   assert.equal(world.runtime.rejected_nodes, 0);
-  assert.equal(later.attestations, 2);
+  assert.equal(later.attestations, 1);
+  assert.equal(asked(), 1);
+  // Half an hour later the node is not asked for its attestation again: the backend is asked
+  // for the proofs of its measurement once more (five minutes passed since its last answer).
   world.advance(HOUR_MS / 2);
   await S.event(fx, "foreground");
-  assert.equal(later.attestations, 2);
+  assert.equal(later.attestations, 1);
+  assert.equal(asked(), 2);
+  assert.equal(later.grants.has(world.userId), false);
   // The measurement held no key of the account: after the day it is not counted.
   await nextDay(fx);
   assert.equal(world.state.log.status, "verified");
   assert.equal(world.state.log.newer_release_nodes, 0);
-  // The program that lists the release hands that node a grant.
-  await S.start(fx, bridge.withListedRelease(fx.source, "v2.5.0", later.measurement, 44));
+  assert.equal(later.attestations, 1);
+  // The backend comes to hold the release proofs of that release: the next step of the grants
+  // verifies them, asks the node for its attestation and hands it its grant, with the program
+  // as it is.
+  world.releaseProofs.set("v2.5.0", model.proofsOf(fx.parties, "v2.5.0", later.measurement));
+  world.advance(HOUR_MS);
+  await S.event(fx, "foreground");
+  assert.equal(later.attestations, 2);
   assert.equal(later.grants.has(world.userId), true);
+  assert.equal(world.stored("log.grants")[later.id].format, 3);
+  assert.equal(world.stored("log.grants")[later.id].store, true);
+  // The verdict is kept: a later runtime asks for no proofs of that measurement.
+  const before = asked();
+  await nextDay(fx);
+  await S.start(fx);
+  assert.equal(asked(), before);
+  assert.equal(world.state.log.status, "verified");
 });
 
 test("a device without a master key judges the key and calls no node", async () => {
@@ -4503,9 +4525,10 @@ test("a runtime that knows a later program is served judges nothing: a node of a
     await S.event(fx, "background");
     await world.settle(1000);
     unchanged("day " + day);
-    // The node of the new release was asked for its attestation, and once more for the release
-    // proofs of its release, once in the runtime, and holds no grant.
-    assert.equal(attested(), before + 2, "day " + day);
+    // The node of the new release was asked for its attestation once in the runtime (the
+    // backend was asked for the release proofs of its measurement, and holds none), and holds
+    // no grant.
+    assert.equal(attested(), before + 1, "day " + day);
     assert.equal(listed.grants.has(world.userId), false, "day " + day);
     world.clearFaults();
   }
