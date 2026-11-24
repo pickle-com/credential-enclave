@@ -111,7 +111,7 @@
     ],
     "id_token_claims": [],
     "api": [
-      {"host": "api.notion.com", "prefixes": ["/v1/pages", "/v1/blocks/", "/v1/databases/", "/v1/data_sources/"], "exact": ["/v1/search"]}
+      {"host": "api.notion.com", "prefixes": ["/v1/pages", "/v1/blocks/", "/v1/databases/", "/v1/data_sources/"], "exact": ["/v1/search", "/v1/comments"]}
     ]
   },
   "x": {

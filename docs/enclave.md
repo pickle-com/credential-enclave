@@ -1962,7 +1962,7 @@ value that the definition does not list does not leave the node.
 | microsoft | `graph.microsoft.com` | Prefix `/v1.0/`. Denied `/v1.0/$batch` |
 | slack | `slack.com` | Exact `/api/conversations.list`, `/api/conversations.history`, `/api/conversations.replies`, `/api/conversations.info`, `/api/auth.test`, `/api/search.messages`, `/api/users.list`, `/api/users.info`, `/api/files.info`, `/api/chat.postMessage`, `/api/files.getUploadURLExternal`, `/api/files.completeUploadExternal` |
 | | `files.slack.com` | Prefix `/files-pri/` |
-| notion | `api.notion.com` | Prefixes `/v1/pages`, `/v1/blocks/`, `/v1/databases/`, `/v1/data_sources/`. Exact `/v1/search` |
+| notion | `api.notion.com` | Prefixes `/v1/pages`, `/v1/blocks/`, `/v1/databases/`, `/v1/data_sources/`. Exact `/v1/search`, `/v1/comments` |
 | x | `api.x.com` | Prefixes `/2/users`, `/2/tweets`, `/2/dm_events` |
 | link | `api.link.com` | Prefix `/spend_requests`. Exact `/userinfo`, `/payment-details`, `/shipping_addresses` |
 | granola | `mcp.granola.ai` | Exact `/mcp` |
