@@ -164,9 +164,11 @@
   //                   alone that the rounds looked for, a table from node id to the expiry the
   //                   list named for the node then)
   //   log.round       the last round: {v, done_ms, tried_ms, last, told, state, unfinished,
-  //                   row_ms} (unfinished: the rounds in a row that had more to read than they
-  //                   read and were not catching up; row_ms: the time that row began, 0 for
-  //                   none)
+  //                   row_ms, chain_read} (unfinished: the rounds in a row that had more to
+  //                   read than they read and were not catching up; row_ms: the time that row
+  //                   began, 0 for none; chain_read: the entries of chains of format 1 and
+  //                   format 2, written at LEGACY_TRANSFER_DOCUMENTS_FROM_MS or later, that
+  //                   the rounds opened since a round last read the chains to their end)
   //   log.cache       the kept screen, sealed (the first page, the time the screen last read
   //                   its listings itself, the summary tally, what it knows of the chains)
   //   log.big         the sizes of the big keys of format 3 the listings named: {key: bytes}
@@ -402,10 +404,32 @@
   // passes at most, and a pass begins only while the round has LEGACY_PASS_RESERVE_MS of its
   // time left, and twice the time the longest pass before it took: a round ends its reading of
   // the chains by those numbers and not because its time passed, on a network that carries
-  // little as on any other.
+  // little as on any other. A round the log screen started makes LEGACY_SCREEN_PASSES passes
+  // at most (the read of the screen waits for that round, and what a chain has beyond those
+  // passes is read on by the rounds of the synchronizations), and a round a synchronization
+  // started makes no further pass while a round the log screen started waits for it to end.
   const LEGACY_ROUND_PASSES = 32;
+  const LEGACY_SCREEN_PASSES = 2;
   const LEGACY_PASS_RESERVE_MS = 20000;
   const LEGACY_ROUND_BODIES = 512;
+  // The entries of chains, written by their nodes at LEGACY_TRANSFER_DOCUMENTS_FROM_MS or
+  // later, that the rounds may open one after another without reading the chains to their end:
+  // as many as 32 rounds open (the rounds of four synchronizations). A round opens the control
+  // entries of format 2 of that time and the entries of format 1; it opens no use entry of
+  // format 2, so the length of a chain is no part of this number. An entry counts here as it
+  // counts among the entries of a round (LEGACY_ROUND_BODIES): one for each object version the
+  // round asks for under its seq (a node writes one, and one more when it repeats a write).
+  // Nodes of the releases of the lists can be made to write control entries of an account
+  // without the user (the delegation handed on from node to node), as many as someone likes
+  // and ahead of time, and a transfer written behind them is read only once they are read. So
+  // beyond this number a round that leaves reads of its chains undone is a round whose reads
+  // are held back (runRound). What the nodes of an account write of such entries in normal
+  // use: one for a grant command (a device renews the grant of a node once a day), for a
+  // connection made or removed, for a revoke, and for a transfer of the delegation. Four
+  // devices that each renew the grants of five such nodes once a day write 8,000 of them in
+  // the 400 days after which the store removes an object, half of this number
+  // (docs/protocol.md, "Formats 1 and 2", states what the accounts of this service wrote).
+  const LEGACY_ROW_ENTRIES = 32 * LEGACY_ROUND_BODIES;
   const LEGACY_SEQ_READS = 8;
   // The seqs at the end of a listing page of a chain that a round reads to see how far the node
   // wrote, when their keys name no control entry, and the object versions a round reads for
@@ -1618,14 +1642,18 @@
     return null;
   }
 
-  /** A count of a JSON value: the value when it is a non-negative integer the program holds
-   *  exactly, otherwise null. With digits true a string of decimal digits without a leading zero
-   *  is a count as well (a lone 0 is one): the form in which an attestation carries its counts. */
-  function countOf(value, digits) {
-    const number = digits && typeof value === "string" && /^(0|[1-9][0-9]{0,15})$/.test(value)
-      ? Number(value) : value;
-    return typeof number === "number" && Number.isSafeInteger(number) && number >= 0 && !Object.is(number, -0)
-      ? number : null;
+  /** A count of an attestation (the time and the index of its log entry, the index and the tree
+   *  size of its inclusion proof): the non-negative integer a string of 1 to 16 decimal digits
+   *  without a leading zero writes (a lone 0 is a count), when the program holds that integer
+   *  exactly; otherwise null. That string is the form in which a bundle carries its counts. A
+   *  count written as a JSON number is none: what a JSON number reads as differs between the
+   *  engines this program runs on for some notations (a number written with many digits that
+   *  lies halfway between two values), so a number would be a count on one platform of the app
+   *  and none on the other, and a string of digits reads the same everywhere. */
+  function countOf(value) {
+    if (typeof value !== "string" || !/^(0|[1-9][0-9]{0,15})$/.test(value)) return null;
+    const number = Number(value);
+    return Number.isSafeInteger(number) ? number : null;
   }
 
   /** One element of DER in bytes at the offset at, before limit: {tag, at, content, end} (its
@@ -2088,7 +2116,10 @@
    *    V4  the log entry is of a log of trust and is the dsse entry (version 0.0.1) of this
    *        payload, this signature and this certificate, and the signed entry timestamp, the
    *        audit path and the checkpoint of the entry verify under the key of that log. An
-   *        entry of another form (a log that signs no entry timestamp among them) is none.
+   *        entry of another form (a log that signs no entry timestamp among them) is none. The
+   *        time and the index of the entry, and the index and the tree size of its inclusion
+   *        proof, are counts written as strings of decimal digits (countOf): an entry that
+   *        writes one of them as a JSON number is none.
    *  The signed certificate timestamps of the certificate are not read: that the certificate was
    *  issued is on the log this function verifies, which holds the certificate. Throws unproven
    *  with the first check that fails. */
@@ -2112,7 +2143,7 @@
     const statement = payload === null ? undefined : parseJson(payload);
     if (payloadType !== PROOF_PAYLOAD_TYPE || !isObject(statement)) throw unproven("v2: payload");
 
-    const integratedTime = countOf(member(entry, "integratedTime"), true);
+    const integratedTime = countOf(member(entry, "integratedTime"));
     if (integratedTime === null) throw unproven("v4: log entry time");
     const leafDer = decodeStrict(certificateText, false);
     const leaf = leafDer === null ? null : readCertificate(leafDer);
@@ -2168,15 +2199,15 @@
     if (loggedCertificate === null || !equal(loggedCertificate, leafDer)) {
       throw unproven("v4: log entry certificate");
     }
-    const logIndex = countOf(member(entry, "logIndex"), true);
+    const logIndex = countOf(member(entry, "logIndex"));
     const timestamp = decodeStrict(member(member(entry, "inclusionPromise"), "signedEntryTimestamp"), false);
     if (logIndex === null || timestamp === null ||
         !ecdsaSigned(log.key, "sha256", signedEntry(bodyText, integratedTime, log.id, logIndex), timestamp)) {
       throw unproven("v4: signed entry timestamp");
     }
     const proof = member(entry, "inclusionProof");
-    const leafIndex = countOf(member(proof, "logIndex"), true);
-    const treeSize = countOf(member(proof, "treeSize"), true);
+    const leafIndex = countOf(member(proof, "logIndex"));
+    const treeSize = countOf(member(proof, "treeSize"));
     const rootHash = decodeStrict(member(proof, "rootHash"), false);
     const hashes = member(proof, "hashes");
     let path = Array.isArray(hashes) && hashes.length <= PROOF_PATH_HASHES ? [] : null;
@@ -2535,6 +2566,19 @@
       return failed.detail === "" ? "proofs" : failed.detail;
     }
     return "";
+  }
+
+  /** Whether this runtime holds no answer of the backend for the release proofs of the
+   *  measurement (by its digest) that is later than its last request for them that failed: it
+   *  has not asked, its last request failed (on its way, at its time limit, or with a status or
+   *  a body that is no answer), or the request ended with its caller. A node of such a
+   *  measurement takes no grant for no other reason than that the backend was not heard: the
+   *  next step asks again, and a procedure that ends without a grant because of it does not
+   *  say that an attestation failed (withGrants). */
+  function proofsUnanswered(digest) {
+    const answered = proofAnswered.get(digest) || 0;
+    const failed = proofFailed.get(digest);
+    return answered === 0 || (failed !== undefined && failed.ms >= answered);
   }
 
   // ---- Keys ----
@@ -3655,14 +3699,30 @@
 
   /** Carries the node ledger of the program before v43 over, once per installation and account:
    *  a node of the ledger with a grant time becomes a grant of this device, and every node the
-   *  ledger explains becomes a chain of format 1 or format 2 this program reads on from the
-   *  verification point of the ledger (closed when that point reached the final head of the node
-   *  or the build of the node wrote no entry to the store). The marks of the earlier program (gaps,
-   *  ends it could not confirm, nodes it could not explain, the time its reads began to fail) are
-   *  not carried over: the first round of this program judges by its own conditions. Nothing is
-   *  carried over while the device holds no master key. The marks of the log of a node carried
-   *  over are those of the name the ledger kept of its release (namedMarks): the program that
-   *  wrote the ledger handed a grant to nodes of listed measurements only. */
+   *  ledger explains becomes a chain of format 1 or format 2 this program reads. The marks of
+   *  the earlier program (gaps, ends it could not confirm, nodes it could not explain, the time
+   *  its reads began to fail) are not carried over: the first round of this program judges by
+   *  its own conditions. Nothing is carried over while the device holds no master key. The
+   *  marks of the log of a node carried over are those of the name the ledger kept of its
+   *  release (namedMarks): the program that wrote the ledger handed a grant to nodes of listed
+   *  measurements only.
+   *
+   *  Where such a chain is read from. The earlier program verified a chain up to a point (the
+   *  verification point of the ledger: a seq, and the time of the entry there), and it judged
+   *  no transfer of the delegation by the measurement of the receiving node. This program
+   *  judges every transfer a node wrote at LEGACY_TRANSFER_DOCUMENTS_FROM_MS or later
+   *  (followLegacy), the ones the earlier program passed among them. So:
+   *    a chain of format 2 is read on from the verification point, and is closed when that
+   *    point reached the final head of the node, only when the ledger keeps the time of the
+   *    entry at that point and that time lies more than LEGACY_SEEK_MARGIN_MS before
+   *    LEGACY_TRANSFER_DOCUMENTS_FROM_MS: nothing the node wrote at that time or later lies
+   *    before an entry it wrote a day earlier by its own clock;
+   *    any other chain of format 2 is read from its first seq and is not closed: the rounds
+   *    find the place of that time in it as they do in every chain (seekProbe), pass what lies
+   *    before it, and judge the transfers after it;
+   *    a chain of format 1 (the last node of such a release ran in October 2026) is read on
+   *    from the verification point, closed when that point reached the final head, and the
+   *    chain of a build that wrote no entry to the store is closed. */
   function migrateLedger() {
     if (native.storeGet(STORE_MIGRATED) !== null || readMasterKey() === null) return;
     const ledger = loadLedger();
@@ -3682,10 +3742,19 @@
       }
       if (legacy.nodes[id] === undefined) {
         const ended = node.final !== null && node.checkpoint.seq >= node.final.seq;
-        legacy.nodes[id] = {
-          seq: node.checkpoint.seq, time_ms: node.checkpoint.time_ms, until_ms: node.not_after_ms,
-          closed: ended || !marks.store,
-        };
+        // Whether the entry at the verification point is one its node wrote long enough before
+        // the time from which a transfer is judged by a document (a point the ledger keeps no
+        // time of is none).
+        const early = node.checkpoint.time_ms > 0 &&
+          node.checkpoint.time_ms < LEGACY_TRANSFER_DOCUMENTS_FROM_MS - LEGACY_SEEK_MARGIN_MS;
+        if (marks.format === 2 && marks.store && node.checkpoint.seq > 0 && !early) {
+          legacy.nodes[id] = { seq: 0, time_ms: 0, until_ms: node.not_after_ms, closed: false };
+        } else {
+          legacy.nodes[id] = {
+            seq: node.checkpoint.seq, time_ms: node.checkpoint.time_ms, until_ms: node.not_after_ms,
+            closed: ended || !marks.store,
+          };
+        }
       }
     }
     storeJson(STORE_GRANTS, grants);
@@ -6547,7 +6616,15 @@
    *  page that goes on and shows the node writing nowhere holds the read back.
    *  A round that ends with chains that have more to read (run.chained) is followed by the next
    *  round at once, and counts as none while it read a chain on and none of its reads failed
-   *  (runRound): the length of a chain marks nothing.
+   *  (runRound): the length of a chain marks nothing. What does count is how many entries the
+   *  rounds open (run.chainEntries: the control entries of format 2 and the entries of format 1
+   *  that their nodes wrote at LEGACY_TRANSFER_DOCUMENTS_FROM_MS or later): once the rounds
+   *  have opened more of them than LEGACY_ROW_ENTRIES without reading the chains to their end,
+   *  a round that leaves reads of its chains undone is a round held back (runRound).
+   *  A round the log screen started makes LEGACY_SCREEN_PASSES passes at most, and a round a
+   *  synchronization started that has read a chain on makes no further pass while a round the
+   *  log screen started waits for the lock (screenRounds): the read of the screen waits for
+   *  its round, and the rounds of the synchronizations read the chains on.
    *  A chain is closed by the first reading that reached its end after the grant of its node ran
    *  out (LEGACY_CLOSE_SLACK_MS later): a node holds no key after that. The keys read are handed
    *  to the log screen (rememberKeys). */
@@ -6573,7 +6650,11 @@
       return !(rowMs > 0 && ended >= rowMs && ended <= now && now - ended < LEGACY_END_FRESH_MS);
     });
     const waited = Object.keys(legacy.waiting);
-    if (open.length === 0 && waited.length === 0) return;
+    if (open.length === 0 && waited.length === 0) {
+      // (No chain has anything to read: every chain this device follows is read to its end.)
+      run.chainsEnded = true;
+      return;
+    }
     // More open chains than a round follows: the chains listed longest ago come first (among
     // them the ones whose grant ends last), and the next round follows at once and takes the
     // others (run.rest). Such a round is not complete, and counts as none while none of its
@@ -6685,8 +6766,16 @@
     const latestFirst = function (a, b) { return (b.isLatest ? 1 : 0) - (a.isLatest ? 1 : 0); };
     let longest = chainPassMs;
     let passes = 0;
-    for (let pass = 0; pass < LEGACY_ROUND_PASSES; pass += 1) {
+    // A round the log screen started makes few passes: the read of the screen waits for that
+    // round, and what its chains have beyond them is read on by the rounds of the
+    // synchronizations.
+    const passLimit = run.origin === "screen" ? LEGACY_SCREEN_PASSES : LEGACY_ROUND_PASSES;
+    for (let pass = 0; pass < passLimit; pass += 1) {
       if (open.length === 0) break;
+      // A round a synchronization started that has read a chain on makes no further pass while
+      // a round the log screen started waits for it to end (screenRounds): the next round of
+      // the synchronization reads on after that one.
+      if (run.origin !== "screen" && run.chainSteps > 0 && screenRounds > 0) break;
       // A pass begins only with the time left that a pass takes, twice over (half the time of a
       // round at most): the round ends its reading of the chains here, with more to read, and
       // not because its time passed.
@@ -6993,6 +7082,16 @@
             written = true;
             if (whole(body.time_ms) > 0) reachedMs = body.time_ms;
             if (whole(body.time_ms) < run.oldest) run.oldest = whole(body.time_ms);
+            // An entry the round opened as one that may name a transfer (a control entry of
+            // format 2, an entry of format 1), which its node wrote at the time from which a
+            // transfer is judged by a document or later: the rounds open only so many of them
+            // without reading the chains to their end (run.chainEntries, LEGACY_ROW_ENTRIES).
+            // The entry counts as it does among the entries of the round (LEGACY_ROUND_BODIES):
+            // one for each object version the round asked for under its seq, so the copies
+            // someone stores of an entry leave the rounds no more rounds before that number.
+            if (control !== undefined && whole(body.time_ms) >= LEGACY_TRANSFER_DOCUMENTS_FROM_MS) {
+              run.chainEntries += control.length;
+            }
             const entry = control === undefined ? null : checkLegacyEntry(signed, plan.id, candidate.parts, keys);
             if (entry === null) break;
             run.checked += 1;
@@ -7103,14 +7202,25 @@
     // to read than it read (the passes of a round, or the time a pass needs), and the next
     // round follows at once (run.chained). A chain of an account in heavy use is long, and a
     // round that read chains on through what their nodes wrote counts as none, however many
-    // such rounds follow one another (runRound). A listing that goes on over pages that hold
-    // many object versions for each seq holds objects no node wrote (run.spoiled), and such a
-    // round counts.
+    // such rounds follow one another, while the rounds have opened no more entries of chains
+    // than LEGACY_ROW_ENTRIES (runRound). A listing that goes on over pages that hold many
+    // object versions for each seq holds objects no node wrote (run.spoiled), and such a round
+    // counts.
     if (open.length > 0) {
       run.cut = true;
       run.chained = true;
       if (thin) run.spoiled += 1;
     }
+    // Whether the round read every chain this device follows to its end: each is closed, was
+    // read to its end by this round, or by a round of this row a moment ago (the chains this
+    // round did not list again), and none was left to the next round (run.rest). The number of
+    // the entries the rounds opened begins anew with such a round (runRound).
+    run.chainsEnded = run.rest !== true && Object.keys(legacy.nodes).every(function (id) {
+      const chain = legacy.nodes[id];
+      const ended = whole(chain.end_ms);
+      return chain.closed || ended === now ||
+        (rowMs > 0 && ended >= rowMs && ended <= now && now - ended < LEGACY_END_FRESH_MS);
+    });
     // A chain that is found and read to its end is remembered by a digest of its node id (a
     // chain of a node this device handed a grant to stays among the chains it keeps).
     for (const id of Object.keys(legacy.nodes)) {
@@ -7150,8 +7260,11 @@
   let staleShown = null;
   let aheadShown = null;
   // The nodes of a measurement this program does not accept that a stale runtime met in its
-  // grant step (kept for the runtime: a stale runtime writes none of what the rounds judge by).
-  const staleLater = new Set();
+  // grant step: a table from node id to the digest of that measurement (kept in memory, while
+  // the runtime is stale: a stale runtime writes none of what the rounds judge by). The steps
+  // after it ask the backend for the release proofs of that measurement, and not the node for
+  // its attestation, until proofs show the measurement (renewGrants).
+  const staleLater = new Map();
 
   /** Notes the time of an answer of the backend (one in ANSWER_TIME_STEP_MS, the latest
    *  ANSWER_TIMES of them). */
@@ -7426,18 +7539,65 @@
     }
   }
 
+  /** The measurements that marked the log of this device (log.unaccepted: stood), by what they
+   *  are now: {lifted, standing}. lifted says that one of them is the measurement of an
+   *  accepted release now (release proofs showed it since: buildOfMeasure), so the round that
+   *  runs next takes its mark back; standing are the digests of the others. */
+  function markedMeasures() {
+    const kept = storedObject(STORE_UNACCEPTED);
+    const out = { lifted: false, standing: [] };
+    for (const digest of Object.keys(kept)) {
+      const item = kept[digest];
+      if (item === null || typeof item !== "object" || item.stood !== true) continue;
+      if (buildOfMeasure(digest) !== undefined) out.lifted = true;
+      else out.standing.push(digest);
+    }
+    return out;
+  }
+
+  /** Asks the backend for the release proofs of the measurements that marked the log of this
+   *  device (A1) and that no proofs showed since, in a synchronization that runs no round. A
+   *  measurement marks the log on the answer that the backend hands out no proofs of it
+   *  (proofsDenied), and a round whose mark stands is followed by the next round
+   *  LOG_ROUND_INTERVAL_MS later. A backend that holds the proofs and answered without them
+   *  for a moment (a process that had not read them yet, an image without the route) hands
+   *  them out soon after: so every synchronization asks again (seekProofs: a measurement not
+   *  sooner than PROOF_SEEK_RETRY_MS after an answer of this runtime), and proofs that show
+   *  the measurement make a round due at once (roundDue), which takes the mark back and tells
+   *  the app. run is the table of the requests for release proofs of the synchronization (the
+   *  one its step of the grants used: renewGrants): the step and this request send
+   *  PROOF_ROUND_REQUESTS requests between them at most, and none for a measurement twice. A
+   *  node of that measurement that is listed to this device receives its grant in a
+   *  synchronization that follows (grantsAfterProofs). A stale runtime asks nothing. A request
+   *  that fails changes nothing. */
+  async function seekMarked(turn, run) {
+    if (accountClosed || staleRuntime()) return;
+    const standing = markedMeasures().standing;
+    if (standing.length === 0) return;
+    const before = (run.proofsShown || []).length;
+    try {
+      await seekProofs(turn, run, standing);
+    } catch (error) {
+      if (failureCode(error) === "cancelled") throw error;
+      native.log("release proofs of a marked measurement: " + failureCode(error));
+    }
+    grantsAfterProofs({ proofsShown: (run.proofsShown || []).slice(before) });
+  }
+
   /** Whether a round is due: this program has ended none on this installation, the last one that
    *  completed is LOG_ROUND_INTERVAL_MS old, or the last one did not complete (it ended pending,
-   *  or it could not read the store while a mark of an earlier round stood) or a read of the
-   *  screen found a key held back since (then not sooner than LOG_ROUND_RETRY_MS after it). */
+   *  or it could not read the store while a mark of an earlier round stood), a read of the
+   *  screen found a key held back since, or release proofs showed a measurement that marked
+   *  the log (then not sooner than LOG_ROUND_RETRY_MS after it). */
   function roundDue() {
     const round = storedObject(STORE_ROUND);
     const now = native.nowMs();
     if (round.v !== VERSION) return true;
     const tried = whole(round.tried_ms);
     // (A node listed for its revokes alone whose chain this device does not follow asks for a
-    // round as a read held back does: chainsUnseen.)
-    const nominated = withheldDue(loadWithheld()) || chainsUnseen();
+    // round as a read held back does: chainsUnseen. So does a measurement that marked the log
+    // and that release proofs showed since: the round takes the mark back. markedMeasures)
+    const nominated = withheldDue(loadWithheld()) || chainsUnseen() || markedMeasures().lifted;
     if (round.open === true || nominated || (round.last !== "verified" && round.last !== "attention")) {
       return now < tried || now - tried >= LOG_ROUND_RETRY_MS;
     }
@@ -7570,9 +7730,11 @@
       // objects it read that no node wrote (spoiled), and the earliest time among the entries
       // it judged for the first time or passed that way (oldest). walking: the round reads the
       // listing of format 3 on from the place the round before stopped at. lagged: a request
-      // of the round stayed without an answer (probed).
+      // of the round stayed without an answer (probed). chainEntries: the entries of chains,
+      // written at LEGACY_TRANSFER_DOCUMENTS_FROM_MS or later, that the round opened;
+      // chainsEnded: the round read every chain it follows to its end (followLegacy).
       gained: 0, walked: 0, chainSteps: 0, spoiled: 0, oldest: Infinity, walking: origin === "sync" && log.resume !== null,
-      lagged: false,
+      lagged: false, chainEntries: 0, chainsEnded: false,
     };
     // What the rounds kept for the screen before this round: an entry kept there is not read
     // again.
@@ -7951,10 +8113,12 @@
     // node wrote, a node of such a release that still runs goes on writing while the device
     // reads, and a device reads a chain on at the pace of its network. So the length of a chain
     // marks nothing, and the reads of a chain mark the log as any reads do: when they are held
-    // back, when they fail, or when its pages hold objects no node wrote. Such a round read
-    // everything else it had to read, so the rounds that counted before it count no longer (a
-    // round of the walk through a long chain whose time passed is no round in a row with the
-    // ones that read on after it); the row goes on, and the next round follows at once.
+    // back, when they fail, when its pages hold objects no node wrote, or when the rounds have
+    // opened more entries of chains than an account has (LEGACY_ROW_ENTRIES, below). Such a
+    // round read everything else it had to read, so the rounds that counted before it count no
+    // longer (a round of the walk through a long chain whose time passed is no round in a row
+    // with the ones that read on after it); the row goes on, and the next round follows at
+    // once.
     const over = !unreachable && (run.truncated || run.over);
     // (The record of the last round is read in this step, not taken from the start of the round:
     // an event of the app may have written it since. judgeKept)
@@ -7995,7 +8159,25 @@
     const beyond = counted && unfinished > LOG_UNFINISHED_ROUNDS;
     const overrun = beyond && first === true;
     if (beyond && run.detail === "") run.detail = "round:unfinished";
-    let blocked = denied || overrun;
+    // The entries of chains, written by their nodes at the time from which a transfer is
+    // judged by a document or later, that the rounds opened since a round last read the chains
+    // to their end (log.round.chain_read): this round adds the ones it opened, whoever started
+    // it and however it ended, and a round that read every chain the device follows to its end
+    // (run.chainsEnded) begins the number anew. Beyond
+    // LEGACY_ROW_ENTRIES, a round that leaves reads of its chains undone is a round held back,
+    // whatever it read and at whatever pace: the nodes of an account write far fewer such
+    // entries in the time the store keeps them, so someone has a node write them, and what
+    // lies behind them (a transfer of the delegation) is kept from the device for as long as
+    // it reads them. The round reads on all the same (the next round follows at once), and it
+    // counts as held back once in LOG_BLOCKED_STEP_MS as every round held back does, so the
+    // log is marked LOG_BLOCKED_MS after the first of them unless a round reaches the end of
+    // the chains before. The use entries of format 2 are not opened and are not in this
+    // number: the length of a chain still marks nothing.
+    let chainRead = (record.v === VERSION ? whole(record.chain_read) : 0) + run.chainEntries;
+    if (run.chainsEnded) chainRead = 0;
+    const flooded = chainRead > LEGACY_ROW_ENTRIES && (chained || rest);
+    if (flooded && run.detail === "") run.detail = "chain:entries";
+    let blocked = denied || overrun || flooded;
     let grace = 0;
     let established = 0;
     // Whether a measurement past its grace waits because this runtime does not know that no
@@ -8109,7 +8291,11 @@
           log.blocked.last_ms = now;
         }
       }
-    } else if (!unreachable && !beyond && !unanswered && !(onward && !counted && unfinished > LOG_UNFINISHED_ROUNDS)) {
+    } else if (!unreachable && !beyond && !unanswered && chainRead <= LEGACY_ROW_ENTRIES &&
+        !(onward && !counted && unfinished > LOG_UNFINISHED_ROUNDS)) {
+      // (While the rounds have opened more entries of chains than LEGACY_ROW_ENTRIES without
+      // reading the chains to their end, a round that did not come to its chains ends no count:
+      // the count ends with the round that reads them to their end.)
       log.blocked = { first_ms: 0, count: 0 };
     }
     // The reads held back from the screen that the reads of the screen count themselves. (A
@@ -8241,7 +8427,7 @@
       // synchronization, however soon.)
       v: VERSION, tried_ms: away ? 0 : now, last: status, open: incomplete, told: told, state: state,
       done_ms: status === "pending" ? (last.v === VERSION ? whole(last.done_ms) : 0) : now,
-      unfinished: unfinished, row_ms: rowMs,
+      unfinished: unfinished, row_ms: rowMs, chain_read: chainRead,
     });
     // The keys this round judged are remembered last: what the round took from them (the
     // receiving nodes that wait, the keys held back, the measurements no list has) is written
@@ -8293,6 +8479,10 @@
   // The turn of the round that reads now (null: none). The event background ends it: the round
   // then judges what it read and writes what it kept before the app is suspended.
   let roundTurn = null;
+  // The rounds the log screen started that wait for the round lock (startRound). While one
+  // waits, a round a synchronization started ends its reading of the chains of format 1 and
+  // format 2 with the pass it is in (followLegacy).
+  let screenRounds = 0;
 
   /** Starts a round behind the rounds that run or wait (the round lock) and returns its promise.
    *  The round reads in a turn of its own (LOG_ROUND_LIMIT_MS from its start), and its promise
@@ -8313,7 +8503,15 @@
     // wait for big keys at its end), and the time its judgement may take after it (the question
     // whether the backend can be reached).
     const held = newTurn(LOG_ROUND_LIMIT_MS + LOG_SLOW_TIMEOUT_MS + 4 * LOG_API_TIMEOUT_MS, "");
+    // A round the log screen started is counted while it waits for the lock (screenRounds).
+    let waits = origin === "screen";
+    if (waits) screenRounds += 1;
+    const began = function () {
+      if (waits) screenRounds -= 1;
+      waits = false;
+    };
     roundLock.run(held, function () {
+      began();
       const own = newTurn(LOG_ROUND_LIMIT_MS, "");
       own.enders = [];
       roundTurn = own;
@@ -8338,6 +8536,7 @@
       }, left);
       return work;
     }, true).then(ended, function (error) {
+      began();
       ended();
       settle.reject(error);
     });
@@ -11563,17 +11762,24 @@
    *  the nodes of it receive their grants in this step. Without such proofs the node receives
    *  no grant, is counted (later), and is kept as such (log.nodes): the next steps ask the
    *  backend for the proofs of its measurement, and not the node for its attestation, until
-   *  proofs show the measurement (a stale runtime keeps the node for its own time only). A
+   *  proofs show the measurement. A stale runtime keeps the node and its measurement in memory
+   *  alone (staleLater) and asks the same way: a request for the proofs that failed is sent
+   *  again by the next step, and one the backend answered without proofs that hold not sooner
+   *  than PROOF_SEEK_RETRY_MS later, so no failure of one request keeps a node from its grant
+   *  for the time of a runtime. Of the nodes counted in later, unproved counts the ones whose
+   *  measurement the backend has not answered this runtime for (proofsUnanswered): they take
+   *  no grant because a request failed, and not because the backend holds no proofs. A
    *  node the list marks revoke_only
    *  (fetchListed) is none of the nodes that are to receive a grant, whatever the options:
    *  nothing is asked of it and nothing is counted for it. A backend without the route of the
    *  list (404) is asked for the
    *  attestations of every node it lists, and what this device kept decides which of them
    *  receives a grant; any other failure of the list is the failure of this step. Returns
-   *  {accepted, rejected, failed, later, lacking, granted, ledgerChanged, guards, guardEnds,
-   *  unread}: the Set of the ids of the nodes that hold or were sent a grant, the number of
-   *  nodes whose attestation failed to verify, of nodes that did not take the grant, of nodes
-   *  of a measurement this program does not accept, of nodes that were to receive a grant and
+   *  {accepted, rejected, failed, later, unproved, lacking, granted, ledgerChanged, guards,
+   *  guardEnds, unread}: the Set of the ids of the nodes that hold or were sent a grant, the
+   *  number of nodes whose attestation failed to verify, of nodes that did not take the grant,
+   *  of nodes of a measurement this program does not accept, of those among them whose release
+   *  proofs the backend was not heard on, of nodes that were to receive a grant and
    *  that this step had no grant
    *  command for, and of nodes that took a grant now, whether the ledger of the earlier
    *  programs changed, the ids of the nodes listed for their revokes alone, the same nodes
@@ -11595,15 +11801,26 @@
       return known !== undefined && known.granted_ms > ledger.revoked_ms &&
         known.granted_ms <= now + GRANT_REFILL_MS && now - known.granted_ms < grantRenewMs(ledger);
     };
-    // A node an earlier synchronization of this program found to be of a measurement no list
-    // has and no release proofs showed.
-    const laterKnown = function (id) {
-      if (staleLater.has(id)) return true;
+    // A runtime that is stale no longer keeps its nodes as every runtime does from here on: the
+    // nodes it kept in memory are asked for their attestation again, and noted (below).
+    if (staleLater.size > 0 && !staleRuntime()) staleLater.clear();
+    // The digest of the measurement of a node an earlier step of the grants found to be of a
+    // measurement no list has and no release proofs showed, as long as none show it (the node
+    // the device keeps, or the one a stale runtime keeps in memory); "" for any other node.
+    const laterMeasure = function (id) {
       const kept = nodes[id];
-      return kept !== undefined && kept.p === "nitro" && kept.m !== "" && buildOfMeasure(kept.m) === undefined;
+      const measure = staleLater.has(id) ? staleLater.get(id)
+        : kept !== undefined && kept.p === "nitro" && kept.m !== "" ? kept.m : "";
+      return measure !== "" && buildOfMeasure(measure) === undefined ? measure : "";
     };
-    // The requests of this step for release proofs (seekProofs).
-    const seeking = {};
+    const laterKnown = function (id) { return laterMeasure(id) !== ""; };
+    // The nodes counted in later whose measurement the backend has not answered this runtime
+    // for (proofsUnanswered): nodes that take no grant for no other reason than that.
+    let unproved = 0;
+    // The requests of this step for release proofs (seekProofs). A synchronization hands in the
+    // table of its requests (options.proofs): what it asks for after this step (seekMarked) is
+    // counted with what this step asked.
+    const seeking = options.proofs !== undefined && options.proofs !== null ? options.proofs : {};
     const sent = options.listed !== undefined && options.listed !== null
       ? await options.listed : await settled(fetchListed(turn));
     let offered = null;
@@ -11619,9 +11836,9 @@
       // those nodes ones that are to receive a grant in this step.
       const unshown = [];
       for (const item of sent.value) {
-        if (item.revoke_only || options.force === true || staleLater.has(item.node) || !laterKnown(item.node)) continue;
-        const measure = nodes[item.node].m;
-        if (unshown.indexOf(measure) < 0) unshown.push(measure);
+        if (item.revoke_only || options.force === true) continue;
+        const measure = laterMeasure(item.node);
+        if (measure !== "" && unshown.indexOf(measure) < 0) unshown.push(measure);
       }
       if (unshown.length > 0) await seekProofs(turn, seeking, unshown);
       for (const item of sent.value) {
@@ -11635,6 +11852,7 @@
         const known = grants[item.node];
         if (options.force !== true && laterKnown(item.node)) {
           later += 1;
+          if (proofsUnanswered(laterMeasure(item.node))) unproved += 1;
           continue;
         }
         const refill = options.refill === true && item.not_after_ms === null && known !== undefined &&
@@ -11700,11 +11918,13 @@
     for (const item of unlisted) {
       const node = item.node;
       later += 1;
+      if (proofsUnanswered(node.measure)) unproved += 1;
       native.log("attestation of a measurement no list has: " + node.release);
-      // A stale runtime keeps the node for its own time only: it writes none of what the
-      // rounds judge by (the time a measurement was first seen among it).
+      // A stale runtime keeps the node, with its measurement, in memory alone: it writes none
+      // of what the rounds judge by (the time a measurement was first seen among it). The next
+      // step asks for the proofs of that measurement again (laterMeasure).
       if (staleRuntime()) {
-        staleLater.add(node.node);
+        staleLater.set(node.node, node.measure);
         continue;
       }
       if (nodes[node.node] === undefined) nodes[node.node] = { m: node.measure, p: "nitro", r: node.release, f: now, c: 0 };
@@ -11738,8 +11958,8 @@
     // apply it (setGrantDays).
     if (options.whole === true && lacking > 0) {
       return {
-        accepted: accepted, rejected: rejected, failed: failed, later: later, lacking: lacking, granted: 0,
-        ledgerChanged: false, guards: guards, guardEnds: guardEnds, unread: null,
+        accepted: accepted, rejected: rejected, failed: failed, later: later, unproved: unproved, lacking: lacking,
+        granted: 0, ledgerChanged: false, guards: guards, guardEnds: guardEnds, unread: null,
       };
     }
     // Before the first grant of the step goes out, the sealed ledger of the backend is read and
@@ -11764,8 +11984,8 @@
       }
       if (unread !== null || ledgerForeign() || delegationOff(ledger)) {
         return {
-          accepted: accepted, rejected: rejected, failed: failed, later: later, lacking: lacking, granted: 0,
-          ledgerChanged: false, guards: guards, guardEnds: guardEnds, unread: unread,
+          accepted: accepted, rejected: rejected, failed: failed, later: later, unproved: unproved, lacking: lacking,
+          granted: 0, ledgerChanged: false, guards: guards, guardEnds: guardEnds, unread: unread,
         };
       }
     }
@@ -11809,8 +12029,8 @@
       }
     }
     return {
-      accepted: accepted, rejected: rejected, failed: failed, later: later, lacking: lacking, granted: granted,
-      ledgerChanged: ledgerChanged, guards: guards, guardEnds: guardEnds, unread: null,
+      accepted: accepted, rejected: rejected, failed: failed, later: later, unproved: unproved, lacking: lacking,
+      granted: granted, ledgerChanged: ledgerChanged, guards: guards, guardEnds: guardEnds, unread: null,
     };
   }
 
@@ -11866,8 +12086,8 @@
     const ledger = loadLedger();
     const grants = loadGrants();
     let renewed = {
-      accepted: new Set(), rejected: 0, failed: 0, later: 0, lacking: 0, granted: 0, ledgerChanged: false, guards: [],
-      guardEnds: [], unread: null,
+      accepted: new Set(), rejected: 0, failed: 0, later: 0, unproved: 0, lacking: 0, granted: 0, ledgerChanged: false,
+      guards: [], guardEnds: [], unread: null,
     };
     // Whether the sealed ledger was read for this step (options.shared: the caller read it).
     let shared = options.shared === true;
@@ -11932,7 +12152,9 @@
    *  answer that fails for a moment: frontQuery), the key is judged, and the grants are handed to
    *  the nodes that are to receive one. When delegation is off it is delegation_off; when no
    *  listed node holds a grant it is grant_required (attestation_failed when every listed node
-   *  failed the attestation verification or is of a measurement this program does not accept);
+   *  failed the attestation verification or is of a measurement this program does not accept,
+   *  and the backend answered every request for the release proofs of such a measurement: a
+   *  node that took no grant because that request failed leaves the failure grant_required);
    *  in a stale runtime that no listed node takes a grant of, and in a runtime whose ledger
    *  holds a value this program does not read, it is program_stale. Returns {keys, ledger,
    *  grants}. */
@@ -11961,6 +12183,15 @@
       // device keeps of its grants says nothing of a delegation another device turned off).
       if (step.renewed.unread !== null) throw step.renewed.unread;
       if (step.grant.state === "none") {
+        // A listed node took no grant for no other reason than that the backend did not answer
+        // the request for the release proofs of its measurement (the request failed on its
+        // way, ran out of its time, or was answered with a status or a body that is no
+        // answer): no attestation failed and no measurement was refused, and the next step
+        // asks again. The failure is the one of a step that could hand no grant for the
+        // moment, in a stale runtime as in any other.
+        if (step.renewed.accepted.size === 0 && step.renewed.unproved > 0) {
+          throw native.error("grant_required", "the release proofs of a listed node were not answered");
+        }
         const refused = step.renewed.rejected + step.renewed.later > 0 && step.renewed.accepted.size === 0;
         // In a stale runtime no listed node takes a grant of this program because the program
         // is behind (every listed node is of a release it does not accept, or the backend lists
@@ -12077,7 +12308,8 @@
    *      (renewGrants), or 5, with delegation off, the revoke to every listed node
    *    6 the published state grant and runtime.ready
    *    7 what follows the grants: the sealing check, the completion of an application password
-   *      setup, and a round of the log when one is due
+   *      setup, and a round of the log when one is due (while none is due, the request for the
+   *      release proofs of the measurements that marked the log: seekMarked)
    *    8 the catch-up of a transfer of the master key
    *  Steps 1 to 5 run under the grant lock. handed is called when step 6 is done, or when the
    *  synchronization ended before it: the line of the synchronizations is held until then and no
@@ -12089,6 +12321,9 @@
   async function runSync(turn, trigger, handed) {
     syncBegun += 1;
     const number = syncBegun;
+    // The requests for release proofs this synchronization sends outside its rounds (seekProofs):
+    // the ones of its step of the grants and the one for the measurements that marked the log.
+    const proofs = {};
     try {
       const step = await grantLock.run(turn, async function () {
         // (The account query and the list of the nodes are each sent once more after an answer
@@ -12100,7 +12335,10 @@
           ? settled(fetchListed(turn)) : null;
         const judged = await judgeKey(turn, account);
         if (judged.keyState !== "present") return { judged: judged, grants: null };
-        return { judged: judged, grants: await grantStep(turn, judged.keys, { listed: listed, refill: trigger.refill === true }) };
+        return {
+          judged: judged,
+          grants: await grantStep(turn, judged.keys, { listed: listed, refill: trigger.refill === true, proofs: proofs }),
+        };
       });
       const judged = step.judged;
       // Step 6: the grant step published the state of the grants; the runtime is ready (the key is
@@ -12117,6 +12355,9 @@
         granted = step.grants.renewed.granted;
         rejected = step.grants.renewed.rejected;
         await afterLine.run(turn, function () { return afterGrants(turn, keys, step.grants); });
+        // A synchronization that runs no round asks for the release proofs of the measurements
+        // that marked the log (seekMarked): proofs that show one make the round due.
+        if (!roundDue()) await seekMarked(turn, proofs);
         if (roundDue()) {
           try {
             // When the round ends with more to read than a round reads, the next rounds follow

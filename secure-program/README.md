@@ -67,7 +67,9 @@ program has that held the key of the account marks the log once the device first
 ago, the runtime knows that no later program than this one is served, and the backend answered
 its request for the release proofs of that measurement without proofs that show it: a runtime
 that knows that a later program is served judges nothing, writes none of the values the rounds
-judge by, and reports once that it is behind. The signature of an object reaches the device through the
+judge by, and reports once that it is behind. While such a mark stands, every synchronization
+asks for those proofs again, and proofs that show the measurement take the mark back in that
+stay (a backend that answered 404 for proofs it holds leaves no mark for a day). The signature of an object reaches the device through the
 backend, so a body handed out with a signature that does not verify marks the log only when the
 answers of two rounds carried none that does, and until one does. The
 entries of the nodes of the releases before v2.4.0 (formats 1 and 2) are read from the bucket
@@ -78,9 +80,18 @@ takes a range of a chain as known only from a listing that was read as far as th
 A round reads the transfers a node wrote from 2026-11-23 on, the time from which the backend
 keeps the document of every node that takes a transfer, and nothing a node wrote before: it
 finds the place of that time in a long chain by the entries the node signed, without listing
-the chain up to it, and an object someone else wrote moves that place nowhere. The length of a
+the chain up to it, and an object someone else wrote moves that place nowhere. A chain a program
+before version 43 verified up to an entry of that time or later is read from its first `seq`
+by the same rule, so a transfer that program passed is judged. The length of a
 chain marks nothing: a round that only read chains on, with none of its reads failing, counts as
-none, however many such rounds it takes.
+none, however many such rounds it takes. The entries the rounds open are counted (the control
+entries of format 2 and the entries of format 1 written from that time on; no use entry of
+format 2): beyond 16,384 of them opened without reading the chains to their end, more than an
+account holds, a round that leaves reads of its chains undone is a round held back, so control
+entries someone had a node write ahead of a transfer put its judgement off by days the device
+reports, and not for as long as they take to read. A round the log screen started makes two
+passes over the chains, and a round of a synchronization ends its passes when a round of the
+screen waits: the screen does not wait for the chains of an account with much to read.
 The rounds follow the chain of every node the store names under the prefix of the account, read
 from the listing of that bucket once a day, so a transfer made by a node this device never
 handed a grant to is judged as well.
@@ -260,7 +271,8 @@ over `native.http` (the listings of object versions with their delete markers, a
 the node documents with the origin of a document and the addresses of the listings of the node
 document keys, which answers from the node registry alone while the backend holds the store of
 format 3 closed), and enclave nodes with their keys, attestation documents, node documents,
-commands and log entries of formats 2 and 3 (`docs/protocol.md` sections 4, 5 and 7). The time of
+commands and log entries of formats 1, 2 and 3 (`docs/protocol.md` sections 4, 5 and 7; a node
+writes format 1 when its fixture says so). The time of
 the model moves only when nothing else can happen, so a test runs a wait of minutes at once. The
 certificate chain of a nitro document is modelled (one leaf of the model stands for the
 certificate); the signature of the document is a real ECDSA signature over the Sig_structure the
@@ -284,7 +296,8 @@ and the program of a test runs with those keys and certificates in the place of 
 each with the check that refuses them; the test runs every case through a synchronization and
 compares whether the node received the grant and what the program logged. The other tests run
 the requests for the proofs (one for a measurement, the answers 200 and 404, a request that
-fails, the five minutes) and histories: the key of an account moving through releases no list
+fails in a runtime that is stale and in one that is not, the five minutes, the request a
+synchronization sends for a measurement that marked the log) and histories: the key of an account moving through releases no list
 has, read by the device that saw every move and by an installation that kept nothing; a release
 among them without proofs that hold; and proofs that reach the backend after the device read
 the entries of a node. `tests/fixtures/release-proofs-v2.4.0-rc.1.json` holds the public build

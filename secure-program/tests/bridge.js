@@ -343,7 +343,8 @@ let listedBuilds = null;
  *  of the lists of the program whose measurement the node has (a node of platform local: whose
  *  release name it has), and format 3 for every other node. The name of a release decides
  *  nothing for a nitro node: a node with the name of a listed release and another measurement
- *  writes format 3. A node of a listed build writes a chain of format 2 in this model. */
+ *  writes format 3. A node of a listed build writes a chain of format 2 in this model unless its
+ *  fixture names format 1 (a node of a release before v2.0.0: appendEntry1). */
 function formatOf(platform, release, measurement) {
   if (listedBuilds === null) {
     const source = fs.readFileSync(path.join(__dirname, "..", "secure-program.js"), "utf8");
@@ -523,6 +524,7 @@ class Node {
 
   /** Writes one entry in the format of this node. */
   write(user, kind, events, options) {
+    if (this.format === 1) return this.appendEntry1(user, kind, events, options);
     return this.format === 3 ? this.appendEntry3(user, kind, events, options) : this.appendEntry(user, kind, events, options);
   }
 
@@ -588,6 +590,36 @@ class Node {
       seq: seq, time_ms: timeMs, kind: kind, events: events, body: body, bodyHash: bodyHash,
       entryHash: entryHash,
       key: "v1/accounts/" + user + "/" + this.id + "/" + fields + "-" + b64u(bodyHash) + "-" + b64u(entryHash),
+      object: JSON.stringify({ body: b64u(body), sig: b64u(sig) }),
+    };
+    chain.push(entry);
+    this.chains.set(user, chain);
+    if (options.stored !== false) this.world.putObject(this.world.bucket, entry.key, entry.object);
+    return entry;
+  }
+
+  /** Appends one entry of format 1 to the chain of user (docs/protocol.md 7.1: the releases
+   *  before v2.0.0) and writes its object to the bucket the binding names unless options.stored
+   *  is false. An entry of format 1 holds one event, and its key names the seq and the entry
+   *  hash alone: neither the time nor the kind of the entry. A fixture names the format (format:
+   *  1); events holds the one event. */
+  appendEntry1(user, kind, events, options) {
+    const chain = this.chains.get(user) || [];
+    const seq = chain.length + 1;
+    const prev = seq === 1 ? Buffer.alloc(32) : chain[chain.length - 1].entryHash;
+    const timeMs = options.timeMs === undefined ? this.world.now : options.timeMs;
+    const aad = utf8([this.id, user, options.keyId, String(seq)].join("\n"));
+    const sealed = hpkeSeal(
+      "chacha20poly1305", options.logPk, utf8("pickle.secure.v1.log-entry"), aad, utf8(JSON.stringify(events[0])));
+    const body = utf8(JSON.stringify({
+      v: 1, node: this.id, user_id: user, key_id: options.keyId, seq: seq, prev: b64u(prev),
+      time_ms: timeMs, enc: b64u(sealed.enc), ct: b64u(sealed.ciphertext),
+    }));
+    const sig = ed25519Sign(this.signSeed, concat(utf8("pickle.secure.v1.log-entry\n"), body));
+    const entryHash = sha("sha256", body);
+    const entry = {
+      seq: seq, time_ms: timeMs, kind: kind, events: events, body: body, bodyHash: entryHash, entryHash: entryHash,
+      key: "v1/accounts/" + user + "/" + this.id + "/" + zeros(seq, SEQ_DIGITS) + "-" + b64u(entryHash),
       object: JSON.stringify({ body: b64u(body), sig: b64u(sig) }),
     };
     chain.push(entry);

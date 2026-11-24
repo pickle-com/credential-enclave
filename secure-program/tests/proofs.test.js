@@ -522,7 +522,7 @@ test("without release proofs, and with proofs that fail, the node is one the pro
   }
 });
 
-test("a request for release proofs that fails leaves the node without its grant for this step and fails nothing else: the round that follows the step asks again and the synchronization after it hands the grant, a step no round follows leaves the node to the next step, which asks again at once, and a procedure of the user that needs the grant of that node alone ends with attestation_failed until then", async () => {
+test("a request for release proofs that fails leaves the node without its grant for this step and fails nothing else: the round that follows the step asks again and the synchronization after it hands the grant, a step no round follows leaves the node to the next step, which asks again at once, and a procedure of the user that needs the grant of that node alone ends with grant_required until then, not with attestation_failed, which is the failure of a node the backend holds no proofs of", async () => {
   for (const failure of [{ status: 503, body: { detail: "unavailable" } }, { status: 429, body: { detail: "too_many_requests" } }, "transport", "hang"]) {
     const name = JSON.stringify(failure);
     const failed = (world) => world.logs.filter((line) => line.indexOf("release proofs request failed") === 0).length;
@@ -568,17 +568,35 @@ test("a request for release proofs that fails leaves the node without its grant 
     assert.equal(quiet.world.state.grant.state, "active", name);
   }
   // The one node of the account is of a release no list has, and the request for its proofs
-  // fails: the procedure ends with attestation_failed, and goes through when the user tries again.
-  const alone = S.fixture(source, { nodes: 1 });
-  const fault = alone.world.fault((line, request) => request.path === PROOFS_PATH, { status: 503, body: { detail: "unavailable" } });
-  await S.start(alone);
-  assert.equal(alone.world.state.grant.state, "none");
-  const first = await S.call(alone, "store_login", { name: "example.com", username: "u", password: "p" });
-  assert.deepEqual([first.ok, first.code], [false, "attestation_failed"]);
-  fault.times = 0;
-  const second = await S.call(alone, "store_login", { name: "example.com", username: "u", password: "p" });
-  assert.equal(second.ok, true);
-  assert.equal(alone.nodes[0].grants.has(alone.world.userId), true);
+  // fails (an error status, a failure on its way, no answer): no attestation failed and the
+  // backend did not say that it holds no proofs, so the procedure ends with grant_required, the
+  // failure of a step that could hand no grant for the moment, and goes through when the user
+  // tries again.
+  for (const failure of [{ status: 503, body: { detail: "unavailable" } }, { status: 429, body: { detail: "too_many_requests" } }, "transport", "hang"]) {
+    const name = JSON.stringify(failure);
+    const alone = S.fixture(source, { nodes: 1 });
+    const fault = alone.world.fault((line, request) => request.path === PROOFS_PATH, failure);
+    await S.start(alone);
+    assert.equal(alone.world.state.grant.state, "none", name);
+    const first = await S.call(alone, "store_login", { name: "example.com", username: "u", password: "p" });
+    assert.deepEqual([first.ok, first.code], [false, "grant_required"], name);
+    fault.times = 0;
+    const second = await S.call(alone, "store_login", { name: "example.com", username: "u", password: "p" });
+    assert.equal(second.ok, true, name);
+    assert.equal(alone.nodes[0].grants.has(alone.world.userId), true, name);
+  }
+  // The backend answers that it holds no proofs of the measurement of that node (404), or
+  // hands out proofs that fail: the node is one of a measurement the program does not accept,
+  // and the procedure ends with attestation_failed.
+  for (const held of [false, true]) {
+    const refused = S.fixture(source, { nodes: 1, proofs: false });
+    if (held) {
+      refused.world.releaseProofs.set("v2.4.0", model.proofsOf(refused.parties, "v2.4.0", refused.measurement, { attestation: { identity: { 11: "self-hosted" } } }));
+    }
+    await S.start(refused);
+    const call = await S.call(refused, "store_login", { name: "example.com", username: "u", password: "p" });
+    assert.deepEqual([call.ok, call.code], [false, "attestation_failed"], String(held));
+  }
 });
 
 test("what the device keeps of release proofs: a program of another version reads it as nothing and verifies anew, a verdict that is not of the form this program writes is not read, and the end of the account erases it", async () => {
@@ -826,6 +844,160 @@ test("a stale runtime verifies release proofs as any runtime does: the node of t
   assert.equal(world.state.grant.state, "active");
   const called = await S.call(fx, "sync", {});
   assert.equal(called.ok, true);
+});
+
+test("a stale runtime whose request for release proofs failed asks again with its next step, and one the backend answered without proofs asks again five minutes later: no failure of one request keeps a node from its grant for the time of the runtime, and a procedure that ends without a grant says grant_required after a request that failed and program_stale after the answer that the backend holds no proofs", async () => {
+  // The one living node of the account is of a release no list has, whose proofs the backend
+  // holds, and the runtime knows that a later program is served. The first request for the
+  // proofs fails.
+  for (const failure of [{ status: 503, body: { detail: "unavailable" } }, { status: 429, body: { detail: "too_many_requests" } }, "transport", "hang"]) {
+    const name = JSON.stringify(failure);
+    const fx = laterFixture("v2.5.0", { nodes: 0 });
+    const world = fx.world;
+    const digest = digestOf(fx.laterMeasurement);
+    world.account.servedProgram = VERSION + 1;
+    const fault = world.fault((line, request) => request.path === PROOFS_PATH, failure, 1);
+    await S.start(fx);
+    assert.equal(world.runtime.program_stale, true, name);
+    assert.equal(fault.hits, 1, name);
+    assert.equal(fx.later.grants.has(world.userId), false, name);
+    // A stale runtime writes none of what the rounds judge by.
+    assert.equal(world.stored("log.nodes"), undefined, name);
+    assert.equal(world.stored("log.unaccepted"), undefined, name);
+    // The next step (an event a minute later) asks for the proofs again, and not the node for
+    // its attestation before they hold: the proofs show the measurement, and the node receives
+    // its grant in that step.
+    const before = world.requests.length;
+    world.advance(MINUTE_MS);
+    await S.event(fx, "foreground");
+    assert.deepEqual(proofRequests(world, before), [digest], name);
+    assert.deepEqual(attestationRequests(world, before), [[fx.later.id]], name);
+    assert.equal(fx.later.grants.has(world.userId), true, name);
+    assert.equal(world.state.grant.state, "active", name);
+    const stored = await S.call(fx, "store_login", { name: "example.com", username: "u", password: "p" });
+    assert.equal(stored.ok, true, name);
+  }
+  // A procedure of the user in that runtime while the requests for the proofs fail: the step
+  // could hand no grant for the moment (grant_required), and the same call goes through once
+  // the backend answers.
+  const failing = laterFixture("v2.5.0", { nodes: 0 });
+  failing.world.account.servedProgram = VERSION + 1;
+  const outage = failing.world.fault((line, request) => request.path === PROOFS_PATH, { status: 503, body: { detail: "unavailable" } });
+  await S.start(failing);
+  const during = await S.call(failing, "store_login", { name: "example.com", username: "u", password: "p" });
+  assert.deepEqual([during.ok, during.code], [false, "grant_required"]);
+  assert.ok(outage.hits >= 2);
+  outage.times = 0;
+  const after = await S.call(failing, "store_login", { name: "example.com", username: "u", password: "p" });
+  assert.equal(after.ok, true);
+  assert.equal(failing.later.grants.has(failing.world.userId), true);
+  // The backend holds no proofs of the measurement (the program is behind: the served one
+  // accepts that release another way). The procedure says program_stale, the runtime asks the
+  // backend again not sooner than five minutes after its answer and the node for no
+  // attestation meanwhile, and proofs that then hold hand the node its grant.
+  const behind = laterFixture("v2.5.0", { nodes: 0 }, undefined, false);
+  const world = behind.world;
+  const digest = digestOf(behind.laterMeasurement);
+  world.account.servedProgram = VERSION + 1;
+  await S.start(behind);
+  assert.deepEqual(proofRequests(world), [digest]);
+  const call = await S.call(behind, "store_login", { name: "example.com", username: "u", password: "p" });
+  assert.deepEqual([call.ok, call.code], [false, "program_stale"]);
+  let before = world.requests.length;
+  world.advance(2 * MINUTE_MS);
+  await S.event(behind, "foreground");
+  assert.deepEqual(proofRequests(world, before), []);
+  assert.deepEqual(attestationRequests(world, before), []);
+  world.releaseProofs.set("v2.5.0", model.proofsOf(behind.parties, "v2.5.0", behind.laterMeasurement));
+  before = world.requests.length;
+  world.advance(4 * MINUTE_MS);
+  await S.event(behind, "foreground");
+  assert.deepEqual(proofRequests(world, before), [digest]);
+  assert.deepEqual(attestationRequests(world, before), [[behind.later.id]]);
+  assert.equal(behind.later.grants.has(world.userId), true);
+  assert.equal(world.state.grant.state, "active");
+});
+
+test("a measurement that marked the log is asked for again by every synchronization, and proofs that then show it take the mark back in that stay: a backend that answered 404 for the proofs of a release it holds (a process that had not read them, an image without the route) leaves the mark until the next synchronization and not for a day", async () => {
+  for (const moment of ["no route", "no row"]) {
+    // The device holds the grant of the node of release v2.4.0. A node of release v2.5.0, whose
+    // proofs the backend holds, holds the key of the account through another device, and wrote
+    // an entry of that key.
+    const fx = S.fixture(source, { nodes: 1, device: { securityStatus: true } });
+    const world = fx.world;
+    await S.start(fx);
+    const measurement = bridge.randomMeasurement();
+    const digest = digestOf(measurement);
+    const other = world.addNode({ release: "v2.5.0", measurement: measurement, format: 3, offered: false });
+    world.releaseProofs.set("v2.5.0", model.proofsOf(fx.parties, "v2.5.0", measurement));
+    other.grants.set(world.userId, { sign_pk: bridge.b64u(fx.keys.signPk), log_pk: bridge.b64u(fx.keys.logPk), key_id: fx.keys.keyId, custody: "enclave", not_after_ms: world.now + 30 * DAY_MS });
+    other.record("c", [{ t: "grant_accepted", time_ms: world.now, not_after_ms: world.now + 30 * DAY_MS, custody: "enclave" }]);
+    // The first stay after that: the route of the proofs answers 503, and the measurement waits.
+    const failing = world.fault((line, request) => request.path === PROOFS_PATH, { status: 503, body: { detail: "unavailable" } });
+    await nextDay(fx);
+    assert.equal(told(world), "pending told pending grant active", moment);
+    failing.times = 0;
+    // A day and a half later, a new runtime: the route answers 404 for that stay, and the
+    // measurement, past its day, marks the log.
+    world.advance(36 * HOUR_MS);
+    let absent = null;
+    if (moment === "no route") world.routes.proofs = false;
+    else absent = world.fault((line, request) => request.path === PROOFS_PATH, { status: 404, body: { detail: "not_found" } });
+    await S.start(fx);
+    await world.settle(MINUTE_MS);
+    assert.equal(told(world), "attention told attention:unlisted_release grant active", moment);
+    assert.equal(world.stored("log.unaccepted")[digest].stood, true, moment);
+    // Within five minutes of that answer, a synchronization of the same runtime asks nothing.
+    let before = world.requests.length;
+    world.advance(2 * MINUTE_MS);
+    await S.event(fx, "foreground");
+    assert.deepEqual(proofRequests(world, before), [], moment);
+    assert.equal(told(world), "attention told attention:unlisted_release grant active", moment);
+    // The backend hands the proofs out again. The next synchronization (ten minutes after the
+    // mark, with no round due for a day) asks for them, they show the measurement, and the round
+    // that follows at once takes the mark back and tells the app.
+    world.routes.proofs = true;
+    if (absent !== null) absent.times = 0;
+    before = world.requests.length;
+    world.advance(8 * MINUTE_MS);
+    await S.event(fx, "foreground");
+    await world.settle(MINUTE_MS);
+    assert.deepEqual(proofRequests(world, before), [digest], moment);
+    assert.equal(told(world), "verified told ok grant active", moment);
+    assert.deepEqual(world.stored("log.unaccepted"), {}, moment);
+    assert.equal(world.state.log.unknown_nodes, 0, moment);
+    // Nothing is asked again from then on.
+    before = world.requests.length;
+    world.advance(10 * MINUTE_MS);
+    await S.event(fx, "foreground");
+    assert.deepEqual(proofRequests(world, before), [], moment);
+  }
+  // A measurement the backend holds no proofs of marks the log on: every synchronization asks
+  // again (not sooner than five minutes after an answer), the mark stands, and a stale runtime
+  // asks nothing.
+  const fx = S.fixture(source, { nodes: 1, device: { securityStatus: true } });
+  const world = fx.world;
+  await S.start(fx);
+  const other = bridge.randomMeasurement();
+  const receiver = world.addNode({ release: "v2.6.0", measurement: other, offered: false });
+  fx.nodes[0].record("c", [{
+    t: "grant_transferred_out", time_ms: world.now, to: receiver.id, release: "v2.6.0", pcr0: other.pcr0, pcr1: other.pcr1, pcr2: other.pcr2,
+  }]);
+  await nextDay(fx);
+  await nextDay(fx);
+  assert.equal(told(world), "attention told attention:unlisted_release grant active");
+  for (let stay = 0; stay < 3; stay += 1) {
+    const before = world.requests.length;
+    world.advance(10 * MINUTE_MS);
+    await S.event(fx, "foreground");
+    assert.deepEqual(proofRequests(world, before), [digestOf(other)]);
+    assert.equal(told(world), "attention told attention:unlisted_release grant active");
+  }
+  world.account.servedProgram = VERSION + 1;
+  const before = world.requests.length;
+  world.advance(10 * MINUTE_MS);
+  await S.event(fx, "foreground");
+  assert.deepEqual(proofRequests(world, before), []);
 });
 
 // ---- The verdicts the device keeps, and the releases a log holds ----

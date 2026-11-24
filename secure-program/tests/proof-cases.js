@@ -355,6 +355,39 @@ function proofCases(release) {
   add("the last leaf of a tree", null, attested({ leafIndex: 10, treeSize: 11 }));
   add("the only leaf of a tree", null, attested({ leafIndex: 0, treeSize: 1 }));
   add("the first leaf of a tree of 4,096 leaves", null, attested({ leafIndex: 0, treeSize: 4096 }));
+  // The four counts of an entry are strings of decimal digits, as a bundle writes them. A
+  // count written as a JSON number is none, also a number of the value the log signed: what a
+  // JSON number reads as differs between the engines the program runs on for some notations.
+  add("a log entry whose time is a JSON number of the time the log signed", "v4: log entry time", attested({}, (bundle) => {
+    const entry = entryOfBundle(bundle);
+    entry.integratedTime = Number(entry.integratedTime);
+  }));
+  add("a log entry whose index is a JSON number of the index the log signed", "v4: signed entry timestamp", attested({}, (bundle) => {
+    const entry = entryOfBundle(bundle);
+    entry.logIndex = Number(entry.logIndex);
+  }));
+  add("an inclusion proof whose index is a JSON number of the index of the leaf", "v4: inclusion proof", attested({}, (bundle) => {
+    const proof = entryOfBundle(bundle).inclusionProof;
+    proof.logIndex = Number(proof.logIndex);
+  }));
+  add("an inclusion proof whose tree size is a JSON number of the size of the tree", "v4: inclusion proof", attested({}, (bundle) => {
+    const proof = entryOfBundle(bundle).inclusionProof;
+    proof.treeSize = Number(proof.treeSize);
+  }));
+  add("an inclusion proof whose index is the JSON number zero", "v4: inclusion proof", attested({ leafIndex: 0, treeSize: 1 }, (bundle) => {
+    entryOfBundle(bundle).inclusionProof.logIndex = 0;
+  }));
+  add("a log entry whose time has a zero in front", "v4: log entry time", attested({}, (bundle) => {
+    const entry = entryOfBundle(bundle);
+    entry.integratedTime = "0" + entry.integratedTime;
+  }));
+  add("a log entry whose time is a string of digits with a fraction", "v4: log entry time", attested({}, (bundle) => {
+    const entry = entryOfBundle(bundle);
+    entry.integratedTime = entry.integratedTime + ".0";
+  }));
+  add("an inclusion proof whose tree size is a string of seventeen digits", "v4: inclusion proof", attested({}, (bundle) => {
+    entryOfBundle(bundle).inclusionProof.treeSize = "10000000000000000";
+  }));
   const checkpointOf = (edit) => attested({}, (bundle) => {
     const proof = entryOfBundle(bundle).inclusionProof;
     proof.checkpoint.envelope = edit(proof.checkpoint.envelope, Number(proof.treeSize), Buffer.from(proof.rootHash, "base64"));
