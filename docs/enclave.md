@@ -1983,7 +1983,11 @@ The rules:
   `/v1.0/$batch;x` are refused like `/v1.0/$batch`.
 - The same address is read a second time by a WHATWG URL parser (the crate `url`). The scheme, the
   host, the port and the path of that reading must all equal the values read above. An address
-  that two parsers read differently is sent nowhere.
+  that two parsers read differently is sent nowhere. The parser writes some bytes of a path as
+  percent escapes, so an address whose path holds one of them as it is does not read the same
+  and is refused: with the version of the crate `Cargo.lock` names (2.5.9) these are `"`, `<`,
+  `>`, `^`, `` ` ``, `{` and `}`. The same address with the byte as its percent escape (`%5E`
+  for `^`) reads the same and passes.
 - The prefix comparison keeps segment boundaries: when a prefix does not end with `/`, the path
   must equal the prefix, or the character after the prefix must be `/`.
 - `suffixes`: a rule can list path ends that are allowed whatever comes before them, when the
@@ -2619,6 +2623,20 @@ content of `out/measurements.json`) to the standard output, or the name of the h
 - GitHub records an attestation on the public Sigstore instance when the repository is public at
   the time of the run. An attestation of a run in a private repository is not on that public
   record. Its bundle is still attached to the GitHub release.
+- The tags of this repository. The tag of a release has the form `v{major}.{minor}.{patch}`
+  (`v2.4.0`), and the tag of a release candidate the form `v{major}.{minor}.{patch}-rc.{n}`
+  (`v2.4.0-rc.1`). The check of `release-statement-build.yml` takes more names than these two
+  forms: a `v` followed by letters, digits, `.`, `_` and `-`.
+- The tag of a release candidate does not stand on the commit that takes the tag of the release.
+  It stands on a commit of its own on top of that commit, one that changes no file. `build.sh`
+  names the release of a build after the `v*` tags of the commit it builds, and of several tags
+  it takes the first in the order of `git tag --sort=-version:refname`, which puts `v2.4.0-rc.1`
+  in front of `v2.4.0`. On a commit that carried both tags, a build in a clone that holds both
+  would be a build of the release `v2.4.0-rc.1`. The release name is compiled into the node
+  program and is part of the measurements (11.1): whoever built the release `v2.4.0` again
+  from such a clone would get another release name and other measurements than the release
+  has. The measurements of a release candidate are not those of the release: its release name
+  differs, and so does the commit time of its commit.
 
 ## 12. Tests
 
