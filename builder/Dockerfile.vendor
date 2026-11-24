@@ -1,0 +1,22 @@
+# The packages of Cargo.lock (enclave.md 11.1, step 2): `builder/enclave-build.sh` builds this
+# file with the files of a commit as the build context and takes the directory /vendor out.
+#
+# This step has a network. cargo downloads the packages Cargo.lock names from crates.io and
+# checks each against its checksum in Cargo.lock. Vendoring compiles nothing and runs no build
+# script, so no program of the commit runs here: the commit is read as data. cargo is the one
+# of the image `enclave-build.sh` fixes by digest, whatever toolchain a file of the commit
+# names, and cargo runs outside the directory of the commit.
+ARG CARGO_IMAGE
+FROM ${CARGO_IMAGE} AS vendor
+
+WORKDIR /commit
+COPY . .
+
+RUN cd / \
+    && export RUSTUP_TOOLCHAIN="$(ls "${RUSTUP_HOME:-/usr/local/rustup}/toolchains" | head -n 1)" \
+    && test -n "$RUSTUP_TOOLCHAIN" \
+    && cargo vendor --locked --versioned-dirs --manifest-path /commit/Cargo.toml /vendor >/dev/null \
+    && touch /vendor/.vendored
+
+FROM scratch
+COPY --from=vendor /vendor /

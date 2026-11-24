@@ -1,16 +1,18 @@
-# The host image (enclave.md 11.1, row 5): what the parent pod runs.
+# The host image (enclave.md 11.1): what the parent pod runs.
 #
 #   /usr/local/bin/credential-enclave-host        the host program (the entrypoint, no arguments)
 #   /usr/bin/nitro-cli                            starts and ends the enclave
 #   /opt/credential-enclave/enclave.eif           the enclave image file
 #   /opt/credential-enclave/measurements.json     its measurements
+#   /opt/credential-enclave/release-proofs.json   the public build proof of the release, in the
+#                                                 host image of a release only
 #
-# `build/build.sh host` builds this image. The enclave image file and its measurements come
-# from the build context `artifacts` (the directory `out/` that `build/build.sh eif` fills).
+# `build/build.sh host` builds this image. The enclave image file, its measurements and the
+# public build proof come from the build context `artifacts` (the directory `out/`).
 #
 # This image is not measured: the identity of a release is PCR0, PCR1 and PCR2 of the enclave
-# image file inside it. The host program is built with the builder of the enclave build and
-# linked statically, so it does not depend on the libraries of the base image.
+# image file inside it. The host program is built with the toolchain image of the enclave build
+# and linked statically, so it does not depend on the libraries of the base image.
 FROM rust:1.98.1-alpine3.24@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f AS build
 
 ENV CARGO_INCREMENTAL=0 \
@@ -26,7 +28,7 @@ COPY verify verify
 
 RUN cargo build --release --locked --target x86_64-unknown-linux-musl -p credential-enclave-host
 
-# The base image and the nitro-cli package are those of `Dockerfile.eif`.
+# The base image and the nitro-cli package are those of `builder/Dockerfile.eif`.
 FROM amazonlinux:2023@sha256:5b29412077a463b4a3a8fbc99a8cdf4b929f38a3ecc8dac10328d8f36b0099b8
 
 RUN dnf install -y --setopt=install_weak_deps=False \
@@ -36,7 +38,10 @@ RUN dnf install -y --setopt=install_weak_deps=False \
     && mkdir -p /run/nitro_enclaves /var/log/nitro_enclaves /opt/credential-enclave
 
 COPY --from=build /build/target/x86_64-unknown-linux-musl/release/credential-enclave-host /usr/local/bin/credential-enclave-host
-COPY --from=artifacts enclave.eif measurements.json /opt/credential-enclave/
+# The bracket makes the last name a pattern: a pattern that matches no file copies nothing,
+# where a plain name that is absent would fail the build. A build outside a release has no
+# public build proof.
+COPY --from=artifacts enclave.eif measurements.json release-proofs.jso[n] /opt/credential-enclave/
 
 # Names the repository of this image for the registry.
 LABEL org.opencontainers.image.source="https://github.com/pickle-com/credential-enclave"

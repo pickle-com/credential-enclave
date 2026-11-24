@@ -1,0 +1,138 @@
+# The enclave image file of a `v*` tag, built and attested by one job (enclave.md 11.2). A
+# workflow that the push of a `v*` tag starts calls this workflow at one fixed commit.
+#
+# The job takes nothing from its caller: no input and no secret. It checks out two commits of
+# this repository: the commit that started the run, into `src/`, and the commit of this
+# workflow file, into `builder/`. It runs the procedure `builder/enclave-build.sh` of the
+# second on the first, and attests `out/measurements.json` as the predicate of the release
+# statement (protocol.md section 9), in the same job.
+#
+# The procedure is the one of the commit of this file, not the one of the commit it builds. A
+# commit of a tag decides its sources, its `Cargo.lock`, how its node program is compiled
+# (`build/Dockerfile.enclave`) and the images that file is built from (`build/inputs.json`,
+# each by digest). The procedure keeps the network away from every step that runs a program
+# of that commit: it downloads the packages `Cargo.lock` names, from crates.io, with cargo
+# checking each against its checksum, and the images by their digests, and then compiles in a
+# BuildKit daemon whose container has no network. It assembles and measures the enclave image
+# file with the nitro-cli this procedure fixes, and writes the release statement itself: no
+# file of the built commit states the release, the commit or a measurement.
+#
+# So the measurements this job attests are those of the enclave image that the commit of the
+# tag makes of three things: its own files, the packages of crates.io that its `Cargo.lock`
+# names by checksum, and the images it names by digest. Nothing else entered the build.
+#
+# The certificate of the attestation states this file at the fixed commit as what signed (the
+# Build Signer URI and the Build Signer Digest), and the repository, the tag and the commit of
+# the tag as what the run was based on (the Source Repository URI, Ref and Digest). A change of
+# this file, or of a file under `builder/`, is another commit of this file. A verifier accepts
+# the commits of this file it lists.
+name: enclave-build
+
+on:
+  workflow_call:
+    outputs:
+      bundle:
+        description: The Sigstore bundle of the attestation as one line of JSON, or the empty string when the job could not read it.
+        value: ${{ jobs.build.outputs.bundle }}
+
+permissions: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      bundle: ${{ steps.bundle.outputs.bundle }}
+    steps:
+      # The commit of this file is the one the identity token of the job states: the claim
+      # `job_workflow_sha`, which the certificate of the attestation repeats as the Build
+      # Signer Digest.
+      - name: The commit of this workflow file
+        id: self
+        shell: bash
+        env:
+          CONTEXT_SHA: ${{ github.job_workflow_sha }}
+        run: |
+          set -euo pipefail
+          token="$(curl --silent --show-error --fail \
+            --header "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=enclave-build" | jq -er .value)"
+          payload="$(printf '%s' "$token" | cut -d . -f 2 | tr '_-' '/+')"
+          while [ $(( ${#payload} % 4 )) -ne 0 ]; do payload="$payload="; done
+          claims="$(printf '%s' "$payload" | base64 --decode)"
+          ref="$(printf '%s' "$claims" | jq -er .job_workflow_ref)"
+          sha="$(printf '%s' "$claims" | jq -er .job_workflow_sha)"
+          [[ "$ref" == "pickle-com/credential-enclave/.github/workflows/enclave-build.yml@"* ]]
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          if [ -n "$CONTEXT_SHA" ]; then test "$CONTEXT_SHA" = "$sha"; fi
+          printf 'this workflow file: %s (commit %s)\n' "$ref" "$sha"
+          printf 'sha=%s\n' "$sha" >> "$GITHUB_OUTPUT"
+      - name: Check out the commit of the tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: src
+          persist-credentials: false
+      - name: Check out the commit of this workflow file
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: pickle-com/credential-enclave
+          ref: ${{ steps.self.outputs.sha }}
+          path: builder
+          persist-credentials: false
+      - name: The run is the push of a tag, and the two checkouts are the two commits
+        shell: bash
+        env:
+          BUILDER_SHA: ${{ steps.self.outputs.sha }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = push
+          test "$GITHUB_REF_TYPE" = tag
+          test "$GITHUB_REF" = "refs/tags/$GITHUB_REF_NAME"
+          [[ "$GITHUB_REF_NAME" =~ ^v[A-Za-z0-9._-]+$ ]]
+          test "$(git -C src rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git -C src status --porcelain)"
+          test "$(git -C builder rev-parse HEAD)" = "$BUILDER_SHA"
+          test -z "$(git -C builder status --porcelain)"
+      - name: Build the enclave image file
+        shell: bash
+        run: builder/builder/enclave-build.sh --source src --release "$GITHUB_REF_NAME" --out out
+      - name: The statement names the pushed tag and its commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(jq -er .release out/measurements.json)" = "$GITHUB_REF_NAME"
+          test "$(jq -er .git_commit out/measurements.json)" = "$GITHUB_SHA"
+          test "$(wc -c < out/measurements.json)" -le 16384
+          cat out/measurements.json
+      - name: Attest the release statement
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: out/enclave.eif
+          predicate-type: https://pickle.com/credential-enclave/release/v1
+          predicate-path: out/measurements.json
+      # The bundle is kept as an artifact of the run, beside the enclave image file and the
+      # statement, and handed to the caller as an output. The attestation is made by then.
+      - name: The bundle of the attestation
+        id: bundle
+        shell: bash
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          bundle="$(jq --compact-output . "$BUNDLE_PATH")"
+          test "$(printf '%s\n' "$bundle" | wc -l)" -eq 1
+          printf '%s\n' "$bundle" > out/release-statement.sigstore.json
+          printf 'bundle=%s\n' "$bundle" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: enclave-build
+          path: |
+            out/enclave.eif
+            out/measurements.json
+            out/release-statement.sigstore.json
+          if-no-files-found: error

@@ -1,34 +1,42 @@
 # check=skip=SecretsUsedInArgOrEnv
 #
 # The check above is skipped for the build argument CREDENTIAL_ENCLAVE_RELEASE: it is the
-# release tag, and its name alone makes the build check take it for a secret.
+# release name, and its name alone makes the build check take it for a secret.
 #
-# The enclave image (enclave.md 11.1, row 1): the node program as the only file of an image
-# built `FROM scratch`. `build/build.sh` builds this image and turns it into the enclave image
-# file (EIF) whose measurements identify a release. Do not build it by hand for a release: the
-# measurements depend on the arguments and on the exporter options that `build.sh` passes.
+# The enclave image (enclave.md 11.1, step 4): the node program as the only file of an image
+# built `FROM scratch`. `builder/enclave-build.sh` builds this file and turns the image into
+# the enclave image file (EIF) whose measurements identify a release. Do not build it by hand
+# for a release: the measurements depend on the arguments and on the exporter options that
+# the procedure passes.
+#
+# This file is the part of the build a commit decides: how the node program is compiled. It is
+# built by a BuildKit daemon that has no network, so nothing here reaches outside the build
+# context. The build context is three things:
+#
+#   - the files of the commit;
+#   - `toolchain`: the image `build/inputs.json` of the commit names by digest (Rust
+#     toolchain, C compiler, C library headers). The procedure fetched it by that digest;
+#   - `vendor`: the packages `Cargo.lock` of the commit names, which the procedure downloaded
+#     from crates.io and cargo checked against the checksums of `Cargo.lock`.
 #
 # The measurements cover the time of the node program in the image, which is the commit time.
 # Two things keep that time the same on a machine with a layer cache and on one without. The
-# stage `build` sets the time of the file it built. And `build.sh` builds the stage `image`
+# stage `build` sets the time of the file it built. And the procedure builds the stage `image`
 # anew at every build: the copy of that stage is found in the layer cache by the bytes of the
 # file, so a commit whose node program has the bytes of an earlier build would otherwise get
 # the layer of that build, with the time that build gave the file.
 #
 # Every input of the binary is fixed:
-#   - the builder image, by digest (Rust toolchain, C compiler, C library headers);
-#   - `rust-toolchain.toml` (the same Rust version as the builder image) and `Cargo.lock`;
+#   - the image `toolchain`, by digest;
+#   - `rust-toolchain.toml` (the same Rust version as that image) and `Cargo.lock`;
 #   - the release profile of the workspace `Cargo.toml`;
 #   - the working directory, the path remapping and the environment below.
 # The build installs no package. The C parts of the `ring` crate need the headers of the C
-# library (`musl-dev`), which this builder image contains: the version is asserted below.
-#
-# The network is there for one step only, the one that downloads the packages `Cargo.lock`
-# names. The step that compiles has none: the build scripts and the procedural macros of the
-# commit and of its dependencies run in it, and they can take nothing from outside the build.
-FROM rust:1.98.1-alpine3.24@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f AS build
+# library (`musl-dev`), which the image `toolchain` contains: the version is asserted below.
+FROM toolchain AS build
 
-# The release tag is compiled into the program and is part of the attestation binding.
+# The release name is compiled into the program and is part of the attestation binding. The
+# procedure passes the name of the tag that started the build, or `dev`.
 ARG CREDENTIAL_ENCLAVE_RELEASE=dev
 # The time of the commit. The node program gets it as the time of its file, and BuildKit
 # stamps the image with it.
@@ -51,12 +59,16 @@ COPY enclave enclave
 COPY host host
 COPY verify verify
 
-# The packages of `Cargo.lock`, from the network. cargo checks every downloaded file against
-# its checksum in `Cargo.lock`, and this command compiles nothing and runs no build script.
-RUN cargo fetch --locked
+# The packages of `Cargo.lock`, as the procedure vendored them, and the cargo configuration
+# that makes them the source of every crates.io package. The commit holds no cargo
+# configuration of its own (the procedure refuses a commit that does).
+COPY --from=vendor / vendor
+RUN mkdir .cargo \
+    && printf '[source.crates-io]\nreplace-with = "vendored-sources"\n\n[source.vendored-sources]\ndirectory = "vendor"\n' >.cargo/config.toml
 
-# The compilation, without a network.
-RUN --network=none cargo build --release --locked --offline --target x86_64-unknown-linux-musl -p credential-enclave \
+# The compilation. The build scripts and the procedural macros of the commit and of its
+# dependencies run here, without a network.
+RUN cargo build --release --locked --offline --target x86_64-unknown-linux-musl -p credential-enclave \
     && touch -d "@${SOURCE_DATE_EPOCH}" target/x86_64-unknown-linux-musl/release/credential-enclave
 
 FROM scratch AS image
