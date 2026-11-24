@@ -7736,11 +7736,12 @@ test("node prefixes no node made are chains the rounds follow like any other: as
   assert.deepEqual(many.world.securityStatuses.slice(-1)[0].reasons, ["verification_blocked"]);
 });
 
-test("a node discovery listing that goes on beyond the pages a round reads of it leaves the round incomplete: the log does not verify while the store names node prefixes the round did not see", async () => {
-  const fx = S.fixture(source);
+test("a node discovery listing that goes on beyond the pages a round reads of it leaves the round with more to read than it read: the log does not verify while the store names more under the prefix of the account than the round saw, the rounds that end that way are rounds that left reads undone, and when they go on for days the log is marked as for any reads held back", async () => {
+  const fx = S.fixture(source, { device: { securityStatus: true } });
   const world = fx.world;
   // The store answers the node discovery listing with a page that goes on, however often it is
-  // asked from the marker of the page before.
+  // asked from the marker of the page before (names under the prefix of the account that are no
+  // node prefixes fill its pages).
   let pages = 0;
   const fault = world.fault((line, request) => typeof request.url === "string" && new URL(request.url).searchParams.get("delimiter") === "/", () => {
     pages += 1;
@@ -7751,17 +7752,37 @@ test("a node discovery listing that goes on beyond the pages a round reads of it
         "</NextKeyMarker></ListVersionsResult>",
     };
   });
+  // The first synchronization: its round reads two pages of the listing and has more to read,
+  // and the rounds that follow it at once end the same way. None of them read anything on, so
+  // each counts.
   await S.start(fx);
-  assert.equal(pages, 2);
+  await world.settle(2 * 60000);
+  assert.equal(pages, 16);
   assert.equal(world.state.log.status, "pending");
   assert.equal(world.stored("log.legacy").more, true);
+  assert.equal(world.stored("log.round").unfinished, 8);
+  assert.equal(world.stored("log.round").caught, 0);
   assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
-  // The listing ends: the next round reads it again and the log verifies.
+  // From the next day on the first round of a synchronization is a round held back, and the log
+  // is marked when three of them were counted and the first is three days old.
+  const states = [];
+  for (let day = 0; day < 4; day += 1) {
+    await nextDay(fx);
+    await world.settle(2 * 60000);
+    states.push(world.state.log.status + ":" + world.state.log.store_failure + ":" + world.stored("log.blocked").count);
+  }
+  assert.deepEqual(states, [
+    "pending:round:unfinished:1", "pending:round:unfinished:2", "pending:round:unfinished:3", "attention:round:unfinished:4",
+  ]);
+  assert.deepEqual(world.securityStatuses.slice(-1)[0].reasons, ["verification_blocked"]);
+  // The listing ends: the next round reads it to its end, and the log verifies.
   fault.times = 0;
-  world.advance(2 * 60000);
-  await S.event(fx, "foreground");
+  await nextDay(fx);
+  await world.settle(2 * 60000);
   assert.equal(world.state.log.status, "verified");
   assert.equal(world.stored("log.legacy").more, undefined);
+  assert.equal(world.stored("log.round").unfinished, 0);
+  assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
 });
 
 test("a round the log screen started that goes on after the screen stopped waiting for it sends its report itself, and what it read is on the screen at the next opening", async () => {
@@ -8457,4 +8478,72 @@ test("a read of a later page whose request fails when the runtime runs again, af
   await world.drain();
   assert.notEqual(failure, null);
   assert.equal(failure.code, "timeout");
+});
+
+/** The program with another number of chains of format 1 and format 2 a round follows (the
+ *  checked-out program follows 64). */
+function withChains(count) {
+  const kept = "const LEGACY_NODES = 64;";
+  assert.ok(source.indexOf(kept) >= 0);
+  return source.replace(kept, "const LEGACY_NODES = " + count + ";");
+}
+
+test("a chain a round begins to follow when it follows as many chains as a round follows is taken by the round that follows at once: the chain of a receiving node whose document arrives with a later round, and the chains of more receiving nodes than a pass lists, are read in the same synchronization, and the log does not verify before", async () => {
+  // A program whose rounds follow two chains.
+  const program = withChains(2);
+  const accepted = (fx) => {
+    const node = fx.world.addNode({ release: fx.latest.release, measurement: fx.latest, offered: false });
+    fx.world.keptDocuments.set(node.id, registryDocument(node));
+    return node;
+  };
+  const followed = (world, node) => world.stored("log.legacy").nodes[node.id];
+
+  // An account with two chains. The node of one hands the delegation on to a node of the same
+  // release, and the request for the document of that node fails: the node waits.
+  const fx = S.fixture(program, { nodes: 0, legacy: 2 });
+  const world = fx.world;
+  world.now = TRANSFER_DOCUMENTS_FROM_MS + DAY_MS;
+  await S.start(fx);
+  await world.settle(1000);
+  assert.equal(world.state.log.status, "verified");
+  const receiver = accepted(fx);
+  world.advance(25 * HOUR_MS);
+  fx.legacy[0].record("c", [{ t: "grant_transferred_out", time_ms: world.now, to: receiver.id }]);
+  world.fault("POST /api/secure/log/documents", { status: 503, body: { detail: "postgresql_unavailable" } }, 1);
+  await S.event(fx, "foreground");
+  await world.settle(1000);
+  assert.deepEqual(Object.keys(world.stored("log.legacy").waiting), [receiver.id]);
+  assert.equal(followed(world, receiver), undefined);
+  // The next round judges the node that waits before it reads the chains, and follows its
+  // chain from there on. It follows two chains already, so the round is not complete, and the
+  // round that follows it at once reads the chain of that node.
+  world.advance(2 * 60000);
+  let reports = world.reports.length;
+  await S.event(fx, "foreground");
+  await world.settle(60000);
+  assert.deepEqual(world.reports.slice(reports).map((report) => report.status), ["pending", "verified"]);
+  assert.deepEqual(world.stored("log.legacy").waiting, {});
+  assert.equal(followed(world, receiver).read_ms > 0, true);
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(world.stored("log.round").unfinished, 0);
+
+  // An account with one chain, whose node hands the delegation on to three nodes of the same
+  // release. The pass that reads those entries follows three chains more, one more than the
+  // next pass lists: the round is not complete, and the round that follows it reads the third.
+  const one = S.fixture(program, { nodes: 0, legacy: 1 });
+  one.world.now = TRANSFER_DOCUMENTS_FROM_MS + DAY_MS;
+  await S.start(one);
+  await one.world.settle(1000);
+  const three = [accepted(one), accepted(one), accepted(one)];
+  one.world.advance(25 * HOUR_MS);
+  for (const node of three) {
+    one.world.advance(1000);
+    one.legacy[0].record("c", [{ t: "grant_transferred_out", time_ms: one.world.now, to: node.id }]);
+  }
+  reports = one.world.reports.length;
+  await S.event(one, "foreground");
+  await one.world.settle(60000);
+  assert.deepEqual(one.world.reports.slice(reports).map((report) => report.status), ["pending", "verified"]);
+  assert.deepEqual(three.map((node) => followed(one.world, node).read_ms > 0), [true, true, true]);
+  assert.equal(one.world.state.log.status, "verified");
 });

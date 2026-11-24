@@ -259,10 +259,11 @@
   const LOG_BLOCKED_STEP_MS = 20 * 3600000;
   // A round that leaves reads undone because there was more to read than one round reads (more
   // listing pages, more nodes without a judgement, more bodies than its requests name, an answer
-  // of the bodies that ended before its last key, more than fits its time) is not complete, and
-  // the next round reads on. A synchronization has the next round follow at once,
-  // LOG_SYNC_ROUNDS rounds in a row at most: a device with much to read (a new device, a device
-  // that was off for long) reads it during its stays in the app, and not one round a day.
+  // of the bodies that ended before its last key, more names in the node discovery listing than
+  // its pages hold, more than fits its time) is not complete, and the next round reads on. A
+  // synchronization has the next round follow at once, LOG_SYNC_ROUNDS rounds in a row at most:
+  // a device with much to read (a new device, a device that was off for long) reads it during
+  // its stays in the app, and not one round a day.
   // An account in normal use is read to its end within a few such rounds, whatever it holds.
   // Beyond LOG_UNFINISHED_ROUNDS rounds in a row that ended that way, a synchronization whose
   // first round ends that way again is one whose reads are held back (someone writes objects
@@ -5112,7 +5113,8 @@
    *  their digests (legacy.recheck, legacy.recheck_ms).
    *  A chain found this way is followed from its first seq. Every prefix the listing names is
    *  followed: a listing that goes on beyond the pages a round reads of it (legacy.more) leaves
-   *  the round incomplete, and is read again by the next round. A read of the listing that is
+   *  the round with more to read than it read (a round that left reads undone: runRound), and
+   *  is read again by the next round. A read of the listing that is
    *  held back is a read of the round held back; a backend that states it has no such store is
    *  believed by a device that knows of no chain. */
   async function findChains(turn, keys, log, run) {
@@ -5196,9 +5198,16 @@
       }
       legacy.recheck_ms = now;
     }
-    // (More node prefixes than the pages of the listing a round reads: the round did not see
-    // every chain of the account.)
-    if (legacy.more) run.cut = true;
+    // More names under the prefix of the account than the pages of the listing a round reads:
+    // the round did not see every chain of the account, and has more to read than it read. An
+    // account has as many node prefixes as its nodes made, far fewer than those pages hold, so
+    // a listing that goes on holds names no node made, and a round that ends that way is one of
+    // the rounds that left reads undone (runRound): it is no round that reads to the end
+    // however often it is made again.
+    if (legacy.more) {
+      run.cut = true;
+      run.over = true;
+    }
   }
 
   /** The part of a round that reads the chains of format 1 and format 2 this device follows: the
@@ -5344,7 +5353,14 @@
       const found = [];
       await judgeReceivers(waiting, found, noop);
       for (const id of found) {
-        if (open.indexOf(id) < 0 && open.length < LEGACY_NODES) open.push(id);
+        if (open.indexOf(id) >= 0) continue;
+        if (open.length < LEGACY_NODES) {
+          open.push(id);
+        } else {
+          // (One chain more than this round follows: the next round takes it. run.rest)
+          run.cut = true;
+          run.rest = true;
+        }
       }
     }
     let bodiesLeft = LEGACY_ROUND_BODIES;
@@ -5620,6 +5636,11 @@
       // (When the reading of the object versions ended before its end, this round makes no
       // further pass: the chains are read on by the next round.)
       open = lost !== null ? [] : next.slice(0, LEGACY_NODES);
+      if (lost === null && next.length > LEGACY_NODES) {
+        // (More chains than a pass lists: the next round takes the others. run.rest)
+        run.cut = true;
+        run.rest = true;
+      }
     }
     // The chains whose listing still goes on are read on by the next round. A chain of an
     // account in heavy use is long, and a round that reads on through it has not more to read
@@ -6409,8 +6430,9 @@
     // for such a round:
     //   it ended because it came to one of the numbers a round reads (the listing pages, the
     //   documents and the bodies its requests name, an answer of the bodies that ended before
-    //   its last key, the control entries of chains, the big keys asked for at its end), and
-    //   not because its time passed (expired);
+    //   its last key, the control entries of chains, the chains a round follows, the pages of
+    //   the node discovery listing, the big keys asked for at its end), and not because its
+    //   time passed (expired);
     //   no read of it failed or stayed without an answer, a request that was asked again for
     //   its first item and answered then among them (run.lagged);
     //   it read no object that no node wrote (spoiled);
@@ -9043,7 +9065,7 @@
       detail: "", blocked: false, silent: false, unreachable: false, cut: false, over: false, checked: 0, bodies: 0,
       nodes: new Set(), undocumented: new Set(), verified: [], entries: records, junk: junk,
       withheld: new Set(), shown: new Set(), kept: new Set(), settled: new Set(), pagesHeld: new Set(),
-      pagesRead: new Set(), store3: true, gained: 0, passed: 0, spoiled: 0, oldest: Infinity, epoch: logEpoch,
+      pagesRead: new Set(), store3: true, gained: 0, spoiled: 0, oldest: Infinity, epoch: logEpoch,
     };
     const log = loadLog();
     // What the rounds read for the screen: an entry kept there is not asked for.
