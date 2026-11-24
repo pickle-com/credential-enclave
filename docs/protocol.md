@@ -3741,8 +3741,13 @@ is and more are left, the read is held back (`chain:keys`) and the chain is not 
 reading of the object versions of a round ends before its end (the time of the round passed, or
 a request failed), what was read is judged, and each chain is read up to the `seq` before the
 first one an object version of which was not read: what was not read is not read as something
-nobody wrote, and the next round asks for none of the object versions that were read. A chain a
-round listed and read nothing of is the first the next round reads.
+nobody wrote, and the next round reads each chain on from the `seq` it was read to. The object
+versions the store answered of the request at which the reading ended are among what was read
+(the store answers the object versions of one request one by one, eight at a time): on a
+network on which those answers take longer than a round has for one request, every round reads
+its chains on by the object versions that arrived, and none asks for the same request again and
+again without reading any of it. A chain a round listed and read nothing of is the first the
+next round reads.
 
 The `seq` up to which a round read a chain moves on only to a `seq` under which the node is seen
 to have written: an object the node signed for that `seq`. The round sees that in the control

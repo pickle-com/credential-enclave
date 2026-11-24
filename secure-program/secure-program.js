@@ -5129,8 +5129,11 @@
    *  request (LOG_OBJECTS_PATH), each checked (objectUrlAccepted), and the objects from the store
    *  (through the store gate). Returns a table from key + "\n" + versionId to {body, sig}, or to
    *  null for a version the store does not hold or that is no signed value. Throws a store
-   *  failure. */
-  async function legacyObjects(turn, wanted) {
+   *  failure: the first one among the object versions in the order of wanted. read, when given,
+   *  is a table that then receives the object versions the store answered for before the failure
+   *  was thrown (the store answers them one by one, and the time of a turn may pass among
+   *  them). */
+  async function legacyObjects(turn, wanted, read) {
     const out = new Map();
     if (wanted.length === 0) return out;
     let signed = null;
@@ -5155,14 +5158,21 @@
     }
     const names = wanted.map(function (item) { return item.key + "\n" + item.versionId; });
     const fetched = await pooled(names, function (name) { return fetchStore(turn, urls.get(name), "object"); });
+    let failure = null;
     for (let at = 0; at < names.length; at += 1) {
-      if (!fetched[at].ok) throw fetched[at].error;
+      if (!fetched[at].ok) {
+        if (failure === null) failure = fetched[at].error;
+        continue;
+      }
       const response = fetched[at].value;
       if (response.status === 404) {
         out.set(names[at], null);
         continue;
       }
-      if (response.status !== 200) throw storeRefusal(response.status, "object", signedMs);
+      if (response.status !== 200) {
+        if (failure === null) failure = storeRefusal(response.status, "object", signedMs);
+        continue;
+      }
       let value = null;
       try {
         value = JSON.parse(response.body);
@@ -5172,6 +5182,10 @@
       const shaped = value !== null && typeof value === "object" &&
         typeof value.body === "string" && typeof value.sig === "string";
       out.set(names[at], shaped ? { body: value.body, sig: value.sig } : null);
+    }
+    if (failure !== null) {
+      if (read !== undefined) out.forEach(function (value, name) { read.set(name, value); });
+      throw failure;
     }
     return out;
   }
@@ -6925,15 +6939,19 @@
       const objects = new Map();
       // What ended the reading of the object versions before its end (null: nothing): the time
       // of the round, or a request that failed. The object versions read before that are
-      // judged, and each chain is read up to the seq before the first one an object version of
-      // which was not read: the next round reads on from there, and what was read is not asked
-      // for again.
+      // judged, those of the request that failed among them (the store answers the object
+      // versions of a request one by one: on a network that carries little the time of a round
+      // passes among them, and a round that kept none of them would read the same ones again
+      // and again). Each chain is read up to the seq before the first one an object version of
+      // which was not read: the next round reads on from there.
       let lost = null;
       try {
         for (let at = 0; at < wanted.length;) {
           // (As many object versions in a request as the care of the runtime names.)
           const slice = wanted.slice(at, at + LOG_CARE_OBJECTS[care()]);
-          const outcome = await settled(legacyObjects(turn, slice));
+          // (What the store answered of this request before it failed.)
+          const read = new Map();
+          const outcome = await settled(legacyObjects(turn, slice, read));
           let batch = outcome.ok ? outcome.value : undefined;
           if (!outcome.ok) {
             // A request for the addresses that was not answered is asked again for its first
@@ -6941,7 +6959,10 @@
             batch = await probed(turn, run, heldBack(outcome.error), slice.length, function () {
               return legacyObjects(turn, [slice[0]]);
             });
-            if (batch === undefined) throw outcome.error;
+            if (batch === undefined) {
+              read.forEach(function (value, name) { objects.set(name, value); });
+              throw outcome.error;
+            }
           }
           at += outcome.ok ? slice.length : 1;
           batch.forEach(function (value, name) { objects.set(name, value); });

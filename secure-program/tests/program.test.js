@@ -4329,6 +4329,51 @@ test("a long chain on a network that carries little: with every request of the c
   assert.equal(slow.world.securityStatuses.some((told) => told.status === "attention"), false);
 });
 
+test("a round whose time passes while the store answers the object versions of one request keeps the ones it read: on a network on which every request of the chains takes five seconds, a device that comes back to 300 control entries on its chain reads them over the rounds of one stay, and with nine seconds over the rounds of two, and nothing marks the log", async () => {
+  // The store answers eight object versions at a time, each request five seconds after it was
+  // sent: the 100 object versions of one request take 65 seconds, more than a round has. The
+  // round keeps the ones the store answered before its time passed, so every round reads the
+  // chain on, and the round that reads the last of them ends in time.
+  const scene = async (delay) => {
+    const fx = await chainFixture(false);
+    const world = fx.world;
+    const node = fx.legacy[0];
+    const from = world.stored("log.legacy").nodes[node.id].seq;
+    pileEntries(fx, node, 300);
+    world.advance(4 * HOUR_MS);
+    for (const route of ["POST /api/secure/log/store/listings", "POST /api/secure/log/store/objects", "S3 " + world.bucket + ".s3." + world.region + ".amazonaws.com"]) {
+      world.fault(route, { delay_ms: delay });
+    }
+    const days = [];
+    for (let day = 0; day < 2; day += 1) {
+      const reports = world.reports.length;
+      await nextDay(fx);
+      await world.settle(20 * 60000);
+      days.push({
+        state: world.state.log.status + ":" + world.stored("log.blocked").count + ":" + world.stored("log.round").unfinished,
+        read: world.stored("log.legacy").nodes[node.id].seq - from,
+        rounds: world.reports.slice(reports).map((report) => report.store_failure),
+      });
+    }
+    assert.equal(world.stored("log.legacy").nodes[node.id].seq, node.chains.get(world.userId).slice(-1)[0].seq);
+    assert.equal(world.securityStatuses.some((told) => told.status === "attention"), false);
+    return days;
+  };
+  // Five seconds: four rounds whose time passes read 72 entries each or thereabouts, and the
+  // fifth reads the rest and ends the row.
+  const five = await scene(5000);
+  assert.equal(five[0].state, "verified:0:0");
+  assert.ok(five[0].rounds.length <= 6 && five[0].rounds.slice(0, -1).every((failure) => failure === "round:time"));
+  assert.equal(five[0].rounds.slice(-1)[0], "");
+  // Nine seconds: a round reads 22 entries, the eight rounds of the first day count as rounds
+  // whose time passed, and the rounds of the second day read the rest: the round that reaches
+  // the end ends the row and what was counted.
+  const nine = await scene(9000);
+  assert.equal(nine[0].state, "pending:0:8");
+  assert.ok(nine[0].read >= 150 && nine[0].read < 300);
+  assert.equal(nine[1].state, "verified:0:0");
+});
+
 test("A1: the seq up to which a round read a chain of format 2 moves on only where the node wrote: an object someone else wrote far beyond the end of the chain, or under a seq the node has not reached, hides no transfer the node writes after it", async () => {
   for (const where of ["far", "ahead"]) {
     const fx = S.fixture(source, { nodes: 0, legacy: 1, device: { securityStatus: true } });
