@@ -1,16 +1,18 @@
 # The release of a `v*` tag (enclave.md 11.2).
 #
 # check:     the checks of check.yml and `cargo audit`.
-# build-a:   build/build.sh on one machine.
-# build-b:   build/build.sh on another machine.
-# compare:   the two builds gave the same measurements. Without this there is no release.
-# publish:   the host image to ghcr.io, the GitHub release with the enclave image file and its
-#            measurements, and two attestations of the enclave image file: its build provenance,
-#            and the release statement whose predicate is measurements.json (protocol.md
-#            section 9).
+# build:     the workflow enclave-build.yml, at the commit fixed below, builds the enclave image
+#            file of the commit of the tag and attests its measurements as the predicate of the
+#            release statement (protocol.md section 9). That attestation is the public build
+#            proof of the release.
+# rebuild:   the same procedure on another machine, without an attestation.
+# publish:   the two builds gave the same measurements (without this there is no release), the
+#            public build proof passes the checks of the secure program and of the node of this
+#            commit, the host image goes to ghcr.io with the proof inside, and the GitHub
+#            release gets the enclave image file, its measurements and the proof.
 #
-# The enclave image file of the release, of the host image and of the attestations is the one
-# build-a made. build-b exists to show that the measurements do not depend on the machine.
+# The enclave image file of the release and of the host image is the one the job `build` made.
+# A tag whose name holds `-rc.` is a release candidate: its GitHub release is a prerelease.
 name: release
 
 on:
@@ -53,7 +55,17 @@ jobs:
           cargo install cargo-audit --locked --version 0.22.2
           cargo audit
 
-  build-a:
+  # The commit after the @ is the commit of enclave-build.yml whose job signs the attestation:
+  # the certificate states it as the Build Signer Digest, and the secure program and the node
+  # accept the commits of that file they list. The permissions are the ones that job asks for.
+  build:
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    uses: pickle-com/credential-enclave/.github/workflows/enclave-build.yml@3f84e8368fcdf1f89e42ca629670bfe0989b6f13
+
+  rebuild:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -62,67 +74,18 @@ jobs:
         with:
           persist-credentials: false
       - name: Build the enclave image file
-        run: build/build.sh eif
-      - name: The release of the build is the pushed tag
-        run: |
-          grep -q "\"release\": \"$GITHUB_REF_NAME\"" out/measurements.json
+        run: build/build.sh --release "$GITHUB_REF_NAME" eif
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: build-a
-          path: |
-            out/enclave.eif
-            out/measurements.json
+          name: rebuild
+          path: out/measurements.json
           if-no-files-found: error
-
-  build-b:
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Build the enclave image file
-        run: build/build.sh eif
-      - name: The release of the build is the pushed tag
-        run: |
-          grep -q "\"release\": \"$GITHUB_REF_NAME\"" out/measurements.json
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: build-b
-          path: |
-            out/enclave.eif
-            out/measurements.json
-          if-no-files-found: error
-
-  compare:
-    needs: [build-a, build-b]
-    runs-on: ubuntu-24.04
-    permissions: {}
-    steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: build-a
-          path: build-a
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: build-b
-          path: build-b
-      - name: Both builds gave the same measurements
-        run: |
-          cat build-a/measurements.json
-          if ! diff build-a/measurements.json build-b/measurements.json; then
-            echo "::error::build-a and build-b differ: the build is not reproducible"
-            exit 1
-          fi
 
   publish:
-    needs: [check, compare]
+    needs: [check, build, rebuild]
     runs-on: ubuntu-24.04
     permissions:
-      id-token: write
       contents: write
-      attestations: write
       packages: write
     env:
       TAG: ${{ github.ref_name }}
@@ -134,9 +97,45 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: build-a
+          name: enclave-build
           path: out
-      - name: Build the host image around the enclave image file of build-a
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rebuild
+          path: rebuild
+      - name: Both builds gave the same measurements
+        run: |
+          cat out/measurements.json
+          if ! diff out/measurements.json rebuild/measurements.json; then
+            echo "::error::the attested build and the rebuild differ: the build is not reproducible, or the procedure of this commit is not the one of the fixed commit of enclave-build.yml"
+            exit 1
+          fi
+      # The public build proof as the node, the backend and the secure program carry it: the
+      # bytes of the release statement and the bundle of its attestation (protocol.md section 9).
+      - name: The public build proof of the release
+        run: |
+          set -euo pipefail
+          statement="$(base64 --wrap=0 < out/measurements.json | tr '+/' '-_' | tr -d '=')"
+          jq --compact-output --null-input --arg statement "$statement" \
+            --slurpfile attestation out/release-statement.sigstore.json \
+            '{statement: $statement, attestation: $attestation[0]}' > out/release-proofs.json
+          test "$(wc -c < out/release-proofs.json)" -le 131072
+      # A release whose proof the secure program or the node of this commit refuses is not
+      # made. Each check runs when this commit holds its command.
+      - name: The secure program and the node of this commit accept the proof
+        run: |
+          set -euo pipefail
+          if [ -f secure-program/tests/prove.js ]; then
+            node secure-program/tests/prove.js out/release-proofs.json
+          else
+            echo "this commit holds no secure-program/tests/prove.js"
+          fi
+          if grep -q '"release-proofs"' verify/src/arguments.rs 2>/dev/null; then
+            cargo run --quiet --locked -p credential-enclave-verify -- release-proofs out/release-proofs.json
+          else
+            echo "the verifier of this commit has no command release-proofs"
+          fi
+      - name: Build the host image around the enclave image file of the job build
         run: build/build.sh host
       - name: Log in to ghcr.io
         run: printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
@@ -152,30 +151,15 @@ jobs:
             echo '```json'
             cat out/measurements.json
             echo '```'
+            echo
+            echo "release-proofs.json is the public build proof of these measurements: the release statement and the Sigstore bundle of its attestation by the job of enclave-build.yml."
           } > notes.md
+          prerelease=""
+          case "$TAG" in *-rc.*) prerelease="--prerelease" ;; esac
           gh release view "$TAG" >/dev/null 2>&1 ||
-            gh release create "$TAG" --verify-tag --title "$TAG" --notes-file notes.md
-          gh release upload "$TAG" --clobber out/enclave.eif out/measurements.json
-      - name: Attest the build provenance of the enclave image file
-        id: provenance
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: out/enclave.eif
-      - name: Attest the release statement
-        id: statement
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-path: out/enclave.eif
-          predicate-type: https://pickle.com/credential-enclave/release/v1
-          predicate-path: out/measurements.json
-      - name: Attach the attestation bundles to the GitHub release
-        env:
-          PROVENANCE_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
-          STATEMENT_BUNDLE: ${{ steps.statement.outputs.bundle-path }}
-        run: |
-          cp "$PROVENANCE_BUNDLE" provenance.sigstore.json
-          cp "$STATEMENT_BUNDLE" release-statement.sigstore.json
-          gh release upload "$TAG" --clobber provenance.sigstore.json release-statement.sigstore.json
+            gh release create "$TAG" --verify-tag $prerelease --title "$TAG" --notes-file notes.md
+          gh release upload "$TAG" --clobber out/enclave.eif out/measurements.json \
+            out/release-statement.sigstore.json out/release-proofs.json
       - name: Export the published registry bytes for offline mirroring
         run: |
           go install github.com/google/go-containerregistry/cmd/crane@v0.21.7
