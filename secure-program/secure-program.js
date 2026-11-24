@@ -3712,17 +3712,23 @@
    *  no transfer of the delegation by the measurement of the receiving node. This program
    *  judges every transfer a node wrote at LEGACY_TRANSFER_DOCUMENTS_FROM_MS or later
    *  (followLegacy), the ones the earlier program passed among them. So:
-   *    a chain of format 2 is read on from the verification point, and is closed when that
-   *    point reached the final head of the node, only when the ledger keeps the time of the
-   *    entry at that point and that time lies more than LEGACY_SEEK_MARGIN_MS before
+   *    a chain is read on from the verification point, and is closed when that point reached
+   *    the final head of the node, when the ledger keeps the time of the entry at that point
+   *    and that time lies more than LEGACY_SEEK_MARGIN_MS before
    *    LEGACY_TRANSFER_DOCUMENTS_FROM_MS: nothing the node wrote at that time or later lies
    *    before an entry it wrote a day earlier by its own clock;
-   *    any other chain of format 2 is read from its first seq and is not closed: the rounds
-   *    find the place of that time in it as they do in every chain (seekProbe), pass what lies
-   *    before it, and judge the transfers after it;
-   *    a chain of format 1 (the last node of such a release ran in October 2026) is read on
-   *    from the verification point, closed when that point reached the final head, and the
-   *    chain of a build that wrote no entry to the store is closed. */
+   *    a chain whose point is of a later time is read from its first seq and is not closed.
+   *    In a chain of format 2 the rounds find the place of that time as they do in every such
+   *    chain (seekProbe), pass what lies before it, and judge the transfers after it. A chain
+   *    of format 1 is read entry by entry: the last node of a release that writes format 1
+   *    ran in October 2026, so such a point is the point of a node someone started since, and
+   *    its chain holds nothing older;
+   *    a chain whose point the ledger keeps no time of (a program before version 29, the
+   *    first that kept it, moved the point last) is read from its first seq when it is of
+   *    format 2, and on from that point when it is of format 1: the rounds would open every
+   *    entry of such a chain, and version 29 came with the first release of format 2, in
+   *    October 2026;
+   *    the chain of a build that wrote no entry to the store is closed. */
   function migrateLedger() {
     if (native.storeGet(STORE_MIGRATED) !== null || readMasterKey() === null) return;
     const ledger = loadLedger();
@@ -3742,12 +3748,12 @@
       }
       if (legacy.nodes[id] === undefined) {
         const ended = node.final !== null && node.checkpoint.seq >= node.final.seq;
-        // Whether the entry at the verification point is one its node wrote long enough before
-        // the time from which a transfer is judged by a document (a point the ledger keeps no
-        // time of is none).
-        const early = node.checkpoint.time_ms > 0 &&
-          node.checkpoint.time_ms < LEGACY_TRANSFER_DOCUMENTS_FROM_MS - LEGACY_SEEK_MARGIN_MS;
-        if (marks.format === 2 && marks.store && node.checkpoint.seq > 0 && !early) {
+        // Whether the ledger keeps the time of the entry at the verification point, and whether
+        // that entry is one its node wrote long enough before the time from which a transfer
+        // is judged by a document.
+        const timed = node.checkpoint.time_ms > 0;
+        const early = timed && node.checkpoint.time_ms < LEGACY_TRANSFER_DOCUMENTS_FROM_MS - LEGACY_SEEK_MARGIN_MS;
+        if (marks.store && node.checkpoint.seq > 0 && !early && (marks.format === 2 || (marks.format === 1 && timed))) {
           legacy.nodes[id] = { seq: 0, time_ms: 0, until_ms: node.not_after_ms, closed: false };
         } else {
           legacy.nodes[id] = {

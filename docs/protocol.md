@@ -2002,10 +2002,11 @@ another from the sealed ledger of the backend ("The settings of the delegation")
 judges nothing by the nodes of that ledger. On its
 first run on an installation it carries the ledger over once: a node with a grant time becomes a
 grant of the device, and every node the ledger explains becomes a chain the rounds read
-(`log.legacy`). A chain of format 1 is read on from the point up to which the earlier program
-verified it. A chain of format 2 is read on from that point only when the ledger keeps the time
-of the entry there and that time lies more than a day before 2026-11-23T00:00:00Z; any other
-chain of format 2 is read from its first `seq`, whatever the earlier program verified of it
+(`log.legacy`). A chain is read on from the point up to which the earlier program verified it
+when the ledger keeps the time of the entry there and that time lies more than a day before
+2026-11-23T00:00:00Z. A chain whose point is of a later time is read from its first `seq`,
+whatever the earlier program verified of it; so is a chain of format 2 whose point the ledger
+keeps no time of, and a chain of format 1 without that time is read on from its point
 ("Formats 1 and 2"). The marks of the earlier program are not
 carried over. A device of the account that still runs an earlier program counts a chain of a node
 no ledger explains as a delegation the app did not make, so the program writes every node of a
@@ -2775,8 +2776,15 @@ on is judged, by every device of the account, and nothing a node wrote before th
   when the ledger keeps the time of the entry at that point, and that time lies more than a day
   before 2026-11-23T00:00:00Z, is the chain read on from that point (and left closed when the
   point reached the final head of its node): no entry of that time or later lies before it. A
-  chain of format 1 the ledger explains is read on from its point: the last node of a release
-  that writes format 1 ran in October 2026.
+  chain of format 1 the ledger explains is carried over the same way when the ledger keeps
+  the time of its point: read on from the point when that time lies more than a day before
+  2026-11-23T00:00:00Z, and from its first `seq`, entry by entry, when it does not. The last
+  node of a release that writes format 1 ran in October 2026, so a point of a later time is
+  the point of a node someone started since, and a transfer that node wrote and the earlier
+  program passed is judged. A chain of format 1 whose point the ledger keeps no time of (a
+  program before version 29, the first that kept it, moved the point last) is read on from
+  that point: the rounds would open every entry of such a chain, and version 29 came with the
+  first release of format 2, in October 2026.
 
 How much a round reads. A round reads its chains in passes: a pass lists one page of every chain
 that has more to read (16 chains in one request for their addresses), reads the object versions
