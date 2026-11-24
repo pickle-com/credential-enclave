@@ -626,6 +626,152 @@ test("a push with the reason grant_required hands a grant again to a node the ba
   assert.equal(node.grants.has(world.userId), true);
 });
 
+test("a push with the reason grant_required hands its grant while the round of an earlier synchronization reads: the line of the synchronizations is held until the grants of a synchronization are handed, and not for its round", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  const node = fx.nodes[0];
+  // The round of the next day could not reach the store (the synchronization of that day
+  // renewed the grant). Two minutes later a synchronization runs the round again, and every
+  // request of that round is answered nine seconds after it was sent: the round reads for
+  // twenty seconds or longer.
+  world.advance(25 * HOUR_MS);
+  world.fault("S3 " + world.shardHost, "transport", 2);
+  await S.event(fx, "foreground");
+  assert.equal(world.state.log.status, "pending");
+  world.advance(2 * 60000);
+  for (const route of ["POST /api/secure/log/read", "POST /api/secure/log/bodies", "S3 " + world.shardHost]) {
+    world.fault(route, { delay_ms: 9000 });
+  }
+  const reports = world.reports.length;
+  const first = Promise.resolve(fx.program.onEvent("foreground", {}));
+  let ended = false;
+  first.then(() => { ended = true; }, () => { ended = true; });
+  await world.settle(6000);
+  assert.ok(world.sent("POST /api/secure/log/read").length > 0);
+  // The node lost the grant, and the push that says so arrives while the round reads.
+  node.grants.delete(world.userId);
+  const pushed = Promise.resolve(fx.program.onEvent("push", { reason: "grant_required" }));
+  await world.settle(2000);
+  assert.equal(node.grants.has(world.userId), true);
+  assert.equal(world.state.grant.state, "active");
+  assert.equal(world.reports.length, reports);
+  assert.equal(ended, false);
+  // Both synchronizations end with the round, and the report of the push says what it handed.
+  await world.run(Promise.all([first, pushed]));
+  await world.settle(60000);
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(world.state.error, undefined);
+  assert.deepEqual(world.syncReports.slice(-1).map((report) => report.reason + ":" + report.granted), ["grant_required:1"]);
+});
+
+test("a synchronization that ends after one that began later publishes no end over it: the failure of the later one stands", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  world.advance(25 * HOUR_MS);
+  for (const route of ["POST /api/secure/log/read", "POST /api/secure/log/bodies", "S3 " + world.shardHost]) {
+    world.fault(route, { delay_ms: 9000 });
+  }
+  const first = Promise.resolve(fx.program.onEvent("foreground", {}));
+  await world.settle(6000);
+  // The account query of the synchronization that begins now fails (twice: it is sent once
+  // more after an answer that fails for a moment).
+  world.fault("GET /api/secure/account", { status: 503, body: { detail: "unavailable" } }, 2);
+  const second = Promise.resolve(fx.program.onEvent("push", { reason: "refresh" })).then(() => "ok", (error) => error.code);
+  await world.run(first);
+  await world.settle(60000);
+  assert.notEqual(await second, "ok");
+  assert.equal(world.state.error, await second);
+});
+
+test("the runtime publishes that this program judges the log by rounds (runtime.log_rounds), and a call of read_log with the argument wait waits for the read of the screen behind the round that reads now: it answers with the judgement of the round and what it read, the next call for the screen ends its wait at once, and a call without the argument answers after three seconds from the screen the device kept", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  assert.equal(world.runtime.log_rounds, true);
+  // (The device keeps a screen.)
+  assert.equal((await S.call(fx, "read_log", { limit: 10 })).ok, true);
+  const slow = () => ["POST /api/secure/log/read", "POST /api/secure/log/bodies", "S3 " + world.shardHost]
+    .map((route) => world.fault(route, { delay_ms: 5000 }));
+  const calls = (args) => {
+    const call = { answer: null };
+    Promise.resolve(fx.program.procedures.read_log(args)).then((value) => { call.answer = value; }, (error) => { call.answer = error; });
+    return call;
+  };
+
+  // The next day a node wrote an entry, a synchronization runs a round, and every request of
+  // the rounds is answered five seconds after it was sent.
+  world.advance(25 * HOUR_MS);
+  fx.nodes[0].record("c", [{ t: "connection_removed", time_ms: world.now, record_id: "r", provider: "slack", provider_revoke: false }]);
+  let faults = slow();
+  const sync = Promise.resolve(fx.program.onEvent("foreground", {}));
+  sync.then(() => {}, () => {});
+  await world.settle(1000);
+  // A call without the argument answers after three seconds, from the kept screen.
+  const plain = calls({ limit: 10 });
+  await world.settle(2900);
+  assert.equal(plain.answer, null);
+  await world.settle(200);
+  assert.deepEqual([plain.answer.status, plain.answer.cached], ["pending", true]);
+  assert.equal(shownGroups(plain.answer).some((group) => group.kind === "disconnected"), false);
+  // The call with the argument waits on: for the round of the synchronization, and for the
+  // read of the screen behind it.
+  const last = calls({ limit: 10, wait: true });
+  await world.settle(10000);
+  assert.equal(last.answer, null);
+  await world.settle(50000);
+  assert.deepEqual([last.answer.status, last.answer.cached], ["verified", false]);
+  assert.equal(shownGroups(last.answer).filter((group) => group.kind === "disconnected").length, 1);
+  await world.run(sync);
+  await world.settle(60000);
+  for (const fault of faults) fault.times = 0;
+
+  // A call that waits is ended by the next call for the screen: by a call for a later page,
+  // and by another call of read_log. It answers at once from the kept screen.
+  for (const next of ["read_log_page", "read_log"]) {
+    world.advance(25 * HOUR_MS);
+    faults = slow();
+    const again = Promise.resolve(fx.program.onEvent("foreground", {}));
+    again.then(() => {}, () => {});
+    await world.settle(1000);
+    const waiting = calls({ limit: 10, wait: true });
+    await world.settle(5000);
+    assert.equal(waiting.answer, null, next);
+    const other = next === "read_log" ? calls({ limit: 10 }) : null;
+    if (next === "read_log_page") Promise.resolve(fx.program.procedures.read_log_page({ before_ms: world.now })).then(() => {}, () => {});
+    await world.settle(0);
+    assert.deepEqual([waiting.answer.status, waiting.answer.cached], ["pending", true], next);
+    await world.run(again);
+    await world.settle(2 * 60000);
+    if (other !== null) assert.notEqual(other.answer, null);
+    for (const fault of faults) fault.times = 0;
+  }
+
+  // The wait has the time of a round: a read that takes longer (the round of the
+  // synchronization and the round of the screen each read a long chain on, with requests
+  // answered after nine seconds) is answered from the kept screen sixty seconds after the call.
+  const long = S.fixture(source, { nodes: 1, legacy: 1 });
+  await S.start(long);
+  assert.equal((await S.call(long, "read_log", { limit: 10 })).ok, true);
+  long.world.pageSize = 3;
+  writeChain(long.legacy[0], 100, long.world.now + 1000);
+  long.world.advance(25 * HOUR_MS);
+  for (const route of ["POST /api/secure/log/store/listings", "POST /api/secure/log/store/objects", "S3 " + long.world.bucket + ".s3." + long.world.region + ".amazonaws.com"]) {
+    long.world.fault(route, { delay_ms: 9000 });
+  }
+  const late = Promise.resolve(long.program.onEvent("foreground", {}));
+  late.then(() => {}, () => {});
+  await long.world.settle(1000);
+  const bounded = { answer: null };
+  Promise.resolve(long.program.procedures.read_log({ limit: 10, wait: true })).then((value) => { bounded.answer = value; }, (error) => { bounded.answer = error; });
+  await long.world.settle(59000);
+  assert.equal(bounded.answer, null);
+  await long.world.settle(1500);
+  assert.deepEqual([bounded.answer.status, bounded.answer.cached], ["pending", true]);
+  await long.world.settle(10 * 60000);
+});
+
 test("a backend without the route of the node list is asked for the attestations of every node, and what the device kept decides the grants", async () => {
   const fx = S.fixture(source, { nodes: 2 });
   fx.world.routes.grants = false;

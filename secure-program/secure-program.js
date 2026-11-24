@@ -2882,12 +2882,15 @@
   // The three lines (the procedures a user starts, the synchronizations, the reads of the log
   // screen) and the two locks (the judgement of the key with the grants that follow it, one round
   // of the log). A lock is a line: whoever holds it runs alone, and everything it waits for while
-  // it holds the lock is a request with a time limit.
+  // it holds the lock is a request with a time limit. A synchronization holds its line until
+  // its grants are handed (runSync); what follows the grants in a synchronization runs one at a
+  // time on a line of its own (afterLine), and the round on the round lock.
   const userLine = newLine();
   const syncLine = newLine();
   const screenLine = newLine();
   const grantLock = newLine();
   const roundLock = newLine();
+  const afterLine = newLine();
 
   /** A turn for work nothing waits on with a limit of its own (a report, the polling of a key
    *  transfer): each of its requests has its time limit. */
@@ -12058,6 +12061,12 @@
     await finishAppPasswordSetup(turn, keys, step.ledger, step.grants);
   }
 
+  // The synchronizations of this runtime are numbered in the order they begin (syncBegun), and
+  // syncEnded is the number of the one that published the end of a synchronization last: a
+  // synchronization that ends after one that began later publishes nothing over it.
+  let syncBegun = 0;
+  let syncEnded = 0;
+
   /** One synchronization (docs/protocol.md, "The program of the app"). trigger says what started
    *  it: {refill} (a push with the reason grant_required: a node the backend reports no grant row
    *  for is handed a grant again). The steps:
@@ -12070,9 +12079,16 @@
    *    7 what follows the grants: the sealing check, the completion of an application password
    *      setup, and a round of the log when one is due
    *    8 the catch-up of a transfer of the master key
-   *  Steps 1 to 5 run under the grant lock. A failure publishes its code to state.error, a success
-   *  clears it. Returns {keyState, keyId, grant, granted, rejected}. */
-  async function runSync(turn, trigger) {
+   *  Steps 1 to 5 run under the grant lock. handed is called when step 6 is done, or when the
+   *  synchronization ended before it: the line of the synchronizations is held until then and no
+   *  longer (requestSync), so the grants of the next synchronization wait for no round of this
+   *  one. Step 7 waits for what follows the grants of the synchronization before (afterLine), and
+   *  for the round that runs. A failure publishes its code to state.error, a success clears it,
+   *  unless a synchronization that began later ended first. Returns {keyState, keyId, grant,
+   *  granted, rejected}. */
+  async function runSync(turn, trigger, handed) {
+    syncBegun += 1;
+    const number = syncBegun;
     try {
       const step = await grantLock.run(turn, async function () {
         // (The account query and the list of the nodes are each sent once more after an answer
@@ -12088,8 +12104,10 @@
       });
       const judged = step.judged;
       // Step 6: the grant step published the state of the grants; the runtime is ready (the key is
-      // judged and the grants are handed). What follows does not hold the screens back.
+      // judged and the grants are handed). What follows does not hold the screens back, and not
+      // the grants of the synchronization after this one.
       native.publish({ runtime: { ready: true } });
+      handed();
       let grant = { state: "none", not_after_ms: 0 };
       let granted = 0;
       let rejected = 0;
@@ -12098,7 +12116,7 @@
         grant = step.grants.grant;
         granted = step.grants.renewed.granted;
         rejected = step.grants.renewed.rejected;
-        await afterGrants(turn, keys, step.grants);
+        await afterLine.run(turn, function () { return afterGrants(turn, keys, step.grants); });
         if (roundDue()) {
           try {
             // When the round ends with more to read than a round reads, the next rounds follow
@@ -12112,7 +12130,10 @@
         }
         shareLedgerSoon(keys);
       }
-      native.publish({ state: { error: null } });
+      if (number > syncEnded) {
+        syncEnded = number;
+        native.publish({ state: { error: null } });
+      }
       // Catching up on the master key transfer: a device with the key reads the pending requests, a
       // device with a transfer in progress advances one step, and the polling loop is started again.
       // The transfer belongs to the line of the procedures a user starts; the synchronization does
@@ -12127,24 +12148,33 @@
       outcomesDaily();
       return { keyState: judged.keyState, keyId: judged.keyId, grant: grant, granted: granted, rejected: rejected };
     } catch (error) {
-      native.publish({ state: { error: failureCode(error) } });
+      if (number > syncEnded) {
+        syncEnded = number;
+        native.publish({ state: { error: failureCode(error) } });
+      }
       throw error;
+    } finally {
+      handed();
     }
   }
 
-  // The synchronization that waits for the one that runs (null: none): {trigger, promise}. A
-  // trigger that arrives while one waits is served by it. runningSync is the one that runs (null:
-  // none): {startedMs, promise}.
+  // The synchronization that waits for the line (null: none): {trigger, promise}. A trigger that
+  // arrives while one waits is served by it. runningSync is the one that began last and has not
+  // ended (null: none): {startedMs, promise}.
   let waitingSync = null;
   let runningSync = null;
 
-  /** Asks for a synchronization on the line of the synchronizations: one runs and at most one
-   *  waits. A trigger that arrives while one waits joins it (its refill is taken over). An event
-   *  of the app itself (own: the start of the runtime, the return to the foreground) is also
-   *  served by the synchronization that runs when it began less than EVENT_SYNC_FRESH_MS ago: what
-   *  it reads is as new as what a synchronization of that event would read. Otherwise a new
-   *  synchronization is put on the line, which runs at once when none runs. The time of a
-   *  synchronization begins when it begins. Returns the promise of its result. */
+  /** Asks for a synchronization on the line of the synchronizations. A synchronization holds the
+   *  line until its grants are handed (steps 1 to 6 of runSync): one hands its grants and at most
+   *  one waits for that. A trigger that arrives while one waits joins it (its refill is taken
+   *  over). An event of the app itself (own: the start of the runtime, the return to the
+   *  foreground) is also served by the synchronization that began last when that was less than
+   *  EVENT_SYNC_FRESH_MS ago and it has not ended: what it reads is as new as what a
+   *  synchronization of that event would read. Otherwise a new synchronization is put on the
+   *  line, which begins at once when no synchronization is handing its grants: a round an earlier
+   *  synchronization waits for holds it back from nothing (a push with the reason grant_required
+   *  hands its grant while that round reads). The time of a synchronization begins when it
+   *  begins. Returns the promise of its result, which is the result of all its steps. */
   function requestSync(trigger) {
     if (waitingSync !== null) {
       if (trigger.refill === true) waitingSync.trigger.refill = true;
@@ -12157,6 +12187,7 @@
     const entry = { trigger: { refill: trigger.refill === true }, promise: null };
     const waits = syncLine.busy();
     const start = tracked(trigger.name, function (args, turn) {
+      let work = null;
       return syncLine.run(turn, function () {
         if (waitingSync === entry) waitingSync = null;
         const running = { startedMs: native.nowMs(), promise: entry.promise };
@@ -12164,10 +12195,13 @@
         const ended = function () {
           if (runningSync === running) runningSync = null;
         };
-        const work = runSync(turn, entry.trigger);
-        work.then(ended, ended);
-        return work;
-      }, true);
+        // The line is held until the grants of this synchronization are handed (handed), and
+        // the synchronization goes on beside the line.
+        return new Promise(function (handed) {
+          work = runSync(turn, entry.trigger, handed);
+          work.then(ended, ended);
+        });
+      }, true).then(function () { return work; });
     });
     entry.promise = start({});
     if (waits) waitingSync = entry;
@@ -13395,21 +13429,52 @@
     return flight.promise;
   }
 
+  // The call of read_log that waits for the read of the store beyond LOG_SCREEN_WAIT_MS (null:
+  // none): {done, release}. The next call for the log screen ends its wait (endScreenWait).
+  let screenWait = null;
+
+  /** Ends the wait of the call of read_log that waits for the read of the store (wait true): it
+   *  answers at once from the screen the device kept. Every call for the log screen does so
+   *  first, so a call that waits holds back nothing the user does on the screen. */
+  function endScreenWait() {
+    const waiting = screenWait;
+    if (waiting === null) return;
+    screenWait = null;
+    waiting.done = true;
+    waiting.release();
+  }
+
   /** read_log: the first page of the log screen and the summary. The call starts a read of the
    *  screen from the store (or joins the one in flight) and waits for it for LOG_SCREEN_WAIT_MS;
    *  when the read has not ended by then, the call answers from the screen the device kept, with
    *  the status pending, and the read goes on (the screen asks again and receives what was read).
-   *  With the argument kept true the call answers from the kept screen at once, without waiting. */
+   *  With the argument kept true the call answers from the kept screen at once, without waiting.
+   *  With the argument wait true the call waits for that read for as long as a round has
+   *  (LOG_ROUND_LIMIT_MS): the read of the screen runs a round behind the round that reads
+   *  now, so a screen whose last call for an opening waits that way receives the judgement of
+   *  the round, and what it read, without the user doing anything. The next call for the log
+   *  screen ends that wait (endScreenWait), and the call that waited answers from the kept
+   *  screen as a call whose wait passed does. */
   async function readLog(turn, args) {
     const limit = screenLimit(args, 100);
     const keys = heldKeys();
+    endScreenWait();
     const read = screenRead(limit);
     read.then(noop, noop);
     if (args.kept === true || args.kept === "true") return keptAnswer(keys, limit);
-    const waited = await Promise.race([
+    const long = args.wait === true || args.wait === "true";
+    const mine = { done: false, release: noop };
+    const races = [
       settled(read),
-      pause(Math.min(LOG_SCREEN_WAIT_MS, Math.max(0, turnLeft(turn)))).then(function () { return null; }),
-    ]);
+      pause(Math.min(long ? LOG_ROUND_LIMIT_MS : LOG_SCREEN_WAIT_MS, Math.max(0, turnLeft(turn))), mine).then(function () { return null; }),
+    ];
+    if (long) {
+      races.push(new Promise(function (resolve) { mine.release = function () { resolve(null); }; }));
+      screenWait = mine;
+    }
+    const waited = await Promise.race(races);
+    mine.done = true;
+    if (screenWait === mine) screenWait = null;
     if (waited === null) return keptAnswer(keys, limit);
     if (!waited.ok) {
       const code = failureCode(waited.error);
@@ -14275,9 +14340,11 @@
 
   // ---- Registration ----
 
-  /** A counted procedure that runs on the line of the reads of the log screen. */
+  /** A counted procedure that runs on the line of the reads of the log screen. The call ends
+   *  the wait of a call of read_log that waits for the read of the store (endScreenWait). */
   function screenProcedure(name, work) {
     return tracked(name, function (args, turn) {
+      endScreenWait();
       return screenLine.run(turn, function () { return work(turn, args); });
     });
   }
@@ -14310,8 +14377,9 @@
       reveal_login_password: userProcedure("reveal_login_password", revealLoginPassword),
       set_grant_days: userProcedure("set_grant_days", setGrantDays),
       set_delegation: userProcedure("set_delegation", setDelegation),
-      // read_log answers within LOG_SCREEN_WAIT_MS and waits on no line: the read of the store it
-      // starts runs on the line of the screen (screenRead).
+      // read_log answers within LOG_SCREEN_WAIT_MS (within LOG_ROUND_LIMIT_MS with the argument
+      // wait) and waits on no line: the read of the store it starts runs on the line of the
+      // screen (screenRead).
       read_log: tracked("read_log", function (args, turn) { return readLog(turn, args); }),
       read_log_page: function (args) {
         const before = args !== null && typeof args === "object" ? logPageCursor(args.before_ms) : null;
@@ -14329,7 +14397,9 @@
         // account or of another) does not stand: it is false until the account query of this
         // runtime says otherwise.
         resetTransfer();
-        native.publish({ runtime: { protected_sheets: protectedSheets(), named_secrets: false } });
+        // (log_rounds: this program judges the log by rounds. The screens choose their wording
+        // by that value, and not by the number of the version of the program.)
+        native.publish({ runtime: { protected_sheets: protectedSheets(), named_secrets: false, log_rounds: true } });
         // The state of the log that a program before this one published is not a judgement of
         // this program: until this program ended a round on this installation, the log is pending.
         if (storedObject(STORE_ROUND).v !== VERSION) native.publish({ state: { log: keptLogState() } });
