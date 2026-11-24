@@ -25,6 +25,13 @@ const model = require("./proofs.js");
 const { proofCases } = require("./proof-cases.js");
 
 const source = fs.readFileSync(path.join(__dirname, "..", "secure-program.js"), "utf8");
+// The shared cases of the release proofs (docs/protocol.md 13): protocol/vectors/release-proofs.json
+// of this checkout, or the file SECURE_PROGRAM_PROOF_CASES names. The node implementation reads
+// the same file (protocol/tests/release_proofs.rs). The test of the cases is skipped when the
+// checkout holds no such file and none is named.
+const SHARED_CASES_PATH = process.env.SECURE_PROGRAM_PROOF_CASES ||
+  path.join(__dirname, "..", "..", "protocol", "vectors", "release-proofs.json");
+const shared = fs.existsSync(SHARED_CASES_PATH) ? JSON.parse(fs.readFileSync(SHARED_CASES_PATH, "utf8")) : null;
 const { HOUR_MS, DAY_MS } = S;
 const MINUTE_MS = 60000;
 const REFUSED = "release proofs refused: ";
@@ -320,6 +327,45 @@ test("release proofs that hold hand the node its grant, and proofs that differ f
     "v7: predicate pcr2",
   ]) {
     assert.ok(seen.get(reason) >= 1, "cases of " + reason);
+  }
+});
+
+test("the shared cases of the release proofs: on every case the program gives the verdict the file states, with the release of an accepted case and the check that refuses a refused one, as the node implementation does on the same file", { skip: shared === null }, () => {
+  // The program of a trust of the file holds the two certificates, the keys of the logs and the
+  // list of build workflows of that trust in the place of its constants; the program of the
+  // trust "source" is the program as it is.
+  const programs = new Map();
+  const verdictOf = (trust) => {
+    if (!programs.has(trust)) {
+      let text = source;
+      if (trust !== "source") {
+        const values = shared.trusts[trust];
+        assert.notEqual(values, undefined, "the trust " + trust);
+        text = model.withConstant(text, "PROOF_LOG_KEYS", JSON.stringify(values.log_keys));
+        text = model.withConstant(text, "FULCIO_ROOT", JSON.stringify(values.fulcio_root));
+        text = model.withConstant(text, "FULCIO_INTERMEDIATE", JSON.stringify(values.fulcio_intermediate));
+        text = model.withBuilders(text, values.builders);
+      }
+      programs.set(trust, model.verdictsOf(text));
+    }
+    return programs.get(trust);
+  };
+  // (The issuer of the tokens and the repository with its two identifiers are constants of the
+  // program that no trust of the file changes.)
+  for (const values of Object.values(shared.trusts)) {
+    assert.deepEqual([values.issuer, values.repository, values.repository_id, values.owner_id],
+      ["https://token.actions.githubusercontent.com", model.REPOSITORY, "1400118248", "151645824"]);
+  }
+  const seen = new Map();
+  for (const item of shared.cases) {
+    const got = verdictOf(item.trust)(item.release_proofs_text, item.measurement);
+    assert.deepEqual([got.accepted, got.release, got.rule], [item.accepted, item.release, item.rule],
+      item.trust + ": " + item.name + (got.reason === "" ? "" : " (" + got.reason + ")"));
+    seen.set(String(item.rule), (seen.get(String(item.rule)) || 0) + 1);
+  }
+  assert.ok(shared.cases.length >= 300);
+  for (const rule of ["null", "form", "V1", "V2", "V3", "V4", "V5", "V6", "V7"]) {
+    assert.ok(seen.get(rule) >= 5, "cases of " + rule);
   }
 });
 

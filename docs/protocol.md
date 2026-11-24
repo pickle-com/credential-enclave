@@ -1423,14 +1423,16 @@ of the calls, and the lines do not wait for one another.
 | Line | What runs on it |
 | --- | --- |
 | The procedures a user starts | `create_key`, `reset_key`, `connect`, `set_connection_writes`, `manage_repositories`, `connect_app_password`, `begin_app_password_setup`, `cancel_app_password_setup`, `store_login`, `store_card`, `store_secret`, `reveal_secret`, `update_secret`, `delete_secret`, `reveal_login_password`, `set_grant_days`, `set_delegation`, the five procedures of the master key transfer and the steps of its polling |
-| The synchronizations | The procedure `sync` and the synchronization an event starts. One runs and at most one waits: a trigger that arrives while one waits is served by the one that waits |
+| The synchronizations | The procedure `sync` and the synchronization an event starts. A synchronization holds the line until its grants are handed (steps 1 to 6 of "The synchronization"): one hands its grants and at most one waits for that, and a trigger that arrives while one waits is served by the one that waits |
 | The reads of the log screen | The read of the first page that `read_log` starts, `read_log_page` and `read_security_record` |
 
 Two locks protect what two lines could change at once. The lock of the grants holds from the
 judgement of the key to the record of the replies of the grant commands: a synchronization, and a
 procedure that makes sure a node holds the grant before it connects or stores, do not overlap in
 that span. The lock of the round holds one round of the log. Whoever holds a lock waits only for
-requests, and every request has a time limit.
+requests, and every request has a time limit. What follows the grants in a synchronization
+(step 7: the sealing of earlier values and the completion of a mail setup) runs one
+synchronization at a time on a line of its own, beside the line of the synchronizations.
 
 | Limit | Value |
 | --- | --- |
@@ -1475,14 +1477,14 @@ log follow rules of their own ("The round").
 
 | Event | What the program does |
 | --- | --- |
-| `session_ready` | Clears the state of a master key transfer (a runtime does not take over the transfer of the runtime before it), publishes whether the build has the protected sheets and `runtime.named_secrets` as false ("The synchronization"), publishes the log as pending when this program has ended no round on the installation (the state an earlier program published is not a judgement of this one), counts the calls the runtime before left open as interrupted, judges the measurements the device kept (A1, "The round"), and starts a synchronization |
+| `session_ready` | Clears the state of a master key transfer (a runtime does not take over the transfer of the runtime before it), publishes whether the build has the protected sheets, `runtime.named_secrets` as false and `runtime.log_rounds` as true ("The synchronization"), publishes the log as pending when this program has ended no round on the installation (the state an earlier program published is not a judgement of this one), counts the calls the runtime before left open as interrupted, judges the measurements the device kept (A1, "The round"), and starts a synchronization |
 | `foreground` | Judges the measurements the device kept (A1) and starts a synchronization |
 | `background` | Ends the reading of the round that runs: the round is judged on what it read and writes what it kept within the event ("The round"). Judges the measurements the device kept (A1), and notes the time for the calls that are open (the report of the outcomes) |
 | `push` | With the reason `transfer_request`: reads the pending requests of a master key transfer. With any other reason: judges the measurements the device kept (A1), starts a synchronization and, when it ended, sends the report of the synchronization. A synchronization of the reason `grant_required` hands a grant again to a node the backend reports no grant for (below) |
 | `account_end` | With the reasons `account_deleted` and `dev_reset`: deletes the master key item, the node ledger and the reception key of a mail setup from the key store, and everything the program store holds of the account. Work that is still running writes nothing of the account after that |
 
 A synchronization the app itself triggers (`session_ready`, `foreground`) within 5 s of the start
-of the one that runs is served by that one.
+of the one that began last, while that one has not ended, is served by that one.
 
 ### The synchronization
 
@@ -1514,10 +1516,12 @@ of the one that runs is served by that one.
    the device kept. A node the list marks `revoke_only` is none of these nodes.
 4. When a node is to receive a grant, the program requests the attestation of those nodes only
    (`GET /api/secure/nodes` with `nonce` and `nodes`, the ids joined by commas, 32 per request),
-   verifies each (4.3 and the next part), and sends the grant commands together (5.2). A node
-   whose document verifies with a measurement no list has and no release proofs showed is asked
-   once more, with the query `proofs=1` ("The release proofs"), before the commands go out. A
-   synchronization without such a node sends no request that calls a node. A backend that has no
+   verifies each (4.3 and the next part), and sends the grant commands together (5.2). For a
+   node whose document verifies with a measurement no list has and no release proofs showed,
+   the program asks the backend for the release proofs of that measurement before the commands
+   go out ("The release proofs"): when they hold, the node receives its grant in that step. A
+   synchronization with no node that is to receive a grant sends no request that calls a node. A
+   backend that has no
    route `GET /api/secure/grants` (status 404) is asked for the attestation of every node of the
    account instead, and what the device kept decides which of them receives a grant. Any other
    failure of the list fails the synchronization: a failed answer is never read as a list of nodes
@@ -1546,6 +1550,15 @@ of the one that runs is served by that one.
    writes, deletes and publishes nothing of the setup it worked on.
 8. The catch-up of a master key transfer.
 
+The line of the synchronizations is held for steps 1 to 6, and steps 7 and 8 run beside it. So
+the grants of a synchronization wait for the grants of the synchronization before it, and for
+no round: a push of the reason `grant_required`, which wakes a device to hand a grant to a node
+that holds none, hands that grant while the round of an earlier synchronization reads. The
+round runs under the lock of the round, and a synchronization that finds a round running takes
+the result of that one. The call of a synchronization ends when all its steps ended, and the
+report of a push follows that. A synchronization that ends after one that began later publishes
+no `state.error` over it.
+
 A runtime whose node ledger holds a value this program does not read ("The settings of the
 delegation") does not know whether the delegation is on. In steps 3 to 5 it asks no node for an
 attestation, hands no grant, sends no revoke, and publishes no state of the grants: the app keeps
@@ -1559,14 +1572,16 @@ on one without:
 | `runtime.named_secrets` | Whether the backend turned the vault items with a name on for the account. A runtime publishes false at its start (what a runtime before it published, of this account or of another, does not stand) and true once the answer to `GET /api/secure/account` of the account of the device carries `named_secrets` true; any other answer, and a query that fails, leave the value as it is. The value is what the operator domain says, handed on to the screens as it is: the screens of the app choose their names by it, and no procedure of the program acts on it |
 | `state.named_secrets` | The same value in the state, which the app keeps over its restarts (it keeps none of the runtime values): true with every answer that says so, and false with the first answer that does not say so after the device published true. An account that was never told true has no such key in its state (the device remembers in `vault.named` that it published true) |
 | `runtime.program_stale` | Whether the runtime knows that a later program than this one is served ("A runtime behind the served program"), or reads a node ledger that holds a value this program does not read (a later program wrote it: "The settings of the delegation"), published whenever that changes. The screens of the app read it to tell the user that the app is loading a later program, and a build of the app may take it as the occasion to load the program that waits |
+| `runtime.log_rounds` | True: this program judges the log by rounds ("The round"), and publishes `state.log` in the form of that section. A runtime publishes it at its start. The screens of the app choose their wording of the log by this value, and not by the number of the version of the program; no procedure of the program acts on it |
 | `runtime.ledger_ahead` | Whether `runtime.program_stale` is true because the node ledger holds a value this program does not read (the key store item, the copy of the device, or the sealed ledger of the backend), whatever else makes it true. False when the ledger is one this program reads. It is published with `runtime.program_stale`. The screens of the app tell the two reasons apart by it, and no procedure of the program acts on it |
 
 A procedure that needs a node holding the grant (a connection, the storing of a value) runs steps
 1 to 4 once under the lock of the grants. With delegation off it fails with `delegation_off`; when
 no listed node holds a grant, with `grant_required`, or with `attestation_failed` when every listed
-node failed the verification or is of a release the program does not list. In a stale runtime
-that no listed node takes a grant of (every listed node is of a release the program does not
-list or failed the verification, or the backend lists none), the failure is `program_stale`: the
+node failed the verification or is of a measurement the program does not accept. In a stale
+runtime that no listed node takes a grant of (every listed node is of a measurement the program
+does not accept or failed the verification, or the backend lists none), the failure is
+`program_stale`: the
 program is behind, and the app loads the served one at its next start or return to the
 foreground. In a runtime whose node ledger holds a value this program does not read, the failure
 is `program_stale` as well, and nothing is sent to a node. When the step was about to hand a
@@ -1584,15 +1599,14 @@ grant to makes no statement it accepts; in a stale runtime that failure is `prog
 
 A node receives a grant when its attestation verifies (4.3) and:
 
-- its measurement (PCR0, PCR1, PCR2) equals an element of the list of accepted releases of the
-  program (4.5), or release proofs that this runtime verified show it as that of a release whose
-  statement states no program later than this one ("The release proofs"). A document that
-  verifies with a measurement no list has and no proofs showed is the document of a release
-  later than the program: the node receives no grant and is not asked again by that program, but
-  for the release proofs of its measurement an hour after the last request for them. So is the
-  document of a measurement whose proofs hold and state a later program, and the proofs of such a
-  measurement are not asked for again;
-- its binding states no `program_min` above the version of the program (below);
+- its measurement (PCR0, PCR1, PCR2) equals an element of the lists of the program (the releases
+  before v2.4.0 and the builds before the first release: 4.5), or release proofs that this
+  program verified show it as the measurement of a release ("The release proofs"). The lists
+  are closed: no release is added to them, and a release from v2.4.0 on is accepted by its
+  proofs. A document that verifies with a measurement no list has and no proofs showed is the
+  document of a measurement the program does not accept: the node receives no grant and is not
+  asked for its attestation again, and the backend is asked for the release proofs of the
+  measurement again five minutes after its last answer;
 - its binding names the log store of the server target (4.3 step 10, a node of platform
   `nitro`);
 - its binding has no `role`, or the role `reserve` (a node that holds delegations and takes no
@@ -1666,7 +1680,8 @@ resumption times, and the lifetime that was set last.
 `set_grant_days` sets the lifetime (an integer from 1 to 30). It hands a grant of that lifetime
 to every listed node at once, whatever the renewal interval says. A shorter lifetime is applied
 to every listed node or to none: when the step has no grant command for a listed node (its
-attestation did not arrive or did not verify, or it is of a release the program does not list),
+attestation did not arrive or did not verify, or it is of a measurement the program does not
+accept),
 no grant and no revoke goes out, the lifetime stays as it was, and the call fails with
 `grant_incomplete`, or with `program_stale` in a stale runtime. When a node did not take the
 grant, or a node listed for its revokes alone did not confirm the revoke that a shorter lifetime
@@ -1761,318 +1776,157 @@ this way and no other. Three checks of the device that takes the key:
 - a device that held another key empties its node ledger and erases what it kept of the log
   before it writes the key of the account, as `reset_key` does.
 
-A binding may state `program_min`, a non-negative integer: the lowest version of the program whose
-grant command the node takes. A node of an accepted release whose `program_min` is above the
-version of the program receives no grant of that program. It is counted with the nodes of a later
-release in the result of a synchronization, and a runtime asks it once. It is no node of a release
-the program does not accept: its entries are judged as those of an accepted node, and nothing is
-kept of its measurement. A node whose binding states a `program_min` that is anything but a
-non-negative integer fails the attestation of a node that is to receive a key, and receives none
-(the target of a revoke is read whatever it states). Its node document is read as that of any
-node: a node document hands no key over. A binding without the key states none.
-
 ### The release proofs
 
-The list of accepted releases is a constant of the program, so it holds the releases that existed
-when the program was written. The nodes of a release made after that state a measurement the list
-does not have. Such a measurement is that of an accepted release when release proofs show it:
-values that anyone may hand to the program, and that the program verifies on the device with
-constants of its own. A release has such proofs when the build workflow of this repository built
-it, at the commit of that workflow file the program holds. That file fixes the build method of a
-release by the SHA-256 of four files (below), so a release whose build method is another one (a
-later toolchain, a changed Dockerfile or build script) has no proofs this program takes: it
-reaches a device with a program that lists it, as every release did before. With proofs that pass, the release counts as an element of the list that
-writes to the log store: a node of the measurement receives the grant by the rules of "The nodes
-that receive a grant" (its binding names the log store of the server target), the format of its
-log follows from the name of the release, and its entries, and a transfer of the key of the account
-to its measurement, are judged as those of an accepted release (7.4, A1). Without proofs that
-pass, the node is one of a later release (4.3). A release whose proofs pass and whose statement
-states a program later than this one is none this program accepts ("A statement that states a
-later program" below).
+The lists of accepted releases are constants of the program, and they are closed: they hold the
+releases before v2.4.0 and the builds before the first release, and no release is added to them.
+The nodes of a release from v2.4.0 on state a measurement no list has. Such a measurement is that
+of an accepted release when release proofs show it: the public build proof of the release
+(section 9), which anyone may hand to the program and which the program verifies on the device
+with constants of its own. No key of the operator takes part in that verdict, and the program
+compares the name of no release with the name of another. With proofs that hold, a node of the
+measurement receives the grant by the rules of "The nodes that receive a grant", it counts as a
+node that writes format 3 to the log store (its binding names the log store of the server
+target), and the rounds judge what it wrote as the entries of an accepted node.
 
-The proofs are a JSON object:
+The proofs are a JSON object (9.2):
 
 ```text
 release_proofs = {"statement": b64u(the bytes of the release statement),
-                  "entry": {"log_id": "...", "body": "...", "integrated_time": 0, "log_index": 0,
-                            "signed_entry_timestamp": "..."},
-                  "deploy_signatures": [{"key_id": "prod", "signature": "<standard base64 of 64 bytes>"}],
-                  "attestation": {the Sigstore bundle of the attestation of the release statement}}
+                  "attestation": <the Sigstore bundle of the attestation GitHub made of the statement>}
 ```
 
-`statement` and `entry` are the endorsement of 10.3 for a log of the form Rekor v1: the release
-statement is the bytes of the file `measurements.json` of the release, and the entry is what the
-log returned for the record of the signature of the release key over those bytes. `attestation` is
-the Sigstore bundle of the attestation that the job of the build workflow of this repository made
-of the release statement (enclave.md 11.2). A release may hold other attestations of the same
-statement, made by a job of another workflow: the program takes none of them (P4). The program
-does not read other members.
+The program takes release proofs for a measurement when they have the form and pass the checks
+V1 to V7 of 9.4, which it makes in the order of that section. In short:
 
-Every check must hold, for a measurement M (PCR0, PCR1 and PCR2 of a document that verified by
-4.3, or of a measurement that an entry of an accepted node names):
-
-| Check | Rule |
+| Check | What the program requires |
 | --- | --- |
-| P1 | The statement is at most 16,384 bytes long and a JSON object that states `release`, `pcr0`, `pcr1` and `pcr2` once each: `release` a release tag (10.3), each PCR 96 lower-case hexadecimal characters that are not all zero (a PCR that is all zero is the value of an enclave in debug mode, whatever it runs). The three PCRs equal those of M. The statement may state `program_min`, once: a non-negative integer below 2^53, written as decimal digits without a leading zero (a lone `0` is one) and with neither a fraction nor an exponent. Other members of the statement are not read |
-| P2 | The release key signed the statement and a transparency log of the program recorded that signature: checks 2, 3 and 4 of 10.3 for a log of the form Rekor v1, with the release key and the log key the program holds. The time of the entry is compared with no clock (check 5 of 10.3 asks the clock of a node, and the notice period is 0 seconds) |
-| P3 | `deploy_signatures` has at most 8 elements, each with the texts `key_id` and `signature`. Exactly one element names the key id of the server target of the build (`prod` for the server target `prod`, `dev` for every other), and its signature is the Ed25519 signature of that deploy key over the UTF-8 bytes of `pickle-enclave-release-statement-v1`, a line feed, the lower-case hexadecimal SHA-256 of the statement and a line feed. The deploy keys are the keys with which the apps verify the deploy signature of a served program, by the same rule of the key id. The deploy signature of a program covers `pickle-secure-program-v1`, a line feed and the program, so neither signature is one of the other kind |
-| P4 | GitHub attested the statement. The statement states `git_commit` once, 40 lower-case hexadecimal characters: the commit the release was built from. The attestation verifies by the rules below, under the identity of the job of the build workflow at the commit of that workflow file the program holds, in a run that the push of the tag `release` of the statement started at the commit `git_commit` of the statement. Its in-toto statement has the predicate type `https://pickle.com/credential-enclave/release/v1` and a predicate whose `release`, `pcr0`, `pcr1`, `pcr2`, `program_min` and `git_commit` equal those of the statement (a predicate states no `program_min` where the statement states none) |
-| P5 | The release of the statement is later than every release of the list of accepted releases of the program, in the order of releases (10.3) |
+| The form | An object with the text `statement` and the object `attestation`, of sound JSON no deeper than the program reads |
+| V1 | The statement is at most 16,384 bytes of JSON that state `release` (the name of a tag: `v` and one or more of `A`-`Z`, `a`-`z`, `0`-`9`, `.`, `_`, `-`), `git_commit` (40 lower-case hexadecimal characters) and `pcr0`, `pcr1`, `pcr2` (96 lower-case hexadecimal characters each, none all zero) once each, and the three PCRs are those of the measurement |
+| V2 | The bundle has one certificate, one entry of the log and one envelope with one signature, is at most 65,536 bytes as JSON, and its payload is an in-toto statement |
+| V3 | The certificate of the bundle was issued by the intermediate certificate of Sigstore the program holds, which the root certificate it holds issued, and all three are valid at the time of the entry of the log |
+| V4 | The entry is one of the transparency log whose key the program holds (Rekor v1): it names the envelope, its signature and the certificate, the log signed the entry (the signed entry timestamp), and the inclusion proof leads to a checkpoint the log signed |
+| V5 | The key of the certificate signed the envelope |
+| V6 | The certificate states the identity below |
+| V7 | The predicate type is `https://pickle.com/credential-enclave/release/v1`, and the predicate states the `release`, the `git_commit` and the three PCRs of the statement |
 
-The attestation (P4) is a Sigstore bundle: the certificate Fulcio issued to the workflow run
-(`verificationMaterial.certificate.rawBytes`), one entry of the transparency log
-(`verificationMaterial.tlogEntries`), and the DSSE envelope of the in-toto statement
-(`dsseEnvelope`: `payload`, `payloadType`, one signature). The program checks, in this order:
+The identity (V6) is read from the extensions `1.3.6.1.4.1.57264.1.N` of the certificate, each a
+UTF-8 text that must equal the value exactly:
 
-1. The bundle, as JSON without white space, is at most 65,536 bytes long, and it holds the
-   certificate, exactly one log entry and an envelope with exactly one signature.
-2. The payload type is `application/vnd.in-toto+json`, and the payload (standard base64) is a JSON
-   object.
-3. The certificate chain. The program holds the root certificate and the intermediate certificate
-   of the certificate authority of the public instance of Sigstore (the SHA-256 of their DER:
-   `3ba7b6cc4e95469d4d334b49cb257ad8537076fa84b0ca87ff4ecfe6a54680c1` and
-   `15d795348226b4649f750f5802592c393bee7cc53c3b86982175b7ad087efe47`). The certificate of the
-   bundle and these two are valid at the time the log took the entry (`integratedTime`: the
-   certificate is valid for ten minutes, and no clock of a device is asked). The two certificates
-   of the program are those of certificate authorities, and the certificate of the bundle is not.
-   The intermediate issued the certificate of the bundle and the root issued the intermediate:
-   the issuer name is the subject name of the issuer as encoded, and the signature is the ECDSA
-   signature of the key of the issuer over the signed part. No trust store of the device and no
-   network is asked.
-4. The identity. The certificate states each of these values in its extension
-   `1.3.6.1.4.1.57264.1.{number}`, whose value is the DER of one UTF8String. A certificate without
-   one of them, or with another value, is refused. `{tag}` is the release of the statement and
-   `{commit}` its `git_commit`. The build workflow, its commit and the release workflow are three
-   constants of the program (`PROOF_BUILD_WORKFLOW`, `PROOF_BUILD_COMMIT`,
-   `PROOF_RELEASE_WORKFLOW`): the path of the workflow file whose job builds a release and
-   attests its statement (`.github/workflows/release-statement-build.yml`), the commit of that
-   file (`3e86688616915309ee409e2cdfae5261aa46fb99`), and the path of the workflow file that the
-   push of a release tag starts and that calls it (`.github/workflows/enclave-release.yml`;
-   enclave.md 11.2).
+| N | Value |
+| --- | --- |
+| 8 | `https://token.actions.githubusercontent.com` (the issuer of the token of the run) |
+| 9 and 10 | The build workflow: the text of 9 before its last `@` is the repository and the path of an element of the list of build workflows of the program, and 10 is the commit of that element. The list (`PROOF_BUILDERS`) has one element: `.github/workflows/enclave-build.yml` at `3f84e8368fcdf1f89e42ca629670bfe0989b6f13` |
+| 11 | `github-hosted` |
+| 12 | `https://github.com/pickle-com/credential-enclave` |
+| 13 | The `git_commit` of the statement |
+| 14 | `refs/tags/` and the `release` of the statement |
+| 15 and 17 | `1400118248` and `151645824`, the identifiers of the repository and of its owner |
+| 20 | `push` |
+| 22 | `public` |
 
-   | Number | What it states | Value |
-   | --- | --- | --- |
-   | 8 | The issuer of the token the certificate was issued for | `https://token.actions.githubusercontent.com` |
-   | 9 | The workflow of the job that signed | `https://github.com/pickle-com/credential-enclave/{build workflow}@{ref}`: the text before the last `@` is the address of the repository, `/` and the path of the build workflow. The ref behind it is what the calling workflow wrote; it is not empty and is not judged |
-   | 10 | The commit of the file of that workflow | The commit of the build workflow the program holds |
-   | 11 | The runner | `github-hosted` |
-   | 12 | The repository the run took place in | `https://github.com/pickle-com/credential-enclave` |
-   | 13 | The commit that started the run | `{commit}` |
-   | 14 | The ref of the run | `refs/tags/{tag}` |
-   | 15 | The identifier of that repository | `1400118248` |
-   | 17 | The identifier of the owner of that repository | `151645824` |
-   | 18 | The workflow that started the run | `https://github.com/pickle-com/credential-enclave/{release workflow}@refs/tags/{tag}` |
-   | 20 | What started the run | `push` |
-   | 22 | The visibility of the repository when the certificate was issued | `public` |
+No other extension is read (the workflow that called the build workflow, extension 18, among
+them). The program verifies with the bridge primitives `ecdsaVerify` (P-256 and P-384) and `sha`
+and parses the certificates, the envelope and the entry itself. Proofs that fail are logged with
+the check that failed (`release proofs refused: v6: identity 11`), and the proofs a runtime
+refused last for a measurement are refused again without a second verification. The shared cases
+of section 13 (`protocol/vectors/release-proofs.json`) hold the program and the node
+implementation to one verdict on the same input.
 
-5. The signature of the envelope is the ECDSA P-256 signature of the key of the certificate over
-   the pre-authentication encoding of DSSE: `DSSEv1`, a space, the length of the payload type, a
-   space, the payload type, a space, the length of the payload, a space and the payload.
-6. The log entry. Its log is a log of the program (`logId.keyId`). Its body
-   (`canonicalizedBody`) is a JSON object of the kind `dsse` and the version `0.0.1`, whose
-   `spec.payloadHash` is the SHA-256 of the payload, and whose `spec.signatures` is one element
-   with the signature of the envelope and, as `verifier`, the PEM of the certificate of the
-   bundle. The signed entry timestamp (`inclusionPromise.signedEntryTimestamp`) is the signature
-   of the log key over the bytes of 10.3, built from the body, `integratedTime`, the log
-   identifier and `logIndex`. The audit path (`inclusionProof`: at most 64 hashes) leads from the
-   leaf of the body to `rootHash` in a tree of `treeSize` leaves, by the path computation of
-   check 9 of "The secure program release". The checkpoint (`inclusionProof.checkpoint.envelope`)
-   is the note of that size and that root, and it holds at least one line of the log key (a line
-   whose bytes begin with the first four bytes of the log identifier), and every such line is an
-   ECDSA signature of the log key over the note.
+Where the proofs come from. The program asks the backend, and whoever hands the proofs over, the
+checks decide:
 
-The signed certificate timestamps of the certificate are not read: that Fulcio issued the
-certificate is on the log the program verifies, whose entry holds the certificate. The times and
-the indexes of an attestation are non-negative integers, or decimal digits in a text without a
-leading zero, below 2^53.
+```text
+GET /api/secure/release-proofs?measurement={digest}
+-> 200 {"statement": "...", "attestation": {...}}      the proofs of that measurement
+-> 404                                                the backend holds no proofs of it
+```
 
-The identity of step 4 is what ties an attestation to this repository and to one workflow file.
-9 and 10 say that the job of the build workflow signed, as the file of that workflow is at the
-commit the program holds. What that job does is what that file states, so the commit of a tag
-decides nothing of it: an attestation a job of a workflow file of the tag made (the release
-workflow itself, or any other file) states that file in 9 and is refused, and so is the build
-workflow at any other commit (10). The text behind the last `@` of 9 names the ref the calling
-workflow wrote for the build workflow. The program does not judge it: 10 states the commit that
-ref led to, and the file of a commit is the same file whatever names the commit. 13 says that the
-run was started at the commit the statement names, 14 that it was the run of the tag of the
-release, and 18 that the release workflow of this repository at that tag started it. 11 says that
-a runner GitHub hosts ran the job: a runner the owner of a repository registers signs whatever
-its owner hands it, under the same workflow and the same tag. 12, 15 and 17 name the repository
-the run took place in, by its address and by identifiers that do not change and are not given to
-another repository: a workflow of another repository may call the build workflow, and the
-certificate of that run states that repository. 20 says that the push of the tag started the run:
-a run started another way takes inputs that are not public. 22 says that the repository was public
-then.
-
-The formats are read in one form. Base64 is the standard alphabet with its padding, or the
-URL-safe alphabet without padding where a value is b64u, and a text whose last character carries
-bits of no byte is refused. A text of JSON is UTF-8 and holds no number outside the finite ones,
-no half of a surrogate pair, and at most 32 arrays and objects inside one another. An element of
-DER has its shortest length form. An ECDSA signature is the DER of two non-negative integers
-without unneeded bytes. Every signature is verified by a primitive of the bridge.
-
-Where the proofs come from. Whoever hands them over, the checks above decide.
-
-- The attestation response of a node (4.2) may carry them as the member `release_proofs`. The
-  grant step asks for them: when the document of a node verifies with a measurement no list has
-  and no proofs showed, the program requests the attestation of that node once more with the
-  query `proofs=1` (`GET /api/secure/nodes` with `nonce`, `nodes` and `proofs`), for one node of
-  each such measurement and four nodes at most in one step. With proofs that pass, that node and
-  the other nodes of the measurement whose attestation the step holds receive their grants in the
-  same step. No other request carries the query, and a step whose nodes are all of listed releases
-  sends none. A request for proofs that fails leaves the node one of a later release for that
-  step and fails nothing else.
-- A node document (7.7) may carry them as the member `release_proofs`. A round that reads the
-  document of a node of a measurement no list has verifies them with that document.
-- The backend hands them out for the digest of a measurement. A round asks for the measurements
-  no list has and no proofs showed, whose nodes may be closed and whose node documents may carry
-  no proofs:
-
-  ```text
-  GET /api/secure/release-proofs?measures={digest},{digest},...
-  -> {"proofs": [{"measure": "{digest}", "release_proofs": {...}}, ...]}
-  ```
-
-  A digest is the base64url (without padding) of the SHA-256 of the UTF-8 bytes of `pcr0`, `pcr1`
+- A digest is the base64url (without padding) of the SHA-256 of the UTF-8 bytes of `pcr0`, `pcr1`
   and `pcr2` of the measurement, each as 96 lower-case hexadecimal characters, one after another:
-  the form in which the program keeps a measurement. The answer holds one element for each
-  measurement of the request whose proofs the backend has, and leaves the others out. Of the
-  answer, an element counts when it names a digest of the request for the first time and
-  carries proofs whose statement states the measurement of that digest; the checks above decide
-  the rest. A round asks at three places: at its start, for the measurements the device kept
-  before it (`log.unaccepted`), the ones that held the key of the account first; after the node
-  documents of step 3, for the measurements those documents state, before the entries of their
-  nodes are judged; and before its judgement, for the measurements it noted. One request names
-  eight measurements at most, and a round sends four such requests at most; a round that leaves
-  a measurement unasked has more to read than it read ("The round"). A runtime asks for one
-  measurement not sooner than five minutes after it asked last (the request calls no node, and
-  the proofs of a release may reach the backend after its nodes), and a round asks for a
-  measurement once. No request goes out while the device has met no such measurement, and a stale runtime
-  sends none.
+  the form in which the program keeps a measurement.
+- One request names one measurement. The answer with the status 200 is the proofs as they are,
+  or an object that holds them as its member `release_proofs`; they count when their statement
+  states the measurement of the request. An answer with the status 404, whatever its body, says
+  that the backend holds none. Any other outcome (another status, a body that is no JSON object,
+  no answer) is a request that failed.
+- The step of the grants asks for the measurement of a node that is to receive a grant, when
+  the attestation of the node verified with a measurement no list has and no proofs showed.
+  With proofs that hold, the nodes of that measurement receive their grants in the same step,
+  with the attestations the step holds. A round asks for the measurements it met that way and
+  the device kept (`log.unaccepted`), the ones that held the key of the account first: at its
+  start, before anything is read, and before its judgement. The attestation response of a node
+  and a node document carry no proofs the program reads.
+- A step and a round send four such requests at most, together. A round that leaves a
+  measurement unasked has more to read than it read ("The round"). A runtime asks for one
+  measurement not sooner than five minutes after the backend answered for it (the proofs of a
+  release may reach the backend after its nodes), and a request that failed is none the
+  measurement was asked with: the next step or round asks again. No request goes out while the
+  device has met no such measurement. A stale runtime asks in its step of the grants (it hands
+  the grant to a node whose proofs hold) and runs no round.
+- A round in which the proofs show a measurement is followed by a synchronization at once,
+  whose step of the grants hands the nodes of that measurement their grants (once for a
+  measurement in a runtime).
 
-  What the answer means for A1 (7.4). A measurement no list has marks the log only for a runtime
-  that knows that the backend hands out no release proofs that show it: the backend answered a
-  request for the proofs of that measurement, the answer is not earlier than the time the device
-  first saw the measurement and not older than one hour, and no proofs of it showed the
-  measurement (it carried none, or proofs that fail a check: the proofs of such an answer are
-  verified whatever proofs failed in the runtime before). A backend without the route (the status 404
-  and no code of its own) answers so. A request that fails any other way is no answer: the
-  measurement waits, the round is pending, and the next round asks again without waiting for
-  the five minutes. Past the 24 hours of A1, a round whose request for the proofs failed on the
-  side of the server (an error status, an answer that is no JSON object, or no answer while the
-  backend answered another request of the runtime within 60 s) is a round held back (A3),
-  whether or not the runtime knows what program is served; a request that failed with the
-  network of the device leaves the round pending and counts nothing. While a measurement past
-  its 24 hours waits for that answer, no round ends the count of the rounds held back: the
-  count ends when the backend answers the request. So a device that could not ask, or was not
-  answered, states nothing of a release whose proofs it has not seen, and a backend that does
-  not answer the route for three days marks the log by A3. A release whose proofs hold and
-  state a later program is judged without a further answer.
-
-A node kept as one of a later release is asked for the proofs of its measurement again when the
-last request for them is an hour old: the proofs of a release may reach the backend after its
-nodes. A request to a node for proofs that failed is none the measurement was asked with: the
-next step asks again. A runtime verifies no further proofs that a node or a node document presents
-while 8 proofs failed within an hour, and it does not verify again the proofs it refused last for a
-measurement: the same value reaches it from a node, from a node document and from the backend. The
-proofs the backend hands out for a measurement a round asked it for are verified whatever failed
-before: that answer is what A1 waits for, and a round asks for a measurement once in five minutes. Proofs that fail are logged with the check that
-failed (`release proofs refused: p4: identity 11`).
+What the answer means for A1 ("The round"). A measurement no list has marks the log only for a
+runtime that knows that the backend hands out no release proofs that show it: the backend
+answered a request for the proofs of that measurement, the answer is not earlier than the time
+the device first saw the measurement and not older than one hour, and no proofs of it showed the
+measurement (the answer was a 404, or it carried proofs that fail a check: the proofs of an
+answer are always verified, whatever failed before). A request that failed is no answer: the
+measurement waits, the round is pending, and the next round asks again. Past the 24 hours of A1,
+a round whose request for the proofs failed on the side of the server (an error status other than
+404, an answer that is no JSON object, or no answer while the backend answered another request of
+the runtime within 60 s) is a round held back (A3), whether or not the runtime knows what program
+is served; a request that failed with the network of the device leaves the round pending and
+counts nothing. While a measurement past its 24 hours waits for that answer, no round ends the
+count of the rounds held back: the count ends when the backend answers the request. So a device
+that could not ask, or was not answered, states nothing of a release whose proofs it has not
+seen, and a backend that does not answer the route for three days marks the log by A3. The
+route therefore has no limit of requests that a device in normal use reaches: a refusal with the
+status 429 is a request that failed on the side of the server.
 
 Proofs that reach the device after it read the entries of a node. A control key is remembered as
-judged when its node is an accepted one (7.4, "The round"). The keys of a node of a measurement
-no list has are read again by every round. So when proofs make that measurement one of an
-accepted release, the next round judges the entries its nodes wrote before as those of accepted
-nodes: a transfer of the key they name is followed (A1), and what the node signed counts for A2.
-A round whose last request shows a measurement is not complete, and the next one judges those
-entries.
+judged when its node is an accepted one ("The round"). The keys of a node of a measurement no
+list has are read again by every round. So when proofs make that measurement one of an accepted
+release, the next round judges the entries its nodes wrote before as those of accepted nodes: a
+transfer of the key they name is followed (A1), and what the node signed counts for A2. A round
+whose request shows a measurement is not complete, and the next one judges those entries.
 
 A node of a measurement the proofs show states the release of the proofs in its binding: a
-document of that measurement whose binding names another release fails the verification.
+document of that measurement whose binding names another release fails the verification. A
+binding and a release statement state no version of the program, and the program reads none.
 
-A statement that states a later program. `program_min` of a release statement is the lowest
-version of the program that reads what the nodes of the release write. A release whose proofs
-pass and whose statement states a `program_min` above the version of the program is none that
-program accepts, whatever version the backend serves:
+What the device keeps (`log.proven`): per measurement the release of the statement and the time
+of the verdict, under the version of the program that made it. A program reads what a program of
+another version kept as nothing, and asks for the proofs itself. A kept verdict is not verified
+again, and no proofs are kept. The device keeps the verdicts of 256 measurements, the ones made
+last; a verdict a runtime made stays with that runtime whether or not the program store holds it,
+and a verdict that left is made again when the device meets the measurement again. The end of
+the account erases them.
 
-- its nodes receive no grant of that program;
-- what its nodes wrote is read as the entries of a node of a measurement no list has: the
-  entries are shown where the program reads them, nothing they hold marks the node (A2), and
-  their keys are not remembered as judged;
-- the release holding the key of the account marks the log under the conditions of a
-  measurement no list has (A1): 24 hours after the device first saw the measurement, in a
-  runtime that knows that no later program than this one is served. A stale runtime states
-  nothing.
+The format of the log of a node, and whether it writes to the log store, follow from its
+measurement at the time of its attestation and are kept with what the device keeps of the node
+(`log.grants`): an element of a list states them (format 1 for the releases before v2.0.0 and
+the builds before the first release, format 2 for v2.0.0 to v2.3.0, and whether the release
+writes to the log store), and any other measurement of platform `nitro` is one of format 3 that
+writes to the log store. The name of the release of a node decides neither.
 
-The proofs of such a measurement are not asked for again. The `program_min` of a binding (above)
-is another value: it keeps the grant of a program from a node and changes nothing of how the
-entries of that node are judged. Of two statements that passed for one measurement, the release
-of the one verified last and the higher `program_min` stand.
-
-What the device keeps (`log.proven`): per measurement the release and the `program_min` of the
-statement and the time, under the version of the program that verified them. A program reads
-what a program of another version kept as nothing. The kept verdict counts where the log is
-judged. A node receives a key only from a runtime that verified the proofs itself: a runtime
-verifies the kept proofs again before the first grant it hands to a node of that measurement,
-and a kept verdict whose proofs fail is kept no longer. The device keeps the verdicts of 256
-measurements. Beyond that number the verdict of the earliest release leaves first, in the order
-of releases (10.3): the key of an account moves to later releases, so the verdict of the release
-that holds it stays. A verdict a runtime made stays with that runtime whether or not the program
-store holds it, and a verdict that left is made again from the proofs of a response, of a node
-document or of the backend. The proofs themselves are kept for the four latest of those releases
-that the program accepts, each when its JSON is at most 65,536 characters long: for the other
-measurements a runtime asks for the proofs once.
-
-What the proofs show, and what they do not. A release whose proofs pass has: the signature of the
-release key over its measurements in the public log, where the monitor of this repository reads
-every entry of that key (enclave.md 11.2); a signature of a deploy key of the operator; and an
-attestation that the job of the build workflow, as the file of that workflow is at the commit the
-program holds, ran on a runner GitHub hosts, in a run the push of the tag started at the commit
-the statement names, in the repository with the identifier above while it was public, and attested
-these measurements. The entry of that attestation is in the public log with its certificate, which
-names that commit and the run.
-
-The program fixes the file of the build workflow (`release-statement-build.yml`) by its commit,
-so the proofs show what that file makes its job do (enclave.md 11.2 states its rules). The job
-takes no input and no secret. It checks out the commit of the tag and stops unless the four files
-of the build method in that commit (`build/build.sh`, `build/Dockerfile.enclave`,
-`build/Dockerfile.eif`, `rust-toolchain.toml`) have the SHA-256 its own file states and every
-package of `Cargo.lock` comes from crates.io. It builds the enclave image file with
-`build/build.sh eif`: the fixed files name the images and the packages of the build by digest and
-version, the one step of the build of the node program that has a network downloads the packages
-`Cargo.lock` names by checksum, and the step that compiles has no network. It stops unless
-`measurements.json`, which the build wrote from the image file it made, names the tag as
-`release` and the commit of the run as `git_commit`, and it attests that statement in the same
-job. The measurements are then those of the node program that the fixed build method makes of the
-commit the statement names, of the packages of crates.io its `Cargo.lock` names, and of the
-images and packages the fixed files name: no file of the commit of the tag chose how it was built
-or what was attested, and nothing it runs had a network while it compiled.
-
-A tag whose commit holds another workflow gets no attestation the program takes, and neither does
-a release whose build method is not the fixed one: the job stops before it builds. A release that
-changes one of the four files, or takes a package from another place than crates.io, needs
-another commit of the build workflow, and a program that holds this commit does not take the
-attestations of that one. Such a release reaches a device with a program that lists it.
-
-The subject of the attestation is the enclave image file the job built itself. The program does
-not read it: a device holds no image file, and what it accepts is the predicate, which is the
-statement the release key signed. (The image file of the GitHub release is another build of the
-same commit, with the same measurements.)
-
-The proofs do not show what the source of that commit does: the commit is public, and what its
-code does is for the one who reads it. They do not show that the tag still names that commit, or
-that the commit is still in the repository: the operator can remove a tag and a commit
-afterwards, and what stays is the hash of the commit in the certificate and in the entries of the
-public log. What the build workflow reads at its fixed commit beyond the commit of the tag (the
-actions and the images its file names, the image of the runner) is named in that file. The proofs
-rest on GitHub (the token of the run and its claims, and that a called workflow is the file of the
-commit the token names), on Fulcio and on the log of Sigstore, as the release proof of the program
-does.
+What the proofs show, and what they do not, is stated in 9.5. In short: the job of a build
+workflow of the list, as the file of that workflow is at its commit, ran on a runner GitHub
+hosts, in a run the push of the tag started at the commit the statement names, in the repository
+with the identifiers above while it was public, and attested these measurements; the entry of
+that attestation is in the public log with its certificate. The proofs do not show what the
+source of that commit does: the commit is public, and what its code does is for the one who
+reads it. They rest on GitHub (the token of the run and its claims), on Fulcio and on the log of
+Sigstore.
 
 When a constant of the program no longer fits (the log key or the certificates of Sigstore
 change, the repository moves, the build workflow is another file or another commit), the proofs
 of a release made after that fail on a device that runs this program, and its nodes are nodes of
-a later release to it: the release reaches that device with a program that lists it.
+a measurement the program does not accept: such a release needs a later program, which holds
+the new value. A runtime that knows a later program is served judges nothing ("A runtime behind
+the served program").
 
 ### What the device keeps
 
@@ -2082,10 +1936,10 @@ it is a secret; what names services and addresses is sealed with a key derived f
 
 | Key | Content |
 | --- | --- |
-| `log.grants` | The nodes this device handed a grant to: the time of the grant, its end, the release and platform of the node, the time of the last attempt. A node is written before its grant goes out |
+| `log.grants` | The nodes this device handed a grant to: the time of the grant, its end, the release and platform of the node, the time of the last attempt, and the format of its log with whether it writes to the log store, as its measurement said when it was attested ("The release proofs"). A node is written before its grant goes out |
 | `log.nodes` | What the node documents that verified said: per node id the digest of the measurement, the platform, the release, the time first seen, and the time a contradiction of its signatures was found. A node id without a document that verifies is not kept, whatever the store showed of it |
-| `log.unaccepted` | The measurements no list of the program has and no release proofs showed, each with the time it was first seen, whether the key of the account went to a node of it, whether it marked the log (a measurement that did marks it on), and the time the grant step last asked for its release proofs |
-| `log.proven` | The measurements whose release proofs this program verified: per digest the release and the `program_min` of the statement and the time, under the version of the program that verified them ("The release proofs"). 256 measurements at most, those of the latest releases, with the proofs of the four latest releases the program accepts |
+| `log.unaccepted` | The measurements no list of the program has and no release proofs showed, each with the time it was first seen, whether the key of the account went to a node of it, whether it marked the log (a measurement that did marks it on) |
+| `log.proven` | The measurements whose release proofs this program verified: per digest the release of the statement and the time of the verdict, under the version of the program that made it ("The release proofs"). 256 measurements at most, the ones verified last |
 | `log.blocked` | The rounds held back that count, in a row: the time of the first, their number, and the time of the last one counted |
 | `log.sample` | The 64 latest control keys the device verified |
 | `log.seen`, `log.seen.{n}` | The digests of the control keys the device judged (a key whose node is of a measurement no list has is not among them: every round reads it again), in parts of 4,096 digests: `log.seen` names the parts, the oldest first, and `log.seen.{n}` holds one. Nine parts are kept; when one more begins, the oldest leaves with the digests it holds, so 32,768 judgements or more are remembered |
@@ -2095,8 +1949,8 @@ it is a secret; what names services and addresses is sealed with a key derived f
 | `log.recovered` | What the rounds read of the reads of the log screen that were held back, kept for the screen and sealed (the key of `log.cache`, with associated data of its own): the entries the screen asked for, as the screen shows them, each string cut to 160 characters (128 entries and 512 events at most; beyond that the ones kept first leave), the listing pages (4 at most, each the keys of 100 events with their entries, which leave with the page), and the node prefixes of the bucket of formats 1 and 2. The value holds 262,144 bytes at most before it is sealed: beyond them an entry the screen asked for or a listing page leaves, whichever was kept first |
 | `log.denied` | The reads held back from the log screen that the screen notes itself and has not read since, one for each day on which a read was held back (8 at most of one kind): the later pages of format 3 (the time the read was noted, the lowest time a page held back that day began below, the events it was asked for), per node (8 at most) the listings of its chain of format 1 or 2 (the time, and the lowest `seq` a listing held back that day began after), and the days on which a page of the screen held no entry because every key it took was no entry (`filled`) |
 | `log.cursor`, `log.resume` | The latest control key of the last round that covered the whole listing, and where a round that its page limit cut short goes on, with a mark when a round of that walk through the listing left keys unjudged |
-| `log.legacy` | The chains of formats 1 and 2 the device follows: per node the `seq` up to which the control entries were read, the latest end of a grant, the times a round last listed the chain and last read it to its end, and whether the chain is followed because the store names its prefix. The receiving nodes of transfers whose documents the device has still to judge. And what the rounds keep of the node discovery listing: the time they last took it in, whether it went on beyond the pages a round reads, the chains read to their end (2,048 at most, each a digest of its node id with the `seq` it was read to), the place and the time of the last of them that was listed again, and the nodes listed for their revokes alone that the rounds looked for (16 at most, each with the expiry the list named for it) |
-| `log.round` | The last round: when it ran, how it ended, the published state, what the app was told, and the row of the rounds of synchronizations that had more to read than they read: the ones that counted, the ones that counted as catching up, and the time the row began |
+| `log.legacy` | The chains of formats 1 and 2 the device follows: per node the `seq` up to which the control entries were read, the latest end of a grant, the times a round last listed the chain and last read it to its end, whether the chain is followed because the store names its prefix, and, while a round looks for the place of 2026-11-23 in a long chain, where it lists the chain next ("Formats 1 and 2"). The receiving nodes of transfers whose documents the device has still to judge. And what the rounds keep of the node discovery listing: the time they last took it in, whether it went on beyond the pages a round reads, the chains read to their end (2,048 at most, each a digest of its node id with the `seq` it was read to), the place and the time of the last of them that was listed again, and the nodes listed for their revokes alone that the rounds looked for (16 at most, each with the expiry the list named for it) |
+| `log.round` | The last round: when it ran, how it ended, the published state, what the app was told, and the row of the rounds of synchronizations that had more to read than they read: the ones that counted, and the time the row began |
 | `log.big` | The sizes of the big keys of format 3 the listings named (32 at most, the latest entries) |
 | `log.cache` | The first page of the log screen, the time the screen last read the listings of that page itself, the summary tally, and what the screen knows of the end of each chain of formats 1 and 2 (the last `seq` the device knows its node wrote, and the latest time a key of the chain names, kept only for a chain whose end the screen had among the keys it knew), sealed |
 | `vault.made` | The names of the vault items `store_secret` made and that hold no value yet (8 at most) |
@@ -2116,10 +1970,11 @@ grant of the device, and the verified point of every node the ledger explains be
 from which the chain of that node is read (`log.legacy`); the marks of the earlier program are not
 carried over. A device of the account that still runs an earlier program counts a chain of a node
 no ledger explains as a delegation the app did not make, so the program writes every node of a
-release before v2.4.0 that it hands a grant to into the ledger, in the form of those programs,
+release of its lists that it hands a grant to into the ledger, in the form of those programs,
 and exchanges the sealed ledger with the backend by their rule (`GET` and `PUT
 /api/secure/ledger`: the value is read and merged before it is uploaded, because an upload
-replaces it). A node of a release from v2.4.0 on is not written to the ledger.
+replaces it). A node of a measurement that release proofs showed (a release from v2.4.0 on) is
+not written to the ledger.
 
 ### The round
 
@@ -2228,8 +2083,8 @@ release proofs").
    keys held back, and the round is not complete (A2 below). A control key whose read came to a
    judgement is remembered as judged when its node is an accepted one. A key of a node of a
    measurement no list has is not: every round reads it again, so the entries such a node wrote
-   are judged as those of an accepted node once release proofs or the list of a later program
-   make its measurement one of an accepted release.
+   are judged as those of an accepted node once release proofs make its measurement one of an
+   accepted release.
 5. The reads that were held back before (`log.withheld`): the keys are read before step 1 (above),
    and each listing page of the log screen is asked for again in the request the screen sends for
    it, with the entries of the page the screen would show there.
@@ -2356,7 +2211,8 @@ ends before its last key, a request was answered for its first item alone, more 
 than it asks for at its end, more measurements no list has wait for their release proofs than
 its requests for them name, the chains of formats 1 and 2 hold more control entries than it
 reads (512), more of those chains are open than it follows (64),
-the listing of such a chain goes on beyond the four pages a round reads of it,
+the listing of such a chain goes on beyond what a round reads of it (32 passes, and the time a
+pass needs: "Formats 1 and 2"),
 the node discovery listing goes on beyond its two pages, or
 its time of 60 s passes before it has read everything) is pending, and the next round reads on
 from where it stopped: a round whose time passes is judged on what it read and keeps what it
@@ -2372,9 +2228,8 @@ as none, when all of this holds:
 
 - it ended because it came to one of the numbers a round reads (the listing pages, the documents
   and the bodies its requests name, an answer of the bodies that ended before its last key, the
-  control entries of chains, the chains a round follows, the pages of the listing of a chain,
-  the pages of the node discovery listing, the big keys at its end), and not because its time
-  passed;
+  chains a round follows, the pages of the node discovery listing, the big keys at its end), and
+  not because its time passed;
 - none of its reads failed or stayed without an answer, a request that was asked again for its
   first item and answered then among them;
 - it read no object that no node wrote (an object under a node id the store holds no node
@@ -2384,23 +2239,33 @@ as none, when all of this holds:
   on beyond the place the round before stopped at (the listing of format 3 from where the walk
   through it stood, a chain from the `seq` it was read to). The keys judged before that a round
   lists again from the start of the listing are no step;
-- one of the entries it so judged or passed was written before the row began;
-- and fewer than 32 rounds of the row counted as catching up.
+- and one of the entries it so judged or passed was written before the row began.
 
 A device that was away has as many entries to read as its nodes wrote in that time, and reads
 them over as many rounds as that takes without a round of them counting. What counts: a round
 whose time passed (a backend that answers late leaves a round no time for what it has to read,
 and a round that is slow is not a round that has much to read), a round with a request that was
 not answered, objects no node wrote that take the reads of a round, a round that judged nothing
-new and read no listing on, rounds that read only entries written after the row began and still
-do not reach the end (entries arrive faster than the device reads them), and every round that
-leaves reads undone once 32 rounds of the row caught up. Nodes of accepted releases can be made
-to write entries of an account without the user (the delegation handed on from node to node, a
-call of a node), as many as someone likes, and no number of them puts the judgement of the other
-entries off for longer than those rounds: 32 is four times the rounds the largest account in
-normal use takes to read (a round reads 512 control entries of chains or 800 of format 3, and
-reads a chain on over 4,000 object versions, so 32 rounds read 16,384 or 25,600 control entries,
-and read one chain on over 128,000 object versions).
+new and read no listing on, and rounds that read only entries written after the row began and
+still do not reach the end (entries arrive faster than the device reads them).
+
+The chains of formats 1 and 2 have a rule of their own, because the chain of an account in heavy
+use is long (the longest of this service held 1.67 million objects in November 2026), a node
+of such a release that still runs goes on writing while a device reads, and a device reads a
+chain on at the pace of its network. A round that left reads undone for no other reason than
+that its chains have more to read than it read (their listings go on beyond the passes or the
+time of a round, or they hold more control entries than a round reads) counts as none when its
+time did not pass, none of its reads failed or stayed without an answer, it read no object that
+no node wrote, and it read a chain on (the `seq` a chain was read to moved on to a `seq` under
+which its node wrote, or the stretch in which the place of a chain lies became shorter:
+"Formats 1 and 2"). It counts as none whatever the time of the entries it read and however many
+such rounds follow one another, and it ends the count of the rounds of the row that counted
+before it: it read everything else it had to read. So the length of a chain marks nothing. The
+reads of a chain mark the log as any reads do: when they are held back, when they fail, or when
+the pages of the chain hold objects no node wrote. What this leaves is stated in "Formats 1 and
+2": a node of such a release that holds the delegation of the account and goes on writing
+faster than a device reads keeps that device from the end of its chain, and the log is pending
+for that time.
 
 Beyond eight rounds of a row that counted, the first round of a synchronization
 that counts again is a round whose reads are held back: someone writes objects under the
@@ -2408,7 +2273,8 @@ prefix of the account faster than the device reads them, or the answers of the b
 reach their end, or come too late for a round to read. It counts once for its synchronization:
 the rounds that follow it read on, and
 neither add to the count of the rounds held back nor end it, and neither does a round that
-catches up while the row is beyond eight. So such reads mark the log when rounds
+catches up while the row is beyond eight (a round that only read chains on ends the count of
+the row, above). So such reads mark the log when rounds
 were counted that way on three days and three days have passed since the first of
 them. Time that passed while the runtime did not run is not time the round had (the app
 went to the background during the round, or the time of the round passed more than 5 s later than
@@ -2420,9 +2286,9 @@ conditions holds, and each holds only in a situation that is a problem:
 
 | | Condition | When it holds |
 | --- | --- | --- |
-| A1 | The key of the account went to a node of a release the program does not accept | A node of an accepted measurement wrote `grant_transferred_out` under the device's own `key_id` naming a measurement no list of the program has and no release proofs show as that of a release the program accepts ("The release proofs"), or a node whose document states such a measurement wrote an entry under that `key_id`; 24 hours have passed since the device first saw that measurement; the runtime knows that no later program than this one is served ("A runtime behind the served program"); and the runtime knows that the backend hands out no release proofs that show the measurement (the backend answered a request for them not earlier than the device first saw the measurement and not longer than one hour ago: "The release proofs"). Until all of that holds the measurement waits and the round is pending: a program that lists a new release is served before a node of that release takes a grant, and a device may run the program before it for longer than a day. The program that lists the release clears the condition, and so do release proofs that show the measurement as that of a release the program accepts. Once it holds, every round that ends states it, however its reads ended, and for a measurement the device kept the events of the app state it without a read when the runtime knows by then that no later program is served and that the backend hands out no release proofs that show the measurement (a new runtime has asked for neither at its event `session_ready`: the round of that event asks for the proofs before it reads). A measurement that marked the log marks it on: a round that cannot say at its end what is served or whether the backend hands out release proofs (its reading is older than an hour and no new one arrived) takes no mark back. A receiving node whose document the device has not seen is no measurement: it waits for its document, a round whose request for that document is answered without one that verifies is a round held back (A3), and no time marks the log for it. The receiving node of a transfer a round judged is kept whatever kept its document from that round, and a round judges the nodes that wait first, with a request of its own, before it reads the chains |
+| A1 | The key of the account went to a node of a release the program does not accept | A node of an accepted measurement wrote `grant_transferred_out` under the device's own `key_id` naming a measurement no list of the program has and no release proofs show as that of a release the program accepts ("The release proofs"), or a node whose document states such a measurement wrote an entry under that `key_id`; 24 hours have passed since the device first saw that measurement; the runtime knows that no later program than this one is served ("A runtime behind the served program"); and the runtime knows that the backend hands out no release proofs that show the measurement (the backend answered a request for them not earlier than the device first saw the measurement and not longer than one hour ago: "The release proofs"). Until all of that holds the measurement waits and the round is pending: the backend hands out the release proofs of a release before a node of that release takes a grant, a program that accepts what this one does not is served before such a node does, and a device may run the program before it for longer than a day. Release proofs that show the measurement as that of a release clear the condition, and so does a program that accepts it. Once it holds, every round that ends states it, however its reads ended, and for a measurement the device kept the events of the app state it without a read when the runtime knows by then that no later program is served and that the backend hands out no release proofs that show the measurement (a new runtime has asked for neither at its event `session_ready`: the round of that event asks for the proofs before it reads). A measurement that marked the log marks it on: a round that cannot say at its end what is served or whether the backend hands out release proofs (its reading is older than an hour and no new one arrived) takes no mark back. A receiving node whose document the device has not seen is no measurement: it waits for its document, a round whose request for that document is answered without one that verifies is a round held back (A3), and no time marks the log for it. The receiving node of a transfer a round judged is kept whatever kept its document from that round, and a round judges the nodes that wait first, with a request of its own, before it reads the chains |
 | A2 | The signatures of a node that passed attestation contradict each other | Under a key of a node of an accepted measurement: an entry of the device's own `key_id` that the node signed and that does not open; two different bodies of one `seq` that both verify; or the body the key names for which the answers of two rounds carried no signature that verifies. The first two are marks no answer can make up, and stay. The third holds until an answer carries a signature that verifies for that key: the key is read again by every round, and a round it is held back from is a round held back (A3) |
-| A3 | The operator domain has held the reads back for three days | Rounds held back were counted three times or more in a row and the first of them is three days old (the rounds of one day count as one: a round held back less than 20 hours after the last one counted adds nothing to the count and ends nothing); or the log screen notes three or more reads of one kind as held back from it (the later pages, the listings of one chain of formats 1 and 2, the pages that held no entry), on three days within 30 days, that it has not read since, and the first of them is three days old. A round is held back when a route of the reads answers with an error status; when a request of the reads ends without an answer (its time, or a failure on its way; for a request that names a list, when the question for its first item stayed without an answer as well) and the backend answers after that failure (an answer to another request that arrived after it, or the answer to the account query the round then asks once); when an address is not the one of the request; when the store answers an address not older than 240 s with a status other than 200, a 429 or a 5xx status at both attempts of the request among them; when the backend hands out no body, or another body, for a key of the listing whose node the device has a judgement of; when an answer of the bodies names none of the keys of a request, or names a key and not one before it in the request; when the backend hands out no verifying document for the node of a key of the listing and the store does not show that it holds none (it holds a version under the key of that node document or more than a page there, the answer gives no address of that listing or another address, or the store refuses the address); when the backend answers the request for the document of the receiving node of a transfer without a document that verifies (a transfer an entry of format 3 names, and a transfer a node of a release before v2.4.0 made on or after 2026-11-23T00:00:00Z: "Formats 1 and 2"); when a key whose signature an answer did not carry is held back from a round (A2); when a measurement past the 24 hours of A1 cannot be judged because the checks of the app for a new program fail on the side of the server ("A runtime behind the served program"), or because the request for its release proofs fails on the side of the server ("The release proofs"); when more objects lie under a `seq` of a chain of formats 1 and 2 than are read there and none of the ones read is the entry of the node, or a listing page of such a chain goes on and shows the node writing nowhere ("Formats 1 and 2"); when a read the log screen made of the bucket of formats 1 and 2 is still held back; and, beyond eight rounds of a row that left reads undone and counted (above), when the first round of a synchronization counts again. A round that made every read, the reads held back before included, clears the count of the rounds. A read the screen makes itself ends the reads it noted that this read covers, and the reads it noted end together when the last of them is 30 days old |
+| A3 | The operator domain has held the reads back for three days | Rounds held back were counted three times or more in a row and the first of them is three days old (the rounds of one day count as one: a round held back less than 20 hours after the last one counted adds nothing to the count and ends nothing); or the log screen notes three or more reads of one kind as held back from it (the later pages, the listings of one chain of formats 1 and 2, the pages that held no entry), on three days within 30 days, that it has not read since, and the first of them is three days old. A round is held back when a route of the reads answers with an error status; when a request of the reads ends without an answer (its time, or a failure on its way; for a request that names a list, when the question for its first item stayed without an answer as well) and the backend answers after that failure (an answer to another request that arrived after it, or the answer to the account query the round then asks once); when an address is not the one of the request; when the store answers an address not older than 240 s with a status other than 200, a 429 or a 5xx status at both attempts of the request among them; when the backend hands out no body, or another body, for a key of the listing whose node the device has a judgement of; when an answer of the bodies names none of the keys of a request, or names a key and not one before it in the request; when the backend hands out no verifying document for the node of a key of the listing and the store does not show that it holds none (it holds a version under the key of that node document or more than a page there, the answer gives no address of that listing or another address, or the store refuses the address); when the backend answers the request for the document of the receiving node of a transfer without a document that verifies (a transfer an entry of format 3 names, and a transfer a node that writes format 1 or format 2 made on or after 2026-11-23T00:00:00Z: "Formats 1 and 2"); when a key whose signature an answer did not carry is held back from a round (A2); when a measurement past the 24 hours of A1 cannot be judged because the checks of the app for a new program fail on the side of the server ("A runtime behind the served program"), or because the request for its release proofs fails on the side of the server ("The release proofs"); when more objects lie under a `seq` of a chain of formats 1 and 2 than are read there and none of the ones read is the entry of the node, or a listing page of such a chain goes on and shows the node writing nowhere ("Formats 1 and 2"); when a read the log screen made of the bucket of formats 1 and 2 is still held back; and, beyond eight rounds of a row that left reads undone and counted (above), when the first round of a synchronization counts again. A round that made every read, the reads held back before included, clears the count of the rounds. A read the screen makes itself ends the reads it noted that this read covers, and the reads it noted end together when the last of them is 30 days old |
 | A4 | An entry the device saw left the listing within its retention | A key of the sample that is younger than 364 days and lies in the range the listing covered is in neither of two readings of the listing. The condition ends for a key when a listing a round reads names it again |
 
 A device without a network, a request to the store that fails on its way or runs out of its
@@ -2512,9 +2378,11 @@ app went to the background).
 
 ### A runtime behind the served program
 
-A node of a release this program does not list may hold the key of the account for no other reason
-than that this program is no longer the one served: a later program lists that release, and the
-runtime has not loaded it. A device runs an earlier program for minutes or for days. So a runtime
+A node of a release this program does not accept may hold the key of the account for no other
+reason than that this program is no longer the one served: a later program accepts that release
+(it takes a build workflow, or a key of the transparency log, that this one does not: "The
+release proofs"), and the runtime has not loaded it. A device runs an earlier program for
+minutes or for days. So a runtime
 judges nothing while it knows that a later program is served, and A1 holds only for a runtime that
 knows that none is.
 
@@ -2531,15 +2399,17 @@ A stale runtime is one that knows that a version above its own is served. While 
 - writes none of the values the rounds judge by (`log.unaccepted`, `log.blocked`, `log.sample`,
   `log.seen`, `log.missing`, `log.doubted`, `log.withheld`, `log.recovered`, `log.denied`,
   `log.nodes`, `log.legacy`, `log.cursor`, `log.resume`, `log.round`, `log.big`), the reads of
-  the log screen included: what a program that is behind reads of the nodes and formats of a later
-  release is nothing the next program is to judge by;
+  the log screen included: what a program that is behind reads of nodes and formats the served
+  program accepts and it does not is nothing the next program is to judge by;
 - publishes no judgement, tells the app none and reports none. The state the device kept stays
   published as it is.
 
 It publishes `runtime.program_stale` and reports once that it is stale: a report of a round (`POST
 /api/secure/log/verified`) with the status `pending`, the first failed read `program:stale` and
-its own version. It goes on handing its grants to the nodes of the releases it lists (a node of a
-later release it meets is kept for the time of the runtime only), serving the procedures the user
+its own version. It goes on handing its grants to the nodes of the releases it accepts (the
+lists, and the measurements release proofs show: it asks for the proofs in its step of the
+grants; a node of a measurement it does not accept that it meets is kept for the time of the
+runtime only), serving the procedures the user
 starts, and reading the log for the screen: the first page is then read as a later page is,
 without a round, with the summary the device kept marked as not complete.
 
@@ -2588,7 +2458,22 @@ keeps the first page it showed last (50 events) and the summary tally, sealed. A
 read of the store on the line of the screen (or joins the one in flight) and waits for it for 3 s;
 when the read has not ended by then, or failed, the call answers from what the device kept, with
 `cached` true and the status `pending`, and the read goes on. With the argument `kept` true the
-call answers from what the device kept at once. A round the screen started is reported by the
+call answers from what the device kept at once.
+
+With the argument `wait` true the call waits for that read for 60 s, the time of a round, and
+not for 3 s. The read of the screen runs a round behind the round that reads at that moment
+(the round of a synchronization, which reads for up to its 60 s when the account has much to
+read), so a call that answers after 3 s shows the kept page with the status `pending`, and the
+judgement of the round is published later. A screen passes `wait` with the last of the calls it
+makes for one opening (it calls `read_log`, and while the answer is `pending` calls again): that
+call answers when the read ended, with the page as the store holds it and the judgement of the
+round, without the user doing anything. The interpreters of the builds of November 2026 have no
+event for a published value that changed, so the screen cannot ask again when a round ends. A
+call that waits holds no line. The next call for the log screen (`read_log`, `read_log_page`,
+`read_security_record`) ends its wait at once, and it answers from what the device kept as a
+call whose wait passed does.
+
+A round the screen started is reported by the
 read of the screen that takes what the round read; a round that goes on after the screen stopped
 waiting for it (it waits for a big key at its end) sends its report itself.
 
@@ -2716,8 +2601,9 @@ by white space alone (the name of a `json:` place may hold a comma).
 
 ### Formats 1 and 2
 
-The entries of the nodes of the releases before v2.4.0 stay in the bucket their bindings name
-until their retention ends. The program reads them for two things.
+The entries of the nodes of the releases of the lists of the program (the releases before
+v2.4.0) stay in the bucket their bindings name until their retention ends. The program reads
+them for two things.
 
 The log screen shows them: below the entries of format 3 and merged with them by time, from the
 chains the device follows and the node prefixes the listing of the account prefix names. An entry
@@ -2775,8 +2661,8 @@ were named by a listing of the store, so that answer holds them back in every ca
 A round follows the delegation along the chains: the chain of every node of such a release
 that the device handed a grant to, of every node such a node handed the delegation on to, and of
 every node the store names under the prefix of the account (below). For each it lists the chain
-from the `seq` up to which it read, reads the control entries, and follows
-`grant_transferred_out` of the device's own `key_id`. The operator domain can write objects into
+from the `seq` up to which it read, reads the control entries of 2026-11-23T00:00:00Z and later
+(below), and follows `grant_transferred_out` of the device's own `key_id`. The operator domain can write objects into
 that bucket as well, so under one `seq` the round reads the object versions whose keys name a
 control entry, the latest first, until one is the entry of the node (eight at most: a node writes
 one object under a `seq`, and one more version when it repeats a write). When none of the eight
@@ -2797,16 +2683,60 @@ the entry the node writes there later is read. A listing page that goes on and s
 writing nowhere cannot be read on, and the read is held back (`chain:keys`); a page a node wrote
 always shows it in its last `seq`s.
 
-A chain an account used heavily is long. A round reads it on over four listing pages, and a
-round that ends with the listing of a chain still going on has more to read than it read ("The
-round"): the next round follows at once, and a round that read on through what the node wrote
-there catches up, 32 rounds of a row at most. A listing that goes on over pages that hold more
-than five object versions for each `seq` they name, on average, holds objects no node wrote, and
-a round that ends that way counts. The event of a transfer names the receiving node and
+What a round reads of a chain. From 2026-11-23T00:00:00Z on the backend keeps the attestation
+document of every node that takes a transfer (below), so a transfer a node wrote from that time
+on is judged, by every device of the account, and nothing a node wrote before that time is read:
+
+- A control key of format 2 that names an earlier time is passed and not read, in every chain:
+  the key of an entry is written by its node, and no transfer of that time is judged by a
+  document. The chain of the node that took such a transfer is followed because the store names
+  its prefix. A key of format 1 names no time and is read.
+- A long chain is not listed page after page up to that time. When a listing page that goes on
+  ends with an entry its node wrote more than a day before that time, the round looks for the
+  place of that time in the chain: it lists the chain 2,000 `seq`s further on, then twice as far
+  beyond the `seq` it reached, and so on, until a page holds an entry of a later time or the
+  chain ends there, and then lists it halfway into the stretch in between until that stretch is
+  1,000 `seq`s or fewer. Of each such page it reads the object versions under the first and
+  the last `seq` (eight versions each at most), and the `seq` up to which the chain is read
+  moves on only to a `seq` under which the node wrote an entry that names a time more than a day
+  before that time. A node writes its entries in the order of its clock, and the day is for a
+  clock that was set back: no entry of that time or later lies before such an entry. An object
+  someone else wrote says nothing of a time, whatever its key names, so it moves that `seq`
+  nowhere: a page that shows no entry of the node under those two `seq`s ends the looking for
+  that round, and the chain is read on page after page from the `seq` it was read to. Where the
+  stretch begins and ends only chooses where the next listing lies; the chain is read from the
+  `seq` it was read to, whatever those listings showed. A chain of 200,000 entries takes 15
+  listings and 20 object versions to its end. What the device keeps of the looking
+  (`log.legacy`) lets the next round go on with it.
+
+How much a round reads. A round reads its chains in passes: a pass lists one page of every chain
+that has more to read (16 chains in one request for their addresses), reads the object versions
+of those pages in one request for 100 of them, and judges the receiving nodes they name. A round
+makes 32 passes at most, and begins a pass only while it has 20 s of its time left, and twice
+the time its longest pass took (30 s at most): it ends its reading of the chains by those
+numbers and not because its time passed, on a network that carries little as on any other. It
+reads 512 control entries of chains at most, and reads the object versions under the last
+`seq`s of its pages besides (8,192 at most). A round that ends with chains that have more to
+read is followed by the next round at once ("The round"), and such a round counts as none while
+it read a chain on and none of its reads failed: the length of a chain marks nothing, however
+many rounds it takes. A listing that goes on over pages that hold more than five object versions
+for each `seq` they name, on average, holds objects no node wrote, and a round that ends that
+way counts.
+
+What this leaves. A node of such a release that holds the delegation of an account writes an
+entry for every use of it, and one that goes on writing faster than a device reads keeps that
+device from the end of its chain for as long as it does: the log of that device is pending for
+that time, and a transfer the node wrote behind those entries is judged when the device reaches
+it. A device reads 32 pages of a chain in a round and eight rounds in a synchronization, far
+more than a node writes in that time, so this takes a node that writes day and night for a
+device that reads during its stays in the app. Once no node of such a release holds the
+delegation, a chain grows no more and every device reads it to its end.
+
+The event of a transfer names the receiving node and
 no measurement, so the program asks for the document of the receiving node (`POST
-/api/secure/log/documents`: the node document of a node of a release from v2.4.0 on, the
-attestation document the backend kept of a node of an earlier release). A receiving node whose
-document states a measurement no list has counts for A1; a receiving node of a release that
+/api/secure/log/documents`: the node document of a node that writes format 3, the
+attestation document the backend kept of a node of a release of the lists). A receiving node
+whose document states a measurement the program does not accept counts for A1; a receiving node of a release that
 writes format 3 has its entries in the listing of format 3; a receiving node of an accepted
 release before that has its chain followed in turn. A receiving node waits from the moment the
 entry that names it is read until it is judged, whatever ends the reading of that round, and a
@@ -2823,9 +2753,9 @@ never met leaves a chain this device follows, and a transfer such a node makes t
 measurement no list has is judged (A1) as on any other chain. For a chain that is followed
 because the store names it:
 
-- The chain is followed from its first `seq`. Of its entries from before 2026-11-23T00:00:00Z,
-  whose transfers no document judges, a control key of format 2 (the key names the time) is
-  passed and not read.
+- The chain is followed from its first `seq`, and read as every chain is: nothing its node
+  wrote before 2026-11-23T00:00:00Z is read, and a long chain is not listed page after page up
+  to that time (above).
 - The latest time the node can hold a grant is taken as 30 days (the longest lifetime of a
   grant) after the latest time the keys of the chain name: a node of such a release writes an
   entry with every grant it takes. One day after that, a reading that reaches the end of the
@@ -2868,9 +2798,10 @@ again, a round whose request for it is answered without a document that verifies
 back (A3), no time alone marks the log for it, and its chain is not followed before a document
 verifies. The receiving node of a transfer an entry of format 3 names waits the same way,
 whatever the time of the event. The
-store is not asked whether it holds a node document of such a node: a node of a release before
-v2.4.0 wrote none. For an event before that time, the receiving node is followed as a node of the
-release of the giving node. The route of the node documents hands out what the backend kept of a
+store is not asked whether it holds a node document of such a node: a node that writes format 1
+or format 2 wrote none. An event before that time is one a round reads only in a chain of
+format 1 (the keys of that format name no time): its receiving node is followed as a node of
+the release of the giving node. The route of the node documents hands out what the backend kept of a
 node whether or not the backend reads the store of format 3, so a backend that answers that it
 has no such route, or no such store, holds the document back in every environment.
 

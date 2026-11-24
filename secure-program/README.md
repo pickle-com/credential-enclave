@@ -15,19 +15,21 @@ the master key between the devices of one account. What the program
 does, in which order and under which limits, is specified in protocol.md, "The program of the
 app".
 
-The program hands a grant to a node whose measurement is an element of its list of accepted
+The program hands a grant to a node whose measurement is an element of its lists of accepted
 releases, or is shown to it by release proofs that it verifies on the device (protocol.md, "The
-release proofs"): the signature of the release key over the measurements of the release in the
-public transparency log, a signature of a deploy key of the operator, and the attestation GitHub
-made of those measurements for the job of the build workflow of this repository, at the commit of
-that workflow file the program holds, in a run of the tag of the release. A release of the
-enclave made after a program so reaches a device that runs that program, when its build method is
-the one that workflow file fixes (the four build files by their SHA-256, and packages from
-crates.io alone): a release that changes its build method has no attestation the program takes
-and reaches the device with a program that lists it. A release whose proofs fail a check is to that device a release it does not list, and so
-is a release whose statement states a version of the program above the one the device runs
-(`program_min`). The proofs reach the program with the attestation of a node, in a node document,
-or from the backend for the digest of a measurement.
+release proofs"). The lists are closed: they hold the releases before v2.4.0, and no release is
+added to them. A release from v2.4.0 on is accepted by its public build proof: the release
+statement (`measurements.json`) and the attestation GitHub made of it for the job of a build
+workflow of this repository that the program takes (`.github/workflows/enclave-build.yml` at
+the commit the program holds), in a run the push of the tag of the release started, on a runner
+GitHub hosts, while the repository was public, with the signature of that run in the public
+transparency log. No key of the operator takes part in that verdict, and the program compares
+the name of no release with the name of another. So a device that runs this program hands the
+key of the account to the nodes of every later release that the build workflow built, without
+a new program, and to no enclave whose source is not public. The program asks the backend for
+the proofs of a measurement (`GET /api/secure/release-proofs`), and whoever hands them over, the
+checks decide. A release whose proofs fail a check, or that a build workflow outside the list of
+the program built, is to that device a release it does not accept.
 
 The program lists the log store itself (protocol.md 7.4): the listing of the two prefixes of its
 account, read from Amazon S3 through addresses it checks, names every act that took place with the
@@ -51,9 +53,9 @@ later read (a later listing page, the listing of a chain of formats 1 and 2) are
 screen itself when they are held back, and mark the log when such reads of three days stay
 unread by the screen: with every opening the screen reads its listings on from their start down
 to what was noted, so a read that failed once ends with the next opening the backend answers.
-A round that left reads undone and spent what it read on entries its nodes wrote catches up and
-counts as none, 32 rounds in a row at most; a round whose time passed, or one of whose requests
-was not answered, counts, and rounds that keep counting are rounds held back. The rounds held
+A round that left reads undone and spent what it read on entries its nodes wrote before the
+device fell behind catches up and counts as none; a round whose time passed, or one of whose
+requests was not answered, counts, and rounds that keep counting are rounds held back. The rounds held
 back count one for a day. A request for a list of keys that is not answered is asked again for
 its first key alone, and an entry of 32,768 bytes or more is asked for alone at the end of a
 round with the time its size takes, so a network that carries little is not read as a backend
@@ -73,6 +75,12 @@ their bindings name, for display and to follow a transfer of the delegation a no
 release made: under one `seq` of such a chain the program reads eight objects at most until one
 is the entry of the node, a round reads a chain on only where its node wrote, and the screen
 takes a range of a chain as known only from a listing that was read as far as the range reaches.
+A round reads the transfers a node wrote from 2026-11-23 on, the time from which the backend
+keeps the document of every node that takes a transfer, and nothing a node wrote before: it
+finds the place of that time in a long chain by the entries the node signed, without listing
+the chain up to it, and an object someone else wrote moves that place nowhere. The length of a
+chain marks nothing: a round that only read chains on, with none of its reads failing, counts as
+none, however many such rounds it takes.
 The rounds follow the chain of every node the store names under the prefix of the account, read
 from the listing of that bucket once a day, so a transfer made by a node this device never
 handed a grant to is judged as well.
@@ -82,7 +90,9 @@ entries at 400 days (7.6).
 
 The work of the program runs on three lines that do not wait for one another (the procedures a
 user starts, the synchronizations, the reads of the log screen), every request has a time limit,
-and a procedure ends itself before the executor gives it up.
+and a procedure ends itself before the executor gives it up. A synchronization holds its line
+until its grants are handed and no longer, so a push that wakes the device to hand a grant to a
+node that holds none hands it while a round of the log reads.
 
 This file is the source of truth of the program. The repository `pickle-com/interactive-character`
 (the backend of the operator) vendors a byte-identical copy at `backend/assets/ui/secure-program.js`
@@ -152,17 +162,12 @@ store), `presentSecret` and `promptSecret` (where a vault value passes the app),
 
 ## How a release is made
 
-A program that is to accept the nodes of a new enclave release lists the measurement of that
-release in `const ACCEPTED_RELEASES` (protocol.md 4.5). One command puts the element in, from the
-`measurements.json` of the GitHub release of the enclave tag, and compares what the list holds
-with that file:
-
-```bash
-python3 secure-program/accept_release.py --measurements measurements.json
-```
-
-It exits 0 when the list holds the three values of the file, and `--check` compares without
-writing ([`accept_release.py`](accept_release.py)).
+A release of the enclave needs no release of the program: the program accepts the nodes of a
+release by its public build proof (above). The lists of the program (`const ACCEPTED_RELEASES`
+and `const PRERELEASE_BUILDS`, protocol.md 4.5) hold the releases before v2.4.0 and are not
+added to. A release of the program is made for a change of the program itself, or when a value
+its checks are made with changes (the build workflow, the certificates or the log key of
+Sigstore: protocol.md, "The release proofs").
 
 1. The commit that changes the file sets `const VERSION` to a new N and is tagged
    `secure-program-v{N}`. The push of the tag starts the workflow
@@ -269,65 +274,59 @@ scenarios (worlds and runs) and returns plain results; `tests/program.test.js` f
 results of the current program.
 
 `tests/proofs.test.js` holds the tests of the release proofs (`docs/protocol.md`, "The release
-proofs"). `tests/proofs.js` is the model of the parties that make such proofs: an operator with a
-release key and deploy keys, a transparency log of the form Rekor v1 with its tree and its
-checkpoints, a certificate authority that issues the certificate of a workflow run as Fulcio does
-(X.509 in DER, written by the encoder of that file), and the attestation of a release statement
-as the job of the build workflow makes it (the workflow file and the commit the program of the
-checkout holds). Every key is made there, and the program of a test runs with
-those keys and certificates in the place of its constants. `tests/proof-cases.js` states proofs
-that hold and proofs that differ from them in one place, each with the check that refuses them;
-the test runs every case through a synchronization and compares whether the node received the
-grant and what the program logged. The other tests run histories: the key of an account moving
-through releases the program does not list, read by the device that saw every move and by an
-installation that kept nothing; a closed node whose proofs the backend hands out for the digest
-of its measurement; a release whose statement states a later program; and proofs that reach the
-device after it read the entries of a node. `tests/fixtures/release-proofs-v2.3.0.json` holds the proofs of
-a published release from public values (its `measurements.json`, the entry of that statement on
-rekor.sigstore.dev, and its `release-statement.sigstore.json`, the attestation of a job of the
-release workflow): they run against the constants of the program as they are, with the deploy
-keys of the test and without the element of that release in the list. The program refuses them at
-the workflow of the job, and a program that holds the workflow and the commit of that certificate
-passes every check. The endorsement cases of `protocol/vectors.json` run through the program as well: the
-program reads a release statement and the entry of its record as a node does.
+proofs"). `tests/proofs.js` is the model of the parties that make such proofs: a transparency
+log of the form Rekor v1 with its tree and its checkpoints, a certificate authority that issues
+the certificate of a workflow run as Fulcio does (X.509 in DER, written by the encoder of that
+file), and the attestation of a release statement as the job of the build workflow makes it
+(the workflow file and the commit the program of the checkout holds). Every key is made there,
+and the program of a test runs with those keys and certificates in the place of its constants.
+`tests/proof-cases.js` states proofs that hold and proofs that differ from them in one place,
+each with the check that refuses them; the test runs every case through a synchronization and
+compares whether the node received the grant and what the program logged. The other tests run
+the requests for the proofs (one for a measurement, the answers 200 and 404, a request that
+fails, the five minutes) and histories: the key of an account moving through releases no list
+has, read by the device that saw every move and by an installation that kept nothing; a release
+among them without proofs that hold; and proofs that reach the backend after the device read
+the entries of a node. `tests/fixtures/release-proofs-v2.4.0-rc.1.json` holds the public build
+proof of the tag `v2.4.0-rc.1` of this repository, the first run of the build workflow on
+GitHub (its `measurements.json` and its `release-statement.sigstore.json`): it runs against the
+constants of the program as they are. The program takes it, and refuses the same proof changed
+in one place at the check of that place.
+
+The shared cases of the release proofs (`protocol/vectors/release-proofs.json`, protocol.md 13)
+hold the program and the node implementation to one verdict: a test runs `proveRelease` of the
+program on every case and compares the verdict, the release and the check that refuses a case
+with the file. `SECURE_PROGRAM_PROOF_CASES` names another file of cases, and the test is skipped
+in a checkout that holds none.
 
 `tests/prove.js` prints what the program makes of release proofs read from a file
-(`node secure-program/tests/prove.js RELEASE_PROOFS_JSON [--attestation ATTESTATIONS_JSON]
-[--node ATTESTATION_RESPONSE_JSON]... [--target prod|dev|alpha] [--program PROGRAM_JS]`): the
-verdict of the program of this checkout, or of the source `--program` names, with its constants as
-they are and for a build of the server target named. Release proofs are public values, so whoever
-makes or carries them can ask a version of the program for its verdict before a node of the
-release takes a key.
+(`node secure-program/tests/prove.js RELEASE_PROOFS_JSON [--node ATTESTATION_RESPONSE_JSON]...
+[--target prod|dev|alpha] [--program PROGRAM_JS]`): the verdict of the program of this
+checkout, or of the source `--program` names, with its constants as they are. `RELEASE_PROOFS_JSON`
+holds `{statement, attestation}`, the base64url of the bytes of `measurements.json` and the
+Sigstore bundle of its attestation; `--statement MEASUREMENTS_JSON --attestation BUNDLE_JSON`
+names the two files instead. The file prints what the program reads of the statement, each value
+the certificate states of the run (the extensions `1.3.6.1.4.1.57264.1.{8..22}`) beside the
+value the program requires, and the verdict: that the proofs show the release, or the check that
+refuses them. Its status is 0 when the program takes the proofs and 1 when it refuses them.
+Release proofs are public values, so whoever makes or carries them can ask a version of the
+program for its verdict before a node of the release takes a key, and the release workflow of
+this repository runs the file on the proofs of the release it made: it makes no release the
+program refuses.
 
-A release may hold several attestations of its release statement: a job of the release workflow
-makes one, and the job of the build workflow another, which is the one the program takes
-(protocol.md, "The release proofs", P4). `--attestation` names a file with attestations: one
-Sigstore bundle, bundles one a line, or the answer of the attestation API of GitHub
-(`{attestations: [{bundle}]}`). For every bundle the file prints what P4 makes of it: each value
-the certificate states of the run (the extensions `1.3.6.1.4.1.57264.1.{8..22}`) beside the value
-the program requires, the other checks of the bundle as one line (the certificate under the
-certificate authority at the time of the log entry, the signature of the envelope, the entry of
-the log, its signed entry timestamp, its inclusion proof and its checkpoint), and the predicate
-beside the statement. With `RELEASE_PROOFS_JSON` the attestation of the proofs is then the bundle
-of that file the program takes. Without proofs,
-`node secure-program/tests/prove.js --statement MEASUREMENTS_JSON --attestation ATTESTATIONS_JSON
-[--program PROGRAM_JS]` prints that report alone for the file `measurements.json` of a release,
-and its status is 0 when P4 holds for a bundle of the file.
-
-The verdict on the proofs is that of the five checks on the proofs alone. The measurement a node
-presents and the binding of that node are read from the attestation of the node: `--node` names a
-file with what a node answered a request for its attestation (protocol.md 4.2), or with an answer
-that carries such responses (`{nodes: [...]}`). For each response the file prints the three PCRs
-of the document beside those of the statement and what the binding states (`release`, `log`,
-`role`, `program_min`), and states whether the program hands that node a grant when the response
-carries these proofs, or the check of the program that refuses it: a measurement that is not the
-one of the statement, a binding whose `release` is not the release of the statement, a `log` that
-is not the log store of the server target, a role that receives no grant, a `program_min` above
-the version of the program. The certificate chain of the document is verified with the X.509
-implementation of Node, against the root the program holds and at the time the document states,
-and the nonce is taken from the document: the file judges an answer that was saved, not its
-freshness. The status is 0 when the proofs make the release one the program accepts and every
-node named presents the measurement of the statement and receives a grant.
+The measurement a node presents and the binding of that node are read from the attestation of
+the node: `--node` names a file with what a node answered a request for its attestation
+(protocol.md 4.2), or with an answer that carries such responses (`{nodes: [...]}`). For each
+response the file prints the three PCRs of the document beside those of the statement and what
+the binding states (`release`, `log`, `role`), and states whether the program hands that node a
+grant once it verified these proofs, or the check of the program that refuses it: a measurement
+that is not the one of the statement, a binding whose `release` is not the release of the
+statement, a `log` that is not the log store of the server target, a role that receives no
+grant. The certificate chain of the document is verified with the X.509 implementation of Node,
+against the root the program holds and at the time the document states, and the nonce is taken
+from the document: the file judges an answer that was saved, not its freshness. With `--node`
+the status is 0 only when, besides, every node named presents the measurement of the statement
+and receives a grant.
 
 `SECURE_PROGRAM_VECTORS` names the vector files to read instead of `protocol/vectors.json` (paths
 separated by commas). A test of vectors that the files do not hold is skipped.
@@ -336,8 +335,8 @@ separated by commas). A test of vectors that the files do not hold is skipped.
 versions of the program and prints what changed between them (the file of a tag is
 `git show secure-program-v{N}:secure-program/secure-program.js`).
 
-`tests/test_monitor.py` and `tests/test_accept_release.py` test the two Python tools of this
-directory (`python3 -m unittest discover -s secure-program/tests`).
+`tests/test_monitor.py` tests the monitor of this directory
+(`python3 -m unittest discover -s secure-program/tests`).
 
 ## Limits
 

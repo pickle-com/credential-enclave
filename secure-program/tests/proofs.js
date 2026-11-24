@@ -419,8 +419,52 @@ function withBuilders(source, builders) {
   return withConstant(source, "PROOF_BUILDERS", JSON.stringify(builders));
 }
 
+/** The verdict of a program on release proofs, outside a runtime: the program text is evaluated
+ *  on the model of the bridge with one line before its end that hands out proveRelease and
+ *  releaseTrust (nothing else of the source changes), and the function returned takes the JSON
+ *  text of release proofs and a measurement {pcr0, pcr1, pcr2}. The text is parsed inside the
+ *  program, as the answer of the backend is. Returns {accepted, release, rule, reason}: rule is
+ *  null for proofs the program takes, and for proofs it refuses the check that refuses them
+ *  ("form", or "V1" to "V7": docs/protocol.md, "The release proofs"), with the words of the
+ *  program for it (reason). */
+function verdictsOf(source) {
+  const bridge = require("./bridge.js");
+  const vm = require("node:vm");
+  const end = source.lastIndexOf("})();");
+  if (end < 0 || source.indexOf("function proveRelease(") < 0) throw new Error("the program has no verdict of release proofs");
+  const handed = source.slice(0, end) +
+    "  globalThis.releaseProofsVerdict = { proveRelease: proveRelease, releaseTrust: releaseTrust };\n" + source.slice(end);
+  const world = new bridge.World({ serverTarget: "prod" });
+  world.bridgeOpen = false;
+  const context = vm.createContext({
+    native: Object.freeze(bridge.makeNative(world)), SecureError: bridge.SecureError, console: { log: () => {} },
+  });
+  vm.runInContext(handed, context, { filename: "secure-program.js" });
+  world.bridgeOpen = true;
+  const parse = vm.runInContext("(function (text) { return JSON.parse(text); })", context);
+  const checks = context.releaseProofsVerdict;
+  return function (text, measurement) {
+    let proofs = null;
+    try {
+      proofs = parse(text);
+    } catch (error) {
+      return { accepted: false, release: null, rule: "form", reason: "no JSON" };
+    }
+    try {
+      const shown = checks.proveRelease(proofs, measurement, checks.releaseTrust());
+      return { accepted: true, release: shown.release, rule: null, reason: "" };
+    } catch (error) {
+      const reason = String((error && error.message) || error);
+      const rule = reason === "shape" ? "form" : /^v[1-7]: /.test(reason) ? "V" + reason[1] : null;
+      if (rule === null) throw error;
+      return { accepted: false, release: null, rule: rule, reason: reason };
+    }
+  };
+}
+
 module.exports = {
   b64, b64u, sha256, der, pem, ecKeyPair, ecdsaSign, certificate, makeAuthority, makeLog, treeHash, auditPath,
   makeParties, statementOf, identityOf, attestationOf, proofsOf, commitOf,
   withParties, withConstant, withBuilders, buildersOf, pinsOf, PINS, COMMIT, REPOSITORY, PREDICATE_TYPE, PAYLOAD_TYPE,
+  verdictsOf,
 };
