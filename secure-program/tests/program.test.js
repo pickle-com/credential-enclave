@@ -394,8 +394,12 @@ test("the program calls the bucket of an account that the vectors name, for ever
       fx.world.keychain.clear();
       fx.keys = fx.world.createAccount();
       await S.start(fx);
+      // (The listing of the entries of format 3 from the bucket of the account, and the node
+      // discovery listing from the bucket of format 1 and format 2.)
       const hosts = fx.world.sent("S3 ").map((request) => new URL(request.url).host);
-      assert.deepEqual(hosts, [owner.bucket + ".s3." + store.region + ".amazonaws.com"], target + " " + owner.owner);
+      assert.deepEqual(hosts, [
+        owner.bucket + ".s3." + store.region + ".amazonaws.com", store.bucket + ".s3." + store.region + ".amazonaws.com",
+      ], target + " " + owner.owner);
       assert.equal(fx.world.state.log.status, "verified", target + " " + owner.owner);
       checked += 1;
     }
@@ -547,7 +551,11 @@ test("a node of format 3 receives the grant after one request for its attestatio
   // the ledger of the earlier programs, and a device with no setting to share uploads nothing.
   assert.equal(world.sent("GET /api/secure/ledger").length, 1);
   assert.equal(world.sent("PUT /api/secure/ledger").length, 0);
-  assert.equal(world.sent("S3 " + world.storeHost).length, 0);
+  // The bucket of format 1 and format 2 is asked for the node prefixes of the account once (the
+  // node discovery listing of the round), and for nothing else: it names none.
+  assert.deepEqual(world.sent("POST /api/secure/log/store/listings").map((request) => JSON.parse(request.body)), [{ discovery: true, nodes: [] }]);
+  assert.equal(world.sent("S3 " + world.storeHost).length, 1);
+  assert.deepEqual(world.stored("log.legacy").nodes, {});
 });
 
 test("a synchronization with no node to hand a grant to sends no request that calls a node", async () => {
@@ -734,10 +742,14 @@ test("the ledger of the program before is carried over once: its grants and veri
   assert.deepEqual(Object.keys(grants).sort(), [living.id, ended.id].sort());
   assert.equal(grants[living.id].granted_ms, world.now - 2 * HOUR_MS);
   const legacy = world.stored("log.legacy").nodes;
-  assert.deepEqual(Object.keys(legacy).sort(), [living.id, ended.id].sort());
+  // (The chain of the third node is one the store names and no grant of this device leads to:
+  // the rounds follow it as a chain they found.)
+  assert.deepEqual(Object.keys(legacy).sort(), [living.id, ended.id, unexplained.id].sort());
   assert.equal(legacy[living.id].seq, 2);
   assert.equal(legacy[living.id].closed, false);
   assert.equal(legacy[ended.id].closed, true);
+  assert.equal(legacy[unexplained.id].found, true);
+  assert.equal(legacy[unexplained.id].closed, false);
   assert.equal(world.store.get("log.migrated"), "43");
   // The first round of this program judges by its own conditions: the mark of the earlier program
   // is gone, and the grant of two hours ago is not handed again.
@@ -3448,19 +3460,21 @@ test("an address of the store that gives a query key twice, or carries a fragmen
     },
   }));
   reread(twice, (url, letter) => url.replace(own(twice.world, letter), "prefix=a3%2Fnone%2F&" + own(twice.world, letter)));
-  let calls = twice.world.sent("S3 ").length;
+  // (The requests to the bucket of the account, where the listing of format 3 lies.)
+  const shard = (world) => world.sent("S3 " + world.shardHost).length;
+  let calls = shard(twice.world);
   await nextDay(twice);
   assert.equal(twice.world.state.log.store, "blocked");
   assert.equal(twice.world.state.log.store_failure, "read:url");
-  assert.equal(twice.world.sent("S3 ").length, calls);
+  assert.equal(shard(twice.world), calls);
   for (const rewrite of [(url) => url.replace("/?", "/#?"), (url) => url + "#", (url) => url.replace("&max-keys=1000", "&max-keys=1000&max-keys=1000")]) {
     const fx = S.fixture(source);
     await S.start(fx);
     reread(fx, rewrite);
-    calls = fx.world.sent("S3 ").length;
+    calls = shard(fx.world);
     await nextDay(fx);
     assert.equal(fx.world.state.log.store_failure, "read:url");
-    assert.equal(fx.world.sent("S3 ").length, calls);
+    assert.equal(shard(fx.world), calls);
   }
   // The listing of a chain of format 2.
   const chain = S.fixture(source, { nodes: 0, legacy: 1 });
@@ -3474,11 +3488,14 @@ test("an address of the store that gives a query key twice, or carries a fragmen
     }
     return { status: 200, body: answer };
   });
-  calls = chain.world.sent("S3 ").length;
+  // (The requests to the store for the listing of that chain.)
+  const listed = () => chain.world.requests.filter((request) => typeof request.url === "string" &&
+    request.url.indexOf(chain.legacy[0].id) >= 0).length;
+  calls = listed();
   await nextDay(chain);
   assert.equal(chain.world.state.log.store, "blocked");
   assert.equal(chain.world.state.log.store_failure, "listings:url");
-  assert.equal(chain.world.sent("S3 ").length, calls);
+  assert.equal(listed(), calls);
 });
 
 test("the bridge is asked for the device as often for a listing of many keys as for one of few: the user_id of the account is read once in a runtime", async () => {
@@ -3911,7 +3928,9 @@ test("the log screen shows the entries a node wrote into its chain of format 2 w
       if (where === "far") strayObject(fx, chain, end + 100000, 1, "u");
       else for (let j = 0; j < 12; j += 1) strayObject(fx, chain, end + 3 + j, 1, "u", String(j));
       await nextDay(fx);
-      assert.equal(world.stored("log.legacy").nodes[node.id] !== undefined, followed, label);
+      // (The rounds follow the chain in either case: a chain no grant of this device leads to
+      // is one they found by the node prefixes of the account.)
+      assert.equal(world.stored("log.legacy").nodes[node.id].found === true, !followed, label);
       const first = await S.call(fx, "read_log", { limit: 50 });
       assert.equal(ofChain(first), 5, label);
       assert.equal(first.value.has_more, true, label);
@@ -4070,18 +4089,37 @@ test("an opening of the log screen after the first of a runtime lists the end of
 
 test("more open chains of format 2 than a round follows are all read within the rounds that follow: the chains listed longest ago come first", async () => {
   const fx = S.fixture(source, { nodes: 0, legacy: 66 });
-  await S.start(fx);
   const world = fx.world;
-  // The first round follows 64 chains, and is not complete.
+  // The listings of chains each round asked the addresses of (the reports of the rounds tell
+  // the rounds apart).
+  const listed = [];
+  world.fault("POST /api/secure/log/store/listings", (request) => {
+    const count = JSON.parse(request.body).nodes.length;
+    if (count > 0) listed.push({ round: world.reports.length, count: count });
+    return undefined;
+  });
+  const perRound = () => {
+    const sums = new Map();
+    for (const item of listed) sums.set(item.round, (sums.get(item.round) || 0) + item.count);
+    return Array.from(sums.values());
+  };
+  await S.start(fx);
+  await world.settle(60000);
+  // The first round follows 64 chains and has more to read than it reads: the next round follows
+  // at once and takes the two the first did not come to, and no chain is listed twice.
+  assert.deepEqual(perRound(), [64, 2]);
   const first = world.stored("log.legacy").nodes;
   assert.equal(Object.keys(first).length, 66);
-  assert.equal(Object.keys(first).filter((id) => first[id].seq === 0).length, 2);
-  assert.equal(world.state.log.status, "pending");
-  // The next round begins with the two it left.
-  world.advance(2 * 60000);
-  await S.event(fx, "foreground");
-  const second = world.stored("log.legacy").nodes;
-  assert.equal(Object.keys(second).filter((id) => second[id].seq === 0).length, 0);
+  assert.equal(Object.keys(first).filter((id) => first[id].seq === 0).length, 0);
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(world.stored("log.round").unfinished, 0);
+  assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  // A day later, with nothing new in any chain: two rounds again, and the log verifies.
+  listed.length = 0;
+  await nextDay(fx);
+  await world.settle(60000);
+  assert.deepEqual(perRound(), [64, 2]);
+  assert.equal(world.state.log.status, "verified");
   assert.equal(world.stored("log.round").unfinished, 0);
   assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
 });
@@ -4206,9 +4244,13 @@ test("the chain of a node of an earlier release is closed once its grant ran out
   world.advance(32 * DAY_MS);
   await S.event(fx, "foreground");
   assert.equal(world.stored("log.legacy").nodes[id].closed, true);
-  const listings = world.sent("POST /api/secure/log/store/listings").length;
+  // (The requests for the listing addresses of chains. The node discovery listing is asked for
+  // once a day, and names the node of that chain, which is not followed anew.)
+  const listings = () => world.sent("POST /api/secure/log/store/listings").filter((request) => JSON.parse(request.body).nodes.length > 0).length;
+  const before = listings();
   await nextDay(fx);
-  assert.equal(world.sent("POST /api/secure/log/store/listings").length, listings);
+  assert.equal(listings(), before);
+  assert.equal(world.stored("log.legacy").nodes[id].closed, true);
   assert.equal(world.state.log.status, "verified");
 });
 
@@ -7152,4 +7194,330 @@ test("the completion of a mail setup by a synchronization does not bring back a 
   assert.equal(world.sent("PUT /api/secure/connections/naver_mail/app-password").length, 0);
   // Another setup can begin at once.
   assert.equal((await S.call(fx, "begin_app_password_setup", { identity: "other" })).ok, true);
+});
+
+// ---- The last list before the tag: the chains of the nodes the store names ----
+
+/** Makes a node of the latest release before v2.4.0 one that another device of the account
+ *  handed a grant to: the backend lists it for its revokes alone, and the node wrote the entry of
+ *  that grant into its chain. */
+function grantedElsewhere(fx, node, timeMs) {
+  const world = fx.world;
+  node.offered = true;
+  node.revokeOnly = true;
+  node.grants.set(world.userId, {
+    sign_pk: b64u(fx.keys.signPk), log_pk: b64u(fx.keys.logPk), key_id: fx.keys.keyId, custody: "enclave",
+    not_after_ms: world.now + 20 * DAY_MS,
+  });
+  return node.record("c", [{ t: "grant_accepted", time_ms: timeMs === undefined ? world.now : timeMs, not_after_ms: world.now + 20 * DAY_MS, custody: "enclave" }],
+    timeMs === undefined ? {} : { timeMs: timeMs });
+}
+
+/** The requests for the node discovery listing, and for the listings of chains. */
+function discoveries(world) {
+  return world.sent("POST /api/secure/log/store/listings").filter((request) => JSON.parse(request.body).discovery === true).length;
+}
+
+function chainListings(world) {
+  return world.sent("POST /api/secure/log/store/listings").reduce((sum, request) => sum + JSON.parse(request.body).nodes.length, 0);
+}
+
+test("the rounds follow the chain of a node the store names under the prefix of the account though no grant of this device leads to it: a transfer of the delegation such a node made to a node of a measurement no list has marks the log (A1), on a device that never opens the log screen", async () => {
+  const fx = S.fixture(source, { nodes: 1, legacy: 1, device: { securityStatus: true } });
+  const world = fx.world;
+  world.now = TRANSFER_DOCUMENTS_FROM_MS + DAY_MS;
+  const guard = fx.legacy[0];
+  grantedElsewhere(fx, guard);
+  await S.start(fx);
+  // This device handed that node no grant, and its rounds follow the chain all the same.
+  assert.equal(world.stored("log.grants")[guard.id], undefined);
+  assert.equal(guard.commands.filter((command) => command.type === "grant").length, 0);
+  const followed = world.stored("log.legacy").nodes[guard.id];
+  assert.equal(followed.found, true);
+  assert.equal(followed.seq, 1);
+  assert.equal(world.state.log.status, "verified");
+  // The node hands the delegation on to a node of a measurement no list has.
+  const rogue = world.addNode({ release: "v2.3.9", measurement: bridge.randomMeasurement(), format: 2, offered: false });
+  world.keptDocuments.set(rogue.id, registryDocument(rogue));
+  world.advance(HOUR_MS);
+  guard.record("c", [{ t: "grant_transferred_out", time_ms: world.now, to: rogue.id }]);
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "pending");
+  assert.equal(world.state.log.newer_release_nodes, 1);
+  await nextDay(fx);
+  assert.equal(world.state.log.status, "attention");
+  assert.equal(world.state.log.unknown_nodes, 1);
+  assert.deepEqual(world.securityStatuses.slice(-1)[0].reasons, ["unlisted_release"]);
+  assert.equal(world.sent("POST /api/secure/log/read").length > 0, true);
+});
+
+test("a chain the rounds found whose listing is held back, or a node discovery listing that is held back on a device that follows a chain, is a round held back: the log is marked on the fourth day, with no opening of the log screen", async () => {
+  for (const what of ["chain", "discovery"]) {
+    const fx = S.fixture(source, { nodes: 1, legacy: 1, device: { securityStatus: true } });
+    const world = fx.world;
+    world.now = TRANSFER_DOCUMENTS_FROM_MS + DAY_MS;
+    grantedElsewhere(fx, fx.legacy[0]);
+    await S.start(fx);
+    assert.equal(world.state.log.status, "verified");
+    world.fault("POST /api/secure/log/store/listings", (request) => {
+      const body = JSON.parse(request.body);
+      const hit = what === "chain" ? body.nodes.length > 0 : body.discovery === true;
+      return hit ? { status: 503, body: { detail: "log_store_unreachable" } } : undefined;
+    });
+    const states = [];
+    for (let day = 0; day < 4; day += 1) {
+      await nextDay(fx);
+      states.push(world.state.log.status + ":" + world.state.log.store + ":" + world.reports.slice(-1)[0].blocked_attempts);
+    }
+    assert.deepEqual(states, ["pending:blocked:1", "pending:blocked:2", "pending:blocked:3", "attention:blocked:4"], what);
+    assert.equal(world.state.log.store_failure, "listings:503", what);
+    assert.equal(world.sent("POST /api/secure/log/read").some((request) => JSON.parse(request.body).pages.length > 1), false, what);
+    world.clearFaults();
+    world.advance(2 * 60000);
+    await S.event(fx, "foreground");
+    assert.equal(world.state.log.status, "verified", what);
+  }
+  // A backend that states it has no such store is believed by a device that knows of no chain,
+  // and holds the listing back from a device that follows one.
+  const none = S.fixture(source);
+  none.world.fault("POST /api/secure/log/store/listings", { status: 409, body: { detail: "log_store_disabled" } });
+  await S.start(none);
+  for (let day = 0; day < 4; day += 1) await nextDay(none);
+  assert.equal(none.world.state.log.status, "verified");
+  assert.deepEqual(none.world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  assert.equal(discoveries(none.world), 5);
+});
+
+test("the node discovery listing is read by the rounds once a day, and at once when the list of the nodes names a node for its revokes alone whose chain this device does not follow: the chain of a node another device just handed a grant to is followed from that synchronization on", async () => {
+  const fx = S.fixture(source, { nodes: 1, legacy: 1 });
+  const world = fx.world;
+  world.now = TRANSFER_DOCUMENTS_FROM_MS + DAY_MS;
+  const guard = fx.legacy[0];
+  guard.offered = false;
+  await S.start(fx);
+  assert.equal(discoveries(world), 1);
+  assert.deepEqual(world.stored("log.legacy").nodes, {});
+  // Synchronizations within the day read the listing no more.
+  world.advance(HOUR_MS);
+  await S.event(fx, "foreground");
+  assert.equal(discoveries(world), 1);
+  // Another device of the account hands the node a grant: the list of the nodes names it for its
+  // revokes alone. The round of that synchronization runs though none was due, reads the listing
+  // again and follows the chain.
+  world.advance(HOUR_MS);
+  grantedElsewhere(fx, guard);
+  const rounds = world.reports.length;
+  await S.event(fx, "foreground");
+  assert.equal(world.reports.length, rounds + 1);
+  assert.equal(discoveries(world), 2);
+  const kept = world.stored("log.legacy");
+  assert.equal(kept.nodes[guard.id].found, true);
+  assert.equal(kept.nodes[guard.id].seq, 1);
+  assert.deepEqual(kept.asked, { [guard.id]: guard.grants.get(world.userId).not_after_ms });
+  assert.equal(world.state.log.status, "verified");
+  // The synchronizations after it: no round before one is due, and the listing once a day.
+  world.advance(HOUR_MS);
+  await S.event(fx, "foreground");
+  assert.equal(world.reports.length, rounds + 1);
+  assert.equal(discoveries(world), 2);
+  await nextDay(fx);
+  assert.equal(discoveries(world), 3);
+  // What the log screen read of that listing within the day is taken, and not read again.
+  await nextDay(fx);
+  assert.equal(discoveries(world), 4);
+  world.advance(23 * HOUR_MS);
+  assert.equal((await S.call(fx, "read_log", {})).ok, true);
+  await world.settle(5000);
+  const read = discoveries(world);
+  world.advance(2 * HOUR_MS);
+  await S.event(fx, "foreground");
+  assert.equal(world.reports.slice(-1)[0].status, "verified");
+  assert.equal(discoveries(world), read);
+});
+
+test("a stale runtime reads no node discovery listing and follows no chain it finds", async () => {
+  const fx = S.fixture(source, { nodes: 1, legacy: 1 });
+  const world = fx.world;
+  world.now = TRANSFER_DOCUMENTS_FROM_MS + DAY_MS;
+  const guard = fx.legacy[0];
+  guard.offered = false;
+  await S.start(fx);
+  assert.equal(discoveries(world), 1);
+  world.account.servedProgram = fx.version + 1;
+  for (let day = 0; day < 3; day += 1) {
+    await nextDay(fx);
+    if (day === 0) grantedElsewhere(fx, guard);
+  }
+  assert.equal(world.runtime.program_stale, true);
+  assert.equal(discoveries(world), 1);
+  assert.equal(chainListings(world), 0);
+  assert.deepEqual(world.stored("log.legacy").nodes, {});
+  // The program that is served is loaded: its first round reads the listing and follows the chain.
+  world.account.servedProgram = fx.version;
+  await S.start(fx);
+  assert.equal(discoveries(world), 2);
+  assert.equal(world.stored("log.legacy").nodes[guard.id].found, true);
+});
+
+test("an account with more node prefixes than a round follows chains is read to its end by the rounds that follow one another, and nothing marks the log: chains whose end lies longer back than a grant lasts are remembered, their control keys from before 2026-11-23 are passed, each of them is listed again once in thirty days, and such a chain is followed again when its node is listed", async () => {
+  const fx = S.fixture(source, { device: { securityStatus: true } });
+  const world = fx.world;
+  await S.start(fx);
+  // 150 nodes of an earlier release that other devices of the account handed their grants to,
+  // between seventy and forty days ago. Each wrote three entries of grants into its chain.
+  const nodes = [];
+  for (let i = 0; i < 150; i += 1) {
+    const node = world.addNode({ release: fx.latest.release, measurement: fx.latest, offered: false });
+    for (let entry = 0; entry < 3; entry += 1) {
+      const at = world.now - (70 - entry * 10) * DAY_MS - i * 1000;
+      node.record("c", [{ t: "grant_accepted", time_ms: at, not_after_ms: at + 30 * DAY_MS, custody: "enclave" }], { timeMs: at });
+    }
+    nodes.push(node);
+  }
+  const objects = () => world.sent("POST /api/secure/log/store/objects").reduce((sum, request) => sum + JSON.parse(request.body).objects.length, 0);
+  const reports = world.reports.length;
+  await nextDay(fx);
+  await world.settle(2 * 60000);
+  // Three rounds in a row: 64, 64 and 22 chains.
+  assert.equal(world.reports.length, reports + 3);
+  assert.equal(chainListings(world), 150);
+  assert.equal(world.state.log.status, "verified");
+  assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  assert.equal(world.stored("log.round").unfinished, 0);
+  assert.equal(world.securityStatuses.some((told) => told.status === "attention"), false);
+  // Every chain is read to its end and remembered by a digest: none is kept as a chain to follow.
+  const kept = world.stored("log.legacy");
+  assert.deepEqual(kept.nodes, {});
+  assert.equal(Object.keys(kept.closed).length, 150);
+  assert.ok(Object.keys(kept.closed).every((digest) => kept.closed[digest] === 3));
+  // Of the three control entries of a chain, the last two were read to see how far the node
+  // wrote, and none was read as an entry to judge: 300 object versions, not 450.
+  assert.equal(objects(), 300);
+  // The days after: the node discovery listing once a day, and of the 150 chains read to their
+  // end, the five a day that are due in a cycle of thirty days are listed again from where they
+  // were read to (25 hours make 5.2 of 150 due). Nothing was written to them: they stay
+  // remembered, and no object is read.
+  for (let day = 0; day < 3; day += 1) await nextDay(fx);
+  assert.equal(chainListings(world), 150 + 15);
+  assert.equal(objects(), 300);
+  assert.equal(discoveries(world), 5);
+  assert.equal(world.state.log.status, "verified");
+  assert.deepEqual(world.stored("log.legacy").nodes, {});
+  assert.equal(Object.keys(world.stored("log.legacy").closed).length, 150);
+  // One of those nodes is handed a grant again: it is listed for its revokes alone, and its
+  // chain is followed again.
+  world.advance(HOUR_MS);
+  grantedElsewhere(fx, nodes[7]);
+  await S.event(fx, "foreground");
+  const again = world.stored("log.legacy");
+  assert.equal(again.nodes[nodes[7].id].found, true);
+  assert.equal(again.nodes[nodes[7].id].closed, false);
+  assert.equal(again.nodes[nodes[7].id].seq, 4);
+  assert.equal(Object.keys(again.closed).length, 149);
+  assert.equal(world.state.log.status, "verified");
+});
+
+test("a chain the device read to its end is listed again within thirty days whatever the list of the nodes says: a node the backend does not list, which is handed a grant again and hands the delegation on to a node of a measurement no list has, marks the log", async () => {
+  const fx = S.fixture(source, { device: { securityStatus: true } });
+  const world = fx.world;
+  world.now = TRANSFER_DOCUMENTS_FROM_MS + 60 * DAY_MS;
+  // A node of an earlier release another device handed a grant to forty days ago. The backend
+  // does not list it for this device.
+  const node = world.addNode({ release: fx.latest.release, measurement: fx.latest, offered: false });
+  const then = world.now - 40 * DAY_MS;
+  node.record("c", [{ t: "grant_accepted", time_ms: then, not_after_ms: then + 30 * DAY_MS, custody: "enclave" }], { timeMs: then });
+  await S.start(fx);
+  assert.deepEqual(world.stored("log.legacy").nodes, {});
+  assert.equal(Object.keys(world.stored("log.legacy").closed).length, 1);
+  // The node is handed a grant again, and hands the delegation on.
+  world.advance(HOUR_MS);
+  const rogue = world.addNode({ release: "v2.3.9", measurement: bridge.randomMeasurement(), format: 2, offered: false });
+  world.keptDocuments.set(rogue.id, registryDocument(rogue));
+  node.record("c", [{ t: "grant_accepted", time_ms: world.now, not_after_ms: world.now + 30 * DAY_MS, custody: "enclave" }]);
+  node.record("c", [{ t: "grant_transferred_out", time_ms: world.now, to: rogue.id }]);
+  // The rounds of the days after: the chain is listed again when its turn in the cycle comes.
+  let marked = 0;
+  let listed = 0;
+  for (let day = 1; day <= 33 && marked === 0; day += 1) {
+    await nextDay(fx);
+    if (listed === 0 && chainListings(world) > 1) listed = day;
+    if (world.state.log.status === "attention") marked = day;
+  }
+  assert.ok(listed >= 1 && listed <= 30, "listed again on day " + listed);
+  assert.equal(marked, listed + 1);
+  assert.equal(world.state.log.unknown_nodes, 1);
+  assert.deepEqual(world.securityStatuses.slice(-1)[0].reasons, ["unlisted_release"]);
+});
+
+/** Writes count node prefixes no node made under the prefix of the account: each holds one object
+ *  whose key has the form of a use entry of the present time. */
+function strayChains(fx, count) {
+  const world = fx.world;
+  const filler = "".padEnd(43, "A");
+  for (let i = 0; i < count; i += 1) {
+    const id = b64u(crypto.randomBytes(32));
+    world.putObject(world.bucket, "v1/accounts/" + world.userId + "/" + id + "/" + "1".padStart(20, "0") + "-" +
+      String(world.now).padStart(13, "0") + "-u-001-" + fx.keys.keyId + "-" + filler + "-" + filler, "x");
+  }
+}
+
+test("node prefixes no node made are chains the rounds follow like any other: as many as the rounds of one synchronization come to leave the log verified, and more than that, day after day, are rounds that left reads undone, which mark the log as before", async () => {
+  // 300 such prefixes: five rounds in a row follow them all, every day, and the log verifies.
+  const some = S.fixture(source, { device: { securityStatus: true } });
+  await S.start(some);
+  strayChains(some, 300);
+  for (let day = 0; day < 4; day += 1) {
+    const reports = some.world.reports.length;
+    await nextDay(some);
+    await some.world.settle(2 * 60000);
+    assert.equal(some.world.reports.length, reports + 5, "day " + day);
+    assert.equal(some.world.state.log.status, "verified", "day " + day);
+    assert.equal(some.world.stored("log.round").unfinished, 0, "day " + day);
+    assert.deepEqual(some.world.stored("log.blocked"), { first_ms: 0, count: 0 }, "day " + day);
+  }
+  assert.equal(Object.keys(some.world.stored("log.legacy").nodes).length, 300);
+  assert.equal(some.world.securityStatuses.some((told) => told.status === "attention"), false);
+
+  // 600 of them: the eight rounds of a synchronization do not come to all, each of them read an
+  // object no node wrote, and from the second day on the first round of a synchronization is a
+  // round held back.
+  const many = S.fixture(source, { device: { securityStatus: true } });
+  await S.start(many);
+  strayChains(many, 600);
+  const states = [];
+  for (let day = 0; day < 5; day += 1) {
+    await nextDay(many);
+    await many.world.settle(2 * 60000);
+    states.push(many.world.state.log.status + ":" + many.world.stored("log.blocked").count);
+  }
+  assert.deepEqual(states, ["pending:0", "pending:1", "pending:2", "pending:3", "attention:4"]);
+  assert.deepEqual(many.world.securityStatuses.slice(-1)[0].reasons, ["verification_blocked"]);
+});
+
+test("a node discovery listing that goes on beyond the pages a round reads of it leaves the round incomplete: the log does not verify while the store names node prefixes the round did not see", async () => {
+  const fx = S.fixture(source);
+  const world = fx.world;
+  // The store answers the node discovery listing with a page that goes on, however often it is
+  // asked from the marker of the page before.
+  let pages = 0;
+  const fault = world.fault((line, request) => typeof request.url === "string" && new URL(request.url).searchParams.get("delimiter") === "/", () => {
+    pages += 1;
+    return {
+      status: 200,
+      body: "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListVersionsResult><Name>" + world.bucket + "</Name><EncodingType>url</EncodingType>" +
+        "<IsTruncated>true</IsTruncated><NextKeyMarker>" + encodeURIComponent("v1/accounts/" + world.userId + "/marker" + pages) +
+        "</NextKeyMarker></ListVersionsResult>",
+    };
+  });
+  await S.start(fx);
+  assert.equal(pages, 2);
+  assert.equal(world.state.log.status, "pending");
+  assert.equal(world.stored("log.legacy").more, true);
+  assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  // The listing ends: the next round reads it again and the log verifies.
+  fault.times = 0;
+  world.advance(2 * 60000);
+  await S.event(fx, "foreground");
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(world.stored("log.legacy").more, undefined);
 });
