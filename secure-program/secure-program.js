@@ -8127,9 +8127,21 @@
       const left = function () {
         if (roundTurn === own) roundTurn = null;
       };
-      work.then(left, left);
       // The wait for the round has the time of the round, in a turn that is not ended with it.
-      limited(newTurn(LOG_ROUND_LIMIT_MS, ""), work, Infinity, "procedure").then(settle.resolve, settle.reject);
+      // A round the log screen started is reported by the read of the screen that takes what
+      // it read (readScreen). One that goes on after the wait for it ended (it waits for a big
+      // key at its end) is taken by no read: it sends its report itself.
+      let waited = true;
+      limited(newTurn(LOG_ROUND_LIMIT_MS, ""), work, Infinity, "procedure").then(settle.resolve, function (error) {
+        waited = false;
+        settle.reject(error);
+      });
+      work.then(function (result) {
+        left();
+        if (!waited && origin === "screen" && result !== null && typeof result === "object" && typeof result.report === "function") {
+          result.report();
+        }
+      }, left);
       return work;
     }, true).then(ended, function (error) {
       ended();
@@ -13813,7 +13825,7 @@
   }
 
   /** The requesting device: creates a transfer request and waits for the approval. It holds only
-   *  when key_state is waiting. */
+   *  when key_state is waiting or mismatch. */
   async function beginTransfer(turn) {
     if (transferRun !== null && !transferTerminal(transferRun.phase)) return { transfer: transferView() };
     const judged = await judgeKey(turn);
