@@ -627,7 +627,9 @@ class World {
     this.serverTarget = given.serverTarget || "prod";
     this.bucket = "character-credential-log-" + this.serverTarget + "-1";
     this.region = "us-west-2";
-    this.now = given.now || 1790000000000;
+    // (2026-12-13T00:00:00Z: twenty days after the time from which the backend keeps the
+    // document of every node that takes a transfer, LEGACY_TRANSFER_DOCUMENTS_FROM_MS.)
+    this.now = given.now || 1797120000000;
     this.nitro = makeNitroSigner();
     this.keychain = new Map();
     this.store = new Map();

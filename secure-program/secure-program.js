@@ -149,11 +149,13 @@
   //                   of the chains of format 1 and format 2, and the pages that held no entry
   //                   because every key they took was no entry, one read for each day)
   //   log.legacy      the chains of format 1 and format 2: {nodes: {node: {seq, time_ms, until_ms,
-  //                   closed, read_ms, end_ms, found}}, waiting: {node: {until_ms, time_ms, strict}},
-  //                   found_ms, more, closed, asked} (waiting: the receiving nodes of transfers
-  //                   whose documents this device has still to judge; strict: nothing but a
-  //                   document judges the node; found: a chain followed because the store
-  //                   names its prefix; found_ms: the time of the node discovery listing the
+  //                   closed, read_ms, end_ms, found, leap, top}}, waiting: {node: {until_ms,
+  //                   time_ms, strict}}, found_ms, more, closed, asked} (waiting: the receiving
+  //                   nodes of transfers whose documents this device has still to judge;
+  //                   strict: nothing but a document judges the node; found: a chain followed
+  //                   because the store names its prefix; leap and top: where a round that
+  //                   looks for the place of 2026-11-23 in a long chain lists it next;
+  //                   found_ms: the time of the node discovery listing the
   //                   rounds last took in; more: that listing went on beyond the pages a
   //                   round reads of it; closed: the chains read to their end, a table from
   //                   the digest of the node id to the seq the chain was read to; recheck and
@@ -270,34 +272,14 @@
   // synchronization has the next round follow at once, LOG_SYNC_ROUNDS rounds in a row at most:
   // a device with much to read (a new device, a device that was off for long) reads it during
   // its stays in the app, and not one round a day.
-  // An account in normal use is read to its end within a few such rounds, whatever it holds.
-  // Beyond LOG_UNFINISHED_ROUNDS rounds in a row that ended that way, a synchronization whose
-  // first round ends that way again is one whose reads are held back (someone writes objects
-  // under the prefix of the account faster than the device reads them, or the answers of the
-  // backend never reach the end): that round counts as a round held back, once for the
-  // synchronization.
+  // Beyond LOG_UNFINISHED_ROUNDS rounds in a row that ended that way and count (runRound says
+  // which do: a round that catches up, and a round that only read chains of format 1 and
+  // format 2 on, count as none), a synchronization whose first round ends that way again is
+  // one whose reads are held back (someone writes objects under the prefix of the account
+  // faster than the device reads them, or the answers of the backend never reach the end):
+  // that round counts as a round held back, once for the synchronization.
   const LOG_UNFINISHED_ROUNDS = 8;
   const LOG_SYNC_ROUNDS = 8;
-  // The rounds of one row that count as rounds that catch up (runRound): a round that left
-  // reads undone and spent everything it read on what nodes wrote adds nothing to the row. Nodes
-  // of accepted releases can be made to write control entries of an account without the user
-  // (the delegation handed on from node to node), as many as someone likes and ahead of time,
-  // and a device reads them as what its nodes wrote. So the rounds that count as catching up
-  // are bounded: once this many of a row did, every round that leaves reads undone counts as
-  // before, whatever it read.
-  // The number is four times the rounds the largest account in normal use takes to read. Of
-  // the accounts of this service in November 2026, the one with the most grant commands had 295
-  // of them in 30 days (3,590 in the LOG_RETENTION_DAYS the store keeps an entry), the one with
-  // the most nodes had 44, and the one that read the most entries in two weeks read 14,707, its
-  // use entries included. A round reads LEGACY_ROUND_BODIES control entries of chains (512), or
-  // LOG_ROUND_BODY_REQUESTS requests of LOG_BODY_KEYS bodies of format 3 (800): a device that
-  // comes back to the control entries of the whole retention of that account reads them in 8
-  // rounds at most. Four times that is 32, the rounds of four synchronizations
-  // (LOG_SYNC_ROUNDS), which read 16,384 control entries of chains or 25,600 of format 3.
-  // A round reads a chain on over LEGACY_ROUND_PASSES pages of its listing (4,000 object
-  // versions, the use entries of the chain among them): the 14,707 entries of that account are
-  // read on in 4 rounds, and 32 rounds read one chain on over 128,000 object versions.
-  const LOG_CATCHING_ROUNDS = 32;
   // A check of the app for a new program that failed without a response counts as kept from
   // the app by the operator domain when the backend answered a request of this runtime within
   // this time of it (deliveryRefused), and a check that ended this long before the backend
@@ -415,13 +397,35 @@
   // screen keeps opened in a runtime.
   const LEGACY_NODES = 64;
   const LEGACY_LISTING_NODES = 16;
-  const LEGACY_ROUND_PASSES = 4;
+  // A round reads its chains in passes: a pass lists one page of every chain that has more to
+  // read, reads the entries of those pages, and judges what they name. LEGACY_ROUND_PASSES
+  // passes at most, and a pass begins only while the round has LEGACY_PASS_RESERVE_MS of its
+  // time left, and twice the time the longest pass before it took: a round ends its reading of
+  // the chains by those numbers and not because its time passed, on a network that carries
+  // little as on any other.
+  const LEGACY_ROUND_PASSES = 32;
+  const LEGACY_PASS_RESERVE_MS = 20000;
   const LEGACY_ROUND_BODIES = 512;
   const LEGACY_SEQ_READS = 8;
   // The seqs at the end of a listing page of a chain that a round reads to see how far the node
-  // wrote, when their keys name no control entry.
+  // wrote, when their keys name no control entry, and the object versions a round reads for
+  // that at most (a node writes one object under a seq, and a version more when it repeats a
+  // write, so the pages of every pass of every chain a round follows fit).
   const LEGACY_PROBE_SEQS = 2;
+  const LEGACY_ROUND_PROBES = 2 * LEGACY_ROUND_PASSES * LEGACY_NODES * LEGACY_PROBE_SEQS;
   const LEGACY_SEQ_VERSIONS = 5;
+  // The place of LEGACY_TRANSFER_DOCUMENTS_FROM_MS in a long chain (seekPlace): a round does
+  // not read the listing of a chain page after page up to that time. When a listing page that
+  // goes on ends with an entry its node wrote more than LEGACY_SEEK_MARGIN_MS before that time,
+  // the round lists the chain LEGACY_SEEK_LEAP seqs further on, then twice as far, and so on
+  // (LEGACY_SEEK_LEAP_MAX at most), until a page holds an entry of a later time or the chain
+  // ends, and then halves the stretch in between until it is LEGACY_SEEK_SPAN seqs or fewer
+  // (one page of the store). The margin is for a node whose clock was set back: no entry of
+  // that time or later lies before an entry the node wrote a day earlier by its own clock.
+  const LEGACY_SEEK_MARGIN_MS = DAY_MS;
+  const LEGACY_SEEK_LEAP = 2000;
+  const LEGACY_SEEK_LEAP_MAX = 1099511627776;
+  const LEGACY_SEEK_SPAN = 1000;
   const LEGACY_DISCOVERY_PAGES = 2;
   // The node prefixes one page of the node discovery listing names at most (the page size of
   // the store).
@@ -5158,11 +5162,13 @@
   // ---- The chains this device follows (log.legacy) ----
 
   /** The kept state of the chains of format 1 and format 2: {nodes: {node: {seq, time_ms,
-   *  until_ms, closed, read_ms, end_ms, found}}, waiting: {node: {until_ms, time_ms}}, found_ms,
-   *  more, closed, recheck, recheck_ms, asked} (read_ms: the time a round last listed the chain;
-   *  end_ms: the time a round last read it to its end; found: the chain is followed because the
-   *  store names its prefix, findChains; found_ms, more, closed (a Map from digest to seq),
-   *  recheck, recheck_ms and asked: what findChains keeps). seq is the seq up to which the
+   *  until_ms, closed, read_ms, end_ms, found, leap, top}}, waiting: {node: {until_ms,
+   *  time_ms}}, found_ms, more, closed, recheck, recheck_ms, asked} (read_ms: the time a round
+   *  last listed the chain; end_ms: the time a round last read it to its end; found: the chain
+   *  is followed because the store names its prefix, findChains; leap and top: what a round
+   *  that looks for the place of LEGACY_TRANSFER_DOCUMENTS_FROM_MS in the chain keeps,
+   *  seekProbe; found_ms, more, closed (a Map from digest to seq), recheck, recheck_ms and
+   *  asked: what findChains keeps). seq is the seq up to which the
    *  control entries of the chain were read (the verification point of the program before v43 for
    *  a node its ledger held), time_ms the time of the entry there (0 when it is not known),
    *  until_ms the latest time the node can hold a grant this device knows of, and closed whether
@@ -5186,6 +5192,8 @@
       };
       if (whole(value.end_ms) > 0) legacy.nodes[id].end_ms = value.end_ms;
       if (value.found === true) legacy.nodes[id].found = true;
+      if (whole(value.leap) > 0) legacy.nodes[id].leap = Math.min(value.leap, LEGACY_SEEK_LEAP_MAX);
+      if (whole(value.top) > 0) legacy.nodes[id].top = value.top;
     }
     const closed = kept.closed !== null && typeof kept.closed === "object" && !Array.isArray(kept.closed) ? kept.closed : {};
     for (const digest of Object.keys(closed)) {
@@ -6362,7 +6370,8 @@
    *  nodes says of its node, once in LEGACY_RECHECK_DAYS: with a reading of the listing, as
    *  many of the chains it names as the time since the last ones makes due, in the order of
    *  their digests (legacy.recheck, legacy.recheck_ms).
-   *  A chain found this way is followed from its first seq. Every prefix the listing names is
+   *  A chain found this way is followed from its first seq (followLegacy says what a round
+   *  reads of it). Every prefix the listing names is
    *  followed: a listing that goes on beyond the pages a round reads of it (legacy.more) leaves
    *  the round with more to read than it read (a round that left reads undone: runRound), and
    *  is read again by the next round. A read of the listing that is
@@ -6461,26 +6470,65 @@
     }
   }
 
+  /** The seq a round lists a chain from while it looks for the place of
+   *  LEGACY_TRANSFER_DOCUMENTS_FROM_MS in it (0: the round does not look for it, and lists the
+   *  chain from the seq up to which it was read). The chain keeps two values while a round
+   *  looks: leap, the seqs the next listing lies beyond the seq the chain was read to, while no
+   *  page showed an entry of the time or the end of the chain; and top, a seq at or beyond which
+   *  such an entry or the end lies, from then on (the listing then lies halfway). The seq the
+   *  chain was read to (seq) moves on only to a seq under which the node wrote an entry that
+   *  names a time more than LEGACY_SEEK_MARGIN_MS before that time: an object someone else wrote
+   *  moves it nowhere, and so nothing a node wrote at that time or later is passed. top only
+   *  chooses where the next listing lies, and whatever it is, the chain is read from seq on.
+   *  The looking ends when top is LEGACY_SEEK_SPAN seqs or fewer beyond seq. */
+  function seekProbe(chain) {
+    const top = whole(chain.top);
+    if (top > 0) return top - chain.seq <= LEGACY_SEEK_SPAN ? 0 : chain.seq + Math.floor((top - chain.seq) / 2);
+    return whole(chain.leap) > 0 ? chain.seq + chain.leap : 0;
+  }
+
+  // The time the longest pass over the chains took in the last round of this runtime that made
+  // one (0: none yet): the first pass of a round begins only with twice that much of the time
+  // of the round left, as every later pass does (followLegacy).
+  let chainPassMs = 0;
+
   /** The part of a round that reads the chains of format 1 and format 2 this device follows: the
-   *  chains of the nodes of releases before LOG_FORMAT_3_FROM that it handed a grant to, of the
-   *  nodes such a node handed the delegation on to, and of every node whose prefix the store
-   *  names under the prefix of the account (findChains: found). The control entries of a chain
-   *  that is found are judged as those of any other chain; of its entries from before
-   *  LEGACY_TRANSFER_DOCUMENTS_FROM_MS, whose transfers no document judges, a control key of
-   *  format 2 (the key names the time) is passed and not read. Such a chain is read until its
-   *  end lies longer back than the longest lifetime of a grant (a node of a release before
-   *  LOG_FORMAT_3_FROM writes an entry with every grant it takes): it is then remembered as
-   *  read to its end. Each open chain is listed from the seq up
-   *  to which it was read, the control entries of the new keys are read (LEGACY_ROUND_BODIES per
-   *  round), and a transfer of the delegation (the event
-   *  grant_transferred_out of this key) is followed. Such an event names the receiving node and
-   *  no measurement, so the document of that node is asked for (one request per pass):
-   *    a receiving node whose document verifies with a measurement no list has is noted (A1);
+   *  chains of the nodes that write such a chain (the format kept with the grant: logMarks) that
+   *  it handed a grant to, of the nodes such a node handed the delegation on to, and of every
+   *  node whose prefix the store names under the prefix of the account (findChains: found).
+   *
+   *  What a round reads of a chain. From LEGACY_TRANSFER_DOCUMENTS_FROM_MS on the backend keeps
+   *  the document of every node that takes a transfer, so the transfers a node of such a release
+   *  wrote from that time on are judged, by every device of the account, and nothing a node
+   *  wrote before that time is read:
+   *    a control key of format 2 that names an earlier time is passed and not read, in every
+   *    chain (the key of an entry is written by its node, and a key of format 1, which names no
+   *    time, is read);
+   *    a long chain is not listed page after page up to that time. When a listing page that goes
+   *    on ends with an entry its node wrote more than LEGACY_SEEK_MARGIN_MS before that time,
+   *    the round looks for the place of that time (seekProbe): it lists the chain further on,
+   *    reads the object versions under the first and the last seq of that page, and moves the
+   *    seq the chain is read to only to a seq under which the node wrote an entry of such an
+   *    early time. An object someone else wrote says nothing of a time, so it moves that seq
+   *    nowhere; a page that shows no entry of the node ends the looking for this round, and the
+   *    chain is read on page after page.
+   *  A chain that is found is read until its end lies longer back than the longest lifetime of
+   *  a grant (a node of such a release writes an entry with every grant it takes): it is then
+   *  remembered as read to its end.
+   *
+   *  A round reads its chains in passes (LEGACY_ROUND_PASSES at most, and only while the time
+   *  of the round leaves room for one: LEGACY_PASS_RESERVE_MS). A pass lists each open chain
+   *  from the seq up to which it was read, reads the control entries of the new keys
+   *  (LEGACY_ROUND_BODIES per round), and follows a transfer of the delegation (the event
+   *  grant_transferred_out of this key). Such an event names the receiving node and no
+   *  measurement, so the document of that node is asked for (one request per pass):
+   *    a receiving node whose document verifies with a measurement this program does not accept
+   *    is noted (A1);
    *    a receiving node of a release that writes format 3 has its entries in the listing of
    *    format 3;
    *    a receiving node of an accepted release before that has its chain followed in turn, in the
-   *    same round (LEGACY_ROUND_PASSES passes of listings per round: a pass lists the chains
-   *    whose listing went on and the chains the pass before found);
+   *    same round (the next pass lists the chains whose listing went on and the chains the pass
+   *    before found);
    *    a receiving node the backend hands out no document that verifies for is judged by the
    *    time of the event. From LEGACY_TRANSFER_DOCUMENTS_FROM_MS on, and within the retention of
    *    the store, the read is held back (run.blocked) and the node waits (legacy.waiting): every
@@ -6494,6 +6542,9 @@
    *  last LEGACY_PROBE_SEQS seqs of the page): an object someone else wrote under a seq the node
    *  has not reached moves nothing, so the entry the node writes there later is read. A listing
    *  page that goes on and shows the node writing nowhere holds the read back.
+   *  A round that ends with chains that have more to read (run.chained) is followed by the next
+   *  round at once, and counts as none while it read a chain on and none of its reads failed
+   *  (runRound): the length of a chain marks nothing.
    *  A chain is closed by the first reading that reached its end after the grant of its node ran
    *  out (LEGACY_CLOSE_SLACK_MS later): a node holds no key after that. The keys read are handed
    *  to the log screen (rememberKeys). */
@@ -6522,9 +6573,9 @@
     if (open.length === 0 && waited.length === 0) return;
     // More open chains than a round follows: the chains listed longest ago come first (among
     // them the ones whose grant ends last), and the next round follows at once and takes the
-    // others (run.rest). Such a round is not complete, and is no round that left reads undone
-    // in the sense that counts (LOG_UNFINISHED_ROUNDS): the chains of an account are as many as
-    // they are, and the rounds of one synchronization come to all of them.
+    // others (run.rest). Such a round is not complete, and counts as none while none of its
+    // reads failed (runRound): the chains of an account are as many as they are, and the rounds
+    // of one synchronization come to all of them.
     open.sort(function (x, y) {
       if (legacy.nodes[x].read_ms !== legacy.nodes[y].read_ms) return legacy.nodes[x].read_ms - legacy.nodes[y].read_ms;
       return legacy.nodes[y].until_ms - legacy.nodes[x].until_ms;
@@ -6615,16 +6666,47 @@
       }
     }
     let bodiesLeft = LEGACY_ROUND_BODIES;
+    let probesLeft = LEGACY_ROUND_PROBES;
     // Each pass lists the chains that have keys left to read: the open chains first, then the
     // chains whose listing went on and the chains of the receiving nodes the pass before found.
     // thin: a listing page that goes on named more than LEGACY_SEQ_VERSIONS object versions for
     // each seq it names, on average. A node writes one object under a seq, and a version more
     // when it repeats a write, so such a page holds objects a node did not write.
     let thin = false;
+    // The chains whose place this round looks for no more (seekProbe): the ones it found the
+    // place of, and the ones a page of which showed no entry of the node. They are read on
+    // page after page.
+    const paged = new Set();
+    // An entry of a time before this is one the listing of a chain leaps over (seekProbe).
+    const early = LEGACY_TRANSFER_DOCUMENTS_FROM_MS - LEGACY_SEEK_MARGIN_MS;
+    const latestFirst = function (a, b) { return (b.isLatest ? 1 : 0) - (a.isLatest ? 1 : 0); };
+    let longest = chainPassMs;
+    let passes = 0;
     for (let pass = 0; pass < LEGACY_ROUND_PASSES; pass += 1) {
       if (open.length === 0) break;
-      const targets = open.map(function (id) {
-        return { node: id, key_marker: listingMarker(id, legacy.nodes[id].seq), version_id_marker: null };
+      // A pass begins only with the time left that a pass takes, twice over (half the time of a
+      // round at most): the round ends its reading of the chains here, with more to read, and
+      // not because its time passed.
+      if (turnLeft(turn) < Math.max(LEGACY_PASS_RESERVE_MS, Math.min(2 * longest, LOG_ROUND_LIMIT_MS / 2))) break;
+      const passBegan = native.nowMs();
+      passes += 1;
+      // The seq each chain is listed from: the seq up to which it was read, or, for a chain
+      // whose place the round looks for, the seq of that step (probes).
+      const probes = open.map(function (id) {
+        const chain = legacy.nodes[id];
+        const probe = paged.has(id) ? 0 : seekProbe(chain);
+        if (probe === 0 && (chain.leap !== undefined || chain.top !== undefined)) {
+          // (The place is found: the chain is read from the seq it was read to, page after page.)
+          delete chain.leap;
+          delete chain.top;
+          paged.add(id);
+        }
+        return probe;
+      });
+      const targets = open.map(function (id, at) {
+        return {
+          node: id, key_marker: listingMarker(id, probes[at] > 0 ? probes[at] : legacy.nodes[id].seq), version_id_marker: null,
+        };
       });
       const listings = await legacyListings(turn, targets);
       const plans = [];
@@ -6639,11 +6721,12 @@
           continue;
         }
         const prefix = accountPrefix() + id + "/";
+        const floor = probes[at] > 0 ? probes[at] : legacy.nodes[id].seq;
         const entries = new Map();
         let versions = 0;
         for (const version of outcome.value.versions) {
           const parts = parseStoreKey(version.key, prefix);
-          if (parts === null || parts.seq <= legacy.nodes[id].seq) continue;
+          if (parts === null || parts.seq <= floor) continue;
           versions += 1;
           if (!entries.has(parts.seq)) entries.set(parts.seq, []);
           entries.get(parts.seq).push({
@@ -6655,6 +6738,30 @@
         // not come to read keeps it, and comes first in the next round.)
         const listedMs = legacy.nodes[id].read_ms;
         legacy.nodes[id].read_ms = now;
+        const seqs = Array.from(entries.keys()).sort(function (a, b) { return a - b; });
+        const more = outcome.value.truncated && outcome.value.nextKeyMarker !== null;
+        // The last seq of a listing page that goes on may have further object versions on the
+        // page after it: it is read with that page, from the seq before it.
+        if (more) seqs.pop();
+        if (more && versions > LEGACY_SEQ_VERSIONS * Math.max(1, seqs.length)) thin = true;
+        if (probes[at] > 0) {
+          // A page that looks for the place of the chain: the object versions under its first
+          // and its last seq are read, to see at what time the node wrote there.
+          const step = { id: id, probe: probes[at], seqs: seqs, more: more, ends: [], unprobed: false, listedMs: listedMs };
+          const ends = seqs.length < 2 ? seqs : [seqs[0], seqs[seqs.length - 1]];
+          for (const seq of ends) {
+            const candidates = entries.get(seq).slice().sort(latestFirst).slice(0, LEGACY_SEQ_READS);
+            if (probesLeft < candidates.length) {
+              step.unprobed = true;
+              break;
+            }
+            probesLeft -= candidates.length;
+            step.ends.push({ seq: seq, candidates: candidates });
+            for (const candidate of candidates) wanted.push(candidate);
+          }
+          plans.push(step);
+          continue;
+        }
         const found = legacy.nodes[id].found === true;
         if (found) {
           // The chain is read until the latest time its keys name lies longer back than the
@@ -6669,17 +6776,10 @@
             legacy.nodes[id].until_ms = Math.max(legacy.nodes[id].until_ms, Math.min(latest, now) + GRANT_DAYS_MAX * DAY_MS);
           }
         }
-        const seqs = Array.from(entries.keys()).sort(function (a, b) { return a - b; });
-        const more = outcome.value.truncated && outcome.value.nextKeyMarker !== null;
-        // The last seq of a listing page that goes on may have further object versions on the
-        // page after it: it is read with that page, from the seq before it.
-        if (more) seqs.pop();
-        if (more && versions > LEGACY_SEQ_VERSIONS * Math.max(1, seqs.length)) thin = true;
         const plan = {
-          id: id, seqs: seqs, entries: entries, reads: new Map(), crowded: new Set(), stop: 0, more: more,
+          id: id, probe: 0, seqs: seqs, entries: entries, reads: new Map(), crowded: new Set(), stop: 0, more: more,
           probes: new Map(), unprobed: false, listedMs: listedMs,
         };
-        const latestFirst = function (a, b) { return (b.isLatest ? 1 : 0) - (a.isLatest ? 1 : 0); };
         for (const seq of seqs) {
           // The object versions whose keys name a control entry, the latest first, up to
           // LEGACY_SEQ_READS of them: an object someone else wrote under the seq of a control
@@ -6688,19 +6788,21 @@
             return candidate.parts.format === 1 || candidate.parts.kind === "c";
           }).sort(latestFirst);
           if (named.length === 0) continue;
-          // In a chain that is found, a control key that names a time before
-          // LEGACY_TRANSFER_DOCUMENTS_FROM_MS is passed: no transfer of that time is judged by
-          // a document, and this device followed no grant of its own there.
-          const shaped = !found ? named : named.filter(function (candidate) {
+          // A control key that names a time before LEGACY_TRANSFER_DOCUMENTS_FROM_MS is passed
+          // and not read, in every chain: no transfer of that time is judged by a document,
+          // and the chain of the node that received it is followed because the store names its
+          // prefix (findChains). A key of format 1 names no time, and is read.
+          const shaped = named.filter(function (candidate) {
             return candidate.parts.format === 1 || candidate.parts.time_ms >= LEGACY_TRANSFER_DOCUMENTS_FROM_MS;
           });
           if (shaped.length === 0) continue;
           const candidates = shaped.slice(0, LEGACY_SEQ_READS);
           if (bodiesLeft < candidates.length) {
-            // The entries of this round are spent: the chain is read on from here by the next.
+            // The entries of this round are spent on what the chains hold: the chain is read
+            // on from here by the next round (run.chained).
             plan.stop = seq;
             run.cut = true;
-            run.over = true;
+            run.chained = true;
             break;
           }
           bodiesLeft -= candidates.length;
@@ -6712,17 +6814,17 @@
         // have written there (an object it signed for that seq): whoever else writes an object
         // under a seq the node has not reached moves nothing, and the entry the node writes
         // there later is read. The last LEGACY_PROBE_SEQS seqs of the page whose keys name no
-        // control entry are read for that alone (probes), so a chain is read on over its use
-        // entries.
+        // control entry the round reads are read for that alone (probes), so a chain is read on
+        // over its use entries and over the control entries it passes.
         for (let back = seqs.length - 1; back >= 0 && back >= seqs.length - LEGACY_PROBE_SEQS && plan.stop === 0; back -= 1) {
           const seq = seqs[back];
           if (plan.reads.has(seq)) continue;
           const candidates = entries.get(seq).slice().sort(latestFirst).slice(0, LEGACY_SEQ_READS);
-          if (bodiesLeft < candidates.length) {
+          if (probesLeft < candidates.length) {
             plan.unprobed = true;
             break;
           }
-          bodiesLeft -= candidates.length;
+          probesLeft -= candidates.length;
           plan.probes.set(seq, candidates);
           for (const candidate of candidates) wanted.push(candidate);
         }
@@ -6761,6 +6863,94 @@
       const receivers = new Map();
       for (const plan of plans) {
         const chain = legacy.nodes[plan.id];
+        if (plan.probe > 0) {
+          // A page that looks for the place of the chain. What the object versions under one
+          // of its ends say: the time the node wrote there (0: none of them is an object the
+          // node signed for that seq that names a time; -1: one of them was not read).
+          const written = function (end) {
+            for (const candidate of end.candidates) {
+              const name = candidate.key + "\n" + candidate.versionId;
+              if (!objects.has(name)) return -1;
+              const signed = objects.get(name);
+              const body = signed === null ? null : legacyBody(signed, plan.id, candidate.parts);
+              run.bodies += 1;
+              if (body === null) {
+                run.spoiled += 1;
+                continue;
+              }
+              const time = whole(body.time_ms);
+              if (time > 0 && time < run.oldest) run.oldest = time;
+              return time;
+            }
+            return 0;
+          };
+          if (plan.unprobed) {
+            // The object versions this round reads for the places of its chains are spent on
+            // pages that hold many under one seq: the next round looks on.
+            run.cut = true;
+            run.over = true;
+            continue;
+          }
+          // Whether the step moved the seq the chain was read to or the stretch the place lies
+          // in, and whether the page showed no entry of the node to tell by.
+          let moved = false;
+          let blind = false;
+          const top = whole(chain.top);
+          if (plan.seqs.length === 0) {
+            // Nothing lies beyond the seq of this step, and the listing ended there: the chain
+            // ends at or before it. (A page that goes on and names no seq in full is one the
+            // node did not write.)
+            if (plan.more) blind = true;
+            else chain.top = plan.probe;
+            moved = !plan.more;
+          } else {
+            const first = plan.ends[0];
+            const last = plan.ends[plan.ends.length - 1];
+            const firstMs = written(first);
+            const lastMs = last === first ? firstMs : written(last);
+            if (firstMs < 0 || lastMs < 0) {
+              // (The reading of the object versions ended before these: the chain keeps the
+              // time it was listed before, and the next round makes the step again.)
+              chain.read_ms = plan.listedMs;
+              continue;
+            }
+            if (lastMs > 0 && lastMs < early) {
+              // The node wrote the whole page before the time: the chain is read up to its
+              // last seq, and the next step lies twice as far beyond it.
+              chain.seq = last.seq;
+              chain.time_ms = lastMs;
+              if (!plan.more) chain.top = last.seq;
+              else if (top === 0) chain.leap = Math.min(2 * whole(chain.leap), LEGACY_SEEK_LEAP_MAX);
+              moved = true;
+            } else if (lastMs > 0 && firstMs > 0 && firstMs < early) {
+              // The time lies on this page: the chain is read from its first seq on.
+              chain.seq = first.seq;
+              chain.time_ms = firstMs;
+              chain.top = first.seq;
+              moved = true;
+            } else if (lastMs > 0 && firstMs > 0) {
+              // The node wrote the whole page at the time or later: the place lies before its
+              // first seq, or before the seq of this step when nothing lies in between.
+              chain.top = top === 0 || first.seq < top ? first.seq : plan.probe;
+              moved = true;
+            } else {
+              blind = true;
+            }
+          }
+          if (blind) {
+            // No object the node signed under the ends of this page: the place of the chain is
+            // looked for no more in this round, and the chain is read on page after page from
+            // the seq it was read to.
+            delete chain.leap;
+            delete chain.top;
+            paged.add(plan.id);
+          } else if (moved) {
+            run.walked += 1;
+            run.chainSteps += 1;
+          }
+          next.push(plan.id);
+          continue;
+        }
         const from = chain.seq;
         let reached = chain.seq;
         let reachedMs = chain.time_ms;
@@ -6844,22 +7034,31 @@
         }
         chain.seq = reached;
         chain.time_ms = reachedMs;
-        // (The listing of the chain was read on from where the round before stopped: run.walked.)
-        if (reached > from) run.walked += 1;
-        // (A chain this round listed and read nothing of, because its reading ended before the
-        // object versions of the chain, keeps the time it was listed before: it is one of the
-        // chains listed longest ago, and comes first in the next round.)
-        else if (unreached) chain.read_ms = plan.listedMs;
+        // (The listing of the chain was read on from where the round before stopped: run.walked,
+        // and run.chainSteps for the chains alone.)
+        if (reached > from) {
+          run.walked += 1;
+          run.chainSteps += 1;
+        } else if (unreached) {
+          // (A chain this round listed and read nothing of, because its reading ended before
+          // the object versions of the chain, keeps the time it was listed before: it is one
+          // of the chains listed longest ago, and comes first in the next round.)
+          chain.read_ms = plan.listedMs;
+        }
         if (held) continue;
         if (plan.more) {
           if (reached > from) {
+            // A page that goes on and ends with an entry the node wrote long before the time
+            // from which a transfer is judged by a document: the round looks for the place of
+            // that time in the chain, and does not read the pages in between (seekProbe).
+            if (!paged.has(plan.id) && chain.time_ms > 0 && chain.time_ms < early) chain.leap = LEGACY_SEEK_LEAP;
             next.push(plan.id);
             continue;
           }
           // The listing goes on and the node is seen to have written nowhere on this page: the
-          // chain cannot be read on. With the entries of this round spent the next round reads
-          // on; otherwise the last seqs of the page hold no object of the node, which a page a
-          // node wrote always does: the read is held back.
+          // chain cannot be read on. With the object versions of this round spent the next
+          // round reads on; otherwise the last seqs of the page hold no object of the node,
+          // which a page a node wrote always does: the read is held back.
           run.cut = true;
           if (plan.unprobed) {
             run.over = true;
@@ -6892,17 +7091,21 @@
         run.cut = true;
         run.rest = true;
       }
+      longest = Math.max(pass === 0 ? 0 : longest, native.nowMs() - passBegan);
     }
+    // (A round that came to no pass halves the time it asks for: what one slow pass left
+    // behind keeps no later round from its chains.)
+    chainPassMs = passes > 0 ? longest : Math.floor(chainPassMs / 2);
     // The chains whose listing still goes on are read on by the next round: the round has more
-    // to read than it read (LEGACY_ROUND_PASSES pages of the listing of a chain), and the next
-    // round follows at once. A chain of an account in heavy use is long, and a round that read
-    // on through what its node wrote there is one that catches up (run.walked, runRound): it
-    // adds nothing to the row, LOG_CATCHING_ROUNDS rounds of a row at most. A listing that goes
-    // on over pages that hold many object versions for each seq holds objects no node wrote
-    // (run.spoiled), and such a round counts.
+    // to read than it read (the passes of a round, or the time a pass needs), and the next
+    // round follows at once (run.chained). A chain of an account in heavy use is long, and a
+    // round that read chains on through what their nodes wrote counts as none, however many
+    // such rounds follow one another (runRound). A listing that goes on over pages that hold
+    // many object versions for each seq holds objects no node wrote (run.spoiled), and such a
+    // round counts.
     if (open.length > 0) {
       run.cut = true;
-      run.over = true;
+      run.chained = true;
       if (thin) run.spoiled += 1;
     }
     // A chain that is found and read to its end is remembered by a digest of its node id (a
@@ -7365,7 +7568,7 @@
       // it judged for the first time or passed that way (oldest). walking: the round reads the
       // listing of format 3 on from the place the round before stopped at. lagged: a request
       // of the round stayed without an answer (probed).
-      gained: 0, walked: 0, spoiled: 0, oldest: Infinity, walking: origin === "sync" && log.resume !== null,
+      gained: 0, walked: 0, chainSteps: 0, spoiled: 0, oldest: Infinity, walking: origin === "sync" && log.resume !== null,
       lagged: false,
     };
     // What the rounds kept for the screen before this round: an entry kept there is not read
@@ -7712,61 +7915,79 @@
     // for such a round:
     //   it ended because it came to one of the numbers a round reads (the listing pages, the
     //   documents and the bodies its requests name, an answer of the bodies that ended before
-    //   its last key, the control entries of chains, the chains a round follows, the pages of
-    //   the listing of a chain, the pages of the node discovery listing, the big keys asked for
-    //   at its end), and not because its time passed (expired);
+    //   its last key, the chains a round follows, the pages of the node discovery listing, the
+    //   big keys asked for at its end), and not because its time passed (expired);
     //   no read of it failed or stayed without an answer, a request that was asked again for
     //   its first item and answered then among them (run.lagged);
     //   it read no object that no node wrote (spoiled);
     //   it moved on: it judged an entry of an accepted node for the first time (gained), or a
     //   listing was read on beyond the place the round before stopped at (walked). The keys
     //   judged before that a round lists again from the start of the listing are no step;
-    //   one of the entries it so judged or passed was written before the row began (oldest,
-    //   row_ms: the start of the first round of the row);
-    //   and fewer than LOG_CATCHING_ROUNDS rounds of the row counted as catching up (caught).
+    //   and one of the entries it so judged or passed was written before the row began (oldest,
+    //   row_ms: the start of the first round of the row).
     // A device that was away has as many entries to read as its nodes wrote in that time, and
     // reads them over as many rounds as that takes without a round of them counting. What
     // counts as before: a round whose time passed (a backend that answers late leaves a round
     // no time for what it has to read, and a round that is slow is not one that has much to
     // read), a round with a request that was not answered, objects no node wrote that take
-    // the reads of a round, a round that judged nothing new and read no listing on, rounds
+    // the reads of a round, a round that judged nothing new and read no listing on, and rounds
     // that read only entries written after the row began and still do not reach the end
-    // (entries arrive faster than the device reads them), and every round that leaves reads
-    // undone once LOG_CATCHING_ROUNDS rounds of the row caught up. A round that does not count
-    // while the row is beyond LOG_UNFINISHED_ROUNDS neither adds to the count of the rounds
-    // held back nor ends it.
+    // (entries arrive faster than the device reads them). A round that does not count while
+    // the row is beyond LOG_UNFINISHED_ROUNDS neither adds to the count of the rounds held
+    // back nor ends it.
+    //
+    // The chains of format 1 and format 2 have a rule of their own. A round that left reads
+    // undone for no other reason than that its chains have more to read than it read (their
+    // listings go on beyond the passes or the time of a round, or they hold more control
+    // entries than a round reads: run.chained) counts as none when its time did not pass, none
+    // of its reads failed or stayed without an answer, it read no object that no node wrote,
+    // and it read a chain on (chainSteps: the seq a chain was read to moved on to a seq under
+    // which its node wrote, or the stretch in which the place of a chain lies became shorter).
+    // It counts as none whatever the time of the entries it read, and however many such rounds
+    // follow one another: the chain of an account in heavy use holds as many entries as its
+    // node wrote, a node of such a release that still runs goes on writing while the device
+    // reads, and a device reads a chain on at the pace of its network. So the length of a chain
+    // marks nothing, and the reads of a chain mark the log as any reads do: when they are held
+    // back, when they fail, or when its pages hold objects no node wrote. Such a round read
+    // everything else it had to read, so the rounds that counted before it count no longer (a
+    // round of the walk through a long chain whose time passed is no round in a row with the
+    // ones that read on after it); the row goes on, and the next round follows at once.
     const over = !unreachable && (run.truncated || run.over);
     // (The record of the last round is read in this step, not taken from the start of the round:
     // an event of the app may have written it since. judgeKept)
     const record = storedObject(STORE_ROUND);
     let unfinished = record.v === VERSION ? whole(record.unfinished) : 0;
     let rowMs = record.v === VERSION ? whole(record.row_ms) : 0;
-    let caught = record.v === VERSION ? whole(record.caught) : 0;
     if (rowMs > now) rowMs = 0;
     // Whether a round that leaves reads undone may count as none: its time did not pass, none
-    // of its reads failed or stayed without an answer, it read no object that no node wrote,
-    // and the row has rounds of that kind left.
+    // of its reads failed or stayed without an answer, and it read no object that no node
+    // wrote.
     const sound = !expired && !run.blocked && !run.silent && !run.unreachable && run.lagged !== true &&
-      run.spoiled === 0 && caught < LOG_CATCHING_ROUNDS;
+      run.spoiled === 0;
     const catching = over && sound && run.gained + run.walked > 0 && run.oldest < (rowMs > 0 ? rowMs : started);
-    // A round that followed as many chains of format 1 and format 2 as a round follows, with
-    // more of them open (run.rest), begins or goes on a row as well. It adds to the row only
-    // when it is no sound round (it read an object no node wrote, among others): an account
-    // has as many chains as its nodes made, and the rounds of one synchronization come to all
-    // of them, unless someone else writes chains under the prefix of the account.
+    // A round whose chains of format 1 and format 2 have more to read than it read (chained),
+    // and a round that followed as many of them as a round follows, with more of them open
+    // (run.rest), begin or go on a row as well. Neither adds to the row while it is a sound
+    // round that left reads undone for no other reason (walking): an account has as many chains
+    // as its nodes made, and the rounds of one synchronization come to all of them, unless
+    // someone else writes chains under the prefix of the account. A round whose chains have
+    // more to read and that read none of them on adds to the row.
     const rest = !unreachable && run.rest === true;
-    const onward = over || rest;
-    const counted = onward && !catching && !(!over && rest && sound);
+    const chained = !unreachable && run.chained === true;
+    const onward = over || rest || chained;
+    const walking = !over && sound && (chained ? run.chainSteps > 0 : rest);
+    const counted = onward && !catching && !walking;
     if (onward) {
       if (origin === "sync") {
         if (rowMs === 0) rowMs = started;
         if (counted) unfinished += 1;
-        else caught += 1;
+        // (A sound round that read a chain on read everything else it had to read: the rounds
+        // before it that counted are no rounds in a row with the ones after it.)
+        else if (walking && chained) unfinished = 0;
       }
     } else if (!denied && !unreachable) {
       unfinished = 0;
       rowMs = 0;
-      caught = 0;
     }
     const beyond = counted && unfinished > LOG_UNFINISHED_ROUNDS;
     const overrun = beyond && first === true;
@@ -8017,7 +8238,7 @@
       // synchronization, however soon.)
       v: VERSION, tried_ms: away ? 0 : now, last: status, open: incomplete, told: told, state: state,
       done_ms: status === "pending" ? (last.v === VERSION ? whole(last.done_ms) : 0) : now,
-      unfinished: unfinished, row_ms: rowMs, caught: caught,
+      unfinished: unfinished, row_ms: rowMs,
     });
     // The keys this round judged are remembered last: what the round took from them (the
     // receiving nodes that wait, the keys held back, the measurements no list has) is written
@@ -9165,9 +9386,9 @@
 
   /** Whether the chain of node id may still be written: this device follows
    *  it and has not closed it, or the device does not follow it and the last time it knows of it
-   *  is unknown or within the longest lifetime of a grant (a node of a release before
-   *  LOG_FORMAT_3_FROM writes an entry with every grant it takes). The end of such a chain is
-   *  listed again with every opening of the screen. */
+   *  is unknown or within the longest lifetime of a grant (a node that writes such a chain
+   *  writes an entry with every grant it takes). The end of such a chain is listed again with
+   *  every opening of the screen. */
   function chainLive(cache, legacy, id) {
     const followed = legacy.nodes[id];
     if (followed !== undefined) return !followed.closed;
