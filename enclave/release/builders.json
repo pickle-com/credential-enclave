@@ -1,0 +1,6 @@
+[
+  {
+    "workflow": ".github/workflows/enclave-build.yml",
+    "commit": "3f84e8368fcdf1f89e42ca629670bfe0989b6f13"
+  }
+]

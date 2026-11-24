@@ -72,10 +72,11 @@ use platform::{PlatformError, SharedPlatform};
 use providers::Definitions;
 use state::{Limits, Node};
 
-/// The release tag of this build: the value of `CREDENTIAL_ENCLAVE_RELEASE` at compile time
-/// (the build passes the git tag), or `dev`. It is part of the binding that the attestation
-/// carries, and it is the release that the order of releases compares with (protocol.md
-/// 10.3).
+/// The release of this build: the value of `CREDENTIAL_ENCLAVE_RELEASE` at compile time (the
+/// build passes the name of the tag it builds), or `dev`. It is part of the binding that the
+/// attestation carries: a node that accepts this node by the release proofs of its
+/// measurement compares it with the release their statement names (protocol.md 10.3). No
+/// program compares it with the release of another node.
 const RELEASE: &str = match option_env!("CREDENTIAL_ENCLAVE_RELEASE") {
     Some(tag) if !tag.is_empty() => tag,
     _ => "dev",
@@ -148,7 +149,7 @@ async fn run(platform_name: &str) -> Result<(), PlatformError> {
         Definitions::embedded(),
         Egress::new(clock.clone(), limits.open_concurrency),
         RELEASE,
-        Lineage::embedded(RELEASE)?,
+        Lineage::embedded()?,
         limits,
     )?);
     let listener = platform.listen(node.limits.inbound_connections).await?;

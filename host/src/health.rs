@@ -10,6 +10,11 @@
 //! - `POST /ready`: sets the ready mark of the pod, and `GET /readyz`: 200 when the pod is
 //!   ready, 503 otherwise (`ready.rs`). The readiness probe of a pod that waits for the mark
 //!   reads `/readyz`.
+//! - `GET /release-proofs`: the bytes of the file of release proofs of the host image
+//!   (protocol.md section 9), 404 when the image holds none. The proofs are public values of
+//!   the release of the enclave image file. The node holds no copy of them and no attestation
+//!   response carries them: whoever needs them for the measurement of this node reads them
+//!   here, without a call to the node.
 //! - `GET /metrics`: the Prometheus text format. Four gauges from the `health` call; the
 //!   series of the `log` object of the call (six counters and one gauge, and the write counts
 //!   of a node of release v2.1.0 or later), of its `log_store` object, of its `load` object
@@ -1035,14 +1040,16 @@ pub fn respond(
 }
 
 /// What the status surface reads: the way to the node, the counts of the egress relay and of
-/// the inbound relay (for `/metrics`), the watch of the enclave (for `/livez` and `/metrics`)
-/// and the ready mark of the pod (for `/ready`, `/readyz` and `/metrics`).
+/// the inbound relay (for `/metrics`), the watch of the enclave (for `/livez` and `/metrics`),
+/// the ready mark of the pod (for `/ready`, `/readyz` and `/metrics`) and the bytes of the
+/// file of release proofs of the host image, when it holds one (for `/release-proofs`).
 pub struct Surface {
     pub node: Arc<dyn NodeConnector>,
     pub counters: Arc<EgressCounters>,
     pub inbound: Arc<InboundCounters>,
     pub watch: Arc<EnclaveWatch>,
     pub readiness: Arc<Readiness>,
+    pub release_proofs: Option<Bytes>,
 }
 
 /// The routes of the status surface.
@@ -1053,6 +1060,7 @@ enum Route {
     Readyz,
     Ready,
     Metrics,
+    ReleaseProofs,
 }
 
 async fn answer<B>(request: Request<B>, surface: &Surface) -> Response<Full<Bytes>>
@@ -1067,6 +1075,7 @@ where
         "/readyz" => Route::Readyz,
         "/ready" => Route::Ready,
         "/metrics" => Route::Metrics,
+        "/release-proofs" => Route::ReleaseProofs,
         _ => return respond(StatusCode::NOT_FOUND, TEXT, "not found\n".into()),
     };
     // The one route that takes a body is the call that sets the ready mark.
@@ -1116,6 +1125,20 @@ where
             ready_series(&mut text, surface.readiness.marked());
             respond(StatusCode::OK, PROMETHEUS_TEXT, text)
         }
+        Route::ReleaseProofs => match &surface.release_proofs {
+            Some(proofs) => {
+                let mut response = Response::new(Full::new(proofs.clone()));
+                response
+                    .headers_mut()
+                    .insert(CONTENT_TYPE, hyper::header::HeaderValue::from_static(JSON));
+                response
+            }
+            None => respond(
+                StatusCode::NOT_FOUND,
+                TEXT,
+                "this image holds no release proofs\n".into(),
+            ),
+        },
     }
 }
 
@@ -1311,6 +1334,19 @@ mod tests {
         watch: Arc<EnclaveWatch>,
         readiness: Arc<Readiness>,
     ) -> SocketAddr {
+        surface_of(node, counters, inbound, watch, readiness, None).await
+    }
+
+    /// The status surface of a pod whose host image holds the file of release proofs
+    /// `release_proofs`, or none.
+    async fn surface_of(
+        node: Arc<FakeNode>,
+        counters: Arc<EgressCounters>,
+        inbound: Arc<InboundCounters>,
+        watch: Arc<EnclaveWatch>,
+        readiness: Arc<Readiness>,
+        release_proofs: Option<Bytes>,
+    ) -> SocketAddr {
         let listener = relay::listen_tcp(
             SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
             relay::LISTEN_BACKLOG,
@@ -1325,6 +1361,7 @@ mod tests {
                 inbound,
                 watch,
                 readiness,
+                release_proofs,
             }),
         ));
         address
@@ -2139,7 +2176,59 @@ mod tests {
         // The two routes of the ready mark take one method each.
         assert_eq!(call(address, Method::GET, "/ready").await.0, 405);
         assert_eq!(call(address, Method::POST, "/readyz").await.0, 405);
+        assert_eq!(call(address, Method::POST, "/release-proofs").await.0, 405);
+        assert_eq!(call(address, Method::GET, "/release-proofs/").await.0, 404);
         // None of them reached the node.
+        assert!(node.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_release_proofs_of_the_host_image_are_served_as_they_are() {
+        // The node of this pod does not answer: the proofs are read without a call to it.
+        let node = FakeNode::answering(|_| (500, String::new()));
+        let surface = |release_proofs: Option<Bytes>| {
+            surface_of(
+                node.clone(),
+                Arc::new(EgressCounters::default()),
+                Arc::new(no_inbound()),
+                EnclaveWatch::new(),
+                Arc::new(Readiness::new(Some(TOKEN.to_string()))),
+                release_proofs,
+            )
+        };
+        // The host image of a release: the bytes of its file, with the type of JSON.
+        let proofs = "{\"statement\":\"e30\",\"attestation\":{\"mediaType\":\"\u{2014}\"}}\n";
+        let address = surface(Some(Bytes::from(proofs))).await;
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(
+                b"GET /release-proofs HTTP/1.1\r\nHost: status.test\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut reply = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut reply)
+            .await
+            .unwrap();
+        let reply = String::from_utf8(reply).unwrap();
+        let (head, body) = reply.split_once("\r\n\r\n").unwrap();
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+        assert!(
+            head.contains("\r\ncontent-type: application/json\r\n"),
+            "{head}"
+        );
+        assert_eq!(body, proofs);
+        // A query does not change the route.
+        assert_eq!(
+            call(address, Method::GET, "/release-proofs?measurement=x").await,
+            (200, proofs.to_string())
+        );
+        // An image built outside a release holds none.
+        let address = surface(None).await;
+        assert_eq!(
+            call(address, Method::GET, "/release-proofs").await,
+            (404, "this image holds no release proofs\n".to_string())
+        );
         assert!(node.calls().is_empty());
     }
 

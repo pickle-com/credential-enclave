@@ -3,12 +3,14 @@
 use serde_json::Value;
 
 use crate::program::ProgramArguments;
+use crate::release_proofs::ProofsArguments;
 
 /// The text of `--help`, and what follows the message about an argument that is not understood.
 pub const USAGE: &str = "\
 usage:
   credential-enclave-verify --url https://{api host} [expected measurements] [--allow-local]
   credential-enclave-verify --document {file} --nonce {hex} [expected measurements]
+  credential-enclave-verify release-proofs {file} [expected measurements]
   credential-enclave-verify program --source {file} --release {file} [--release-key {pem}] [--log-key {pem}]...
 
 what is verified, one of:
@@ -30,6 +32,16 @@ expected measurements, one of:
                          (no attestation verifies such a node)
   --help                 print this text
 
+release-proofs: verifies the release proofs of a release (docs/protocol.md section 9), the
+public build proof of its measurement, with the seven checks of a node and the values compiled
+into the node program (enclave/release/: the certificates of the certificate authority of
+Sigstore, the key of the transparency log, the build workflows):
+  {file}                 the release proofs, a JSON object of the statement and the
+                         attestation: the file release-proofs.json of a release, or what a
+                         host program answers GET /release-proofs with
+  expected measurements  the measurement the proofs are verified for. Without them it is the
+                         measurement the statement of the proofs states
+
 program: verifies the release proof of the secure program (docs/protocol.md, the section The
 secure program release) with the ten checks of the apps:
   --source {file}        the program file (secure-program/secure-program.js of the release)
@@ -39,8 +51,8 @@ secure program release) with the ten checks of the apps:
                          (may be given several times; the log id is the SHA-256 of the DER)
 
 exit status:
-  0  every node passed; program: the release proof holds
-  1  at least one node failed; program: a check failed (the output names its code)
+  0  every node passed; release-proofs: the proofs hold; program: the release proof holds
+  1  at least one node failed; release-proofs and program: a check failed (the output names it)
   2  there is no result: the arguments, a file, the network, the HTTP status or the response
 ";
 
@@ -50,6 +62,8 @@ pub enum Command {
     /// `--help`.
     Help,
     Verify(Box<Arguments>),
+    /// `release-proofs ...`: the release proofs of a release.
+    Proofs(Box<ProofsArguments>),
     /// `program ...`: the release proof of the secure program.
     Program(Box<ProgramArguments>),
 }
@@ -132,6 +146,9 @@ impl Measurements {
 
 /// Reads the command line (without the program name).
 pub fn parse(arguments: &[String]) -> Result<Command, String> {
+    if arguments.first().map(String::as_str) == Some("release-proofs") {
+        return parse_proofs(&arguments[1..]);
+    }
     if arguments.first().map(String::as_str) == Some("program") {
         return parse_program(&arguments[1..]);
     }
@@ -181,22 +198,7 @@ pub fn parse(arguments: &[String]) -> Result<Command, String> {
         }
     }
 
-    let expected =
-        match (measurements, pcrs) {
-            (Some(_), pcrs) if pcrs.iter().any(Option::is_some) => return Err(
-                "--measurements and --pcr0, --pcr1, --pcr2 both give the expected measurements: \
-                 give one of the two"
-                    .to_string(),
-            ),
-            (Some(path), _) => Expected::File(path),
-            (None, [None, None, None]) => Expected::Nothing,
-            (None, [Some(pcr0), Some(pcr1), Some(pcr2)]) => Expected::Values([
-                pcr("--pcr0", &pcr0)?,
-                pcr("--pcr1", &pcr1)?,
-                pcr("--pcr2", &pcr2)?,
-            ]),
-            (None, _) => return Err("--pcr0, --pcr1 and --pcr2 go together: give all three".into()),
-        };
+    let expected = expected_of(measurements, pcrs)?;
 
     let source = match (url, document) {
         (Some(_), Some(_)) => {
@@ -233,6 +235,75 @@ pub fn parse(arguments: &[String]) -> Result<Command, String> {
         source,
         expected,
         allow_local,
+    })))
+}
+
+/// The expected measurements of a command line: `--measurements`, or `--pcr0`, `--pcr1` and
+/// `--pcr2` together, or neither.
+fn expected_of(
+    measurements: Option<String>,
+    pcrs: [Option<String>; 3],
+) -> Result<Expected, String> {
+    match (measurements, pcrs) {
+        (Some(_), pcrs) if pcrs.iter().any(Option::is_some) => Err(
+            "--measurements and --pcr0, --pcr1, --pcr2 both give the expected measurements: \
+             give one of the two"
+                .to_string(),
+        ),
+        (Some(path), _) => Ok(Expected::File(path)),
+        (None, [None, None, None]) => Ok(Expected::Nothing),
+        (None, [Some(pcr0), Some(pcr1), Some(pcr2)]) => Ok(Expected::Values([
+            pcr("--pcr0", &pcr0)?,
+            pcr("--pcr1", &pcr1)?,
+            pcr("--pcr2", &pcr2)?,
+        ])),
+        (None, _) => Err("--pcr0, --pcr1 and --pcr2 go together: give all three".into()),
+    }
+}
+
+/// Reads the arguments of `release-proofs`: the file of the proofs, once, and the expected
+/// measurements. `--name value` and `--name=value` are the same.
+fn parse_proofs(arguments: &[String]) -> Result<Command, String> {
+    let mut proofs = None;
+    let mut measurements = None;
+    let mut pcrs: [Option<String>; 3] = [None, None, None];
+    let mut rest = arguments.iter();
+    while let Some(argument) = rest.next() {
+        let (name, inline) = match argument.split_once('=') {
+            Some((name, value)) if name.starts_with("--") => (name, Some(value)),
+            _ => (argument.as_str(), None),
+        };
+        let slot = match name {
+            "--help" | "-h" => return Ok(Command::Help),
+            "--measurements" => &mut measurements,
+            "--pcr0" => &mut pcrs[0],
+            "--pcr1" => &mut pcrs[1],
+            "--pcr2" => &mut pcrs[2],
+            _ if name.starts_with('-') => {
+                return Err(format!("the argument {argument} is not known"))
+            }
+            // The file of the proofs.
+            _ => {
+                if proofs.replace(argument.clone()).is_some() {
+                    return Err("release-proofs takes one file of release proofs".into());
+                }
+                continue;
+            }
+        };
+        let value = match inline {
+            Some(value) => value,
+            None => rest
+                .next()
+                .ok_or_else(|| format!("{name} needs a value"))?
+                .as_str(),
+        };
+        if slot.replace(value.to_string()).is_some() {
+            return Err(format!("{name} is given twice"));
+        }
+    }
+    Ok(Command::Proofs(Box::new(ProofsArguments {
+        proofs: proofs.ok_or("release-proofs needs the file of the release proofs")?,
+        expected: expected_of(measurements, pcrs)?,
     })))
 }
 
@@ -495,6 +566,67 @@ mod tests {
             );
         }
         assert!(with(&["--pcr0", PCR0, "--pcr1", PCR1, "--pcr2", PCR2]).is_ok());
+    }
+
+    #[test]
+    fn the_release_proofs_of_a_release() {
+        let proofs = |words: &[&str]| match parse_words(words) {
+            Ok(Command::Proofs(arguments)) => *arguments,
+            other => panic!("{other:?}"),
+        };
+        // The file alone: the proofs are verified for the measurement their statement states.
+        assert_eq!(
+            proofs(&["release-proofs", "out/release-proofs.json"]),
+            ProofsArguments {
+                proofs: "out/release-proofs.json".to_string(),
+                expected: Expected::Nothing,
+            }
+        );
+        // With expected measurements, in front of the file and behind it.
+        assert_eq!(
+            proofs(&["release-proofs", "--measurements=m.json", "p.json"]).expected,
+            Expected::File("m.json".to_string())
+        );
+        assert_eq!(
+            proofs(&[
+                "release-proofs",
+                "p.json",
+                "--pcr0",
+                PCR0,
+                "--pcr1",
+                PCR1,
+                "--pcr2",
+                PCR2
+            ]),
+            ProofsArguments {
+                proofs: "p.json".to_string(),
+                expected: Expected::Values([pcr_bytes(PCR0), pcr_bytes(PCR1), pcr_bytes(PCR2)]),
+            }
+        );
+        assert_eq!(
+            parse_words(&["release-proofs", "--help"]),
+            Ok(Command::Help)
+        );
+        // No file, two files, an argument of another command, one of the three values, both
+        // ways to give the measurements.
+        for words in [
+            &["release-proofs"][..],
+            &["release-proofs", "a.json", "b.json"],
+            &["release-proofs", "a.json", "--url", "https://a.example"],
+            &["release-proofs", "a.json", "--allow-local"],
+            &["release-proofs", "a.json", "--pcr0", PCR0],
+            &["release-proofs", "a.json", "--measurements"],
+            &[
+                "release-proofs",
+                "a.json",
+                "--measurements",
+                "m.json",
+                "--pcr0",
+                PCR0,
+            ],
+        ] {
+            assert!(parse_words(words).is_err(), "{words:?}");
+        }
     }
 
     #[test]

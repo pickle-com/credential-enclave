@@ -1,13 +1,12 @@
 //! `POST /v1/peer/export` and `POST /v1/peer/import` (enclave.md 5.13, protocol.md 10.1 and
 //! 10.3): the delegations of a node move to another node of the same platform and measurement,
-//! or to a node of a later release that the operator's release key signed and the public
-//! transparency log recorded.
+//! or to a node of another release whose measurement the release proofs of the call show.
 //!
 //! A node that restarts or is replaced starts without user keys. A node that is alive hands it
 //! the delegations it holds, so the accounts keep working without their apps. The operator
-//! domain carries the attestation responses and the envelope between the two nodes. It learns
-//! nothing from them: the envelope is sealed to the sealing key inside the receiving node's
-//! verified attestation, and signed by the giving node.
+//! domain carries the attestation responses, the release proofs and the envelope between the
+//! two nodes. It learns nothing from them: the envelope is sealed to the sealing key inside
+//! the receiving node's verified attestation, and signed by the giving node.
 //!
 //! Both calls work without the operator configuration.
 //!
@@ -19,30 +18,35 @@
 //! accepted when it delegated, and what a reader of the store needs of either node is its
 //! node document. A node that restarted is filled this way without a write.
 //!
-//! A transfer between two releases goes one way, from the earlier release to the later one,
-//! and is on the log of the account. The giving node asks for an endorsement of the later
-//! release (`endorsement` of `peer/export`) and hands a grant over only after the log store
-//! confirmed the entry `grant_transferred_out` of that grant, which names the receiving node,
-//! its release and its measurement. The receiving node takes delegations from the releases
-//! that its program lists as predecessors (`enclave/release/predecessors.json`) and creates
-//! the entry `grant_transferred_in` for each. Such a transfer is not stopped by the limit of
-//! pending entries, like a command.
+//! A transfer between two releases is on the log of the account. The giving node asks for the
+//! release proofs of the receiving node (`release_proofs` of `peer/export`): the public build
+//! proof that the measurement of that node is the one the build workflow of the public
+//! repository measured for a public tag (protocol.md section 9). It hands a grant over only
+//! after the log store confirmed the entry `grant_transferred_out` of that grant, which names
+//! the receiving node, its release and its measurement. The receiving node takes delegations
+//! from a node whose measurement the release proofs of its call show (`release_proofs` of
+//! `peer/import`) and from the old releases its program lists
+//! (`enclave/release/predecessors.json`), and creates the entry `grant_transferred_in` for
+//! each. Such a transfer is not stopped by the limit of pending entries, like a command.
+//!
+//! No release is compared with another one by its name: a node hands delegations to a release
+//! whose proofs hold, whatever that release is called. No signature of the operator makes a
+//! node accept another release.
 
 use std::sync::Arc;
 
 use axum::extract::{Request, State};
 use axum::response::Response;
-use credential_enclave_protocol::encoding::b64u_decode;
 use credential_enclave_protocol::envelope::{TransferEnvelope, TransferGrant};
 use credential_enclave_protocol::keys::key_id;
 use credential_enclave_protocol::log::EntryKind;
-use credential_enclave_protocol::release::{verify_endorsement, LogEntry, ReleaseMeasurement};
+use credential_enclave_protocol::release::ReleaseMeasurement;
 use credential_enclave_protocol::secret::Secret;
 use credential_enclave_protocol::{limits, ProtocolError};
 
 use super::responses::{AccountLogRef, Exported, Imported};
-use super::{invalid, json_ok, limit_of, respond, subset_of, ApiError, JsonBody};
-use crate::attest::{verify_peer, Accepted, Peer, Program};
+use super::{json_ok, limit_of, respond, subset_of, ApiError, JsonBody};
+use crate::attest::{verify_peer, Accepted, Peer, Program, Proofs};
 use crate::log_store;
 use crate::state::{
     events, lock, Account, AccountLock, ActiveGrant, EventPlace, GrantState, Handover, Node,
@@ -55,46 +59,36 @@ fn seq_of(place: &EventPlace) -> Result<u64, ApiError> {
     place.seq().ok_or_else(ApiError::internal)
 }
 
-/// Steps 1 to 3b of protocol.md 10.1 under the rule `accepted`: the attestation response of
-/// the peer verifies, the peer runs on the platform of this node and, on nitro, has a
-/// measurement the rule names, and its binding names the log store of this node and a role
-/// under which a node holds delegations.
-fn verified_peer(node: &Node, body: &JsonBody, accepted: Accepted<'_>) -> Result<Peer, ApiError> {
+/// Steps 1 to 3b of protocol.md 10.1: the attestation response of the peer verifies, the peer
+/// runs on the platform of this node and, on nitro, has the measurement of this node, the
+/// measurement of an element of `predecessors`, or a measurement the release proofs of the
+/// call show (the key `release_proofs` of the body), and its binding names the log store of
+/// this node and a role under which a node holds delegations.
+///
+/// The release proofs are read for a peer of another measurement alone. Whatever value the
+/// key holds, a call to a peer of the measurement of this node is the call of two nodes of
+/// one program.
+fn verified_peer(
+    node: &Node,
+    body: &JsonBody,
+    predecessors: &[ReleaseMeasurement],
+) -> Result<Peer, ApiError> {
     let response = body.object("peer")?;
+    let own = node.platform.measurement();
+    let accepted = Accepted {
+        measurement: own.as_ref(),
+        predecessors,
+        proofs: body.get("release_proofs").map(|value| Proofs {
+            value,
+            trust: &node.lineage.proofs,
+        }),
+    };
     Ok(verify_peer(
         node.platform.name(),
         accepted,
         node.log_store.id(),
         response,
     )?)
-}
-
-/// Checks 1 to 6 of the giving node (protocol.md 10.3): the release and the measurement that
-/// the statement of an endorsement states, when the release key of this program signed that
-/// statement, a transparency log of the table of this program holds the record of the
-/// signature, and the release is later than the release of this node. Every failure is
-/// `peer_unverified`, also an endorsement that lacks a value or holds one of another type.
-fn endorsed_release(
-    node: &Node,
-    endorsement: &serde_json::Value,
-) -> Result<ReleaseMeasurement, ProtocolError> {
-    read_endorsed_release(node, endorsement).ok_or(ProtocolError::PeerUnverified)
-}
-
-fn read_endorsed_release(
-    node: &Node,
-    endorsement: &serde_json::Value,
-) -> Option<ReleaseMeasurement> {
-    let statement = b64u_decode(endorsement.get("statement")?.as_str()?).ok()?;
-    let entry = LogEntry::read(endorsement.get("entry")?)?;
-    verify_endorsement(
-        &statement,
-        &entry,
-        &node.lineage.keys(),
-        node.release,
-        node.now_ms() / 1000,
-    )
-    .ok()
 }
 
 pub async fn export(State(node): State<Arc<Node>>, request: Request) -> Response {
@@ -111,25 +105,27 @@ pub async fn export(State(node): State<Arc<Node>>, request: Request) -> Response
 /// transfer is signed by this node and sealed to the sealing key of the peer. A page without a
 /// grant answers with `envelope: null`. An empty `next` ends the listing.
 ///
-/// Without `endorsement` the peer is a node of the measurement of this node: the same program.
-/// The call creates no entry and writes nothing to the log store, and it works while the node
-/// cannot write to its log store.
+/// The peer is a node of the measurement of this node, the same program, or a node whose
+/// measurement the `release_proofs` of the call show (protocol.md section 9 and 10.3): they
+/// pass every check for the measurement of the attestation document of the peer, and the
+/// binding of the peer names the release of their statement. A node hands nothing to a peer
+/// of any other measurement, and a node of the local platform reads no release proofs.
 ///
-/// With `endorsement` the peer is the node of a later release: the endorsement passes checks 1
-/// to 6 of protocol.md 10.3, and the peer has the measurement and the release of its statement
-/// (check 7). The rule of the same measurement does not apply then, and a node of the local
-/// platform accepts no peer under an endorsement. For each account the entry
-/// `grant_transferred_out` that names the peer, its release and its measurement exists, and
-/// the log store confirmed it, before its grant enters the transfer. When the log store does
-/// not confirm the entry of one account of the page, the call ends with
-/// `log_store_unavailable` and hands no grant over; the entries are pending entries, so the
-/// next call for the same peer creates none: it writes the ones that wait again.
+/// A call to a node of the measurement of this node creates no entry and writes nothing to
+/// the log store, and it works while the node cannot write to its log store.
 ///
-/// There is one entry per grant and peer of a later release. A grant keeps the list of the
-/// peers of a later release it was handed to: a repeated transfer to a peer of that list
+/// For a peer of another release, for each account the entry `grant_transferred_out` that
+/// names the peer, its release and its measurement exists, and the log store confirmed it,
+/// before its grant enters the transfer. When the log store does not confirm the entry of one
+/// account of the page, the call ends with `log_store_unavailable` and hands no grant over;
+/// the entries are pending entries, so the next call for the same peer creates none: it writes
+/// the ones that wait again.
+///
+/// There is one entry per grant and peer of another release. A grant keeps the list of the
+/// peers of another release it was handed to: a repeated transfer to a peer of that list
 /// carries the grant again, so that a transfer whose envelope was lost can be made again, and
 /// creates no entry. The list holds at most 64 peers. A grant whose list is full is handed to
-/// no further peer of a later release: its account is left out, without an entry. So repeated
+/// no further peer of another release: its account is left out, without an entry. So repeated
 /// calls add no more than 64 entries per grant.
 ///
 /// The call also works on a closing node: the orderly shutdown hands the delegations on before
@@ -140,47 +136,29 @@ async fn run_export(node: &Node, request: Request) -> Result<Response, ApiError>
     let limit = limit_of(&body, limits::TRANSFER_GRANTS)?;
     let subset = subset_of(&body)?;
 
-    // 1 to 3b
-    let own = node.platform.measurement();
-    let (peer, later) = match body.get("endorsement") {
-        None => (
-            verified_peer(
-                node,
-                &body,
-                Accepted::Own {
-                    measurement: own.as_ref(),
-                    predecessors: &[],
-                },
-            )?,
-            None,
-        ),
-        Some(endorsement) => {
-            if !endorsement.is_object() {
-                return Err(invalid("endorsement"));
-            }
-            let later = endorsed_release(node, endorsement)?;
-            (
-                verified_peer(node, &body, Accepted::Later(&later))?,
-                Some(later),
-            )
-        }
-    };
+    // 1 to 3b: a node hands nothing to an old release.
+    let peer = verified_peer(node, &body, &[])?;
     Ok(json_ok(
-        &export_to(node, &peer, later.as_ref(), after, limit, subset.as_ref()).await?,
+        &export_to(node, &peer, after, limit, subset.as_ref()).await?,
     ))
 }
 
 /// Steps 4 to 6 of protocol.md 10.1 for a peer the call verified: one page of the delegations
-/// of this node for `peer`, which is a node of the measurement of this node when `later` is
-/// `None`, and the node of the later release `later` otherwise.
+/// of this node for `peer`, a node of the measurement of this node or the node of another
+/// release ([`Program`]).
 pub(crate) async fn export_to(
     node: &Node,
     peer: &Peer,
-    later: Option<&ReleaseMeasurement>,
     after: &str,
     limit: usize,
     subset: Option<&Subset>,
 ) -> Result<Exported, ApiError> {
+    // The release and the measurement of a peer of another release: what the entry of the
+    // transfer names.
+    let other = match peer.program() {
+        Program::Same => None,
+        Program::Release(release) => Some(release),
+    };
     // 4
     if peer.sign_public() == node.keys.sign_public() {
         return Err(ApiError::with_message(
@@ -189,10 +167,10 @@ pub(crate) async fn export_to(
         ));
     }
 
-    // 4a: a node that cannot write an entry to its log store hands no delegation to a later
+    // 4a: a node that cannot write an entry to its log store hands no delegation to another
     // release. A transfer to a node of its own measurement needs no entry and no write.
     let now_ms = node.now_ms();
-    if later.is_some() {
+    if other.is_some() {
         node.log_store.ensure_ready(now_ms)?;
     }
 
@@ -200,7 +178,7 @@ pub(crate) async fn export_to(
     // created, so a failure of the random source changes nothing.
     let to = peer.node();
     let to_public = peer.sign_public();
-    let recorded = later.is_some();
+    let recorded = other.is_some();
     let mut candidates = node.accounts_after(after).peekable();
     let mut page = Vec::new();
     let mut last = String::new();
@@ -222,12 +200,12 @@ pub(crate) async fn export_to(
     };
     let envelope_seed = node.random_secret::<32>()?;
 
-    // The entries of a transfer to a later release. One entry per grant and peer: the first
+    // The entries of a transfer to another release. One entry per grant and peer: the first
     // transfer of a grant to the peer puts the peer on the list of the grant and creates the
     // entry (a control entry, which closes an open batch of the account before it). A later
     // one finds both.
     let mut logs = Vec::new();
-    if let Some(later) = later {
+    if let Some(other) = other {
         let mut seeds = Vec::with_capacity(page.len());
         for _ in 0..page.len() {
             seeds.push(node.random_secret::<32>()?);
@@ -257,7 +235,7 @@ pub(crate) async fn export_to(
                         &log_pk,
                         now_ms,
                         EntryKind::Control,
-                        events::grant_transferred_out(&to, later),
+                        events::grant_transferred_out(&to, other),
                         &seed,
                     )?;
                     let seq = seq_of(&place)?;
@@ -327,9 +305,9 @@ pub(crate) async fn export_to(
 }
 
 /// True when a transfer hands the delegation of this account on to the peer with the signing
-/// public key `to`: it has a grant within its time and, for a peer of a later release
+/// public key `to`: it has a grant within its time and, for a peer of another release
 /// (`recorded`: the transfer has an entry), the grant was handed to that peer before or to
-/// fewer than 64 peers of a later release.
+/// fewer than 64 peers of another release.
 fn transferable(account: &mut Account, to: &[u8; 32], recorded: bool, now_ms: u64) -> bool {
     if !account.has_grant(now_ms) {
         return false;
@@ -383,16 +361,18 @@ pub async fn import(State(node): State<Arc<Node>>, request: Request) -> Response
 /// An account whose grant here is of another signing key, an account that revoked here, a
 /// halted account and an account outside the share of this node are not named.
 ///
-/// The peer is a node of the measurement of this node, or a node of a release that this
-/// program lists as a predecessor: its measurement is the measurement of an element of the
-/// list, and its binding names the release of that element (protocol.md 10.3). A grant from a
-/// node of the same measurement is put in place without an entry. For a grant from a
-/// predecessor the node creates the entry `grant_transferred_in`, which names the giving node
-/// and its release: the grant is put in place first, the call then writes the entries it
-/// created in one round, and an entry the store did not confirm is a pending entry that the
-/// next write of the account takes along. The outcome of the round does not change the outcome
-/// of the call: the entry that says where the grant went is the `grant_transferred_out` of the
-/// giving node, which the log store confirmed before the transfer was made.
+/// The peer is a node of the measurement of this node, a node of an old release that this
+/// program lists (its measurement is the measurement of an element of the list, and its
+/// binding names the release of that element), or a node whose measurement the
+/// `release_proofs` of the call show, whose binding names the release of their statement
+/// (protocol.md section 9 and 10.3). A grant from a node of the same measurement is put in
+/// place without an entry. For a grant from a node of another release the node creates the
+/// entry `grant_transferred_in`, which names the giving node and its release: the grant is put
+/// in place first, the call then writes the entries it created in one round, and an entry the
+/// store did not confirm is a pending entry that the next write of the account takes along.
+/// The outcome of the round does not change the outcome of the call: the entry that says
+/// where the grant went is the `grant_transferred_out` of the giving node, which the log store
+/// confirmed before the transfer was made.
 ///
 /// When the orderly shutdown starts while the call runs, it stops there and answers with what
 /// it took until then.
@@ -403,15 +383,7 @@ async fn run_import(node: &Node, request: Request) -> Result<Response, ApiError>
     node.ensure_open()?;
 
     // 1
-    let own = node.platform.measurement();
-    let peer = verified_peer(
-        node,
-        &body,
-        Accepted::Own {
-            measurement: own.as_ref(),
-            predecessors: &node.lineage.predecessors,
-        },
-    )?;
+    let peer = verified_peer(node, &body, &node.lineage.predecessors)?;
     Ok(json_ok(
         &import_from(node, &peer, envelope, subset.as_ref()).await?,
     ))
@@ -435,12 +407,12 @@ pub(crate) async fn import_from(
     // 3: every random value is drawn before an entry is created.
     let latest_ms = now_ms.saturating_add(limits::GRANT_MAX_MS);
     let from = peer.node();
-    let earlier = match peer.program() {
+    let other = match peer.program() {
         Program::Same => None,
-        Program::Release(release) => Some(release.as_str()),
+        Program::Release(release) => Some(release.release.as_str()),
     };
     let mut seeds: Vec<Secret<[u8; 32]>> = Vec::new();
-    if earlier.is_some() {
+    if other.is_some() {
         for _ in 0..transfer.grants.len() {
             seeds.push(node.random_secret::<32>()?);
         }
@@ -479,10 +451,10 @@ pub(crate) async fn import_from(
             GrantState::Revoked { .. } => {}
             GrantState::None | GrantState::Expired { .. } => {
                 let key_id = key_id(&grant.sign_pk);
-                // The entry of a transfer from an earlier release starts as a pending entry;
+                // The entry of a transfer from another release starts as a pending entry;
                 // the round below writes it when the node can, and the next write of the
                 // account takes it along otherwise.
-                let seq = match (earlier, seeds.next()) {
+                let seq = match (other, seeds.next()) {
                     (Some(release), Some(seed)) => {
                         let place = node.create_event_seeded(
                             &mut guard,
@@ -525,7 +497,7 @@ pub(crate) async fn import_from(
             }
         }
     }
-    // The grants are in place. The entries of a transfer from an earlier release are written
+    // The grants are in place. The entries of a transfer from another release are written
     // now, in one round. The outcome of the round changes nothing: an entry that is not
     // confirmed is a pending entry.
     if !created.is_empty() {

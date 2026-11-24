@@ -34,12 +34,14 @@
 
 pub mod app;
 pub mod attestation;
+pub mod certificate;
 pub mod encoding;
 pub mod envelope;
 pub mod keys;
 pub mod log;
 pub mod record;
 pub mod release;
+pub mod release_proofs;
 pub mod released;
 pub mod secret;
 pub mod secret_use;
@@ -192,22 +194,13 @@ pub mod limits {
     /// user key and writes an entry: 31 days (7.7). An entry written inside this time has a
     /// retention that ends before the retention of that version of the document.
     pub const NODE_DOCUMENT_VALID_DAYS: u64 = 31;
-    /// Longest release statement, in bytes (10.3).
+    /// Longest release statement, in bytes (section 9).
     pub const RELEASE_STATEMENT_BYTES: usize = 16_384;
-    /// The notice period of a release: how old the entry of the transparency log must be, by
-    /// the clock of the giving node, before the statement it records counts (10.3).
-    pub const RELEASE_NOTICE_SECONDS: u64 = 0;
-    /// How far the time of an entry of the transparency log may lie after the clock of the
-    /// giving node: 300 seconds (10.3).
-    pub const RELEASE_ENTRY_AHEAD_SECONDS: u64 = 300;
-    /// Longest checkpoint of the inclusion proof of an entry of a transparency log, in bytes
-    /// (10.3): 262,144. It holds the note of a tree head, the signature of the log and the
-    /// signatures of witnesses, which a node does not read. A reader of a signed note takes at
-    /// least 16 signatures (c2sp.org/signed-note), and a signature of a witness can be close to
-    /// 5,000 bytes long.
-    pub const RELEASE_CHECKPOINT_BYTES: usize = 262_144;
+    /// Longest attestation of release proofs, in bytes of its JSON without white space
+    /// (section 9).
+    pub const RELEASE_ATTESTATION_BYTES: usize = 65_536;
     /// Most hashes in the audit path of the inclusion proof of an entry of a transparency log
-    /// (10.3): 64, the height of a tree whose number of leaves fits 64 bits.
+    /// (section 9): 64, the height of a tree whose number of leaves fits 64 bits.
     pub const RELEASE_PROOF_HASHES: usize = 64;
     /// Longest `name` of a record of kind `vault_secret`, in characters (section 6).
     pub const VAULT_SECRET_NAME_CHARS: usize = 64;

@@ -43,7 +43,7 @@ pub const ACCOUNTS_PER_PAGE: u64 = 1_000;
 /// without delegations: the base of [`response_timeout`].
 pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(100);
 /// What the wait grows by for every page of delegations of the node: the handover goes page by
-/// page, and a page whose transfer has entries (a handover to a later release) waits for the
+/// page, and a page whose transfer has entries (a handover to another release) waits for the
 /// log store as well.
 pub const RESPONSE_TIMEOUT_PER_PAGE: Duration = Duration::from_secs(4);
 /// The longest wait. The `terminationGracePeriodSeconds` of the pod covers this wait of the

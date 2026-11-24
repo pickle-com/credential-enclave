@@ -26,6 +26,13 @@ const NITRO_CLI: &str = "nitro-cli";
 pub const EIF_PATH: &str = "/opt/credential-enclave/enclave.eif";
 /// The measurements of that enclave image file.
 pub const MEASUREMENTS_PATH: &str = "/opt/credential-enclave/measurements.json";
+/// The release proofs of that enclave image file (protocol.md section 9): the release
+/// statement and the attestation of the job that built it. The host image of a release holds
+/// the file. An image built outside a release, and the image of the local platform, hold none.
+pub const RELEASE_PROOFS_PATH: &str = "/opt/credential-enclave/release-proofs.json";
+/// Longest file of release proofs the host program serves: a release statement of 16,384
+/// bytes in base64url and an attestation of 65,536 bytes fit it with room to spare.
+pub const RELEASE_PROOFS_LIMIT_BYTES: u64 = 131_072;
 /// The vCPUs of the enclave.
 const CPU_COUNT: u32 = 2;
 /// The variable that gives the memory of the enclave, in MiB.
@@ -215,6 +222,38 @@ pub fn release_line(measurements: &Path) -> String {
     )
 }
 
+/// The bytes of the file of release proofs of the host image, and one line that says what
+/// the host program found. The bytes are `None` when there is no file at `path`, when it
+/// cannot be read and when it is longer than [`RELEASE_PROOFS_LIMIT_BYTES`]. The host program
+/// reads the file once, at its start, and does not look at its content: the proofs are
+/// verified by whoever asks for them.
+pub fn release_proofs(path: &Path) -> (Option<Vec<u8>>, String) {
+    use std::io::Read;
+
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(path).and_then(|file| {
+        file.take(RELEASE_PROOFS_LIMIT_BYTES + 1)
+            .read_to_end(&mut bytes)
+    });
+    match read {
+        Err(_) => (
+            None,
+            format!("release proofs: none at {}", path.display()),
+        ),
+        Ok(_) if bytes.len() as u64 > RELEASE_PROOFS_LIMIT_BYTES => (
+            None,
+            format!(
+                "release proofs: the file at {} is longer than {RELEASE_PROOFS_LIMIT_BYTES} bytes and is not served",
+                path.display()
+            ),
+        ),
+        Ok(_) => {
+            let line = format!("release proofs: {} bytes at {}", bytes.len(), path.display());
+            (Some(bytes), line)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -381,6 +420,53 @@ mod tests {
         assert_eq!(
             release_line(&missing),
             format!("enclave image: no measurements at {}", missing.display())
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn the_file_of_release_proofs_is_read_as_it_is_up_to_its_limit() {
+        let directory = test_directory("release-proofs");
+        let path = directory.join("release-proofs.json");
+        // The bytes are handed on as they are: the host program reads no JSON in them.
+        let proofs = b"{\"statement\":\"e30\",\"attestation\":{}}\n not read";
+        std::fs::write(&path, proofs).unwrap();
+        assert_eq!(
+            release_proofs(&path),
+            (
+                Some(proofs.to_vec()),
+                format!(
+                    "release proofs: {} bytes at {}",
+                    proofs.len(),
+                    path.display()
+                )
+            )
+        );
+        // A file of the limit is served, and a file of one byte more is not.
+        std::fs::write(&path, vec![b'x'; 131_072]).unwrap();
+        assert_eq!(
+            release_proofs(&path).0.map(|bytes| bytes.len()),
+            Some(131_072)
+        );
+        std::fs::write(&path, vec![b'x'; 131_073]).unwrap();
+        assert_eq!(
+            release_proofs(&path),
+            (
+                None,
+                format!(
+                    "release proofs: the file at {} is longer than 131072 bytes and is not served",
+                    path.display()
+                )
+            )
+        );
+        // An image built outside a release holds no file.
+        let missing = directory.join("missing.json");
+        assert_eq!(
+            release_proofs(&missing),
+            (
+                None,
+                format!("release proofs: none at {}", missing.display())
+            )
         );
         std::fs::remove_dir_all(&directory).unwrap();
     }

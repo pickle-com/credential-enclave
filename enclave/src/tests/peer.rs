@@ -1,10 +1,11 @@
 //! Delegation transfer between two nodes (enclave.md 5.13, protocol.md 10.1 and 10.3):
 //! `peer/export` on the node that holds the delegations and `peer/import` on the node that
-//! takes them. Both nodes of these tests run on the local platform, so their custody is
-//! `operator`, and two of them are two nodes of one program: a transfer between them creates
-//! no entry. What a node does with a peer of another release (the entries of the transfer, the
-//! list of the peers a grant was handed to) is tested with a peer the test states as accepted:
-//! which peer a node accepts is tested with the attestation documents (`crate::attest`).
+//! takes them. The nodes of most of these tests run on the local platform, so their custody
+//! is `operator`, and two of them are two nodes of one program: a transfer between them
+//! creates no entry. What a node does with a peer of another release (the entries of the
+//! transfer, the list of the peers a grant was handed to) is tested with a peer the test
+//! states as accepted: which peer a node accepts is tested with the attestation documents
+//! (`crate::attest`), and at the two calls with a recorded document of a real enclave.
 
 use credential_enclave_protocol::encoding::{b64u, b64u_decode, to_json};
 use credential_enclave_protocol::envelope::{
@@ -19,8 +20,9 @@ use serde_json::{json, Value};
 use super::{quiet_provider, quiet_provider_and_log_store};
 use crate::api::peer::{export_to, import_from};
 use crate::attest::{Peer, Program};
+use crate::platform::Measurement;
 use crate::state::{lock, ActiveGrant, GrantState};
-use crate::testing::{App, Harness, Provider};
+use crate::testing::{proof_case, App, Harness, Provider};
 
 /// The attestation response of a node, as the operator domain fetches it for the other node.
 async fn attestation(harness: &Harness) -> Value {
@@ -89,41 +91,35 @@ async fn transfer(giving: &Harness, receiving: &Harness, limit: u64) -> (usize, 
     }
 }
 
-/// The release and the measurement the tests state for a later release.
-fn later_release() -> ReleaseMeasurement {
+/// The release `release` with the measurement the tests state for a node of another release.
+fn other_release(release: &str) -> ReleaseMeasurement {
     ReleaseMeasurement {
-        release: "v9.0.0".to_string(),
+        release: release.to_string(),
         pcrs: [[0x11; 48], [0x22; 48], [0x33; 48]],
     }
 }
 
-/// The node of `harness` as a peer that runs the program of the release `release`.
+/// The node of `harness` as a peer that runs the program of the release `release`, with the
+/// measurement of [`other_release`].
 fn peer_of(harness: &Harness, release: &str) -> Peer {
-    Peer::accepted_for_tests(&harness.node.keys, Program::Release(release.to_string()))
+    Peer::accepted_for_tests(&harness.node.keys, Program::Release(other_release(release)))
 }
 
-/// One page of the delegations of `giving` for `peer`, a node of the later release
-/// [`later_release`]: the part of `peer/export` after the peer and its endorsement verified.
+/// One page of the delegations of `giving` for `peer`, a node of another release: the part
+/// of `peer/export` after the peer verified by the release proofs of its measurement.
 async fn export_later(
     giving: &Harness,
     peer: &Peer,
     after: &str,
     limit: usize,
 ) -> Result<Value, (u16, &'static str)> {
-    export_to(
-        &giving.node,
-        peer,
-        Some(&later_release()),
-        after,
-        limit,
-        None,
-    )
-    .await
-    .map(|exported| serde_json::to_value(&exported).unwrap())
-    .map_err(|error| (error.status.as_u16(), error.code))
+    export_to(&giving.node, peer, after, limit, None)
+        .await
+        .map(|exported| serde_json::to_value(&exported).unwrap())
+        .map_err(|error| (error.status.as_u16(), error.code))
 }
 
-/// Takes the transfer `envelope` that `peer`, a node of an earlier release, made for
+/// Takes the transfer `envelope` that `peer`, a node of another release, made for
 /// `receiving`: the part of `peer/import` after the peer verified.
 async fn import_earlier(
     receiving: &Harness,
@@ -288,7 +284,7 @@ async fn a_delegation_moves_to_a_node_of_the_same_program_without_an_entry() {
 }
 
 #[tokio::test]
-async fn a_delegation_moves_to_a_later_release_and_both_nodes_record_it() {
+async fn a_delegation_moves_to_another_release_and_both_nodes_record_it() {
     let provider = quiet_provider_and_log_store().await;
     let old = Harness::new(&provider);
     let new = Harness::new(&provider);
@@ -301,7 +297,7 @@ async fn a_delegation_moves_to_a_later_release_and_both_nodes_record_it() {
     let record = alice.record("vault_password", "vault", &json!({"value": "hunter2"}));
     assert_eq!(release(&old, &alice, &record).await.0, 200);
 
-    // The giving node hands its delegations to a node of a later release. One entry per
+    // The giving node hands its delegations to a node of another release. One entry per
     // account, in the store before the grant left: alice has grant, release, transfer, and
     // bob grant, transfer.
     let exported = export_later(&old, &peer_of(&new, "v9.0.0"), "", 1000)
@@ -333,7 +329,7 @@ async fn a_delegation_moves_to_a_later_release_and_both_nodes_record_it() {
     );
     assert_eq!((old.last_seq("alice"), old.last_seq("bob")), (3, 2));
 
-    // The receiving node takes them from a node of an earlier release, and writes the entries
+    // The receiving node takes them from a node of another release, and writes the entries
     // of the import in one round: the store holds the first entry of each account on the new
     // node before any of them acts there.
     let envelope = &exported["envelope"];
@@ -799,7 +795,7 @@ async fn a_revoke_on_a_node_is_not_undone_by_a_transfer() {
 }
 
 #[tokio::test]
-async fn a_repeated_export_to_a_later_release_carries_the_grant_again_without_an_entry() {
+async fn a_repeated_export_to_another_release_carries_the_grant_again_without_an_entry() {
     let provider = quiet_provider_and_log_store().await;
     let old = Harness::new(&provider);
     let new = Harness::new(&provider);
@@ -813,7 +809,7 @@ async fn a_repeated_export_to_a_later_release_carries_the_grant_again_without_an
     let to = peer_of(&new, "v9.0.0");
     let from = peer_of(&old, "v2.3.0");
 
-    // The first transfer of the grant to the node of the later release: one entry.
+    // The first transfer of the grant to the node of the other release: one entry.
     let first = export_later(&old, &to, "", 1000).await.unwrap();
     assert_eq!(first["logs"], json!([{"user_id": "alice", "seq": 2}]));
     assert_eq!(
@@ -867,7 +863,7 @@ async fn a_repeated_export_to_a_later_release_carries_the_grant_again_without_an
     assert!(page["envelope"].is_object());
     assert_eq!((&page["logs"], &page["next"]), (&json!([]), &json!("")));
 
-    // Another peer of the later release is another transfer: one entry that names it.
+    // Another peer of the other release is another transfer: one entry that names it.
     let other = export_later(&old, &peer_of(&third, "v9.0.0"), "", 1000)
         .await
         .unwrap();
@@ -911,7 +907,7 @@ async fn a_repeated_export_to_a_later_release_carries_the_grant_again_without_an
 }
 
 #[tokio::test]
-async fn a_grant_is_handed_to_at_most_64_peers_of_a_later_release() {
+async fn a_grant_is_handed_to_at_most_64_peers_of_another_release() {
     let provider = quiet_provider_and_log_store().await;
     let old = Harness::new(&provider);
     old.use_log_store().await;
@@ -922,7 +918,7 @@ async fn a_grant_is_handed_to_at_most_64_peers_of_a_later_release() {
     let later = |index: u8| {
         Peer::accepted_for_tests(
             &NodeKeys::from_random(&[index; 32], &[index.wrapping_add(100); 32]),
-            Program::Release("v9.0.0".to_string()),
+            Program::Release(other_release("v9.0.0")),
         )
     };
 
@@ -1050,11 +1046,19 @@ async fn a_full_page_of_1000_grants_fits_one_import_call() {
     let (status, first) = export(&old, &to, "", 5000).await;
     assert_eq!(status, 200);
     assert_eq!(first["next"], "00000000-0000-4000-8000-000000000999");
-    // The import call carries the envelope and the attestation response in a JSON body of at
-    // most 1 MiB.
-    let body = to_json(&json!({"peer": from, "envelope": first["envelope"]}));
-    assert!(body.len() < 1024 * 1024, "{}", body.len());
-    let (status, imported) = import(&new, &from, &first["envelope"]).await;
+    // The import call carries the envelope, the attestation response and the release proofs
+    // of the giving node in a JSON body of at most 1 MiB, also with the longest proofs: a
+    // statement of 16,384 bytes and an attestation of 65,536 bytes.
+    let longest = json!({
+        "statement": proof_case("a statement of 16,384 bytes").proofs["statement"],
+        "attestation": proof_case("an attestation of 65,536 bytes").proofs["attestation"],
+    });
+    assert_eq!(longest["statement"].as_str().unwrap().len(), 21_846);
+    assert_eq!(to_json(&longest["attestation"]).len(), 65_536);
+    let body = json!({"peer": from, "envelope": first["envelope"], "release_proofs": longest});
+    let length = to_json(&body).len();
+    assert!(length < 1024 * 1024, "{length}");
+    let (status, imported) = new.post("/v1/peer/import", body).await;
     assert_eq!((status, imported["imported"].as_u64()), (200, Some(1000)));
     assert_eq!(accounts_of(&imported).len(), 1000);
 
@@ -1211,126 +1215,227 @@ async fn an_export_with_a_subset_hands_over_the_share_of_the_peer_and_an_import_
     assert_eq!(sixth.health().await["grants"], 0);
 }
 
-/// The entry of the transparency log Rekor with the index 150,000,000, in the form of the
-/// `entry` of an endorsement. Its signed entry timestamp verifies with the log key of this
-/// program. It records the signature of another signer, not one of the release key.
-const REKOR_ENTRY: &str =
-    include_str!("../../../protocol/tests/fixtures/rekor-entry-150000000.json");
+/// A real attestation document of a production-mode enclave (2026-10-01), the answer to an
+/// attestation call: its user data is the binding of that node, which names the release
+/// `v0.0.0-diag.local` and no log store.
+const RECORDED_DOCUMENT: &[u8] =
+    include_bytes!("../../../protocol/tests/fixtures/nitro-attestation-document-operational.cbor");
 
-/// The entry of the transparency log `log2025-1.rekor.sigstore.dev` with the index
-/// 200,000,163, in the form of the `entry` of an endorsement. Its inclusion proof verifies
-/// with the key of that log, and the table of this program has no row for that log. It
-/// records the signature of another signer, not one of the release key.
-const REKOR_LOG2025_1_ENTRY: &str =
-    include_str!("../../../protocol/tests/fixtures/rekor-log2025-1-entry-200000163.json");
+/// The attestation response that carries the recorded document.
+fn recorded_peer() -> Value {
+    json!({"v": 1, "platform": "nitro", "document": b64u(RECORDED_DOCUMENT)})
+}
+
+/// A measurement of no document of these tests.
+fn measurement_of_this_node() -> Measurement {
+    Measurement {
+        pcrs: [[0xa0; 48], [0xa1; 48], [0xa2; 48]],
+    }
+}
 
 #[tokio::test]
-async fn an_export_with_an_endorsement_hands_nothing_over_unless_the_endorsement_holds() {
+async fn an_export_goes_to_a_node_of_another_measurement_only_under_the_release_proofs_of_it() {
     let provider = quiet_provider().await;
-    let old = Harness::new(&provider);
-    let new = Harness::new(&provider);
-    let app = App::new("user-1", 1);
-    app.grant(&old).await;
-    let to = attestation(&new).await;
-
-    // An endorsement that is not a JSON object.
-    for endorsement in [json!("text"), json!([]), json!(1), json!(true)] {
-        let body = json!({"peer": to, "endorsement": endorsement});
-        assert_eq!(
-            code(&old.post("/v1/peer/export", body.clone()).await),
-            (400, "invalid_request"),
-            "{body}"
-        );
-    }
-
-    // An endorsement that does not hold. The peer is a node of the same program, which the
-    // call without an endorsement accepts: with an endorsement that rule does not apply.
-    let pcr = "ab".repeat(48);
-    let statement = b64u(
-        format!(r#"{{"release":"v9.0.0","pcr0":"{pcr}","pcr1":"{pcr}","pcr2":"{pcr}"}}"#)
-            .as_bytes(),
+    // Release proofs that hold for the measurement of the recorded document and name the
+    // release of its binding, and what the node of this test verifies them with.
+    let case = proof_case("the proofs of the measurement of a recorded attestation document");
+    let recorded = Measurement { pcrs: case.pcrs };
+    let other = proof_case("proofs that hold");
+    let old = Harness::measured_with(
+        &provider,
+        measurement_of_this_node(),
+        case.trust.clone(),
+        Vec::new(),
     );
-    let entry: Value = serde_json::from_str(REKOR_ENTRY).unwrap();
-    let entry = json!({
-        "body": entry["body"],
-        "integrated_time": entry["integrated_time"],
-        "log_index": entry["log_index"],
-        "log_id": entry["log_id"],
-        "signed_entry_timestamp": entry["signed_entry_timestamp"],
-    });
-    let entry_with = |change: fn(&mut Value)| {
-        let mut entry = entry.clone();
-        change(&mut entry);
-        entry
-    };
-    let tiled_entry: Value = serde_json::from_str(REKOR_LOG2025_1_ENTRY).unwrap();
-    let tiled_entry_with = |change: fn(&mut Value)| {
-        let mut entry = tiled_entry.clone();
-        change(&mut entry);
-        entry
-    };
-    for endorsement in [
-        json!({}),
-        json!({"statement": statement}),
-        json!({"entry": entry}),
-        json!({"statement": 1, "entry": entry}),
-        json!({"statement": "not base64url!", "entry": entry}),
-        json!({"statement": statement, "entry": "text"}),
-        json!({"statement": statement, "entry": entry_with(|entry| {
-            entry.as_object_mut().unwrap().remove("log_id");
-        })}),
-        json!({"statement": statement, "entry": entry_with(|entry| {
-            entry["integrated_time"] = json!("1732051154");
-        })}),
-        json!({"statement": statement, "entry": entry_with(|entry| {
-            entry["integrated_time"] = json!(-1);
-        })}),
-        json!({"statement": statement, "entry": entry_with(|entry| {
-            entry["log_index"] = json!(1.5);
-        })}),
-        json!({"statement": statement, "entry": entry_with(|entry| {
-            entry["body"] = json!(["text"]);
-        })}),
-        // A real entry of the log for a statement the release key did not sign, to a node
-        // of the local platform, from a node whose release is not a release tag.
-        json!({"statement": statement, "entry": entry}),
-        // A real entry of a log of the form Rekor v2 that the table of this program does not
-        // hold, with its inclusion proof, and such an entry without its proof, with a proof of
-        // another type, with a hash and with an index of another type.
-        json!({"statement": statement, "entry": tiled_entry}),
-        json!({"statement": statement, "entry": tiled_entry_with(|entry| {
-            entry.as_object_mut().unwrap().remove("inclusion_proof");
-        })}),
-        json!({"statement": statement, "entry": tiled_entry_with(|entry| {
-            entry["inclusion_proof"] = json!("proof");
-        })}),
-        json!({"statement": statement, "entry": tiled_entry_with(|entry| {
-            entry["inclusion_proof"]["hashes"][0] = json!(7);
-        })}),
-        json!({"statement": statement, "entry": tiled_entry_with(|entry| {
-            entry["inclusion_proof"]["log_index"] = json!("200000163");
-        })}),
-        json!({"statement": statement, "entry": tiled_entry_with(|entry| {
-            entry["inclusion_proof"]["checkpoint"] = json!(null);
-        })}),
+    let peer = recorded_peer();
+
+    // Without release proofs the node of another measurement is no peer, and neither with a
+    // value that is no proofs, with the proofs of another measurement, or with what a node
+    // of an old release asks for: an endorsement is not read.
+    for body in [
+        json!({"peer": peer}),
+        json!({"peer": peer, "release_proofs": null}),
+        json!({"peer": peer, "release_proofs": "proofs"}),
+        json!({"peer": peer, "release_proofs": []}),
+        json!({"peer": peer, "release_proofs": {}}),
+        json!({"peer": peer, "release_proofs": {"statement": case.proofs["statement"]}}),
+        json!({"peer": peer, "release_proofs": other.proofs}),
+        json!({"peer": peer, "endorsement": case.proofs}),
+        json!({"peer": peer, "endorsement": {"statement": case.proofs["statement"], "entry": {}}}),
     ] {
-        let body = json!({"peer": to, "endorsement": endorsement});
         assert_eq!(
             code(&old.post("/v1/peer/export", body.clone()).await),
             (403, "peer_unverified"),
             "{body}"
         );
     }
-    // No refused export left an entry.
-    assert_eq!(old.last_seq("user-1"), 1);
+    // With the proofs of its measurement it is a peer of another release. A transfer to it
+    // has an entry, and this node has no log store to write one to: the call ends there,
+    // after the peer verified.
+    let body = json!({"peer": peer, "release_proofs": case.proofs});
+    assert_eq!(
+        code(&old.post("/v1/peer/export", body.clone()).await),
+        (503, "log_store_unavailable")
+    );
+    // A node whose own values do not take those proofs refuses the same call: the build
+    // workflows of the source are not those of the case.
+    let by_source = Harness::measured(&provider, measurement_of_this_node());
+    assert_eq!(
+        code(&by_source.post("/v1/peer/export", body.clone()).await),
+        (403, "peer_unverified")
+    );
+    // A node hands nothing to an old release: a list that names the measurement of the peer
+    // is the rule of `peer/import` alone.
+    let listing = Harness::measured_with(
+        &provider,
+        measurement_of_this_node(),
+        other.trust.clone(),
+        vec![ReleaseMeasurement {
+            release: "v0.0.0-diag.local".to_string(),
+            pcrs: case.pcrs,
+        }],
+    );
+    assert_eq!(
+        code(&listing.post("/v1/peer/export", json!({"peer": peer})).await),
+        (403, "peer_unverified")
+    );
 
-    // `null` in the place of the endorsement is a call without one: a transfer to a node of
-    // the same program, which has no entry.
-    let (status, page) = old
-        .post("/v1/peer/export", json!({"peer": to, "endorsement": null}))
-        .await;
-    assert_eq!(status, 200, "{page}");
-    assert!(!page["envelope"].is_null());
-    assert_eq!(page["logs"], json!([]));
-    assert_eq!(old.last_seq("user-1"), 1);
+    // A node of the measurement of the peer is a node of the same program: the call needs no
+    // proofs and reads none, creates no entry and writes nothing, also without a log store.
+    let same = Harness::measured(&provider, recorded);
+    for body in [
+        json!({"peer": peer}),
+        json!({"peer": peer, "release_proofs": "not proofs"}),
+        json!({"peer": peer, "release_proofs": other.proofs}),
+        json!({"peer": peer, "release_proofs": case.proofs}),
+    ] {
+        let (status, page) = same.post("/v1/peer/export", body.clone()).await;
+        assert_eq!(
+            (status, page),
+            (200, json!({"envelope": null, "logs": [], "next": ""})),
+            "{body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_import_comes_from_a_node_of_another_measurement_under_its_release_proofs_or_the_list() {
+    let provider = quiet_provider().await;
+    let case = proof_case("the proofs of the measurement of a recorded attestation document");
+    let other = proof_case("proofs that hold");
+    let new = Harness::measured_with(
+        &provider,
+        measurement_of_this_node(),
+        case.trust.clone(),
+        Vec::new(),
+    );
+    let peer = recorded_peer();
+    let envelope = json!({"v": 1, "from": "a", "to": "b", "enc": "", "ct": ""});
+
+    // Without release proofs the node of another measurement is no peer, and neither with
+    // the proofs of another measurement.
+    for body in [
+        json!({"peer": peer, "envelope": envelope}),
+        json!({"peer": peer, "envelope": envelope, "release_proofs": "proofs"}),
+        json!({"peer": peer, "envelope": envelope, "release_proofs": other.proofs}),
+    ] {
+        assert_eq!(
+            code(&new.post("/v1/peer/import", body.clone()).await),
+            (403, "peer_unverified"),
+            "{body}"
+        );
+    }
+    // With the proofs of its measurement the giving node is a peer of another release. This
+    // node has no log store that holds its node document, and takes no user key without one:
+    // the call ends there, after the peer verified.
+    let body = json!({"peer": peer, "envelope": envelope, "release_proofs": case.proofs});
+    assert_eq!(
+        code(&new.post("/v1/peer/import", body).await),
+        (503, "log_store_unavailable")
+    );
+    // A node that lists the release of the peer as an old release takes it without proofs,
+    // and with any value in their place.
+    let listing = Harness::measured_with(
+        &provider,
+        measurement_of_this_node(),
+        other.trust.clone(),
+        vec![ReleaseMeasurement {
+            release: "v0.0.0-diag.local".to_string(),
+            pcrs: case.pcrs,
+        }],
+    );
+    for body in [
+        json!({"peer": peer, "envelope": envelope}),
+        json!({"peer": peer, "envelope": envelope, "release_proofs": "proofs"}),
+    ] {
+        assert_eq!(
+            code(&listing.post("/v1/peer/import", body.clone()).await),
+            (503, "log_store_unavailable"),
+            "{body}"
+        );
+    }
+    // The element of the list names the release of the binding of the peer: under another
+    // release that measurement is listed for no node.
+    let renamed = Harness::measured_with(
+        &provider,
+        measurement_of_this_node(),
+        other.trust.clone(),
+        vec![ReleaseMeasurement {
+            release: "v0.0.0-diag.other".to_string(),
+            pcrs: case.pcrs,
+        }],
+    );
+    assert_eq!(
+        code(
+            &renamed
+                .post(
+                    "/v1/peer/import",
+                    json!({"peer": peer, "envelope": envelope})
+                )
+                .await
+        ),
+        (403, "peer_unverified")
+    );
+}
+
+#[tokio::test]
+async fn a_node_of_the_local_platform_reads_no_release_proofs() {
+    let provider = quiet_provider().await;
+    let old = Harness::new(&provider);
+    let new = Harness::new(&provider);
+    let app = App::new("user-1", 1);
+    app.grant(&old).await;
+    let to = attestation(&new).await;
+    let from = attestation(&old).await;
+    let case = proof_case("proofs that hold");
+
+    // Two nodes of the local platform are two nodes of one program, whatever value the call
+    // carries as release proofs or as the endorsement a node of an old release asks for: the
+    // transfer has no entry.
+    for extra in [
+        json!({"release_proofs": "not proofs"}),
+        json!({"release_proofs": {}}),
+        json!({"release_proofs": case.proofs}),
+        json!({"endorsement": "not read"}),
+        json!({"release_proofs": null, "endorsement": null}),
+    ] {
+        let mut body = json!({"peer": to});
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let (status, page) = old.post("/v1/peer/export", body.clone()).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(page["envelope"].is_object(), "{body}");
+        assert_eq!(page["logs"], json!([]));
+
+        let mut body = json!({"peer": from, "envelope": page["envelope"]});
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let (status, imported) = new.post("/v1/peer/import", body).await;
+        assert_eq!(status, 200, "{imported}");
+        assert_eq!(imported["accounts"], json!(["user-1"]));
+        assert_eq!(imported["logs"], json!([]));
+    }
+    assert_eq!((old.last_seq("user-1"), new.last_seq("user-1")), (1, 0));
 }

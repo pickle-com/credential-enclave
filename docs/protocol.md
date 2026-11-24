@@ -23,7 +23,7 @@ The formats of this document are fixed for all stages. A stage is a part of the 
 | --- | --- |
 | 1 | Every item without a stage marker. The current release implements it |
 | 2 | Witness signatures (7.5, 10.2) |
-| 3 | The verification of release statements and of the public record by the app and by a node (section 9), the list of allowed measurements in a grant (4.5), the delegation transfer to a release of that list (10.1) |
+| 3 | The list of allowed measurements in a grant (4.5), the delegation transfer to a release of that list (10.1) |
 | 4 | The sealed delivery of the authorization code (5.6) |
 
 An item marked stage 2, 3 or 4 is a field or a message that the current release does not use.
@@ -66,9 +66,9 @@ Identifiers:
 | `node` | `b64u(node signing public key, 32 bytes)`. It lives as long as the node process (it changes on a restart) | 43 characters |
 | `key_id` | `hex(the first 8 bytes of SHA-256(account signing public key, 32 bytes))`, lower case | 16 characters |
 | record `id` | `b64u(16 random bytes)` | 22 characters |
-| `release` | The release tag of this repository (`v{major}.{minor}.{patch}`) | Variable |
+| `release` | The name of the release of a node program: the name of the tag of this repository the program was built for (`v` followed by one or more of the characters `A` to `Z`, `a` to `z`, `0` to `9`, `.`, `_` and `-`, for example `v2.4.0` and `v2.4.0-rc.1`), or `dev` for a build without a tag. A node compares two release names for equality and for nothing else: no rule of a node orders releases by their names | Variable |
 
-In the examples of this document, `v1.0.0` stands for the release tag of the node.
+In the examples of this document, `v1.0.0` stands for the release of the node.
 
 ## 2. Algorithms
 
@@ -80,9 +80,9 @@ In the examples of this document, `v1.0.0` stands for the release tag of the nod
 | Record encryption | ChaCha20-Poly1305 (RFC 8439), a random nonce of 12 bytes | The output `ct` is the ciphertext followed by the 16-byte tag |
 | Chain | SHA-256 | |
 | TOTP | RFC 6238, HMAC-SHA1, 6 digits, 30 seconds | Only a node computes it |
-| Signature of a release statement, signed entry timestamp of a transparency log of the form Rekor v1 (10.3) | ECDSA P-256 with SHA-256, the signature in ASN.1 DER | Only a node verifies them. The public keys are compiled into the node program |
-| Signature of a transparency log of the form Rekor v2 on a checkpoint (10.3) | Ed25519 over the note of the checkpoint | Only a node verifies it. The public key is compiled into the node program |
-| Inclusion proof of an entry of a transparency log of the form Rekor v2 (10.3) | The Merkle tree of RFC 6962 section 2.1 with SHA-256 | Only a node verifies it |
+| Signature of the envelope of the attestation of a release statement, signed entry timestamp and checkpoint signature of the transparency log (section 9) | ECDSA P-256 with SHA-256, the signature in ASN.1 DER | The key of the envelope is the key of the certificate of the attestation. The key of the log is compiled into the node program |
+| Signature of a certificate of the attestation of a release statement by its issuer (section 9) | ECDSA with SHA-256 or SHA-384 under a key on P-256 or P-384, the signature in ASN.1 DER | The two certificates of the certificate authority are compiled into the node program |
+| Inclusion proof of the entry of the transparency log (section 9) | The Merkle tree of RFC 6962 section 2.1 with SHA-256 | |
 | Attestation | Per platform (section 4) | |
 
 The app performs every operation above with native functions of its binary, which call the
@@ -122,8 +122,8 @@ node                       = b64u(node signing public key)
 - Only a holder of the UK of a custody can create and open the records of that custody. The
   holders of a UK are the app (it derives the UK from MK), a node to which the app handed it with a
   grant (until an expiry, in memory), and a node to which that node transferred the delegation
-  under the conditions of section 10: a node of the same measurement (10.1), or a node of a later
-  release (10.3). There is no other holder.
+  under the conditions of section 10: a node of the same measurement (10.1), or a node of another
+  release under the rules of 10.3. There is no other holder.
 - `key_id` is an 8-byte identifier for display and for early rejection. Where a binding is needed
   (statements, the comparison of a pending authorization with the grant, revocation), all 32 bytes
   of `sign_pk` are compared.
@@ -259,8 +259,8 @@ Input: the `document` bytes, the nonce that was sent with the request (32 bytes)
 `641a0321a3e244efe456463195d606317ed7cdcc3c1756e09893f3c68f79bb5b`), and the list of allowed
 measurements. A node that verifies the document of a peer (section 10) skips step 6 (the nonce).
 The document of a peer must still carry `nonce` and `user_data` as byte strings: it is a document
-that an attestation call made. For a node, the list of allowed measurements has one element: its
-own PCR0, PCR1 and PCR2.
+that an attestation call made. For a node, the allowed measurements are its own PCR0, PCR1 and
+PCR2 and the ones that 10.3 adds for a delegation transfer (4.5).
 
 1. Parse the document as CBOR. Arrays and maps are accepted at any place in both forms, with a
    definite and with an indefinite length. Strings are accepted in the definite-length form only.
@@ -329,7 +329,7 @@ with the signing public key of that `binding` (4.2).
 
 | Stage | The app | A node (verification of a peer) |
 | --- | --- | --- |
-| 1, 2 | A constant list inside the signed program of the app (`[{release, pcr0, pcr1, pcr2}]`, each PCR as 96 lower-case hexadecimal characters). For every release of the enclave the list is changed and the program is signed again. An app whose program does not list a release treats the nodes of that release as nodes of a later release (4.3): no key, and a pending verification of their chains (7.4) until the app loads the program that lists it | Its own measurement. A giving node also accepts the measurement of a later release whose endorsement it verified, and a receiving node also accepts the measurements of the list of predecessors inside its program (10.3) |
+| 1, 2 | A constant list inside the signed program of the app (`[{release, pcr0, pcr1, pcr2}]`, each PCR as 96 lower-case hexadecimal characters). For every release of the enclave the list is changed and the program is signed again. An app whose program does not list a release treats the nodes of that release as nodes of a later release (4.3): no key, and a pending verification of their chains (7.4) until the app loads the program that lists it | Its own measurement. A giving node also accepts a measurement whose public build proof the call carries (section 9), and a receiving node also accepts such a measurement and the measurements of the list of old releases inside its program (10.3) |
 | 3 | The app obtains it by verifying the release statements of the public record (section 9) | Its own measurement, and the list of allowed measurements that the grant of that account carries (the app verifies the release statements and writes the list into the grant) |
 
 ## 5. The commands an app sends to a node
@@ -654,7 +654,7 @@ body_hash = SHA-256(body)
   `c`) holds one control event: `grant_accepted`, `grant_revoked`, `connection_created`,
   `connection_removed`, `grant_transferred_out`, `grant_transferred_in`. A control entry is never
   merged with another event. The first entry of a node for an account is a control entry when the
-  node took the user key by a grant command or from a node of an earlier release, and it can be a
+  node took the user key by a grant command or from a node of another release, and it can be a
   use entry when the node took the key from a node of its own measurement, a transfer that has no
   entry (10.1).
 - The open batch and the group commit. A node keeps, per account, the use events whose entry does
@@ -677,10 +677,10 @@ body_hash = SHA-256(body)
   confirmation of every entry that holds one of its events.
 - The entry and the act. `forward`, `forward/batch`, `refresh`, `revoke-token`, `release`,
   `vault/handoff`, the command grant that puts a user key into the node, the command revoke, and
-  `peer/export` to a node of a later release create their event before the act: the node creates the
+  `peer/export` to a node of another release create their event before the act: the node creates the
   event, and the entry that holds it, and after that it calls the provider, hands the value out,
   seals the value of a vault secret for its one request (10.5), changes the delegation or seals the
-  user key to the peer. `peer/import` of a transfer from an earlier release creates its entry before
+  user key to the peer. `peer/import` of a transfer from another release creates its entry before
   it puts a grant in place, and writes it after (7.6). `oauth/complete` receives the token response
   of the provider first and creates the entry `connection_created` before the record leaves the
   node: no part of an accepted token response leaves the node before that entry exists, and when a
@@ -695,7 +695,7 @@ body_hash = SHA-256(body)
   requests (7.2), a repeated `refresh` of the same record and a `refresh` of a record without a
   refresh token (enclave.md 5.7), a revoke of an account without a grant (5.4), a grant command that
   renews the grant in force (5.3), a transfer between two nodes of one measurement, a repeated
-  transfer of a grant to the same node of a later release, a transfer that a node takes for an
+  transfer of a grant to the same node of another release, a transfer that a node takes for an
   account whose grant of the same key it holds (10.1), and a call that uses a credential of an
   account that has 64 pending entries (enclave.md 5.14).
 - The entry is not carried in the response of a call. The response names the entry and the index of
@@ -749,8 +749,8 @@ store until their retention ends (7.6), and the shape of a key tells the format 
 | `mail_request` | `time_ms`, `record_id`, `provider`, `operation`, `request`, `body_bytes`, `body_sha256`, `context` (the mail call surface at the end of this document) | `mail/verify`, `mail/read`, `mail/submit` |
 | `secret_released` | `time_ms`, `record_id`, `kind`, `field`, `origin`, `context`, and for a record of kind `vault_secret` the `name` of the record behind them | `release` |
 | `totp_issued` | `time_ms`, `record_id`, `origin`, `context` | `release` |
-| `grant_transferred_out` | `time_ms`, `to` (the `node` of the receiving node), `release` (the release of the receiving node), `pcr0`, `pcr1`, `pcr2` (the measurement of the receiving node, 96 lower-case hexadecimal characters each: the values of the statement the release key signed, which the attestation document of the receiving node states, 10.3) | `peer/export` to a node of a later release (10.3). A transfer to a node of the measurement of the giving node creates no event (10.1) |
-| `grant_transferred_in` | `time_ms`, `from` (the `node` of the giving node), `release` (the release of the giving node, as its binding names it), `not_after_ms`, `custody` | `peer/import` of a transfer from a node of an earlier release (10.3). A transfer from a node of the measurement of the receiving node creates no event (10.1) |
+| `grant_transferred_out` | `time_ms`, `to` (the `node` of the receiving node), `release` (the release of the receiving node), `pcr0`, `pcr1`, `pcr2` (the measurement of the receiving node, 96 lower-case hexadecimal characters each: the values of the release statement whose public build proof the giving node verified, which the attestation document of the receiving node states, 10.3) | `peer/export` to a node of another release (10.3). A transfer to a node of the measurement of the giving node creates no event (10.1) |
+| `grant_transferred_in` | `time_ms`, `from` (the `node` of the giving node), `release` (the release of the giving node, as its binding names it), `not_after_ms`, `custody` | `peer/import` of a transfer from a node of another release (10.3). A transfer from a node of the measurement of the receiving node creates no event (10.1) |
 
 - `time_ms` is the node time at which the event was created: the moment the call passed the common
   front and the account lock created the event. The `time_ms` of an entry (7.1) is the time at
@@ -1162,9 +1162,9 @@ entry as a pending entry (a call that waited writes it once more, 7.1):
 | The command grant that puts a user key into the node (step 14 of 5.3) | `grant_accepted` | The user key is put into the memory of the node | The signed reply has `ok` false and the code `log_store_unavailable`. The node holds no key |
 | The command grant that renews the grant in force (step 13a of 5.3) | None | None: the node holds the same key before and after, and the entry `grant_accepted` of that key is in the store | |
 | The command revoke | `grant_revoked` | None. The user key is erased whatever the store answers | The reply is that of a revoke that succeeded. The entry is a pending entry |
-| `peer/export` to a node of a later release (10.3) | `grant_transferred_out`, one per account | The grant of that account enters the transfer | `log_store_unavailable` for the whole call, also when the store confirmed the entries of other accounts: no grant is handed over. The next call for the same receiving node creates no entry for these accounts: it writes the entries that wait again |
+| `peer/export` to a node of another release (10.3) | `grant_transferred_out`, one per account | The grant of that account enters the transfer | `log_store_unavailable` for the whole call, also when the store confirmed the entries of other accounts: no grant is handed over. The next call for the same receiving node creates no entry for these accounts: it writes the entries that wait again |
 | `peer/export` to a node of the measurement of this node (10.1) | None | None: the user key moves between two nodes of one program, and each of the two has its node document in the store (7.7) | |
-| `peer/import` of a transfer from a node of an earlier release (10.3) | `grant_transferred_in`, one per account | None. The grant is put in place first; the call then writes the entries it created in one round, when the node has credentials for its log store | The grant stays in place and the entry is a pending entry: the next write of the account takes it along. The call succeeds all the same |
+| `peer/import` of a transfer from a node of another release (10.3) | `grant_transferred_in`, one per account | None. The grant is put in place first; the call then writes the entries it created in one round, when the node has credentials for its log store | The grant stays in place and the entry is a pending entry: the next write of the account takes it along. The call succeeds all the same |
 | `peer/import` of a transfer from a node of the measurement of this node (10.1) | None | None | |
 
 - A pending entry is an entry that the store has not confirmed and that no call is writing. It stays
@@ -1184,10 +1184,10 @@ entry as a pending entry (a call that waited writes it once more, 7.1):
   retention ends. So for an entry that is not in the store, the act that entry describes did not
   take place: the node did not call the provider, did not hand the value out, did not hand the
   record of a stored value out, did not seal the value of a vault secret for a request, did not take
-  the user key, did not hand the grant to a later release. This holds for an entry the store never
+  the user key, did not hand the grant to another release. This holds for an entry the store never
   confirmed, whose `seq` no key of the store carries, and for whatever a node held in memory when it
   ended or when it halted the account. The two exceptions are the rows without an act that waits: a revoke erased the key, and an
-  import from an earlier release put the grant in place (the giving node's `grant_transferred_out`
+  import from another release put the grant in place (the giving node's `grant_transferred_out`
   of that grant is in the store). The store can hold more entries than there were acts, and not
   fewer: an entry whose act failed afterwards or never started (the provider refused, the call
   ended, the store confirmed and the answer was lost) is in the store like any other.
@@ -1314,36 +1314,291 @@ than 262,144 bytes by that count, the node makes no record of it:
 `oauth/complete` fails with `exchange_failed` and `refresh` with `refresh_failed`, both with
 `provider_status` 200 and an empty `provider_error`, and `oauth/merge` with `record_invalid`.
 
-## 9. Release statements and the public record (stage 3)
+## 9. The release statement and the public build proof
 
-- A release statement is an in-toto statement. Its `predicateType` is
-  `https://pickle.com/credential-enclave/release/v1`, its `subject` is the enclave image file (name
-  `enclave.eif`, digest sha256), and its `predicate` is
-  `{"release":"v1.0.0","git_commit":"<40 hex>","pcr0":"<96 hex>","pcr1":"<96 hex>","pcr2":"<96 hex>","inputs":{the table of the sha256 of the build inputs}}`.
-- The `release` workflow of this repository creates the signature and the entry of the public
-  record as a GitHub artifact attestation (a Sigstore bundle: a short-lived certificate issued by
-  Fulcio, a DSSE signature, a proof of the entry in Rekor).
-- The verification rules of a verifier (the app, a node):
-  1. Verify the DSSE signature with the public key of the certificate of the bundle (ECDSA P-256,
-     SHA-256).
-  2. Verify the certificate chain up to the pinned Fulcio root (the time of the verification is
-     the time of the Rekor entry).
-  3. Check in the extensions of the certificate: the issuer
-     `https://token.actions.githubusercontent.com`, the repository `pickle-com/credential-enclave`,
-     the workflow `.github/workflows/release.yml`, and a ref that is a tag starting with
-     `refs/tags/v`.
-  4. Verify the proof of the Rekor entry (the signed entry time, or the inclusion proof and the
-     checkpoint signature) with the pinned Rekor public key.
-  5. Read the `predicateType` of the statement and the measurements of its `predicate`.
-- In the app, the JavaScript program does this verification with the native functions
-  `ecdsaVerify`, `x509Verify` and `sha256`.
+A release is a tag of this repository and the enclave image file that the build workflow of this
+repository built from the commit of that tag. What a verifier accepts of a release is its
+measurement: PCR0, PCR1 and PCR2 of that file. The public build proof of a measurement shows that
+the build workflow measured it for a tag of this repository while the repository was public, so
+whoever accepts a measurement by its proof accepts an enclave whose source anyone can read. A
+node accepts a node of another release by this proof (10.3). No key of the operator takes part in
+it, and no check compares the name of one release with the name of another.
+
+This section states the release statement, the proof, the values a verifier holds and the checks.
+Two programs of this source make the checks with one function
+(`verify_release_proofs` of `protocol/src/release_proofs.rs`): the node program, and the tool
+`credential-enclave-verify release-proofs` (README, "How to verify"). The secure program of the
+apps makes the same checks from its version 43 on, and the shared cases of section 13 hold the
+implementations to the same verdict on the same input.
+
+### 9.1 The release statement
+
+The release statement is the bytes of the file `measurements.json` of a release (enclave.md
+11.1): a JSON object of at most 16,384 bytes.
+
+| Member | Value |
+| --- | --- |
+| `release` | The name of the tag of the release: `v` followed by one or more of the characters `A` to `Z`, `a` to `z`, `0` to `9`, `.`, `_` and `-` |
+| `git_commit` | The commit of that tag, 40 lower-case hexadecimal characters |
+| `pcr0`, `pcr1`, `pcr2` | The measurement of the enclave image file of the release, 96 lower-case hexadecimal characters each |
+| `inputs` | The SHA-256 of what the measurement was made of. No check reads it: it serves a person who builds the release again and compares |
+
+A reader of a release statement ignores the members this table does not name.
+
+### 9.2 The public build proof
+
+The public build proof of a release is the attestation that the job of the build workflow made of
+its release statement, in the run that built the release (enclave.md 11.2). It is a Sigstore
+bundle with three parts:
+
+- The certificate: an X.509 certificate that the certificate authority of the public instance of
+  Sigstore (Fulcio) issued to that workflow run, for a key the run created, valid for ten
+  minutes. Its extensions state the identity of the run as GitHub stated it to the certificate
+  authority.
+- The envelope (DSSE): an in-toto statement with the predicate type
+  `https://pickle.com/credential-enclave/release/v1`, whose predicate is the release statement,
+  and the signature of the key of the certificate over it.
+- The entry of the transparency log (Rekor): the record of that envelope and that certificate in
+  `rekor.sigstore.dev`, with what the log returned for it: the time at which it took the entry,
+  its signature over the entry (the signed entry timestamp), and the inclusion proof of the entry
+  (the audit path to the root of a tree, and the checkpoint in which the log signed the head of
+  that tree).
+
+The value that carries a release statement and its proof is named `release_proofs`:
+
+```text
+release_proofs = JSON {"statement": b64u(the bytes of the release statement),
+                       "attestation": bundle}
+
+bundle = {"verificationMaterial": {
+            "certificate": {"rawBytes": "<standard base64 of the DER of the certificate>"},
+            "tlogEntries": [{
+              "logIndex": <count>,
+              "logId": {"keyId": "<standard base64 of the 32 bytes of the log identifier>"},
+              "integratedTime": <count>,
+              "inclusionPromise": {"signedEntryTimestamp": "<standard base64>"},
+              "inclusionProof": {"logIndex": <count>, "treeSize": <count>,
+                                 "rootHash": "<standard base64 of 32 bytes>",
+                                 "hashes": ["<standard base64 of 32 bytes>", ...],
+                                 "checkpoint": {"envelope": "<the checkpoint, its line feeds included>"}},
+              "canonicalizedBody": "<standard base64 of the body of the entry>"}]},
+          "dsseEnvelope": {"payload": "<standard base64 of the in-toto statement>",
+                           "payloadType": "application/vnd.in-toto+json",
+                           "signatures": [{"sig": "<standard base64>"}]}}
+```
+
+The bundle is the JSON object that the attestation of GitHub writes, as it is. `release_proofs` is
+a public value: whoever carries it, the checks of 9.4 decide. A reader ignores the members of
+`release_proofs` and of the bundle that this section does not name (among them `mediaType`,
+`kindVersion` and `timestampVerificationData` of a bundle).
+
+### 9.3 The values of a verifier
+
+A verifier holds five values. In the node program they are compiled in, so they are part of its
+measurement (`enclave/src/lineage.rs` with the files of `enclave/release/`, and the repository in
+`protocol/src/release_proofs.rs`). The tool `credential-enclave-verify release-proofs` compiles in
+the same files.
+
+| Value | What it is |
+| --- | --- |
+| The root certificate | The root certificate of the certificate authority of the public instance of Sigstore (`enclave/release/fulcio-root.pem`). The SHA-256 of its DER is `3ba7b6cc4e95469d4d334b49cb257ad8537076fa84b0ca87ff4ecfe6a54680c1` |
+| The intermediate certificate | The certificate of that authority that the root certificate issued and that issues the certificates of workflow runs (`enclave/release/fulcio-intermediate.pem`). The SHA-256 of its DER is `15d795348226b4649f750f5802592c393bee7cc53c3b86982175b7ad087efe47` |
+| The key of the transparency log | The public key of `rekor.sigstore.dev`, a log of the form Rekor v1: ECDSA P-256, as the DER of its SubjectPublicKeyInfo (91 bytes; `enclave/release/rekor-key.pem`). The log identifier is the SHA-256 of that DER: `c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d` in lower-case hexadecimal |
+| The repository | The address `https://github.com/pickle-com/credential-enclave`, the identifier of the repository (`1400118248`) and the identifier of its owner (`151645824`), as GitHub numbers them. GitHub does not change these identifiers and does not give them to another repository or owner |
+| The list of build workflows | `[{"workflow":"<the path of a workflow file in the repository>","commit":"<40 lower-case hexadecimal characters>"}]` (`enclave/release/builders.json`): the workflow files whose job a verifier takes the attestation of, each at one commit of that file. The list of this release has one element: `.github/workflows/enclave-build.yml` at the commit `3f84e8368fcdf1f89e42ca629670bfe0989b6f13` |
+
+- The two certificates and the key of the log are those that the trusted root of the public
+  instance of Sigstore names (`targets/trusted_root.json` of the repository
+  `sigstore/root-signing`, which the TUF repository of Sigstore distributes). A test of
+  `enclave/src/lineage.rs` holds them to the copy of that trusted root in this repository
+  (enclave.md 11.1).
+- A node does not start when one of the two certificates is not a certificate of a certificate
+  authority in the form of 9.4, when the root certificate did not issue the intermediate
+  certificate, when the key of the log is not such a key, and when the list of build workflows is
+  not a JSON array of such elements or names one build workflow twice. The path of a workflow is
+  one or more of the characters `!` to `~` without `@`.
+- None of the five is a value of one release: a release is built, tagged and deployed without a
+  change to them. The first three change when the certificate authority or the log of Sigstore
+  does, and the list of build workflows when the build workflow does: the job of a workflow file
+  does what the file of that commit states, so a changed build workflow is another element.
+- A verifier takes the proof of a release that a build workflow of its own list built. A release
+  that a build workflow outside that list built, a certificate of another certificate authority
+  and an entry of another log have no proof this verifier takes: for a node, the nodes of such a
+  release receive no delegation from it and are delegated to by the apps (10.1).
+
+### 9.4 The checks
+
+A verifier takes `release_proofs` for a measurement M (PCR0, PCR1 and PCR2 of an attestation
+document that verified by 4.3) when the value has the form of the first row and every check V1 to
+V7 holds. A node answers a failure of any of them with `peer_unverified` (10.3).
+
+| Check | Rule |
+| --- | --- |
+| The form | `release_proofs` is a JSON object whose `statement` is a string of at most 32,768 UTF-16 code units and whose `attestation` is an object, and the value holds at most 32 arrays and objects inside one another |
+| V1, the release statement | `statement`, decoded from base64url without padding, is at most 16,384 bytes of JSON text that reads as an object. The object states `release`, `git_commit`, `pcr0`, `pcr1` and `pcr2` once each, as strings: `release` has the form of 9.1, `git_commit` is 40 lower-case hexadecimal characters, and each PCR is 96 lower-case hexadecimal characters that are not all zero (a PCR that is all zero is the value of an enclave in debug mode, whatever that enclave runs). The three PCRs equal those of M |
+| V2, the form of the bundle | `attestation` holds the string `verificationMaterial.certificate.rawBytes`, the array `verificationMaterial.tlogEntries` with exactly one element, which is an object (the entry), and the object `dsseEnvelope` with the strings `payload` and `payloadType` and the array `signatures` with exactly one element, whose `sig` is a string. `attestation`, written as JSON without white space, is at most 65,536 bytes of UTF-8. `payload`, decoded from standard base64, is JSON text that reads as an object (the in-toto statement), and `payloadType` is `application/vnd.in-toto+json` |
+| V3, the certificate chain | `rawBytes`, decoded from standard base64, is one certificate in the form below. That certificate, the intermediate certificate and the root certificate are valid at the time of the entry (`integratedTime` of V4, in seconds since the Unix epoch): the time is neither before the start nor after the end of the validity of any of the three. The certificate of the bundle is not the certificate of a certificate authority. The intermediate certificate issued it: its issuer name is the subject name of the intermediate certificate, byte for byte as encoded, its signature algorithm is ECDSA with SHA-256 or with SHA-384, and its signature is the signature of the key of the intermediate certificate over its signed part. The function of this source also validates the X.509 path from the certificate over the intermediate certificate to the root certificate at that time, with the path validation a node uses for the certificates of an attestation document (4.3): every extended key usage is accepted and no revocation list is read. So a node also refuses a certificate that the rules of this row take and that path validation refuses, a certificate with a critical extension the validation does not know among them |
+| V4, the entry of the log | The rules of the entry below |
+| V5, the signature of the envelope | `sig`, decoded from standard base64, is the ECDSA P-256 SHA-256 signature (ASN.1 DER) of the key of the certificate over the pre-authentication encoding of DSSE: the ASCII text `DSSEv1`, a space, the number of bytes of `payloadType` in decimal, a space, `payloadType`, a space, the number of bytes of the decoded payload in decimal, a space, and the decoded payload. A certificate whose key is not on P-256 signed nothing |
+| V6, the identity | The certificate states every value of the table of the identity below |
+| V7, the predicate | The `predicateType` of the in-toto statement is `https://pickle.com/credential-enclave/release/v1`, and the strings `release`, `git_commit`, `pcr0`, `pcr1` and `pcr2` of its `predicate` equal those of the release statement of V1. The `subject` of the in-toto statement is not read: a verifier holds no enclave image file, and what it accepts is the predicate |
+
+The checks are made in this order, and the first one that fails ends the verification: the form,
+V1, V2, the time of the entry (the first rule of V4), V3, V6, V5, the other rules of V4, V7.
+
+The entry (V4). `tlogEntries[0]` is the entry of a log of the form Rekor v1. An entry of another
+form (the entry of a log that signs no entry timestamp among them) fails these rules.
+
+1. `integratedTime` is a count: the time at which the log took the entry, in seconds since the
+   Unix epoch.
+2. `logId.keyId`, decoded from standard base64, is the 32 bytes of the log identifier of the log
+   of the verifier.
+3. `canonicalizedBody`, decoded from standard base64, is JSON text that reads as an object with
+   `kind` `"dsse"` and `apiVersion` `"0.0.1"`. Its `spec.payloadHash.algorithm` is `"sha256"`, and
+   its `spec.payloadHash.value` is the lower-case hexadecimal SHA-256 of the decoded payload of
+   V2. Its `spec.signatures` is an array with exactly one element: `signature`, decoded from
+   standard base64, is the bytes of the signature of V5, and `verifier`, decoded from standard
+   base64 and then read as the PEM of a `CERTIFICATE`, is the DER of the certificate of V3, byte
+   for byte.
+4. `logIndex` is a count, and `inclusionPromise.signedEntryTimestamp`, decoded from standard
+   base64, is the ECDSA P-256 SHA-256 signature (ASN.1 DER) of the log key over the UTF-8 bytes of
+
+   ```text
+   {"body":"<canonicalizedBody>","integratedTime":<integratedTime>,"logID":"<log identifier>","logIndex":<logIndex>}
+   ```
+
+   with the keys in this order, without white space, `<canonicalizedBody>` as the string of the
+   bundle, the two counts in decimal, and the log identifier as the 64 lower-case hexadecimal
+   characters the verifier computed from the key of the log.
+5. `inclusionProof.logIndex` and `inclusionProof.treeSize` are counts, `inclusionProof.rootHash`
+   is the standard base64 of 32 bytes, and `inclusionProof.hashes` is an array of at most 64
+   strings, each the standard base64 of 32 bytes. `inclusionProof.logIndex` is below `treeSize`,
+   and with `leaf = SHA-256(0x00 ∥ the decoded body)`, `fn = inclusionProof.logIndex` and
+   `sn = treeSize − 1`, the path computation of check 9 of "The secure program release" ends with
+   `sn = 0` and with the bytes of `rootHash`. `inclusionProof.logIndex` is the index of the leaf
+   in the tree of the checkpoint, a value other than `logIndex`, the index the log signed in rule
+   4.
+6. `inclusionProof.checkpoint.envelope` is a string that holds `"\n\n"`. The part before the
+   first `"\n\n"`, split at `"\n"`, has at least three lines: the first is not empty (the origin
+   of the log, which is not compared with a value of the verifier), the second is `treeSize` in
+   decimal, and the third, decoded from standard base64, is the bytes of `rootHash`. That part
+   followed by one `"\n"` is the note. A line of the part after the first `"\n\n"` is a line of
+   the log when it is `"— "` (U+2014 and a space), a name that is not empty, a space, and the
+   standard base64 of more than four bytes whose first four are the first four bytes of the log
+   identifier. The checkpoint holds at least one line of the log, and in every line of the log
+   the bytes after the first four are the ECDSA P-256 SHA-256 signature (ASN.1 DER) of the log
+   key over the UTF-8 bytes of the note. A line of the log that is no such signature refuses the
+   checkpoint, also beside one that is. Every other line (the signature of a witness, a line of
+   another key) is not read, and neither are further lines of the note, which the signature of
+   the log covers.
+
+The identity (V6). The certificate states each value below in its extension
+`1.3.6.1.4.1.57264.1.{number}`, whose value is the DER of one UTF8String. A certificate without
+one of these extensions, or with another value in it, is refused. `{release}` and `{git_commit}`
+are those of the release statement of V1.
+
+| Number | What it states | The value a verifier asks for |
+| --- | --- | --- |
+| 8 | The issuer of the token the certificate was issued for | `https://token.actions.githubusercontent.com` (GitHub Actions) |
+| 9 | The workflow of the job that signed | The text before its last `@` is the address of the repository, `/` and the `workflow` of an element of the list of build workflows. The text after that `@` is the ref the calling workflow wrote: it is not empty and is not judged |
+| 10 | The commit of the file of that workflow | The `commit` of an element of the list with the `workflow` of 9 |
+| 11 | The runner | `github-hosted` |
+| 12 | The repository the run took place in | The address of the repository |
+| 13 | The commit that started the run | `{git_commit}` |
+| 14 | The ref that started the run | `refs/tags/{release}` |
+| 15 | The identifier of that repository | The identifier of the repository |
+| 17 | The identifier of the owner of that repository | The identifier of the owner |
+| 20 | What started the run | `push` |
+| 22 | The visibility of the repository when the certificate was issued | `public` |
+
+The extension 18, the workflow that started the run and called the build workflow, is not judged:
+its file is a file of the commit of the tag, and the job that signed does what the file of the
+build workflow states.
+
+The forms. Every value is read in one form, and a value in another form is refused:
+
+- Base64. Standard base64 is the alphabet of RFC 4648 section 4 with its padding, and base64url
+  the alphabet of section 5 without padding. A text with a character outside the alphabet, with
+  white space, with missing or surplus padding, or whose last character carries bits of no byte
+  is refused.
+- JSON text. The bytes are UTF-8 and one JSON value that holds no number outside the finite
+  ones, no half of a surrogate pair and at most 32 arrays and objects inside one another. Of two
+  members of one object with the same name the last one counts, except for the five members of a
+  release statement, each of which occurs once (V1).
+- A count is a non-negative integer of at most 2^53 − 1. It is written as a string of 1 to 16
+  decimal digits without a leading zero (a lone `0` is a count), which is how a bundle writes its
+  times and indexes, or as a JSON number of that value: a number written with a fraction or an
+  exponent counts by its value, and a zero with a minus sign is no count.
+- The length of `attestation` (V2) is the number of bytes of the value written as JSON without
+  white space: a string with the two-character escapes of `"`, `\`, backspace, form feed, line
+  feed, carriage return and tab, the six-character escape of every other character below U+0020
+  and the UTF-8 bytes of every other character, and a number as ECMAScript writes it.
+- A certificate. An element of DER has a tag of one byte and its shortest length form. The
+  certificate is one SEQUENCE of the signed part, the signature algorithm and the signature (a BIT
+  STRING without unused bits), with no byte behind it. The signed part holds, behind a version
+  `[0]` it may begin with: the serial number, the signature algorithm (the bytes of the one of
+  the certificate), the issuer name, the validity (two times, each a UTCTime `YYMMDDHHMMSSZ` or a
+  GeneralizedTime `YYYYMMDDHHMMSSZ` of a day the calendar has, not before 1950), the subject name
+  and the SubjectPublicKeyInfo. What follows is a unique identifier (`[1]`, `[2]`), which is not
+  read, or the extensions (`[3]`): each a SEQUENCE of an object identifier, an optional BOOLEAN
+  and an OCTET STRING, and no object identifier twice. A certificate is one of a certificate
+  authority when the value of its extension 2.5.29.19 (basic constraints) is a SEQUENCE that
+  begins with a BOOLEAN of one byte that is not zero.
+- A key. The key of a certificate is an ECDSA key on P-256 or on P-384, as a SubjectPublicKeyInfo
+  with an uncompressed point (91 or 120 bytes). An ECDSA signature is the DER of two non-negative
+  integers without unneeded bytes.
+- A PEM text of a kind is the line `-----BEGIN {kind}-----`, standard base64 and the line
+  `-----END {kind}-----`, with white space around it and inside the base64 left out.
+
+### 9.5 What the checks show
+
+- The identity of V6 is what ties an attestation to this repository and to one workflow file. The
+  extensions 9 and 10 say that the job of a build workflow of the list signed, as the file of
+  that workflow is at the commit of the list. What that job does is what that file states,
+  whatever the commit of a tag holds: an attestation that the job of another workflow file made
+  (the workflow that the push of the tag starts among them) states that file in 9 and is
+  refused, and so is the build workflow at any other commit (10). The ref behind the last `@` of
+  9 is not judged, because 10 states the commit that ref led to. 13 and 14 say that the run was
+  started at the commit the statement names, by the push of the tag the statement names as its
+  release. 11 says that a runner GitHub hosts ran the job: a runner that the owner of a
+  repository registers signs whatever its owner hands it, under the same workflow and the same
+  tag. 12, 15 and 17 name the repository the run took place in: a workflow of another repository
+  can call the build workflow, and the certificate of that run states that repository. 20 says
+  that the push of the tag started the run: a run that is started another way takes inputs that
+  are not public. 22 says that the repository was public when the certificate was issued.
+- So a measurement with a proof that passes is the measurement that the job of a build workflow
+  of the list wrote into the release statement, for the commit of a tag of this repository that
+  was public at that time. What that job builds from the commit, and what it keeps away from the
+  programs of the commit while it builds, is stated with the build workflow (enclave.md 11.2).
+  The proof says nothing about what the source of the release does: it says which source it is.
+- The proof names the commit and the tag as the repository held them when the run took place.
+  It does not show that the repository holds them still: a tag can be deleted after its release
+  was attested, and a commit that no branch and no tag names may stop being served. What stays
+  is the record of the attestation in the log, with the commit and the name of the tag.
+- The proof rests on GitHub, which states the identity of a workflow run to the certificate
+  authority, on the certificate authority of Sigstore, which issues a certificate for the
+  identity it was shown and no other, and on the transparency log of Sigstore. The signed
+  certificate timestamps of the certificate are not read: that the certificate was issued is on
+  the log a verifier checks, whose entry holds the certificate.
+- A verifier sends no request and reads no clock. The verdict depends on the bytes of
+  `release_proofs`, on the measurement and on the values of the verifier. The time at which the
+  certificates are valid is the time the log signed for the entry, and the certificate of the
+  bundle is valid for ten minutes.
+- Of the log a verifier checks what the log returned for the entry: the signed entry timestamp,
+  and the inclusion proof with the checkpoint. It reads no signature of a witness, so the checks
+  do not show that the log presents the same tree to every reader.
+- `release_proofs` has no end. A verifier takes the proofs of a release for as long as it holds
+  the values they verify under, and nothing withdraws a proof.
+- Where a value could be read in more than one way, it is refused. Proofs that hold and are
+  refused keep the nodes of a release from receiving delegations from other nodes. Proofs that do
+  not hold and are accepted hand user keys to an enclave whose source nobody can read.
 
 ## 10. Delegation transfer between nodes and witnessing
 
 A node hands delegations to another node only after it verified that node by its attestation. The
-operator domain supplies the address of the peer and carries the messages (a node does not trust
-the carrier). The delegation transfer (10.1) and the delegation transfer to a later release (10.3)
-are part of stage 1. Witnessing (10.2) is stage 2.
+operator domain supplies the address of the peer and carries the messages and the release proofs
+(a node does not trust the carrier). The delegation transfer (10.1) and the delegation transfer
+between two releases (10.3) are part of stage 1. Witnessing (10.2) is stage 2.
 
 ### 10.1 The delegation transfer
 
@@ -1364,20 +1619,20 @@ envelope = JSON {"v":1,"from":<giving node>,"to":<receiving node>,"enc":b64u,"ct
 ```
 
 The rules of the giving node (`peer/export`. The input is the attestation response of the
-receiving node):
+receiving node and, for a receiving node of another release, its release proofs):
 
 | Step | Rule | Failure code |
 | --- | --- | --- |
 | 1 | The node verifies the attestation response of the receiving node: platform `nitro` by 4.3 (without the nonce check), platform `local` by parsing `binding`. This gives the signing public key and the sealing public key of the receiving node | `peer_unverified` |
 | 2 | The platform of the receiving node is the platform of this node (nothing is handed to a node of another custody) | `peer_unverified` |
-| 3 | Platform `nitro`: PCR0, PCR1 and PCR2 of the receiving node all equal those of this node (without an endorsement, delegations go to a node of the same release only. A PCR whose value is all zero is refused). A call with an endorsement follows check 7 of 10.3 in the place of this step | `peer_unverified` |
+| 3 | Platform `nitro`: PCR0, PCR1 and PCR2 of the receiving node are a measurement this node hands delegations to: the three values equal those of this node, or the release proofs of the call show them as the measurement of a release (10.3). Without release proofs that hold, delegations go to a node of the measurement of this node only. A PCR whose value is all zero is refused | `peer_unverified` |
 | 3a | The log store that the binding of the receiving node names is the log store of this node: the same bucket and the same region, or no `log` on both sides (delegations stay among nodes that write to the same log store) | `peer_unverified` |
 | 3b | The binding of the receiving node has no `role` key or the `role` `reserve` (4.1: delegations stay among nodes that hold delegations. A node of the forward role takes none, and a binding with any other `role` is no binding) | `peer_unverified` |
 | 4 | The receiving node is not this node | `invalid_request` |
-| 4a | (A transfer with an endorsement, 10.3) The node can write to its log store (7.6, 7.7). A node of platform `local` without a log store passes. A transfer to a node of the measurement of this node writes nothing and passes this step in every case | `log_store_unavailable` |
-| 5 | The node selects the accounts that have a grant within its time, in the lexical order of `user_id`, one page at a time (at most 1,000 accounts). A transfer to a node of the measurement of this node creates no entry: every selected grant goes on to step 5b. A transfer with an endorsement (10.3) has entries: an account whose grant was handed to 64 other nodes of a later release is skipped (see below), and for every selected account, inside the lock of that account, the node creates the log entry `grant_transferred_out` when it hands that grant to the receiving node for the first time. The entry names the receiving node, its release and its measurement (7.2) | |
-| 5a | (With an endorsement) The node writes the entries to the log store: the entries of step 5, and the entry of an earlier call for the same receiving node that the store has not confirmed. It goes on only when the store confirmed the entry of every selected account | `log_store_unavailable` |
-| 5b | For every selected account, inside the lock of that account again, the node puts the grant into the transfer when the account still has a grant within its time and, with an endorsement, that grant is the one whose entry for this receiving node the store confirmed. An account that revoked in between is left out, and so is, with an endorsement, an account whose grant was replaced in between | |
+| 4a | (A transfer to a node of another release, 10.3) The node can write to its log store (7.6, 7.7). A transfer to a node of the measurement of this node writes nothing and passes this step in every case | `log_store_unavailable` |
+| 5 | The node selects the accounts that have a grant within its time, in the lexical order of `user_id`, one page at a time (at most 1,000 accounts). A transfer to a node of the measurement of this node creates no entry: every selected grant goes on to step 5b. A transfer to a node of another release (10.3) has entries: an account whose grant was handed to 64 other nodes of another release is skipped (see below), and for every selected account, inside the lock of that account, the node creates the log entry `grant_transferred_out` when it hands that grant to the receiving node for the first time. The entry names the receiving node, its release and its measurement (7.2) | |
+| 5a | (To a node of another release) The node writes the entries to the log store: the entries of step 5, and the entry of an earlier call for the same receiving node that the store has not confirmed. It goes on only when the store confirmed the entry of every selected account | `log_store_unavailable` |
+| 5b | For every selected account, inside the lock of that account again, the node puts the grant into the transfer when the account still has a grant within its time and, for a node of another release, that grant is the one whose entry for this receiving node the store confirmed. An account that revoked in between is left out, and so is, for a node of another release, an account whose grant was replaced in between | |
 | 6 | The node signs the transfer, seals it to the sealing public key of the receiving node and returns it. The entries that step 5 created are named in the same response | |
 
 - The nonce and the age of the document of the receiving node are not looked at. The document
@@ -1390,17 +1645,17 @@ receiving node):
   nodes performs it (7.4). What a reader needs of the receiving node is its node document, which
   that node wrote before it took the key (7.7). So the nodes that are alive fill a node that
   restarted without a write to the log store, also while the log store cannot be written.
-- The entries of a transfer to a later release are not stopped by the limit of entries without a
+- The entries of a transfer to another release are not stopped by the limit of entries without a
   storage acknowledgement (64), like the entries of a command.
-- There is one entry per grant and receiving node of a later release. A node keeps, with every grant
-  in its memory, the list of the nodes of a later release it handed that grant to. The first
+- There is one entry per grant and receiving node of another release. A node keeps, with every grant
+  in its memory, the list of the nodes of another release it handed that grant to. The first
   transfer of a grant to such a node creates the entry `grant_transferred_out` and puts that node on
   the list. A repeated transfer of the same grant to a node of the list carries the grant again and
   creates no entry: a transfer whose envelope was lost on its way is made again, and the entry that
   names the receiving node exists already. A node is put on the list when the entry is created, also
   when the log store does not confirm that entry: the repeated call writes that entry again and
   hands the grant over once the store confirmed it. The list holds at most 64 nodes. A grant whose
-  list is full is handed to no further node of a later release: its account is skipped, without an
+  list is full is handed to no further node of another release: its account is skipped, without an
   entry. So a carrier that repeats the call adds at most 64 entries per grant.
 - The list belongs to the grant state in the memory of the node. A grant command that puts a grant
   in place (step 14 of 5.3), a revoke, the end of the grant and a transfer that puts a grant in
@@ -1408,18 +1663,18 @@ receiving node):
   is empty. A renewal (step 13a of 5.3) keeps the grant and its list.
 
 The rules of the receiving node (`peer/import`. The input is the attestation response of the
-giving node and the envelope):
+giving node, the envelope and, for a giving node of another release, its release proofs):
 
 | Step | Rule | Failure code |
 | --- | --- | --- |
-| 1 | The node verifies the attestation response of the giving node by the rules of steps 1 to 3b above. In step 3 the measurement of the giving node is that of this node or that of a predecessor of this node (10.3) | `peer_unverified` |
+| 1 | The node verifies the attestation response of the giving node by the rules of steps 1 to 3b above. In step 3 the measurement of the giving node is that of this node, that of an element of the list of old releases of this node, or one that the release proofs of the call show as the measurement of a release (10.3) | `peer_unverified` |
 | 1a | The log store of this node holds its node document, with a retention that outlives an entry written now (7.7). A node of platform `local` without a log store passes. The node needs no credentials for its log store here | `log_store_unavailable` |
 | 2 | The `to` of the envelope is the `node` of this node and its `from` is the giving node of step 1. The node opens the envelope with its sealing private key and verifies the signature with the signing public key of the giving node. `from` and `to` of the payload equal those of the envelope | `wrong_node`, `open_failed`, `bad_signature` |
-| 3 | For every grant: only a grant whose `custody` is the custody of the platform of this node and whose `not_after_ms > now` is looked at. A grant of an account whose revoke command this node accepted before is skipped (see below). When the account has no grant within its time, the node puts the grant into its memory. For a grant from a node of an earlier release (10.3) it creates the log entry `grant_transferred_in`, which names the giving node and its release (7.2); a grant from a node of the measurement of this node is put in place without an entry. When the account has a grant of the same `sign_pk` within its time, the larger `not_after_ms` stays (no entry). When the account has a grant of another `sign_pk`, the grant of the transfer is skipped | |
+| 3 | For every grant: only a grant whose `custody` is the custody of the platform of this node and whose `not_after_ms > now` is looked at. A grant of an account whose revoke command this node accepted before is skipped (see below). When the account has no grant within its time, the node puts the grant into its memory. For a grant from a node of another release (10.3) it creates the log entry `grant_transferred_in`, which names the giving node and its release (7.2); a grant from a node of the measurement of this node is put in place without an entry. When the account has a grant of the same `sign_pk` within its time, the larger `not_after_ms` stays (no entry). When the account has a grant of another `sign_pk`, the grant of the transfer is skipped | |
 
 - The receiving node shortens the `not_after_ms` of a grant it takes to the limit of 5.2
   (`now + 30 days`).
-- The receiving node of a transfer from an earlier release puts the grants in place first and then
+- The receiving node of a transfer from another release puts the grants in place first and then
   writes the entries `grant_transferred_in` it created (7.6). An entry the store does not confirm is
   a pending entry, and the next write of the account on that node takes it along. What says where a
   grant went is the `grant_transferred_out` of the giving node, which the store confirmed before the
@@ -1439,7 +1694,7 @@ giving node and the envelope):
   1,000 grants make the whole transfer `invalid_request`. When `from` and `to` of the payload
   differ from those of the envelope, the code is `wrong_node`.
 - A reader of format 3 traces no transfer: the entries of every node that used the key of an account
-  are under the prefix of that account (7.4), and a transfer to a later release is on the log with
+  are under the prefix of that account (7.4), and a transfer to another release is on the log with
   the measurement of the receiving node. For the chains of the releases before v2.4.0 the app reads
   `grant_transferred_out` on the chain of the giving node, learns the receiving node from its `to`
   and verifies the chain of that node with that value, the signing public key of the receiving node
@@ -1450,8 +1705,9 @@ giving node and the envelope):
 - Both calls take an optional `subset` object (10.4). With it, the giving node selects the
   accounts of the share of the receiving node alone, and the receiving node keeps the grants of
   its own share alone.
-- A transfer to a node of a later release follows 10.3: the release key of the operator and the
-  public transparency log decide which release receives the delegations of a node.
+- A transfer between two nodes of different releases follows 10.3: the public build proof of the
+  measurement of the other node decides and, for a receiving node, the list of old releases of
+  its program.
 - A transfer to a node of another release under a rule of the account is stage 3: the app writes
   the list of the measurements it verified against the public record into the grant (the device of
   the account decides which releases may receive its key), and the giving node hands a delegation
@@ -1471,252 +1727,122 @@ receiving node gave (it prevents a replay). The response is the `witness` of 7.5
 witness node accepts only a `seq` that is larger than the last `seq` it holds for that
 (node, account) pair.
 
-### 10.3 The delegation transfer to a later release
+### 10.3 The delegation transfer between two releases
 
 Purpose: the delegations of the accounts stay when the operator replaces the nodes of one release
-with the nodes of a later release. A giving node hands delegations to a node of a later release
-when the release key of the operator signed the measurements of that release and a public
-transparency log of the table of the giving node holds the record of that signature. A receiving
-node takes delegations from a node of a release that its own program lists as a predecessor. The
-payload and the envelope are those of 10.1. Such a transfer is on the log of the account: the
-giving node creates the entry `grant_transferred_out` of every grant and hands the grant over
-after the log store confirmed that entry (steps 4a to 5b of 10.1), and the receiving node creates
-the entry `grant_transferred_in` (step 3 of the receiving node). This section states which node of
-another release a node accepts.
+with the nodes of another. A node hands delegations to a node of another measurement, and takes
+them from one, when the public build proof of that measurement holds (section 9): the measurement
+is the one the build workflow of this repository measured for a public tag. A receiving node also
+takes delegations from the nodes of the old releases its program lists. The payload and the
+envelope are those of 10.1. Such a transfer is on the log of the account: the giving node creates
+the entry `grant_transferred_out` of every grant and hands the grant over after the log store
+confirmed that entry (steps 4a to 5b of 10.1), and the receiving node creates the entry
+`grant_transferred_in` (step 3 of the receiving node). This section states which node of another
+measurement a node accepts.
 
-Three values are compiled into the node program, so they are part of its measurement:
+Both calls take the release proofs of the other node as the key `release_proofs` of their body
+(9.2, enclave.md 5.13). The operator domain supplies them as it supplies the attestation
+response. They are public values: the verdict is the one of the checks of 9.4, made with the
+values that are compiled into the node (9.3).
 
-| Value | What it is |
-| --- | --- |
-| The release key | The public key of the operator whose signature over a release statement a giving node asks for: ECDSA P-256, as the DER of its SubjectPublicKeyInfo (91 bytes) |
-| The table of transparency logs | The logs whose entries a giving node accepts: each row states the form of its log, the public key of the log and, for a log of the form Rekor v2, its origin. The log identifier of a row follows from these values |
-| The list of predecessors | `[{"release":"v1.1.0-rc.1","pcr0":"<96 hex>","pcr1":"<96 hex>","pcr2":"<96 hex>"}]`: the releases whose nodes a node of this program takes delegations from, each with its measurement |
+The rule of the giving node (`peer/export`). In step 3 of 10.1 the measurement of the receiving
+node is accepted in one of two cases:
 
-A transparency log has one of two forms. The form states what the log returns with an entry (which
-is what shows that the log holds the entry), the form of the body of an entry, the kind of the key
-of the log and what its log identifier is.
-
-| Form | The key and the log identifier | What the log returns with an entry | The body of an entry |
-| --- | --- | --- | --- |
-| Rekor v1 | ECDSA P-256, as the DER of its SubjectPublicKeyInfo (91 bytes). The log identifier is the lower-case hexadecimal SHA-256 of that DER | The time at which it took the entry, the index of the entry and the signed entry timestamp: its signature over the entry with that time and that index | A `hashedrekord` of version 0.0.1 |
-| Rekor v2 (a tiled log, c2sp.org/tlog-tiles) | Ed25519, as the DER of its SubjectPublicKeyInfo (44 bytes: 12 bytes in front of the 32 bytes of the key), and the origin of the log: the first line of its checkpoints and the name of its key on them. The log identifier is the lower-case hexadecimal SHA-256 of the UTF-8 bytes of the origin, the byte 0x0A, the byte 0x01 and the 32 bytes of the key: the key ID of the signature of the log on a checkpoint (c2sp.org/signed-note) before it is cut to four bytes | The index of the entry and its inclusion proof: the audit path from the entry to the root of a tree, and a checkpoint, the note of the head of that tree with the signature of the log. The log states no time for the entry and signs no single entry | A `hashedrekord` of version 0.0.2 |
-
-A log has a row when the trusted root of the public instance of Sigstore names it
-(`targets/trusted_root.json` of the repository `sigstore/root-signing`, which the TUF repository
-of Sigstore distributes) and the monitor of this repository reads the entries of the release key
-in it (enclave.md 11.2). The table of this release has one row:
-
-| Log | Form | Log identifier |
+| Case | Rule | Entry |
 | --- | --- | --- |
-| `rekor.sigstore.dev` | Rekor v1 | `c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d` |
+| The measurement of this node | PCR0, PCR1 and PCR2 of the document of the receiving node equal those of this node. `release_proofs` is not read | None (10.1) |
+| A measurement with a public build proof | `release_proofs` passes every check of 9.4 for PCR0, PCR1 and PCR2 of the document of the receiving node, and the `release` of the binding of the receiving node equals the `release` of the release statement of the proofs | `grant_transferred_out`, which the log store confirms before the grant is handed over |
 
-As of 2026-11-23 that trusted root names a second log, `log2025-1.rekor.sigstore.dev` (this text
-is its origin), of the form Rekor v2, with the log identifier
-`cf1199155bddd051268d1f16ac5c0c75c009f6fb5a63f4177f8e18d7051e3fa0`. It has no row: the log offers
-no search for the entries of a key, and the monitor does not read it. A node of this release
-refuses an entry of that log at check 2. The tests of this repository verify a real entry of it
-with the code of its form.
+A giving node hands nothing to a node of any other measurement: not to a node of an old release
+of its list, and not under a signature of the operator. It does not read the key `endorsement`,
+which the releases before v2.4.0 read.
 
-A node does not start with a table that has no row, with a row whose key is not a key of the form
-of the row (for the form Rekor v2: also a key that is no point of the curve or a point of small
-order), with a row of the form Rekor v2 whose origin is empty or holds a character outside `!` to
-`~` or a `+`, with a row of the form Rekor v1 that states an origin, or with two rows of one log
-identifier.
+The rule of the receiving node (`peer/import`). In step 1 of the receiving node of 10.1 the
+measurement of the giving node is accepted in one of three cases:
 
-The release statement of this section is the exact bytes of the file `measurements.json` of the
-later release (enclave.md 11.1). It is not the in-toto statement of section 9. A node reads four
-keys of it: the string `release` and the strings `pcr0`, `pcr1` and `pcr2`. It does not read the
-other keys.
+| Case | Rule | Entry |
+| --- | --- | --- |
+| The measurement of this node | PCR0, PCR1 and PCR2 of the document of the giving node equal those of this node. `release_proofs` is not read | None (10.1) |
+| An old release | The three values equal those of one element of the list of old releases, and the `release` of the binding of the giving node equals the `release` of that element. `release_proofs` is not read | `grant_transferred_in` |
+| A measurement with a public build proof | `release_proofs` passes every check of 9.4 for the three values, and the `release` of the binding of the giving node equals the `release` of the release statement of the proofs | `grant_transferred_in` |
 
-The log entry: the operator signs the bytes of the statement with the release key (ECDSA P-256
-with SHA-256, the signature in ASN.1 DER) and records the signature in a log of the table as an
-entry of the kind `hashedrekord`.
+The cases are tried in the order of each table. In every case no PCR is all zero, and the other
+steps of 10.1 apply: the two nodes run on one platform, the binding of the other node names the
+log store of this node (step 3a) and no role or the role `reserve` (step 3b). For a node whose
+measurement no other case accepts, a call that carries no `release_proofs`, and a call whose
+`release_proofs` fails a check of 9.4, ends with `peer_unverified`. A node of platform `local`
+reads no release proofs: a local document states no measurement, and the peers of such a node
+are those of 10.1.
 
-In a log of the form Rekor v1 the body of the entry is, after its standard base64 is decoded:
-
-```text
-{"apiVersion":"0.0.1","kind":"hashedrekord","spec":{
-   "data":{"hash":{"algorithm":"sha256","value":"<lower-case hex SHA-256 of the statement>"}},
-   "signature":{"content":"<standard base64 of the signature>",
-                "publicKey":{"content":"<standard base64 of the PEM of the release public key>"}}}}
-```
-
-The log returns the body with the time at which it took the entry, the index of the entry, its
-log identifier and the signed entry timestamp. The signed entry timestamp is the signature of the
-log key (ECDSA P-256 with SHA-256, ASN.1 DER) over the UTF-8 bytes of
+The list of old releases is compiled into the node program
+(`enclave/release/predecessors.json`), so it is part of its measurement:
 
 ```text
-{"body":"<body>","integratedTime":<integrated_time>,"logID":"<log_id>","logIndex":<log_index>}
+[{"release":"v2.3.0","pcr0":"<96 hex>","pcr1":"<96 hex>","pcr2":"<96 hex>"}, ...]
 ```
 
-with the keys in this order, without white space, `<body>` as the standard base64 string the log
-returned, and the two integers in decimal.
+It holds the releases that were built before the build workflow of section 9 and have no public
+build proof, each with the values of its `measurements.json`: v1.5.2, v2.0.0, v2.0.1, v2.1.0,
+v2.2.0 and v2.3.0. A release that the build workflow built is not put on the list: it is
+accepted by its proof. A node reads the list once, when it starts. It does not start when the
+list is not a JSON array of such elements, when the `release` of an element has not the form of
+the name of a release (9.1), or when a PCR of an element is not 96 lower-case hexadecimal
+characters or is all zero.
 
-In a log of the form Rekor v2 the body of the entry is, after its standard base64 is decoded:
-
-```text
-{"apiVersion":"0.0.2","kind":"hashedrekord","spec":{"hashedRekordV002":{
-   "data":{"algorithm":"SHA2_256","digest":"<standard base64 of the SHA-256 of the statement>"},
-   "signature":{"content":"<standard base64 of the signature>",
-                "verifier":{"keyDetails":"PKIX_ECDSA_P256_SHA_256",
-                            "publicKey":{"rawBytes":"<standard base64 of the DER of the release public key>"}}}}}}
-```
-
-The log writes the body without white space and with the keys of every object in the order of
-their bytes. The entry is a leaf of the Merkle tree of the log (RFC 6962 section 2.1): the hash
-of the leaf is the SHA-256 of the byte 0x00 and the decoded body, and the hash of an inner node
-is the SHA-256 of the byte 0x01, the hash of its left child and the hash of its right child. The
-log returns the body with the index of the entry, the hashes of the audit path from the leaf to
-the root of a tree (RFC 6962 section 2.1.1) and the checkpoint of that tree. A checkpoint
-(c2sp.org/tlog-checkpoint) is the text
-
-```text
-<the origin of the log>\n
-<the number of leaves of the tree, in decimal>\n
-<standard base64 of the 32 bytes of the root hash>\n
-\n
-— <the origin of the log> <standard base64 of 4 + 64 bytes>\n
-— <the name of a witness> <standard base64>\n
-```
-
-where `\n` is one line feed and every line of the text ends with it, and where each of the lines
-after the empty line begins with U+2014 and a space. The three lines in front of the empty line,
-each with its line feed, are the note. The 4 bytes of the line of the log are the first four bytes
-of its log identifier, and the 64 bytes are the Ed25519 signature of the log key over the UTF-8
-bytes of the note. A checkpoint may hold further lines in the note, behind the root hash, and the
-lines of any number of witnesses.
-
-The endorsement is the value of the key `endorsement` of `peer/export`. Its `entry` has the form
-of its log:
-
-```text
-endorsement = JSON {"statement": b64u(the bytes of the statement), "entry": entry}
-
-entry of a log of the form Rekor v1:
-  {"log_id":"<64 lower-case hexadecimal characters>",
-   "body":"<standard base64, exactly as the log returned it>",
-   "integrated_time":0,"log_index":0,
-   "signed_entry_timestamp":"<standard base64>"}
-
-entry of a log of the form Rekor v2:
-  {"log_id":"<64 lower-case hexadecimal characters>",
-   "body":"<standard base64, exactly as the log returned it>",
-   "inclusion_proof":{"log_index":0,
-                      "hashes":["<64 lower-case hexadecimal characters>", ...],
-                      "checkpoint":"<the checkpoint, exactly as the log returned it, its line feeds included>"}}
-```
-
-`hashes` is the audit path from the leaf upwards. A node reads the keys of the form of the log of
-the entry and no other key: an entry may hold the keys of both forms, and the size of the tree and
-its root hash beside the checkpoint (the form of the release proof of the secure program), which a
-node does not read.
-
-The rules of the giving node (`peer/export` with `endorsement`). Every check must hold. The failure
-code of each of them is `peer_unverified`:
-
-| Check | Rule |
-| --- | --- |
-| 1 | The statement is at most 16,384 bytes long and is a JSON object whose `release` is a string and whose `pcr0`, `pcr1` and `pcr2` are 96 lower-case hexadecimal characters each. A statement that holds one of these four keys twice is refused |
-| 2 | `entry.log_id` equals the log identifier of a log of the table of the node. Checks 3 to 5 are those of the form of that log |
-| 3, Rekor v1 | `entry.integrated_time` and `entry.log_index` are non-negative integers, and `entry.signed_entry_timestamp` is a string. `entry.body` consists only of the characters `A` to `Z`, `a` to `z`, `0` to `9`, `+`, `/` and `=`. `entry.signed_entry_timestamp`, decoded with standard base64, is a signature of the log key over the bytes above, built from `entry.body`, `entry.integrated_time`, the log identifier of check 2 and `entry.log_index` |
-| 3, Rekor v2 | `entry.inclusion_proof` is an object whose `log_index` is a non-negative integer, whose `checkpoint` is a string and whose `hashes` is an array of at most 64 strings. The checkpoint passes the rules below, which give the size of a tree and its root hash. `entry.body` decodes with standard base64, and every element of `hashes` is 64 lower-case hexadecimal characters. `log_index` is below the size, and with `leaf = SHA-256(0x00 ∥ the decoded body)`, `fn = log_index` and `sn = size − 1` the path computation of check 9 of "The secure program release" ends with `sn = 0` and with the root hash of the checkpoint |
-| 4, Rekor v1 | `entry.body`, decoded with standard base64, is a JSON object with `apiVersion` `"0.0.1"`, `kind` `"hashedrekord"` and `spec.data.hash.algorithm` `"sha256"`. Its `spec.data.hash.value` equals the lower-case hexadecimal SHA-256 of the statement. Its `spec.signature.publicKey.content`, decoded with standard base64 and then as PEM, gives DER bytes that equal the DER of the release key of the node. Its `spec.signature.content`, decoded with standard base64, is a signature of the release key over the bytes of the statement |
-| 4, Rekor v2 | The decoded body is a JSON object with `apiVersion` `"0.0.2"` and `kind` `"hashedrekord"`, and with `r = spec.hashedRekordV002`: `r.data.algorithm` is `"SHA2_256"`. `r.data.digest`, decoded with standard base64, equals the SHA-256 of the statement. `r.signature.verifier.keyDetails` is `"PKIX_ECDSA_P256_SHA_256"`, and `r.signature.verifier.publicKey.rawBytes`, decoded with standard base64, equals the DER of the release key of the node. `r.signature.content`, decoded with standard base64, is a signature of the release key over the bytes of the statement. Each of the keys named here is a string or an object as its use says, and a body in which one of them occurs twice in its object is refused. The other keys of the body are not read |
-| 5 | Rekor v1: `entry.integrated_time` lies at most 300 seconds after the time of the node. The notice period is the age an entry must have before its statement counts: with a notice period above zero, `entry.integrated_time` plus the notice period is not after the time of the node, and the 300 seconds do not shorten the period. Rekor v2: the entry states no time, and it counts while the notice period is 0 seconds. The notice period is 0 seconds |
-| 6 | The release of the statement is later than the release of the node, in the order below. A node whose own release is not a release tag (for example `dev`) accepts no endorsement |
-| 7 | The receiving node: its attestation response verifies by step 1 of 10.1 on platform `nitro`, and the platform of this node is `nitro` (a node of platform `local` accepts no endorsement). PCR0, PCR1 and PCR2 of its document equal those of the statement, not those of this node. No PCR is all zero. The `release` of its binding equals the `release` of the statement. Its binding names the log store of this node (step 3a of 10.1) and no role or the role `reserve` (step 3b of 10.1) |
-
-The rules of the checkpoint of check 3 for a log of the form Rekor v2:
-
-- The checkpoint is at most 262,144 bytes long and holds `"\n\n"`. The part before the first
-  `"\n\n"`, followed by one `"\n"`, is the note.
-- The first line of the note equals the origin of the log. The second line is the size of the
-  tree: a decimal number without a leading zero (a lone `0` is a number) that fits an unsigned
-  64-bit integer. The third line, decoded with standard base64, is the 32 bytes of the root hash.
-  Further lines of the note are not read: the signature of the log covers them.
-- A line of the part after the first `"\n\n"` is a line of the log when it is `"— "` (U+2014 and
-  a space), the origin of the log, one space and the standard base64 of bytes whose first four
-  equal the first four bytes of the log identifier. The checkpoint holds at least one line of the
-  log, and in every line of the log the bytes after the first four are an Ed25519 signature of the
-  log key over the UTF-8 bytes of the note (RFC 8032, 64 bytes). A line of the log that is no
-  such signature refuses the checkpoint, also beside one that is.
-- Every other line is not read: the signature of a witness, a line of another key under the
-  name of the log, a line of a name that begins with the origin of the log.
-
-After check 7 the call continues with step 4 of 10.1. A call without `endorsement` follows 10.1.
-When `endorsement` is present, the checks above apply and step 3 of 10.1 does not: a node of the
-measurement of the giving node is not the node of the statement.
-
-The rule of the receiving node (`peer/import`): in step 1 of the receiving node of 10.1, the
-measurement of the giving node is accepted when PCR0, PCR1 and PCR2 equal those of this node, or
-when they equal those of one element of the list of predecessors and the `release` of the binding
-of the giving node equals the `release` of that element. The other steps are those of 10.1. A node
-reads the list once, when it starts. It does not start when the list is not a JSON array of such
-elements, when the `release` of an element is not a release tag or is not earlier than the release
-of the node, or when a PCR of an element is all zero. A node whose own release is not a release
-tag starts with the empty list only.
-
-The order of releases: a release tag is `v{major}.{minor}.{patch}` or
-`v{major}.{minor}.{patch}-rc.{n}`. Each number is decimal without a leading zero (a lone `0` is a
-number) and fits an unsigned 32-bit integer. Releases are ordered by major, then minor, then patch,
-each as a number. Of two releases with the same three numbers, the one with `-rc.{n}` is earlier
-than the one without, and of two with `-rc.{n}` the one with the smaller `n` is earlier. A text of
-any other form is not a release tag and has no place in the order.
-
-- A transfer between two releases goes from the earlier release to the later one. It takes place
-  when both programs agree: the giving node verified the endorsement of the later release, and the
-  program of the later release lists the giving release as a predecessor with the measurement of
-  the giving node.
-- A statement counts only with its entry in a public log of the table. A release that received
-  delegations under this section has its statement hash, signed by the release key, in a log from
-  which no entry is removed.
-- Who reads the log. `rekor.sigstore.dev` answers a search by public key, and the monitor of this
-  repository reads every entry of the release key in it and compares it with the releases
-  (enclave.md 11.2). So every endorsement a node of this release accepts is an entry the monitor
-  reads. A log of the form Rekor v2 has no search: an entry of the release key in it is found by
-  reading the entries of the log from its tiles. Such a log gets a row in a release whose
-  monitor reads it in that way. What tells an account that its key went to a release it does not
-  accept is its own log (the item on the entry `grant_transferred_out` below), which rests on no
-  monitor.
-- A node sends no request to a log. The entry and what the log returned with it are bytes of the
-  call, and the verdict depends on them, on the values compiled into the node and, for the time
-  of an entry of a log of the form Rekor v1, on the clock of the node.
-- What the two forms show. The signed entry timestamp is the statement of a log of the form
-  Rekor v1, signed with its key, that it took the entry at that time. A node verifies no
-  inclusion proof of such an entry: that the log holds every entry it signed a timestamp for
-  rests on the operation of Sigstore Rekor. The inclusion proof of an entry of a log of the form
-  Rekor v2 shows that the entry is a leaf of a tree whose head the log signed. Neither shows
-  that the log presents the same tree to every reader: a node reads no signature of a witness.
-- A node verifies an entry of a log of its table and of no other log. An entry that a log holds
-  stays valid after the log stopped taking entries, but the endorsement of a release that is
-  built later needs a log that still takes entries. So the endorsement of a release is recorded
-  in a log that the table of every release in service has. Sigstore, the operator of
+- No order of releases. A node compares the release of a binding with the release of a statement
+  or of an element of the list for equality, and compares no release with its own. It hands
+  delegations to a release whose proof holds whatever the name of that release is, a name that
+  sorts before its own included. The name of a tag is chosen by whoever pushes it, so a
+  comparison of names holds nobody who can push a tag: an old source under a higher name passes
+  it.
+- No key of the operator. A giving node of this release asks for no signature of the operator,
+  and no public key of the operator is compiled into it. What the operator cannot make is a
+  proof for an enclave whose source is not a public tag of this repository: the certificate of a
+  proof is issued to a run of the build workflow, and the record of it is in the transparency
+  log (9.5). What a party that can push a tag to this repository and that carries the calls
+  between the nodes can do is move delegations to an enclave built from that tag: its source, its
+  tag and its commit are public then, and so is the record of its attestation.
+- A transfer between two releases takes place when the receiving node accepts the giving node as
+  well: by its own measurement, by its list of old releases, or by the release proofs of the
+  giving node, which the `peer/import` call carries.
+- The nodes of an old release follow the rules of their own release, which this release cannot
+  change. Such a node hands delegations to a node of this release by 10.3 of the document of its
+  tag: it asks for the endorsement of the receiving release, the signature of the release key of
+  the operator over the release statement with the record of that signature in
+  `rekor.sigstore.dev`, and for a release name later than its own, where a release name has the
+  form `v{major}.{minor}.{patch}` or `v{major}.{minor}.{patch}-rc.{n}`. So while nodes of an old
+  release are to hand their delegations to a release, the operator makes that endorsement for
+  it, outside this repository, and names the release in that form. A node of this release
+  neither makes nor reads an endorsement.
+- A node sends no request to the certificate authority or to the log and reads no clock for a
+  proof. The proofs are bytes of the call, and the verdict depends on them, on the attestation
+  document of the other node and on the values compiled into the node (9.5).
+- A proof has no end: a node accepts the proofs of a release for as long as that node runs.
+- No notice period lies between the entry of the log and a transfer: a node hands delegations to
+  a release as soon as a call carries its proofs. An account does not learn of a release before
+  its delegation can move there. What it learns from is its own log (the last item below).
+- The values of a node are those of the day its release was built (9.3). A release that is built
+  after the certificate authority of Sigstore changed its certificates, after
+  `rekor.sigstore.dev` stopped taking entries or changed its key, or by a build workflow outside
+  the list of a node, has no proof that node takes: the node hands it no delegation, and the
+  nodes of that release receive their delegations from the apps (10.1). Sigstore, the operator of
   `rekor.sigstore.dev`, has stated that it will announce the end of the uploads to that log one
-  year ahead, and that it replaces a log of the form Rekor v2 by a log with another key and
-  another origin about every six months (the announcement of the general availability of Rekor
-  v2 and its documentation, as of 2026-11-23). When Sigstore announces the end of the uploads
-  to a log of the tables in service, a release whose table has a log that goes on taking
-  entries, and whose monitor reads that log, is built and endorsed while a log of the tables in
-  service still takes entries. When no log of the table of a node takes entries any more, that
-  node hands no delegation to a release that is endorsed after that, and the nodes of that
-  release receive their delegations from the apps (10.1). A workflow of this repository
-  compares, every hour, the transparency logs of the trusted root that the TUF repository of
-  Sigstore distributes with the ones of the copy of that trusted root in this repository, to
-  which a test ties the table of this release: a log the copy does not name, a log of the copy
-  that the trusted root no longer names, and an end of the validity of a log open an issue
-  (enclave.md 11.2). The workflow tells people that the table may have to follow. It checks no
-  signature of the TUF repository, and no node depends on it.
-- An endorsement is a public value and has no end: a node of an earlier release accepts it for as
-  long as that node runs. The age of the entry is looked at in check 5 only.
+  year ahead (the announcement of the general availability of Rekor v2, as of 2026-11-23). A
+  workflow of this repository compares, every hour, the transparency logs of the trusted root
+  that the TUF repository of Sigstore distributes with the ones of the copy of that trusted root
+  in this repository, to which a test ties the key of the log of this release, and opens an
+  issue when they differ (enclave.md 11.2). The workflow tells people that the values may have to
+  follow. It checks no signature of the TUF repository, it does not compare the certificate
+  authorities of the trusted root, and no node depends on it.
+- The trusted root of Sigstore names a second log, `log2025-1.rekor.sigstore.dev`, of the form
+  Rekor v2 (as of 2026-11-23). A node holds no key for it and takes no entry of it: that log
+  signs no entry timestamp, so an entry of it has not the form of V4 (9.4).
 - The account sees the transfer on its log: the entry `grant_transferred_out` of the giving node
-  names the receiving node, its release and its measurement (7.2). So a reader learns from its own
-  log which program received its key, and whether that is a program it accepts (7.4). The
-  measurement on the entry is the one the giving node verified: the values of the statement the
-  release key signed, which the attestation document of the receiving node states (check 7). A
-  giving node of a release before v2.4.0 names the receiving node only.
-- The releases before v2.4.0 hold the key of `rekor.sigstore.dev` and no table, and read the keys
-  of an entry of the form Rekor v1 alone. The endorsement of a release that such a node hands
-  delegations to is recorded in that log.
+  names the receiving node, its release and its measurement (7.2). So a reader learns from its
+  own log which program received its key, and whether that is a program it accepts (7.4). The
+  measurement on the entry is the one the giving node verified: the values of the release
+  statement of the proofs, which the attestation document of the receiving node states. A giving
+  node of a release before v2.4.0 names the receiving node only.
 
 ### 10.4 The delegation subset
 
@@ -2041,7 +2167,7 @@ redirect. The response passes rule E4 of the egress policy before any part of it
 | `invalid_request` | A violation of a form, a length or a required key. A call of a path that is not defined and a call with a method that is not allowed have this code too |
 | `unsupported_version` | `v` is not 1 (envelope, command, record) |
 | `wrong_node`, `open_failed`, `bad_signature`, `bad_challenge`, `bad_expiry`, `unsupported_policy`, `custody_mismatch` | Failures of command processing (5.3). `custody_mismatch` means that the `custody` of the grant is not the custody of the platform of that node |
-| `peer_unverified` | The attestation response of a peer does not verify, or its platform, its measurement or its log store is not one this node accepts (10.1). The endorsement of a later release fails a check of 10.3. The node a use of a vault secret is to be sealed to is not a node of the forward role of the measurement of this node (10.5) |
+| `peer_unverified` | The attestation response of a peer does not verify, or its platform, its measurement or its log store is not one this node accepts (10.1). The release proofs of a peer of another release fail a check of 9.4, or the binding of that peer names another release than their statement (10.3). The node a use of a vault secret is to be sealed to is not a node of the forward role of the measurement of this node (10.5) |
 | `user_mismatch` | The `user_id` of a command is not the account of the call (5.3). The `user_id` of a record is not the account of the call (section 6). The account of a pending authorization is not the account of the call |
 | `internal` | A failure of the platform (the attestation device, the random source), or a call that needs the state of an account the node halted after a fault (enclave.md 3.1). The call performed no act, and another node that holds the delegation of the account can take it |
 | `not_configured` | The operator configuration has not arrived yet |
@@ -2076,18 +2202,18 @@ redirect. The response passes rule E4 of the egress policy before any part of it
 | Longest time a node keeps receiving the response of a token address call of `refresh` after the time limit of the call, counted from the start of the call (`TOKEN_LATE_LIMIT`, enclave.md 5.7) | 120 seconds |
 | Token address calls of `refresh` a node continues after their time limit at once (`REFRESH_LATE_TASKS`) | 128 |
 | Most accounts in one delegation transfer | 1,000 |
-| Most nodes of a later release that a node hands one grant to (10.1) | 64 |
+| Most nodes of another release that a node hands one grant to (10.1) | 64 |
 | Nodes a delegation subset names (`pods`, 10.4) | 1 to 1,024 |
 | Nodes per account of a delegation subset (`copies`, 10.4) | Without `groups`: 1 to `pods` (a larger value names every node). With `groups`: at least 1, and `skip + copies` at most the number of different group names |
 | Longest name of a group of a delegation subset (10.4) | 63 bytes |
 | Span numbers of a delegation subset (`span_number` and the two ends of `span`, 10.4) | 0 to 4,294,967,295 |
 | Most pruned accounts in one page of `grants/prune` (10.4, enclave.md 5.15) | 1,000 |
 | Most accounts one `grants/prune` call looks at (`SCAN_LIMIT`) | 10,000 |
-| Longest release statement (10.3) | 16,384 bytes |
-| Notice period of a release (10.3) | 0 seconds |
-| Longest time by which a log entry lies after the time of the node (10.3) | 300 seconds |
-| Longest checkpoint of the inclusion proof of a log entry (10.3) | 262,144 bytes |
-| Most hashes of the audit path of the inclusion proof of a log entry (10.3) | 64 |
+| Longest release statement (9.1) | 16,384 bytes |
+| Longest `statement` of release proofs before it is decoded (9.4) | 32,768 UTF-16 code units |
+| Longest attestation of release proofs, as JSON without white space (9.4) | 65,536 bytes |
+| Most arrays and objects inside one another of a JSON value of release proofs (9.4) | 32 |
+| Most hashes of the audit path of the inclusion proof of a log entry (9.4) | 64 |
 | Most events in one entry (`ENTRY_EVENTS`) | 128 |
 | Most bytes of the plaintext of one entry (`ENTRY_PLAINTEXT_BYTES`) | 1,048,576 |
 | Events of GET requests without a body that a node remembers for one account at one time (`MERGE_KEYS`, 7.2) | 8,192 |
@@ -2149,7 +2275,7 @@ name ends with `_text` holds the same value again as UTF-8 text.
 | `record` | `user_key`, `id`, `nonce`, `user_id`, `key_id`, `custody`, `kind`, `provider`, `plaintext`, `aad_text`, `record_key`, `record` (the finished record), `tampered` (records with one field changed each, and `opens: false`. One of them has a changed `custody`), `imported` (a record of kind `oauth_imported` under the same user key: `id`, `nonce`, `kind`, `provider`, `plaintext`, `aad_text`, `record_key`, `record`) | A record created from the same input equals `record`, and the records of `tampered` do not open. The record of `imported` opens under `user_key` and has the plaintext form of kind `oauth` |
 | `command` | The node keys (`node_sign_seed`, `node_sign_pk`, `node_seal_private`, `node_seal_pk`, `node`), the `info` and the `aad` of HPKE, the signature purpose, `cases` (`name`, `envelope`, `result`, `opens`, the opened `payload` and `sig`, `signature_valid`) | A node implementation opens the envelope and gives `result` (`ok` for a success, the code of 5.3 for a failure) |
 | `signed` | `authorization_url_text`, `cases` (`name`, the signature purpose, `public_key`, `body`, `sig`, `valid`): replies, the two statements about an authorization, heads, a challenge statement, and changed ones (among them a reply offered under the purpose string of a challenge statement) | Every case verifies as `valid` says. The `url_sha256` of the `oauth_begin` statement is the hash of `authorization_url_text` |
-| `log_v3` | Format 3: the node signing public key and `node`, `user_id`, `key_id`, `log_private`, `log_pk`, the HPKE info and the signature purpose as text, the two prefixes of the account, `entries` (four entries of one node: a control entry `grant_accepted`, a use entry with three `provider_request` events, a use entry with one `secret_released` event, a control entry `grant_transferred_out` to a later release; each with `seq`, `hpke_seed`, `time_ms`, `kind`, `count`, `events_text`, `entry`, `body_text`, `body_hash`, `key`), `control_listing` and `use_listing` (the keys of each prefix in the order of a listing), `verifies`, `rejected` (three objects that are not the entry of their key: the body of another entry, the signature of another node, a key of another `seq`; each with `key`, `entry` and `result`: `body`, `signature` or `fields`), `not_keys` (strings that are no keys of format 3 of the account) with `a_key_of_not_keys_parses` false, and `node_document` (the `key`, the `bucket`, the `nonce` and the text in front of the key in its hash, `binding_text`, `document_text` and `object_text` of a node document of platform `local`, `accepted`, and `rejected`: a document with another nonce, an object with another release, the object read as the document of another node) | Every key parses to the parts of its entry, every entry verifies against its key (7.4) and opens to `events_text`, an entry created with the same `hpke_seed` equals `entry`, the listings are in the order of the bytes of the keys (the latest entry first), the objects of `rejected` fail with their `result`, no string of `not_keys` is a key, and the node document reads as `accepted` says (7.7) |
+| `log_v3` | Format 3: the node signing public key and `node`, `user_id`, `key_id`, `log_private`, `log_pk`, the HPKE info and the signature purpose as text, the two prefixes of the account, `entries` (four entries of one node: a control entry `grant_accepted`, a use entry with three `provider_request` events, a use entry with one `secret_released` event, a control entry `grant_transferred_out` to another release; each with `seq`, `hpke_seed`, `time_ms`, `kind`, `count`, `events_text`, `entry`, `body_text`, `body_hash`, `key`), `control_listing` and `use_listing` (the keys of each prefix in the order of a listing), `verifies`, `rejected` (three objects that are not the entry of their key: the body of another entry, the signature of another node, a key of another `seq`; each with `key`, `entry` and `result`: `body`, `signature` or `fields`), `not_keys` (strings that are no keys of format 3 of the account) with `a_key_of_not_keys_parses` false, and `node_document` (the `key`, the `bucket`, the `nonce` and the text in front of the key in its hash, `binding_text`, `document_text` and `object_text` of a node document of platform `local`, `accepted`, and `rejected`: a document with another nonce, an object with another release, the object read as the document of another node) | Every key parses to the parts of its entry, every entry verifies against its key (7.4) and opens to `events_text`, an entry created with the same `hpke_seed` equals `entry`, the listings are in the order of the bytes of the keys (the latest entry first), the objects of `rejected` fail with their `result`, no string of `not_keys` is a key, and the node document reads as `accepted` says (7.7) |
 | `log_store` | `stores` (five log stores by the bucket name of their binding: `bucket`, `region`, `host`, `shards`, `first_bucket`, `last_bucket`, and `owners`: for three `user_id` values and one node identifier the `hash`, the `index` and the `bucket`), `longest_name` (a bucket name of 49 characters and its first bucket), `name_without_buckets` (a bucket name of 50 characters: `first_bucket` is null) | The number of buckets, their names and the bucket of every owner follow from the bucket name of the binding by 7.6 |
 | `log` | Format 2: the node signing public key, `user_id`, `key_id`, `log_private`, `log_pk`, `checkpoint`, `entries` (three entries: a control entry `grant_accepted`, a use entry with three `provider_request` events, a use entry with one `secret_released` event; each with `seq`, `hpke_seed`, `time_ms`, `kind`, `count`, `events_text`, `entry`, `body_text`, `body_hash`, `entry_hash`, `key`), `head_nonce`, `head`, `final_head`, `index_valid` (the keys alone verify to the head), `content_valid`, `missing_middle` (the keys without the middle one: `index_valid` false), `forged_key` (the keys with one more key of `seq` 2 whose `body_hash` is another and whose `entry_hash` is consistent with it: `ambiguous_seq` 2, and the content verification takes the genuine object alone) | The index verification of the keys and the content verification of the entries give these results, every entry opens to `events_text`, and an entry created with the same `hpke_seed` equals `entry` |
 | `log_v1` | The vector `log` of format 1 as the releases before v2.0.0 wrote it: the node signing public key, `user_id`, `key_id`, `log_private`, `log_pk`, `checkpoint`, `entries` (three entries: `seq`, `hpke_seed`, `time_ms`, `event_text`, `entry`, `entry_hash`), `head_nonce`, `head`, `final_head`, `chain_valid`, `missing_middle` | A reader of format 1 verifies the chain with the same result and opens every entry to `event_text` |
@@ -2162,11 +2288,38 @@ name ends with `_text` holds the same value again as UTF-8 text.
 | `header_values` | `placeholder_text`, `refused_schemes` and `cases`: values of the header of a slot `header:<name>` with `valid`, whether a node of the forward role puts the value in the place of the placeholder (10.5) | The same |
 | `subset` | `cases`: a pool of `pods` nodes with `copies` nodes per account, `skip`, and with or without `groups`, each with `assign`, the ordinals that hold the delegation of `user_id` in the order the account takes them; without `groups` also `ranked`, every ordinal in the order of its rank; with `groups` also `group_order`, the groups in the order of the account, and `group_ranked`, the ordinals of each of those groups by their rank. `pools`: the placements of two pools with the same groups (`calls`: `copies` 2, `skip` 0; `reserve`: `copies` 1, `skip` 2) and, for six accounts, the nodes of the account in both and the three groups of those nodes. `objects`: `subset` objects of a request, each with `valid`. `spans`: `numbers`, the `number` of the span of six accounts; `contains`, `subset` objects with and without a `span`, each with a `user_id` and whether the share of `pod` holds that account (`contains`); `fleet`, the spans of three pools that divide the span numbers (`pools`) and the one pool of each of the six accounts (`accounts`); `objects`, `subset` objects with a `span`, each with `valid` | A node and the backend of the operator compute `assign` for every case (10.4): the node to select the share of a node, the backend to list the nodes of an account. The nodes of an account in the two pools lie in three different groups. A node reads an object with `valid` true and answers `invalid_request` to one with `valid` false. Both compute `number` for every account of `spans`, and `contains` from the span and the assignment: the node to select the share of a node of a pool with a span, the backend to name the pool of an account. Every account of `fleet` is in the span of its pool and in no other |
 | `transfer` | The keys of the giving node and of the receiving node, `payload_text`, `signed`, `envelope`, `hpke_seed`, the result that the receiving node opened (`grants`), and `cases`: an envelope with a changed ciphertext (`opens: false`), a transfer signed by another key (`signature_valid: false`), an envelope for another node | A receiving node implementation opens the envelope and obtains the same list of grants (10.1) |
-| `endorsement` | The endorsements of one release statement (`statement_text`, of the release `release`) for a giving node with the release key `release_key_pem` and the table `logs`: a log of the form Rekor v1 (`form` `rekor_v1`, `key_pem`, `log_id`) and a log of the form Rekor v2 (`form` `rekor_v2`, `origin`, `key_pem`, `log_id`). `cases`: `name`, the release of the giving node (`own_release`), its clock in seconds (`now_s`), the `endorsement` in the encodings of 10.3 (not all in b64u: the body of an entry is standard base64 and a hash is hexadecimal), `accepted`, and `check`, the number of the check of 10.3 that fails (null for an accepted one). The cases hold an entry of each form that is accepted and, for each of the checks 1 to 6, entries that fail it. The two ECDSA signatures of the vectors (of the release key over the statement, of the log of the form Rekor v1 over its entry) are constants of the generator | A verifier of an endorsement gives `accepted` on every case and, for a refusal, fails at the check `check`. The script of the operator that makes an endorsement verifies its output with the same rules (10.3) |
 
 Of these, the tests of the app use `key_derivation`, `record`, `signed`, `log` and
 `attestation.local`. Opening a `command` and computing a `totp` code are the work of a node. The
 tests of the app open the envelopes that the app created themselves and check them.
+
+`protocol/vectors/release-proofs.json` holds the shared cases of the release proofs (section 9):
+the file that holds the verifiers of this repository to one verdict. Every implementation of the
+checks of 9.4 must give the verdict the file states on every case: the node implementation,
+whose test `protocol/tests/release_proofs.rs` reads the file, and `proveRelease` of the secure
+program of the apps.
+`protocol/vectors/release_proofs.py` writes the file from fixed keys and with deterministic
+signatures, so the same script gives the same bytes, and its option `--check` fails when the
+committed file differs ([protocol/vectors/README.md](../protocol/vectors/README.md)). The script
+shares no code with a verifier. The top level is
+`{"v":1,"description":...,"trusts":{...},"cases":[...]}`:
+
+| Key | What it holds |
+| --- | --- |
+| `trusts` | The values of a verifier (9.3), by a name: `fulcio_root` and `fulcio_intermediate` (the DER of the two certificates, b64u), `log_keys` (the DER of the SubjectPublicKeyInfo of each log key, b64u), `issuer` (the issuer of the tokens), `repository`, `repository_id`, `owner_id`, and `builders` (the list of build workflows). The keys behind these values are keys of the script, which signs the certificates, the envelopes and the entries of the cases with them. The name `source` is not a member of `trusts`: it stands for the values of the verifier itself, the certificates of Sigstore, the key of Rekor and the list of build workflows of this source |
+| `cases` | Per case: `name`, `trust` (a name of `trusts`, or `source`), `measurement` (`pcr0`, `pcr1` and `pcr2`: the measurement the proofs are verified for), `release_proofs_text` (the JSON text of `release_proofs`. It is a text so that a case can hold what a parsed value does not: a member that occurs twice, a number outside the finite ones, a text that is no JSON), `accepted`, `release` (the `release` of the statement of an accepted case, null for a refused one) and `rule` (null for an accepted case, and for a refused one the check of 9.4 that refuses it: `form`, or `V1` to `V7`) |
+
+A verifier parses `release_proofs_text` with its own reader of JSON, and a text that reader
+refuses is a case of the rule `form`. Under a trust whose two certificates are not the root
+certificate and the intermediate certificate of one certificate authority, every case is refused
+at `V3`. A verifier gives `accepted` on every case, and the check at which it refuses a case is
+the `rule` of the case. The cases hold proofs that pass and, for the form and for each of the
+checks V1 to V7, proofs that fail it and proofs at its bounds. The cases of the trust `source`
+are made of the published proofs of two releases of this repository, whose files are in
+`protocol/vectors/published/`: the proofs of the release candidate `v2.4.0-rc.1`, which the build
+workflow of the list of this source built, pass; the same proofs with one place changed are
+refused; and the attestation of the release `v2.3.0`, which the job of the release workflow of
+that tag made, is refused at `V6`, because that workflow is no build workflow of the list.
 
 
 ## Mail statements and records
@@ -2230,7 +2383,7 @@ The release statement is one JSON object serialized to bytes by these rules:
   lower-case hexadecimal characters. `git_commit` is the commit the tag points to (an annotated tag
   is peeled), 40 lower-case hexadecimal characters. `repository` is
   `"pickle-com/credential-enclave"`. `path` is `"secure-program/secure-program.js"`.
-- At most 16,384 bytes, the limit of 10.3.
+- At most 16,384 bytes.
 
 ```text
 {"kind":"secure-program","release":"secure-program-v27","version":27,"sha256":"<64 hex>","git_commit":"<40 hex>","repository":"pickle-com/credential-enclave","path":"secure-program/secure-program.js"}
@@ -2240,20 +2393,27 @@ The release statement is one JSON object serialized to bytes by these rules:
 (enclave.md 11.2) runs it for the pushed tag and attaches the result to the GitHub release of the
 tag as `statement.json`, next to the file.
 
-A node does not take this statement for an endorsement of 10.3: check 1 of 10.3 requires `pcr0`,
-`pcr1` and `pcr2`, which this statement does not have. The two kinds of statement are signed by the
-same release key and do not mix.
+A node of this release reads no statement that the release key signed (10.3). A node of a release
+before v2.4.0 does not take this statement for the endorsement of a node release: the first check
+of an endorsement requires `pcr0`, `pcr1` and `pcr2`, which this statement does not have. So the
+two kinds of statement that the release key signs do not mix.
 
 ### The entry of the log
 
 The operator signs the bytes of the statement with the release key (ECDSA P-256 with SHA-256, the
 signature in ASN.1 DER) and records the signature in Rekor (rekor.sigstore.dev) as an entry of the
-kind `hashedrekord`, version 0.0.1: the body of a log of the form Rekor v1 of 10.3, with the
-SHA-256 of the statement in
-`spec.data.hash.value`, the signature in `spec.signature.content` and the PEM of the release public
-key in `spec.signature.publicKey.content`. The log returns the body, the time at which it took the
+kind `hashedrekord`, version 0.0.1. The body of the entry is, after its standard base64 is decoded:
+
+```text
+{"apiVersion":"0.0.1","kind":"hashedrekord","spec":{
+   "data":{"hash":{"algorithm":"sha256","value":"<lower-case hex SHA-256 of the statement>"}},
+   "signature":{"content":"<standard base64 of the signature>",
+                "publicKey":{"content":"<standard base64 of the PEM of the release public key>"}}}}
+```
+
+The log returns the body, the time at which it took the
 entry (`integratedTime`), the global index of the entry (`logIndex`), the log identifier (`logID`),
-the signed entry timestamp (the signature of the log key over the bytes stated in 10.3) and the
+the signed entry timestamp (the signature of the log key over the bytes of check 8 below) and the
 inclusion proof: the index of the leaf in the active shard of the log (`inclusionProof.logIndex`,
 a value other than the global index), the size of the tree (`treeSize`), the root hash
 (`rootHash`), the hashes of the path from the leaf to the root (`hashes`) and the checkpoint, a
@@ -2285,8 +2445,8 @@ Two values are compiled into the apps and into the verification tool of this rep
 
 | Value | What it is |
 | --- | --- |
-| The release key | The public key of the operator, the key of 10.3: `enclave/release/release-key.pem`. The apps hold the DER of its SubjectPublicKeyInfo |
-| The log key table | The public keys of the transparency log, by log identifier (the lower-case hexadecimal SHA-256 of the DER of the key: the log identifier of a log of the form Rekor v1 of 10.3). The identifier `c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d` maps to `enclave/release/rekor-key.pem`. When the log signs with a new key, an app release adds a row; an app of an older build verifies no entry of the new key. The ten checks below are those of an entry of a log of the form Rekor v1: this table holds no log of the form Rekor v2, and the release proof of a program is an entry of rekor.sigstore.dev |
+| The release key | The public key of the operator, ECDSA P-256: `enclave/release/release-key.pem`. The apps hold the DER of its SubjectPublicKeyInfo. The node program does not hold it (10.3) |
+| The log key table | The public keys of the transparency log, by log identifier (the lower-case hexadecimal SHA-256 of the DER of the key: the log identifier of 9.3). The identifier `c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d` maps to `enclave/release/rekor-key.pem`. When the log signs with a new key, an app release adds a row; an app of an older build verifies no entry of the new key. The ten checks below are those of an entry of a log of the form Rekor v1, a log that signs an entry timestamp: this table holds no log of another form, and the release proof of a program is an entry of rekor.sigstore.dev |
 
 ### The verification
 
@@ -2295,9 +2455,8 @@ The input is the bytes of the served program, the version the program declares (
 log key table. The ten checks run in this order, and the first one that fails ends the
 verification with its code. An app logs a failure as `secure program rejected: release proof {code}`
 and does not load the program; the assembly of the backend refuses a bundle whose proof fails; the
-tool prints `program release: failed: {code}: {detail}`. No check reads a clock: the notice period
-is 0 seconds, as in 10.3. A decoding that fails (base64, UTF-8, JSON, hexadecimal) is a failure of
-the check that reads the value.
+tool prints `program release: failed: {code}: {detail}`. No check reads a clock. A decoding that
+fails (base64, UTF-8, JSON, hexadecimal) is a failure of the check that reads the value.
 
 | Check | Rule | Code |
 | --- | --- | --- |

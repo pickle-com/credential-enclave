@@ -1122,23 +1122,23 @@ async fn a_revoke_erases_the_key_whatever_the_store_answers() {
 /// The node of `harness` as a peer that runs the program of the release `release`: a peer the
 /// test states as accepted (which peer a node accepts is tested in `crate::attest`).
 fn peer_of(harness: &Harness, release: &str) -> Peer {
-    Peer::accepted_for_tests(&harness.node.keys, Program::Release(release.to_string()))
-}
-
-/// One page of the delegations of `giving` for `peer`, a node of a later release.
-async fn export_later(giving: &Harness, peer: &Peer) -> (u16, Value) {
-    let later = ReleaseMeasurement {
-        release: "v9.0.0".to_string(),
+    let other = ReleaseMeasurement {
+        release: release.to_string(),
         pcrs: [[0x11; 48], [0x22; 48], [0x33; 48]],
     };
-    match export_to(&giving.node, peer, Some(&later), "", 1000, None).await {
+    Peer::accepted_for_tests(&harness.node.keys, Program::Release(other))
+}
+
+/// One page of the delegations of `giving` for `peer`, a node of another release.
+async fn export_later(giving: &Harness, peer: &Peer) -> (u16, Value) {
+    match export_to(&giving.node, peer, "", 1000, None).await {
         Ok(exported) => (200, serde_json::to_value(&exported).unwrap()),
         Err(error) => (error.status.as_u16(), json!({"code": error.code})),
     }
 }
 
 #[tokio::test]
-async fn an_export_to_a_later_release_hands_a_grant_over_only_after_the_store_confirmed_its_entry()
+async fn an_export_to_another_release_hands_a_grant_over_only_after_the_store_confirmed_its_entry()
 {
     let (provider, store) = stand_in().await;
     let old = Harness::with(&provider, Definitions::embedded(), short_write_limits());
@@ -1243,7 +1243,7 @@ async fn an_export_to_a_later_release_hands_a_grant_over_only_after_the_store_co
     assert_eq!(exported["logs"], json!([{"user_id": "alice", "seq": 6}]));
     assert_eq!((old.last_seq("alice"), old.last_seq("bob")), (6, 3));
 
-    // A node whose credentials for the log store ended hands nothing to a later release,
+    // A node whose credentials for the log store ended hands nothing to another release,
     // before an entry is created, and still hands its grants to a node of its own program:
     // that transfer writes nothing.
     let fourth = Harness::new(&provider);
@@ -1765,7 +1765,7 @@ async fn a_revoke_that_is_accepted_while_an_export_waits_for_the_store_leaves_no
     let for_the_revoke = alice.attest(&old).await;
     let before = writes(&provider).len();
 
-    // The transfer goes to a node of a later release: its entries are written before a grant
+    // The transfer goes to a node of another release: its entries are written before a grant
     // is handed over, and the account is free while they are.
     lock(&store).pause = Duration::from_millis(400);
     let revoke = async {

@@ -1,9 +1,11 @@
 # Fixtures of the attestation tests and of the release tests
 
 Test inputs of the tests in `protocol/src/attestation.rs`, `protocol/src/release.rs`,
-`protocol/tests/endorsement_vectors.rs`, `enclave/src/attest.rs`, `enclave/src/lineage.rs`,
-`enclave/src/platform/nitro.rs`, `enclave/src/tests/peer.rs` and `verify/src/`. Only tests read
-them: no built program contains them.
+`protocol/src/certificate.rs`, `protocol/src/release_proofs.rs`, `enclave/src/attest.rs`,
+`enclave/src/lineage.rs`, `enclave/src/platform/nitro.rs`, `enclave/src/tests/peer.rs` and
+`verify/src/`. Only tests read them: no built program contains them. The shared cases of the
+release proofs and the published proofs of two releases are in `protocol/vectors/`, which has a
+README of its own.
 
 The certificate of a Nitro attestation document is valid for about three hours. The tests
 pass at any time because the verification validates the certificate chain at the time the
@@ -64,12 +66,12 @@ document states, not at the time of the machine.
 ## `rekor-entry-150000000.json`
 
 - What it is: the entry with the index 150,000,000 of the transparency log Rekor of
-  rekor.sigstore.dev, in the form of the `entry` of an endorsement (protocol.md 10.3): `body`
-  (a `hashedrekord` of version 0.0.1 of another signer, in standard base64), `integrated_time`
-  (1732051154, 2024-11-19T21:19:14Z), `log_index`, `log_id` and `signed_entry_timestamp`. The
-  key `uuid` is the identifier of the entry in the log. The tests verify the signed entry
-  timestamp with the log key of the node program (`enclave/release/rekor-key.pem`): this fixes
-  the bytes the log signs for an entry.
+  rekor.sigstore.dev, as an object of what the log returned for it: `body` (a `hashedrekord` of
+  version 0.0.1 of another signer, in standard base64), `integrated_time` (1732051154,
+  2024-11-19T21:19:14Z), `log_index`, `log_id` and `signed_entry_timestamp`. The key `uuid` is
+  the identifier of the entry in the log. The tests verify the signed entry timestamp with the
+  log key of the node program (`enclave/release/rekor-key.pem`): this fixes, against a real
+  entry, the bytes the log signs for an entry (protocol.md 9.4, rule 4 of the entry).
 - Origin: the response of `GET https://rekor.sigstore.dev/api/v1/log/entries?logIndex=150000000`.
   `body` is the `body` of that response without a change. `integrated_time`, `log_index`,
   `log_id` and `signed_entry_timestamp` are its `integratedTime`, `logIndex`, `logID` and
@@ -78,40 +80,13 @@ document states, not at the time of the machine.
   repository (Apache License 2.0).
 - SHA-256: `c340515579e40b7305f1ad7a5c868291edcd589fd06de23f082bc82bfbf53954`
 
-## `rekor-log2025-1-entry-200000163.json`
-
-- What it is: the entry with the index 200,000,163 of the transparency log
-  log2025-1.rekor.sigstore.dev, a log of the form Rekor v2, in the form of the `entry` of an
-  endorsement (protocol.md 10.3): `log_id` (the log identifier of that log), `body` (a
-  `hashedrekord` of version 0.0.2 under the ECDSA P-256 public key of another signer, in
-  standard base64: the form of the entry of a key its holder keeps, which the entry of the
-  release key has) and `inclusion_proof` with `log_index`, `hashes` (the audit path of the
-  entry in a tree of 212,315,329 leaves, 28 hashes in lower-case hexadecimal) and `checkpoint`
-  (the note of that tree head with the signature of the log and the signatures of four
-  witnesses). The tests verify the checkpoint and the audit path with the key of that log
-  (`rekor-log2025-1-key.pem` below): this fixes, against a real entry, the hash of the leaf
-  of an entry, the bytes the log signs for a tree head, the key ID of its signature and the
-  form of the body.
-- Origin: read from the log on 2026-11-23 by the read addresses of a tiled log
-  (c2sp.org/tlog-tiles): `GET https://log2025-1.rekor.sigstore.dev/api/v2/checkpoint` for the
-  checkpoint, the entry bundle `api/v2/tile/entries/x781/250` for the body (its entry 163),
-  and the hash tiles `api/v2/tile/0/x781/250`, `api/v2/tile/0/x829/356.p/193`,
-  `api/v2/tile/1/x003/051`, `api/v2/tile/1/x003/239.p/172`, `api/v2/tile/2/011`,
-  `api/v2/tile/2/012.p/167` and `api/v2/tile/3/000.p/12` for the audit path, which is computed
-  from them by RFC 6962 section 2.1.1. `body` is the bytes of the entry in standard base64,
-  and the checkpoint is the text of the response without a change.
-- License: the entry is a public record of the log. The file is under the license of this
-  repository (Apache License 2.0).
-- SHA-256: `f73aa39da77b5bc1257a0640bf1f2a3abb326a02132c3658763aad73391c81a8`
-
 ## `rekor-log2025-1-key.pem`
 
 - What it is: the public key of the transparency log log2025-1.rekor.sigstore.dev (Ed25519, a
-  SubjectPublicKeyInfo in PEM), a log of the form Rekor v2. No program holds it: the table of
-  transparency logs of the node program has no row for that log, which the monitor of this
-  repository does not read (protocol.md 10.3). The tests of the form Rekor v2 verify a real
-  entry of the log with it, and the tests of `enclave/src/lineage.rs` compare it with the
-  trusted root below.
+  SubjectPublicKeyInfo in PEM), a log of the form Rekor v2. No program holds it: a node takes no
+  entry of that log, which signs no entry timestamp and which the monitor of this repository
+  does not read (protocol.md 10.3). The test of `enclave/src/lineage.rs` names it as the one
+  transparency log of the trusted root below that the node program holds no key for.
 - Origin: the `publicKey.rawBytes` of the transparency log `https://log2025-1.rekor.sigstore.dev`
   of `sigstore-trusted-root.json` below, in PEM.
 - License: a public key is a public value. The file is under the license of this repository
@@ -125,14 +100,19 @@ document states, not at the time of the machine.
   key (`publicKey.rawBytes`, the DER of the SubjectPublicKeyInfo in standard base64, with
   `keyDetails`) and its log identifier (`logId.keyId`, in standard base64): rekor.sigstore.dev
   (ECDSA P-256, valid from 2021-01-12) and log2025-1.rekor.sigstore.dev (Ed25519, valid from
-  2025-09-23). The test of `enclave/src/lineage.rs` compares the table of transparency logs of
-  the node program with it: every log of the file has a row with its key, and the log
-  identifier of that row is the one the file states. The workflow `trusted-root-monitor.yml`
-  compares the `tlogs` of the trusted root that the TUF repository of Sigstore distributes with
-  the `tlogs` of this file every hour (`secure-program/monitor.py --trusted-root`, enclave.md
-  11.2): when they differ, this file is replaced by the trusted root as it is distributed then,
-  and the table and the test follow. The other parts of the file (the certificate authorities,
-  the certificate transparency logs, the timestamp authority) are not read.
+  2025-09-23). Its `certificateAuthorities` names the certificate authorities of that instance,
+  each with its certificate chain (`certChain.certificates`, the DER of each certificate in
+  standard base64) and its validity. The test of `enclave/src/lineage.rs` compares the values of
+  the node program with it (`enclave/release/`): every log of the file is the log of
+  `rekor-key.pem`, with the log identifier the file states, or the log of
+  `rekor-log2025-1-key.pem` above, and the two certificates of the node program are the chain
+  of the one certificate authority of the file whose validity has no end. The workflow
+  `trusted-root-monitor.yml` compares the `tlogs` of the trusted root that the TUF repository
+  of Sigstore distributes with the `tlogs` of this file every hour
+  (`secure-program/monitor.py --trusted-root`, enclave.md 11.2): when they differ, this file is
+  replaced by the trusted root as it is distributed then, and the values and the test follow.
+  The other parts of the file (the certificate transparency logs, the timestamp authority) are
+  not read.
 - Origin: `targets/trusted_root.json` of the repository
   <https://github.com/sigstore/root-signing>, as of its commit
   `c09d62f9397fcff8b98b5bcd2dc9044a4f853cd4` (2026-11-23), without a change. The TUF
@@ -143,47 +123,25 @@ document states, not at the time of the machine.
   `LICENSE` file at the root of this repository.
 - SHA-256: `6494e21ea73fa7ee769f85f57d5a3e6a08725eae1e38c755fc3517c9e6bc0b66`
 
-## `endorsement-vectors.json`
+## `fulcio-certificate-v2.4.0-rc.1.der`
 
-- What it is: 22 endorsements for the test `protocol/tests/endorsement_vectors.rs`, made by an
-  implementation that shares no code with this repository (Python with the `cryptography`
-  package). `release_key_pem` and `log_key_pem` are a test release key and a test log key
-  (ECDSA P-256, made for this file; their private keys were not kept). Each element of `cases`
-  holds a `name`, the `endorsement` (protocol.md 10.3), the release of the giving node
-  (`own_release`), its clock in Unix epoch seconds (`now`) and the verdict `ok`. Four cases
-  hold. Each of the others breaks one check: the log id, the signed entry timestamp (another
-  log key, a changed time, a changed index), the hash of the statement, the logged public key,
-  the release signature, the time of the entry, the order of releases, the form of the
-  statement, and the alphabet of the body.
-- Origin: generated by the maintainers of this repository.
-- License: the license of this repository (Apache License 2.0).
-- SHA-256: `7436ad9b3d4c32053531f1aed5d3f326ac43d9a5893b186f66a25743aa103246`
-
-## `endorsement-vectors-rekor-v2.json`
-
-- What it is: 108 endorsements for the test `protocol/tests/endorsement_vectors.rs`, made by an
-  implementation that shares no code with this repository (Python with the `cryptography`
-  package), for a giving node whose table holds a log of each form. `release_key_pem` is a test
-  release key (ECDSA P-256), `log_origin`, `log_key_pem` and `log_id` are the origin, the key
-  (Ed25519) and the log identifier of a test log of the form Rekor v2, and
-  `rekor_v1_log_key_pem` is the key (ECDSA P-256) of a test log of the form Rekor v1. The keys
-  were made for this file, and their private halves were not kept. Each element of `cases`
-  holds a `name`, the `endorsement` (protocol.md 10.3), the release of the giving node
-  (`own_release`), its clock in Unix epoch seconds (`now`) and the verdict `ok`. 22 cases hold:
-  an entry at different places of trees of 1 to 257 leaves, a checkpoint with the signatures
-  of witnesses, with an extension line and with a line of another key under the name of the
-  log, an entry with keys a node does not read, a body with a key a node does not read, and an
-  entry of the log of the form Rekor v1. Each of the others breaks one rule: the log
-  identifier, the form of the entry of its log, the inclusion proof as a value, the checkpoint
-  (no signature of the log, the signature of another key, another key ID, another name, a
-  second line of the log that does not verify, another origin, a size or a root that is not
-  the one the log signed or does not have its form, a line the log did not sign), the audit
-  path (a changed, missing or added hash, a hash of another form, another index, the path of
-  another entry, the checkpoint of a later tree, another body than the leaf), the body (the
-  record of another statement or of another key, another signature, another version, kind,
-  algorithm or kind of key, a certificate in the place of the key, a key that occurs twice,
-  the record of the other form), the statement, the order of releases, and the shape of the
-  endorsement.
-- Origin: generated by the maintainers of this repository.
-- License: the license of this repository (Apache License 2.0).
-- SHA-256: `1be71b82fda3f394da9f8eb630e929bfef5ad02681782656fc0c5fa06c1a5f9c`
+- What it is: the certificate of the attestation of the release statement of the release
+  candidate `v2.4.0-rc.1` of this repository (X.509, DER, 1930 bytes): the certificate that the
+  certificate authority of the public instance of Sigstore issued to the job of the build
+  workflow that built that release, for an ECDSA P-256 key, valid from 2026-11-24T17:48:31Z to
+  2026-11-24T17:58:31Z, under the intermediate certificate
+  `enclave/release/fulcio-intermediate.pem`. Its extensions `1.3.6.1.4.1.57264.1.{number}` state
+  the run: the build workflow `.github/workflows/enclave-build.yml` at the commit
+  `3f84e8368fcdf1f89e42ca629670bfe0989b6f13` (9 and 10), a runner GitHub hosts (11), the
+  repository `https://github.com/pickle-com/credential-enclave` with the identifiers
+  `1400118248` and `151645824` (12, 15 and 17), the commit
+  `4c21e0083064aec5300f6f8472a796607e83d9f3` and the ref `refs/tags/v2.4.0-rc.1` (13 and 14), the
+  push that started the run (20) and the visibility `public` (22). The tests read the
+  certificate and its extensions with the reader of the protocol crate, verify that the
+  intermediate certificate issued it, and validate its path at the two ends of its validity.
+- Origin: `verificationMaterial.certificate.rawBytes` of
+  `protocol/vectors/published/v2.4.0-rc.1/release-statement.sigstore.json`, decoded from
+  standard base64 without a change.
+- License: a certificate of a public attestation is a public value. The file is under the
+  license of this repository (Apache License 2.0).
+- SHA-256: `409a56076de2836d460b02ccf40fb00a73dc77a4c3472d2c4c2118f5af2ec443`

@@ -234,8 +234,9 @@ pub struct ActiveGrant {
     pub custody: Custody,
     pub user_key: Secret<[u8; 32]>,
     pub not_after_ms: u64,
-    /// The nodes of a later release this grant was handed to (`peer/export` with an
-    /// endorsement), at most 64. The node created the entry `grant_transferred_out` that names
+    /// The nodes of another release this grant was handed to (`peer/export` to a node whose
+    /// measurement release proofs show), at most 64. The node created the entry
+    /// `grant_transferred_out` that names
     /// a node of this list, so a repeated transfer to it creates none. A grant command that
     /// puts a grant in place where none of that key was in force, a revoke, the end of the
     /// grant and a transfer this node takes put a new state in place, and a new grant state
@@ -244,7 +245,7 @@ pub struct ActiveGrant {
     pub exported_to: Vec<Handover>,
 }
 
-/// One node of a later release a grant was handed to, and the entry that says so.
+/// One node of another release a grant was handed to, and the entry that says so.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Handover {
     /// The signing public key of the receiving node.
@@ -255,7 +256,7 @@ pub struct Handover {
 }
 
 impl ActiveGrant {
-    /// The entry that says that this grant was handed to the node `peer` of a later release,
+    /// The entry that says that this grant was handed to the node `peer` of another release,
     /// when it was.
     pub fn handed_to(&self, peer: &[u8; 32]) -> Option<u64> {
         self.exported_to
@@ -1264,8 +1265,8 @@ pub struct Node {
     pub custody: Custody,
     /// The release tag compiled into the binary.
     pub release: &'static str,
-    /// The release key, the table of transparency logs and the predecessors of this
-    /// release (`crate::lineage`).
+    /// What this node verifies the release proofs of another release with, and the old
+    /// releases it takes delegations from (`crate::lineage`).
     pub lineage: Lineage,
     pub started_ms: u64,
     pub closing: AtomicBool,
@@ -2062,25 +2063,26 @@ pub mod events {
         })
     }
 
-    /// The event of a transfer to a node of a later release (protocol.md 10.3). `to` is the
-    /// node the delegation was sealed for, and `later` the release and the measurement of
-    /// that node: the statement the release key signed, which the attestation document of the
-    /// node carries. With them the account reads from its log which program received its key.
-    /// A transfer to a node of the measurement of this node creates no event.
-    pub fn grant_transferred_out(to: &str, later: &ReleaseMeasurement) -> Value {
-        let [pcr0, pcr1, pcr2] = later.pcrs.map(|pcr| hex(&pcr));
+    /// The event of a transfer to a node of another release (protocol.md 10.3). `to` is the
+    /// node the delegation was sealed for, and `other` the release and the measurement of
+    /// that node: the measurement of its verified attestation document, which the release
+    /// proofs of the call show, and the release its binding names. With them the account
+    /// reads from its log which program received its key. A transfer to a node of the
+    /// measurement of this node creates no event.
+    pub fn grant_transferred_out(to: &str, other: &ReleaseMeasurement) -> Value {
+        let [pcr0, pcr1, pcr2] = other.pcrs.map(|pcr| hex(&pcr));
         json!({
             "t": "grant_transferred_out",
             "time_ms": TIME_MS,
             "to": to,
-            "release": later.release,
+            "release": other.release,
             "pcr0": pcr0,
             "pcr1": pcr1,
             "pcr2": pcr2,
         })
     }
 
-    /// The event of a transfer this node took from a node of an earlier release (protocol.md
+    /// The event of a transfer this node took from a node of another release (protocol.md
     /// 10.3). `from` is the node that gave the delegation and `release` the release of that
     /// node, as its binding names it. `not_after_ms` is the end the receiving node accepted.
     pub fn grant_transferred_in(
