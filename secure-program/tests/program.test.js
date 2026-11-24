@@ -82,6 +82,15 @@ function writeLedger(fx, settings, nodes) {
   return ledger;
 }
 
+/** A sealed ledger of the backend for the key of a fixture that holds text: sealed with the key
+ *  derived from the master key for it, as the program seals the ledger it uploads. */
+function sealedLedger(fx, text) {
+  const key = Buffer.from(crypto.hkdfSync("sha256", fx.keys.masterKey, Buffer.alloc(0), utf8("pickle.secure.v1.ledger"), 32));
+  const nonce = crypto.randomBytes(12);
+  const aad = utf8("pickle.secure.v1.ledger\n" + fx.world.userId + "\n" + fx.keys.keyId);
+  return { key_id: fx.keys.keyId, nonce: b64u(nonce), ct: b64u(bridge.aeadSeal("chacha20poly1305", key, nonce, aad, utf8(text))) };
+}
+
 /** The ledger the program keeps in the key store. */
 function readLedger(fx) {
   const kept = fx.world.keychain.get("com.pickle.client.secure.ledger\n" + fx.world.userId);
@@ -1088,6 +1097,21 @@ test("A3: a request of a round that fails on its way counts as held back by what
   assert.equal(held.world.stored("log.blocked").count, 1);
   // (The account query of the synchronization, and the one the round asked after the failure.)
   assert.equal(held.world.sent("GET /api/secure/account").length, asked + 2);
+  // A request for bodies fails on its way (it is sent once more, and fails again), and the
+  // backend answers the request the round sends after it, the listing addresses of a chain:
+  // the request was held back, and the round asks for no account.
+  const after = S.fixture(source, { nodes: 1, legacy: 1 });
+  await S.start(after);
+  after.world.advance(HOUR_MS);
+  after.nodes[0].record("c", [{ t: "grant_revoked", time_ms: after.world.now }]);
+  after.world.advance(25 * HOUR_MS);
+  after.world.fault("POST /api/secure/log/bodies", "transport");
+  after.world.fault("POST /api/secure/log/store/listings", { delay_ms: 50 });
+  const queries = after.world.sent("GET /api/secure/account").length;
+  await S.event(after, "foreground");
+  assert.equal(after.world.state.log.store, "blocked");
+  assert.equal(after.world.state.log.store_failure, "bodies:transport");
+  assert.equal(after.world.sent("GET /api/secure/account").length, queries + 1);
 });
 
 test("A3: what counts as a read the operator domain holds back", async () => {
@@ -1526,6 +1550,12 @@ test("a read that ends because the app was suspended counts nothing: a round who
   const late = await untilListed(() => fx.program.procedures.read_log_page({ before_ms: before }));
   world.advance(10 * 60000);
   assert.equal((await ended(late)).code, "timeout");
+  // The same when the request fails on its way and that failure arrives first, once the runtime
+  // runs again after the time of the procedure.
+  world.fault("POST /api/secure/log/read", { delay_ms: 5000, fail: "transport" }, 1);
+  const cut = await untilListed(() => fx.program.procedures.read_log_page({ before_ms: before }));
+  world.advance(10 * 60000);
+  assert.equal((await ended(cut)).code, "timeout");
 });
 
 test("A1: a measurement that held the key marks the log at an event of the app once the device first saw it a day ago and this runtime read within the hour that no later program is served, whatever the reads of the log answer: a runtime states nothing before it has read what is served", async () => {
@@ -3714,7 +3744,7 @@ test("A1: objects someone else wrote under the seq of a transfer in a chain of f
   assert.deepEqual(other.securityStatuses.slice(-1)[0].reasons, ["verification_blocked"]);
 });
 
-test("A3: a chain of format 2 whose listing goes on over pages that hold many objects under one seq keeps the rounds from its end and marks the log, and a long chain a node wrote is read on round after round without a count", async () => {
+test("A3: a chain of format 2 whose listing goes on over pages that hold many objects under one seq keeps the rounds from its end and marks the log, and a long chain a node wrote is read on by rounds that follow one another and catch up", async () => {
   // A use entry and then a transfer to a node of a measurement no list has. Under the seq of
   // the use entry, more objects than the listing pages of a round hold (pages of ten object
   // versions): the rounds do not reach the transfer.
@@ -3748,21 +3778,81 @@ test("A3: a chain of format 2 whose listing goes on over pages that hold many ob
   assert.equal(world.state.log.newer_release_nodes, 0);
 
   // 9,000 entries a node wrote, one object under each seq, in listing pages of 1,000: a round
-  // lists four pages, and the rounds after it read on. Nothing is counted.
+  // lists four pages, and the rounds that follow it at once read on. Each of them read on
+  // through what the node wrote, so none counts, and the synchronization reads the chain to its
+  // end.
   const long = S.fixture(source, { nodes: 0, legacy: 1 });
   for (let i = 0; i < 9000; i += 1) {
     long.world.advance(1000);
     long.legacy[0].record("u", [S.providerRequest(long.world.now)]);
   }
   await S.start(long);
-  const walked = [long.world.state.log.status];
-  for (let day = 0; day < 2; day += 1) {
-    await nextDay(long);
-    walked.push(long.world.state.log.status);
-    assert.equal(long.world.stored("log.round").unfinished, 0, "day " + day);
-    assert.equal(long.world.stored("log.blocked").count, 0, "day " + day);
+  await long.world.settle(60000);
+  assert.deepEqual(long.world.reports.map((report) => report.status), ["pending", "pending", "verified"]);
+  assert.equal(long.world.stored("log.round").unfinished, 0);
+  assert.equal(long.world.stored("log.blocked").count, 0);
+  assert.equal(long.world.state.log.status, "verified");
+});
+
+test("the rounds that read a long chain on catch up while they read what its node wrote before they began to fall behind, thirty-two of them in a row at most: a chain whose node wrote more than that many rounds read, and a chain whose node goes on writing faster than the rounds read, leave rounds that count, and the log is marked as for any reads held back", async () => {
+  // The store answers a listing with pages of ten object versions: a round reads a chain on
+  // over four of them.
+  const rows = async (fx, days) => {
+    const out = [];
+    for (let day = 0; day < days; day += 1) {
+      await nextDay(fx);
+      await fx.world.settle(5 * 60000);
+      const round = fx.world.stored("log.round");
+      out.push(fx.world.state.log.status + ":" + round.unfinished + ":" + round.caught + ":" + fx.world.stored("log.blocked").count);
+    }
+    return out;
+  };
+  const use = (fx, count) => {
+    for (let i = 0; i < count; i += 1) {
+      fx.world.advance(1);
+      fx.legacy[0].record("u", [S.providerRequest(fx.world.now)]);
+    }
+  };
+
+  // 1,000 use entries the node wrote while the device was away: the rounds of four
+  // synchronizations read them, none of them counts, and nothing marks the log.
+  const away = S.fixture(source, { nodes: 0, legacy: 1, device: { securityStatus: true } });
+  await S.start(away);
+  away.world.pageSize = 10;
+  use(away, 1000);
+  assert.deepEqual(await rows(away, 4), ["pending:0:8:0", "pending:0:16:0", "pending:0:24:0", "verified:0:0:0"]);
+  assert.equal(away.world.securityStatuses.some((told) => told.status === "attention"), false);
+
+  // 2,600 of them: after thirty-two rounds that caught up the rounds count, beyond eight of
+  // those the first round of a synchronization is a round held back, and the log is marked
+  // when three of them were counted and the first is three days old. The rounds read on all the
+  // while, and the log verifies when they reach the end.
+  const piled = S.fixture(source, { nodes: 0, legacy: 1, device: { securityStatus: true } });
+  await S.start(piled);
+  piled.world.pageSize = 10;
+  use(piled, 2600);
+  assert.deepEqual(await rows(piled, 10), [
+    "pending:0:8:0", "pending:0:16:0", "pending:0:24:0", "pending:0:32:0", "pending:8:32:0", "pending:16:32:1",
+    "pending:24:32:2", "pending:32:32:3", "attention:40:32:4", "verified:0:0:0",
+  ]);
+  assert.deepEqual(piled.world.securityStatuses.filter((told) => told.status === "attention").slice(-1)[0].reasons, ["verification_blocked"]);
+
+  // A node that goes on writing 400 use entries a day, more than the rounds of a day read: once
+  // the rounds read nothing but entries written after they began to fall behind, they count,
+  // though fewer than thirty-two rounds caught up.
+  const flooded = S.fixture(source, { nodes: 0, legacy: 1, device: { securityStatus: true } });
+  await S.start(flooded);
+  flooded.world.pageSize = 10;
+  const states = [];
+  for (let day = 0; day < 7; day += 1) {
+    use(flooded, 400);
+    states.push((await rows(flooded, 1))[0]);
   }
-  assert.deepEqual(walked, ["pending", "pending", "verified"]);
+  assert.deepEqual(states, [
+    "pending:0:8:0", "pending:5:11:0", "pending:13:11:0", "pending:21:11:1", "pending:29:11:2", "pending:37:11:3",
+    "attention:45:11:4",
+  ]);
+  assert.deepEqual(flooded.world.securityStatuses.slice(-1)[0].reasons, ["verification_blocked"]);
 });
 
 /** Writes an object no node signed under the seq of a chain of format 2 (chain: the prefix of the
@@ -4671,6 +4761,8 @@ test("a procedure that needs a node holding the grant ends with program_stale in
       if (stale) world.account.servedProgram = fx.version + 1;
       await S.start(fx);
       assert.equal(world.runtime.program_stale, stale, label);
+      // (The ledger is one this program reads: that is not why the runtime is behind.)
+      assert.equal(world.runtime.ledger_ahead, false, label);
       const code = stale ? "program_stale" : nodes === "later" ? "attestation_failed" : "grant_required";
       assert.deepEqual(await S.call(fx, "connect", { target: "github" }), { ok: false, code: code }, label);
       assert.deepEqual(await S.call(fx, "store_login", { name: "example.com", username: "u", password: "p" }), { ok: false, code: code }, label);
@@ -5976,6 +6068,7 @@ test("a runtime that reads a node ledger of a form it does not know hands no gra
     const world = fx.world;
     assert.equal(world.state.grant.state, "active");
     assert.equal(world.runtime.program_stale, false);
+    assert.equal(world.runtime.ledger_ahead, false);
     // Another device of the account, which runs a later program, turns the delegation off: the
     // nodes take its revoke, and the ledger item of the account is written in the form of that
     // program.
@@ -5987,6 +6080,7 @@ test("a runtime that reads a node ledger of a form it does not know hands no gra
     const kept = item(world).value;
     const before = commands(fx);
     const copy = world.store.get("ledger");
+    const attested = world.sent("GET /api/secure/nodes").length;
     // Days of synchronizations, pushes that ask for a grant, and new runtimes.
     for (let day = 0; day < 4; day += 1) {
       world.advance(25 * HOUR_MS);
@@ -5994,8 +6088,12 @@ test("a runtime that reads a node ledger of a form it does not know hands no gra
       await S.event(fx, "push", { reason: "grant_required" });
       await S.start(fx);
       assert.equal(world.runtime.program_stale, true, shape + " day " + day);
+      // (The screens are told why: the ledger is one of a later program.)
+      assert.equal(world.runtime.ledger_ahead, true, shape + " day " + day);
     }
     assert.deepEqual(commands(fx), before, shape);
+    // (No node was asked for its attestation either.)
+    assert.equal(world.sent("GET /api/secure/nodes").length, attested, shape);
     assert.equal(item(world).value, kept, shape);
     assert.equal(world.store.get("ledger"), copy, shape);
     for (const node of fx.nodes.concat(fx.legacy)) assert.equal(node.grants.has(world.userId), false, shape);
@@ -6013,7 +6111,10 @@ test("a runtime that reads a node ledger of a form it does not know hands no gra
     // The user turns the delegation off on this device: the ledger cannot be written, so no
     // revoke goes to a node, the ledger stays as it is on both sides, and the call says
     // program_stale. What the user is told (the call failed) is what is the case.
+    const read = world.sent("GET /api/secure/ledger").length;
     assert.deepEqual(await S.call(fx, "set_delegation", { enabled: false }), { ok: false, code: "program_stale" }, shape);
+    // (The call ends before it asks for anything: the sealed ledger is not read either.)
+    assert.equal(world.sent("GET /api/secure/ledger").length, read, shape);
     assert.deepEqual(commands(fx), before, shape);
     assert.equal(item(world).value, kept, shape);
     assert.equal(world.store.get("ledger"), copy, shape);
@@ -6021,6 +6122,24 @@ test("a runtime that reads a node ledger of a form it does not know hands no gra
     world.advance(25 * HOUR_MS);
     await S.event(fx, "foreground");
     assert.deepEqual(commands(fx), before, shape);
+    // The key of the account is replaced on this device (another key was registered meanwhile):
+    // the ledger item of the later program stays as it is, no node is sent anything, and the
+    // runtime goes on saying that the program is behind.
+    world.account.key = { sign_pk: "", log_pk: "", key_id: "00112233445566aa" };
+    await S.start(fx);
+    assert.equal(world.state.key_state, "mismatch", shape);
+    assert.equal((await S.call(fx, "reset_key")).ok, true, shape);
+    assert.equal(world.state.key_state, "present", shape);
+    assert.equal(item(world).value, kept, shape);
+    assert.equal(world.runtime.program_stale, true, shape);
+    assert.deepEqual(commands(fx), before, shape);
+    // The ledger item holds a value this program reads again (the device copy, written back):
+    // the two published values are false with the next step.
+    world.keychain.set("com.pickle.client.secure.ledger\n" + world.userId, { value: b64u(utf8(copy)), synchronizable: true });
+    world.advance(HOUR_MS);
+    await S.event(fx, "foreground");
+    assert.equal(world.runtime.program_stale, false, shape);
+    assert.equal(world.runtime.ledger_ahead, false, shape);
   }
   // An account without a ledger value, and a ledger of the form this program reads: as before.
   const plain = S.fixture(source, { nodes: 1, legacy: 1 });
@@ -6086,6 +6205,27 @@ test("a round that is about to mark a log that is not marked asks what is served
   silent.world.advance(2 * HOUR_MS);
   silent.world.fault("GET /api/secure/account", { status: 503, body: {} });
   assert.equal((await S.call(silent, "read_log", { limit: 5 })).value.status, "attention");
+
+  // What the step of the grants writes while a round waits for that answer is kept by the
+  // round. The answer comes eight seconds late, and a push arrives meanwhile: its
+  // synchronization meets a listed node of a measurement no list has and keeps what its
+  // attestation said. The round, which read those values before, writes after it.
+  const met = S.fixture(source, { device: { securityStatus: true } });
+  await S.start(met);
+  conflict(met);
+  met.world.advance(2 * HOUR_MS);
+  const unlisted = met.world.addNode({ release: "v9.0.0", measurement: bridge.randomMeasurement() });
+  met.world.fault("GET /api/secure/account", { delay_ms: 8000 }, 1);
+  const reading = met.program.procedures.read_log({}).then(() => {}, () => {});
+  await met.world.settle(2000);
+  const pushed = Promise.resolve(met.program.onEvent("push", { reason: "grant_required" })).then(() => {}, () => {});
+  await met.world.settle(3000);
+  assert.notEqual(met.world.stored("log.nodes")[unlisted.id], undefined);
+  await met.world.run(Promise.all([reading, pushed]));
+  await met.world.settle(30000);
+  assert.equal(met.world.state.log.status, "attention");
+  assert.notEqual(met.world.stored("log.nodes")[unlisted.id], undefined);
+  assert.equal(Object.values(met.world.stored("log.unaccepted")).filter((item) => item.node === unlisted.id).length, 1);
 
   // Reads held back: the round of the fourth day, started by the screen two hours after the
   // synchronization of that day, would mark the log. A later version served by then ends it
@@ -6170,10 +6310,10 @@ test("a device that comes back to more control entries on a chain of format 2 th
   assert.equal(whole.world.stored("log.round").unfinished, 0);
 
   // A program whose round reads 16 of them (128 in the eight rounds of a synchronization): a
-  // device that synchronizes once a day reads 40 in one day, 300 in three and 700 in six. No
+  // device that synchronizes once a day reads 40 in one day, 300 in three and 500 in four. No
   // round of those days counts, in a new installation and in one that carried the ledger over.
   const small = withChainEntries(16);
-  for (const [backlog, migrated, days] of [[40, false, 1], [300, false, 3], [700, false, 6], [300, true, 3]]) {
+  for (const [backlog, migrated, days] of [[40, false, 1], [300, false, 3], [500, false, 4], [300, true, 3]]) {
     const label = backlog + (migrated ? ", carried over" : ", new");
     const fx = await chainFixture(migrated, small);
     const world = fx.world;
@@ -6190,6 +6330,31 @@ test("a device that comes back to more control entries on a chain of format 2 th
     assert.ok(world.reports.every((report) => report.status !== "attention" && report.blocked_attempts === 0), label);
     assert.ok(world.stored("log.legacy").nodes[fx.legacy[0].id].seq >= backlog, label);
   }
+
+  // Thirty-two rounds of a row count as rounds that catch up (512 of these entries, the reading
+  // of four days). Entries beyond that are read on as before, and the rounds that read them
+  // count as rounds that left reads undone, whatever they read: with 1,400 entries (and the one
+  // the node writes with the grant of each day) the rounds of the fifth day fill the row, the
+  // first round of each day after it is a round held back, the log is marked on the ninth day,
+  // and the round that reaches the end on the twelfth ends the row, the count and the mark.
+  const piled = await chainFixture(false, small);
+  pileEntries(piled, piled.legacy[0], 1400);
+  const rows = [];
+  for (let day = 0; day < 12; day += 1) {
+    piled.world.advance(25 * HOUR_MS);
+    await S.event(piled, "foreground");
+    await piled.world.settle(30000);
+    const round = piled.world.stored("log.round");
+    rows.push(piled.world.state.log.status + ":" + piled.world.stored("log.blocked").count + ":" + round.unfinished + ":" + round.caught);
+  }
+  assert.deepEqual(rows, [
+    "pending:0:0:8", "pending:0:0:16", "pending:0:0:24", "pending:0:0:32", "pending:0:8:32", "pending:1:16:32",
+    "pending:2:24:32", "pending:3:32:32", "attention:4:40:32", "attention:5:48:32", "attention:6:56:32",
+    "verified:0:0:0",
+  ]);
+  assert.equal(piled.world.reports.filter((report) => report.status === "attention")[0].store_failure, "round:unfinished");
+  assert.equal(piled.world.securityStatuses.slice(-1)[0].status, "ok");
+  assert.ok(piled.world.stored("log.legacy").nodes[piled.legacy[0].id].seq >= 1400);
 });
 
 test("control entries that arrive on a chain faster than the device reads them, day after day, are reads held back as before: once the rounds read nothing but entries written after they began to fall behind, they count, and the log is marked; when the entries stop arriving the rounds reach the end and the mark is cleared", async () => {
@@ -6368,13 +6533,15 @@ test("a step whose reading of the sealed ledger fails hands no grant, and the ne
 
   // A sealed ledger of this key that this program does not read (a later program sealed it): no
   // grant, no upload over it, and program_stale.
-  for (const shape of ["sealed otherwise", "another shape"]) {
+  for (const shape of ["sealed otherwise", "another shape", "a later form"]) {
     const later = S.fixture(source);
     const sealed = shape === "another shape" ? { key_id: later.keys.keyId, v: 2, payload: "AAAA" }
-      : { key_id: later.keys.keyId, nonce: b64u(crypto.randomBytes(12)), ct: b64u(crypto.randomBytes(80)) };
+      : shape === "a later form" ? sealedLedger(later, JSON.stringify({ v: 2, switches: [{ off_ms: later.world.now }] }))
+        : { key_id: later.keys.keyId, nonce: b64u(crypto.randomBytes(12)), ct: b64u(crypto.randomBytes(80)) };
     later.world.sharedLedger = sealed;
     await S.start(later);
     assert.equal(later.world.runtime.program_stale, true, shape);
+    assert.equal(later.world.runtime.ledger_ahead, true, shape);
     assert.deepEqual(later.nodes[0].commands, [], shape);
     assert.deepEqual(await S.call(later, "connect", { target: "github" }), { ok: false, code: "program_stale" }, shape);
     assert.deepEqual(await S.call(later, "set_delegation", { enabled: true }), { ok: false, code: "program_stale" }, shape);
@@ -6384,6 +6551,30 @@ test("a step whose reading of the sealed ledger fails hands no grant, and the ne
     assert.equal(later.world.ledgerUploads, 0, shape);
     assert.deepEqual(later.world.sharedLedger, sealed, shape);
   }
+  // A sealed ledger of a later form that arrives after this runtime last read the sealed ledger:
+  // the call that turns the delegation off reads it before it writes anything, sends no revoke,
+  // and says program_stale. The switch stays as it is.
+  const arrived = S.fixture(source);
+  await S.start(arrived);
+  assert.equal(arrived.world.runtime.program_stale, false);
+  arrived.world.sharedLedger = sealedLedger(arrived, JSON.stringify({ v: 2, switches: [] }));
+  const sent = arrived.nodes[0].commands.length;
+  const written = readLedger(arrived);
+  assert.deepEqual(await S.call(arrived, "set_delegation", { enabled: false }), { ok: false, code: "program_stale" });
+  assert.equal(arrived.nodes[0].commands.length, sent);
+  assert.deepEqual(readLedger(arrived), written);
+  assert.equal(arrived.world.runtime.program_stale, true);
+  assert.equal(arrived.world.runtime.ledger_ahead, true);
+  assert.equal(arrived.world.state.grant.state, "active");
+  // (A sealed ledger of the form this program reads, sealed the same way, is merged: the
+  // delegation another device turned off is off.)
+  const merged = S.fixture(source);
+  merged.world.sharedLedger = sealedLedger(merged, JSON.stringify({
+    v: 1, revoked_ms: merged.world.now, resumed_ms: 0, ttl_days: 30, ttl_set_ms: 0, store_failing_ms: 0, discovery_after: "", nodes: {},
+  }));
+  await S.start(merged);
+  assert.equal(merged.world.state.grant.state, "off");
+  assert.equal(merged.world.runtime.program_stale, false);
   // A sealed ledger of another key (the key the account had before) is nothing to merge.
   const old = S.fixture(source);
   old.world.sharedLedger = { key_id: "0123456789abcdef", nonce: b64u(crypto.randomBytes(12)), ct: b64u(crypto.randomBytes(80)) };
@@ -6419,15 +6610,16 @@ test("a setting of the delegation whose upload failed is uploaded by the next st
   assert.equal(node.commands.filter((command) => command.type === "grant").length, handed);
   assert.equal(world.state.grant.state, "off");
 
-  // The same when the read of that exchange fails (twice: it is asked once more): the next
-  // synchronization of the device, whose delegation is off, reads the sealed ledger before its
-  // revokes and uploads what it does not hold.
+  // The same when the reads of the sealed ledger fail (the read before the switch is turned
+  // off and the read of the exchange after it, each asked once more): the switch is turned off
+  // by what this device knows, and the next synchronization of the device, whose delegation is
+  // off, reads the sealed ledger before its revokes and uploads what it does not hold.
   const other = S.fixture(source);
   const pair = twoDevices(other);
   await pair.on("a");
   await pair.on("b");
   await pair.on("a");
-  other.world.fault("GET /api/secure/ledger", { status: 503, body: {} }, 2);
+  other.world.fault("GET /api/secure/ledger", { status: 503, body: {} }, 4);
   assert.equal((await S.call(other, "set_delegation", { enabled: false })).ok, true);
   await other.world.settle(1000);
   assert.equal(other.world.ledgerUploads, 0);
@@ -6588,6 +6780,12 @@ test("a setting of the delegation that is made while an exchange of the ledger i
   const both = twoDevices(fx);
   await both.on("a");
   await both.on("b");
+  // (Device B set a lifetime before: the backend holds a sealed ledger, which an exchange
+  // merges into the ledger of the device and writes.)
+  assert.equal((await S.call(fx, "set_grant_days", { days: 9 })).ok, true);
+  await world.settle(1000);
+  assert.notEqual(world.sharedLedger, null);
+  world.advance(60000);
   await both.on("a");
   // Device A sets a lifetime, and the exchange that uploads it is answered five seconds late:
   // the second request for the sealed ledger of that call (the first is the reading before the
@@ -6638,10 +6836,23 @@ test("a request for bodies that is not answered in its time, or fails on its way
       if (count < 2) return undefined;
       return failure === "timeout" ? { delay_ms: 12000 } : "transport";
     });
+    // (What the device keeps of the row of the rounds when each round begins: the rounds that
+    // left reads undone and counted, and the ones that counted as catching up.)
+    const row = [];
+    world.fault("POST /api/secure/log/read", () => {
+      const round = world.stored("log.round");
+      row.push(round.unfinished + ":" + round.caught);
+      return undefined;
+    });
     world.advance(25 * HOUR_MS);
     await S.event(fx, "foreground");
     await world.settle(20 * 60000);
     assert.equal(world.state.log.status, "verified", failure);
+    // A round one request of which stayed without an answer is no round that catches up, though
+    // the question for the first key was answered and the round judged that entry: the two
+    // rounds that asked that way add to the row, and the round that reads to the end ends it.
+    assert.deepEqual(row, ["0:0", "1:0", "2:0"], failure);
+    assert.equal(world.stored("log.round").unfinished, 0, failure);
     assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 }, failure);
     assert.equal(world.reports.some((report) => report.store === "blocked" || report.store === "unreachable"), false, failure);
     assert.equal(world.securityStatuses.some((told) => told.status === "attention"), false, failure);
@@ -7044,7 +7255,10 @@ test("create_key: a registration whose answer is lost does not leave the account
   // device holds it. The state is absent, and create_key registers a new key in its place.
   await S.start(lost);
   assert.equal(lost.world.state.key_state, "absent");
+  const registrations = lost.world.sent("PUT /api/secure/account/key").length;
   const again = await S.call(lost, "create_key");
+  // (One request: the key of the call is registered in the place of the other at once.)
+  assert.equal(lost.world.sent("PUT /api/secure/account/key").length, registrations + 1);
   assert.equal(again.ok, true);
   assert.equal(again.value.key_state, "present");
   assert.notEqual(again.value.key_id, orphan);
@@ -7116,30 +7330,58 @@ test("a device that holds another key than the one of the account asks for the k
   assert.notEqual(taking.world.stored("log.grants"), undefined);
   assert.equal(readLedger(taking).ttl_days, 7);
   // The account then has the key of the other device registered (that device replaced the key).
+  // (The key store of the device that takes the key: a write of the ledger item fails when told.)
+  const failing = { times: 0 };
+  const broken = (native) => ({
+    keychainSet: (kept) => {
+      if (failing.times > 0 && String(kept.service).endsWith(".ledger")) {
+        failing.times -= 1;
+        throw new bridge.SecureError("keychain_failed", "the write of " + kept.service + " failed");
+      }
+      return native.keychainSet(kept);
+    },
+  });
   taking.world.account.key = giving.world.account.key;
-  await S.start(taking);
+  await startWith(taking, broken);
   assert.equal(taking.world.state.key_state, "mismatch");
   // (Something the device kept of the log of the key it holds.)
   taking.world.store.set("log.denied", JSON.stringify({ pages: [{ t: taking.world.now, before_ms: 5, limit: 50 }], chains: {} }));
-  const begun = await S.call(taking, "begin_transfer", {});
-  assert.equal(begun.ok, true);
-  assert.equal(begun.value.transfer.phase, "requested");
-  await S.event(giving, "push", { reason: "transfer_request" });
-  assert.equal((await S.call(giving, "approve_transfer", {})).value.transfer.phase, "approved");
-  const code = giving.world.runtime.transfer_code;
+  const item = "com.pickle.client.secure.master-key\n" + taking.world.userId;
+  const held = taking.world.keychain.get(item).value;
   const pass = async (turns) => {
     for (let turn = 0; turn < turns; turn += 1) {
       await taking.world.settle(2500);
       await giving.world.settle(2500);
     }
   };
-  await pass(3);
-  assert.equal(taking.world.state.transfer.phase, "code_entry");
-  await S.call(taking, "enter_transfer_code", { code: code });
-  await pass(6);
+  const hand = async () => {
+    const begun = await S.call(taking, "begin_transfer", {});
+    assert.equal(begun.ok, true);
+    assert.equal(begun.value.transfer.phase, "requested");
+    await S.event(giving, "push", { reason: "transfer_request" });
+    assert.equal((await S.call(giving, "approve_transfer", {})).value.transfer.phase, "approved");
+    const code = giving.world.runtime.transfer_code;
+    await pass(3);
+    assert.equal(taking.world.state.transfer.phase, "code_entry");
+    await S.call(taking, "enter_transfer_code", { code: code });
+    await pass(6);
+  };
+  // The key arrives, and the write that empties the ledger of the key before fails: the transfer
+  // ends as failed before the key of the account is written. The next runtime holds the key of
+  // before with what belongs to it, and never the key of the account with that ledger.
+  failing.times = 1;
+  await hand();
+  assert.equal(taking.world.state.transfer.phase, "failed");
+  assert.equal(taking.world.keychain.get(item).value, held);
+  await S.start(giving);
+  await startWith(taking, broken);
+  assert.equal(taking.world.state.key_state, "mismatch");
+  assert.equal(readLedger(taking).ttl_days, 7);
+  assert.notEqual(taking.world.stored("log.denied"), undefined);
+  // The transfer is made again.
+  await hand();
   assert.equal(taking.world.state.transfer.phase, "done");
   assert.equal(taking.world.state.key_state, "present");
-  const item = "com.pickle.client.secure.master-key\n" + taking.world.userId;
   assert.equal(taking.world.keychain.get(item).value, giving.world.keychain.get(item).value);
   // What belonged to the key it held is gone: the setting of its ledger, and what it kept of
   // the log.
@@ -7330,6 +7572,15 @@ test("a chain the rounds found whose listing is held back, or a node discovery l
   assert.equal(none.world.state.log.status, "verified");
   assert.deepEqual(none.world.stored("log.blocked"), { first_ms: 0, count: 0 });
   assert.equal(discoveries(none.world), 5);
+  const known = S.fixture(source, { nodes: 1, legacy: 1 });
+  known.world.now = TRANSFER_DOCUMENTS_FROM_MS + DAY_MS;
+  await S.start(known);
+  assert.equal(known.world.state.log.status, "verified");
+  known.world.fault("POST /api/secure/log/store/listings", (request) => (
+    JSON.parse(request.body).discovery === true ? { status: 409, body: { detail: "log_store_disabled" } } : undefined));
+  await nextDay(known);
+  assert.equal(known.world.state.log.status + ":" + known.world.state.log.store, "pending:blocked");
+  assert.equal(known.world.stored("log.blocked").count, 1);
 });
 
 test("the node discovery listing is read by the rounds once a day, and at once when the list of the nodes names a node for its revokes alone whose chain this device does not follow: the chain of a node another device just handed a grant to is followed from that synchronization on", async () => {
@@ -7366,17 +7617,26 @@ test("the node discovery listing is read by the rounds once a day, and at once w
   assert.equal(discoveries(world), 2);
   await nextDay(fx);
   assert.equal(discoveries(world), 3);
-  // What the log screen read of that listing within the day is taken, and not read again.
+  // What the log screen read of that listing within the day is taken, and not read again. The
+  // screen is opened 23 hours after the rounds read the listing, and reads it; the round of
+  // that opening is refused its listing of format 3, so the next synchronization runs a round,
+  // 25 hours after the rounds read the listing: it takes what the screen read two hours before.
   await nextDay(fx);
   assert.equal(discoveries(world), 4);
   world.advance(23 * HOUR_MS);
+  world.fault("POST /api/secure/log/read", { status: 503, body: {} }, 1);
+  const opened = world.now;
   assert.equal((await S.call(fx, "read_log", {})).ok, true);
   await world.settle(5000);
-  const read = discoveries(world);
+  assert.equal(discoveries(world), 5);
+  assert.equal(world.state.log.status, "pending");
   world.advance(2 * HOUR_MS);
+  const before = world.reports.length;
   await S.event(fx, "foreground");
+  assert.equal(world.reports.length, before + 1);
   assert.equal(world.reports.slice(-1)[0].status, "verified");
-  assert.equal(discoveries(world), read);
+  assert.equal(discoveries(world), 5);
+  assert.equal(world.stored("log.legacy").found_ms, opened);
 });
 
 test("a stale runtime reads no node discovery listing and follows no chain it finds", async () => {
@@ -7538,11 +7798,12 @@ test("node prefixes no node made are chains the rounds follow like any other: as
   assert.deepEqual(many.world.securityStatuses.slice(-1)[0].reasons, ["verification_blocked"]);
 });
 
-test("a node discovery listing that goes on beyond the pages a round reads of it leaves the round incomplete: the log does not verify while the store names node prefixes the round did not see", async () => {
-  const fx = S.fixture(source);
+test("a node discovery listing that goes on beyond the pages a round reads of it leaves the round with more to read than it read: the log does not verify while the store names more under the prefix of the account than the round saw, the rounds that end that way are rounds that left reads undone, and when they go on for days the log is marked as for any reads held back", async () => {
+  const fx = S.fixture(source, { device: { securityStatus: true } });
   const world = fx.world;
   // The store answers the node discovery listing with a page that goes on, however often it is
-  // asked from the marker of the page before.
+  // asked from the marker of the page before (names under the prefix of the account that are no
+  // node prefixes fill its pages).
   let pages = 0;
   const fault = world.fault((line, request) => typeof request.url === "string" && new URL(request.url).searchParams.get("delimiter") === "/", () => {
     pages += 1;
@@ -7553,17 +7814,37 @@ test("a node discovery listing that goes on beyond the pages a round reads of it
         "</NextKeyMarker></ListVersionsResult>",
     };
   });
+  // The first synchronization: its round reads two pages of the listing and has more to read,
+  // and the rounds that follow it at once end the same way. None of them read anything on, so
+  // each counts.
   await S.start(fx);
-  assert.equal(pages, 2);
+  await world.settle(2 * 60000);
+  assert.equal(pages, 16);
   assert.equal(world.state.log.status, "pending");
   assert.equal(world.stored("log.legacy").more, true);
+  assert.equal(world.stored("log.round").unfinished, 8);
+  assert.equal(world.stored("log.round").caught, 0);
   assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
-  // The listing ends: the next round reads it again and the log verifies.
+  // From the next day on the first round of a synchronization is a round held back, and the log
+  // is marked when three of them were counted and the first is three days old.
+  const states = [];
+  for (let day = 0; day < 4; day += 1) {
+    await nextDay(fx);
+    await world.settle(2 * 60000);
+    states.push(world.state.log.status + ":" + world.state.log.store_failure + ":" + world.stored("log.blocked").count);
+  }
+  assert.deepEqual(states, [
+    "pending:round:unfinished:1", "pending:round:unfinished:2", "pending:round:unfinished:3", "attention:round:unfinished:4",
+  ]);
+  assert.deepEqual(world.securityStatuses.slice(-1)[0].reasons, ["verification_blocked"]);
+  // The listing ends: the next round reads it to its end, and the log verifies.
   fault.times = 0;
-  world.advance(2 * 60000);
-  await S.event(fx, "foreground");
+  await nextDay(fx);
+  await world.settle(2 * 60000);
   assert.equal(world.state.log.status, "verified");
   assert.equal(world.stored("log.legacy").more, undefined);
+  assert.equal(world.stored("log.round").unfinished, 0);
+  assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
 });
 
 test("a round the log screen started that goes on after the screen stopped waiting for it sends its report itself, and what it read is on the screen at the next opening", async () => {
@@ -7657,4 +7938,674 @@ test("the lock of the rounds is held while a round waits for a big key at its en
   assert.ok(listings() > before);
   assert.equal(world.state.log.status, "verified");
   assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
+});
+
+// ---- What a second review of the program found ----
+
+test("a round whose time passes is no round that catches up, whatever it read: a backend whose answers come late leaves rounds that judge entries their node wrote and count as rounds that left reads undone, beyond eight of them the first round of a synchronization is a round held back, the log is marked, and when the answers come in time the rounds read to the end", async () => {
+  const fx = S.fixture(source, { device: { securityStatus: true } });
+  await S.start(fx);
+  const world = fx.world;
+  // 200 control entries arrive while the device is away, in listing pages of two.
+  world.pageSize = 2;
+  world.advance(HOUR_MS);
+  for (let i = 0; i < 200; i += 1) {
+    world.advance(1000);
+    fx.nodes[0].record("c", [{ t: "grant_revoked", time_ms: world.now }]);
+  }
+  // Every request of the reads is answered 9.9 seconds after it was sent, within its own time: a
+  // listing page takes 29.7 seconds (the address, the listing, the bodies), a round reads two
+  // of them (four entries), and its time passes in the third.
+  const late = [
+    world.fault("POST /api/secure/log/read", { delay_ms: 9900 }),
+    world.fault("POST /api/secure/log/bodies", { delay_ms: 9900 }),
+    world.fault("S3 " + world.shardHost, { delay_ms: 9900 }),
+  ];
+  const judged = judgedKeys(world);
+  const rows = [];
+  for (let day = 0; day < 5; day += 1) {
+    world.advance(25 * HOUR_MS);
+    const from = world.reports.length;
+    await S.event(fx, "foreground");
+    await world.settle(20 * 60000);
+    const round = world.stored("log.round");
+    assert.deepEqual(world.reports.slice(from).map((report) => report.store_failure), Array(8).fill("round:time"), "day " + day);
+    rows.push(world.state.log.status + ":" + world.stored("log.blocked").count + ":" + round.unfinished + ":" + round.caught);
+  }
+  // Every round judged four entries the node wrote before the row began, and none of them is a
+  // round that catches up: the rounds of the first day fill the row, the first round of each
+  // day after it counts, and the fifth day is three days after the first of those.
+  assert.deepEqual(rows, ["pending:0:8:0", "pending:1:16:0", "pending:2:24:0", "pending:3:32:0", "attention:4:40:0"]);
+  assert.equal(judgedKeys(world), judged + 5 * 8 * 4);
+  assert.deepEqual(world.securityStatuses.slice(-1)[0].reasons, ["verification_blocked"]);
+  // The answers come in time again: the rounds read the rest, and the round that reaches the
+  // end ends the row, the count and the mark.
+  for (const fault of late) fault.times = 0;
+  world.advance(25 * HOUR_MS);
+  await S.event(fx, "foreground");
+  await world.settle(60000);
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(judgedKeys(world), judged + 200);
+  assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
+  assert.equal(world.stored("log.round").unfinished, 0);
+  assert.equal(world.securityStatuses.slice(-1)[0].status, "ok");
+});
+
+test("a listing that a round reads on beyond the place the round before stopped at is a step of the walk, and the keys a round lists again from the start of the listing are none: of the rounds that walk through a long listing of keys judged before, the one that begins at the start counts as a round that left reads undone, the ones that read on do not, and the one that reaches the end ends the row", async () => {
+  const fx = S.fixture(source);
+  const world = fx.world;
+  // Nine control entries in listing pages of one key: with the entry of the grant, ten pages.
+  // The rounds of the first synchronization judge them.
+  world.pageSize = 1;
+  for (let i = 0; i < 9; i += 1) {
+    world.advance(1000);
+    fx.nodes[0].record("c", [{ t: "connection_created", time_ms: world.now, record_id: "r" + i, provider: "slack", scope: "" }]);
+  }
+  await S.start(fx);
+  await world.settle(1000);
+  assert.equal(world.state.log.status, "verified");
+  const judged = judgedKeys(world);
+  // The next day nothing is new. A round reads four pages. What the device keeps of the row
+  // when each round begins (the rounds that counted, the rounds that counted as catching up):
+  const row = [];
+  world.fault("POST /api/secure/log/read", () => {
+    const round = world.stored("log.round");
+    const kept = round.unfinished + ":" + round.caught;
+    if (row.slice(-1)[0] !== kept) row.push(kept);
+    return undefined;
+  });
+  const from = world.reports.length;
+  await nextDay(fx);
+  await world.settle(1000);
+  // The first round lists pages it listed the day before and judges nothing: it counts. The
+  // second reads the listing on from where the first stopped: it does not. The third reaches
+  // the end.
+  assert.deepEqual(world.reports.slice(from).map((report) => report.status + ":" + report.store), [
+    "pending:truncated", "pending:truncated", "verified:verified",
+  ]);
+  assert.deepEqual(row, ["0:0", "1:0", "1:1"]);
+  assert.equal(world.stored("log.round").unfinished, 0);
+  assert.equal(world.stored("log.round").caught, 0);
+  assert.equal(judgedKeys(world), judged);
+});
+
+test("the object versions of a chain a round read before its reading ended are judged, and the chain is read up to the seq before the first one that was not read: a request for object versions that the backend refuses, or the time of the round, leaves the next round the rest and nothing that was read", async () => {
+  const named = (world, from) => world.sent("POST /api/secure/log/store/objects").slice(from)
+    .map((request) => JSON.parse(request.body).objects.length);
+  // 120 control entries on the chain of a node of an earlier release (and the one the node
+  // writes with the grant of the day): a round asks for the object versions of 100 in one
+  // request and of the others in the next, and the backend refuses the second.
+  const refused = await chainFixture(false);
+  const node = refused.legacy[0];
+  const read = () => refused.world.stored("log.legacy").nodes[node.id].seq;
+  const written = () => node.chains.get(refused.world.userId).length;
+  const start = read();
+  pileEntries(refused, node, 120);
+  let requests = 0;
+  refused.world.fault("POST /api/secure/log/store/objects", () => {
+    requests += 1;
+    return requests === 2 ? { status: 503, body: { detail: "postgresql_unavailable" } } : undefined;
+  });
+  let from = refused.world.sent("POST /api/secure/log/store/objects").length;
+  await nextDay(refused);
+  await refused.world.settle(1000);
+  assert.deepEqual(named(refused.world, from), [100, written() - start - 100]);
+  assert.equal(written(), start + 121);
+  assert.equal(read(), start + 100);
+  assert.equal(refused.world.state.log.status + ":" + refused.world.state.log.store, "pending:blocked");
+  assert.equal(refused.world.reports.slice(-1)[0].keys_checked, 100);
+  // The next round asks for the ones that are left, and for none of the 100.
+  from = refused.world.sent("POST /api/secure/log/store/objects").length;
+  await nextDay(refused);
+  await refused.world.settle(1000);
+  assert.deepEqual(named(refused.world, from), [22]);
+  assert.equal(read(), start + 122);
+  assert.equal(read(), written());
+  assert.equal(refused.world.state.log.status, "verified");
+
+  // 620 control entries, and a backend that answers the listing addresses and each request for
+  // object versions 9.9 seconds late: a round reads 512 control entries, the node discovery
+  // listing of the day, the listing of the chain and four requests of 100 object versions are
+  // answered within its time, and its time passes in the fifth.
+  const slow = await chainFixture(false);
+  const chain = slow.legacy[0];
+  const place = () => slow.world.stored("log.legacy").nodes[chain.id].seq;
+  const first = place();
+  pileEntries(slow, chain, 620);
+  slow.world.fault("POST /api/secure/log/store/listings", { delay_ms: 9900 });
+  slow.world.fault("POST /api/secure/log/store/objects", { delay_ms: 9900 });
+  from = slow.world.sent("POST /api/secure/log/store/objects").length;
+  const reports = slow.world.reports.length;
+  slow.world.advance(25 * HOUR_MS);
+  Promise.resolve(slow.program.onEvent("foreground", {})).then(() => {}, () => {});
+  await slow.world.settle(61000);
+  // The round whose time passed judged the 400 entries it read and keeps the place.
+  assert.equal(slow.world.reports.length, reports + 1);
+  assert.equal(slow.world.reports[reports].store_failure, "round:time");
+  assert.equal(slow.world.reports[reports].keys_checked, 400);
+  assert.equal(place(), first + 400);
+  assert.equal(slow.world.stored("log.round").unfinished, 1);
+  assert.deepEqual(named(slow.world, from), [100, 100, 100, 100, 100]);
+  // The round that follows reads the 221 that are left (the entry of the grant of the day among
+  // them), and none of the 400.
+  await slow.world.settle(10 * 60000);
+  assert.deepEqual(named(slow.world, from).slice(5), [100, 100, 21]);
+  assert.equal(place(), first + 621);
+  assert.equal(slow.world.state.log.status, "verified");
+  assert.equal(slow.world.stored("log.round").unfinished, 0);
+});
+
+test("a chain whose object versions a round did not come to read comes first in the next round: the chains whose entries were read wait behind it", async () => {
+  // Two nodes of an earlier release. A round asks for the object versions of 100 entries in one
+  // request, and the backend refuses every request after the first of a round.
+  const fx = S.fixture(source, { nodes: 0, legacy: 2 });
+  await S.start(fx);
+  const world = fx.world;
+  const read = (node) => world.stored("log.legacy").nodes[node.id].seq;
+  const starts = fx.legacy.map(read);
+  pileEntries(fx, fx.legacy[0], 100);
+  pileEntries(fx, fx.legacy[1], 100);
+  let requests = 0;
+  world.fault("POST /api/secure/log/store/objects", () => {
+    requests += 1;
+    return requests > 1 ? { status: 503, body: {} } : undefined;
+  });
+  await nextDay(fx);
+  await world.settle(1000);
+  // The entries of one chain were read, and the other chain was listed and not read.
+  const moved = fx.legacy.map((node, at) => read(node) - starts[at]);
+  assert.deepEqual(moved.slice().sort((a, b) => a - b), [0, 100]);
+  const ahead = fx.legacy[moved.indexOf(100)];
+  const behind = fx.legacy[moved.indexOf(0)];
+  // The chain that was read has 100 new entries the next day. The round asks for the entries of
+  // the chain it did not come to first.
+  pileEntries(fx, ahead, 100);
+  requests = 0;
+  await nextDay(fx);
+  await world.settle(1000);
+  assert.equal(read(behind) - starts[fx.legacy.indexOf(behind)], 100);
+  assert.equal(read(ahead) - starts[fx.legacy.indexOf(ahead)], 100);
+});
+
+test("a receiving node a pass over the chains named waits until that pass has judged it: when the reading of the round ends while the document of another receiving node is asked for, the transfer to a node of a measurement the device knew is judged by the next round", async () => {
+  const fx = S.fixture(source, { nodes: 0, legacy: 1, device: { securityStatus: true } });
+  const world = fx.world;
+  world.now = TRANSFER_DOCUMENTS_FROM_MS + DAY_MS;
+  // A node of a measurement no list has that the backend lists for the account: the step of the
+  // grants hands it no grant and keeps what its attestation said. The key of the account is not
+  // at that node.
+  const known = world.addNode({ release: "v9.0.0", measurement: bridge.randomMeasurement() });
+  await S.start(fx);
+  await world.settle(1000);
+  const noted = () => Object.values(world.stored("log.unaccepted") || {});
+  assert.deepEqual(noted().map((item) => item.node + ":" + item.held), [known.id + ":false"]);
+  // The node of the earlier release hands the key of the account to that node and to a second
+  // one, which the device has no judgement of.
+  const second = world.addNode({ release: "v9.1.0", measurement: bridge.randomMeasurement(), offered: false });
+  world.keptDocuments.set(second.id, registryDocument(second));
+  world.advance(25 * HOUR_MS);
+  fx.legacy[0].record("c", [{ t: "grant_transferred_out", time_ms: world.now, to: known.id }]);
+  fx.legacy[0].record("c", [{ t: "grant_transferred_out", time_ms: world.now, to: second.id }]);
+  // The round reads the two entries and asks for the document of the second node. The answer
+  // does not come, and the app goes to the background: the round ends its reading there.
+  world.fault("POST /api/secure/log/documents", "hang", 1);
+  world.advance(HOUR_MS);
+  Promise.resolve(fx.program.onEvent("foreground", {})).then(() => {}, () => {});
+  await world.settle(3000);
+  assert.equal(world.sent("POST /api/secure/log/documents").length > 0, true);
+  fx.program.onEvent("background", {});
+  await world.drain();
+  // Both receiving nodes wait: the chain is read past the two entries, and neither is lost.
+  assert.deepEqual(Object.keys(world.stored("log.legacy").waiting).sort(), [known.id, second.id].sort());
+  assert.deepEqual(noted().map((item) => item.held), [false]);
+  // The next round judges the nodes that wait first, with a request of its own, before it
+  // reads the chains: the listing of the chain is not answered and the app goes to the
+  // background again, and both are judged all the same. The key of the account went to two
+  // measurements no list has, and the one the device saw a day ago marks the log.
+  world.advance(2 * 60000);
+  world.fault("POST /api/secure/log/store/listings", "hang", 1);
+  const asked = world.sent("POST /api/secure/log/store/listings").length;
+  Promise.resolve(fx.program.onEvent("foreground", {})).then(() => {}, () => {});
+  await world.settle(3000);
+  assert.equal(world.sent("POST /api/secure/log/store/listings").length, asked + 1);
+  fx.program.onEvent("background", {});
+  await world.drain();
+  assert.deepEqual(world.stored("log.legacy").waiting, {});
+  assert.deepEqual(noted().map((item) => item.node + ":" + item.held).sort(), [known.id + ":true", second.id + ":true"].sort());
+  assert.equal(world.state.log.status, "attention");
+  assert.deepEqual(world.securityStatuses.slice(-1)[0].reasons, ["unlisted_release"]);
+});
+
+test("a setting of the delegation made while an upload of the ledger is open is uploaded after it, and what the device keeps as uploaded is what that upload sealed: a lifetime the user shortened while the upload of the lifetime before was on its way reaches the other devices of the account", async () => {
+  const uploads = (world) => world.sent("PUT /api/secure/ledger").length;
+  for (const again of ["answered", "refused"]) {
+    const fx = S.fixture(source);
+    const world = fx.world;
+    const node = fx.nodes[0];
+    const both = twoDevices(fx);
+    await both.on("a");
+    await both.on("b");
+    await both.on("a");
+    const before = uploads(world);
+    // On device A: a lifetime of 20 days, whose upload fails.
+    world.fault("PUT /api/secure/ledger", { status: 503, body: {} }, 1);
+    assert.equal((await S.call(fx, "set_grant_days", { days: 20 })).value.days, 20);
+    await world.settle(1000);
+    assert.equal(uploads(world), before + 1, again);
+    assert.equal(world.sharedLedger, null, again);
+    // A minute later: a lifetime of 1 day. The call reads the sealed ledger first, finds that it
+    // lacks what this device holds, and starts an upload of the ledger as it is then (20 days),
+    // which the backend answers 20 seconds late. The setting of 1 day is written while that
+    // upload is open, and is uploaded when it has ended.
+    world.advance(60000);
+    world.fault("PUT /api/secure/ledger", { delay_ms: 20000 }, 1);
+    if (again === "refused") world.fault("PUT /api/secure/ledger", { status: 503, body: {} }, 1);
+    assert.equal((await S.call(fx, "set_grant_days", { days: 1 })).value.days, 1);
+    await world.settle(40000);
+    assert.equal(uploads(world), before + 3, again);
+    if (again === "refused") {
+      // The upload of the setting was refused. What the device keeps as uploaded is the ledger
+      // the upload before it sealed (20 days), so the next synchronization uploads the setting.
+      world.advance(HOUR_MS);
+      await S.event(fx, "foreground");
+      await world.settle(1000);
+      assert.equal(uploads(world), before + 4, again);
+    }
+    // Device B, when its grants are due, reads 1 day and renews with it.
+    world.advance(25 * HOUR_MS);
+    await both.on("b");
+    assert.equal(world.state.grant_days, 1, again);
+    assert.ok(node.grants.get(world.userId).not_after_ms <= world.now + DAY_MS, again);
+    assert.ok(node.grants.get(world.userId).not_after_ms > world.now, again);
+  }
+});
+
+test("turning the delegation off reads the sealed ledger first: a resumption time another device of the account wrote with a clock ahead of this one does not turn the switch on again, and when that read fails the delegation is turned off by what this device knows", async () => {
+  const fx = S.fixture(source, { nodes: 2 });
+  const world = fx.world;
+  const holders = () => fx.nodes.filter((node) => node.grants.has(world.userId)).length;
+  const both = twoDevices(fx);
+  await both.on("a");
+  await both.on("b");
+  // On device B, whose clock runs two hours ahead, the user turned the delegation off and a
+  // minute later on again: its ledger holds those two times, and its next step uploads them.
+  const ahead = world.now + 2 * HOUR_MS;
+  writeLedger(fx, { revoked_ms: ahead, resumed_ms: ahead + 60000 }, []);
+  world.advance(60000);
+  await S.event(fx, "foreground");
+  await world.settle(1000);
+  assert.equal(world.state.grant.state, "active");
+  assert.notEqual(world.sharedLedger, null);
+  assert.equal(holders(), 2);
+  // Five minutes later the user turns the delegation off on device A, which has not read the
+  // sealed ledger since. The revocation time it writes is after the resumption time of B.
+  world.advance(5 * 60000);
+  await both.on("a");
+  assert.deepEqual(await S.call(fx, "set_delegation", { enabled: false }), { ok: true, value: { grant: { state: "off", not_after_ms: 0 } } });
+  await world.settle(1000);
+  assert.equal(holders(), 0);
+  assert.ok(readLedger(fx).revoked_ms > ahead + 60000);
+  // The synchronizations of A after it hand no grant: the switch is off.
+  for (const wait of [10 * 60000, 25 * HOUR_MS]) {
+    world.advance(wait);
+    await S.event(fx, "foreground");
+    await world.settle(1000);
+    assert.equal(world.state.grant.state, "off");
+    assert.equal(holders(), 0);
+  }
+
+  // The read of the sealed ledger fails (asked once more, and the exchange after the switch
+  // likewise): the call turns the delegation off all the same, and the revokes go out.
+  const cut = S.fixture(source, { nodes: 2 });
+  await S.start(cut);
+  cut.world.fault("GET /api/secure/ledger", { status: 503, body: {} }, 4);
+  assert.equal((await S.call(cut, "set_delegation", { enabled: false })).ok, true);
+  assert.equal(cut.nodes.filter((node) => node.grants.has(cut.world.userId)).length, 0);
+  assert.equal(cut.world.state.grant.state, "off");
+});
+
+test("create_key: a call whose registration meets a key this device made before, which arrived at the backend only now, registers its key in the place of that one: the call does not end well without a key", async () => {
+  const master = (world) => world.keychain.get("com.pickle.client.secure.master-key\n" + world.userId);
+  const fx = S.fixture(source, { account: false });
+  await S.start(fx);
+  const world = fx.world;
+  // The first call: its registration is cut on its way, and the account query after it says
+  // that the account has no key. The call ends with that failure.
+  let first = null;
+  world.fault("PUT /api/secure/account/key", (request) => {
+    first = request;
+    return "transport";
+  }, 1);
+  assert.deepEqual(await S.call(fx, "create_key"), { ok: false, code: "transport" });
+  assert.equal(world.account.key, null);
+  const made = world.stored("key.made");
+  assert.equal(made.length, 1);
+  // The second call. The registration of the first arrives at the backend while the second is
+  // on its way, so the second is answered with key_exists: the account has the key the first
+  // call made, which no device holds.
+  world.fault("PUT /api/secure/account/key", () => {
+    world.api("PUT", first.path, first.query || {}, first.body);
+    return undefined;
+  }, 1);
+  const second = await S.call(fx, "create_key");
+  assert.equal(world.sent("PUT /api/secure/account/key").length, 3);
+  assert.equal(second.ok, true);
+  assert.equal(second.value.key_state, "present");
+  assert.equal(made.indexOf(second.value.key_id), -1);
+  assert.equal(world.account.key.key_id, second.value.key_id);
+  assert.equal(world.state.key_state, "present");
+  assert.notEqual(master(world), undefined);
+  assert.equal(world.stored("key.made"), undefined);
+});
+
+test("a device that replaces the key it holds empties what belongs to that key before it writes the new one: a key store write that fails in the middle of reset_key, or of the reception of a transfer, leaves no runtime with the new key and the ledger and log values of the key before", async () => {
+  const item = (world) => "com.pickle.client.secure.master-key\n" + world.userId;
+  // A key store whose next write of the item of the named service fails.
+  const failing = { service: "", times: 0 };
+  const broken = (native) => ({
+    keychainSet: (kept) => {
+      if (failing.times > 0 && String(kept.service).endsWith(failing.service)) {
+        failing.times -= 1;
+        throw new bridge.SecureError("keychain_failed", "the write of " + kept.service + " failed");
+      }
+      return native.keychainSet(kept);
+    },
+  });
+  // A device that holds a key of its own, with a setting in its ledger and grants it handed,
+  // while the account has another key registered.
+  const displaced = async () => {
+    const fx = S.fixture(source);
+    await S.start(fx);
+    assert.equal((await S.call(fx, "set_grant_days", { days: 7 })).ok, true);
+    fx.world.account.key = { sign_pk: "", log_pk: "", key_id: "00112233445566aa" };
+    await startWith(fx, broken);
+    assert.equal(fx.world.state.key_state, "mismatch");
+    assert.equal(readLedger(fx).ttl_days, 7);
+    assert.notEqual(fx.world.stored("log.grants"), undefined);
+    return fx;
+  };
+  for (const service of [".ledger", ".master-key"]) {
+    const fx = await displaced();
+    const world = fx.world;
+    const held = world.keychain.get(item(world)).value;
+    failing.service = service;
+    failing.times = 1;
+    assert.deepEqual(await S.call(fx, "reset_key"), { ok: false, code: "keychain_failed" }, service);
+    // The next runtime holds the key of before, and never the new key with what belonged to
+    // the key of before.
+    await startWith(fx, broken);
+    assert.equal(world.keychain.get(item(world)).value, held, service);
+    assert.equal(world.state.key_state, "mismatch", service);
+    if (service === ".master-key") {
+      // (The ledger and the log values of that key were emptied before the write that failed.)
+      assert.equal(readLedger(fx).ttl_days, 30, service);
+      assert.equal(world.stored("log.grants"), undefined, service);
+    }
+    // The replacement is made again.
+    const again = await S.call(fx, "reset_key");
+    assert.equal(again.ok, true, service);
+    assert.equal(world.state.key_state, "present", service);
+    assert.notEqual(world.keychain.get(item(world)).value, held, service);
+    assert.equal(readLedger(fx).ttl_days, 30, service);
+  }
+});
+
+test("a seq of a chain an object version of which was not read stops the chain there, though the node is seen to have written under a later seq: what was not read is not read as something nobody wrote", async () => {
+  const fx = await chainFixture(false);
+  const world = fx.world;
+  const node = fx.legacy[0];
+  const read = () => world.stored("log.legacy").nodes[node.id].seq;
+  const start = read();
+  // 98 control entries, and the entry of the grant of the next day: the round of that day is
+  // refused the one request for their object versions, and reads none of them.
+  pileEntries(fx, node, 98);
+  world.fault("POST /api/secure/log/store/objects", { status: 503, body: {} }, 1);
+  await nextDay(fx);
+  await world.settle(1000);
+  assert.equal(read(), start);
+  assert.equal(node.chains.get(world.userId).length, start + 99);
+  // Two use entries follow. The next round asks for the object versions of the 99 control
+  // entries and of the last two seqs of the page, the later one first: 100 in one request, and
+  // the object version of the seq before the last in a second, which the backend refuses.
+  world.advance(1000);
+  node.record("u", [S.providerRequest(world.now)]);
+  world.advance(1000);
+  node.record("u", [S.providerRequest(world.now)]);
+  let requests = 0;
+  world.fault("POST /api/secure/log/store/objects", () => {
+    requests += 1;
+    return requests === 2 ? { status: 503, body: {} } : undefined;
+  });
+  const from = world.sent("POST /api/secure/log/store/objects").length;
+  world.advance(2 * 60000);
+  await S.event(fx, "foreground");
+  await world.settle(1000);
+  assert.deepEqual(world.sent("POST /api/secure/log/store/objects").slice(from).map((request) => JSON.parse(request.body).objects.length), [100, 1]);
+  // The chain is read up to the last control entry, and not past the seq whose object version
+  // was not read, though the object version of the seq after it was read.
+  assert.equal(read(), start + 99);
+  // The round after it reads the two.
+  world.advance(2 * 60000);
+  await S.event(fx, "foreground");
+  await world.settle(1000);
+  assert.equal(read(), start + 101);
+  assert.equal(world.state.log.status, "verified");
+});
+
+test("a chain whose listing a round reads on is a step of the walk as well: a round that lists the keys of format 3 again from the start and reads a chain on over entries its node wrote is a round that catches up", async () => {
+  const fx = S.fixture(source, { nodes: 1, legacy: 1 });
+  const world = fx.world;
+  // Fourteen control entries of format 3 in listing pages of three keys (five pages with the
+  // entry of the grant), judged by the rounds of the first synchronization.
+  world.pageSize = 3;
+  for (let i = 0; i < 14; i += 1) {
+    world.advance(1000);
+    fx.nodes[0].record("c", [{ t: "connection_created", time_ms: world.now, record_id: "r" + i, provider: "slack", scope: "" }]);
+  }
+  await S.start(fx);
+  await world.settle(1000);
+  assert.equal(world.state.log.status, "verified");
+  // The next day the listing of format 3 is refused once: the round reads the chain (the entry
+  // its node wrote with the grant of the day) and is one held back.
+  world.fault("POST /api/secure/log/read", { status: 503, body: {} }, 1);
+  await nextDay(fx);
+  await world.settle(1000);
+  assert.equal(world.state.log.status + ":" + world.state.log.store, "pending:blocked");
+  const read = world.stored("log.legacy").nodes[fx.legacy[0].id].seq;
+  // The node of the earlier release then writes three use entries. The round of the next
+  // synchronization, which hands no grant, judges no entry for the first time: it lists the
+  // first four pages of format 3 again, and reads the chain on over those entries.
+  for (let i = 0; i < 3; i += 1) {
+    world.advance(1000);
+    fx.legacy[0].record("u", [S.providerRequest(world.now)]);
+  }
+  const row = [];
+  world.fault("POST /api/secure/log/read", () => {
+    const round = world.stored("log.round");
+    const kept = round.unfinished + ":" + round.caught;
+    if (row.slice(-1)[0] !== kept) row.push(kept);
+    return undefined;
+  });
+  const from = world.reports.length;
+  world.advance(2 * 60000);
+  await S.event(fx, "foreground");
+  await world.settle(1000);
+  // That round does not count: the listing of the chain was read on. The round after it reads
+  // the listing of format 3 on and reaches its end.
+  assert.deepEqual(world.reports.slice(from).map((report) => report.status + ":" + report.store + ":" + report.keys_checked), [
+    "pending:truncated:0", "verified:verified:0",
+  ]);
+  assert.deepEqual(row, ["0:0", "0:1"]);
+  assert.equal(world.stored("log.legacy").nodes[fx.legacy[0].id].seq, read + 3);
+  assert.equal(world.stored("log.round").caught, 0);
+});
+
+test("an exchange of the ledger that is open while the key of the account is replaced merges nothing, and the exchange that was asked for meanwhile is not made: what belongs to the key of before does not enter the ledger of the new key", async () => {
+  const fx = S.fixture(source);
+  await S.start(fx);
+  const world = fx.world;
+  const uploads = () => world.sent("PUT /api/secure/ledger").length;
+  // A lifetime of 5 days: the backend holds the sealed ledger of the key of this device.
+  assert.equal((await S.call(fx, "set_grant_days", { days: 5 })).value.days, 5);
+  await world.settle(1000);
+  assert.equal(world.sharedLedger.key_id, fx.keys.keyId);
+  // A lifetime of 3 days. The exchange that follows the setting reads the sealed ledger, and
+  // that answer comes 20 seconds late (the second request for the sealed ledger of the call:
+  // the first is the reading before the setting).
+  let reads = 0;
+  world.fault("GET /api/secure/ledger", () => {
+    reads += 1;
+    return reads === 2 ? { delay_ms: 20000 } : undefined;
+  });
+  assert.equal((await S.call(fx, "set_grant_days", { days: 3 })).value.days, 3);
+  // A lifetime of 4 days while that exchange is open: one more exchange is to follow it.
+  assert.equal((await S.call(fx, "set_grant_days", { days: 4 })).value.days, 4);
+  const before = uploads();
+  // Meanwhile another device replaced the key of the account, and the user replaces it on this
+  // device: the ledger of the key before is emptied.
+  world.account.key = { sign_pk: "", log_pk: "", key_id: "00112233445566aa" };
+  assert.equal((await S.call(fx, "reset_key")).ok, true);
+  assert.equal(readLedger(fx).ttl_days, 30);
+  // The answer that was open arrives: the sealed ledger of the key of before. Nothing of it
+  // enters the ledger of the new key, and no exchange follows with the key of before.
+  await world.settle(60000);
+  assert.equal(reads >= 2, true);
+  assert.equal(readLedger(fx).ttl_days, 30);
+  assert.equal(world.state.grant_days, 30);
+  assert.equal(uploads(), before);
+});
+
+test("a round one read of which was held back is no round that catches up, whatever else it read: it adds to the row of the rounds that left reads undone", async () => {
+  // A program whose request for bodies names 2 keys (8 in a round), and 12 control entries that
+  // arrive while the device is away.
+  const small = source.replace("const LOG_BODY_KEYS = 200;", "const LOG_BODY_KEYS = 2;");
+  assert.notEqual(small, source);
+  const fx = S.fixture(small, { nodes: 1, legacy: 1 });
+  await S.start(fx);
+  const world = fx.world;
+  world.advance(HOUR_MS);
+  for (let i = 0; i < 12; i += 1) {
+    world.advance(1000);
+    fx.nodes[0].record("c", [{ t: "grant_revoked", time_ms: world.now }]);
+  }
+  // The listing of the chain is refused once: the round judged eight entries their node wrote,
+  // has four more to read, and one of its reads was held back.
+  world.fault("POST /api/secure/log/store/listings", (request) => (
+    JSON.parse(request.body).nodes.length > 0 ? { status: 503, body: {} } : undefined), 1);
+  const from = world.reports.length;
+  await nextDay(fx);
+  await world.settle(1000);
+  assert.deepEqual(world.reports.slice(from).map((report) => report.status + ":" + report.store + ":" + report.keys_checked), ["pending:blocked:8"]);
+  assert.equal(world.stored("log.round").unfinished, 1);
+  assert.equal(world.stored("log.round").caught, 0);
+  assert.equal(world.stored("log.blocked").count, 1);
+  // The next round reads the rest and the chain: the row and the count end.
+  world.advance(2 * 60000);
+  await S.event(fx, "foreground");
+  await world.settle(1000);
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(world.stored("log.round").unfinished, 0);
+  assert.deepEqual(world.stored("log.blocked"), { first_ms: 0, count: 0 });
+});
+
+test("a read of a later page whose request fails when the runtime runs again, after the time of the procedure has passed, ends the call with timeout and not with the failure of that read", async () => {
+  const fx = S.fixture(source);
+  const world = fx.world;
+  for (let i = 0; i < 6; i += 1) {
+    world.advance(HOUR_MS);
+    fx.nodes[0].record("u", [S.providerRequest(world.now, "/gmail/v1/users/me/messages/" + i, "POST")]);
+  }
+  world.pageSize = 2;
+  // A runtime whose requests the test answers itself while holding is on: the answer of a request
+  // that was on its way while the app was suspended reaches the runtime when it runs again,
+  // before its timers.
+  const held = [];
+  let holding = false;
+  await startWith(fx, (native) => ({
+    http: (request) => (holding ? new Promise((resolve, reject) => { held.push({ resolve: resolve, reject: reject }); }) : native.http(request)),
+  }));
+  const first = await S.call(fx, "read_log", { limit: 2 });
+  assert.equal(first.value.has_more, true);
+  const before = world.runtime.log_pages[0].before_ms;
+  await world.settle(5000);
+  holding = true;
+  let failure = null;
+  fx.program.procedures.read_log_page({ before_ms: before }).then(() => {}, (error) => { failure = error; });
+  await world.drain();
+  assert.equal(held.length, 1);
+  // The app is suspended for ten minutes, longer than the time of a procedure, and the request
+  // fails when the runtime runs again.
+  world.advance(10 * 60000);
+  held[0].reject(new bridge.SecureError("transport", "the connection was lost"));
+  await world.drain();
+  assert.notEqual(failure, null);
+  assert.equal(failure.code, "timeout");
+});
+
+/** The program with another number of chains of format 1 and format 2 a round follows (the
+ *  checked-out program follows 64). */
+function withChains(count) {
+  const kept = "const LEGACY_NODES = 64;";
+  assert.ok(source.indexOf(kept) >= 0);
+  return source.replace(kept, "const LEGACY_NODES = " + count + ";");
+}
+
+test("a chain a round begins to follow when it follows as many chains as a round follows is taken by the round that follows at once: the chain of a receiving node whose document arrives with a later round, and the chains of more receiving nodes than a pass lists, are read in the same synchronization, and the log does not verify before", async () => {
+  // A program whose rounds follow two chains.
+  const program = withChains(2);
+  const accepted = (fx) => {
+    const node = fx.world.addNode({ release: fx.latest.release, measurement: fx.latest, offered: false });
+    fx.world.keptDocuments.set(node.id, registryDocument(node));
+    return node;
+  };
+  const followed = (world, node) => world.stored("log.legacy").nodes[node.id];
+
+  // An account with two chains. The node of one hands the delegation on to a node of the same
+  // release, and the request for the document of that node fails: the node waits.
+  const fx = S.fixture(program, { nodes: 0, legacy: 2 });
+  const world = fx.world;
+  world.now = TRANSFER_DOCUMENTS_FROM_MS + DAY_MS;
+  await S.start(fx);
+  await world.settle(1000);
+  assert.equal(world.state.log.status, "verified");
+  const receiver = accepted(fx);
+  world.advance(25 * HOUR_MS);
+  fx.legacy[0].record("c", [{ t: "grant_transferred_out", time_ms: world.now, to: receiver.id }]);
+  world.fault("POST /api/secure/log/documents", { status: 503, body: { detail: "postgresql_unavailable" } }, 1);
+  await S.event(fx, "foreground");
+  await world.settle(1000);
+  assert.deepEqual(Object.keys(world.stored("log.legacy").waiting), [receiver.id]);
+  assert.equal(followed(world, receiver), undefined);
+  // The next round judges the node that waits before it reads the chains, and follows its
+  // chain from there on. It follows two chains already, so the round is not complete, and the
+  // round that follows it at once reads the chain of that node.
+  world.advance(2 * 60000);
+  let reports = world.reports.length;
+  await S.event(fx, "foreground");
+  await world.settle(60000);
+  assert.deepEqual(world.reports.slice(reports).map((report) => report.status), ["pending", "verified"]);
+  assert.deepEqual(world.stored("log.legacy").waiting, {});
+  assert.equal(followed(world, receiver).read_ms > 0, true);
+  assert.equal(world.state.log.status, "verified");
+  assert.equal(world.stored("log.round").unfinished, 0);
+
+  // An account with one chain, whose node hands the delegation on to three nodes of the same
+  // release. The pass that reads those entries follows three chains more, one more than the
+  // next pass lists: the round is not complete, and the round that follows it reads the third.
+  const one = S.fixture(program, { nodes: 0, legacy: 1 });
+  one.world.now = TRANSFER_DOCUMENTS_FROM_MS + DAY_MS;
+  await S.start(one);
+  await one.world.settle(1000);
+  const three = [accepted(one), accepted(one), accepted(one)];
+  one.world.advance(25 * HOUR_MS);
+  for (const node of three) {
+    one.world.advance(1000);
+    one.legacy[0].record("c", [{ t: "grant_transferred_out", time_ms: one.world.now, to: node.id }]);
+  }
+  reports = one.world.reports.length;
+  await S.event(one, "foreground");
+  await one.world.settle(60000);
+  assert.deepEqual(one.world.reports.slice(reports).map((report) => report.status), ["pending", "verified"]);
+  assert.deepEqual(three.map((node) => followed(one.world, node).read_ms > 0), [true, true, true]);
+  assert.equal(one.world.state.log.status, "verified");
 });
