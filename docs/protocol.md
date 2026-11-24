@@ -2004,7 +2004,8 @@ requests name, more bodies are to be read than its body requests name, an answer
 ends before its last key, a request was answered for its first item alone, more big keys wait
 than it asks for at its end, the chains of formats 1 and 2 hold more control entries than it
 reads (512), more of those chains are open than it follows (64),
-the listing of such a chain goes on over pages that hold many object versions for each `seq`, or
+the listing of such a chain goes on over pages that hold many object versions for each `seq`,
+the node discovery listing goes on beyond its two pages, or
 its time of 60 s passes before it has read everything) is pending, and the next round reads on
 from where it stopped: a round whose time passes is judged on what it read and keeps what it
 judged. A synchronization has the next round follow such a round at once, eight rounds in a row
@@ -2019,8 +2020,8 @@ as none, when all of this holds:
 
 - it ended because it came to one of the numbers a round reads (the listing pages, the documents
   and the bodies its requests name, an answer of the bodies that ended before its last key, the
-  control entries of chains, the chains a round follows, the big keys at its end), and not
-  because its time passed;
+  control entries of chains, the chains a round follows, the pages of the node discovery
+  listing, the big keys at its end), and not because its time passed;
 - none of its reads failed or stayed without an answer, a request that was asked again for its
   first item and answered then among them;
 - it read no object that no node wrote (an object under a node id the store holds no node
@@ -2481,10 +2482,15 @@ because the store names it:
   or follows the chain again when the device read it to its end before: once for each expiry
   the list names for that node.
 - Every prefix the listing names is followed. A listing that goes on beyond its two pages leaves
-  the round incomplete, and the next round reads it again. A round follows 64 chains, the ones
-  listed longest ago first; with more of them open, the next round follows at once and takes
-  the others, and lists no chain again that a round of that row read to its end within the last
-  10 minutes.
+  the round with more to read than it read, and the next round reads it again. An account has
+  as many node prefixes as its nodes made, far fewer than two pages hold, so a listing that goes
+  on holds names no node made: a round that ends that way is one of the rounds that left reads
+  undone ("The round"), and rounds that go on ending that way mark the log as reads held back
+  do. A round follows 64 chains, the ones listed longest ago first; with more of them open, the
+  next round follows at once and takes the others, and lists no chain again that a round of
+  that row read to its end within the last 10 minutes. A chain a round begins to follow while
+  it follows that many (the chain of the receiving node of a transfer it read) is one of the
+  others.
 - A read of the node discovery listing that is held back, and a read of such a chain that is
   held back, is a read of the round held back as on any chain (A3), with no opening of the log
   screen. A backend that states it has no store of these chains is believed by a device that
