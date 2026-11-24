@@ -8,7 +8,9 @@ calls "the app": the device side of the credential protocol. It creates the mast
 the account keys from it (protocol.md section 3), verifies the attestation of enclave nodes
 (section 4), seals grants and revokes to a verified node (section 5), encrypts credential records
 (section 6) and vault secrets, reads and judges the credential log (section 7), keeps the grants it
-handed to nodes (a node the backend lists for its revokes alone is handed none), and transfers
+handed to nodes (a node the backend lists for its revokes alone is handed none), keeps the
+settings of the delegation (the switch and the lifetime of a grant) and reads the ones the other
+devices of the account made before it sends a command to a node, and transfers
 the master key between the devices of one account. What the program
 does, in which order and under which limits, is specified in protocol.md, "The program of the
 app".
@@ -35,7 +37,13 @@ later read (a later listing page, the listing of a chain of formats 1 and 2) are
 screen itself when they are held back, and mark the log when such reads of three days stay
 unread by the screen: with every opening the screen reads its listings on from their start down
 to what was noted, so a read that failed once ends with the next opening the backend answers.
-Rounds that keep ending with more to read than a round reads count as rounds held back. A round
+A round that left reads undone and spent what it read on entries its nodes wrote catches up and
+counts as none, 32 rounds in a row at most; a round whose time passed, or one of whose requests
+was not answered, counts, and rounds that keep counting are rounds held back. The rounds held
+back count one for a day. A request for a list of keys that is not answered is asked again for
+its first key alone, and an entry of 32,768 bytes or more is asked for alone at the end of a
+round with the time its size takes, so a network that carries little is not read as a backend
+that holds reads back. A round
 ends its reading when the app goes to the background and is judged on what it read, and the keys
 it listed and did not come to judge are the first the next round asks for, so a device whose
 stays in the app are short reads the log on with every stay. A measurement no list of the
@@ -50,6 +58,9 @@ their bindings name, for display and to follow a transfer of the delegation a no
 release made: under one `seq` of such a chain the program reads eight objects at most until one
 is the entry of the node, a round reads a chain on only where its node wrote, and the screen
 takes a range of a chain as known only from a listing that was read as far as the range reaches.
+The rounds follow the chain of every node the store names under the prefix of the account, read
+from the listing of that bucket once a day, so a transfer made by a node this device never
+handed a grant to is judged as well.
 The storage of the operator holds no entry. An entry older than 365 days (the
 retention of its Object Lock) is expected by nobody, and the lifecycle rule of a bucket removes
 entries at 400 days (7.6).
@@ -100,6 +111,13 @@ draws. The first page of the
 log screen and what the rounds read for the screen, which name services and addresses, are kept in
 the program store sealed with a key derived from the master key.
 
+The settings of the delegation (the time the user turned it off or on, the lifetime of a grant)
+and the nodes of the releases before v2.4.0 the device handed a grant to reach the other devices
+of the account as a ledger sealed with a key derived from the master key (`native.aeadSeal` in
+`sealLedger`): the backend stores that value and cannot open it. A message of a master key
+transfer that gives no shared value (the X25519 result is 32 zero bytes) ends the transfer before
+anything is sealed with a key made from it.
+
 What the program reports to the backend about itself names no secret and nothing of the content of
 an account: the result of a round (the status, counts, the names of releases, node ids), the
 outcomes of its procedures (the names of procedures, failure codes, times) and the result of a
@@ -109,8 +127,8 @@ query `program`), and no other request does.
 
 A reader checks this in the file. The search terms: `keychainSet` and `keychainGet` (where the
 master key is stored and read), `hpkeSeal` (what is sealed to a node), `aeadSeal` (what is
-encrypted as a record, what the transfer seals, the kept screen and what the rounds keep for the
-screen), `native.http(` (every
+encrypted as a record, what the transfer seals, the ledger of the settings of the delegation, the
+kept screen and what the rounds keep for the screen), `native.http(` (every
 request the program sends: `request` builds the requests to the backend and `fetchStore` the
 requests to the log store), `native.publish(` (every value the program hands to the user
 interface), `native.storeSet(` (every value the program keeps on the device outside the key
@@ -118,6 +136,18 @@ store), `presentSecret` and `promptSecret` (where a vault value passes the app),
 `confirmDestinations` (where the user confirms the hosts and places of a vault value).
 
 ## How a release is made
+
+A program that is to accept the nodes of a new enclave release lists the measurement of that
+release in `const ACCEPTED_RELEASES` (protocol.md 4.5). One command puts the element in, from the
+`measurements.json` of the GitHub release of the enclave tag, and compares what the list holds
+with that file:
+
+```bash
+python3 secure-program/accept_release.py --measurements measurements.json
+```
+
+It exits 0 when the list holds the three values of the file, and `--check` compares without
+writing ([`accept_release.py`](accept_release.py)).
 
 1. The commit that changes the file sets `const VERSION` to a new N and is tagged
    `secure-program-v{N}`. The push of the tag starts the workflow
@@ -208,6 +238,9 @@ separated by commas). A test of vectors that the files do not hold is skipped.
 `node secure-program/tests/compare.js <program-a.js> <program-b.js>` runs the scenarios on two
 versions of the program and prints what changed between them (the file of a tag is
 `git show secure-program-v{N}:secure-program/secure-program.js`).
+
+`tests/test_monitor.py` and `tests/test_accept_release.py` test the two Python tools of this
+directory (`python3 -m unittest discover -s secure-program/tests`).
 
 ## Limits
 
