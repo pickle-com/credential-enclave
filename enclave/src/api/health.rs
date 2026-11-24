@@ -48,6 +48,7 @@ pub async fn health(State(node): State<Arc<Node>>) -> Response {
     let read = |counter: &std::sync::atomic::AtomicU64| counter.load(Ordering::Relaxed);
     let count = |counter: &std::sync::atomic::AtomicUsize| counter.load(Ordering::Relaxed);
     let buckets = &counters.write_ms_buckets;
+    let app_password_providers = node.definitions.app_password_names();
     json_ok(&Health {
         node: &node.node,
         release: node.release,
@@ -60,6 +61,7 @@ pub async fn health(State(node): State<Arc<Node>>) -> Response {
         accounts: node.account_count(),
         grants: count(&state.grants),
         mail_providers: &["naver_mail"],
+        app_password_providers: &app_password_providers,
         log_store: node.log_store.id().map(|id| LogStoreState {
             bucket: id.bucket(),
             region: id.region(),

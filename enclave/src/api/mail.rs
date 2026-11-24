@@ -5,12 +5,11 @@ use std::sync::Arc;
 use axum::extract::{Request, State};
 use axum::http::header::CONTENT_LENGTH;
 use axum::response::Response;
-use credential_enclave_protocol::encoding::{b64u, to_json};
+use credential_enclave_protocol::encoding::to_json;
 use credential_enclave_protocol::log::EntryKind;
-use credential_enclave_protocol::{purpose, ProtocolError};
+use credential_enclave_protocol::ProtocolError;
 use hyper::body::Bytes;
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use tokio::sync::OwnedSemaphorePermit;
 
 use super::responses::forward_frame;
@@ -182,7 +181,7 @@ async fn run(node: &Node, request: Request, operation: &str) -> Result<Response,
         node.ensure_open()?;
         let now_ms = node.now_ms();
         let grant = account.active(now_ms)?;
-        let credentials = AppPassword::open(&grant, user, &record)?;
+        let credentials = AppPassword::open(&grant, user, &record, "naver_mail", "naver.com")?;
         if operation == "submit" {
             credentials
                 .validate_submission(&recipients, &payload)
@@ -207,16 +206,7 @@ async fn run(node: &Node, request: Request, operation: &str) -> Result<Response,
     let outcome = match operation {
         "verify" => credentials.verify(node).await.map(|()| {
             let identity = credentials.identity();
-            let statement = node.keys.sign(
-                purpose::STATEMENT,
-                &to_json(&json!({
-                    "v": 1, "type": "app_password_verified", "node": node.node,
-                    "user_id": user, "provider": "naver_mail", "record_id": record.id,
-                    "key_id": key_id, "sign_pk": b64u(&sign_pk),
-                    "ciphertext_sha256": b64u(&Sha256::digest(record.ct.as_bytes())),
-                    "identity": identity, "time_ms": node.now_ms(),
-                })),
-            );
+            let statement = credentials.verified_statement(node, user, &record, &key_id, &sign_pk);
             MailData::Json(json!({"identity": identity, "node": node.node, "statement": statement}))
         }),
         "read" => {

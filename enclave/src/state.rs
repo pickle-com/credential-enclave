@@ -1611,9 +1611,11 @@ impl Node {
 /// `record_invalid`, and a record whose kind this release does not know is `not_allowed`.
 ///
 /// The kind is part of the AAD of the record, so a record that opened has the kind it names.
-/// The two callers turn the plaintext into the type of their call family and refuse the kinds
-/// of the other one: [`crate::oauth::open_record`] for the calls that use a token inside the
-/// node, [`crate::vault::open_record`] for `release`.
+/// The callers turn the plaintext into the type of their call family and refuse the kinds of
+/// the other families: [`crate::oauth::open_record`] and [`crate::oauth::token_record`] for
+/// the calls that use a token inside the node, [`crate::mail::AppPassword::open`] and
+/// [`crate::mail::AppPassword::from_plaintext`] for the calls that use an application
+/// password, [`crate::vault::open_record`] for `release`.
 pub fn open_for(
     grant: &GrantView,
     user_id: &str,

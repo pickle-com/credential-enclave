@@ -51,7 +51,7 @@ credential-enclave/
 │   ├── src/clock.rs              # node time (section 8)
 │   ├── src/api/mod.rs            # the router, the failure responses
 │   ├── src/api/responses.rs      # every response type (rule E3 of the egress policy)
-│   ├── src/api/{health,config,attestation,messages,status,oauth,refresh,revoke,forward,forward_batch,release,close,peer,grants,log_store}.rs
+│   ├── src/api/{health,config,attestation,messages,status,oauth,refresh,revoke,forward,forward_batch,mail,app_password,release,close,peer,grants,log_store}.rs
 │   ├── src/attest.rs             # which peer a node accepts (same platform; same measurement, a later release with an endorsement, a predecessor)
 │   ├── src/lineage.rs            # the release key, the log key and the list of predecessors of the program (5.13)
 │   ├── src/load.rs               # the CPU time and the memory of the kernel, from procfs, for `load` of health (5.1)
@@ -357,8 +357,9 @@ code `invalid_request`. `user_mismatch` is 400 also when the account of a record
 (protocol.md section 6). A JSON body is accepted up to 1 MiB, and a longer one is `too_large`. The
 responses of a node carry no `Date` header (it would be a value of the system clock).
 
-- The common front of the calls that use a credential (`forward`, `forward/batch`, `refresh`,
-  `revoke-token`, `release`, `oauth/complete`, the mail calls): (1) the node is not `closing`. (2)
+- The common front of the calls that use a credential (`forward`, `forward/batch`,
+  `app-password/verify`, `refresh`, `revoke-token`, `release`, `oauth/complete`, the mail
+  calls): (1) the node is not `closing`. (2)
   The operator configuration is present (`release` is the exception). (3) The node can write to
   its log store, and the account has fewer than 64 pending entries (5.14. A node of platform
   `local` without a log store passes. An account the node holds no state of fails before this
@@ -393,7 +394,7 @@ responses of a node carry no `Date` header (it would be a value of the system cl
 
 ```json
 GET /v1/health -> {"node":"...","release":"v2.1.0","platform":"nitro","custody":"enclave","started_ms":0,"time_ms":0,"configured":true,"closing":false,"accounts":0,"grants":0,
-                   "mail_providers":["naver_mail"],
+                   "mail_providers":["naver_mail"],"app_password_providers":["naver_calendar"],
                    "log_store":{"bucket":"...","region":"...","credentials_expires_ms":0,"pending":0,"pending_oldest_ms":0}|null,
                    "log":{"entries":0,"events":0,"writes":0,"write_failures":0,"open_batches":0,"batch_calls":0,"batch_requests":0,
                           "write_attempt_failures":{"connect":0,"tls":0,"closed":0,"timeout":0,"status_4xx":0,"status_5xx":0},"write_retries":0,
@@ -704,10 +705,15 @@ of the processing:
 0. The frame: meta is a JSON object of at most 1 MiB (a longer meta, and a meta that is no object,
    is `invalid_request`). A payload above 64 MiB is `too_large`. A `timeout_ms` that is not an
    integer from 1,000 to 120,000 is `invalid_request` (when it is omitted, it is 30,000).
-1. The common front. The kind of the record is `oauth` or `oauth_imported` (any other kind is
-   `not_allowed`).
-2. The address check (section 7). A violation is `not_allowed`.
-3. The method is one of `GET`, `POST`, `PUT`, `PATCH`, `DELETE` (any other is `not_allowed`).
+1. The common front. The record opens by its kind: a record of kind `oauth` or `oauth_imported`
+   with the OAuth definition of its provider (a provider without one is `provider_unknown`), or
+   a record of kind `app_password` of a provider that has an application password definition
+   (6.5; a record of kind `app_password` of another provider, `naver_mail` included, is
+   `not_allowed`). Any other kind is `not_allowed`.
+2. The address check (section 7) against the `api` rules of that definition. A violation is
+   `not_allowed`.
+3. The method is one of `GET`, `POST`, `PUT`, `PATCH`, `DELETE` for a token record, and one of
+   the `methods` of the definition for an application password (any other is `not_allowed`).
 4. The header check: a name holds token characters only, and a value holds no control character
    (CR and LF included). A violation is `invalid_request`. A value can hold characters outside
    ASCII and is sent as UTF-8. A call with a header named `x-http-method-override`,
@@ -715,7 +721,8 @@ of the processing:
    refused with `not_allowed`: such a header asks a provider to treat the request as one of
    another method than the method the request is sent with, which is the method the entry of
    step 6 names. The node refuses the call. It does not drop the header and send the rest. The
-   node drops the names below and the name that equals `inject.header` of the definition:
+   node drops the names below and the credential header of the definition (`inject.header`, or
+   `Authorization` for an application password definition):
    `authorization`, `proxy-authorization`, `cookie`, `host`, `content-length`,
    `transfer-encoding`, `connection`, `keep-alive`, `upgrade`, `te`, `trailer`, `expect`,
    `accept-encoding`.
@@ -735,8 +742,9 @@ of the processing:
    request is sent.
 7. (Stage 2) The node obtains the witness signatures.
 8. The node assembles the request and sends it: `Host`, then `Content-Length` when there is a body
-   or the method is `POST`, `PUT` or `PATCH`, then the credential header made by the injection
-   rule of the definition, then `Accept-Encoding: identity`, then the headers of the caller, then
+   or the method is `POST`, `PUT` or `PATCH`, then the credential header (made by the injection
+   rule of an OAuth definition, or HTTP Basic of the login and the password of an application
+   password, 6.5), then `Accept-Encoding: identity`, then the headers of the caller, then
    `Connection: keep-alive`. The node keeps at most 8 idle connections per (account, host), each
    for at most 30 seconds, and a request of an account goes over an idle connection of that
    account and host when there is one. No connection carries requests of two accounts, and a
@@ -757,7 +765,8 @@ of the processing:
     response with a `Content-Encoding` other than `identity`, or with a transfer coding other than
     `chunked`, fails the check: the node does not hand on a body it cannot search. A response
     fails the check when a header name, a header value or the body holds the injected credential
-    (the token without the prefix of the definition). Each of the three is read as it was
+    (the token without the prefix of the definition, or the application password). Each of the
+    three is read as it was
     received and with its percent escapes decoded (up to three times, for a value that was
     encoded more than once), and each reading is searched for the credential as it is, in base64
     or base64url (each of the three byte alignments, without padding) and in hexadecimal (lower
@@ -765,9 +774,11 @@ of the processing:
     `response_withheld`: no part of the response leaves. The event `provider_request` is already
     on the chain, because the request went to the provider.
 
-The value of the credential header: `inject.prefix` followed by the value at the first path of
-`inject.paths` that holds a non-empty string in the token object. When there is no such value, the
-call fails with `record_invalid`.
+The value of the credential header of a token record: `inject.prefix` followed by the value at
+the first path of `inject.paths` that holds a non-empty string in the token object. When there is
+no such value, the call fails with `record_invalid`. The credential header of an application
+password is `Authorization` with the value `Basic` and the base64 of `{login}:{password}`, where
+the login is the account name of the record without the domain of the definition (6.5).
 
 The node does not judge the expiry of a token and does not refresh. The response of the provider
 (a 401 and the `ok: false` of slack included) goes back as it is, after the check of step 10.
@@ -820,6 +831,44 @@ confirmation of the entry. `requests` holds 1 to 100 objects; another count is `
    batch as it covers the body of a single `forward`: the reservation of the request frame is
    split among the requests by the length of their bodies, and the share of a request is free
    once the request is on the wire, before its response body takes a share of its own.
+
+### 5.8c `POST /v1/app-password/verify`
+
+The check, at the time a connection is made, that a provider accepts the application password of
+a record whose provider has an application password definition (6.5). The frame is the frame of
+5.8. Its meta is `{"user_id":"...","record":{...},"context":"...","request":{},"timeout_ms":30000}`:
+`request` is absent, `null` or the empty object and the payload is empty (anything else is
+`invalid_request`), and `timeout_ms` is read as in 5.8 step 0. Its response is the frame of 5.8
+with `status`, `headers`, `log` and a JSON body.
+
+1. The common front of section 4. The record opens as an application password and nothing else:
+   the provider must have an application password definition (the password of `naver_mail`,
+   whose calls are the mail calls, is `not_allowed`), and the kind must be `app_password`. A
+   record of another kind is `not_allowed` before its plaintext is read, whatever its provider:
+   a token record whose provider has no OAuth definition is `not_allowed` here and
+   `provider_unknown` on `forward`.
+2. The request is the `verify` request of that definition: its method, its address, its headers
+   and its body. It passes steps 2 to 4 of 5.8 as a request of the caller would (the validation
+   of the definition guarantees that it does: 6.5), and steps 5 and 6: the event
+   `provider_request` names it, and the request leaves only after the log store confirmed the
+   entry that holds the event.
+3. Steps 8 to 10 of 5.8, within `timeout_ms`: the request leaves with the credential header of
+   the password, and the response passes the check of rule E4 with the password as the
+   searched credential (a response that reflects it is `response_withheld`).
+4. The response of the provider stays inside the node. Its status decides what leaves:
+
+| Status of the provider | `status` of the frame | Body of the frame |
+| --- | --- | --- |
+| A status of `verify.accepted` of the definition | 200 | `{"identity":"...","node":"...","statement":{"body":"...","sig":"..."}}`: the identity of the account (`{login}@{domain}` of the definition), the identifier of the node and the statement `app_password_verified` of protocol.md (its `provider` is the provider of the record) |
+| 401 | 401 | `{"code":"authentication_failed"}` |
+| Any other | 502 | `{"code":"verification_failed","status":n}`: `n` is the status of the provider, as an integer |
+
+The three frame statuses are the node's: a 2xx answer that is not an accepted status (a page that
+answers 200 whatever the credential) is the last row, not the first. The node follows no
+redirect: a 3xx answer is a status of the last row too. The `headers` of the frame are
+`[["content-type","application/json"]]` in every row, and no other byte of the provider response
+leaves. The call takes a forward slot and its share of the body budget as `forward` does
+(section 8).
 
 ### 5.9 `POST /v1/release`
 
@@ -1045,6 +1094,13 @@ The rules are those of protocol.md 10.4. What this document adds:
 
 ## 6. The provider definitions
 
+A definition is of one of two forms, told apart by the key `credential`. An entry without that
+key is an OAuth definition (6.1 to 6.4): the node issues and refreshes the tokens of the provider
+and injects them into the requests of `forward`. An entry with `"credential": "app_password"` is
+an application password definition (6.5): the device encrypts a password the user made at the
+provider, and the node sends it as HTTP Basic to the hosts of the definition. Both forms have an
+`api` list (section 7). A provider name is of one form only.
+
 ### 6.1 The format (`enclave/src/providers/definitions.json`, compiled into the binary)
 
 ```json
@@ -1222,6 +1278,55 @@ value that the definition does not list does not leave the node.
   record and no public field leaves. A string holds a token when it contains the token as it
   is, or in one of the encoded forms that the response check of `forward` searches for (5.8).
 
+### 6.5 Application password definitions
+
+A definition with the key `"credential": "app_password"` describes a provider whose credential is
+an application password the user made at the provider: a record of kind `app_password` that the
+device encrypted (protocol.md section 6). The node sends it as HTTP Basic (the header
+`Authorization` with the value `Basic` and the base64 of `{login}:{password}`) to the hosts of the
+definition, in the requests of `forward` and `forward/batch` (5.8, 5.8b) and in the one request of
+`app-password/verify` (5.8c). Such a definition has none of the keys of 6.1: no client, no
+authorization address, no token address, no revocation address, no public fields, and the host
+program carries no client values for it (section 9).
+
+```json
+{
+  "naver_calendar": {
+    "credential": "app_password",
+    "account_domain": "naver.com",
+    "methods": ["PROPFIND", "REPORT", "GET", "PUT", "DELETE"],
+    "api": [{"host": "caldav.calendar.naver.com", "prefixes": ["/"], "exact": []}],
+    "verify": {"method": "PROPFIND", "url": "https://caldav.calendar.naver.com/", "accepted": [207], "headers": [["Depth", "0"], ["Content-Type", "application/xml; charset=utf-8"]], "body": "<?xml version=\"1.0\" encoding=\"utf-8\"?><d:propfind xmlns:d=\"DAV:\"><d:prop><d:current-user-principal/></d:prop></d:propfind>"}
+  }
+}
+```
+
+| Key | Meaning |
+| --- | --- |
+| `credential` | `app_password`, the one value. The key tells the two forms of definition apart: an entry without it is an OAuth definition |
+| `account_domain` | The domain of the account: a lower-case DNS name with a dot. The `username` of the plaintext of a record is the login of the account, with or without `@` and this domain, compared without regard to case: 1 to 64 letters, digits, `_`, `.` and `-` (another form is `record_invalid`). The login is the user name of the HTTP Basic credential, and `{login}@{domain}` is the identity a verification declassifies. This form of the login is one rule for every application password definition (`AppPassword::from_plaintext` in `enclave/src/mail.rs`): a provider whose account names have another form needs a change of that rule, which is a release |
+| `methods` | The methods `forward` sends with the password: distinct upper-case HTTP tokens, at least one. A request of another method is `not_allowed` |
+| `api` | Section 7: the hosts and the paths a password of this provider may be sent to, under the rules of an `api` list of 6.1 |
+| `verify` | The request of `app-password/verify` (5.8c): `method` (one of `methods`), `url` (an address that passes the address check of this definition), `accepted` (the statuses that mean the provider accepted the password: distinct 2xx statuses, at least one; any other 2xx is no acceptance), `headers` (`[name, value]` pairs under the header rules of 5.8 step 4; a header that `forward` drops or refuses, the credential header `Authorization` among them, is refused here, so the request leaves as it is written) and `body` (text of at most 4,096 bytes) |
+
+The values of the one definition:
+
+| | naver_calendar |
+| --- | --- |
+| account_domain | `naver.com` |
+| methods | `PROPFIND`, `REPORT`, `GET`, `PUT`, `DELETE` |
+| api | `caldav.calendar.naver.com`, prefix `/` (section 7) |
+| verify | `PROPFIND https://caldav.calendar.naver.com/` with `Depth: 0` and `Content-Type: application/xml; charset=utf-8`, and the `propfind` body above, which asks for `current-user-principal`. Accepted: 207 (Multi-Status, the answer of a PROPFIND that succeeded) |
+
+The definitions are validated when the node loads them, and a node with an invalid one does not
+start (`AppPasswordDefinition::validate` in `enclave/src/providers/mod.rs`): the name is a valid
+name, the domain has the form above, the methods and the `api` rules follow their rules, and the
+`verify` request is one that `forward` would send as it is written (its method is one of
+`methods`, its address passes the address check, none of its headers is one that 5.8 step 4 drops
+or refuses, its body is within its limit, its accepted statuses are distinct 2xx statuses). A key
+the format does not define is refused, and so is a key of 6.1 on such an entry. `health` lists the
+providers of these definitions as `app_password_providers` (5.1).
+
 ## 7. The address check (`forward`)
 
 | Definition | host | Allowed paths |
@@ -1245,8 +1350,9 @@ value that the definition does not list does not leave the node.
 | github | `api.github.com` | Prefixes `/user`, `/users/`, `/repos/`, `/search/`, `/orgs/`, `/rate_limit`. Exact `/graphql` |
 | | `uploads.github.com` | Prefix `/repos/` (the release asset uploads `/repos/{owner}/{repo}/releases/{id}/assets`) |
 | | `github.com` | Suffixes `/info/refs`, `/git-upload-pack`, `/git-receive-pack` (the git smart HTTP addresses `/{owner}/{repo}.git/info/refs`, `.../git-upload-pack`, `.../git-receive-pack`) |
+| naver_calendar (6.5) | `caldav.calendar.naver.com` | Prefix `/`: every path of the host, with the methods of the definition |
 
-The rules:
+The rules, which hold for the `api` list of either form of definition:
 
 - The address is read as the string that was received (nothing is normalized). It is at most
   8,192 bytes long, every byte is printable ASCII (0x21 to 0x7e), and it has no fragment (`#`).
@@ -1412,8 +1518,8 @@ configuration from environment variables.
 | --- | --- |
 | Start | Before the enclave, the host program raises its own limit of open descriptors to 65,536 (`descriptors.rs`), or to its hard limit when the target is above it (the container does not hold `CAP_SYS_RESOURCE`), and logs the limits in force. Then `nitro-cli run-enclave --eif-path /opt/credential-enclave/enclave.eif --cpu-count 2 --memory {memory} --enclave-cid 16`, where `{memory}` is the value of the environment variable `CREDENTIAL_ENCLAVE_MEMORY_MIB` in MiB and 4,096 when the variable is not set or empty. A value that is not a positive decimal integer (a sign, a leading zero, a fraction, letters, a value above 4,294,967,295) ends the host program before the start of the enclave with one line on the standard error that names the variable and the value, and a status that is not 0. The host program logs the memory and the vCPUs it starts the enclave with. When the start fails, the host program prints the ends of the `nitro-cli` log files and ends with a status that is not 0 |
 | Inbound relay | For every connection on TCP `0.0.0.0:8080` it opens a connection to vsock `16:8080` and moves the bytes in both directions. It does not read the bytes: the call surface of the node ends inside the enclave. It counts the connections for which the vsock connection to the node failed or did not open within its time limit of 5 seconds (the Status row): a caller whose connection the relay closes without a byte |
-| Egress relay | It listens on vsock port 8443. It reads the first line `CONNECT {host}:{port}\n`. When the host is on the allow list and the port is 443, it connects by TCP, answers `OK\n` and moves the bytes. Otherwise it sends `ERR\n` and closes. The allow list is the hosts of section 7, the hosts of the token addresses and the revocation addresses of 6.2 (the host program is built from the same definitions file), and the host of the log store, `{bucket}.s3.{region}.amazonaws.com`, when the two variables of the next row name one. TLS ends inside the node, so the relay sees ciphertext only. This list is a second line: the node itself sends a credential only to the addresses of its definitions, and log entries only to its log store. Its listener has a backlog of 1,024 connections (the queue of connections that wait for accept; the kernel of the parent instance resets a connection request that finds the queue full); when the kernel refuses to set it the host program logs one line and keeps the default. A failed accept, on this listener and on the two TCP listeners, is classified by its error: `ECONNABORTED`, `EPROTO`, `EINTR` and `EAGAIN` (the connection was gone before accept returned it, or the call was interrupted) are followed by the next accept at once; `EMFILE`, `ENFILE`, `ENOBUFS` and `ENOMEM` (the process or the kernel is out of descriptors or memory) and every other error are followed by a pause of 50 milliseconds. The egress relay counts its failed accepts by class (`aborted`, `resources`, `other`), its connections by outcome and the connections whose bytes it moves at this moment (the Status row) |
-| Operator configuration | It reads the values of every provider from environment variables and calls `POST /v1/config` once the `health` call of the node answers. The variables: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `OUTLOOK_CLIENT_ID`, `OUTLOOK_CLIENT_SECRET`, `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `NOTION_CLIENT_ID`, `NOTION_CLIENT_SECRET`, `X_CLIENT_ID`, `X_CLIENT_SECRET`, `LINK_CLIENT_ID`, `LINK_CLIENT_SECRET`, `STRIPE_PUBLISHABLE_KEY`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, and `CHARACTER_API_BASE_URL` (the front of the callback address `{value}/api/integrations/{provider}/oauth/callback`). The configuration names every provider of the definitions: `redirect_uri` is always set, and a value without a variable is the empty string. `CREDENTIAL_ENCLAVE_LOG_BUCKET` and `CREDENTIAL_ENCLAVE_LOG_REGION` name the log store: when both are set and have the forms of protocol.md 4.1, the configuration carries them as `log_store`. When one is missing or has another form, the configuration carries no `log_store` and one line of the log says why. Without `CHARACTER_API_BASE_URL` no configuration is sent. A configuration that the node refuses is not sent again. The host program does not send the credentials for the log store: the backend sends them (5.14) |
+| Egress relay | It listens on vsock port 8443. It reads the first line `CONNECT {host}:{port}\n`. When the host is on the allow list and the port is 443, it connects by TCP, answers `OK\n` and moves the bytes. Otherwise it sends `ERR\n` and closes. The allow list is the hosts of section 7 (the `api` hosts of the OAuth definitions and of the application password definitions), the hosts of the token addresses and the revocation addresses of 6.2 (the host program is built from the same definitions file), and the host of the log store, `{bucket}.s3.{region}.amazonaws.com`, when the two variables of the next row name one. TLS ends inside the node, so the relay sees ciphertext only. This list is a second line: the node itself sends a credential only to the addresses of its definitions, and log entries only to its log store. Its listener has a backlog of 1,024 connections (the queue of connections that wait for accept; the kernel of the parent instance resets a connection request that finds the queue full); when the kernel refuses to set it the host program logs one line and keeps the default. A failed accept, on this listener and on the two TCP listeners, is classified by its error: `ECONNABORTED`, `EPROTO`, `EINTR` and `EAGAIN` (the connection was gone before accept returned it, or the call was interrupted) are followed by the next accept at once; `EMFILE`, `ENFILE`, `ENOBUFS` and `ENOMEM` (the process or the kernel is out of descriptors or memory) and every other error are followed by a pause of 50 milliseconds. The egress relay counts its failed accepts by class (`aborted`, `resources`, `other`), its connections by outcome and the connections whose bytes it moves at this moment (the Status row) |
+| Operator configuration | It reads the values of every provider from environment variables and calls `POST /v1/config` once the `health` call of the node answers. The variables: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `OUTLOOK_CLIENT_ID`, `OUTLOOK_CLIENT_SECRET`, `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `NOTION_CLIENT_ID`, `NOTION_CLIENT_SECRET`, `X_CLIENT_ID`, `X_CLIENT_SECRET`, `LINK_CLIENT_ID`, `LINK_CLIENT_SECRET`, `STRIPE_PUBLISHABLE_KEY`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, and `CHARACTER_API_BASE_URL` (the front of the callback address `{value}/api/integrations/{provider}/oauth/callback`). The configuration names every OAuth provider of the definitions (an application password definition has no client values and is not named): `redirect_uri` is always set, and a value without a variable is the empty string. `CREDENTIAL_ENCLAVE_LOG_BUCKET` and `CREDENTIAL_ENCLAVE_LOG_REGION` name the log store: when both are set and have the forms of protocol.md 4.1, the configuration carries them as `log_store`. When one is missing or has another form, the configuration carries no `log_store` and one line of the log says why. Without `CHARACTER_API_BASE_URL` no configuration is sent. A configuration that the node refuses is not sent again. The host program does not send the credentials for the log store: the backend sends them (5.14) |
 | Status | TCP 9091: `GET /healthz` (200 when the round trip of the `health` call of the node succeeds within 8 seconds, 503 otherwise: the responsiveness of the node, read by the startup and readiness probes of the pod), `GET /livez` (200 while the enclave runs, 503 once the watch of the enclave (the Watch row) confirmed that it ended: the life of the enclave, read by the liveness probe of the pod. It makes no call to the node: a node that does not answer is not a dead enclave, and a pod replaced for that reason would lose the delegations of a living node) and `GET /metrics` (the Prometheus text format). Four gauges: `credential_enclave_up` (1 when the `health` round trip succeeds, 0 when it fails), `credential_enclave_configured` (1 when `configured` of `health` is true), `credential_enclave_accounts` (`accounts` of `health`), `credential_enclave_started_timestamp_seconds` (`started_ms` of `health` in seconds). From the `log` object of `health`, when the node answers with one: the counters `credential_enclave_log_entries_total` (`entries`), `credential_enclave_log_events_total` (`events`), `credential_enclave_log_store_writes_total` (`writes`), `credential_enclave_log_store_write_failures_total` (`write_failures`), `credential_enclave_forward_batch_calls_total` (`batch_calls`), `credential_enclave_forward_batch_requests_total` (`batch_requests`), and the gauge `credential_enclave_log_open_batches` (`open_batches`); and, when the object holds the write counts of 5.1: the counter `credential_enclave_log_store_write_attempt_failures_total{cause}` (`write_attempt_failures`; `cause` is `connect`, `tls`, `closed`, `timeout`, `status_4xx` or `status_5xx`), the counter `credential_enclave_log_store_write_retries_total` (`write_retries`), and the histogram `credential_enclave_log_store_write_seconds`: `_bucket{le}` for `le` `0.025`, `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5` and `5` from the cumulative counts of `write_ms_buckets`, `_bucket{le="+Inf"}` and `_count` from `write_count`, `_sum` from `write_ms_sum` as seconds with three decimals. From the `log_store` object of `health`, when it is not null: the gauge `credential_enclave_log_store_pending_accounts` (`pending`) and, when the object holds `pending_oldest_ms`, the gauge `credential_enclave_log_store_pending_oldest_seconds` (its milliseconds as seconds with three decimals). From the `load` object of `health`, when the node answers with one: the gauges `credential_enclave_provider_inflight` (`provider_inflight`) and `credential_enclave_forward_calls` (`forward_calls`); when its three CPU values are not null, the counters `credential_enclave_cpu_user_seconds_total`, `credential_enclave_cpu_system_seconds_total` and `credential_enclave_cpu_idle_seconds_total` (the milliseconds of `health` as seconds with three decimals); when its two memory values are not null, the gauges `credential_enclave_memory_total_bytes` and `credential_enclave_memory_available_bytes`; when the object holds the two counts of the connections from the backend (a node of release v2.2.0 or later), the gauge `credential_enclave_inbound_connections` (`inbound_connections`) and the counter `credential_enclave_inbound_refused_total` (`inbound_refused`); when it holds the value, the gauge `credential_enclave_descriptors_open` (`descriptors_open`) and the gauge `credential_enclave_descriptors_limit` (`descriptors_limit`). From the `egress` object of `health`, when the node answers with one: the counter `credential_enclave_egress_opens_total` (`opens`), the counter `credential_enclave_egress_open_failures_total{cause}` (`open_failures`; `cause` is `transport`, `relay_refused`, `tls` or `http`), the counter `credential_enclave_egress_open_retries_total` (`open_retries`), the gauge `credential_enclave_egress_open_inflight` (`open_inflight`) and the counter `credential_enclave_egress_idle_reuses_total{peer}` (`idle_reuses`; `peer` is `provider` or `log_store`). From the `refresh` object of `health`, when the node answers with one: the counter `credential_enclave_refresh_late_total{outcome}` (`late`; `outcome` is `kept`, `dropped`, `failed` or `abandoned`) and the gauge `credential_enclave_refresh_late_inflight` (`late_inflight`). After the series of the objects, when the answer holds the value: the gauge `credential_enclave_grants` (`grants` of `health`, the accounts with a grant within its time; every release answers it). From the `state` object of `health`, when the node answers with one: the gauges `credential_enclave_kept_refreshes` (`kept_refreshes`), `credential_enclave_merge_keys` (`merge_keys`), `credential_enclave_pending_entries` (`pending_entries`) and `credential_enclave_idle_connections{peer}` (`idle_connections`; `peer` is `provider` or `log_store`). From the host program itself, with every answer, after the series of `health`: the gauge `credential_enclave_host_enclave_running` (1 while the last `describe-enclaves` of the watch listed a running enclave or none ran yet, 0 when it listed none), the gauges `credential_enclave_host_descriptors_open` and `credential_enclave_host_descriptors_limit` (the open descriptors of the host program and its limit in force, when the kernel gives both), the counter `credential_enclave_host_egress_accept_errors_total{cause}` (the failed accepts of the egress relay; `cause` is `aborted`, `resources` or `other`), the counter `credential_enclave_host_egress_relays_total{outcome}` (the connections of the node the egress relay served; `outcome` is `relayed`, `malformed`, `not_allowed` or `unreachable`), the gauge `credential_enclave_host_egress_relays_inflight` (the connections whose bytes the egress relay moves at this moment) and the counter `credential_enclave_host_inbound_node_connect_failures_total` (the connections of callers for which the inbound relay could not open its connection to the node). When the `health` call fails, the answer is `credential_enclave_up 0` and the series of the host program. A counter of the node restarts at 0 when the node restarts (the started timestamp changes), a CPU counter when the kernel of the node boots, and a counter of the host program when the host program starts |
 | Sending the operator configuration again | Does not happen. The configuration is sent once at the start. To change a value, the pod is replaced |
 | Watch | Every 10 seconds the host program runs `nitro-cli describe-enclaves` (in a blocking task; an answer is waited for 5 seconds, a run that takes longer is waited for at the next poll and no second run starts beside it) and reads its JSON list: an element whose `State` is `RUNNING` is a running enclave. Before the third consecutive answer without a running enclave counts, the host program makes one `health` call to the node: a node that answers is alive whatever the list said, the answer counts as a running enclave and the count starts over (a node that does not answer is judged by the list alone). Three consecutive answers without a running enclave confirm that the enclave ended on its own (the node program aborted, the enclave ran out of memory, the hypervisor ended it): the host program logs it, makes the shutdown collection call of the Shutdown row (the backend records the node as closed; the collection fails at its first stage, as the node is gone), calls `nitro-cli terminate-enclave --all` and ends with a status that is not 0, so that the container runtime starts it again with a new enclave, which takes its delegations from the living nodes. One answer without a running enclave does not confirm the end (one line of the log says that the list was empty), and a run that failed or passed its 5 seconds changes nothing: a host program that ended on a reading failure would end a living node and lose its delegations. `GET /livez` and the gauge `credential_enclave_host_enclave_running` of the Status row read the same observations |
@@ -1529,10 +1635,11 @@ place of every provider (`enclave/src/testing.rs`).
 | Log | `enclave/src/tests/log.rs` | The entry is on the chain before the provider is called (the provider stand-in looks at the head at the time of the call), the group commit (the events that arrive during a write form the next entry; a merged GET waits for the entry of the event it shares; a control event closes the open batch and stands alone; the caps of 128 events and 1,048,576 bytes), the `log` object of every response, the chain verified from the keys of the store and its head (index and content verification, a gap, a changed key), the final heads of `close` when the store confirmed every entry, a final head that covers an open batch, the times of the events and entries of a chain |
 | Orderly shutdown | `enclave/src/tests/close.rs` | The final head rule of 5.11 against a store that refuses writes: pending entries that are the tail of a chain are dropped and the final head stands at the last confirmed entry (the sweep writes nothing more, the keys the store holds reach the head, `truncated` 1); a chain whose every entry is pending ends at `seq` 0 and leaves the account without a chain; a confirmed entry above a pending one leaves the account without a head and counted in `skipped` until a later call finds the gap closed; a repeated call returns the same head |
 | Log store | `enclave/src/tests/log_store.rs`, the unit tests of `enclave/src/log_store.rs` | Against a stand-in for Amazon S3 on the TLS server of the provider stand-in: the write of an entry arrives before the request to the provider, under the key of format 2 whose seven parts the test computes again from the body, with the headers and a signature that the test computes again from the request. A write the store does not confirm (a status other than 200, a 412 included, no connection, no answer within the time limit) stops the act of every call, the writer and the calls that waited for it. A pending entry is written again with the next write of its account, and a request that shares an event waits for its entry. The signed refusal of a grant, a revoke that erases the key whatever the store answers, the failure and the repetition of `peer/export`, the refusal of a peer of another log store, a node of the nitro platform without a log store or credentials, the limit of pending entries, calls that end before their write (the account has no writer afterwards), calls that run at the same time form one entry and write each entry once. The idle connections: one connection for writes in a row, a connection the store closed, a write whose idle connection ends without a response, the current credentials over an idle connection. The attempts of a write: a 5xx status and 429 are repeated over a new connection with the same body within the budget, a 4xx status is not, an idle connection that stalls or that closes without a response is left for a new connection, a new connection that closes without a response is repeated as well, a store that cannot be reached is asked for three connections, and the causes and the counts of health. The sweep: its rate, its random order, and the jitter before it writes the entries of an account. The local endpoint: a path-style write over plain HTTP with the host of the endpoint, refused on the nitro platform and for a value that is not an origin. The signature against the examples of the AWS documentation |
-| Address check | The unit tests of `enclave/src/providers/mod.rs` | The refusals of section 7 (another host, a path outside the lists, a denied path in its spellings, dot segments, dot segments in front of a path parameter, encoded separators and separators that are encoded twice, a port, user information), and the validation of the definitions, including the rules for public fields |
+| Address check | The unit tests of `enclave/src/providers/mod.rs` | The refusals of section 7 (another host, a path outside the lists, a denied path in its spellings, dot segments, dot segments in front of a path parameter, encoded separators and separators that are encoded twice, a port, user information), and the validation of the definitions, including the rules for public fields and the application password definitions of 6.5 (the two forms, the domain of the account, the methods, the `verify` request, the one embedded definition and the addresses and methods it allows) |
 | OAuth | `enclave/src/tests/oauth.rs`, the unit tests of `enclave/src/oauth.rs` | Against the provider stand-in: exchange, refresh, the merge of a reconnect, the nested token place of slack and its `ok: false`, the public fields and the containment check, the closed vocabulary of `provider_error`, the kept response of a repeated refresh, a token address call of `refresh` whose response arrives after the time limit of the call (kept for the next call with the same record; dropped after a revoke or after `close`; a late refusal and the late limit; the bound of the late calls and their counts in health), a record of kind `oauth_imported` |
 | forward | `enclave/src/tests/forward.rs`, the unit tests of `enclave/src/provider_response.rs` and `enclave/src/egress.rs` | Header removal, the refusal of a header that overrides the method and of the batch address of Microsoft Graph, the injected credential, the event of a GET request with a body, the whole path and the whole query in the event of the longest address, redirects that are not followed, chunked responses, the body limit, the time limit, a response that reflects the credential (as it is, under percent escapes of up to three layers, in base64 and in hexadecimal), the idle connections per (account, host): two accounts never share one, a connection is dropped after 30 seconds idle, a GET over an idle connection that ends without a response is sent once more and a POST is not; an open that fails before a request byte left is repeated within half the time limit of the call (two refusals and then a success, three refusals, a refusal that arrives after half the time limit), the bound of connections being opened at once, and the counts of `egress` of health |
 | forward/batch | `enclave/src/tests/forward_batch.rs` | One entry names every request before any leaves; a batch of 100 with 6 in flight; a request that fails the address check refuses the whole call with its index and creates no event; a merged request inside a batch shares the event; two entries when the open batch reaches its cap inside a batch; one failed request leaves the other results intact and keeps its `log` object; the bodies of the results together under the body limit; the results in the order of the requests; the bodies split by `body_bytes`; a batch of 0 or 101 requests is invalid |
+| Application passwords over HTTP | `enclave/src/tests/app_password.rs` | Against a stand-in for the CalDAV host of NAVER Calendar: `forward` with a record of kind `app_password` of `naver_calendar` sends HTTP Basic of the login and the password (the account name without its domain, in lower case; the credential header of the caller is dropped) and logs a `provider_request`; the methods and the hosts of the definition bound the password (another method, another host, another port, a token toward the CalDAV host); the password of `naver_mail` and a vault record are refused by `forward` and `app-password/verify`, and so is a token record by `app-password/verify`; `app-password/verify` sends the request of the definition, states the identity with a statement that verifies, refuses a request or a payload of its own, reports 401 as `authentication_failed` and any other status as it is, and follows no redirect; a response that reflects the password is withheld by both calls; and the route in a success and a failure case, with the password reaching the CalDAV host only |
 | Delegation transfer | `enclave/src/tests/peer.rs` | The round trip of export and import between two nodes of the local platform, paging, the exclusion of expired grants and of accounts that revoked, a grant of another `sign_pk` is not replaced, the refusal of a changed envelope and of an envelope for another node, the entries `grant_transferred_out` and `grant_transferred_in` (the `logs` of the responses and the objects of the store), a repeated export to the same peer without a new entry, the limit of 64 peers per grant, an export with an endorsement that does not hold (it hands nothing over and leaves no entry, also for a peer the call without an endorsement accepts), the `subset` of export (the share of the peer alone, with entries for it alone, and pages that count the selected grants) and of import (the share of the receiving node alone out of a transfer of every account, `copies` at or above `pods` names every account, `null` is a call without a subset, a subset outside its bounds is refused by both calls) |
 | Delegation subset and pruning | `enclave/src/tests/grants.rs`, the unit tests of `enclave/src/subset.rs` | The assignment vectors of protocol.md 10.4 and the agreement of `contains` with `assign`; `grants/prune` drops the grants within their time and the expired grants outside the share page by page in `user_id` order, leaves the chains, the revocation markers and the grants of the share, prunes nothing more on a repeated walk, works in the state `closing`, and refuses a missing subset, a subset outside its bounds and a `limit` of 0; after grants, a refresh, merged GET requests, refused writes, an expiry, a revoke, an import, a prune, two sweeps and the shutdown, every count of health (`accounts`, `grants`, `pending`, `pending_entries`, `kept_refreshes`, `merge_keys`, `open_batches`) equals a scan of the accounts |
 | Call surface | `enclave/src/tests/surface.rs`, the unit tests of `enclave/src/load.rs` and `enclave/src/descriptors.rs` | `health` with the counts of its `log`, `egress`, `refresh` and `state` objects and the values of its `load` object (the readers of `/proc/stat`, `/proc/meminfo` and the auxiliary vector on sample text: the columns of each mode, a line with fewer columns, malformed text; the limit of open descriptors is raised or kept and never lowered, and the count of open descriptors follows the descriptors the process holds), the bound of the connections from the backend (a connection above the bound is closed without a byte and counted, an idle connection is closed after the idle time and frees its place), the operator configuration, attestation and its challenge statement, the failure bodies, HTTP/1.1 over a real connection, that `log/entries` and `log/ack` do not exist, and that the calls of the router are the calls of the table in section 4 of egress-policy.md |
@@ -1544,7 +1651,10 @@ place of every provider (`enclave/src/testing.rs`).
 ## Mail call surface
 
 GET /v1/health adds `mail_providers: ["naver_mail"]`. An absent field on an older release means
-no mail support. POST /v1/mail/verify, /v1/mail/read and /v1/mail/submit use the forward binary
+no mail support. `app_password_providers` of the same call lists the providers of the application
+password definitions (6.5), whose password travels over HTTP and whose verification is 5.8c; an
+absent field on an older release means no such provider. POST /v1/mail/verify, /v1/mail/read and
+/v1/mail/submit use the forward binary
 frame. Meta is `{user_id, record, context, request}`; only submit has payload bytes (ASCII SMTP
 MIME with CRLF). The response is the forward frame with `status`, `headers`, `log` and body.
 

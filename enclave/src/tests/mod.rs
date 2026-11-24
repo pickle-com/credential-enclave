@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use crate::providers::{endpoint, Definitions};
 use crate::testing::{Provider, Reply, Seen, LOG_HOST};
 
+mod app_password;
 mod canary;
 mod close;
 mod commands;
@@ -43,7 +44,8 @@ fn seven_counts(log: &Value) -> Value {
 }
 
 /// Every host a node can connect to with the embedded definitions: the token addresses, the
-/// revocation addresses and the hosts of the `api` rules.
+/// revocation addresses and the hosts of the `api` rules of the OAuth definitions, and the
+/// hosts of the `api` rules of the application password definitions.
 fn provider_hosts() -> Vec<String> {
     let definitions = Definitions::embedded();
     let mut hosts = BTreeSet::new();
@@ -54,6 +56,11 @@ fn provider_hosts() -> Vec<String> {
             hosts.insert(endpoint(&revoke.url).unwrap().host);
         }
         for rule in &definition.api {
+            hosts.insert(rule.host.clone());
+        }
+    }
+    for name in definitions.app_password_names() {
+        for rule in &definitions.app_password(name).unwrap().api {
             hosts.insert(rule.host.clone());
         }
     }

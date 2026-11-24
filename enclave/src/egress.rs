@@ -45,6 +45,35 @@ use crate::state::lock;
 /// The port of every provider address and of the log store.
 pub const PROVIDER_PORT: u16 = 443;
 
+/// Caller headers the HTTP calls drop (enclave.md 5.8 step 4): the credential header is the
+/// node's, `Accept-Encoding` is set by the node, and the rest describe the connection or the
+/// body framing. The `verify` request of an application password definition cannot name one.
+pub const DROPPED_REQUEST_HEADERS: [&str; 13] = [
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "upgrade",
+    "te",
+    "trailer",
+    "expect",
+    "accept-encoding",
+];
+
+/// Caller headers that ask a provider to treat a request as one of another method than the
+/// method it is sent with. A call that carries one is refused: the event `provider_request`
+/// names the method of the request, and the request that leaves is of that method. The `verify`
+/// request of an application password definition cannot name one either.
+pub const REFUSED_REQUEST_HEADERS: [&str; 3] = [
+    "x-http-method-override",
+    "x-http-method",
+    "x-method-override",
+];
+
 /// Open connections to providers in total that carry no request, over every account.
 const IDLE_PROVIDER_CONNECTIONS_TOTAL: usize = 1024;
 

@@ -28,6 +28,7 @@ use crate::state::{Node, OperatorConfig, ProviderCredentials};
 use crate::subset::Subset;
 use credential_enclave_protocol::record::Record;
 
+mod app_password;
 mod attestation;
 mod close;
 mod config;
@@ -86,6 +87,11 @@ fn routes() -> Vec<Route> {
         route(Method::POST, "/v1/mail/verify", mail::verify),
         route(Method::POST, "/v1/mail/read", mail::read),
         route(Method::POST, "/v1/mail/submit", mail::submit),
+        route(
+            Method::POST,
+            "/v1/app-password/verify",
+            app_password::verify,
+        ),
         route(Method::POST, "/v1/release", release::release),
         route(Method::POST, "/v1/close", close::close),
         route(Method::POST, "/v1/close/heads", close::heads),

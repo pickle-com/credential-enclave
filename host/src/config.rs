@@ -153,11 +153,17 @@ const CONFIG_REPLY_LIMIT_BYTES: usize = 64 * 1024;
 /// A failed attempt is logged the first time and then once in this many attempts.
 const FAILURE_LOG_PERIOD: u64 = 60;
 
-/// The names of the providers of the definitions, in the order of the file.
+/// The names of the providers whose client values the operator configuration carries: the
+/// OAuth definitions, in the order of the file. An application password definition (an entry
+/// with the key `credential`) has no client values and is left out.
 pub fn provider_names(definitions: &str) -> Result<Vec<String>, String> {
     let definitions: Map<String, Value> = serde_json::from_str(definitions)
         .map_err(|_| "the provider definitions are not a JSON object".to_string())?;
-    Ok(definitions.keys().cloned().collect())
+    Ok(definitions
+        .iter()
+        .filter(|(_, definition)| definition.get("credential").is_none())
+        .map(|(name, _)| name.clone())
+        .collect())
 }
 
 /// Why no configuration can be built.
@@ -346,6 +352,8 @@ mod tests {
                 "github"
             ])
         );
+        // The application password definition has no client values: it is not configured.
+        assert!(crate::DEFINITIONS.contains("\"naver_calendar\""));
         assert!(provider_names("[]").is_err());
     }
 

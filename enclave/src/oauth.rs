@@ -3,10 +3,11 @@
 //!
 //! Tokens are issued to the node and stay in it. This module owns the types that hold them:
 //! the response of a token address ([`TokenResponse`]), the plaintext of a record of kind
-//! `oauth` or `oauth_imported` ([`OauthRecord`], [`OauthPlaintext`]), the credential of a
-//! request ([`Credential`]) and the PKCE verifier ([`PkceVerifier`]). Their fields are private
-//! to this module and are secrets of the protocol crate, so no other module of the node can
-//! read a token.
+//! `oauth` or `oauth_imported` ([`OauthRecord`], [`OauthPlaintext`]) and the PKCE verifier
+//! ([`PkceVerifier`]). Their fields are private to this module and are secrets of the protocol
+//! crate, so no other module of the node can read a token. The credential of a `forward`
+//! request ([`crate::provider_response::Credential`]) is made here from a token
+//! ([`OauthPlaintext::credential`]) and leaves as two secrets.
 //!
 //! The kind of a record says where its token came from (rule E6 of the egress policy). A
 //! record of kind `oauth` holds a token this node, or another node that held the user key of
@@ -43,7 +44,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::egress::{OutboundBody, OutboundHeader, OutboundRequest};
-use crate::provider_response::Forms;
+use crate::provider_response::{Credential, Forms};
 use crate::providers::{
     BodyFormat, ClientAuth, Definition, Destination, FieldType, Inject, PublicField, Revoke,
     TOKEN_KEYS,
@@ -62,8 +63,8 @@ const PARAM_VALUE_CHARS: usize = 1024;
 pub struct TokenResponse(Secret<Value>);
 
 /// The opened plaintext of a record of kind `oauth` or `oauth_imported`, before it is parsed.
-/// Only [`open_record`] and [`open_records`] create one, so the bytes are those of a record
-/// that opened under the grant of the account and names that kind in its AAD.
+/// Only [`open_record`], [`open_records`] and [`token_record`] create one, so the bytes are
+/// those of a record that opened under the grant of the account and names that kind in its AAD.
 pub struct OauthRecord {
     kind: TokenKind,
     plaintext: Secret<Vec<u8>>,
@@ -110,20 +111,6 @@ pub struct OauthPlaintext {
     plaintext: Secret<Value>,
 }
 
-/// The credential `forward` injects: the token of an `oauth` record, and the header value made
-/// of the prefix of the definition and that token.
-pub struct Credential {
-    token: Secret<String>,
-    header: Secret<String>,
-}
-
-impl Credential {
-    /// The header value for the TLS client, and the token for the check of the response.
-    pub fn into_parts(self) -> (Secret<String>, Secret<String>) {
-        (self.header, self.token)
-    }
-}
-
 /// The PKCE verifier of an authorization in progress. It reaches the token address of the
 /// provider and nothing else. Its S256 challenge is public.
 pub struct PkceVerifier(Secret<String>);
@@ -160,6 +147,13 @@ pub fn open_record(
     record: &Record,
 ) -> Result<OauthRecord, ProtocolError> {
     let (kind, plaintext) = open_for(grant, user_id, record)?;
+    token_record(kind, plaintext)
+}
+
+/// The opened plaintext of a record as a token record, for a call that opened the record
+/// before it judged the kind (`forward`, which also takes an application password). The kinds
+/// `oauth` and `oauth_imported` are taken. Any other kind is `not_allowed`.
+pub fn token_record(kind: Kind, plaintext: Secret<Vec<u8>>) -> Result<OauthRecord, ProtocolError> {
     let kind = TokenKind::of(kind).ok_or(ProtocolError::NotAllowed)?;
     Ok(OauthRecord { kind, plaintext })
 }
@@ -308,10 +302,10 @@ impl OauthPlaintext {
             let pair = Secret::new(format!("{}:{token}", rule.basic_user));
             format!("Basic {}", STANDARD.encode(pair.expose_secret().as_bytes()))
         };
-        Some(Credential {
-            header: Secret::new(header),
-            token: Secret::new(token.to_string()),
-        })
+        Some(Credential::new(
+            Secret::new(header),
+            Secret::new(token.to_string()),
+        ))
     }
 
     /// The client identifier of a dynamically registered client. It goes into the requests to
