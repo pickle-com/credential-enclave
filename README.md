@@ -124,7 +124,7 @@ Each row holds for a node that runs this source inside a Nitro Enclave (see "How
 | A vault secret that goes into a request leaves the node that opened its record only under a seal to a node of the forward role of the same measurement, for one request to a host of the record, with the value at a slot of the record, after the log entry of that request. The node of the forward role sends that request once, and hands on no response that holds the value in a form its search knows | The seal takes the log entry of the use and a node whose attestation was verified. The request that leaves is built from the opened envelope alone: its host, its address and the hash of its body are those of the entry. The response passes the reflection check of the egress policy while it arrives | protocol.md 10.5, enclave.md 5.9c and 5.16, `enclave/src/bound.rs`, `enclave/src/provider_response.rs` |
 | A value the operator domain stored in the vault says so, and its storing has a log entry | `vault/store` writes the plaintext itself, with the source `operator`, under an `id` and a nonce the node draws, and hands the record out after the log store confirmed the entry | enclave.md 5.9b |
 | The node that holds user keys connects to no host an account chose, and the node that does holds no user key | A node takes one role. A node of the forward role refuses every call that takes a command, a delegation transfer or a record, a node of the delegation role has no call that sends a request outside the addresses of its definitions, and a node of the reserve role refuses every call that opens a record or sends a request to a provider | protocol.md 4.1, enclave.md section 4, `enclave/src/role.rs` |
-| The code a node runs is this source, and anyone can check that with the measurements | The build is reproducible: one commit gives the same PCR0, PCR1 and PCR2 on every build. The attestation document of a node, signed under the AWS Nitro Enclaves root certificate, states the three values of the running enclave and binds the public keys of the node. A node does not start in a debug-mode enclave | enclave.md section 11, `build/build.sh`, `protocol/src/attestation.rs`, `verify/` |
+| The code a node runs is this source, and anyone can check that with the measurements | The build is reproducible: one commit under one release name gives the same PCR0, PCR1 and PCR2 on every build. The attestation document of a node, signed under the AWS Nitro Enclaves root certificate, states the three values of the running enclave and binds the public keys of the node. A node does not start in a debug-mode enclave | enclave.md section 11, `builder/enclave-build.sh`, `build/build.sh`, `protocol/src/attestation.rs`, `verify/` |
 
 A vault value that is typed into a page is protected by the node up to `release`. `release` hands
 a password, a card number, a CVC or a vault secret with the slot `field` to the worker of the
@@ -164,7 +164,7 @@ section 5 of egress-policy.md states.
 | The log store | The guarantee of the log store rests on AWS: on S3 Object Lock in compliance mode, and on the AWS account of the operator, which holds the buckets. When that account is closed, the buckets go with it. An object can be deleted when its retention ended, 365 days after the write. The operator domain carries the bytes between a node and the store and can stop them: the node then uses no credential (the calls end with `log_store_unavailable`), so stopping the store stops the service and hides no use. The store can hold more entries than there were acts: an entry whose act failed afterwards or never started is in the store like any other. The operator domain holds the credentials for the buckets and can add objects to them: an object is an entry of a node when it verifies against its key under the signing key of that node and the store holds the node document of that node (protocol.md 7.4) |
 | The transfer to another release | The operator can move the delegations of a node to a node of another release of this repository: a release whose measurement has a public build proof (protocol.md section 9 and 10.3). That release is another program, and the user keys are then under the rules of its source, a source anyone can read. A node does not tell an earlier release from a later one: a release with a lower name receives delegations like any other, and whoever can push a tag to this repository and carries the calls between the nodes can move delegations to the release of that tag, without a key of the operator. No notice period lies between the proof and the transfer: an account does not learn of a release before its delegation can move there. What stays is the record: the attestation of every release that received delegations is in the public transparency log with the commit of its tag, and the log of every account whose key moved holds the entry of the giving node that names the release and the measurement of the receiving node |
 | The public build proof | The proof of a release rests on GitHub, which states the identity of a workflow run to the certificate authority, on the certificate authority of Sigstore, which issues the certificate of an attestation, and on the transparency log `rekor.sigstore.dev`, which records it (protocol.md section 9). A node holds the two certificates of that authority and the key of that log, and takes a proof under them alone. Of the log it checks what the log returned for the entry: the signed entry timestamp, the signature of the log key over the entry, and the inclusion proof, the audit path of the entry and the checkpoint in which the log signed the head of its tree. It checks no signature of a witness, so it does not show that the log presents the same tree to every reader, and it does not read the signed certificate timestamps of the certificate. The proof says which source a measurement was built from and nothing about what that source does, and it names the commit and the tag as the repository held them at the time of the build: it does not show that the repository holds them still. The second log of the trusted root of Sigstore, `log2025-1.rekor.sigstore.dev` of the form Rekor v2, signs no entry timestamp: a node holds no key for it and takes no entry of it |
-| Values of Sigstore and of the build that change | The two certificates of the certificate authority, the key of the log and the list of build workflows are compiled into the node program. A release that is built after the certificate authority of Sigstore changed its certificates, after `rekor.sigstore.dev` stopped taking entries or changed its key, or by a build workflow that the list of an older node does not hold, has no proof that node takes: it receives no delegation from that node, and its delegations then come from the apps. Sigstore, the operator of `rekor.sigstore.dev`, has stated that it will announce the end of the uploads to that log one year ahead. So a release that holds new values is built and deployed while the proofs of new releases still verify under the values of the nodes in service (protocol.md 10.3). A workflow of this repository reads the trusted root that Sigstore distributes every hour and opens an issue when its transparency logs are not the ones this repository knows: a further log, a log that is gone, or an end of the validity of a log (enclave.md 11.2). It does not compare the certificate authorities of that trusted root. The workflow tells people, and nothing a node does depends on it |
+| Values of Sigstore and of the build that change | The two certificates of the certificate authority, the key of the log and the list of build workflows are compiled into the node program. A release that is built after the certificate authority of Sigstore changed its certificates, after `rekor.sigstore.dev` stopped taking entries or changed its key, or by a build workflow that the list of an older node does not hold, has no proof that node takes: it receives no delegation from that node, and its delegations then come from the apps. Sigstore, the operator of `rekor.sigstore.dev`, has stated that it will announce the end of the uploads to that log one year ahead. So a release that holds new values is built and deployed while the proofs of new releases still verify under the values of the nodes in service (protocol.md 10.3). A workflow of this repository reads the trusted root that Sigstore distributes every hour and opens an issue when its transparency logs or its certificate authorities are not the ones this repository knows: a further log or certificate authority, one that is gone, or an end of the validity of one (enclave.md 11.2). The workflow tells people, and nothing a node does depends on it |
 | Reading the log store | The app reads the store without passing through the operator domain: the operator's backend only presigns the addresses, and the program verifies that each address names the bucket of its server target and the prefix of its own account before it calls it. An operator that signs no address stops the verification (the app shows pending, and attention after 3 days). The operator holds no copy of the entries: what the app shows comes from the store, and entries older than the retention of the bucket (400 days) are gone. What this source does not show is that the app binary runs the published program unchanged (the row "The honesty of the app") |
 | The log of a node of a release before v2.4.0 that ended without its orderly shutdown | Such a node left no `final` head. The entries it wrote after the last point that the app verified cannot be checked against a head (protocol.md 7.4). The entries of its acts are in the log store: a node writes an entry there before the act. A node of release v2.4.0 or later signs no head, and its end leaves no such part: the entries of its acts are under the prefixes of the account whether it ended in order or not |
 | What a credential fetches | The response of `forward` or a mail call goes to the operator domain: the node protects the token, not the data that the token gives access to |
@@ -186,37 +186,56 @@ transfers of the nodes of the releases before v2.4.0, rest on the release key of
 ```bash
 git clone https://github.com/pickle-com/credential-enclave
 cd credential-enclave
-git checkout {tag}        # the release to check, for example v1.0.0
-build/build.sh eif        # writes out/enclave.eif and out/measurements.json
+git checkout {tag}                    # the release to check, for example v2.4.0
+build/build.sh --release {tag} eif    # writes out/enclave.eif and out/measurements.json
 ```
 
-The script needs git and Docker with buildx. Its reference machine is Linux x86_64. It builds the
-commit `HEAD` (it stops when the work tree has uncommitted changes) and prints the measurements to
-the standard output:
+The script needs git, jq and Docker with buildx. Its reference machine is Linux x86_64. It builds
+the commit `HEAD` (it stops when the work tree has uncommitted changes) under the release name it
+is given, and prints the measurements to the standard output:
 
 ```json
 {
-  "release": "v1.0.0",
+  "release": "v2.4.0",
   "git_commit": "(40 hex digits)",
   "pcr0": "(96 hex digits)",
   "pcr1": "(96 hex digits)",
   "pcr2": "(96 hex digits)",
-  "inputs": { "image/rust": "(SHA-256)", "binary/credential-enclave": "(SHA-256)", "...": "..." }
+  "inputs": { "image/toolchain": "(SHA-256)", "binary/credential-enclave": "(SHA-256)", "...": "..." }
 }
 ```
 
 PCR0, PCR1 and PCR2 are the identity of a release. PCR0 measures the enclave image file, PCR1 the
-kernel and the boot ramdisk, PCR2 the node program. The release tag is compiled into the node
-program, so a build of a commit without a `v*` tag has the release `dev` and other measurements.
-`inputs` lists the SHA-256 of everything the three values were made of: when two builds disagree,
-the first key that differs says where they parted.
+kernel and the boot ramdisk, PCR2 the node program. The release name is compiled into the node
+program, so a build without `--release` has the release `dev` and other measurements than the
+release of the tag. `inputs` lists the SHA-256 of everything the three values were made of: when
+two builds disagree, the first key that differs says where they parted. The script of a release
+before v2.4.0 takes no `--release`: it names the release after the `v*` tag of the commit it
+builds, and the command of such a tag is `build/build.sh eif`.
+
+The build is made of files of two kinds ([enclave.md](docs/enclave.md) 11.1). A commit decides
+its sources, its `Cargo.lock`, how its node program is compiled (`build/Dockerfile.enclave`) and
+the images it is compiled with (`build/inputs.json`, each by digest). The procedure of the build,
+the files of `builder/`, does the rest. It downloads the packages `Cargo.lock` names from
+crates.io, with cargo checking each against its checksum, and the images by their digests. It
+compiles in a BuildKit daemon whose container has no network, so no program of the commit (its
+Dockerfile, a build script, a procedural macro) runs with a network. It assembles the enclave
+image file with a fixed `nitro-cli`, reads the three measurements from that file and writes
+`measurements.json` itself: no file of the commit states a measurement.
+
+A release is built by the build workflow, with the procedure of the commit of that workflow file
+(section 3). `build/build.sh` runs the procedure of the commit you checked out. The release
+workflow builds the commit of a tag that way as well and makes no release unless the two
+`measurements.json` are equal, so your build of a released tag under the name of the tag gives
+the published measurements.
 
 On an Apple Silicon Mac the node program builds under emulation, but the step that assembles the
 enclave image file (`nitro-cli`) has been observed to crash under the QEMU emulation of Docker
-Desktop. Without a Linux x86_64 machine, two builds made by others are available: the `check`
-workflow builds the image on every push and keeps `measurements.json` as an artifact of the run,
-and the `release` workflow builds it twice on independent machines and refuses to release when the
-measurements differ.
+Desktop. Without a Linux x86_64 machine, the measurements of a release are those of its GitHub
+release (section 3): the build workflow built and attested them, and a second build on another
+runner agreed with them. The `check` workflow builds the enclave image file of every commit that
+is pushed to a branch, under the release name `dev`, and keeps `measurements.json` as an artifact
+of the run.
 
 ### 2. Compare with the running nodes
 
@@ -267,9 +286,24 @@ target/release/credential-enclave-verify \
 
 ### 3. Compare with the published measurements
 
-Every GitHub release carries `enclave.eif` and the `measurements.json` that two independent builds
-agreed on, and the Sigstore bundles of two attestations of the enclave image file (its build
-provenance, and a release statement whose predicate is `measurements.json`).
+The push of a `v*` tag starts the release workflow ([enclave.md](docs/enclave.md) 11.2). It calls
+the build workflow, `.github/workflows/enclave-build.yml`, at one fixed commit of that file. The
+job of the build workflow checks out two commits: the commit of the tag, and the commit of its own
+file. Of the first it takes what a commit decides about its build: its sources, its `Cargo.lock`,
+`build/Dockerfile.enclave` and `build/inputs.json`. Of the second it takes the procedure, the
+files of `builder/`, which fixes BuildKit, the cargo that downloads the packages and the
+`nitro-cli` that assembles and measures the enclave image file. The procedure builds the commit
+of the tag as section 1 states: no program of that commit runs with a network, and the
+measurements are the ones the procedure read from the enclave image file it assembled. In the
+same job the build workflow attests the `measurements.json` the procedure wrote: that attestation
+is the public build proof of the release. A second job builds the commit of the tag again with
+`build/build.sh`. The release is made only when the two `measurements.json` are equal and the
+verification tool of the commit of the tag takes the proof (section 4).
+
+The GitHub release of a tag carries `enclave.eif` and `measurements.json`. For a release that the
+build workflow built they are the enclave image file of that job and the measurements it attested,
+and the release carries two more files: `release-statement.sigstore.json`, the Sigstore bundle of
+the attestation, and `release-proofs.json`, the release statement and that bundle as one value.
 
 ```bash
 curl -L -O \
@@ -367,9 +401,12 @@ secure-program/   the secure program of the apps (the source of truth), the rele
              and monitor scripts, its README
 egress/      the list of the functions that read a secret, the list of the callers of the sinks
 scripts/     secret-access.sh: compares the source with the two lists
-build/       build.sh and the Dockerfiles of the reproducible build
+builder/     the procedure of the build of an enclave image file: enclave-build.sh and its two
+             Dockerfiles. The build workflow runs the files of its own commit
+build/       what a commit decides about its build (Dockerfile.enclave, inputs.json), build.sh,
+             and the Dockerfiles of the host image and of the local platform image
 docs/        protocol.md, enclave.md, egress-policy.md
-.github/     the check and release workflows, the release and monitor workflows of the
+.github/     the check, release and build workflows, the release and monitor workflows of the
              secure program, and the monitor workflow of the trusted root of Sigstore
 ```
 
@@ -381,6 +418,9 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 # protocol/vectors.json is the output of the generator
 cargo run --locked -p credential-enclave-protocol --bin vectors -- --check
+# protocol/vectors/release-proofs.json is the output of its generator, which needs the Python
+# package cryptography (protocol/vectors/README.md)
+python3 protocol/vectors/release_proofs.py --check
 # the functions that read a secret, and the callers of the sinks, are the listed ones
 scripts/secret-access.sh --check
 ```

@@ -107,12 +107,12 @@ document states, not at the time of the machine.
   `rekor-key.pem`, with the log identifier the file states, or the log of
   `rekor-log2025-1-key.pem` above, and the two certificates of the node program are the chain
   of the one certificate authority of the file whose validity has no end. The workflow
-  `trusted-root-monitor.yml` compares the `tlogs` of the trusted root that the TUF repository
-  of Sigstore distributes with the `tlogs` of this file every hour
-  (`secure-program/monitor.py --trusted-root`, enclave.md 11.2): when they differ, this file is
-  replaced by the trusted root as it is distributed then, and the values and the test follow.
-  The other parts of the file (the certificate transparency logs, the timestamp authority) are
-  not read.
+  `trusted-root-monitor.yml` compares the `tlogs` and the `certificateAuthorities` of the
+  trusted root that the TUF repository of Sigstore distributes with those of this file every
+  hour (`secure-program/monitor.py --trusted-root`, enclave.md 11.2): when they differ, this
+  file is replaced by the trusted root as it is distributed then, and the values and the test
+  follow. The other parts of the file (the certificate transparency logs, the timestamp
+  authority) are not read.
 - Origin: `targets/trusted_root.json` of the repository
   <https://github.com/sigstore/root-signing>, as of its commit
   `c09d62f9397fcff8b98b5bcd2dc9044a4f853cd4` (2026-11-23), without a change. The TUF

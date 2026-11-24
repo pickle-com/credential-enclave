@@ -1,6 +1,6 @@
 """The comparisons of the monitor (secure-program/monitor.py): which result an entry of the release
-key gets, which result the transparency logs of the trusted root of Sigstore get, and which exit
-status a run ends with.
+key gets, which result the transparency logs and the certificate authorities of the trusted root of
+Sigstore get, and which exit status a run ends with.
 
     python3 -m unittest discover -s secure-program/tests -p 'test_*.py'
 """
@@ -98,7 +98,9 @@ class RunTest(unittest.TestCase):
                 status = monitor.run(["--trusted-root", "--report", str(report)])
             self.assertEqual(status, monitor.EXIT_INCOMPLETE)
             text = report.read_text()
-            self.assertTrue(text.startswith("# Trusted root of Sigstore: transparency logs\n"), text)
+            self.assertTrue(
+                text.startswith("# Trusted root of Sigstore: transparency logs and certificate authorities\n"), text
+            )
             self.assertIn("stopped before it finished the comparison", text)
 
 
@@ -131,12 +133,49 @@ def identifier(number: int) -> str:
     return (bytes([number]) * 32).hex()
 
 
-def trusted_root(*logs: dict, authorities: int = 2) -> bytes:
-    """A trusted root that names `logs`, and other parts the monitor does not compare."""
+FULCIO = "https://fulcio.sigstore.dev"
+
+
+def certificate(number: int) -> bytes:
+    """The bytes that stand for the DER of one certificate: 40 bytes of the value `number`."""
+    return bytes([number]) * 40
+
+
+def authority(*numbers: int, address: str = FULCIO, end: str | None = None) -> dict:
+    """A certificate authority as a trusted root states it. `numbers` makes the certificates of
+    its chain, in their order."""
+    valid_for = {"start": "2022-04-13T20:06:15Z"}
+    if end is not None:
+        valid_for["end"] = end
+    return {
+        "subject": {"organization": "sigstore.dev", "commonName": "sigstore"},
+        "uri": address,
+        "certChain": {
+            "certificates": [{"rawBytes": base64.b64encode(certificate(number)).decode()} for number in numbers]
+        },
+        "validFor": valid_for,
+    }
+
+
+def chain(*numbers: int) -> str:
+    """The certificates of a chain as the monitor names them: the SHA-256 of each."""
+    return " ".join(hashlib.sha256(certificate(number)).hexdigest() for number in numbers)
+
+
+# The certificate authorities of a trusted root of these tests, unless a test names others: one
+# whose validity ended, of one certificate, and one of an intermediate and a root certificate.
+AUTHORITIES = (authority(7, end="2022-12-31T23:59:59.999Z"), authority(8, 9))
+
+
+def trusted_root(*logs: dict, authorities: tuple[dict, ...] = AUTHORITIES, others: int = 2) -> bytes:
+    """A trusted root that names `logs` and `authorities`, and `others` items in each of the parts
+    the monitor does not compare."""
     root = {
         "mediaType": "application/vnd.dev.sigstore.trustedroot+json;version=0.1",
         "tlogs": list(logs),
-        "certificateAuthorities": [{"uri": f"https://fulcio.example/{n}"} for n in range(authorities)],
+        "certificateAuthorities": list(authorities),
+        "ctlogs": [{"baseUrl": f"https://ctfe.example/{n}"} for n in range(others)],
+        "timestampAuthorities": [{"uri": f"https://timestamp.example/{n}"} for n in range(others)],
     }
     return json.dumps(root).encode()
 
@@ -145,6 +184,14 @@ def differences(distributed: bytes, known: bytes) -> list[tuple[str, str, str]]:
     found = monitor.log_differences(
         monitor.transparency_logs(distributed, "the distributed trusted root"),
         monitor.transparency_logs(known, "the copy"),
+    )
+    return [(item.address, item.identifier, item.difference) for item in found]
+
+
+def authority_differences(distributed: bytes, known: bytes) -> list[tuple[str, str, str]]:
+    found = monitor.authority_differences(
+        monitor.certificate_authorities(distributed, "the distributed trusted root"),
+        monitor.certificate_authorities(known, "the copy"),
     )
     return [(item.address, item.identifier, item.difference) for item in found]
 
@@ -164,8 +211,9 @@ class LogDifferencesTest(unittest.TestCase):
 
     def test_a_trusted_root_with_the_same_logs_does_not_differ_whatever_its_other_parts(self) -> None:
         known = trusted_root(log(1, V1), log(2, V2))
-        # Another order of the logs, and other certificate authorities.
-        self.assertEqual(differences(trusted_root(log(2, V2), log(1, V1), authorities=3), known), [])
+        # Another order of the logs, other certificate authorities, and other parts.
+        other = trusted_root(log(2, V2), log(1, V1), authorities=(authority(5, 6),), others=3)
+        self.assertEqual(differences(other, known), [])
 
     def test_a_log_the_copy_does_not_name_differs(self) -> None:
         known = trusted_root(log(1, V1), log(2, V2))
@@ -213,6 +261,123 @@ class LogDifferencesTest(unittest.TestCase):
         for root in [b"", b"[]", b"{}", b'{"tlogs": {}}', b'{"tlogs": [{}]}', b'{"tlogs": [{"logId": {"keyId": "?"}}]}', twice]:
             with self.assertRaises(ValueError, msg=root):
                 monitor.transparency_logs(root, "the trusted root")
+
+
+class AuthorityDifferencesTest(unittest.TestCase):
+    def test_the_certificate_authorities_of_the_copy_of_this_repository_are_read(self) -> None:
+        copy = monitor.TRUSTED_ROOT_COPY.read_bytes()
+        authorities = monitor.certificate_authorities(copy, "the copy")
+        # The certificate authority whose validity has no end is the chain of the intermediate
+        # certificate and the root certificate that the node program compiles in
+        # (enclave/release/fulcio-intermediate.pem, fulcio-root.pem: docs/protocol.md 9.3).
+        self.assertEqual(
+            {key: (entry["uri"], entry["validFor"].get("end")) for key, entry in authorities.items()},
+            {
+                "03a38ffb1f450100c2596d1d10b900ac4d504058006dda58199576bbeb9c73d0": (
+                    FULCIO,
+                    "2022-12-31T23:59:59.999Z",
+                ),
+                "15d795348226b4649f750f5802592c393bee7cc53c3b86982175b7ad087efe47"
+                " 3ba7b6cc4e95469d4d334b49cb257ad8537076fa84b0ca87ff4ecfe6a54680c1": (FULCIO, None),
+            },
+        )
+        self.assertEqual(authority_differences(copy, copy), [])
+
+    def test_a_trusted_root_with_the_same_certificate_authorities_does_not_differ_whatever_its_other_parts(
+        self,
+    ) -> None:
+        known = trusted_root(log(1, V1), log(2, V2))
+        # Another order of the certificate authorities, other logs, and other parts.
+        other = trusted_root(log(3, NEXT), authorities=tuple(reversed(AUTHORITIES)), others=3)
+        self.assertEqual(authority_differences(other, known), [])
+
+    def test_a_certificate_authority_the_copy_does_not_name_differs(self) -> None:
+        known = trusted_root(log(1, V1))
+        distributed = trusted_root(log(1, V1), authorities=AUTHORITIES + (authority(10, 9),))
+        self.assertEqual(
+            authority_differences(distributed, known),
+            [(FULCIO, chain(10, 9), "the copy does not name this certificate authority")],
+        )
+        # A new certificate authority that is stated with the end of its validity says so.
+        ending = AUTHORITIES + (authority(10, 9, end="2028-01-01T00:00:00Z"),)
+        self.assertEqual(
+            authority_differences(trusted_root(log(1, V1), authorities=ending), known),
+            [
+                (
+                    FULCIO,
+                    chain(10, 9),
+                    "the copy does not name this certificate authority (the end of its validity: `2028-01-01T00:00:00Z`)",
+                )
+            ],
+        )
+
+    def test_another_certificate_of_a_chain_is_another_certificate_authority(self) -> None:
+        # The certificate authority issues under a new intermediate certificate: the chain of the
+        # copy is gone from the trusted root, and the copy does not name the new chain.
+        known = trusted_root(log(1, V1))
+        distributed = trusted_root(log(1, V1), authorities=(AUTHORITIES[0], authority(10, 9)))
+        self.assertEqual(
+            sorted(authority_differences(distributed, known)),
+            sorted(
+                [
+                    (FULCIO, chain(8, 9), "the trusted root no longer names this certificate authority"),
+                    (FULCIO, chain(10, 9), "the copy does not name this certificate authority"),
+                ]
+            ),
+        )
+
+    def test_an_end_of_the_validity_of_a_certificate_authority_differs(self) -> None:
+        known = trusted_root(log(1, V1))
+        ending = (AUTHORITIES[0], authority(8, 9, end="2027-11-01T00:00:00Z"))
+        distributed = trusted_root(log(1, V1), authorities=ending)
+        self.assertEqual(
+            authority_differences(distributed, known),
+            [(FULCIO, chain(8, 9), "the end of its validity is `2027-11-01T00:00:00Z` (the copy: `not stated`)")],
+        )
+        # The copy that states the same end does not differ.
+        self.assertEqual(authority_differences(distributed, distributed), [])
+
+    def test_a_certificate_authority_the_trusted_root_no_longer_names_differs(self) -> None:
+        known = trusted_root(log(1, V1))
+        distributed = trusted_root(log(1, V1), authorities=(AUTHORITIES[1],))
+        self.assertEqual(
+            authority_differences(distributed, known),
+            [(FULCIO, chain(7), "the trusted root no longer names this certificate authority")],
+        )
+
+    def test_another_value_of_a_certificate_authority_differs(self) -> None:
+        known = trusted_root(log(1, V1))
+        moved = (AUTHORITIES[0], authority(8, 9, address="https://fulcio.example"))
+        found = authority_differences(trusted_root(log(1, V1), authorities=moved), known)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0][:2], ("https://fulcio.example", chain(8, 9)))
+        self.assertTrue(found[0][2].startswith("another value than in the copy: `{"), found[0][2])
+
+    def test_a_trusted_root_of_another_shape_is_not_compared(self) -> None:
+        def root(authorities: object) -> bytes:
+            return json.dumps({"tlogs": [], "certificateAuthorities": authorities}).encode()
+
+        without_certificates = dict(authority(8, 9), certChain={"certificates": []})
+        without_bytes = dict(authority(8, 9), certChain={"certificates": [{"rawBytes": ""}]})
+        not_base64 = dict(authority(8, 9), certChain={"certificates": [{"rawBytes": "?"}]})
+        without_address = {key: value for key, value in authority(8, 9).items() if key != "uri"}
+        for value in [
+            b"",
+            b"[]",
+            b"{}",
+            b'{"tlogs": []}',
+            root({}),
+            root([{}]),
+            root(["authority"]),
+            root([without_certificates]),
+            root([without_bytes]),
+            root([not_base64]),
+            root([without_address]),
+            # One chain twice.
+            root([authority(8, 9), authority(8, 9, end="2027-11-01T00:00:00Z")]),
+        ]:
+            with self.assertRaises(ValueError, msg=value):
+                monitor.certificate_authorities(value, "the trusted root")
 
 
 class Repository:
@@ -322,19 +487,25 @@ class CompareTrustedRootTest(unittest.TestCase):
                 status = monitor.run(["--trusted-root", "--report", str(report)])
             return status, report.read_text()
 
-    def test_the_logs_of_the_copy_end_the_run_with_the_status_of_known_logs(self) -> None:
+    def test_the_logs_and_the_certificate_authorities_of_the_copy_end_the_run_with_the_status_of_a_known_root(
+        self,
+    ) -> None:
         known = trusted_root(log(1, V1), log(2, V2))
-        status, report = self.compare(Repository(trusted_root(log(1, V1), log(2, V2), authorities=5)), known)
-        self.assertEqual(status, monitor.EXIT_KNOWN_LOGS)
-        self.assertIn("The transparency logs of the trusted root are the ones of the copy.", report)
+        # The parts the monitor does not compare differ.
+        status, report = self.compare(Repository(trusted_root(log(1, V1), log(2, V2), others=5)), known)
+        self.assertEqual(status, monitor.EXIT_KNOWN_ROOT)
+        self.assertIn(
+            "The transparency logs and the certificate authorities of the trusted root are the ones of the copy.",
+            report,
+        )
         self.assertIn("The signatures of the metadata were not checked.", report)
         self.assertNotIn("## What differs", report)
 
-    def test_other_logs_end_the_run_with_the_status_of_other_logs_and_are_named(self) -> None:
+    def test_other_logs_end_the_run_with_the_status_of_another_root_and_are_named(self) -> None:
         known = trusted_root(log(1, V1), log(2, V2))
         distributed = trusted_root(log(1, V1, end="2027-11-01T00:00:00Z"), log(2, V2), log(3, NEXT))
         status, report = self.compare(Repository(distributed), known)
-        self.assertEqual(status, monitor.EXIT_OTHER_LOGS)
+        self.assertEqual(status, monitor.EXIT_OTHER_ROOT)
         self.assertIn(f"| {NEXT} | `{identifier(3)}` | the copy does not name this log |", report)
         self.assertIn(
             f"| {V1} | `{identifier(1)}` | the end of its validity is `2027-11-01T00:00:00Z` (the copy: `not stated`) |",
@@ -342,11 +513,46 @@ class CompareTrustedRootTest(unittest.TestCase):
         )
         self.assertIn(hashlib.sha256(distributed).hexdigest(), report)
         self.assertIn(hashlib.sha256(known).hexdigest(), report)
+        self.assertNotIn("| Certificate authority |", report)
 
-    def test_a_further_trusted_root_target_ends_the_run_with_the_status_of_other_logs(self) -> None:
+    def test_other_certificate_authorities_end_the_run_with_the_status_of_another_root_and_are_named(self) -> None:
+        # The logs are those of the copy. The certificate authority that issues the certificates
+        # has another intermediate certificate, and the one that ended is gone.
+        known = trusted_root(log(1, V1), log(2, V2))
+        distributed = trusted_root(log(1, V1), log(2, V2), authorities=(authority(10, 9),))
+        status, report = self.compare(Repository(distributed), known)
+        self.assertEqual(status, monitor.EXIT_OTHER_ROOT)
+        digests = chain(10, 9).split(" ")
+        self.assertIn(
+            f"| {FULCIO} | `{digests[0]}` `{digests[1]}` | the copy does not name this certificate authority |",
+            report,
+        )
+        gone = chain(8, 9).split(" ")
+        self.assertIn(
+            f"| {FULCIO} | `{gone[0]}` `{gone[1]}` | the trusted root no longer names this certificate authority |",
+            report,
+        )
+        self.assertIn(
+            f"| {FULCIO} | `{chain(7)}` | the trusted root no longer names this certificate authority |", report
+        )
+        self.assertNotIn("| Log | Log identifier |", report)
+        self.assertIn("## What follows", report)
+        # The end of the validity of the certificate authority of the copy is a difference too.
+        ending = trusted_root(
+            log(1, V1), log(2, V2), authorities=(AUTHORITIES[0], authority(8, 9, end="2027-11-01T00:00:00Z"))
+        )
+        status, report = self.compare(Repository(ending), known)
+        self.assertEqual(status, monitor.EXIT_OTHER_ROOT)
+        self.assertIn(
+            f"| {FULCIO} | `{gone[0]}` `{gone[1]}` |"
+            " the end of its validity is `2027-11-01T00:00:00Z` (the copy: `not stated`) |",
+            report,
+        )
+
+    def test_a_further_trusted_root_target_ends_the_run_with_the_status_of_another_root(self) -> None:
         known = trusted_root(log(1, V1))
         status, report = self.compare(Repository(known, further=("trusted_root.v0.2.json",)), known)
-        self.assertEqual(status, monitor.EXIT_OTHER_LOGS)
+        self.assertEqual(status, monitor.EXIT_OTHER_ROOT)
         self.assertIn("a further trusted root under the name `trusted_root.v0.2.json`", report)
 
     def test_a_repository_that_cannot_be_read_leaves_the_run_incomplete(self) -> None:
@@ -355,16 +561,18 @@ class CompareTrustedRootTest(unittest.TestCase):
         gone.documents.clear()
         expired = Repository(known, expires="2020-01-01T00:00:00Z")
         misshapen = Repository(b'{"tlogs": 5}')
-        for repository in [gone, expired, misshapen]:
+        without_authorities = Repository(json.dumps({"tlogs": [log(1, V1)]}).encode())
+        for repository in [gone, expired, misshapen, without_authorities]:
             status, report = self.compare(repository, known)
             self.assertEqual(status, monitor.EXIT_INCOMPLETE)
             self.assertIn("The trusted root could not be read from the TUF repository", report)
             self.assertNotIn("## What differs", report)
 
     def test_a_copy_of_another_shape_leaves_the_run_incomplete(self) -> None:
-        status, report = self.compare(Repository(trusted_root(log(1, V1))), b'{"tlogs": 5}')
-        self.assertEqual(status, monitor.EXIT_INCOMPLETE)
-        self.assertIn("stopped before it finished the comparison", report)
+        for copy in [b'{"tlogs": 5}', json.dumps({"tlogs": [log(1, V1)]}).encode()]:
+            status, report = self.compare(Repository(trusted_root(log(1, V1))), copy)
+            self.assertEqual(status, monitor.EXIT_INCOMPLETE)
+            self.assertIn("stopped before it finished the comparison", report)
 
 
 if __name__ == "__main__":

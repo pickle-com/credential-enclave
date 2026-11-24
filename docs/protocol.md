@@ -1854,12 +1854,12 @@ characters or is all zero.
   nodes of that release receive their delegations from the apps (10.1). Sigstore, the operator of
   `rekor.sigstore.dev`, has stated that it will announce the end of the uploads to that log one
   year ahead (the announcement of the general availability of Rekor v2, as of 2026-11-23). A
-  workflow of this repository compares, every hour, the transparency logs of the trusted root
-  that the TUF repository of Sigstore distributes with the ones of the copy of that trusted root
-  in this repository, to which a test ties the key of the log of this release, and opens an
-  issue when they differ (enclave.md 11.2). The workflow tells people that the values may have to
-  follow. It checks no signature of the TUF repository, it does not compare the certificate
-  authorities of the trusted root, and no node depends on it.
+  workflow of this repository compares, every hour, the transparency logs and the certificate
+  authorities of the trusted root that the TUF repository of Sigstore distributes with the ones
+  of the copy of that trusted root in this repository, to which a test ties the two certificates
+  and the key of the log of this release, and opens an issue when they differ (enclave.md 11.2).
+  The workflow tells people that the values may have to follow. It checks no signature of the
+  TUF repository, and no node depends on it.
 - The trusted root of Sigstore names a second log, `log2025-1.rekor.sigstore.dev`, of the form
   Rekor v2 (as of 2026-11-23). A node holds no key for it and takes no entry of it: that log
   signs no entry timestamp, so an entry of it has not the form of V4 (9.4).
@@ -2239,6 +2239,7 @@ redirect. The response passes rule E4 of the egress policy before any part of it
 | Longest `statement` of release proofs before it is decoded (9.4) | 32,768 UTF-16 code units |
 | Longest attestation of release proofs, as JSON without white space (9.4) | 65,536 bytes |
 | Most arrays and objects inside one another of a JSON value of release proofs (9.4) | 32 |
+| Most arrays, objects and commas, counted together outside its strings, of a JSON text inside a string of release proofs that a node reads (`RELEASE_TEXT_MARKS`, 9.4) | 1,024 |
 | Most hashes of the audit path of the inclusion proof of a log entry (9.4) | 64 |
 | Most events in one entry (`ENTRY_EVENTS`) | 128 |
 | Most bytes of the plaintext of one entry (`ENTRY_PLAINTEXT_BYTES`) | 1,048,576 |
@@ -2332,7 +2333,7 @@ shares no code with a verifier. The top level is
 
 | Key | What it holds |
 | --- | --- |
-| `trusts` | The values of a verifier (9.3), by a name: `fulcio_root` and `fulcio_intermediate` (the DER of the two certificates, b64u), `log_keys` (the DER of the SubjectPublicKeyInfo of each log key, b64u), `issuer` (the issuer of the tokens), `repository`, `repository_id`, `owner_id`, and `builders` (the list of build workflows). The keys behind these values are keys of the script, which signs the certificates, the envelopes and the entries of the cases with them. The name `source` is not a member of `trusts`: it stands for the values of the verifier itself, the certificates of Sigstore, the key of Rekor and the list of build workflows of this source |
+| `trusts` | The values of a verifier (9.3), by a name: `fulcio_root` and `fulcio_intermediate` (the DER of the two certificates, b64u), `log_keys` (the DER of the SubjectPublicKeyInfo of each log key, b64u), `issuer` (the issuer of the tokens), `repository`, `repository_id`, `owner_id`, and `builders` (the list of build workflows). The keys behind the values of `test` and of the trusts whose names begin with `test-` are keys of the script, which signs the certificates, the envelopes and the entries of their cases with them. The two trusts whose names begin with `sigstore-` hold the two certificates of the certificate authority of Sigstore and the key of Rekor with a list of build workflows that is not the one of this source: `sigstore-build-workflow-v2.4.0-rc.1` names the build workflow at the commit whose job attested the release candidate `v2.4.0-rc.1`, and `sigstore-release-workflow-v2.3.0` names the release workflow of the tag `v2.3.0` at the commit of that tag. The name `source` is not a member of `trusts`: it stands for the values of the verifier itself, the certificates of Sigstore, the key of Rekor and the list of build workflows of this source |
 | `cases` | Per case: `name`, `trust` (a name of `trusts`, or `source`), `measurement` (`pcr0`, `pcr1` and `pcr2`: the measurement the proofs are verified for), `release_proofs_text` (the JSON text of `release_proofs`. It is a text so that a case can hold what a parsed value does not: a member that occurs twice, a number outside the finite ones, a text that is no JSON), `accepted`, `release` (the `release` of the statement of an accepted case, null for a refused one) and `rule` (null for an accepted case, and for a refused one the check of 9.4 that refuses it: `form`, or `V1` to `V7`) |
 
 A verifier parses `release_proofs_text` with its own reader of JSON, and a text that reader
@@ -2340,12 +2341,17 @@ refuses is a case of the rule `form`. Under a trust whose two certificates are n
 certificate and the intermediate certificate of one certificate authority, every case is refused
 at `V3`. A verifier gives `accepted` on every case, and the check at which it refuses a case is
 the `rule` of the case. The cases hold proofs that pass and, for the form and for each of the
-checks V1 to V7, proofs that fail it and proofs at its bounds. The cases of the trust `source`
-are made of the published proofs of two releases of this repository, whose files are in
-`protocol/vectors/published/`: the proofs of the release candidate `v2.4.0-rc.1`, which the build
-workflow of the list of this source built, pass; the same proofs with one place changed are
-refused; and the attestation of the release `v2.3.0`, which the job of the release workflow of
-that tag made, is refused at `V6`, because that workflow is no build workflow of the list.
+checks V1 to V7, proofs that fail it and proofs at its bounds. The cases that no key of the
+script signs are made of the published proofs of two releases of this repository, whose files
+are in `protocol/vectors/published/`. The job of the build workflow attested the release
+candidate `v2.4.0-rc.1` at a commit of the workflow file that the list of this source does not
+name (9.3), and a job of the release workflow of its tag attested the release `v2.3.0`. Under
+the trust `source` the proofs of both are refused at `V6`. Under the trust
+`sigstore-build-workflow-v2.4.0-rc.1` the proofs of the release candidate pass, and the same
+proofs with one place changed are refused by the first check the change breaks, or pass where
+no check reads the changed place (the `inputs` of the statement). Under the trust
+`sigstore-release-workflow-v2.3.0` the proofs of the release `v2.3.0` pass, and those of the
+release candidate are refused at `V6`.
 
 
 ## Mail statements and records
