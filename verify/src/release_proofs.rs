@@ -131,12 +131,12 @@ pub fn judge(proofs: &Value, expected: Option<&Measurements>, trust: &ProofTrust
 mod tests {
     use super::*;
 
-    /// The release statement and the bundle of the attestation of release v2.4.0-rc.1, as its
-    /// GitHub release holds them.
+    /// The release statement and the bundle of the attestation of release v2.4.0-rc.2, as its
+    /// GitHub release holds them: the job of the build workflow this source lists attested it.
     const STATEMENT: &[u8] =
-        include_bytes!("../../protocol/vectors/published/v2.4.0-rc.1/measurements.json");
+        include_bytes!("../../protocol/vectors/published/v2.4.0-rc.2/measurements.json");
     const BUNDLE: &str = include_str!(
-        "../../protocol/vectors/published/v2.4.0-rc.1/release-statement.sigstore.json"
+        "../../protocol/vectors/published/v2.4.0-rc.2/release-statement.sigstore.json"
     );
 
     fn published() -> Value {
@@ -144,6 +144,49 @@ mod tests {
             "statement": credential_enclave_protocol::encoding::b64u(STATEMENT),
             "attestation": serde_json::from_str::<Value>(BUNDLE).unwrap(),
         })
+    }
+
+    /// The same of release v2.4.0-rc.1, which the job of the build workflow attested at an
+    /// earlier commit of that file.
+    const EARLIER_STATEMENT: &[u8] =
+        include_bytes!("../../protocol/vectors/published/v2.4.0-rc.1/measurements.json");
+    const EARLIER_BUNDLE: &str = include_str!(
+        "../../protocol/vectors/published/v2.4.0-rc.1/release-statement.sigstore.json"
+    );
+
+    fn published_earlier() -> Value {
+        serde_json::json!({
+            "statement": credential_enclave_protocol::encoding::b64u(EARLIER_STATEMENT),
+            "attestation": serde_json::from_str::<Value>(EARLIER_BUNDLE).unwrap(),
+        })
+    }
+
+    #[test]
+    fn the_published_proofs_of_a_release_hold_for_the_values_of_this_source() {
+        let trust = source_trust().unwrap();
+        let end = judge(&published(), None, &trust);
+        assert_eq!(
+            (end.status, end.output.as_str(), end.error.as_str()),
+            (
+                EXIT_PASSED,
+                concat!(
+                    "release proofs: release v2.4.0-rc.2, ",
+                    "commit ebf4358294a6a1e92db804ab3286684b232f8981, ",
+                    "pcr0 0d92c7d5c9e00f526eaff129a548e33ce6324330b8b3c3e655dcac9a3d05978cff0f7d4c92fc39bc99a9123a15a2658e, ",
+                    "pcr1 4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493, ",
+                    "pcr2 de865be1108c177b010827f6cbf983366d5bc375ece626473ff3d05002840ae453606f68c385370701b2ae4148e8b3ed, ",
+                    "the measurement of the statement of the proofs: ok\n"
+                ),
+                ""
+            )
+        );
+        // The same for the measurement of that release, given beside the proofs.
+        let measurements = Measurements::of_file("measurements.json", STATEMENT).unwrap();
+        let end = judge(&published(), Some(&measurements), &trust);
+        assert_eq!(end.status, EXIT_PASSED);
+        assert!(end
+            .output
+            .ends_with("the measurement of measurements.json: ok\n"));
     }
 
     /// The values of the node program with, in the place of its list of build workflows, the
@@ -165,7 +208,7 @@ mod tests {
     fn the_published_proofs_of_a_release_candidate_hold_for_the_build_workflow_that_attested_them()
     {
         let trust = attested_by();
-        let end = judge(&published(), None, &trust);
+        let end = judge(&published_earlier(), None, &trust);
         assert_eq!(
             (end.status, end.output.as_str(), end.error.as_str()),
             (
@@ -182,15 +225,15 @@ mod tests {
             )
         );
         // The same for the measurement of that release, given beside the proofs.
-        let measurements = Measurements::of_file("measurements.json", STATEMENT).unwrap();
-        let end = judge(&published(), Some(&measurements), &trust);
+        let measurements = Measurements::of_file("measurements.json", EARLIER_STATEMENT).unwrap();
+        let end = judge(&published_earlier(), Some(&measurements), &trust);
         assert_eq!(end.status, EXIT_PASSED);
         assert!(end
             .output
             .ends_with("the measurement of measurements.json: ok\n"));
         // With the values of the node program the proofs fail: its list of build workflows
         // names another commit of the build workflow file.
-        let end = judge(&published(), None, &source_trust().unwrap());
+        let end = judge(&published_earlier(), None, &source_trust().unwrap());
         assert_eq!(
             (end.status, end.output.as_str(), end.error.as_str()),
             (
@@ -203,7 +246,7 @@ mod tests {
 
     #[test]
     fn proofs_that_do_not_hold_fail_with_the_check_they_break() {
-        let trust = attested_by();
+        let trust = source_trust().unwrap();
         let failed = |proofs: &Value, expected: Option<&Measurements>| {
             let end = judge(proofs, expected, &trust);
             assert_eq!((end.status, end.error.as_str()), (EXIT_FAILED, ""));
@@ -232,7 +275,7 @@ mod tests {
         let mut proofs = published();
         let renamed = String::from_utf8(STATEMENT.to_vec())
             .unwrap()
-            .replace("\"v2.4.0-rc.1\"", "\"v2.4.0\"");
+            .replace("\"v2.4.0-rc.2\"", "\"v2.4.0\"");
         proofs["statement"] = Value::from(credential_enclave_protocol::encoding::b64u(
             renamed.as_bytes(),
         ));

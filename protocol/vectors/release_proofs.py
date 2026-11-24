@@ -2002,8 +2002,8 @@ def published(release: str) -> tuple[bytes, dict]:
 
 
 def cases_of_published_releases():
-    """The proofs of two published releases, and such proofs with one value changed."""
-    statement, bundle = published("v2.4.0-rc.1")
+    """The proofs of three published releases, and such proofs with one value changed."""
+    statement, bundle = published("v2.4.0-rc.2")
     stated = json.loads(statement)
     measurement = {name: stated[name] for name in ["pcr0", "pcr1", "pcr2"]}
     earlier_statement, earlier_bundle = published("v2.3.0")
@@ -2019,28 +2019,29 @@ def cases_of_published_releases():
             change(value["attestation"])
         return value
 
-    # The cases of this release candidate are verified with the certificates of Sigstore, the
-    # key of Rekor and the build workflow at the commit that attested it.
+    # The cases of this release candidate are verified with the values of the verifier itself:
+    # the certificates of Sigstore, the key of Rekor and the build workflow at the commit a
+    # node and a secure program list. The job of that build workflow attested this release.
     def source(name, rule, value, **more):
         add(
-            "release v2.4.0-rc.1: " + name,
+            "release v2.4.0-rc.2: " + name,
             rule,
             value,
-            trust="sigstore-build-workflow-v2.4.0-rc.1",
+            trust="source",
             measurement=more.pop("measurement", measurement),
             **more,
         )
 
-    source("the published proofs, for a trust that names the build workflow at the commit that attested them", None, proofs())
+    source("the published proofs", None, proofs())
     add(
-        "release v2.4.0-rc.1: the published proofs, which the build workflow at an earlier commit attested",
+        "release v2.4.0-rc.2: the published proofs, for a trust that names the build workflow at an earlier commit",
         "V6",
         proofs(),
-        trust="source",
+        trust="sigstore-build-workflow-v2.4.0-rc.1",
         measurement=measurement,
     )
     add(
-        "release v2.4.0-rc.1: the published proofs, for a trust that names another build workflow",
+        "release v2.4.0-rc.2: the published proofs, for a trust that names another build workflow",
         "V6",
         proofs(),
         trust="sigstore-release-workflow-v2.3.0",
@@ -2063,7 +2064,7 @@ def cases_of_published_releases():
     source(
         "a statement of another release",
         "V6",
-        proofs(of_statement=statement.replace(b'"v2.4.0-rc.1"', b'"v2.4.0-rc.2"')),
+        proofs(of_statement=statement.replace(b'"v2.4.0-rc.2"', b'"v2.4.0-rc.3"')),
     )
     source(
         "a statement of another commit",
@@ -2076,7 +2077,7 @@ def cases_of_published_releases():
         proofs(of_statement=statement.replace(b'"image/toolchain"', b'"image/other"')),
     )
     source(
-        "the statement of release v2.3.0 with the attestation of release v2.4.0-rc.1",
+        "the statement of release v2.3.0 with the attestation of release v2.4.0-rc.2",
         "V6",
         proofs(of_statement=earlier_statement),
         measurement=earlier_measurement,
@@ -2126,6 +2127,42 @@ def cases_of_published_releases():
     source("the checkpoint of release v2.3.0", "V4", proofs(entry(lambda item: item["inclusionProof"].update({"checkpoint": entry_of(earlier_bundle)["inclusionProof"]["checkpoint"]}))))
     source("the size of the tree one higher", "V4", proofs(entry(lambda item: item["inclusionProof"].update({"treeSize": str(int(item["inclusionProof"]["treeSize"]) + 1)}))))
     source("two copies of the log entry", "V2", proofs(lambda attestation: attestation["verificationMaterial"]["tlogEntries"].append(entry_of(attestation))))
+
+    # The release candidate v2.4.0-rc.1: the job of the build workflow attested it at an earlier
+    # commit of that file. Its proofs hold for a trust that names that commit, and a verifier
+    # that lists the build workflow of this source refuses them.
+    candidate_statement, candidate_bundle = published("v2.4.0-rc.1")
+    candidate = json.loads(candidate_statement)
+    candidate_measurement = {name: candidate[name] for name in ["pcr0", "pcr1", "pcr2"]}
+
+    def candidate_proofs():
+        return {"statement": b64u(candidate_statement), "attestation": copy.deepcopy(candidate_bundle)}
+
+    add(
+        "release v2.4.0-rc.1: the published proofs, for a trust that names the build workflow at the commit that attested them",
+        None,
+        candidate_proofs(),
+        trust="sigstore-build-workflow-v2.4.0-rc.1",
+        measurement=candidate_measurement,
+    )
+    add(
+        "release v2.4.0-rc.1: the published proofs, which the build workflow at an earlier commit attested",
+        "V6",
+        candidate_proofs(),
+        trust="source",
+        measurement=candidate_measurement,
+    )
+    source(
+        "the statement of release v2.4.0-rc.1 with the attestation of release v2.4.0-rc.2",
+        "V6",
+        proofs(of_statement=candidate_statement),
+        measurement=candidate_measurement,
+    )
+    source(
+        "the certificate of release v2.4.0-rc.1",
+        "V3",
+        proofs(lambda attestation: attestation["verificationMaterial"].update({"certificate": candidate_bundle["verificationMaterial"]["certificate"]})),
+    )
 
     def earlier_proofs():
         return {"statement": b64u(earlier_statement), "attestation": copy.deepcopy(earlier_bundle)}

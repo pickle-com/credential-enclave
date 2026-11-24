@@ -143,6 +143,37 @@ fn the_verdict_on_every_case_is_the_verdict_of_the_file() {
 }
 
 #[test]
+fn the_published_proofs_of_a_release_the_build_workflow_of_this_source_attested_hold() {
+    // The release statement and the bundle of the attestation of release v2.4.0-rc.2, as its
+    // GitHub release holds them: the job of the build workflow at the commit this source lists
+    // (`enclave/release/builders.json`) made the attestation.
+    let statement = include_bytes!("../vectors/published/v2.4.0-rc.2/measurements.json");
+    let bundle: Value = serde_json::from_str(include_str!(
+        "../vectors/published/v2.4.0-rc.2/release-statement.sigstore.json"
+    ))
+    .unwrap();
+    let stated: Value = serde_json::from_slice(statement).unwrap();
+    let measurement = ["pcr0", "pcr1", "pcr2"].map(|key| pcr(text(&stated, key)));
+    let proofs = serde_json::json!({
+        "statement": credential_enclave_protocol::encoding::b64u(statement),
+        "attestation": bundle,
+    });
+    let release = verify_release_proofs(&proofs, &measurement, &source()).unwrap();
+    assert_eq!(release.release, "v2.4.0-rc.2");
+    assert_eq!(
+        release.git_commit,
+        "ebf4358294a6a1e92db804ab3286684b232f8981"
+    );
+    assert_eq!(release.pcrs, measurement);
+    assert_eq!(release.measurement().pcrs, measurement);
+    // For the measurement of another enclave the same proofs show nothing.
+    let mut other = measurement;
+    other[0][0] ^= 1;
+    let refused = verify_release_proofs(&proofs, &other, &source()).unwrap_err();
+    assert_eq!(refused.check(), 1, "{refused}");
+}
+
+#[test]
 fn the_published_proofs_of_a_release_candidate_hold_for_the_build_workflow_that_attested_them() {
     // The release statement and the bundle of the attestation of release v2.4.0-rc.1, as its
     // GitHub release holds them. The job of the build workflow made the attestation at an

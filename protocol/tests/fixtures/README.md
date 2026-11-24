@@ -4,7 +4,7 @@ Test inputs of the tests in `protocol/src/attestation.rs`, `protocol/src/release
 `protocol/src/certificate.rs`, `protocol/src/release_proofs.rs`, `enclave/src/attest.rs`,
 `enclave/src/lineage.rs`, `enclave/src/platform/nitro.rs`, `enclave/src/tests/peer.rs` and
 `verify/src/`. Only tests read them: no built program contains them. The shared cases of the
-release proofs and the published proofs of two releases are in `protocol/vectors/`, which has a
+release proofs and the published proofs of three releases are in `protocol/vectors/`, which has a
 README of its own.
 
 The certificate of a Nitro attestation document is valid for about three hours. The tests
