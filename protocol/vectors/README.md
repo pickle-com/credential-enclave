@@ -61,9 +61,9 @@ A case names a trust: a member of `trusts` of the file, or `source`.
   Rekor, the list of build workflows) and the repository of this source. The cases of this
   trust are made of the published proofs of `published/`. The proofs of the release candidate
   `v2.4.0-rc.2` pass: the job of the build workflow at the commit the list of this source
-  names attested it. The same proofs with one value changed are refused. No key of the script
-  signs them, so a changed value is refused by the first check it breaks, and a changed value
-  that no check reads (the `inputs` of the statement) leaves the proofs accepted. The proofs
+  names attested it. The other cases are the same proofs with one value changed. No key of the
+  script signs them, so a changed value is refused by the first check it breaks, and a changed
+  value that no check reads (the `inputs` of the statement) leaves the proofs accepted. The proofs
   of the release candidate `v2.4.0-rc.1` and of the release `v2.3.0`, as they are, are refused
   at `V6`: the list of build workflows of this source names neither the commit of the build
   workflow file whose job attested that release candidate nor the release workflow of the tag

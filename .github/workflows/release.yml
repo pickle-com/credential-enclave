@@ -1,6 +1,9 @@
 # The release of a `v*` tag (enclave.md 11.2).
 #
-# check:     the checks of check.yml and `cargo audit`.
+# check:     formatting, lints, the tests of the workspace, the check of the committed test
+#            vectors, the check of the functions that read a secret, and `cargo audit`. The
+#            other checks of check.yml (the shared cases of the release proofs, the tests of
+#            the secure program and of the monitor) run when the commit is pushed to a branch.
 # build:     the workflow enclave-build.yml, at the commit fixed below, builds the enclave image
 #            file of the commit of the tag and attests its measurements as the predicate of the
 #            release statement (protocol.md section 9). That attestation is the public build
