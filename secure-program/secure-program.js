@@ -144,9 +144,18 @@
   //                   of the chains of format 1 and format 2, and the pages that held no entry
   //                   because every key they took was no entry, one read for each day)
   //   log.legacy      the chains of format 1 and format 2: {nodes: {node: {seq, time_ms, until_ms,
-  //                   closed, read_ms}}, waiting: {node: {until_ms, time_ms, strict}}} (waiting:
-  //                   the receiving nodes of transfers whose documents this device has still to
-  //                   judge; strict: nothing but a document judges the node)
+  //                   closed, read_ms, end_ms, found}}, waiting: {node: {until_ms, time_ms, strict}},
+  //                   found_ms, more, closed, asked} (waiting: the receiving nodes of transfers
+  //                   whose documents this device has still to judge; strict: nothing but a
+  //                   document judges the node; found: a chain followed because the store
+  //                   names its prefix; found_ms: the time of the node discovery listing the
+  //                   rounds last took in; more: that listing went on beyond the pages a
+  //                   round reads of it; closed: the chains read to their end, a table from
+  //                   the digest of the node id to the seq the chain was read to; recheck and
+  //                   recheck_ms: the digest of the last chain read to its end that was listed
+  //                   again, and the time of that; asked: the nodes listed for their revokes
+  //                   alone that the rounds looked for, a table from node id to the expiry the
+  //                   list named for the node then)
   //   log.round       the last round: {v, done_ms, tried_ms, last, told, state, unfinished,
   //                   row_ms} (unfinished: the rounds in a row that had more to read than they
   //                   read and were not catching up; row_ms: the time that row began, 0 for none)
@@ -386,8 +395,25 @@
   const LEGACY_PROBE_SEQS = 2;
   const LEGACY_SEQ_VERSIONS = 5;
   const LEGACY_DISCOVERY_PAGES = 2;
+  // The node prefixes one page of the node discovery listing names at most (the page size of
+  // the store).
+  const LEGACY_DISCOVERY_PAGE = 1000;
   const LEGACY_CLOSE_SLACK_MS = DAY_MS;
   const LEGACY_FOUND_INTERVAL_MS = DAY_MS;
+  // The chains the rounds follow because the store names their prefix (the node discovery
+  // listing, read once in LEGACY_FOUND_INTERVAL_MS): the chains read to their end that the
+  // device remembers by a digest of their node id, the nodes listed for their revokes alone
+  // for which that listing was read when they appeared, and the days in which every chain
+  // read to its end is listed once again from where it was read to (a node whose chain ended
+  // may be handed a grant again by another device of the account, and writes on: of the
+  // chains the listing names and the device remembers, one part in LEGACY_RECHECK_DAYS is
+  // listed again with each reading of the listing).
+  const LEGACY_RECHECK_DAYS = 30;
+  // The rounds that follow one another at once because each had more to read (a row) do not
+  // list a chain again that a round of the row read to its end less than this ago.
+  const LEGACY_END_FRESH_MS = 600000;
+  const LEGACY_CLOSED_NODES = 2048;
+  const LEGACY_ASKED_NODES = 16;
   const LOG_STORE_CONCURRENCY = 8;
   const LOG_STORE_OBJECTS = 100;
   const LOG_STORE_SEQ_DIGITS = 20;
@@ -3678,12 +3704,14 @@
 
   /** The nodes of this account in the bucket of format 1 and format 2: the common prefixes of the
    *  account prefix (the node discovery listing), LEGACY_DISCOVERY_PAGES pages at most. A prefix
-   *  that does not name a node id is left out. Throws a store failure. */
-  async function discoverLegacyNodes(turn) {
+   *  that does not name a node id is left out. state, when given, receives more: whether the
+   *  listing went on beyond those pages. Throws a store failure. */
+  async function discoverLegacyNodes(turn, state) {
     const prefix = accountPrefix();
     const nodes = [];
     let keyMarker = null;
     let versionIdMarker = null;
+    if (state !== undefined) state.more = true;
     for (let page = 0; page < LEGACY_DISCOVERY_PAGES; page += 1) {
       let url = null;
       let signedMs = 0;
@@ -3711,7 +3739,10 @@
         const id = common.slice(prefix.length, -1);
         if (NODE_ID.test(id) && nodes.indexOf(id) < 0) nodes.push(id);
       }
-      if (!listing.truncated || listing.nextKeyMarker === null) break;
+      if (!listing.truncated || listing.nextKeyMarker === null) {
+        if (state !== undefined) state.more = false;
+        break;
+      }
       keyMarker = listing.nextKeyMarker;
       versionIdMarker = listing.nextVersionIdMarker;
     }
@@ -3828,8 +3859,11 @@
   // ---- The chains this device follows (log.legacy) ----
 
   /** The kept state of the chains of format 1 and format 2: {nodes: {node: {seq, time_ms,
-   *  until_ms, closed, read_ms}}, waiting: {node: {until_ms, time_ms}}} (read_ms: the time a
-   *  round last listed the chain). seq is the seq up to which the
+   *  until_ms, closed, read_ms, end_ms, found}}, waiting: {node: {until_ms, time_ms}}, found_ms,
+   *  more, closed, recheck, recheck_ms, asked} (read_ms: the time a round last listed the chain;
+   *  end_ms: the time a round last read it to its end; found: the chain is followed because the
+   *  store names its prefix, findChains; found_ms, more, closed (a Map from digest to seq),
+   *  recheck, recheck_ms and asked: what findChains keeps). seq is the seq up to which the
    *  control entries of the chain were read (the verification point of the program before v43 for
    *  a node its ledger held), time_ms the time of the entry there (0 when it is not known),
    *  until_ms the latest time the node can hold a grant this device knows of, and closed whether
@@ -3838,7 +3872,11 @@
    *  for a chain, and time_ms the time of the latest event that names the node. */
   function loadLegacy() {
     const kept = storedObject(STORE_LEGACY);
-    const legacy = { nodes: Object.create(null), waiting: Object.create(null) };
+    const legacy = {
+      nodes: Object.create(null), waiting: Object.create(null), found_ms: whole(kept.found_ms), more: kept.more === true,
+      closed: new Map(), recheck: typeof kept.recheck === "string" ? kept.recheck : "", recheck_ms: whole(kept.recheck_ms),
+      asked: Object.create(null),
+    };
     const nodes = kept.nodes !== null && typeof kept.nodes === "object" ? kept.nodes : {};
     for (const id of Object.keys(nodes)) {
       const value = nodes[id];
@@ -3847,6 +3885,16 @@
         seq: whole(value.seq), time_ms: whole(value.time_ms), until_ms: whole(value.until_ms),
         closed: value.closed === true, read_ms: whole(value.read_ms),
       };
+      if (whole(value.end_ms) > 0) legacy.nodes[id].end_ms = value.end_ms;
+      if (value.found === true) legacy.nodes[id].found = true;
+    }
+    const closed = kept.closed !== null && typeof kept.closed === "object" && !Array.isArray(kept.closed) ? kept.closed : {};
+    for (const digest of Object.keys(closed)) {
+      if (digest.length === SEEN_DIGEST_CHARS && legacy.closed.size < LEGACY_CLOSED_NODES) legacy.closed.set(digest, whole(closed[digest]));
+    }
+    const asked = kept.asked !== null && typeof kept.asked === "object" && !Array.isArray(kept.asked) ? kept.asked : {};
+    for (const id of Object.keys(asked).slice(-LEGACY_ASKED_NODES)) {
+      if (NODE_ID.test(id)) legacy.asked[id] = whole(asked[id]);
     }
     const waiting = kept.waiting !== null && typeof kept.waiting === "object" ? kept.waiting : {};
     for (const id of Object.keys(waiting).slice(0, LEGACY_ROUND_BODIES)) {
@@ -3859,7 +3907,8 @@
   }
 
   /** Writes the kept state. Above 2 * LEGACY_NODES chains, the closed chains with the earliest
-   *  end leave first. */
+   *  end leave first: the device remembers them as chains read to their end (closed), so the
+   *  node discovery listing does not make it follow them anew. */
   function saveLegacy(legacy) {
     const ids = Object.keys(legacy.nodes);
     if (ids.length > 2 * LEGACY_NODES) {
@@ -3867,10 +3916,29 @@
       closed.sort(function (x, y) { return legacy.nodes[x].until_ms - legacy.nodes[y].until_ms; });
       for (const id of closed) {
         if (Object.keys(legacy.nodes).length <= 2 * LEGACY_NODES) break;
+        legacy.closed.set(keyDigest(id), legacy.nodes[id].seq);
         delete legacy.nodes[id];
       }
     }
-    storeJson(STORE_LEGACY, legacy);
+    const stored = { nodes: legacy.nodes, waiting: legacy.waiting };
+    if (legacy.found_ms > 0) stored.found_ms = legacy.found_ms;
+    if (legacy.more) stored.more = true;
+    if (legacy.closed.size > 0) {
+      // (Beyond LEGACY_CLOSED_NODES the ones remembered first leave: the node discovery listing
+      // then makes the device follow them from their first seq once more.)
+      stored.closed = {};
+      Array.from(legacy.closed.keys()).slice(-LEGACY_CLOSED_NODES).forEach(function (digest) {
+        stored.closed[digest] = legacy.closed.get(digest);
+      });
+    }
+    if (legacy.recheck !== "") stored.recheck = legacy.recheck;
+    if (legacy.recheck_ms > 0) stored.recheck_ms = legacy.recheck_ms;
+    const asked = Object.keys(legacy.asked).slice(-LEGACY_ASKED_NODES);
+    if (asked.length > 0) {
+      stored.asked = {};
+      for (const id of asked) stored.asked[id] = legacy.asked[id];
+    }
+    storeJson(STORE_LEGACY, stored);
   }
 
   // ---- The round: one reading and judging of the log of the account (docs/protocol.md 7.4) ----
@@ -4926,11 +4994,19 @@
   // ---- The round and the chains of format 1 and format 2 ----
 
   /** Puts a chain of format 1 or format 2 among the chains this device follows: the node id, and
-   *  the latest time the node can hold the grant that reached it. */
-  function followChain(log, id, untilMs) {
+   *  the latest time the node can hold the grant that reached it. found: the chain is followed
+   *  because the store names its prefix (findChains); no grant of this device and no transfer
+   *  it read reached that node, and the time until which the chain is read is taken from the
+   *  times of its keys. */
+  function followChain(log, id, untilMs, found) {
     const kept = log.legacy.nodes[id];
     if (kept === undefined) {
-      log.legacy.nodes[id] = { seq: 0, time_ms: 0, until_ms: untilMs, closed: false, read_ms: 0 };
+      // (A chain the device read to its end before is followed on from where it was read to.)
+      const digest = keyDigest(id);
+      const from = log.legacy.closed.has(digest) ? log.legacy.closed.get(digest) : 0;
+      log.legacy.nodes[id] = { seq: from, time_ms: 0, until_ms: untilMs, closed: false, read_ms: 0 };
+      if (found === true) log.legacy.nodes[id].found = true;
+      log.legacy.closed.delete(digest);
       return;
     }
     if (untilMs > kept.until_ms) {
@@ -4939,9 +5015,142 @@
     }
   }
 
+  // The nodes the backend listed for their revokes alone in the last step of the grants of this
+  // runtime that read the list (renewGrants): [{node, ends}], ends being the expiry the list
+  // names for the grant the node holds (0: none). Such a node holds a grant another device of
+  // the account handed it, and writes its chain of format 1 or format 2.
+  let listedGuards = [];
+
+  /** Whether the list of the nodes named a node for its revokes alone whose chain this device
+   *  does not follow, with an expiry other than the one the rounds last looked for that node
+   *  with (another device handed it a grant since, or the node is new to this device): a round
+   *  is then due as for a read held back (roundDue), and looks for the chain (findChains). */
+  function chainsUnseen() {
+    if (listedGuards.length === 0) return false;
+    const legacy = loadLegacy();
+    return listedGuards.some(function (guard) {
+      return legacy.nodes[guard.node] === undefined && legacy.asked[guard.node] !== guard.ends;
+    });
+  }
+
+  /** Puts the chains of the nodes whose prefix the store names under the prefix of the account
+   *  among the chains the rounds follow. A device of the account that runs another program
+   *  hands its grants to nodes this device hands none to, and such a node writes its entries
+   *  (the transfers of the delegation among them) into a chain no grant of this device leads
+   *  to. Which chains there are is read from the store, and not from a list of the backend: the
+   *  node discovery listing of the bucket of format 1 and format 2, once in
+   *  LEGACY_FOUND_INTERVAL_MS (what the log screen read of it within that time is taken, when
+   *  it is later than what the rounds took in). The list of the nodes only says when to read it
+   *  again: for a node listed for its revokes alone whose chain this device does not follow,
+   *  and whose expiry in that list is not the one the rounds last looked for it with
+   *  (legacy.asked), the chain is followed again when the device read it to its end before,
+   *  and the listing is read at once when it never saw that chain.
+   *  A chain the device read to its end (one it remembers by a digest, legacy.closed, or a
+   *  closed one it keeps) is listed again from where it was read to, whatever the list of the
+   *  nodes says of its node, once in LEGACY_RECHECK_DAYS: with a reading of the listing, as
+   *  many of the chains it names as the time since the last ones makes due, in the order of
+   *  their digests (legacy.recheck, legacy.recheck_ms).
+   *  A chain found this way is followed from its first seq. Every prefix the listing names is
+   *  followed: a listing that goes on beyond the pages a round reads of it (legacy.more) leaves
+   *  the round incomplete, and is read again by the next round. A read of the listing that is
+   *  held back is a read of the round held back; a backend that states it has no such store is
+   *  believed by a device that knows of no chain. */
+  async function findChains(turn, keys, log, run) {
+    const legacy = log.legacy;
+    const now = native.nowMs();
+    const unseen = [];
+    for (const guard of listedGuards) {
+      if (legacy.nodes[guard.node] !== undefined || legacy.asked[guard.node] === guard.ends) continue;
+      if (legacy.closed.has(keyDigest(guard.node))) {
+        followChain(log, guard.node, 0, true);
+        delete legacy.asked[guard.node];
+        legacy.asked[guard.node] = guard.ends;
+      } else {
+        unseen.push(guard);
+      }
+    }
+    if (unseen.length === 0 && !legacy.more && now >= legacy.found_ms && now - legacy.found_ms < LEGACY_FOUND_INTERVAL_MS) return;
+    let ids = null;
+    // What the log screen read of the listing within the day, when it is later than what the
+    // rounds took in and names fewer prefixes than one page of the listing holds (such a
+    // listing did not go on).
+    const cache = unseen.length === 0 && !legacy.more ? loadCache(keys) : null;
+    if (cache !== null && cache.found_ms > legacy.found_ms && cache.found_ms <= now &&
+        now - cache.found_ms < LEGACY_FOUND_INTERVAL_MS && cache.found.length < LEGACY_DISCOVERY_PAGE) {
+      ids = cache.found;
+      legacy.found_ms = cache.found_ms;
+    } else {
+      const state = { more: false };
+      try {
+        ids = await discoverLegacyNodes(turn, state);
+      } catch (failure) {
+        const known = Object.keys(legacy.nodes).length > 0 || legacy.closed.size > 0;
+        if (isStoreFailure(failure) && failure.kind === "absent" && !known && turnLeft(turn) > 0) {
+          legacy.found_ms = now;
+          return;
+        }
+        noteFailure(turn, run, heldBack(failure));
+        return;
+      }
+      legacy.found_ms = now;
+      legacy.more = state.more;
+    }
+    for (const guard of unseen) {
+      delete legacy.asked[guard.node];
+      legacy.asked[guard.node] = guard.ends;
+    }
+    // The chains the listing names that the device read to their end before (the ones it
+    // remembers by a digest, and the closed ones it keeps): [digest, id].
+    const ended = [];
+    for (const id of ids) {
+      const digest = keyDigest(id);
+      if (legacy.nodes[id] !== undefined) {
+        if (legacy.nodes[id].closed) ended.push([digest, id]);
+      } else if (legacy.closed.has(digest)) {
+        ended.push([digest, id]);
+      } else {
+        followChain(log, id, 0, true);
+      }
+    }
+    // They are listed again, each once in LEGACY_RECHECK_DAYS: as many of them as the time since
+    // the last ones were taken makes due, in the order of their digests, the ones after the last
+    // one taken first. A chain listed again is followed as one the store names (found), and
+    // closes again with the same reading when nothing was written to it.
+    // (The time runs while the listing names such chains.)
+    if (ended.length === 0 || legacy.recheck_ms === 0 || legacy.recheck_ms > now) legacy.recheck_ms = now;
+    const due = Math.min(ended.length, Math.floor(ended.length * (now - legacy.recheck_ms) / (LEGACY_RECHECK_DAYS * DAY_MS)));
+    if (due > 0) {
+      ended.sort(function (a, b) { return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0; });
+      let at = ended.findIndex(function (item) { return item[0] > legacy.recheck; });
+      if (at < 0) at = 0;
+      for (let taken = 0; taken < due; taken += 1) {
+        const item = ended[(at + taken) % ended.length];
+        legacy.recheck = item[0];
+        const kept = legacy.nodes[item[1]];
+        if (kept === undefined) {
+          followChain(log, item[1], 0, true);
+        } else {
+          kept.closed = false;
+          kept.found = true;
+        }
+      }
+      legacy.recheck_ms = now;
+    }
+    // (More node prefixes than the pages of the listing a round reads: the round did not see
+    // every chain of the account.)
+    if (legacy.more) run.cut = true;
+  }
+
   /** The part of a round that reads the chains of format 1 and format 2 this device follows: the
-   *  chains of the nodes of releases before LOG_FORMAT_3_FROM that it handed a grant to, and of
-   *  the nodes such a node handed the delegation on to. Each open chain is listed from the seq up
+   *  chains of the nodes of releases before LOG_FORMAT_3_FROM that it handed a grant to, of the
+   *  nodes such a node handed the delegation on to, and of every node whose prefix the store
+   *  names under the prefix of the account (findChains: found). The control entries of a chain
+   *  that is found are judged as those of any other chain; of its entries from before
+   *  LEGACY_TRANSFER_DOCUMENTS_FROM_MS, whose transfers no document judges, a control key of
+   *  format 2 (the key names the time) is passed and not read. Such a chain is read until its
+   *  end lies longer back than the longest lifetime of a grant (a node of a release before
+   *  LOG_FORMAT_3_FROM writes an entry with every grant it takes): it is then remembered as
+   *  read to its end. Each open chain is listed from the seq up
    *  to which it was read, the control entries of the new keys are read (LEGACY_ROUND_BODIES per
    *  round), and a transfer of the delegation (the event
    *  grant_transferred_out of this key) is followed. Such an event names the receiving node and
@@ -4976,11 +5185,26 @@
       if (logFormatOf(record.release) === 3 || !writesToStore(record.platform, record.release)) continue;
       followChain(log, id, record.not_after_ms);
     }
-    let open = Object.keys(legacy.nodes).filter(function (id) { return !legacy.nodes[id].closed; });
+    await findChains(turn, keys, log, run);
+    // The chains of this round: the open chains, without the ones a round of this row read to
+    // their end a moment ago (the rounds of a row follow one another at once, and a round of
+    // the row takes the chains the rounds before it did not come to: log.round.row_ms is the
+    // time the row began).
+    const last = storedObject(STORE_ROUND);
+    const rowMs = last.v === VERSION ? whole(last.row_ms) : 0;
+    let open = Object.keys(legacy.nodes).filter(function (id) {
+      const chain = legacy.nodes[id];
+      if (chain.closed) return false;
+      const ended = whole(chain.end_ms);
+      return !(rowMs > 0 && ended >= rowMs && ended <= now && now - ended < LEGACY_END_FRESH_MS);
+    });
     const waited = Object.keys(legacy.waiting);
     if (open.length === 0 && waited.length === 0) return;
     // More open chains than a round follows: the chains listed longest ago come first (among
-    // them the ones whose grant ends last), so every chain is read within a few rounds.
+    // them the ones whose grant ends last), and the next round follows at once and takes the
+    // others (run.rest). Such a round is not complete, and is no round that left reads undone
+    // in the sense that counts (LOG_UNFINISHED_ROUNDS): the chains of an account are as many as
+    // they are, and the rounds of one synchronization come to all of them.
     open.sort(function (x, y) {
       if (legacy.nodes[x].read_ms !== legacy.nodes[y].read_ms) return legacy.nodes[x].read_ms - legacy.nodes[y].read_ms;
       return legacy.nodes[y].until_ms - legacy.nodes[x].until_ms;
@@ -4988,6 +5212,7 @@
     if (open.length > LEGACY_NODES) {
       open = open.slice(0, LEGACY_NODES);
       run.cut = true;
+      run.rest = true;
     }
     // A control entry names one receiving node at most, and the nodes that wait are asked for
     // with the first pass: the entries of a round and the nodes that wait fit one request.
@@ -5030,6 +5255,20 @@
         }
         run.nodes.add(id);
         legacy.nodes[id].read_ms = now;
+        const found = legacy.nodes[id].found === true;
+        if (found) {
+          // The chain is read until the latest time its keys name lies longer back than the
+          // longest lifetime of a grant (a time after now counts as now).
+          let latest = 0;
+          entries.forEach(function (list) {
+            for (const candidate of list) {
+              if (candidate.parts.format === 2 && candidate.parts.time_ms > latest) latest = candidate.parts.time_ms;
+            }
+          });
+          if (latest > 0) {
+            legacy.nodes[id].until_ms = Math.max(legacy.nodes[id].until_ms, Math.min(latest, now) + GRANT_DAYS_MAX * DAY_MS);
+          }
+        }
         const seqs = Array.from(entries.keys()).sort(function (a, b) { return a - b; });
         const more = outcome.value.truncated && outcome.value.nextKeyMarker !== null;
         // The last seq of a listing page that goes on may have further object versions on the
@@ -5045,10 +5284,21 @@
           // The object versions whose keys name a control entry, the latest first, up to
           // LEGACY_SEQ_READS of them: an object someone else wrote under the seq of a control
           // entry does not take the place of the entry of the node.
-          const shaped = entries.get(seq).filter(function (candidate) {
+          const named = entries.get(seq).filter(function (candidate) {
             return candidate.parts.format === 1 || candidate.parts.kind === "c";
           }).sort(latestFirst);
-          if (shaped.length === 0) continue;
+          if (named.length === 0) continue;
+          // In a chain that is found, a control key that names a time before
+          // LEGACY_TRANSFER_DOCUMENTS_FROM_MS is passed: no transfer of that time is judged by
+          // a document, and this device followed no grant of its own there.
+          const shaped = !found ? named : named.filter(function (candidate) {
+            return candidate.parts.format === 1 || candidate.parts.time_ms >= LEGACY_TRANSFER_DOCUMENTS_FROM_MS;
+          });
+          if (shaped.length === 0) {
+            run.passed += 1;
+            if (named[0].parts.time_ms < run.oldest) run.oldest = named[0].parts.time_ms;
+            continue;
+          }
           const candidates = shaped.slice(0, LEGACY_SEQ_READS);
           if (bodiesLeft < candidates.length) {
             // The entries of this round are spent: the chain is read on from here by the next.
@@ -5202,6 +5452,12 @@
           }
           continue;
         }
+        // (A chain that is found and whose keys name no time: the time of its last entry read.)
+        if (chain.found === true && chain.time_ms > 0) {
+          chain.until_ms = Math.max(chain.until_ms, Math.min(chain.time_ms, now) + GRANT_DAYS_MAX * DAY_MS);
+        }
+        // The chain is read to its end.
+        chain.end_ms = now;
         if (now > chain.until_ms + LEGACY_CLOSE_SLACK_MS) chain.closed = true;
       }
       // The receiving nodes this device has no judgement of: their documents.
@@ -5268,6 +5524,14 @@
         run.over = true;
         // (Such pages hold objects no node wrote.)
         run.spoiled += 1;
+      }
+    }
+    // A chain that is found and read to its end is remembered by a digest of its node id (a
+    // chain of a node this device handed a grant to stays among the chains it keeps).
+    for (const id of Object.keys(legacy.nodes)) {
+      if (legacy.nodes[id].closed && legacy.nodes[id].found === true && log.grants[id] === undefined) {
+        legacy.closed.set(keyDigest(id), legacy.nodes[id].seq);
+        delete legacy.nodes[id];
       }
     }
   }
@@ -5576,7 +5840,9 @@
     const now = native.nowMs();
     if (round.v !== VERSION) return true;
     const tried = whole(round.tried_ms);
-    const nominated = withheldDue(loadWithheld());
+    // (A node listed for its revokes alone whose chain this device does not follow asks for a
+    // round as a read held back does: chainsUnseen.)
+    const nominated = withheldDue(loadWithheld()) || chainsUnseen();
     if (round.open === true || nominated || (round.last !== "verified" && round.last !== "attention")) {
       return now < tried || now - tried >= LOG_ROUND_RETRY_MS;
     }
@@ -6041,16 +6307,24 @@
     if (rowMs > now) rowMs = 0;
     const catching = over && run.spoiled === 0 && run.gained + run.passed > 0 &&
       run.oldest < (rowMs > 0 ? rowMs : started);
-    if (over) {
+    // A round that followed as many chains of format 1 and format 2 as a round follows, with
+    // more of them open (run.rest), begins or goes on a row as well. It adds to the row only
+    // when it read an object no node wrote: an account has as many chains as its nodes made,
+    // and the rounds of one synchronization come to all of them, unless someone else writes
+    // chains under the prefix of the account.
+    const rest = !unreachable && run.rest === true;
+    const onward = over || rest;
+    const counted = (over && !catching) || (!over && rest && run.spoiled > 0);
+    if (onward) {
       if (origin === "sync") {
         if (rowMs === 0) rowMs = started;
-        if (!catching) unfinished += 1;
+        if (counted) unfinished += 1;
       }
     } else if (!denied && !unreachable) {
       unfinished = 0;
       rowMs = 0;
     }
-    const beyond = over && !catching && unfinished > LOG_UNFINISHED_ROUNDS;
+    const beyond = counted && unfinished > LOG_UNFINISHED_ROUNDS;
     const overrun = beyond && first === true;
     if (beyond && run.detail === "") run.detail = "round:unfinished";
     let blocked = denied || overrun;
@@ -6295,7 +6569,7 @@
     // nothing held back: the next round follows at once (follow of them at most after this
     // one), and nothing waits for it. A round that ends any other way (complete, held back,
     // without the store, in a runtime that did not run) is followed by none.
-    if (origin === "sync" && over && !denied && whole(follow) > 0 && !accountClosed) {
+    if (origin === "sync" && onward && !denied && whole(follow) > 0 && !accountClosed) {
       startRound(keys, "sync", undefined, false, follow - 1).then(noop, noop);
     }
     return {
@@ -9568,16 +9842,19 @@
    *  is counted for it. A backend without the route of the list (404) is asked for the
    *  attestations of every node it lists, and what this device kept decides which of them
    *  receives a grant; any other failure of the list is the failure of this step. Returns
-   *  {accepted, rejected, failed, later, lacking, granted, ledgerChanged, guards, unread}: the
-   *  Set of the ids of the nodes that hold or were sent a grant, the number of nodes whose
-   *  attestation failed to verify, of nodes that did not take the grant, of nodes of a later
-   *  release, of nodes that were to receive a grant and that this step had no grant command
-   *  for, and of nodes that took a grant now, whether the ledger of the earlier programs
-   *  changed, the ids of the nodes listed for their revokes alone, and the failure of the read
-   *  of the sealed ledger that kept the step from handing a grant (null: none). */
+   *  {accepted, rejected, failed, later, lacking, granted, ledgerChanged, guards, guardEnds,
+   *  unread}: the Set of the ids of the nodes that hold or were sent a grant, the number of
+   *  nodes whose attestation failed to verify, of nodes that did not take the grant, of nodes
+   *  of a later release, of nodes that were to receive a grant and that this step had no grant
+   *  command for, and of nodes that took a grant now, whether the ledger of the earlier
+   *  programs changed, the ids of the nodes listed for their revokes alone, the same nodes
+   *  with the expiry the list names for each ([{node, ends}]), and the failure of the read of
+   *  the sealed ledger that kept the step from handing a grant (null: none). */
   async function renewGrants(turn, keys, ledger, grants, options) {
     const accepted = new Set();
     const guards = [];
+    // (The same nodes with the expiry the list names for each: findChains.)
+    const guardEnds = [];
     const nodes = loadNodes();
     // The nodes of a later release this step met: {node, measure, release}.
     const noted = [];
@@ -9607,6 +9884,7 @@
         // and it counts neither among the nodes that hold a grant nor among the ones that do not.
         if (item.revoke_only) {
           guards.push(item.node);
+          guardEnds.push({ node: item.node, ends: item.not_after_ms === null ? 0 : item.not_after_ms });
           continue;
         }
         const known = grants[item.node];
@@ -9685,7 +9963,7 @@
     if (options.whole === true && lacking > 0) {
       return {
         accepted: accepted, rejected: rejected, failed: failed, later: later, lacking: lacking, granted: 0,
-        ledgerChanged: false, guards: guards, unread: null,
+        ledgerChanged: false, guards: guards, guardEnds: guardEnds, unread: null,
       };
     }
     // Before the first grant of the step goes out, the sealed ledger of the backend is read and
@@ -9711,7 +9989,7 @@
       if (unread !== null || ledgerForeign() || delegationOff(ledger)) {
         return {
           accepted: accepted, rejected: rejected, failed: failed, later: later, lacking: lacking, granted: 0,
-          ledgerChanged: false, guards: guards, unread: unread,
+          ledgerChanged: false, guards: guards, guardEnds: guardEnds, unread: unread,
         };
       }
     }
@@ -9755,7 +10033,7 @@
     }
     return {
       accepted: accepted, rejected: rejected, failed: failed, later: later, lacking: lacking, granted: granted,
-      ledgerChanged: ledgerChanged, guards: guards, unread: null,
+      ledgerChanged: ledgerChanged, guards: guards, guardEnds: guardEnds, unread: null,
     };
   }
 
@@ -9812,7 +10090,7 @@
     const grants = loadGrants();
     let renewed = {
       accepted: new Set(), rejected: 0, failed: 0, later: 0, lacking: 0, granted: 0, ledgerChanged: false, guards: [],
-      unread: null,
+      guardEnds: [], unread: null,
     };
     // Whether the sealed ledger was read for this step (options.shared: the caller read it).
     let shared = options.shared === true;
@@ -9832,6 +10110,8 @@
       // (The sealed ledger is read before the first grant goes out, unless it was read for this
       // step: renewGrants. What it says may turn the delegation off.)
       renewed = await renewGrants(turn, keys, ledger, grants, Object.assign({}, options, { shared: shared }));
+      // (The rounds look for the chain of a node listed for its revokes alone: findChains.)
+      listedGuards = renewed.guardEnds.slice(0, LEGACY_ASKED_NODES);
     }
     if (ledgerForeign()) {
       // The ledger holds a value this program does not read (the keychain item, the device copy,
