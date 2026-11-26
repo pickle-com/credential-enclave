@@ -10,8 +10,9 @@ the account keys from it (protocol.md section 3), verifies the attestation of en
 (section 6) and vault secrets, reads and judges the credential log (section 7), keeps the grants it
 handed to nodes (a node the backend lists for its revokes alone is handed none), keeps the
 settings of the delegation (the switch and the lifetime of a grant) and reads the ones the other
-devices of the account made before it sends a command to a node, and transfers
-the master key between the devices of one account. What the program
+devices of the account made before it sends a command to a node, transfers
+the master key between the devices of one account, and proves to the backend that a login
+session is one of a device that holds the key of the account. What the program
 does, in which order and under which limits, is specified in protocol.md, "The program of the
 app".
 
@@ -125,8 +126,12 @@ contract between the program and the two executors is `docs/ssot/client/secure-e
 
 The master key is written to the key store of the device (`native.keychainSet`: the iCloud
 Keychain on iOS, Block Store with end-to-end encryption on Android) and read from it
-(`native.keychainGet`), and nowhere else. What leaves the device is: the public keys and the
-signatures derived from the master key; the user key, sealed with HPKE to the sealing key of a
+(`native.keychainGet`), and nowhere else. What leaves the device is: the public keys derived
+from the master key, and the signatures of the account signing key derived from it
+(`native.ed25519Sign`: over the registration of the key, over a command to a node, over the
+request of a mail setup, and over a challenge of the backend, the account key proof that shows
+the backend that a login session is one of a device that holds the key; protocol.md, "The
+account key proof of a session"); the user key, sealed with HPKE to the sealing key of a
 node whose attestation the program verified (`native.hpkeSeal`); the ciphertext of credential
 records (`native.aeadSeal`); and, during the transfer of the master key to another device of the
 same account, the master key sealed with the session key that the two devices derived from the
@@ -162,7 +167,8 @@ request to a route of the backend under `/api/secure/` names the version of the 
 query `program`), and no other request does.
 
 A reader checks this in the file. The search terms: `keychainSet` and `keychainGet` (where the
-master key is stored and read), `hpkeSeal` (what is sealed to a node), `aeadSeal` (what is
+master key is stored and read), `ed25519Sign` (what the account signing key signs, each under a
+purpose string of its own), `hpkeSeal` (what is sealed to a node), `aeadSeal` (what is
 encrypted as a record, what the transfer seals, the ledger of the settings of the delegation, the
 kept screen and what the rounds keep for the screen), `native.http(` (every
 request the program sends: `request` builds the requests to the backend and `fetchStore` the
@@ -270,7 +276,9 @@ build), the backend of the operator and the buckets of the log store as the prog
 over `native.http` (the listings of object versions with their delete markers, and the route of
 the node documents with the origin of a document and the addresses of the listings of the node
 document keys, which answers from the node registry alone while the backend holds the store of
-format 3 closed), and enclave nodes with their keys, attestation documents, node documents,
+format 3 closed; the account key proof of a login session as the backend states and takes it,
+and, when a fixture has the backend enforce the proof, the refusal of the other routes to a
+session that has not made it), and enclave nodes with their keys, attestation documents, node documents,
 commands and log entries of formats 1, 2 and 3 (`docs/protocol.md` sections 4, 5 and 7; a node
 writes format 1 when its fixture says so). The time of
 the model moves only when nothing else can happen, so a test runs a wait of minutes at once. The
@@ -283,7 +291,9 @@ bridges against, and run the program on the entries, the keys, the node document
 of the vectors `log_v3` and `log_store` and on the forms of the vectors `vault_secret`: the program
 gives the answers of the reference reader (`protocol/src/app.rs`). `tests/scenarios.js` holds the
 scenarios (worlds and runs) and returns plain results; `tests/program.test.js` fixes the expected
-results of the current program.
+results of the current program. One of its tests fixes the signature of the account key proof
+for one master key, account and challenge (protocol.md, "The account key proof of a session"):
+a backend that verifies the proof can check its verification against those values.
 
 `tests/proofs.test.js` holds the tests of the release proofs (`docs/protocol.md`, "The release
 proofs"). `tests/proofs.js` is the model of the parties that make such proofs: a transparency

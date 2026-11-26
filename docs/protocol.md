@@ -145,6 +145,7 @@ All purpose strings (no string outside this table is used):
 | `pickle.secure.v1.head\n` | Signature purpose of a head (formats 1 and 2, 7.3) |
 | `pickle.secure.v3.node-document\n` | Prefix of the nonce of a node document (7.7) |
 | `pickle.secure.v1.register\n` | Signature purpose of the account key registration (the operator's backend verifies it) |
+| `pickle.secure.v1.session-key\n` | Signature purpose of the account key proof of a login session (the operator's backend verifies it: "The account key proof of a session" in "The program of the app") |
 | `pickle.secure.v1.witness\n` | Signature purpose of a witness signature (stage 2) |
 | `pickle.secure.v1.peer`, `pickle.secure.v1.peer\n` | HPKE info and signature purpose of the messages between nodes (section 10) |
 | `pickle.secure.v3.secret-use`, `pickle.secure.v3.secret-use\n` | HPKE info and signature purpose of the envelope of one use of a vault secret (10.5) |
@@ -2425,6 +2426,7 @@ So no answer of a mail call depends on the content of a record unless an entry r
 This section states what the secure program of this repository (`secure-program/secure-program.js`,
 from version 43 on) does on a device: the order of its work and its time limits, the
 synchronization that hands the grants, the settings of the delegation and the key of the account,
+the account key proof of a login session (from version 44 on),
 how it reads and judges the log, what it shows on the log
 screen, what it reports, and the procedures of the vault secrets. "The app" of sections 3 to 7 and
 10 is this program. The formats, the commands and the verifications it applies are those of the
@@ -2471,12 +2473,14 @@ key transfer ends with the expiry of the transfer. A poll of a transfer that fai
 transport, with its time, or with an answer of the status 429 or 500 to 599 (whatever code the
 body names) is left to the next poll; any other failure ends the transfer as failed.
 
-A request is sent once. The requests of three kinds are sent once more, 0.5 s after an answer
+A request is sent once. The requests of four kinds are sent once more, 0.5 s after an answer
 that fails for a moment (a failure of the transport, the status 429, a status of 500 to 599; a
 request that ran out of its time is not sent again):
 
 - the two requests at the front of a synchronization and of a procedure that needs the grants:
   the account query and the list of the nodes ("The synchronization");
+- the account key proof of a session, which follows the judgement of the key ("The account key
+  proof of a session");
 - the reading of the sealed ledger of the backend ("The settings of the delegation");
 - the requests of a procedure that follow what the user did in it, so that one answer of a
   backend that is being deployed does not throw that away: the completion query of a connection
@@ -2518,10 +2522,23 @@ of the one that began last, while that one has not ended, is served by that one.
    moment ("The lines, the locks and the time limits").
 2. The judgement of the key: the master key of the key store against the `key_id` registered on
    the account (`absent`, `waiting`, `present`, `mismatch`, `account_mismatch`). A device with a
-   master key registers its public keys when the account has none. A device without a master key
-   whose account has a key waits for that key from another device (`waiting`), unless the key is
-   one `create_key` made on this device and never wrote to the key store: no device holds such a
-   key, and the state is `absent` ("The key of the account").
+   master key registers its public keys when the account has none. When the backend refuses
+   that registration because a key was registered since the query (`key_exists`), the program
+   sends the account query again and judges the key by that answer, once: the key state, and
+   what is published of the account key proof, are those of the key the account has then
+   (`mismatch` for the key of another device, `present` for the key of this one, and an account
+   without a key again takes the registration once more). A query of that second judgement
+   that fails, and a registration it makes that is refused once more, end the judgement with
+   that failure, and nothing is published. A device without a master key whose account has a
+   key waits for that key from another device (`waiting`), unless the key is one `create_key`
+   made on this device and never wrote to the key store: no device holds such a key, and the
+   state is `absent` ("The key of the account"). With the key `present`, a session
+   the answer of step 1 states as one that has not proved the key makes its account key proof
+   here. A synchronization that sent the proof asks for the list of the nodes again after the
+   answer of the proof: steps 3 and 4 go by that answer, and the answer of the list sent in
+   step 1 is dropped. When the proof was left unmade and the backend enforces it, the
+   synchronization ends here with the failure `account_key_required` and makes no step below
+   ("The account key proof of a session").
 3. With the key `present` and delegation on, a listed node receives a grant when one of these
    holds: the device keeps no grant of it; the last grant the device handed it is the renewal
    interval old (the smaller of 24 hours and half of the lifetime of a grant); or the
@@ -2592,6 +2609,7 @@ on one without:
 | `runtime.program_stale` | Whether the runtime knows that a later program than this one is served ("A runtime behind the served program"), or reads a node ledger that holds a value this program does not read (a later program wrote it: "The settings of the delegation"), published whenever that changes. The screens of the app read it to tell the user that the app is loading a later program, and a build of the app may take it as the occasion to load the program that waits |
 | `runtime.log_rounds` | True: this program judges the log by rounds ("The round"), and publishes `state.log` in the form of that section. A runtime publishes it at its start. The screens of the app choose their wording of the log by this value, and not by the number of the version of the program; no procedure of the program acts on it |
 | `runtime.ledger_ahead` | Whether `runtime.program_stale` is true because the node ledger holds a value this program does not read (the key store item, the copy of the device, or the sealed ledger of the backend), whatever else makes it true. False when the ledger is one this program reads. It is published with `runtime.program_stale`. The screens of the app tell the two reasons apart by it, and no procedure of the program acts on it |
+| `state.key_proof` | What the backend states of the account key proof of the session and how far this device made it: `none`, `proved`, `proving` or `required`. It is published with the key state of step 2, and again after the answer of a proof ("The account key proof of a session") |
 
 A procedure that needs a node holding the grant (a connection, the storing of a value) runs steps
 1 to 4 once under the lock of the grants. With delegation off it fails with `delegation_off`; when
@@ -2785,6 +2803,9 @@ values are erased, and then the new key is written to the key store. A runtime t
 that write leaves the key of before (or none) with an empty ledger, and the replacement is made
 again; no runtime finds the new key with the ledger and the log values of the key before.
 
+The registration `create_key` and `reset_key` make of the new key is the account key proof of
+the session of the call ("The account key proof of a session").
+
 The master key moves to another device of the account by a transfer the user approves on a
 device that holds it, over a session key the two devices derive from a 6-digit code (CPace over
 X25519). A device asks for the transfer in the state `waiting` and in the state `mismatch`: on a
@@ -2799,6 +2820,169 @@ this way and no other. Three checks of the device that takes the key:
   is the `key_id` registered on the account;
 - a device that held another key empties its node ledger and erases what it kept of the log
   before it writes the key of the account, as `reset_key` does.
+
+### The account key proof of a session
+
+The backend of the operator can tie what a login session of an account reaches to the key of
+that account: a session counts as the session of a device that holds the key once that device
+signed a challenge of the backend with the account signing key, or registered the key as the
+key of the account (below). The program makes that proof (from version 44 on). Which requests
+the backend answers a session that has not made the proof is a rule of the backend, and whether
+the backend applies that rule (it enforces the proof) is a setting of the backend. The program
+makes the proof either way.
+
+What the backend states. The answer of the account query (`GET /api/secure/account`) and the
+answer of the registration of a key (`PUT /api/secure/account/key`) carry the member `key_proof`
+when the account has a key registered and the backend knows the proof:
+
+```json
+{"proved":true,"enforced":true}
+{"proved":false,"enforced":true,"challenge":"..."}
+```
+
+| Member | Meaning |
+| --- | --- |
+| `proved` | Whether the login session of the request proved the key that is registered on the account |
+| `enforced` | Whether the backend enforces the proof |
+| `challenge` | With `proved` false: a string the backend made for that session and that key. The program reads nothing of it and hands it back as it received it |
+
+An answer without the member states nothing of the proof, and so does a member of another form
+(a value that is no object, a `proved` or an `enforced` that is no boolean, a `proved` false
+without a `challenge` that is a string of one character or more).
+
+A registration that is the proof. A registration that makes the key of the account, or replaces
+it, proves the session of its request: its body carries the signature of the new key over the
+account (the purpose string `pickle.secure.v1.register\n`, section 3), so the backend writes
+the proof of that session with the registration, and the answer states `proved` true. A
+registration that sends the key the account has registered already changes nothing and is no
+proof: the signature of a registration names neither a session nor a challenge, so a body that
+was sent once can be sent again. Its answer states the session as it stood: `proved` false with
+a challenge, unless that session proved the key before.
+
+The proof. When the key state is `present` and the answer states `proved` false, the program
+signs the challenge with the account signing key (section 3) and sends the signature:
+
+```text
+signature = Ed25519(account signing key, UTF-8("pickle.secure.v1.session-key\n" || user_id || "\n" || challenge))
+
+PUT /api/secure/account/key/proof
+{"challenge": challenge, "signature": b64u(signature)}
+```
+
+`user_id` is the account the runtime is bound to, and `challenge` the string of the answer,
+character for character. The answer with the status 200 is the proof made: it carries
+`key_proof` as the backend states it from then on (`proved` true). The signed bytes name the
+account and the challenge and nothing else.
+
+When the proof is made:
+
+- At a judgement of the key (step 2 of "The synchronization", the front of a procedure that
+  needs the grants, and every other procedure that judges the key), with the challenge of the
+  account query of that judgement. A judgement that registers the key of a device for an
+  account without one sends no proof when its registration made the key of the account: the
+  answer states `proved` true. When the account had that key registered by then (another device
+  that holds the same master key registered it meanwhile), the answer of the registration
+  names a challenge, and the proof is made with it.
+- `create_key` and `reset_key` send no proof: their registration of the new key is the proof
+  of the session of the call, and what its answer states is published with the key state once
+  the key is written to the key store. When the registration ended without an answer and the
+  account query found the key registered ("The key of the account"), the statement is the one
+  of that query.
+- A device that took the key by a transfer publishes the key state `present` with what its
+  account query stated of the proof, and the synchronization that follows the transfer makes
+  the proof at its judgement of the key.
+
+The list of the nodes after a proof. A synchronization, and a procedure that needs the grants,
+send the list of the nodes (`GET /api/secure/grants`) together with the account query, before
+they know what the backend states of the session, and a backend that enforces the proof
+refuses that request of a session that has not made it. So when the judgement of the key sent
+a proof, the answer of the request sent ahead is dropped: a call that goes on to the grants
+asks for the list of the nodes again after the answer of the proof, and hands the grants by
+that answer. A judgement that sends no proof sends no request that version 43 of the program
+did not send, and sends its requests in the order of that version, with one exception: the
+account query it sends again after a registration that was refused with `key_exists` ("The
+synchronization", step 2).
+
+A proof that fails. The request is sent once more after an answer that fails for a moment
+("The lines, the locks and the time limits"). A refusal of the backend (a challenge whose time
+passed, a key that was replaced since the challenge was made) is not sent again. A proof that
+failed is logged, and the next judgement of the key makes the proof with the challenge of its
+own account query. On a backend that does not enforce the proof the work the judgement belongs
+to goes on and ends as it ends without a proof: the list of the nodes is asked for again, and
+the grants are handed.
+
+A proof left unmade on a backend that enforces it. When a judgement ends with the key `present`
+and `state.key_proof` at `proving` (the backend enforces the proof, and no answer of the proof
+came with the status 200), the call does not go on to the step of the grants: it asks for no
+list of the nodes, sends nothing to a node, and ends with the failure code
+`account_key_required`. That holds where the step of the grants follows the judgement at once:
+in a synchronization, which publishes the code as `state.error` and makes none of the steps
+after the judgement, and at the front of a procedure that needs the grants. `state.key_proof`
+stays `proving`, and the next judgement of the key makes the proof with the challenge of its
+own account query: the synchronization that follows hands the grants. The program applies this
+rule by what the answers stated, and waits for no refusal of the backend: a backend that
+enforces the proof refuses the requests of that step to such a session. A procedure that needs
+the grants while delegation is off, or in a runtime whose node ledger holds a value the program
+does not read, ends with `delegation_off` or `program_stale` as it does without the proof: no
+step of the grants follows there. The other procedures that judge the key (`set_grant_days`,
+`set_delegation`, the procedures that store a value, `approve_transfer`) are not ended by this
+rule: they go on, and a request the backend refuses to such a session fails as a refused
+request of that procedure does.
+
+What the program publishes. `state.key_proof` is published with `state.key_state` and
+`state.key_id` whenever the program publishes the key state (a judgement of the key, a key
+`create_key` or `reset_key` wrote, a key a transfer handed over), from what the answer the
+program then holds states (the account query, or the registration), and again after the answer
+of a proof, from what that answer states. It is part of the state, which the app keeps over
+its restarts.
+
+| `state.key_proof` | Condition |
+| --- | --- |
+| `none` | The answer states nothing of the proof (a backend that does not know it, an account without a key), or it states `enforced` false |
+| `proved` | `enforced` is true and the session proved the key: the answer states `proved` true (the account query, the registration, or the answer of the proof this device sent) |
+| `proving` | `enforced` is true, the key state is `present`, and no answer has stated `proved` true yet: the proof is on its way, or it failed and the next judgement makes it |
+| `required` | `enforced` is true, `proved` is false, and the key state is not `present`: `waiting`, `mismatch`, or `absent` with a registered key no device holds |
+
+A call that ends with `account_mismatch` leaves the published value as it is.
+
+Who reads the value. The published value is what the backend stated at the last account query
+of the program, and what the backend answers the session may change after that query (another
+device replaces the key, the setting of the backend changes). So the backend tells the app the
+verdict of its session itself, apart from the program: the account state the app reads carries
+it, a request the backend refuses for it names it, and the event stream of the account names it
+before the backend ends that stream for it. An app that reads that verdict raises its key
+screen by the verdict and by nothing else, reads the account state again after every procedure
+of the program ends, and takes no decision from `state.key_proof`. An app that does not read
+the verdict (a build from before it) raises the key screen over its session by the published
+value: `required` is a device that has to take the key of the account from another device, or
+to replace it.
+
+The results of the procedures `sync`, `create_key` and `reset_key` carry the member `key_proof`,
+the published value when the call ends, beside the members they had. A synchronization ends
+after the proof of its judgement was answered or failed, and one the rule above ends has no
+result: it fails with `account_key_required`. `create_key` and `reset_key` carry what the
+answer of their registration states.
+
+A backend that enforces the proof may refuse the registration that replaces a registered key
+(the status 403 with the code `reauth_required`) when the login session of the request was
+issued more than ten minutes ago and holds no recent confirmation of its sign-in. A session of
+a sign-in the user just made always passes, so the user signs in again and makes the call
+again. The call that asked for the registration (`reset_key`, or `create_key` in the place of
+a key no device holds) ends with that failure code. The key of the account, the key store of
+the device, its node ledger and what it kept of the log are as they were: the registration
+comes before those writes.
+
+What the proof gives the operator domain. The signature is a value the backend receives and can
+keep. It gives the operator domain nothing a node takes: a node takes a command of an account
+in the envelope of section 5 alone (a payload signed under the purpose string
+`pickle.secure.v1.command\n`, sealed to that node, with a challenge the node issued), and a
+signature under the purpose string of this proof is no command and verifies as none. The proof
+hands no key over and opens no record. What it decides lies inside the operator domain: which
+requests of a login session the backend answers. It is a rule the operator domain applies to
+itself, against a party that can sign in to an account and does not hold its key. A node knows
+nothing of the login sessions of the backend or of this proof: the calls it answers
+([enclave.md](enclave.md)) and what the log shows of the key of the account (section 7) are the
+same with the proof and without it.
 
 ### The release proofs
 

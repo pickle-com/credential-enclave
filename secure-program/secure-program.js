@@ -2,8 +2,8 @@
 // of the Android app (QuickJS) runs this file. It owns the device side of the credential protocol:
 // the creation and derivation of the master key, the verification of the attestation of enclave
 // nodes, the sealed delivery of grants and revokes, the encryption of credential records and of
-// vault secrets, the reading and judging of the credential log, and the transfer of the master key
-// between the devices of one account.
+// vault secrets, the reading and judging of the credential log, the transfer of the master key
+// between the devices of one account, and the proof of the key of the account for a login session.
 //
 // This file is the source of truth. The repository pickle-com/interactive-character vendors a
 // byte-identical copy at backend/assets/ui/secure-program.js and serves it to the apps. A release
@@ -27,7 +27,7 @@
 
   // ---- Constants ----
 
-  const VERSION = 43;
+  const VERSION = 44;
   const MASTER_KEY_SERVICE = "com.pickle.client.secure.master-key";
   const DAY_MS = 86400000;
 
@@ -45,7 +45,8 @@
   const LOG_STORE_TIMEOUT_MS = 10000;
   const NODE_TIMEOUT_MS = 30000;
   // The two requests at the front of a synchronization and of a procedure that needs the grants
-  // (the account query and the list of the nodes), and the requests of a procedure that follow
+  // (the account query and the list of the nodes), the account key proof of a session that
+  // follows the judgement of the key (proveKey), and the requests of a procedure that follow
   // what the user did in it (a consent given in a web session, a value typed, the device owner
   // authentication), are sent once more, this long after an answer that fails for a moment
   // (frontQuery): one answer of a backend that is being deployed does not end a procedure, and
@@ -3042,7 +3043,8 @@
   }
 
   /** A request at the front of a synchronization or of a procedure (ask sends it and returns
-   *  its promise: the account query accountQuery, the list of the nodes fetchListed), or one
+   *  its promise: the account query accountQuery, the list of the nodes fetchListed, the
+   *  account key proof of a session proveKey), or one
    *  that follows what the user did in a procedure (FRONT_RETRY_MS), sent once more when it
    *  fails for a moment: a failure of the transport and an answer with the status 429 or
    *  500 to 599 are asked again once, FRONT_RETRY_MS later. A backend that is being deployed
@@ -11599,15 +11601,53 @@
   // another account).
   let accountMismatch = false;
 
-  /** The key_id registered on the account (null when there is none), from the account query
-   *  (fetched: the promise of the query when the caller sent it ahead). When the user_id of the
-   *  response differs from the bound userId (the account the server authenticated and the bound
-   *  account of this device differ), the key is not read, key_state account_mismatch is published
-   *  and the call ends with account_mismatch (a response without user_id counts as no mismatch).
+  /** What an answer of the backend states of the account key proof of this session
+   *  (docs/protocol.md, "The account key proof of a session"). body is the JSON object of the
+   *  answer of the account query, of the registration of a key, or of the proof, and the
+   *  statement is its member key_proof. Returns {proved, enforced, challenge}: whether the login
+   *  session of the request proved the key registered on the account, whether the backend
+   *  enforces the proof, and, with proved false, the challenge the backend made for that session
+   *  and that key, as it was received (with proved true the empty string: a challenge beside it
+   *  is not read). Returns null for an answer that states nothing of the proof: one without the
+   *  member, and one whose member has another form (a value that is no object, a proved or an
+   *  enforced that is no boolean, a proved false without a challenge that is a string of one
+   *  character or more). */
+  function statedKeyProof(body) {
+    const stated = member(body, "key_proof");
+    if (!isObject(stated) || typeof stated.proved !== "boolean" || typeof stated.enforced !== "boolean") return null;
+    if (stated.proved) return { proved: true, enforced: stated.enforced, challenge: "" };
+    if (typeof stated.challenge !== "string" || stated.challenge === "") return null;
+    return { proved: false, enforced: stated.enforced, challenge: stated.challenge };
+  }
+
+  /** The value of state.key_proof for what an answer states of the proof (stated: the result
+   *  of statedKeyProof) and the key state of this device:
+   *    none      the answer states nothing of the proof (a backend that does not know it, an
+   *              account without a key), or the backend does not enforce the proof
+   *    proved    the backend enforces the proof and states this session as proved
+   *    proving   the backend enforces the proof, states this session as not proved, and the
+   *              key state is present: this device makes the proof (proveKey)
+   *    required  the backend enforces the proof, states this session as not proved, and the
+   *              key state is not present (waiting, mismatch, or absent with a registered key
+   *              no device holds): this device holds no key to make the proof with */
+  function keyProofState(stated, keyState) {
+    if (stated === null || !stated.enforced) return "none";
+    if (stated.proved) return "proved";
+    return keyState === "present" ? "proving" : "required";
+  }
+
+  /** The key registered on the account, from the account query (fetched: the promise of the
+   *  query when the caller sent it ahead): {keyId, stated}, the key_id (null when there is none)
+   *  and what the answer states of the account key proof of this session (its member key_proof
+   *  {proved, enforced, challenge}; null when the answer has no such member or one of another
+   *  form: statedKeyProof). When the user_id of the response differs from the bound userId (the
+   *  account the server authenticated and the bound account of this device differ), the key is
+   *  not read, key_state account_mismatch is published and the call ends with account_mismatch
+   *  (a response without user_id counts as no mismatch).
    *  A response of this account that says named_secrets true is published as
    *  runtime.named_secrets true (the screens of the app choose their names by it); any other
    *  response leaves what this runtime published. */
-  async function registeredKeyId(turn, fetched) {
+  async function registeredKey(turn, fetched) {
     const body = (await (fetched === undefined ? accountQuery(turn) : fetched)).json;
     if (typeof body.user_id === "string" && body.user_id !== "" && body.user_id !== userId()) {
       accountMismatch = true;
@@ -11636,27 +11676,93 @@
       native.storeSet(STORE_VAULT_NAMED, null);
     }
     const key = body.key;
-    if (key === null) return null;
+    const stated = statedKeyProof(body);
+    if (key === null) return { keyId: null, stated: stated };
     if (key === undefined || typeof key !== "object" || typeof key.key_id !== "string" || key.key_id === "") {
       throw native.error("invalid_response", "account key");
     }
-    return key.key_id;
+    return { keyId: key.key_id, stated: stated };
   }
 
   /** Registers the account signing public key and the log public key on the account. proof is the
    *  signature of the account signing key over the account id. When replace is false, an account
-   *  with another registered key fails with key_exists. */
+   *  with another registered key fails with key_exists. Returns what the answer states of the
+   *  account key proof of this session for the key it registered (as registeredKey does). A
+   *  registration that makes the key of the account, or replaces it, is the proof of the session
+   *  of its request: the backend writes that proof with the registration, and the answer states
+   *  the session as proved. A registration of the key the account has registered already
+   *  changes nothing and is no proof: its answer states the session as it stood. */
   async function registerKey(turn, keys, replace) {
     const proof = native.ed25519Sign(keys.signSeed, encode(utf8(purpose("register") + "\n" + userId())));
-    await api(turn, "PUT", "/api/secure/account/key", {
+    const answer = await api(turn, "PUT", "/api/secure/account/key", {
       sign_pk: keys.signPk, log_pk: keys.logPk, proof: proof, replace: replace,
     });
+    return statedKeyProof(answer.json);
   }
 
-  function publishKey(keyState, keys) {
+  /** Publishes the key state with the account key proof of the session: state.key_state,
+   *  state.key_id and state.key_proof (keyProofState of stated: what the answer the caller
+   *  holds states of the proof) in one call. Returns the judgement {keyState, keyId, keys,
+   *  keyProof, challenge}: keyProof is the published value, and challenge the challenge this
+   *  device is to make the proof for (the key is present and the answer states the session as
+   *  not proved), null when there is none. */
+  function publishKey(keyState, keys, stated) {
     const keyId = keys === null ? null : keys.keyId;
-    native.publish({ state: { key_state: keyState, key_id: keyId } });
-    return { keyState: keyState, keyId: keyId, keys: keys };
+    const keyProof = keyProofState(stated, keyState);
+    native.publish({ state: { key_state: keyState, key_id: keyId, key_proof: keyProof } });
+    return {
+      keyState: keyState, keyId: keyId, keys: keys, keyProof: keyProof,
+      challenge: keyState === "present" && stated !== null && !stated.proved ? stated.challenge : null,
+    };
+  }
+
+  /** Makes the account key proof of the session for a judgement whose key is present (judged:
+   *  the result of publishKey, with its challenge). The signature of the account signing key
+   *  over the purpose string, the account and the challenge as it was received
+   *  (purpose("session-key") + "\n" + user_id + "\n" + challenge) goes to PUT
+   *  /api/secure/account/key/proof as {challenge, signature}, whether the backend enforces the
+   *  proof or not, and once more after an answer that fails for a moment (frontQuery). The
+   *  answer with the status 200 is the proof made: state.key_proof is published again from what
+   *  that answer states, and judged.keyProof becomes that value. A proof that fails (on its
+   *  way or with a status of 429 or 500 to 599 at both attempts, at its time limit, or with a
+   *  refusal of the backend, which is not sent again) is logged and thrown no further:
+   *  judged.keyProof and the published value stay what they were (proving on a backend that
+   *  enforces the proof), and the next judgement of the key makes the proof with the challenge
+   *  of its own account query. What ends the caller is thrown (the bridge closed, the time of
+   *  the turn passed). */
+  async function proveKey(turn, judged) {
+    const signature = native.ed25519Sign(
+      judged.keys.signSeed, encode(utf8(purpose("session-key") + "\n" + userId() + "\n" + judged.challenge)));
+    let answer = null;
+    try {
+      answer = await frontQuery(turn, function () {
+        return api(turn, "PUT", "/api/secure/account/key/proof", { challenge: judged.challenge, signature: signature });
+      });
+    } catch (error) {
+      if (failureCode(error) === "cancelled" || !(turnLeft(turn) > 0)) throw error;
+      native.log("account key proof: " + failureCode(error));
+      return;
+    }
+    judged.keyProof = keyProofState(statedKeyProof(answer.json), "present");
+    native.publish({ state: { key_proof: judged.keyProof } });
+  }
+
+  /** Ends a call whose judgement of the key left the account key proof of the session unmade
+   *  on a backend that enforces it (judged.keyProof proving: the key is present and no answer
+   *  of the proof came with the status 200), before the call goes on to the step of the grants:
+   *  the failure account_key_required. A backend that enforces the proof refuses the requests
+   *  of that step to such a session, so the call asks for no list of the nodes and sends
+   *  nothing to a node. state.key_proof stays proving, and the next judgement of the key makes
+   *  the proof with the challenge of its own account query. A judgement with any other value
+   *  passes: with none (the backend does not enforce the proof, whether the proof was made or
+   *  failed) and with proved the call goes on to the grants, and a key that is not present is
+   *  the caller's to judge. The callers are the ones whose judgement is followed by the step
+   *  of the grants at once: a synchronization, and the front of a procedure that needs the
+   *  grants. */
+  function requireKeyProof(judged) {
+    if (judged.keyProof === "proving") {
+      throw native.error("account_key_required", "the account key proof of the session was not made");
+    }
   }
 
   /** The key_ids create_key noted before it asked for their registration (STORE_KEY_MADE). */
@@ -11671,39 +11777,58 @@
    *  and the account has no registered key, its public key is registered. When the account query
    *  fails nothing is published and the failure is thrown (and so is a failure of the key store:
    *  a read that failed is not a key store without a key).
+   *  A registration the backend refuses with key_exists met a key another device registered
+   *  between the query and the registration. What the query said of the account no longer
+   *  holds, so the key is judged again by a new account query, once (again: this judgement is
+   *  that second one): the key state, and what is published of the account key proof, are those
+   *  of the answer that names the key the account has now. A query of the second judgement that
+   *  fails is thrown as the first is, and so is a registration it makes that is refused with
+   *  key_exists once more.
    *  A device without a master key whose account has a key registered waits for that key from
    *  another device (waiting), unless the registered key is one create_key made on this device
    *  and never wrote to the key store (madeKeyIds): its registration reached the backend and the
    *  answer, or the runtime, was lost before the key was kept. No device holds that key, so the
    *  state is absent, and the result says so (orphan: create_key then registers a new key in
    *  its place). What create_key noted ends when this device holds a master key, and when the
-   *  account has another key registered. */
-  async function judgeKey(turn, fetched) {
+   *  account has another key registered.
+   *  state.key_proof is published with the key state, from what the answer of the account
+   *  query, or of the registration this judgement made, states of the account key proof of the
+   *  session (keyProofState). With the key present and a session stated as not proved, the
+   *  proof is sent (proveKey) and state.key_proof is published again from its answer; a proof
+   *  that fails is logged and left to the next judgement. The result carries the published
+   *  value (keyProof) and the challenge a proof was sent for (challenge: null when none was).
+   *  The callers whose next step is the step of the grants (runSync, withGrants) end first when
+   *  the proof was left unmade on a backend that enforces it (requireKeyProof). */
+  async function judgeKey(turn, fetched, again) {
     const masterKey = readMasterKey();
-    const registered = await registeredKeyId(turn, fetched);
+    const registered = await registeredKey(turn, fetched);
     const made = madeKeyIds();
     if (masterKey === null) {
-      if (registered !== null && made.indexOf(registered) >= 0) {
-        const judged = publishKey("absent", null);
+      if (registered.keyId !== null && made.indexOf(registered.keyId) >= 0) {
+        const judged = publishKey("absent", null, registered.stated);
         judged.orphan = true;
         return judged;
       }
-      if (registered !== null && made.length > 0) native.storeSet(STORE_KEY_MADE, null);
-      return publishKey(registered === null ? "absent" : "waiting", null);
+      if (registered.keyId !== null && made.length > 0) native.storeSet(STORE_KEY_MADE, null);
+      return publishKey(registered.keyId === null ? "absent" : "waiting", null, registered.stated);
     }
     if (made.length > 0) native.storeSet(STORE_KEY_MADE, null);
     const keys = deriveKeys(masterKey);
-    let keyState = registered === null || registered === keys.keyId ? "present" : "mismatch";
-    if (registered === null) {
+    const keyState = registered.keyId === null || registered.keyId === keys.keyId ? "present" : "mismatch";
+    let stated = registered.stated;
+    if (registered.keyId === null) {
       try {
-        await registerKey(turn, keys, false);
+        stated = await registerKey(turn, keys, false);
       } catch (error) {
-        // Another device registered another key between the query and the registration.
-        if (error.code !== "key_exists") throw error;
-        keyState = "mismatch";
+        // Another device registered a key between the query and the registration: the key is
+        // judged again by a new account query (once: the second judgement throws this failure).
+        if (error.code !== "key_exists" || again === true) throw error;
+        return judgeKey(turn, undefined, true);
       }
     }
-    return publishKey(keyState, keys);
+    const judged = publishKey(keyState, keys, stated);
+    if (judged.challenge !== null) await proveKey(turn, judged);
+    return judged;
   }
 
   /** The derived keys when key_state is present. Otherwise key_required. */
@@ -12177,14 +12302,17 @@
   /** The front of a procedure that needs a node holding the grant of this account: under the grant
    *  lock, the account query and the list of the nodes are sent together (each once more after an
    *  answer that fails for a moment: frontQuery), the key is judged, and the grants are handed to
-   *  the nodes that are to receive one. When delegation is off it is delegation_off; when no
-   *  listed node holds a grant it is grant_required (attestation_failed when every listed node
-   *  failed the attestation verification or is of a measurement this program does not accept,
-   *  and the backend answered every request for the release proofs of such a measurement: a
-   *  node that took no grant because that request failed leaves the failure grant_required);
-   *  in a stale runtime that no listed node takes a grant of, and in a runtime whose ledger
-   *  holds a value this program does not read, it is program_stale. Returns {keys, ledger,
-   *  grants}. */
+   *  the nodes that are to receive one (after a judgement that sent an account key proof, the
+   *  step asks for the list again and the answer of the list sent ahead is dropped). When the
+   *  judgement left the account key proof unmade on a backend that enforces it, no step of the
+   *  grants follows and it is account_key_required (requireKeyProof). When delegation is off it
+   *  is delegation_off; when no listed node holds a grant it is grant_required
+   *  (attestation_failed when every listed node failed the attestation verification or is of a
+   *  measurement this program does not accept, and the backend answered every request for the
+   *  release proofs of such a measurement: a node that took no grant because that request
+   *  failed leaves the failure grant_required); in a stale runtime that no listed node takes a
+   *  grant of, and in a runtime whose ledger holds a value this program does not read, it is
+   *  program_stale. Returns {keys, ledger, grants}. */
   function withGrants(turn) {
     return grantLock.run(turn, async function () {
       const account = accountQuery(turn);
@@ -12200,7 +12328,8 @@
       const listed = held ? settled(fetchListed(turn)) : null;
       const judged = await judgeKey(turn, account);
       if (judged.keyState !== "present") throw native.error("key_required", judged.keyState);
-      const step = await grantStep(turn, judged.keys, { listed: listed });
+      requireKeyProof(judged);
+      const step = await grantStep(turn, judged.keys, { listed: judged.challenge !== null ? null : listed });
       // (The step may have read a sealed ledger this program does not read, or one that says
       // that the delegation is off.)
       if (ledgerForeign()) throw ledgerStale();
@@ -12330,7 +12459,11 @@
    *  for is handed a grant again). The steps:
    *    1 the account query and, when this device holds a master key, the list of the nodes of the
    *      account, sent together
-   *    2 the judgement of the key (judgeKey)
+   *    2 the judgement of the key (judgeKey), with the account key proof of the session when
+   *      the answer states it as not proved; after a proof the list of the nodes is asked for
+   *      again, and the answer of the list sent with the account query is dropped. A judgement
+   *      that left the proof unmade on a backend that enforces it ends the synchronization
+   *      here with account_key_required (requireKeyProof): no step below is made
    *    3 which listed nodes are to receive a grant, 4 their attestations and the grants
    *      (renewGrants), or 5, with delegation off, the revoke to every listed node
    *    6 the published state grant and runtime.ready
@@ -12343,8 +12476,8 @@
    *  longer (requestSync), so the grants of the next synchronization wait for no round of this
    *  one. Step 7 waits for what follows the grants of the synchronization before (afterLine), and
    *  for the round that runs. A failure publishes its code to state.error, a success clears it,
-   *  unless a synchronization that began later ended first. Returns {keyState, keyId, grant,
-   *  granted, rejected}. */
+   *  unless a synchronization that began later ended first. Returns {keyState, keyId, keyProof,
+   *  grant, granted, rejected}. */
   async function runSync(turn, trigger, handed) {
     syncBegun += 1;
     const number = syncBegun;
@@ -12362,9 +12495,12 @@
           ? settled(fetchListed(turn)) : null;
         const judged = await judgeKey(turn, account);
         if (judged.keyState !== "present") return { judged: judged, grants: null };
+        requireKeyProof(judged);
         return {
           judged: judged,
-          grants: await grantStep(turn, judged.keys, { listed: listed, refill: trigger.refill === true, proofs: proofs }),
+          grants: await grantStep(turn, judged.keys, {
+            listed: judged.challenge !== null ? null : listed, refill: trigger.refill === true, proofs: proofs,
+          }),
         };
       });
       const judged = step.judged;
@@ -12414,7 +12550,10 @@
         }
       });
       outcomesDaily();
-      return { keyState: judged.keyState, keyId: judged.keyId, grant: grant, granted: granted, rejected: rejected };
+      return {
+        keyState: judged.keyState, keyId: judged.keyId, keyProof: judged.keyProof, grant: grant, granted: granted,
+        rejected: rejected,
+      };
     } catch (error) {
       if (number > syncEnded) {
         syncEnded = number;
@@ -12479,7 +12618,7 @@
   /** The procedure sync: a synchronization, within the turn of the call. */
   async function syncProcedure(turn) {
     const outcome = await limited(turn, requestSync({ name: "", refill: false }), Infinity, "sync");
-    return { key_state: outcome.keyState, grant: outcome.grant };
+    return { key_state: outcome.keyState, grant: outcome.grant, key_proof: outcome.keyProof };
   }
 
   /** A synchronization an event started (counted as event_sync). own says that the event is one of
@@ -12542,12 +12681,18 @@
   /** Key creation: a new key is made only when the keychain has no master key and the account has
    *  no registered key. The account registration comes first and the keychain is written only after
    *  it succeeded: when two devices create a key at the same time, the one that loses the
-   *  registration does not write to the keychain. The grants follow under the same lock, and what
-   *  follows the grants (afterGrants) after it. */
+   *  registration does not write to the keychain. The registration of a new key is the account
+   *  key proof of the session of the call (its body carries the signature of that key, and the
+   *  backend writes the proof with the registration): the call sends no proof, and
+   *  state.key_proof is published with the key state from what the answer of the registration
+   *  states. The grants follow under the same lock, and what follows the grants (afterGrants)
+   *  after it. */
   async function createKey(turn) {
     const made = await grantLock.run(turn, async function () {
       const judged = await judgeKey(turn);
-      if (judged.keyState !== "absent") return { keyState: judged.keyState, keyId: judged.keyId, keys: null, step: null };
+      if (judged.keyState !== "absent") {
+        return { keyState: judged.keyState, keyId: judged.keyId, keyProof: judged.keyProof, keys: null, step: null };
+      }
       const masterKey = native.randomBytes(32);
       const keys = deriveKeys(masterKey);
       // The key_id is noted before the registration is asked for, and until the key is in the
@@ -12555,10 +12700,12 @@
       // was lost leaves the account with a key this device alone could have kept (judgeKey).
       storeJson(STORE_KEY_MADE, madeKeyIds().concat([keys.keyId]).slice(-KEY_MADE_IDS));
       // Registers the key (replace: in the place of a key registered on the account that no
-      // device holds).
+      // device holds). Returns what the backend states of the account key proof of this
+      // session for that key: the answer of the registration, or of the account query that
+      // found the key registered.
       const register = async function (replace) {
         try {
-          await registerKey(turn, keys, replace);
+          return await registerKey(turn, keys, replace);
         } catch (error) {
           if (error.code === "key_exists") throw error;
           // A registration that ended without an answer (the request failed on its way, ran out
@@ -12572,17 +12719,19 @@
           if (!unanswered || !(turnLeft(turn) > 0)) throw error;
           let registered = null;
           try {
-            registered = await registeredKeyId(turn);
+            registered = await registeredKey(turn);
           } catch (failure) {
             if (failureCode(failure) === "cancelled") throw failure;
             throw error;
           }
-          if (registered !== keys.keyId) throw error;
+          if (registered.keyId !== keys.keyId) throw error;
+          return registered.stated;
         }
       };
+      let stated = null;
       try {
         // (A key registered on the account that no device holds is replaced: judged.orphan.)
-        await register(judged.orphan === true);
+        stated = await register(judged.orphan === true);
       } catch (error) {
         if (error.code !== "key_exists") throw error;
         // A key was registered on the account between the query and the registration. When
@@ -12593,19 +12742,24 @@
         // not end well without one. A registration that is refused once more is the failure of
         // the call.
         const again = await judgeKey(turn);
-        if (again.keyState !== "absent") return { keyState: again.keyState, keyId: again.keyId, keys: null, step: null };
-        await register(again.orphan === true);
+        if (again.keyState !== "absent") {
+          return { keyState: again.keyState, keyId: again.keyId, keyProof: again.keyProof, keys: null, step: null };
+        }
+        stated = await register(again.orphan === true);
       }
       writeMasterKey(masterKey);
       native.storeSet(STORE_KEY_MADE, null);
-      publishKey("present", keys);
-      return { keyState: "present", keyId: keys.keyId, keys: keys, step: await grantStep(turn, keys, {}) };
+      const present = publishKey("present", keys, stated);
+      return {
+        keyState: "present", keyId: keys.keyId, keyProof: present.keyProof, keys: keys,
+        step: await grantStep(turn, keys, {}),
+      };
     });
     if (made.step !== null) {
       await afterGrants(turn, made.keys, made.step);
       native.publish({ runtime: { ready: true } });
     }
-    return { key_state: made.keyState, key_id: made.keyId };
+    return { key_state: made.keyState, key_id: made.keyId, key_proof: made.keyProof };
   }
 
   /** Key replacement: while waiting for the key of another device, or while another key is
@@ -12614,7 +12768,10 @@
    *  of the log is forgotten. Both are done once the new key is registered and before it is
    *  written to the key store: a runtime that ends between the two leaves the key of before
    *  (or none) with an empty ledger, and the replacement is made again, and none leaves the
-   *  new key with the ledger and the log values of the key before. */
+   *  new key with the ledger and the log values of the key before. The registration of the new
+   *  key is the account key proof of the session of the call, as in create_key: the call sends
+   *  no proof, and state.key_proof is published with the key state from what the answer of the
+   *  registration states. */
   async function resetKey(turn) {
     const made = await grantLock.run(turn, async function () {
       const judged = await judgeKey(turn);
@@ -12623,17 +12780,17 @@
       }
       const masterKey = native.randomBytes(32);
       const keys = deriveKeys(masterKey);
-      await registerKey(turn, keys, true);
+      const stated = await registerKey(turn, keys, true);
       saveLedger(emptyLedger());
       clearLog();
       native.publish({ state: { log: logState } });
       writeMasterKey(masterKey);
-      publishKey("present", keys);
-      return { keys: keys, step: await grantStep(turn, keys, {}) };
+      const present = publishKey("present", keys, stated);
+      return { keys: keys, keyProof: present.keyProof, step: await grantStep(turn, keys, {}) };
     });
     await afterGrants(turn, made.keys, made.step);
     native.publish({ runtime: { ready: true } });
-    return { key_state: "present", key_id: made.keys.keyId };
+    return { key_state: "present", key_id: made.keys.keyId, key_proof: made.keyProof };
   }
 
   // ---- Connections ----
@@ -14428,8 +14585,8 @@
       return;
     }
     const keys = deriveKeys(masterKey);
-    const registered = await registeredKeyId(turn);
-    if (registered !== keys.keyId) {
+    const registered = await registeredKey(turn);
+    if (registered.keyId !== keys.keyId) {
       transferSettle("failed", "key_mismatch");
       return;
     }
@@ -14446,7 +14603,7 @@
       native.publish({ state: { log: logState } });
     }
     writeMasterKey(masterKey);
-    publishKey("present", keys);
+    publishKey("present", keys, registered.stated);
     try {
       await api(turn, "POST", TRANSFER_PATH + "/" + run.requestId + "/ack", {});
     } catch (error) {
@@ -14454,7 +14611,8 @@
       native.log("transfer ack: " + failureCode(error));
     }
     transferSettle("done");
-    // The device holds the key now: a synchronization hands the grants (nothing waits for it here).
+    // The device holds the key now: a synchronization makes the account key proof of the session
+    // and hands the grants (nothing waits for it here).
     requestSync({ name: "event_sync", refill: false }).then(noop, noop);
   }
 

@@ -496,7 +496,7 @@ test("the top level of the program defines secureProgram and calls nothing", () 
   const world = new bridge.World();
   const program = bridge.loadProgram(source, world);
   assert.equal(program.version, bridge.declaredVersion(source));
-  assert.equal(program.version, 43);
+  assert.equal(program.version, 44);
   assert.equal(typeof program.procedures.sync, "function");
   assert.equal(typeof program.onEvent, "function");
   assert.equal(world.requests.length, 0);
@@ -542,11 +542,11 @@ test("a node of format 3 receives the grant after one request for its attestatio
   assert.equal(fx.nodes[0].grants.has(world.userId), true);
   assert.deepEqual(S.logState(world), {
     status: "verified", unverified_nodes: 0, missing: 0, expired: 0, unknown_nodes: 0, newer_release_nodes: 0,
-    store: "verified", store_failure: "", program_version: 43,
+    store: "verified", store_failure: "", program_version: 44,
   });
   assert.deepEqual(S.lastReport(world), {
     status: "verified", store: "verified", nodes: 1, keys_checked: 1, bodies_fetched: 1, missing: 0, expired: 0,
-    unknown_nodes: 0, newer_release_nodes: 0, program_version: 43, store_failure: "", unaccepted_releases: [],
+    unknown_nodes: 0, newer_release_nodes: 0, program_version: 44, store_failure: "", unaccepted_releases: [],
     blocked_attempts: 0, undocumented_nodes: 0, control_keys: 1,
   });
   const attested = world.sent("GET /api/secure/nodes");
@@ -609,7 +609,7 @@ test("a push with the reason grant_required hands a grant again to a node the ba
   assert.equal(world.syncReports.length, 1);
   assert.deepEqual(Object.assign({}, world.syncReports[0], { elapsed_ms: 0 }), {
     trigger: "push", reason: "refresh", key_state: "present", grant: "active", granted: 0, rejected: 0,
-    elapsed_ms: 0, program_version: 43,
+    elapsed_ms: 0, program_version: 44,
   });
   await S.event(fx, "push", { reason: "grant_required" });
   assert.equal(node.grants.has(world.userId), true);
@@ -927,12 +927,12 @@ test("the ledger of the program before is carried over once: its grants and veri
   assert.equal(legacy[ended.id].closed, true);
   assert.equal(legacy[unexplained.id].found, true);
   assert.equal(legacy[unexplained.id].closed, false);
-  assert.equal(world.store.get("log.migrated"), "43");
+  assert.equal(world.store.get("log.migrated"), "44");
   // The first round of this program judges by its own conditions: the mark of the earlier program
   // is gone, and the grant of two hours ago is not handed again.
   assert.equal(world.state.log.status, "verified");
   assert.equal(world.state.log.unknown_nodes, 0);
-  assert.equal(world.state.log.program_version, 43);
+  assert.equal(world.state.log.program_version, 44);
   assert.equal(living.commands.length, 0);
   // The settings of the delegation stay in the ledger of the key store.
   assert.equal(world.state.grant_days, 7);
@@ -1152,7 +1152,7 @@ test("A1: the key of the account at a measurement no list has is pending for a d
   assert.deepEqual(world.reports.slice(-1)[0].unknown_node_ids, [receiver.id]);
   const told = world.securityStatuses.slice(-1)[0];
   assert.deepEqual({ status: told.status, reasons: told.reasons }, { status: "attention", reasons: ["unlisted_release"] });
-  await S.start(fx, bridge.withListedRelease(fx.source, "v9.0.0", other, 44));
+  await S.start(fx, bridge.withListedRelease(fx.source, "v9.0.0", other, fx.version + 1));
   assert.equal(world.state.log.status, "verified");
   assert.equal(world.state.log.unknown_nodes, 0);
 });
@@ -1937,7 +1937,7 @@ test("A1: a measurement that held the key marks the log at an event of the app o
     // The program that lists the release judges nothing from what the device kept, and its
     // first round clears the mark.
     world.clearFaults();
-    await S.start(fx, bridge.withListedRelease(fx.source, "v9.0.0", other, 44));
+    await S.start(fx, bridge.withListedRelease(fx.source, "v9.0.0", other, fx.version + 1));
     assert.equal(world.state.log.status, "verified", name);
     assert.equal(world.state.log.unknown_nodes, 0, name);
   }
@@ -5721,7 +5721,7 @@ test("a procedure that failed is reported with its code and its times five secon
   await world.settle(5000);
   assert.equal(world.outcomeReports.length, 1);
   const report = world.outcomeReports[0];
-  assert.equal(report.program_version, 43);
+  assert.equal(report.program_version, 44);
   assert.deepEqual(report.bounds_ms, [250, 1000, 3000, 10000, 30000]);
   assert.ok(report.since_ms <= report.until_ms);
   const done = report.done.find((item) => item.name === "store_login");
@@ -6261,7 +6261,7 @@ test("the state of the log a program before published is not shown as a judgemen
   assert.equal(world.state.log.status, "pending");
   assert.equal(world.state.log.unknown_nodes, 0);
   assert.equal(world.state.log.missing, 0);
-  assert.equal(world.state.log.program_version, 43);
+  assert.equal(world.state.log.program_version, 44);
   // The first round of this program judges by its own conditions.
   world.clearFaults();
   world.advance(HOUR_MS);
@@ -9442,4 +9442,479 @@ test("a chain a round begins to follow when it follows as many chains as a round
   assert.deepEqual(one.world.reports.slice(reports).map((report) => report.status), ["pending", "verified"]);
   assert.deepEqual(three.map((node) => followed(one.world, node).read_ms > 0), [true, true, true]);
   assert.equal(one.world.state.log.status, "verified");
+});
+
+function keyProofBackend(fx, enforced) {
+  fx.world.keyProof = { enforced: enforced, provedKeyId: null, reauthRequired: false };
+  return fx;
+}
+
+function apiLines(world, from) {
+  return S.requestLines(world, from).filter((line) => !line.startsWith("S3 "))
+    .map((line) => line.replace(/\/nodes\/[A-Za-z0-9_-]{43}\//, "/nodes/{node}/"));
+}
+
+function keyProofs(world) {
+  return world.sent("PUT /api/secure/account/key/proof").map((request) => JSON.parse(request.body));
+}
+
+const GRANT_STEP_LINES = [
+  "GET /api/secure/grants", "GET /api/secure/nodes", "GET /api/secure/release-proofs", "GET /api/secure/ledger",
+  "POST /api/secure/nodes/{node}/messages",
+];
+const FOREIGN_KEY = { sign_pk: "", log_pk: "", key_id: "00112233445566aa" };
+const KEY_REGISTRATION = (line) => line === "PUT /api/secure/account/key";
+
+test("the account key proof of a session is the signature of the account signing key over the purpose string, the account and the challenge as it was received: the signature for a fixed master key, account and challenge", async () => {
+  const masterKey = Buffer.from("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "hex");
+  const challenge = "eyJhbGciOiJFUzI1NiJ9.eyJhdWQiOiJhY2NvdW50LWtleS1wcm9vZiJ9.c2lnbmF0dXJl";
+  const world = new bridge.World({ userId: "0190f2a4-7b1c-7d3e-9f00-5c2d8e4a6b10" });
+  world.keychain.set("com.pickle.client.secure.master-key\n" + world.userId, { value: b64u(masterKey), synchronizable: true });
+  const keys = bridge.deriveAccountKeys(masterKey);
+  assert.equal(b64u(keys.signPk), "mOBRnrP2so3bKn_nT8iju_jBrkxWKGnsEcjNSI4PFqI");
+  world.account.key = { sign_pk: b64u(keys.signPk), log_pk: b64u(keys.logPk), key_id: keys.keyId };
+  world.fault("GET /api/secure/account", {
+    status: 200,
+    body: { user_id: world.userId, key: { key_id: keys.keyId }, key_proof: { proved: false, enforced: false, challenge: challenge } },
+  }, 1);
+  world.fault("PUT /api/secure/account/key/proof", { status: 200, body: { key_proof: { proved: true, enforced: false } } }, 1);
+  await S.start({ world: world, program: null, source: source });
+  assert.deepEqual(keyProofs(world), [{
+    challenge: challenge,
+    signature: "BX2z_K6Pk3jZCnzQWBr2C-DN1VDrsyG-hQKzNinp4I8EAA13y5uMV4TaLyV4xWmU9NBUA30E1K7QY8w8C0KGDQ",
+  }]);
+});
+
+test("state.key_proof is none while the backend states no proof or does not enforce it, proved for a session it enforces the proof for and states as proved, proving on a device that holds the key until its proof is answered, and required on a device that does not hold the key of the account; a device that holds the key makes the proof whether the backend enforces it or not, and a call that ends with account_mismatch leaves the value", async () => {
+  const unstated = S.fixture(source);
+  await S.start(unstated);
+  assert.equal(unstated.world.state.key_proof, "none");
+  assert.deepEqual(keyProofs(unstated.world), []);
+
+  const open = keyProofBackend(S.fixture(source), false);
+  await S.start(open);
+  assert.equal(open.world.state.key_proof, "none");
+  assert.equal(keyProofs(open.world).length, 1);
+  assert.equal(open.world.keyProof.provedKeyId, open.keys.keyId);
+  const waits = keyProofBackend(S.fixture(source, { account: false }), false);
+  waits.world.account.key = FOREIGN_KEY;
+  await S.start(waits);
+  assert.deepEqual([waits.world.state.key_state, waits.world.state.key_proof], ["waiting", "none"]);
+
+  const held = keyProofBackend(S.fixture(source), true);
+  const during = [];
+  held.world.fault("PUT /api/secure/account/key/proof", () => {
+    during.push(held.world.state.key_proof);
+    return undefined;
+  });
+  await S.start(held);
+  assert.deepEqual(during, ["proving"]);
+  assert.equal(held.world.state.key_proof, "proved");
+  const again = await S.call(held, "sync", {});
+  assert.deepEqual([again.value.key_state, again.value.key_proof], ["present", "proved"]);
+  assert.equal(keyProofs(held.world).length, 1);
+
+  held.world.fault("GET /api/secure/account", { status: 200, body: { user_id: "another-account", key: null } }, 1);
+  assert.deepEqual(await S.call(held, "sync", {}), { ok: false, code: "account_mismatch" });
+  assert.deepEqual([held.world.state.key_state, held.world.state.key_proof], ["account_mismatch", "proved"]);
+
+  const without = keyProofBackend(S.fixture(source, { account: false }), true);
+  without.world.account.key = FOREIGN_KEY;
+  await S.start(without);
+  assert.deepEqual([without.world.state.key_state, without.world.state.key_proof], ["waiting", "required"]);
+  const waited = await S.call(without, "sync", {});
+  assert.deepEqual([waited.value.key_state, waited.value.key_proof], ["waiting", "required"]);
+  const other = keyProofBackend(S.fixture(source), true);
+  other.world.account.key = FOREIGN_KEY;
+  await S.start(other);
+  assert.deepEqual([other.world.state.key_state, other.world.state.key_proof], ["mismatch", "required"]);
+  assert.deepEqual(keyProofs(without.world).concat(keyProofs(other.world)), []);
+
+  for (const stated of [{ proved: false, enforced: true }, { proved: "false", enforced: true, challenge: "c" }, "proved"]) {
+    const fx = S.fixture(source);
+    fx.world.fault("GET /api/secure/account", (request) => {
+      const answer = JSON.parse(fx.world.api("GET", request.path, request.query, null).body);
+      answer.key_proof = stated;
+      return { status: 200, body: answer };
+    });
+    await S.start(fx);
+    assert.equal(fx.world.state.key_proof, "none", JSON.stringify(stated));
+    assert.deepEqual(keyProofs(fx.world), [], JSON.stringify(stated));
+  }
+});
+
+test("a synchronization that makes the account key proof asks for the list of the nodes again after the answer of the proof and hands its grants by that answer, a procedure that needs the grants does the same, and a synchronization that makes no proof sends the requests of the program before", async () => {
+  const fx = keyProofBackend(S.fixture(source), true);
+  const world = fx.world;
+  const listed = [];
+  world.fault("GET /api/secure/grants", (request) => {
+    const answer = world.api("GET", request.path, request.query, null);
+    listed.push(answer.status);
+    return { status: answer.status, body: JSON.parse(answer.body) };
+  });
+  await S.start(fx);
+  assert.deepEqual(apiLines(world).slice(0, 8), [
+    "GET /api/secure/account", "GET /api/secure/grants", "PUT /api/secure/account/key/proof",
+  ].concat(GRANT_STEP_LINES));
+  assert.deepEqual(listed, [403, 200]);
+  assert.equal(fx.nodes[0].grants.has(world.userId), true);
+  assert.equal(world.state.grant.state, "active");
+  world.advance(HOUR_MS);
+  const from = world.requests.length;
+  await S.event(fx, "foreground");
+  assert.deepEqual(apiLines(world, from), ["GET /api/secure/account", "GET /api/secure/grants", "GET /api/secure/transfers"]);
+
+  const late = keyProofBackend(S.fixture(source), true);
+  late.world.fault("PUT /api/secure/account/key/proof", { status: 409, body: { detail: "key_changed" } }, 1);
+  S.load(late);
+  await assert.rejects(late.world.run(late.program.onEvent("session_ready", {})), (error) => error.code === "account_key_required");
+  assert.deepEqual(apiLines(late.world), [
+    "GET /api/secure/account", "GET /api/secure/grants", "PUT /api/secure/account/key/proof",
+  ]);
+  assert.equal(late.nodes[0].grants.has(late.world.userId), false);
+  late.world.device.webAuth = (args) => {
+    const state = new URL(args.url).searchParams.get("state").split(".")[0];
+    late.world.connections.get(state).completed = true;
+    return "pickle://oauth?oauth_status=connected&oauth_state=" + state;
+  };
+  const before = late.world.requests.length;
+  assert.equal((await S.call(late, "connect", { target: "github" })).ok, true);
+  assert.deepEqual(apiLines(late.world, before).slice(0, 8), [
+    "GET /api/secure/account", "GET /api/secure/grants", "PUT /api/secure/account/key/proof",
+  ].concat(GRANT_STEP_LINES));
+  assert.equal(late.world.state.key_proof, "proved");
+});
+
+test("on a backend whose answers state no account key proof the requests are those of the program before: a synchronization, create_key and reset_key send no proof and ask for the list of the nodes once", async () => {
+  const present = S.fixture(source);
+  await S.start(present);
+  assert.deepEqual(apiLines(present.world).slice(0, 6), ["GET /api/secure/account"].concat(GRANT_STEP_LINES));
+  present.world.advance(HOUR_MS);
+  let from = present.world.requests.length;
+  await S.event(present, "foreground");
+  assert.deepEqual(apiLines(present.world, from), ["GET /api/secure/account", "GET /api/secure/grants", "GET /api/secure/transfers"]);
+
+  const made = ["GET /api/secure/account", "PUT /api/secure/account/key"].concat(GRANT_STEP_LINES, ["GET /api/secure/sealing"]);
+  const absent = S.fixture(source, { account: false });
+  await S.start(absent);
+  from = absent.world.requests.length;
+  const created = await S.call(absent, "create_key");
+  assert.deepEqual([created.value.key_state, created.value.key_proof], ["present", "none"]);
+  assert.deepEqual(apiLines(absent.world, from), made);
+
+  const waiting = S.fixture(source, { account: false });
+  waiting.world.account.key = FOREIGN_KEY;
+  await S.start(waiting);
+  from = waiting.world.requests.length;
+  const reset = await S.call(waiting, "reset_key");
+  assert.deepEqual([reset.value.key_state, reset.value.key_proof], ["present", "none"]);
+  assert.deepEqual(apiLines(waiting.world, from), made);
+  assert.deepEqual([present, absent, waiting].map((fx) => fx.world.state.key_proof), ["none", "none", "none"]);
+});
+
+test("a registration that makes or replaces the key of the account proves the session of its request: create_key, reset_key and the judgement that registers the key of a device send no proof, ask for the list of the nodes once and publish what the answer of the registration states; a registration whose answer is lost is read from the account query that found the key registered; a registration of the key the account has registered already is no proof, and the proof follows it; a registration the backend refuses with reauth_required ends the call with that code and leaves the key of the account and the key store as they were", async () => {
+  const master = (world) => world.keychain.get("com.pickle.client.secure.master-key\n" + world.userId);
+  const made = ["GET /api/secure/account", "PUT /api/secure/account/key"].concat(GRANT_STEP_LINES, ["GET /api/secure/sealing"]);
+  const lands = (fx) => (request) => {
+    fx.world.api("PUT", request.path, request.query, request.body);
+    return "transport";
+  };
+
+  for (const enforced of [true, false]) {
+    const value = enforced ? "proved" : "none";
+    const absent = keyProofBackend(S.fixture(source, { account: false }), enforced);
+    await S.start(absent);
+    const from = absent.world.requests.length;
+    const created = await S.call(absent, "create_key");
+    assert.deepEqual([created.value.key_state, created.value.key_proof], ["present", value]);
+    assert.deepEqual(apiLines(absent.world, from), made);
+    assert.equal(absent.world.sent("PUT /api/secure/account/key")[0].query.program, String(absent.version));
+    assert.equal(absent.world.state.key_proof, value);
+    assert.equal(absent.nodes[0].grants.has(absent.world.userId), true);
+
+    const unregistered = keyProofBackend(S.fixture(source), enforced);
+    unregistered.world.account.key = null;
+    await S.start(unregistered);
+    assert.deepEqual(apiLines(unregistered.world).slice(0, 7), [
+      "GET /api/secure/account", "GET /api/secure/grants", "PUT /api/secure/account/key", "GET /api/secure/nodes",
+      "GET /api/secure/release-proofs", "GET /api/secure/ledger", "POST /api/secure/nodes/{node}/messages",
+    ]);
+    assert.deepEqual([unregistered.world.state.key_state, unregistered.world.state.key_proof], ["present", value]);
+    assert.equal(unregistered.nodes[0].grants.has(unregistered.world.userId), true);
+
+    const replaced = keyProofBackend(S.fixture(source, { account: false }), enforced);
+    replaced.world.account.key = FOREIGN_KEY;
+    await S.start(replaced);
+    const since = replaced.world.requests.length;
+    const reset = await S.call(replaced, "reset_key");
+    assert.deepEqual([reset.value.key_state, reset.value.key_proof], ["present", value]);
+    assert.deepEqual(apiLines(replaced.world, since), made);
+    assert.equal(replaced.world.state.key_proof, value);
+    assert.equal(replaced.nodes[0].grants.has(replaced.world.userId), true);
+    assert.deepEqual(keyProofs(absent.world).concat(keyProofs(unregistered.world), keyProofs(replaced.world)), []);
+  }
+
+  const landed = keyProofBackend(S.fixture(source, { account: false }), true);
+  await S.start(landed);
+  landed.world.fault("PUT /api/secure/account/key", lands(landed), 1);
+  const kept = await S.call(landed, "create_key");
+  assert.deepEqual([kept.value.key_state, kept.value.key_proof], ["present", "proved"]);
+  assert.deepEqual(keyProofs(landed.world), []);
+  assert.equal(landed.nodes[0].grants.has(landed.world.userId), true);
+
+  const same = keyProofBackend(S.fixture(source), true);
+  const registered = same.world.account.key;
+  same.world.account.key = null;
+  same.world.fault(KEY_REGISTRATION, () => {
+    same.world.account.key = registered;
+    return undefined;
+  });
+  await S.start(same);
+  assert.deepEqual(apiLines(same.world).slice(0, 5), [
+    "GET /api/secure/account", "GET /api/secure/grants", "PUT /api/secure/account/key", "PUT /api/secure/account/key/proof",
+    "GET /api/secure/grants",
+  ]);
+  assert.deepEqual([same.world.state.key_state, same.world.state.key_proof], ["present", "proved"]);
+  assert.equal(same.world.keyProof.provedKeyId, same.keys.keyId);
+
+  const waiting = keyProofBackend(S.fixture(source, { account: false }), true);
+  waiting.world.account.key = FOREIGN_KEY;
+  waiting.world.keyProof.reauthRequired = true;
+  await S.start(waiting);
+  assert.deepEqual(await S.call(waiting, "reset_key"), { ok: false, code: "reauth_required" });
+  assert.equal(master(waiting.world), undefined);
+  assert.equal(waiting.world.account.key, FOREIGN_KEY);
+  assert.deepEqual([waiting.world.state.key_state, waiting.world.state.key_proof], ["waiting", "required"]);
+  waiting.world.keyProof.reauthRequired = false;
+  const reset = await S.call(waiting, "reset_key");
+  assert.deepEqual([reset.value.key_state, reset.value.key_proof], ["present", "proved"]);
+  assert.deepEqual(keyProofs(waiting.world), []);
+
+  const lost = keyProofBackend(S.fixture(source, { account: false }), true);
+  await S.start(lost);
+  let cut = false;
+  lost.world.fault("PUT /api/secure/account/key", (request) => {
+    cut = true;
+    return lands(lost)(request);
+  }, 1);
+  lost.world.fault("GET /api/secure/account", () => (cut ? "transport" : undefined), 2);
+  assert.deepEqual(await S.call(lost, "create_key"), { ok: false, code: "transport" });
+  const orphan = lost.world.account.key.key_id;
+  lost.world.keyProof = { enforced: true, provedKeyId: null, reauthRequired: true };
+  await S.start(lost);
+  assert.deepEqual([lost.world.state.key_state, lost.world.state.key_proof], ["absent", "required"]);
+  assert.deepEqual(await S.call(lost, "create_key"), { ok: false, code: "reauth_required" });
+  assert.equal(master(lost.world), undefined);
+  assert.equal(lost.world.account.key.key_id, orphan);
+});
+
+test("an account key proof that is answered with a 503 is sent once more, and one the backend refuses is not: a proof that fails leaves state.key_proof proving, the next judgement of the key makes it with the challenge of its own account query, and on a backend that does not enforce the proof its failure fails nothing", async () => {
+  const unavailable = { status: 503, body: { detail: "postgresql_unavailable" } };
+  const moment = keyProofBackend(S.fixture(source), true);
+  moment.world.fault("PUT /api/secure/account/key/proof", unavailable, 1);
+  await S.start(moment);
+  const sent = keyProofs(moment.world);
+  assert.equal(sent.length, 2);
+  assert.deepEqual(sent[0], sent[1]);
+  assert.equal(moment.world.state.key_proof, "proved");
+
+  const refused = keyProofBackend(S.fixture(source), true);
+  refused.world.fault("PUT /api/secure/account/key/proof", { status: 409, body: { detail: "key_changed" } }, 1);
+  S.load(refused);
+  await assert.rejects(refused.world.run(refused.program.onEvent("session_ready", {})), (error) => error.code === "account_key_required");
+  assert.deepEqual(apiLines(refused.world), [
+    "GET /api/secure/account", "GET /api/secure/grants", "PUT /api/secure/account/key/proof",
+  ]);
+  assert.deepEqual([refused.world.state.key_state, refused.world.state.key_proof], ["present", "proving"]);
+  const next = await S.call(refused, "sync", {});
+  assert.deepEqual([next.value.key_state, next.value.key_proof], ["present", "proved"]);
+  const challenges = keyProofs(refused.world).map((proof) => proof.challenge);
+  assert.equal(challenges.length, 2);
+  assert.notEqual(challenges[0], challenges[1]);
+
+  const open = keyProofBackend(S.fixture(source), false);
+  open.world.fault("PUT /api/secure/account/key/proof", unavailable, 2);
+  await S.start(open);
+  assert.deepEqual(apiLines(open.world).slice(0, 9), [
+    "GET /api/secure/account", "GET /api/secure/grants", "PUT /api/secure/account/key/proof", "PUT /api/secure/account/key/proof",
+  ].concat(GRANT_STEP_LINES));
+  assert.equal(open.world.keyProof.provedKeyId, null);
+  assert.equal(open.nodes[0].grants.has(open.world.userId), true);
+  assert.equal(open.world.state.grant.state, "active");
+  assert.equal(open.world.state.key_proof, "none");
+  assert.ok(open.world.state.error === null || open.world.state.error === undefined);
+  open.world.advance(HOUR_MS);
+  await S.event(open, "foreground");
+  assert.equal(open.world.keyProof.provedKeyId, open.keys.keyId);
+});
+
+test("a judgement of the key that leaves the account key proof unmade on a backend that enforces it ends the call with account_key_required before the step of the grants: a synchronization and a procedure that needs the grants ask for no list of the nodes after the proof that failed, state.key_proof stays proving, and the next synchronization makes the proof and hands the grants", async () => {
+  const proof = "PUT /api/secure/account/key/proof";
+
+  const fx = keyProofBackend(S.fixture(source), true);
+  const world = fx.world;
+  world.fault(proof, { status: 503, body: { detail: "postgresql_unavailable" } }, 2);
+  S.load(fx);
+  await assert.rejects(world.run(fx.program.onEvent("session_ready", {})), (error) => error.code === "account_key_required");
+  assert.deepEqual(apiLines(world), ["GET /api/secure/account", "GET /api/secure/grants", proof, proof]);
+  assert.equal(world.state.error, "account_key_required");
+  assert.deepEqual([world.state.key_state, world.state.key_proof], ["present", "proving"]);
+  assert.equal(fx.nodes[0].grants.has(world.userId), false);
+
+  world.device.webAuth = (args) => {
+    const state = new URL(args.url).searchParams.get("state").split(".")[0];
+    world.connections.get(state).completed = true;
+    return "pickle://oauth?oauth_status=connected&oauth_state=" + state;
+  };
+  world.fault(proof, { status: 409, body: { detail: "key_changed" } }, 1);
+  const from = world.requests.length;
+  assert.deepEqual(await S.call(fx, "connect", { target: "github" }), { ok: false, code: "account_key_required" });
+  assert.deepEqual(apiLines(world, from), ["GET /api/secure/account", "GET /api/secure/grants", proof]);
+  assert.deepEqual([world.state.key_state, world.state.key_proof], ["present", "proving"]);
+
+  world.advance(60000);
+  await S.event(fx, "foreground");
+  assert.deepEqual([world.state.key_proof, world.state.grant.state], ["proved", "active"]);
+  assert.ok(world.state.error === null || world.state.error === undefined);
+  assert.equal(fx.nodes[0].grants.has(world.userId), true);
+  assert.equal((await S.call(fx, "connect", { target: "github" })).ok, true);
+});
+
+test("a registration of the judgement that meets a key another device registered since the account query has the key judged again by a new account query, once: with another key registered the key state is mismatch and state.key_proof is required on a backend that enforces the proof and none on one that does not; with the key of this device registered the key is present and the proof is made with the challenge of that query; an account without a key again takes the registration once more, and a second refusal, or a query that fails, ends the judgement with that failure", async () => {
+  const refusedOnce = (fx, registered) => {
+    fx.world.account.key = null;
+    fx.world.fault(KEY_REGISTRATION, () => {
+      fx.world.account.key = registered;
+      return undefined;
+    });
+  };
+  const exists = { status: 409, body: { code: "key_exists" } };
+
+  for (const enforced of [true, false]) {
+    const fx = keyProofBackend(S.fixture(source), enforced);
+    refusedOnce(fx, FOREIGN_KEY);
+    await S.start(fx);
+    assert.deepEqual([fx.world.state.key_state, fx.world.state.key_proof], ["mismatch", enforced ? "required" : "none"]);
+    assert.deepEqual(apiLines(fx.world), [
+      "GET /api/secure/account", "GET /api/secure/grants", "PUT /api/secure/account/key", "GET /api/secure/account",
+    ]);
+  }
+
+  const own = keyProofBackend(S.fixture(source), true);
+  const registered = own.world.account.key;
+  let refused = false;
+  own.world.account.key = null;
+  own.world.fault(KEY_REGISTRATION, () => {
+    own.world.account.key = FOREIGN_KEY;
+    refused = true;
+    return undefined;
+  });
+  own.world.fault("GET /api/secure/account", () => {
+    if (refused) own.world.account.key = registered;
+    return undefined;
+  });
+  await S.start(own);
+  assert.deepEqual(apiLines(own.world).slice(0, 6), [
+    "GET /api/secure/account", "GET /api/secure/grants", "PUT /api/secure/account/key", "GET /api/secure/account",
+    "PUT /api/secure/account/key/proof", "GET /api/secure/grants",
+  ]);
+  assert.deepEqual([own.world.state.key_state, own.world.state.key_proof], ["present", "proved"]);
+  assert.equal(own.nodes[0].grants.has(own.world.userId), true);
+
+  const emptied = keyProofBackend(S.fixture(source), true);
+  emptied.world.account.key = null;
+  emptied.world.fault(KEY_REGISTRATION, exists, 1);
+  await S.start(emptied);
+  assert.deepEqual(apiLines(emptied.world).slice(0, 5), [
+    "GET /api/secure/account", "GET /api/secure/grants", "PUT /api/secure/account/key", "GET /api/secure/account",
+    "PUT /api/secure/account/key",
+  ]);
+  assert.deepEqual([emptied.world.state.key_state, emptied.world.state.key_proof], ["present", "proved"]);
+  assert.equal(emptied.world.account.key.key_id, emptied.keys.keyId);
+
+  const twice = keyProofBackend(S.fixture(source), true);
+  twice.world.account.key = null;
+  twice.world.fault(KEY_REGISTRATION, exists);
+  S.load(twice);
+  await assert.rejects(twice.world.run(twice.program.onEvent("session_ready", {})), (error) => error.code === "key_exists");
+  assert.deepEqual(apiLines(twice.world), [
+    "GET /api/secure/account", "GET /api/secure/grants", "PUT /api/secure/account/key", "GET /api/secure/account",
+    "PUT /api/secure/account/key",
+  ]);
+  assert.equal(twice.world.state.key_state, undefined);
+
+  const unread = keyProofBackend(S.fixture(source), true);
+  let met = false;
+  unread.world.account.key = null;
+  unread.world.fault(KEY_REGISTRATION, () => {
+    unread.world.account.key = FOREIGN_KEY;
+    met = true;
+    return undefined;
+  });
+  unread.world.fault("GET /api/secure/account", () => (met ? "transport" : undefined));
+  S.load(unread);
+  await assert.rejects(unread.world.run(unread.program.onEvent("session_ready", {})), (error) => error.code === "transport");
+  assert.equal(unread.world.state.key_state, undefined);
+  assert.equal(unread.world.state.key_proof, undefined);
+});
+
+test("a device that takes the key of the account by a transfer publishes state.key_proof as proving once it holds the key, and the synchronization that follows makes the proof", async () => {
+  const giving = keyProofBackend(S.fixture(source, { device: { ownerAuth: true } }), true);
+  const taking = keyProofBackend(S.fixture(source, { account: false }), true);
+  taking.world.account.key = giving.world.account.key;
+  const transfers = new Map();
+  const acknowledged = [];
+  const answer = (status, body) => ({ status: status, body: body });
+  const backend = (world) => (request) => {
+    const method = request.method || "GET";
+    const body = typeof request.body === "string" && request.body !== "" ? JSON.parse(request.body) : {};
+    if (method === "POST" && request.path === "/api/secure/transfers") {
+      const id = b64u(crypto.randomBytes(16));
+      transfers.set(id, { request_id: id, phase: "requested", device: body.device, expires_ms: world.now + 15 * 60000 });
+      return answer(200, { transfer: transfers.get(id) });
+    }
+    if (method === "GET" && request.path === "/api/secure/transfers") {
+      return answer(200, { transfers: Array.from(transfers.values()).filter((transfer) => transfer.phase === "requested") });
+    }
+    const match = /^\/api\/secure\/transfers\/([^/]+)(?:\/([a-z]+))?$/.exec(request.path);
+    const transfer = transfers.get(match[1]);
+    if (transfer === undefined) return answer(404, { code: "not_found" });
+    if (method === "GET" && match[2] === undefined) return answer(200, { transfer: transfer });
+    if (method === "PUT" && match[2] === "approval") Object.assign(transfer, { phase: "approved", yb: body.yb, approver: body.device });
+    else if (method === "PUT" && match[2] === "reply") Object.assign(transfer, { phase: "replied", ya: body.ya, ta: body.ta });
+    else if (method === "PUT" && match[2] === "envelope") Object.assign(transfer, { phase: "sealed", ciphertext: body.ciphertext, tb: body.tb });
+    else if (method === "POST" && match[2] === "ack") {
+      acknowledged.push([world.state.key_state, world.state.key_proof]);
+      transfers.delete(match[1]);
+    }
+    return answer(200, {});
+  };
+  giving.world.fault((line) => line.indexOf("/api/secure/transfers") >= 0, backend(giving.world));
+  taking.world.fault((line) => line.indexOf("/api/secure/transfers") >= 0, backend(taking.world));
+  await S.start(giving);
+  await S.start(taking);
+  assert.deepEqual([taking.world.state.key_state, taking.world.state.key_proof], ["waiting", "required"]);
+  assert.equal((await S.call(taking, "begin_transfer", {})).value.transfer.phase, "requested");
+  await S.event(giving, "push", { reason: "transfer_request" });
+  assert.equal((await S.call(giving, "approve_transfer", {})).value.transfer.phase, "approved");
+  const code = giving.world.runtime.transfer_code;
+  const pass = async (turns) => {
+    for (let turn = 0; turn < turns; turn += 1) {
+      await taking.world.settle(2500);
+      await giving.world.settle(2500);
+    }
+  };
+  await pass(3);
+  const from = taking.world.requests.length;
+  await S.call(taking, "enter_transfer_code", { code: code });
+  await pass(6);
+  assert.equal(taking.world.state.transfer.phase, "done");
+  assert.deepEqual(acknowledged, [["present", "proving"]]);
+  assert.deepEqual([taking.world.state.key_state, taking.world.state.key_proof], ["present", "proved"]);
+  assert.equal(taking.world.keyProof.provedKeyId, giving.keys.keyId);
+  const after = apiLines(taking.world, from);
+  const proved = after.indexOf("PUT /api/secure/account/key/proof");
+  assert.deepEqual(after.slice(proved - 2, proved + 2), [
+    "GET /api/secure/account", "GET /api/secure/grants", "PUT /api/secure/account/key/proof", "GET /api/secure/grants",
+  ]);
 });
