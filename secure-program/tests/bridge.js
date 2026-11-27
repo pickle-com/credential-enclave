@@ -312,6 +312,23 @@ const DAY_MS = 86400000;
 const SEQ_DIGITS = 20;
 const TIME_DIGITS = 13;
 const RTIME_MAX = 9999999999999;
+// The account key proof of a login session, as the backend of the operator keeps it
+// (docs/protocol.md, "The account key proof of a session"): the version of the program from which
+// the backend states the proof in its answers, the lifetime of a challenge, and the routes under
+// /api/secure/ on which a backend that enforces the proof answers a session that has not made it.
+const KEY_PROOF_PROGRAM = 44;
+const KEY_CHALLENGE_MS = 300000;
+const KEY_PROOF_OPEN_ROUTES = [
+  /^GET \/api\/secure\/account$/,
+  /^PUT \/api\/secure\/account\/key$/,
+  /^PUT \/api\/secure\/account\/key\/proof$/,
+  /^POST \/api\/secure\/transfers$/,
+  /^(GET|DELETE) \/api\/secure\/transfers\/[^/]+$/,
+  /^PUT \/api\/secure\/transfers\/[^/]+\/reply$/,
+  /^POST \/api\/secure\/transfers\/[^/]+\/ack$/,
+  /^POST \/api\/secure\/procedures\/outcomes$/,
+  /^POST \/api\/secure\/sync\/report$/,
+];
 
 // The buckets of format 3 per server target (docs/protocol.md 7.6): the number of buckets, and the
 // name of the log store (the bucket the binding of a node names) the bucket names are made from.
@@ -679,6 +696,14 @@ class World {
     // (servedProgram: the value of served_program_version in the answer of the account query;
     // undefined for a backend that names none).
     this.account = { key: null, keys: null, servedProgram: undefined };
+    // The account key proof of the login session of the device (null: a backend that does not
+    // know the proof and states nothing of it). enforced: whether the backend enforces the proof.
+    // provedKeyId: the key_id the session proved (null: none). reauthRequired: a backend that
+    // enforces the proof refuses the registration that replaces the key of the account
+    // (reauth_required). keyChallenges: the challenges the backend made, each with the key it
+    // was made for and the time it ends.
+    this.keyProof = null;
+    this.keyChallenges = new Map();
     this.nodes = new Map();
     this.buckets = new Map();
     this.versionCounter = 0;
@@ -947,24 +972,78 @@ class World {
     return query !== null && query !== undefined && query.program !== undefined ? (pool || guard) : (guard || pool);
   }
 
+  /** What the backend states of the account key proof of the session in the answer of the
+   *  account query and of the registration of a key (the member key_proof), for a request with
+   *  the query query. Undefined (the answer carries no such member) for a backend that does not
+   *  know the proof, for an account without a key, and for a request of a program before the one
+   *  that makes the proof. A session that has not proved the key the account has registered is
+   *  stated with a new challenge for that key. */
+  keyProofStated(query) {
+    if (this.keyProof === null || this.account.key === null || !(Number(query.program) >= KEY_PROOF_PROGRAM)) return undefined;
+    if (this.keyProof.provedKeyId === this.account.key.key_id) return { proved: true, enforced: this.keyProof.enforced };
+    const challenge = b64u(crypto.randomBytes(12)) + "." + b64u(crypto.randomBytes(24)) + "." + b64u(crypto.randomBytes(32));
+    this.keyChallenges.set(challenge, { keyId: this.account.key.key_id, expiresMs: this.now + KEY_CHALLENGE_MS });
+    return { proved: false, enforced: this.keyProof.enforced, challenge: challenge };
+  }
+
+  /** Whether a backend that enforces the proof refuses a request (the status 403 with the code
+   *  account_key_required): the account has a key registered, the session has not proved it, and
+   *  the route is none of the ones such a session is answered on (KEY_PROOF_OPEN_ROUTES). */
+  keyProofRefuses(method, path) {
+    if (this.keyProof === null || !this.keyProof.enforced || this.account.key === null) return false;
+    if (this.keyProof.provedKeyId === this.account.key.key_id) return false;
+    return !KEY_PROOF_OPEN_ROUTES.some((route) => route.test(method + " " + path));
+  }
+
   api(method, path, query, bodyText) {
     const json = (status, value) => ({ status: status, headers: {}, body: JSON.stringify(value), bodyBase64: null });
     const body = typeof bodyText === "string" && bodyText !== "" ? JSON.parse(bodyText) : null;
     const absent = () => json(404, { detail: "Not Found" });
+    if (this.keyProofRefuses(method, path)) return json(403, { detail: "account_key_required" });
     if (method === "GET" && path === "/api/secure/account") {
       const account = { user_id: this.userId, key: this.account.key === null ? null : { key_id: this.account.key.key_id } };
       // The backend names the vault items with a name only for an account it turned them on for.
       if (this.account.namedSecrets === true) account.named_secrets = true;
       if (this.account.servedProgram !== undefined) account.served_program_version = this.account.servedProgram;
+      const keyProof = this.keyProofStated(query);
+      if (keyProof !== undefined) account.key_proof = keyProof;
       return json(200, account);
     }
     if (method === "PUT" && path === "/api/secure/account/key") {
       const signPk = bytes(body.sign_pk);
       const proof = ed25519Verify(signPk, utf8("pickle.secure.v1.register\n" + this.userId), bytes(body.proof));
       if (!proof) return json(400, { code: "invalid_input" });
-      if (this.account.key !== null && body.replace !== true) return json(409, { code: "key_exists" });
-      this.account.key = { sign_pk: body.sign_pk, log_pk: body.log_pk, key_id: sha("sha256", signPk).subarray(0, 8).toString("hex") };
-      return json(200, {});
+      // A registration of the key the account has registered already changes nothing, whatever
+      // replace says, and is no proof of the session. Another key is refused without replace
+      // (key_exists), and a backend that enforces the proof may refuse the replacement
+      // (reauth_required). A registration that makes the key of the account, or replaces it, is
+      // the proof of the session of its request: the answer states that session as proved.
+      const registered = this.account.key;
+      const unchanged = registered !== null && registered.sign_pk === body.sign_pk && registered.log_pk === body.log_pk;
+      if (!unchanged) {
+        if (registered !== null && body.replace !== true) return json(409, { code: "key_exists" });
+        if (registered !== null && this.keyProof !== null && this.keyProof.enforced && this.keyProof.reauthRequired) {
+          return json(403, { detail: "reauth_required" });
+        }
+        const keyId = sha("sha256", signPk).subarray(0, 8).toString("hex");
+        this.account.key = { sign_pk: body.sign_pk, log_pk: body.log_pk, key_id: keyId };
+        if (this.keyProof !== null) this.keyProof.provedKeyId = keyId;
+      }
+      const keyProof = this.keyProofStated(query);
+      return json(200, keyProof === undefined ? {} : { key_proof: keyProof });
+    }
+    if (method === "PUT" && path === "/api/secure/account/key/proof") {
+      if (this.keyProof === null) return absent();
+      const issued = this.keyChallenges.get(body.challenge);
+      if (issued === undefined || issued.expiresMs < this.now) return json(400, { detail: "bad_challenge" });
+      if (this.account.key === null) return json(409, { detail: "key_absent" });
+      if (this.account.key.key_id !== issued.keyId) return json(409, { detail: "key_changed" });
+      const signed = typeof body.signature === "string" && ed25519Verify(
+        bytes(this.account.key.sign_pk), utf8("pickle.secure.v1.session-key\n" + this.userId + "\n" + body.challenge),
+        bytes(body.signature));
+      if (!signed) return json(400, { detail: "bad_signature" });
+      this.keyProof.provedKeyId = issued.keyId;
+      return json(200, { key_proof: { proved: true, enforced: this.keyProof.enforced } });
     }
     if (method === "GET" && path === "/api/secure/grants") {
       if (!this.routes.grants) return absent();
