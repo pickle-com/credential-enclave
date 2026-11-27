@@ -3,7 +3,8 @@
 # The check above is skipped for the build argument CREDENTIAL_ENCLAVE_RELEASE: it is the
 # release tag, and its name alone makes the build check take it for a secret.
 #
-# The local platform image (enclave.md 11.1, row 6): the node program as an ordinary process,
+# The local platform image (enclave.md 11.1, the table of the two images that are not
+# measured): the node program as an ordinary process,
 # for development stacks. It listens on TCP 8080. There is no Nitro attestation in this image:
 # the attestation document is the unsigned local document of protocol.md 4.2.
 #

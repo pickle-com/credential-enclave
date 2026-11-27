@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use axum::response::Response;
+use credential_enclave_protocol::keys::Role;
 
 use super::json_ok;
 use super::responses::{
@@ -13,27 +14,61 @@ use super::responses::{
     WriteAttemptFailureCounts, WriteMsBuckets,
 };
 use crate::descriptors;
+use crate::faults;
 use crate::load;
 use crate::state::Node;
 
-/// The diagnostic values of a node. `accounts` counts the accounts that have a chain on this
+/// What the program of this source does, by name (enclave.md 5.1). A caller of a node reads
+/// from this list which calls it sends to the node and in which form, and reads no order of
+/// releases from the name of a release. A later release adds names and takes none away.
+///
+/// | Name | What a node of this program does |
+/// | --- | --- |
+/// | `log_format_3` | writes its entries in format 3 to the buckets of its log store, and returns no head with the response of a call |
+/// | `peer_proofs` | reads the `release_proofs` of `peer/export` and `peer/import`, and no endorsement |
+/// | `internal_inert` | answers `internal` only for a call that did not act |
+/// | `release_sealed` | seals the value of `release` to the key the call names |
+/// | `vault` | takes the calls under `vault/` |
+/// | `drain_paged` | hands its delegations on in the pages of `peer/export` |
+/// | `subset_groups` | reads `groups` and `skip` of a `subset` |
+/// | `subset_span` | reads `span` of a `subset` |
+pub const CAPABILITIES: [&str; 8] = [
+    "log_format_3",
+    "peer_proofs",
+    "internal_inert",
+    "release_sealed",
+    "vault",
+    "drain_paged",
+    "subset_groups",
+    "subset_span",
+];
+
+/// The diagnostic values of a node. `role` is `reserve` on a node of the reserve role,
+/// `forward` on a node of the forward role and null on every other node. `capabilities` is
+/// [`CAPABILITIES`]. `accounts` counts
+/// the accounts that have a chain on this
 /// node and `grants` the accounts that have a grant within its time (the operator domain reads
 /// it to see that a delegation transfer arrived). `log_store` is null on a node without a log
 /// store. Otherwise it names the bucket and its region, the end of the credentials the node
-/// holds (0 when it holds none), the number of accounts that have an entry the store has not
+/// holds (0 when it holds none: it never received credentials, or its clock is at or past the
+/// end of the ones it received), the number of accounts that have an entry the store has not
 /// confirmed and the age of the oldest pending entry as the last sweep of the node found it.
 /// `log` counts the entries, events, write attempts (confirmed, failed by cause, repeated, and
 /// the time to confirmation of the confirmed ones) and batch calls since the node started.
 /// `load` is the load at the moment of the call: the provider requests in flight, the calls
 /// that hold a forward slot, the connections from the backend open now and the ones refused
 /// at accept since the start, the CPU time and the memory of the kernel the node runs in,
-/// read from procfs (`crate::load`), null where the kernel exposes no value, and the open
-/// file descriptors of the node process and their limit (`crate::descriptors`). `egress` counts
+/// read from procfs (`crate::load`), null where the kernel exposes no value, the open
+/// file descriptors of the node process and their limit (`crate::descriptors`), the faults
+/// the node contained: the panics of the program since it started and the accounts it halted
+/// (`crate::faults`), and the kept `refresh` responses the node dropped for the bound of
+/// their sum since it started. `egress` counts
 /// the outbound connections (opened, failed by cause, repeated, being opened, and the requests
 /// that reused an idle connection), `refresh` the token address calls of `refresh` the node
 /// continued after their time limit, by outcome and in progress, and `state` the sizes of the
-/// variable state of the accounts (kept `refresh` responses, merge keys, unconfirmed entries)
-/// and the idle connections by peer.
+/// variable state of the accounts (kept `refresh` responses and the bytes the node counts for
+/// them, merge keys, unconfirmed entries) and the idle connections the node holds open at the
+/// moment of the call, by peer.
 ///
 /// Every count of the accounts is a count the node keeps with the state it counts
 /// (`crate::state::StateCounters`): the call walks no account, so its time does not grow with
@@ -45,25 +80,31 @@ pub async fn health(State(node): State<Arc<Node>>) -> Response {
     let state = &node.counters;
     let cpu = load::read_cpu();
     let memory = load::read_memory();
+    let lingering = node.platform.lingering();
     let read = |counter: &std::sync::atomic::AtomicU64| counter.load(Ordering::Relaxed);
     let count = |counter: &std::sync::atomic::AtomicUsize| counter.load(Ordering::Relaxed);
     let buckets = &counters.write_ms_buckets;
+    let now_ms = node.now_ms();
     json_ok(&Health {
         node: &node.node,
         release: node.release,
         platform: node.platform.name(),
         custody: node.custody.as_str(),
+        role: node.role.get().and_then(Role::binding_value),
         started_ms: node.started_ms,
-        time_ms: node.now_ms(),
+        time_ms: now_ms,
         configured: node.is_configured(),
         closing: node.closing.load(Ordering::SeqCst),
         accounts: node.account_count(),
         grants: count(&state.grants),
         mail_providers: &["naver_mail"],
+        capabilities: &CAPABILITIES,
         log_store: node.log_store.id().map(|id| LogStoreState {
             bucket: id.bucket(),
             region: id.region(),
-            credentials_expires_ms: node.log_store.credentials_expires_ms(),
+            shards: id.shards(),
+            credentials_expires_ms: node.log_store.credentials_expires_ms(now_ms),
+            node_document_ms: node.log_store.document_ms(),
             pending: count(&state.pending_accounts),
             pending_oldest_ms: node.pending_oldest_ms(),
         }),
@@ -102,6 +143,7 @@ pub async fn health(State(node): State<Arc<Node>>) -> Response {
             forward_calls: node.forward_calls(),
             inbound_connections: node.inbound.open(),
             inbound_refused: node.inbound.refused(),
+            inbound_limit: node.limits.inbound_connections,
             cpu_user_ms: cpu.map(|cpu| cpu.user),
             cpu_system_ms: cpu.map(|cpu| cpu.system),
             cpu_idle_ms: cpu.map(|cpu| cpu.idle),
@@ -109,6 +151,11 @@ pub async fn health(State(node): State<Arc<Node>>) -> Response {
             memory_available_bytes: memory.map(|memory| memory.available),
             descriptors_open: descriptors::open_count(),
             descriptors_limit: descriptors::soft_limit(),
+            lingering_connections: lingering.map(|(waiting, _)| waiting),
+            lingering_cut: lingering.map(|(_, cut)| cut),
+            contained_panics: faults::panics(),
+            halted_accounts: node.halted_accounts(),
+            kept_refreshes_dropped: node.kept_refreshes_dropped(),
         },
         egress: EgressCounts {
             opens: read(&egress.opens),
@@ -123,6 +170,7 @@ pub async fn health(State(node): State<Arc<Node>>) -> Response {
             idle_reuses: IdleReuseCounts {
                 provider: read(&egress.idle_reuses.provider),
                 log_store: read(&egress.idle_reuses.log_store),
+                mail: read(&egress.idle_reuses.mail),
             },
         },
         refresh: RefreshCounts {
@@ -136,11 +184,13 @@ pub async fn health(State(node): State<Arc<Node>>) -> Response {
         },
         state: StateCounts {
             kept_refreshes: count(&state.kept_refreshes),
+            kept_refresh_bytes: node.kept_refresh_bytes(),
             merge_keys: count(&state.merge_keys),
             pending_entries: count(&state.pending_entries),
             idle_connections: IdleConnectionCounts {
                 provider: node.egress.provider_idle.idle_total(),
                 log_store: node.log_store.idle_connections(),
+                mail: node.egress.mail_sessions.count(),
             },
         },
     })

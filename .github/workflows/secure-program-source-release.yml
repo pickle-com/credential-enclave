@@ -1,0 +1,48 @@
+# The attestation of the source of a secure-program-v* tag (docs/protocol.md, "The secure
+# program release"). The workflow secure-program-source.yml, at the commit fixed below, attests
+# that the program of the tag is the file of the commit of the tag, and the bundle of that
+# attestation is attached to the GitHub release of the tag as secure-program-source.sigstore.json.
+#
+# This file is apart from secure-program-release.yml, which the same push starts: a run of this
+# file that does not start, or that fails, leaves the release of the tag, its statement and its
+# build provenance attestation as that workflow makes them.
+name: secure-program-source-release
+on:
+  push:
+    tags: ["secure-program-v*"]
+permissions: {}
+concurrency:
+  group: secure-program-source-release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  # The commit after the @ is the commit of secure-program-source.yml that a verifier fixes: the
+  # certificate of the attestation states it as the Build Signer Digest. The permissions are the
+  # ones the job of that workflow asks for.
+  source:
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    uses: pickle-com/credential-enclave/.github/workflows/secure-program-source.yml@f17754dc9bfaa8445193f9bd6dce176d8ac7fa7d
+  bundle:
+    needs: source
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      BUNDLE: ${{ needs.source.outputs.bundle }}
+    steps:
+      - name: Attach the bundle of the attestation to the release of the tag
+        shell: bash
+        run: |
+          test -n "$BUNDLE"
+          printf '%s\n' "$BUNDLE" > secure-program-source.sigstore.json
+          # The release of the tag is made by secure-program-release.yml: wait for it, ten minutes at most.
+          for attempt in $(seq 1 60); do
+            if gh release view "$TAG" > /dev/null 2>&1; then break; fi
+            sleep 10
+          done
+          gh release upload "$TAG" --clobber secure-program-source.sigstore.json

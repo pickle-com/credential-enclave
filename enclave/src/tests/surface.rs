@@ -34,9 +34,12 @@ async fn health_reports_the_node_in_the_key_order_of_5_1() {
     let prefix = format!(
         concat!(
             "{{\"node\":\"{}\",\"release\":\"v0.0.0-test\",\"platform\":\"local\",",
-            "\"custody\":\"operator\",\"started_ms\":{},\"time_ms\":{},",
+            "\"custody\":\"operator\",\"role\":null,\"started_ms\":{},\"time_ms\":{},",
             "\"configured\":false,\"closing\":false,\"accounts\":0,\"grants\":0,",
-            "\"mail_providers\":[\"naver_mail\"],\"log_store\":null,",
+            "\"mail_providers\":[\"naver_mail\"],",
+            "\"capabilities\":[\"log_format_3\",\"peer_proofs\",\"internal_inert\",",
+            "\"release_sealed\",\"vault\",\"drain_paged\",\"subset_groups\",",
+            "\"subset_span\"],\"log_store\":null,",
             "\"log\":{{\"entries\":0,\"events\":0,\"writes\":0,\"write_failures\":0,",
             "\"open_batches\":0,\"batch_calls\":0,\"batch_requests\":0,",
             "\"write_attempt_failures\":{{\"connect\":0,\"tls\":0,\"closed\":0,\"timeout\":0,",
@@ -44,7 +47,7 @@ async fn health_reports_the_node_in_the_key_order_of_5_1() {
             "\"write_ms_buckets\":{{\"25\":0,\"50\":0,\"100\":0,\"250\":0,\"500\":0,",
             "\"1000\":0,\"2500\":0,\"5000\":0}},\"write_ms_sum\":0,\"write_count\":0}},",
             "\"load\":{{\"provider_inflight\":0,\"forward_calls\":0,",
-            "\"inbound_connections\":0,\"inbound_refused\":0,"
+            "\"inbound_connections\":0,\"inbound_refused\":0,\"inbound_limit\":16384,"
         ),
         harness.node.node, started_ms, time_ms
     );
@@ -52,16 +55,26 @@ async fn health_reports_the_node_in_the_key_order_of_5_1() {
     // The five values of the kernel and the two values of the descriptors follow. They depend
     // on the machine that runs the test: numbers from the procfs of a Linux kernel, null on
     // another kernel (the limit of the descriptors is a number on every Unix kernel). The
+    // two values of the connections that wait for the end of their peer are null: the
+    // local platform closes a connection when the node is done with it. The count of the
+    // panics is that of the process, which other tests of this program raise. The count of
+    // the halted accounts and of the kept responses the node dropped for their bound, and the
     // counts of the outbound connections, of the late token address calls and of the state of
-    // the accounts end the body.
+    // the accounts, end the body.
+    let (_, faults) = text
+        .split_once("\"lingering_connections\":null,\"lingering_cut\":null,\"contained_panics\":")
+        .unwrap();
+    assert!(faults.starts_with(|first: char| first.is_ascii_digit()));
     let suffix = concat!(
+        ",\"halted_accounts\":0,\"kept_refreshes_dropped\":0",
         "},\"egress\":{\"opens\":0,\"open_failures\":{\"transport\":0,\"relay_refused\":0,",
         "\"tls\":0,\"http\":0},\"open_retries\":0,\"open_inflight\":0,",
-        "\"idle_reuses\":{\"provider\":0,\"log_store\":0}},",
+        "\"idle_reuses\":{\"provider\":0,\"log_store\":0,\"mail\":0}},",
         "\"refresh\":{\"late\":{\"kept\":0,\"dropped\":0,\"failed\":0,\"abandoned\":0},",
         "\"late_inflight\":0},",
-        "\"state\":{\"kept_refreshes\":0,\"merge_keys\":0,\"pending_entries\":0,",
-        "\"idle_connections\":{\"provider\":0,\"log_store\":0}}}"
+        "\"state\":{\"kept_refreshes\":0,\"kept_refresh_bytes\":0,\"merge_keys\":0,",
+        "\"pending_entries\":0,",
+        "\"idle_connections\":{\"provider\":0,\"log_store\":0,\"mail\":0}}}"
     );
     assert!(text.ends_with(suffix), "{text}");
     let load = health["load"].as_object().unwrap();
@@ -75,7 +88,7 @@ async fn health_reports_the_node_in_the_key_order_of_5_1() {
         "descriptors_limit",
     ];
     assert_eq!(
-        load.keys().skip(4).collect::<Vec<_>>(),
+        load.keys().skip(5).take(7).collect::<Vec<_>>(),
         kernel_values.to_vec()
     );
     for key in kernel_values {
@@ -127,7 +140,7 @@ async fn health_reports_the_node_in_the_key_order_of_5_1() {
             "open_failures": {"transport": 0, "relay_refused": 0, "tls": 0, "http": 0},
             "open_retries": 0,
             "open_inflight": 0,
-            "idle_reuses": {"provider": 0, "log_store": 0},
+            "idle_reuses": {"provider": 0, "log_store": 0, "mail": 0},
         })
     );
     assert_eq!(
@@ -140,8 +153,8 @@ async fn health_reports_the_node_in_the_key_order_of_5_1() {
     assert_eq!(
         health["state"],
         json!({
-            "kept_refreshes": 0, "merge_keys": 0, "pending_entries": 0,
-            "idle_connections": {"provider": 0, "log_store": 0},
+            "kept_refreshes": 0, "kept_refresh_bytes": 0, "merge_keys": 0, "pending_entries": 0,
+            "idle_connections": {"provider": 0, "log_store": 0, "mail": 0},
         })
     );
 }
@@ -182,7 +195,10 @@ async fn the_operator_configuration_is_validated_and_replaced_as_a_whole() {
             }}),
         )
         .await;
-    assert_eq!((status, configured), (200, json!({"configured": true})));
+    assert_eq!(
+        (status, configured),
+        (200, json!({"configured": true, "node_document_ms": 0}))
+    );
 
     // A second configuration replaces the first one as a whole.
     let app = App::new("user-1", 1);
@@ -443,8 +459,10 @@ async fn the_router_serves_the_calls_of_the_route_list_and_no_other() {
             "POST /v1/mail/read",
             "POST /v1/mail/submit",
             "POST /v1/release",
+            "POST /v1/vault/store",
+            "POST /v1/vault/handoff",
+            "POST /v1/vault/send",
             "POST /v1/close",
-            "POST /v1/close/heads",
             "POST /v1/peer/export",
             "POST /v1/peer/import",
             "POST /v1/grants/prune",
@@ -553,31 +571,38 @@ async fn failures_of_the_surface_have_a_code_and_a_message() {
         failure(status.as_u16(), &bytes),
         (413, "too_large".to_string())
     );
-    // A status nonce that is not base64url, or empty.
-    for nonce in ["", "not base64url!"] {
-        let (status, body) = harness
-            .post("/v1/status", json!({"user_id": "user-1", "nonce": nonce}))
+    // A status call names its account.
+    let (status, body) = harness.post("/v1/status", json!({})).await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (400, Some("invalid_request"))
+    );
+    // An account the node does not know has no grant. The call answers with the grant alone:
+    // a node of this release signs no head, and a `nonce`, which a caller sent to a node of
+    // an earlier release for the head, is not read, whatever its form.
+    for nonce in [
+        json!("bm9uY2U"),
+        json!(""),
+        json!("not base64url!"),
+        Value::Null,
+    ] {
+        let (status, state) = harness
+            .post("/v1/status", json!({"user_id": "nobody", "nonce": nonce}))
             .await;
+        assert_eq!(status, 200);
         assert_eq!(
-            (status, body["code"].as_str()),
-            (400, Some("invalid_request"))
+            state,
+            json!({"grant": {"state": "none", "key_id": "", "custody": "", "not_after_ms": 0}})
         );
     }
-    // An account the node does not know has an empty chain and no grant.
-    let (status, state) = harness
-        .post(
-            "/v1/status",
-            json!({"user_id": "nobody", "nonce": "bm9uY2U"}),
-        )
+    // The calls of the shutdown of an earlier release that this release does not have.
+    let (status, body) = harness
+        .post("/v1/close/heads", json!({"cursor": "", "limit": 1000}))
         .await;
-    assert_eq!(status, 200);
     assert_eq!(
-        state["grant"],
-        json!({"state": "none", "key_id": "", "custody": "", "not_after_ms": 0})
+        (status, body["code"].as_str()),
+        (404, Some("invalid_request"))
     );
-    let head = harness.verified(credential_enclave_protocol::purpose::HEAD, &state["head"]);
-    assert_eq!(head["seq"], 0);
-    assert_eq!(head["hash"], b64u(&[0u8; 32]));
 }
 
 async fn exchange(stream: &mut TcpStream, request: &str) -> (u16, Value) {
@@ -619,7 +644,9 @@ async fn exchange(stream: &mut TcpStream, request: &str) -> (u16, Value) {
 async fn the_node_serves_http_1_1_on_the_listener_of_its_platform() {
     let provider = quiet_provider().await;
     let harness = Harness::new(&provider);
-    let listener = Platform::listen(harness.platform.as_ref()).await.unwrap();
+    let listener = Platform::listen(harness.platform.as_ref(), 16)
+        .await
+        .unwrap();
     let address = listener.tcp_addr().unwrap();
     tokio::spawn(api::serve(
         listener,
@@ -671,7 +698,9 @@ async fn the_node_bounds_the_connections_it_holds_and_closes_an_idle_one() {
             ..Limits::default()
         },
     );
-    let listener = Platform::listen(harness.platform.as_ref()).await.unwrap();
+    let listener = Platform::listen(harness.platform.as_ref(), 16)
+        .await
+        .unwrap();
     let address = listener.tcp_addr().unwrap();
     tokio::spawn(api::serve(
         listener,

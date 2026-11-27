@@ -141,7 +141,7 @@ mod tests {
             Ok(value)
         }
 
-        async fn listen(&self) -> Result<Listener, PlatformError> {
+        async fn listen(&self, _: usize) -> Result<Listener, PlatformError> {
             Err(PlatformError("unused"))
         }
 

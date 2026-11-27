@@ -36,6 +36,11 @@ pub fn b64u_decode_array<const N: usize>(text: &str) -> Result<[u8; N], Protocol
 ///
 /// Types passed here are structs whose field order is the order the protocol writes, or
 /// `serde_json::Value` built with the `preserve_order` feature.
+#[expect(
+    clippy::expect_used,
+    reason = "the values of this protocol are JSON values and structures of strings, integers \
+              and such values, with string keys: their serialization does not fail"
+)]
 pub fn to_json<T: Serialize>(value: &T) -> Vec<u8> {
     serde_json::to_vec(value).expect("protocol values serialize to JSON")
 }

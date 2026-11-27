@@ -1,6 +1,6 @@
 [package]
 name = "credential-enclave-protocol"
-version = "2.3.0"
+version = "2.4.0"
 description = "Key, message and storage formats of the credential enclave (protocol v1)"
 edition.workspace = true
 rust-version.workspace = true
@@ -27,8 +27,9 @@ hpke.workspace = true
 # The same crates, with the same `ring` backend, verify TLS certificates in the node program.
 rustls-pki-types = { version = "1", features = ["std"] }
 webpki = { package = "rustls-webpki", version = "0.103.15", default-features = false, features = ["ring", "std"] }
-# The signatures of the release key and of the transparency log in the endorsement of a later
-# release (src/release.rs). The crate is already part of the program as the backend of `webpki`.
+# The signatures of the release proofs of a release: of a certificate by its issuer, of the
+# envelope and of the transparency log (src/certificate.rs, src/release.rs). The crate is already
+# part of the program as the backend of `webpki`.
 ring = "0.17"
 serde.workspace = true
 serde_json.workspace = true

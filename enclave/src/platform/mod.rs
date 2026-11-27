@@ -11,11 +11,17 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 
+// The vsock connections of a node, which only the nitro platform has.
+#[cfg(any(target_os = "linux", test))]
+mod lingering;
 pub mod local;
 // The platform inside this module is compiled on Linux only. Its pure helpers are also
 // compiled for tests on other systems.
 #[cfg(any(target_os = "linux", test))]
 pub mod nitro;
+
+#[cfg(target_os = "linux")]
+pub use lingering::{Lingerers, Lingering};
 
 /// The port a node listens on: vsock 8080 on nitro, TCP 8080 on local.
 pub const LISTEN_PORT: u16 = 8080;
@@ -64,15 +70,165 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> ByteStream for T {}
 /// A connection accepted from the backend or opened towards a provider.
 pub type Stream = Box<dyn ByteStream>;
 
+/// A stream whose writes are attempted each time they are asked for, not only after the stream
+/// reported that it takes bytes. `io::Write` of the inner stream is a write that returns at
+/// once: it answers `WouldBlock` when the stream takes no byte now.
+///
+/// The vsock connections a node accepts are streams of this kind. The kernel of an enclave
+/// gives a writer that waits no event when the peer of its vsock connection closes: the
+/// event that says a socket takes bytes comes while the connection is open and its peer has
+/// room, and a close of the peer changes neither. A write that waits for that event waits
+/// without an end. An attempted write to a connection whose peer closed fails at once, and
+/// what holds the stream asks for a write that waits again at its own pace
+/// (`crate::inbound::TimedStream`).
+///
+/// The stream writes several buffers in one write (`is_write_vectored`): the HTTP connection
+/// of a caller then keeps the body of a response as it is until the stream took it, and does
+/// not copy it into a buffer of its own first.
+#[cfg(any(target_os = "linux", test))]
+pub struct Attempted<S>(pub S);
+
+#[cfg(any(target_os = "linux", test))]
+impl<S: AsyncRead + Unpin> AsyncRead for Attempted<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buffer)
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl<S: AsyncWrite + std::io::Write + Unpin> AsyncWrite for Attempted<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        use std::io::ErrorKind::{Interrupted, WouldBlock};
+        loop {
+            match std::io::Write::write(&mut self.0, bytes) {
+                Err(error) if error.kind() == Interrupted => {}
+                // The stream takes no byte now: its own write registers the task for the
+                // event that says it does.
+                Err(error) if error.kind() == WouldBlock => {
+                    return Pin::new(&mut self.0).poll_write(cx, bytes);
+                }
+                outcome => return std::task::Poll::Ready(outcome),
+            }
+        }
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        slices: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        use std::io::ErrorKind::{Interrupted, WouldBlock};
+        loop {
+            match std::io::Write::write_vectored(&mut self.0, slices) {
+                Err(error) if error.kind() == Interrupted => {}
+                Err(error) if error.kind() == WouldBlock => {
+                    let first = slices
+                        .iter()
+                        .find(|slice| !slice.is_empty())
+                        .map_or(&[][..], |slice| &**slice);
+                    return Pin::new(&mut self.0).poll_write(cx, first);
+                }
+                outcome => return std::task::Poll::Ready(outcome),
+            }
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
+/// A vsock connection as [`Attempted`] writes to it: the write that returns at once, of one
+/// buffer and of several buffers in one message.
+#[cfg(target_os = "linux")]
+pub struct VsockConnection(tokio_vsock::VsockStream);
+
+#[cfg(target_os = "linux")]
+impl std::io::Write for VsockConnection {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        std::io::Write::write(&mut self.0, bytes)
+    }
+
+    fn write_vectored(&mut self, slices: &[std::io::IoSlice<'_>]) -> std::io::Result<usize> {
+        socket2::SockRef::from(&self.0).send_vectored(slices)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl AsyncRead for VsockConnection {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buffer)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl AsyncWrite for VsockConnection {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, bytes)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
 /// The place where backend calls arrive.
 pub enum Listener {
     Tcp(TcpListener),
+    /// A vsock listener, and the connections of the node that wait for the end of their
+    /// peer.
     #[cfg(target_os = "linux")]
-    Vsock(tokio_vsock::VsockListener),
+    Vsock(tokio_vsock::VsockListener, Arc<Lingerers>),
 }
 
 impl Listener {
-    /// Waits for the next connection.
+    /// Waits for the next connection. A vsock connection is a stream whose writes are
+    /// attempted each time they are asked for ([`Attempted`]) and that is closed only after
+    /// its peer reported the end of its bytes ([`Lingering`]).
     pub async fn accept(&self) -> std::io::Result<Stream> {
         match self {
             Listener::Tcp(listener) => {
@@ -81,9 +237,12 @@ impl Listener {
                 Ok(Box::new(stream))
             }
             #[cfg(target_os = "linux")]
-            Listener::Vsock(listener) => {
+            Listener::Vsock(listener, lingerers) => {
                 let (stream, _) = listener.accept().await?;
-                Ok(Box::new(stream))
+                Ok(Box::new(Lingering::new(
+                    Attempted(VsockConnection(stream)),
+                    lingerers.clone(),
+                )))
             }
         }
     }
@@ -94,7 +253,7 @@ impl Listener {
         match self {
             Listener::Tcp(listener) => listener.local_addr().ok(),
             #[cfg(target_os = "linux")]
-            Listener::Vsock(_) => None,
+            Listener::Vsock(..) => None,
         }
     }
 }
@@ -114,14 +273,29 @@ pub trait Platform: Send + Sync + 'static {
     fn fill_random(&self, out: &mut [u8]) -> Result<(), PlatformError>;
     /// The time the hypervisor gives, in Unix epoch milliseconds.
     fn trusted_time_ms(&self) -> Result<u64, PlatformError>;
-    /// Opens the listener for backend calls.
-    fn listen(&self) -> impl Future<Output = Result<Listener, PlatformError>> + Send;
+    /// Opens the listener for backend calls of a node that holds `connections` connections
+    /// from the backend at once (enclave.md section 8). On nitro the queue of the listener
+    /// holds as many connections that wait for accept, so the kernel refuses no connection
+    /// the node has a place for. The local platform leaves the queue of its TCP listener as
+    /// the library sets it.
+    fn listen(
+        &self,
+        connections: usize,
+    ) -> impl Future<Output = Result<Listener, PlatformError>> + Send;
     /// Opens a byte pipe to `host:port` of a provider or of the log store.
     fn connect(
         &self,
         host: &str,
         port: u16,
     ) -> impl Future<Output = Result<Stream, ConnectError>> + Send;
+    /// The connections the node is done with that wait for the end of their peer at this
+    /// moment, and the connections it closed before their peer had reported its end since it
+    /// started (`lingering_connections` and `lingering_cut` of `load` of health). `None` on a
+    /// platform that closes a connection when the node is done with it: only the vsock
+    /// connections of nitro wait.
+    fn lingering(&self) -> Option<(usize, u64)> {
+        None
+    }
 }
 
 /// A boxed future, for the object-safe form of [`Platform`].
@@ -136,12 +310,13 @@ pub trait DynPlatform: Send + Sync + 'static {
     fn attestation(&self, user_data: &[u8], nonce: &[u8]) -> Result<Vec<u8>, PlatformError>;
     fn fill_random(&self, out: &mut [u8]) -> Result<(), PlatformError>;
     fn trusted_time_ms(&self) -> Result<u64, PlatformError>;
-    fn listen(&self) -> BoxFuture<'_, Result<Listener, PlatformError>>;
+    fn listen(&self, connections: usize) -> BoxFuture<'_, Result<Listener, PlatformError>>;
     fn connect<'a>(
         &'a self,
         host: &'a str,
         port: u16,
     ) -> BoxFuture<'a, Result<Stream, ConnectError>>;
+    fn lingering(&self) -> Option<(usize, u64)>;
 }
 
 impl<P: Platform> DynPlatform for P {
@@ -169,8 +344,8 @@ impl<P: Platform> DynPlatform for P {
         Platform::trusted_time_ms(self)
     }
 
-    fn listen(&self) -> BoxFuture<'_, Result<Listener, PlatformError>> {
-        Box::pin(Platform::listen(self))
+    fn listen(&self, connections: usize) -> BoxFuture<'_, Result<Listener, PlatformError>> {
+        Box::pin(Platform::listen(self, connections))
     }
 
     fn connect<'a>(
@@ -179,6 +354,10 @@ impl<P: Platform> DynPlatform for P {
         port: u16,
     ) -> BoxFuture<'a, Result<Stream, ConnectError>> {
         Box::pin(Platform::connect(self, host, port))
+    }
+
+    fn lingering(&self) -> Option<(usize, u64)> {
+        Platform::lingering(self)
     }
 }
 

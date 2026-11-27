@@ -37,7 +37,7 @@ use base64::Engine;
 use credential_enclave_protocol::encoding::{b64u, to_json};
 use credential_enclave_protocol::record::{self, Kind, Record};
 use credential_enclave_protocol::secret::Secret;
-use credential_enclave_protocol::ProtocolError;
+use credential_enclave_protocol::{limits, ProtocolError};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -46,20 +46,99 @@ use crate::egress::{OutboundBody, OutboundHeader, OutboundRequest};
 use crate::provider_response::Forms;
 use crate::providers::{
     BodyFormat, ClientAuth, Definition, Destination, FieldType, Inject, PublicField, Revoke,
-    TOKEN_KEYS,
+    PUBLIC_STRING_BYTES, TOKEN_KEYS,
 };
+use crate::room::Marks;
 use crate::state::{open_for, GrantView, Node};
 
 /// Time limit of a revocation address call.
 pub const REVOKE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Longest token response a node reads: 1 MiB.
+/// Longest token response a node reads: 1 MiB. A response is longer than the token object a
+/// node makes of it: what a node keeps of a response is its tokens and its short values
+/// ([`kept_of`]), so a response with a long value that is no token is read and taken.
 const TOKEN_RESPONSE_LIMIT_BYTES: usize = 1024 * 1024;
+/// The most room the JSON text of a token response may take once it is parsed
+/// (`Marks::value_room`): the room of the bytes of the longest response, a quarter more than
+/// those bytes, and the room a token object may take ([`TOKEN_OBJECT_ROOM_BYTES`]) for its
+/// values. A response above it is not parsed. So a response of as many values as a token
+/// object may have is parsed whatever the length of its strings, within the longest response.
+const TOKEN_RESPONSE_ROOM_BYTES: usize =
+    TOKEN_RESPONSE_LIMIT_BYTES + TOKEN_RESPONSE_LIMIT_BYTES / 4 + TOKEN_OBJECT_ROOM_BYTES;
+/// Longest string a node keeps of a token response beside its tokens, and longest name of a
+/// member it keeps: 8,192 bytes, the longest value a public field of a definition holds
+/// (`PUBLIC_STRING_BYTES`). A node reads these values of a token object and no other: its
+/// tokens, and what its definition lists as public fields.
+const TOKEN_RESPONSE_STRING_BYTES: usize = PUBLIC_STRING_BYTES;
 /// Longest value of an authorization parameter, in characters.
 const PARAM_VALUE_CHARS: usize = 1024;
 
-/// The successful response of a token address: a JSON object with an access token in the
-/// token place. The whole response is a secret. Only [`call_token_address`] creates one.
-pub struct TokenResponse(Secret<Value>);
+/// The most room the JSON text of a token object may take once it is parsed
+/// (`Marks::value_room`): 262,144 bytes. A token object is the plaintext of a record of kind
+/// `oauth` or `oauth_imported`, and what a node keeps of the response of a token address
+/// ([`kept_of`]). A node parses no plaintext that would take more, and takes no response
+/// whose kept part does. `refresh` holds the parsed plaintext of its record while it waits
+/// for its provider, so that room is a share of the body budget the call takes before it
+/// knows the plaintext ([`REFRESH_SHARE_BYTES`]).
+///
+/// The token objects of the defined providers have up to some thirty values. The bound
+/// leaves a text of the longest plaintext, 65,536 bytes, 350 arrays and objects or 400
+/// further elements, and a text of 3,000 bytes 502 or 574.
+pub const TOKEN_OBJECT_ROOM_BYTES: usize = 262_144;
+
+/// The share of the body budget of the node a call holds for the response of a token address
+/// while that response arrives: the bytes of the longest response, 1 MiB. The buffer of the
+/// response has its whole room from the start and does not grow
+/// (`Exchange::read_body_within`). `oauth/complete` holds the same share for what it answers
+/// with, the record of the response and its public fields, while it waits for the log
+/// store: they are no more.
+pub const TOKEN_RESPONSE_SHARE_BYTES: usize = TOKEN_RESPONSE_LIMIT_BYTES;
+
+/// The share of the body budget a `refresh` call takes before its entry is created: the room
+/// of the parsed plaintext of its record at the most, and the share of the token response.
+/// The call gives back what its plaintext does not need once the record is open
+/// ([`refresh_share`]).
+pub const REFRESH_SHARE_BYTES: usize = refresh_share(TOKEN_OBJECT_ROOM_BYTES);
+
+/// The share of the body budget a `refresh` call holds from the opening of its record to
+/// the end of its exchange with the token address, for a record whose parsed plaintext takes
+/// `plaintext_room` bytes: that plaintext, which the call merges the response into, and the
+/// response while it arrives.
+///
+/// What the call makes of the response once it has arrived (the parsed response, what the
+/// node keeps of it, the merged plaintext, the search of the public fields, the new record)
+/// it makes in one piece, without a wait: a node does that work for as many calls at once as
+/// it has threads for its calls, and each of those values is bounded by a constant (the room
+/// of a parsed response, the room of a token object, the longest token).
+pub const fn refresh_share(plaintext_room: usize) -> usize {
+    plaintext_room.saturating_add(TOKEN_RESPONSE_SHARE_BYTES)
+}
+
+/// Why a node does not use the plaintext of a token record for a call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unusable {
+    /// The plaintext is no JSON object with a `token` object, or it lacks what the call
+    /// uses. The call ends with `record_invalid`.
+    Invalid,
+    /// The plaintext, or a token of it the call would handle, is above what a node reads:
+    /// the text takes more room than [`TOKEN_OBJECT_ROOM_BYTES`], or a token is longer than
+    /// `limits::TOKEN_BYTES`. The node made no copy of that token and did not parse that
+    /// text. A call that creates an entry ends with `record_invalid` once the log store
+    /// confirmed that entry, and has sent nothing: the judgement depends on the content of
+    /// the plaintext, so it has an entry.
+    AboveBounds,
+}
+
+impl From<Unusable> for ProtocolError {
+    fn from(_: Unusable) -> Self {
+        ProtocolError::RecordInvalid
+    }
+}
+
+/// The successful response of a token address, as a node keeps it ([`kept_of`]): a JSON
+/// object with an access token in the token place, and a bound of the room of that object
+/// (`Marks::value_room` of its text). The whole of it is a secret. Only
+/// [`call_token_address`] creates one.
+pub struct TokenResponse(Secret<Value>, usize);
 
 /// The opened plaintext of a record of kind `oauth` or `oauth_imported`, before it is parsed.
 /// Only [`open_record`] and [`open_records`] create one, so the bytes are those of a record
@@ -83,7 +162,11 @@ impl TokenKind {
         match kind {
             Kind::Oauth => Some(TokenKind::Issued),
             Kind::OauthImported => Some(TokenKind::Imported),
-            Kind::VaultPassword | Kind::VaultTotp | Kind::VaultCard | Kind::AppPassword => None,
+            Kind::VaultPassword
+            | Kind::VaultTotp
+            | Kind::VaultCard
+            | Kind::VaultSecret
+            | Kind::AppPassword => None,
         }
     }
 
@@ -108,6 +191,9 @@ impl TokenKind {
 pub struct OauthPlaintext {
     kind: TokenKind,
     plaintext: Secret<Value>,
+    /// A bound of the room of the parsed plaintext (`Marks::value_room` of the text it was
+    /// parsed from, or the sum of the rooms of the values it was made of).
+    room: usize,
 }
 
 /// The credential `forward` injects: the token of an `oauth` record, and the header value made
@@ -121,6 +207,13 @@ impl Credential {
     /// The header value for the TLS client, and the token for the check of the response.
     pub fn into_parts(self) -> (Secret<String>, Secret<String>) {
         (self.header, self.token)
+    }
+
+    /// The length of the token in bytes: what a call holds for the credential of a request
+    /// depends on it, the search of the response and the copies of the token the request
+    /// carries (`credential_share` of `api::forward`, `StreamCheck::memory_bound`).
+    pub fn token_bytes(&self) -> usize {
+        self.token.expose_secret().len()
     }
 }
 
@@ -192,22 +285,29 @@ pub fn open_records(
 
 impl OauthRecord {
     /// Parses the plaintext. A plaintext that is not a JSON object with a `token` object is
-    /// `record_invalid`.
-    pub fn parse(&self) -> Result<OauthPlaintext, ProtocolError> {
+    /// [`Unusable::Invalid`]. A plaintext whose parsed form would take more room than
+    /// [`TOKEN_OBJECT_ROOM_BYTES`] is [`Unusable::AboveBounds`]: the room is computed from
+    /// the bytes (`Marks::value_room`), and such a text is not parsed.
+    pub fn parse(&self) -> Result<OauthPlaintext, Unusable> {
+        let room = Marks::of(self.plaintext.expose_secret()).value_room();
+        if room > TOKEN_OBJECT_ROOM_BYTES {
+            return Err(Unusable::AboveBounds);
+        }
         let parsed = Secret::new(
             serde_json::from_slice::<Value>(self.plaintext.expose_secret())
-                .map_err(|_| ProtocolError::RecordInvalid)?,
+                .map_err(|_| Unusable::Invalid)?,
         );
         if !parsed
             .expose_secret()
             .get("token")
             .is_some_and(Value::is_object)
         {
-            return Err(ProtocolError::RecordInvalid);
+            return Err(Unusable::Invalid);
         }
         Ok(OauthPlaintext {
             kind: self.kind,
             plaintext: parsed,
+            room,
         })
     }
 }
@@ -218,17 +318,24 @@ impl TokenResponse {
     /// received this token itself, so the record is of kind `oauth`.
     pub fn into_plaintext(self, obtained_ms: u64, client_id: Option<&str>) -> OauthPlaintext {
         let token = object_of(self.0.expose_secret()).clone();
-        OauthPlaintext::from_parts(TokenKind::Issued, token, obtained_ms, client_id)
+        OauthPlaintext::from_parts(TokenKind::Issued, token, obtained_ms, client_id, self.1)
     }
 }
 
+/// The room of what a plaintext holds around its token object: the object of the plaintext,
+/// `obtained_ms`, and the client identifier of a dynamically registered client (at most 256
+/// characters).
+const PLAINTEXT_FRAME_ROOM_BYTES: usize = 4096;
+
 impl OauthPlaintext {
-    /// `{"token": .., "obtained_ms": .., "client_id": ..}`, in this key order.
+    /// `{"token": .., "obtained_ms": .., "client_id": ..}`, in this key order. `token_room`
+    /// is a bound of the room of `token`.
     fn from_parts(
         kind: TokenKind,
         token: Map<String, Value>,
         obtained_ms: u64,
         client_id: Option<&str>,
+        token_room: usize,
     ) -> OauthPlaintext {
         let mut plaintext = Map::new();
         plaintext.insert("token".to_string(), Value::Object(token));
@@ -242,6 +349,27 @@ impl OauthPlaintext {
         OauthPlaintext {
             kind,
             plaintext: Secret::new(Value::Object(plaintext)),
+            room: token_room.saturating_add(PLAINTEXT_FRAME_ROOM_BYTES),
+        }
+    }
+
+    /// A bound of the room of this parsed plaintext.
+    pub fn room(&self) -> usize {
+        self.room
+    }
+
+    /// `Ok` when no token of this plaintext is longer than `limits::TOKEN_BYTES`: the
+    /// strings at `access_token`, `refresh_token` and `id_token` of the token object, at
+    /// its top level and in the token place of `definition`, and the strings its injection
+    /// rules name. Those are the strings a call reads as tokens: `refresh` and
+    /// `revoke-token` send one to the provider, and the search of the public fields makes
+    /// the forms of each. A plaintext with a longer one is [`Unusable::AboveBounds`], and
+    /// the node makes no copy of that string.
+    pub fn within_bounds(&self, definition: &Definition) -> Result<(), Unusable> {
+        let token = token_of(self.plaintext.expose_secret());
+        match longest_token(token, definition) > limits::TOKEN_BYTES {
+            true => Err(Unusable::AboveBounds),
+            false => Ok(()),
         }
     }
 
@@ -260,7 +388,9 @@ impl OauthPlaintext {
             object_of(response.0.expose_secret()),
             container,
         );
-        OauthPlaintext::from_parts(self.kind, merged, obtained_ms, client_id_of(old))
+        // The merged token holds values of the old token and of the response and no other.
+        let room = self.room.saturating_add(response.1);
+        OauthPlaintext::from_parts(self.kind, merged, obtained_ms, client_id_of(old), room)
     }
 
     /// The plaintext of a reconnect (protocol.md 8.3): this plaintext, with the refresh token
@@ -277,7 +407,15 @@ impl OauthPlaintext {
             token_of(previous.plaintext.expose_secret()),
             container,
         );
-        OauthPlaintext::from_parts(self.kind, token, obtained_ms_of(new), client_id_of(new))
+        // The token of this plaintext, and at most one string of the previous one.
+        let room = self.room.saturating_add(previous.room);
+        OauthPlaintext::from_parts(
+            self.kind,
+            token,
+            obtained_ms_of(new),
+            client_id_of(new),
+            room,
+        )
     }
 
     /// The refresh token: in the token place first, then at the top level.
@@ -300,15 +438,23 @@ impl OauthPlaintext {
     /// The credential `forward` injects under one rule of the definition: the token at the first
     /// path of the rule that holds a non-empty string, and the header value made of the prefix
     /// and that token, or of HTTP Basic with the rule's user name and that token.
-    pub fn credential(&self, rule: &Inject) -> Option<Credential> {
-        let token = inject_token(rule, token_of(self.plaintext.expose_secret()))?;
+    ///
+    /// A plaintext without such a string is [`Unusable::Invalid`]. A token of more than
+    /// `limits::TOKEN_BYTES` bytes is [`Unusable::AboveBounds`]: the node makes no copy of
+    /// it, and no header.
+    pub fn credential(&self, rule: &Inject) -> Result<Credential, Unusable> {
+        let token = inject_token(rule, token_of(self.plaintext.expose_secret()))
+            .ok_or(Unusable::Invalid)?;
+        if token.len() > limits::TOKEN_BYTES {
+            return Err(Unusable::AboveBounds);
+        }
         let header = if rule.basic_user.is_empty() {
             format!("{}{}", rule.prefix, token)
         } else {
             let pair = Secret::new(format!("{}:{token}", rule.basic_user));
             format!("Basic {}", STANDARD.encode(pair.expose_secret().as_bytes()))
         };
-        Some(Credential {
+        Ok(Credential {
             header: Secret::new(header),
             token: Secret::new(token.to_string()),
         })
@@ -368,6 +514,11 @@ impl OauthPlaintext {
     /// Creates the record of this plaintext under the user key of the grant, with the kind this
     /// plaintext came from. This is the one place where a token leaves this module as a record
     /// (sink K1).
+    ///
+    /// `None` for a plaintext a node would not read again: its text is longer than
+    /// `limits::RECORD_PLAINTEXT_BYTES`, or takes more room than [`TOKEN_OBJECT_ROOM_BYTES`]
+    /// once it is parsed ([`OauthRecord::parse`] judges the same bytes by the same rule). A
+    /// node creates no record that it, or another node of its release, refuses to open.
     pub fn seal(
         &self,
         grant: &GrantView,
@@ -375,9 +526,15 @@ impl OauthPlaintext {
         nonce: &[u8; 12],
         user_id: &str,
         provider: &str,
-    ) -> Record {
+    ) -> Option<Record> {
         let plaintext = Secret::new(to_json(self.plaintext.expose_secret()));
-        record::seal(
+        let text = plaintext.expose_secret();
+        if text.len() > limits::RECORD_PLAINTEXT_BYTES
+            || Marks::of(text).value_room() > TOKEN_OBJECT_ROOM_BYTES
+        {
+            return None;
+        }
+        Some(record::seal(
             &grant.user_key,
             id,
             nonce,
@@ -387,7 +544,7 @@ impl OauthPlaintext {
             self.kind.kind(),
             provider,
             &plaintext,
-        )
+        ))
     }
 }
 
@@ -420,12 +577,22 @@ impl PublicFields {
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "a `TokenResponse` is made in one place, `judge_token_response`, from a value it \
+              read as a JSON object"
+)]
 fn object_of(value: &Value) -> &Map<String, Value> {
     value
         .as_object()
         .expect("a token response is created from a JSON object")
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "an `OauthPlaintext` is made in two places: `OauthRecord::parse`, which refuses a \
+              plaintext without a `token` object, and `from_parts`, which writes one"
+)]
 fn token_of(plaintext: &Value) -> &Map<String, Value> {
     plaintext
         .get("token")
@@ -460,8 +627,10 @@ fn push_percent_encoded(output: &mut String, text: &str) {
             output.push(char::from(byte));
         } else {
             output.push('%');
-            output.push(char::from(HEX[usize::from(byte >> 4)]));
-            output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+            // A half of a byte is below 16, the length of the table.
+            for half in [byte >> 4, byte & 0x0f] {
+                output.extend(HEX.get(usize::from(half)).map(|digit| char::from(*digit)));
+            }
         }
     }
 }
@@ -972,24 +1141,41 @@ pub async fn call_token_address(
         .await
         .map_err(|_| transport)?;
     let status = exchange.status;
+    // The buffer of the response has its whole room from the start: the call holds the
+    // bytes of the longest response at the most while the response arrives, which is the
+    // share of the body budget it took for it.
     let body = exchange
-        .read_body(TOKEN_RESPONSE_LIMIT_BYTES)
+        .read_body_within(TOKEN_RESPONSE_LIMIT_BYTES)
         .await
         .map(Secret::new)
         .map_err(|_| transport)?;
     judge_token_response(definition, status, &body)
 }
 
+/// Judges the response of a token address, and makes of a response it takes what a node
+/// keeps of it ([`kept_of`]).
+///
+/// A node takes a response within its bounds only. A response whose parsed form would take
+/// more room than [`TOKEN_RESPONSE_ROOM_BYTES`] is not parsed. A response with a token of
+/// more than `limits::TOKEN_BYTES` bytes is not taken, and neither is one whose kept part
+/// would take more room than a token object may take ([`TOKEN_OBJECT_ROOM_BYTES`]). Each is
+/// a failure with the status of the provider and no error word, like a response that is no
+/// JSON text. A string of the response that is no token is no reason of a failure, however
+/// long it is: a node does not keep it.
 fn judge_token_response(
     definition: &Definition,
     status: u16,
     body: &Secret<Vec<u8>>,
 ) -> Result<TokenResponse, TokenFailure> {
+    let unread = TokenFailure {
+        status,
+        error: ProviderError::NONE,
+    };
+    if Marks::of(body.expose_secret()).value_room() > TOKEN_RESPONSE_ROOM_BYTES {
+        return Err(unread);
+    }
     let Ok(parsed) = serde_json::from_slice::<Value>(body.expose_secret()) else {
-        return Err(TokenFailure {
-            status,
-            error: ProviderError::NONE,
-        });
+        return Err(unread);
     };
     let response = Secret::new(parsed);
     let failure = TokenFailure {
@@ -1004,7 +1190,92 @@ fn judge_token_response(
     if status != 200 || refused || access_token_of(object, &definition.token_container).is_none() {
         return Err(failure);
     }
-    Ok(TokenResponse(response))
+    if longest_token(object, definition) > limits::TOKEN_BYTES {
+        return Err(unread);
+    }
+    let paths = token_paths(definition);
+    let places: Vec<&[&str]> = paths.iter().map(Vec::as_slice).collect();
+    let kept = Secret::new(Value::Object(kept_of(object, &places)));
+    let text = Secret::new(to_json(kept.expose_secret()));
+    let room = Marks::of(text.expose_secret()).value_room();
+    if room > TOKEN_OBJECT_ROOM_BYTES {
+        return Err(unread);
+    }
+    Ok(TokenResponse(kept, room))
+}
+
+/// The paths of a token object at which `definition` has a token: `access_token`,
+/// `refresh_token` and `id_token` at its top level and in its token place, and the paths of
+/// its injection rules. Each path is the keys from the top level down.
+fn token_paths(definition: &Definition) -> Vec<Vec<&str>> {
+    let container = definition.token_container.as_str();
+    let mut paths: Vec<Vec<&str>> = TOKEN_KEYS.iter().map(|key| vec![*key]).collect();
+    if !container.is_empty() {
+        paths.extend(TOKEN_KEYS.iter().map(|key| vec![container, *key]));
+    }
+    paths.extend(
+        definition
+            .inject
+            .iter()
+            .flat_map(|rule| &rule.paths)
+            .map(|path| path.split('.').collect()),
+    );
+    paths
+}
+
+/// What a node keeps of an object of a token response: a copy without the strings a node
+/// reads from no token object.
+///
+/// A member is left out when its name is longer than [`TOKEN_RESPONSE_STRING_BYTES`], and
+/// when its value is a string that is longer and stands at none of the paths `tokens` (the
+/// paths of the tokens below this object: a path of one key names a member of it). An
+/// element of an array that is such a string is left out as well, and the objects and arrays
+/// inside are kept by the same rule, at every depth. Every other value is kept as it is. So
+/// the tokens of a response stay, and what a node keeps of a response beside them has no
+/// string above the longest value of a public field.
+fn kept_of(object: &Map<String, Value>, tokens: &[&[&str]]) -> Map<String, Value> {
+    let mut kept = Map::new();
+    for (name, value) in object {
+        if name.len() > TOKEN_RESPONSE_STRING_BYTES {
+            continue;
+        }
+        // The token paths that go on below this member.
+        let below: Vec<&[&str]> = tokens
+            .iter()
+            .filter_map(|path| match path {
+                [first, rest @ ..] if *first == name.as_str() => Some(rest),
+                _ => None,
+            })
+            .collect();
+        let value = match value {
+            Value::String(text) => {
+                let token = below.iter().any(|rest| rest.is_empty());
+                if text.len() > TOKEN_RESPONSE_STRING_BYTES && !token {
+                    continue;
+                }
+                value.clone()
+            }
+            Value::Object(nested) => Value::Object(kept_of(nested, &below)),
+            Value::Array(elements) => Value::Array(kept_elements(elements)),
+            _ => value.clone(),
+        };
+        kept.insert(name.clone(), value);
+    }
+    kept
+}
+
+/// What a node keeps of an array of a token response: [`kept_of`] for its elements. No token
+/// path leads into an array.
+fn kept_elements(elements: &[Value]) -> Vec<Value> {
+    elements
+        .iter()
+        .filter_map(|element| match element {
+            Value::String(text) if text.len() > TOKEN_RESPONSE_STRING_BYTES => None,
+            Value::Object(nested) => Some(Value::Object(kept_of(nested, &[]))),
+            Value::Array(nested) => Some(Value::Array(kept_elements(nested))),
+            _ => Some(element.clone()),
+        })
+        .collect()
 }
 
 /// The refresh rule of protocol.md 8.3: the old token with the keys of the response written
@@ -1140,12 +1411,14 @@ fn public_claims(fields: &[PublicField], token: &Map<String, Value>) -> Map<Stri
         return claims;
     }
     // The body of the JWT is read without verifying its signature: the TLS connection to the
-    // token address vouches for where it came from.
+    // token address vouches for where it came from. A body whose parsed form would take more
+    // room than a token object may take is not parsed, and gives no claim.
     let body = token
         .get("id_token")
         .and_then(Value::as_str)
         .and_then(|jwt| jwt.split('.').nth(1))
         .and_then(|part| URL_SAFE_NO_PAD.decode(part.trim_end_matches('=')).ok())
+        .filter(|bytes| Marks::of(bytes).value_room() <= TOKEN_OBJECT_ROOM_BYTES)
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
     if let Some(Value::Object(body)) = body {
         for field in fields {
@@ -1177,6 +1450,24 @@ fn token_strings<'a>(token: &'a Map<String, Value>, container: &str, tokens: &mu
             }
         }
     }
+}
+
+/// The length in bytes of the longest token of a token object under `definition`: the
+/// strings [`token_strings`] collects, and the strings at the paths its injection rules name.
+fn longest_token(token: &Map<String, Value>, definition: &Definition) -> usize {
+    let mut tokens = Vec::new();
+    token_strings(token, &definition.token_container, &mut tokens);
+    let injected = definition
+        .inject
+        .iter()
+        .flat_map(|rule| &rule.paths)
+        .filter_map(|path| lookup(token, path).and_then(Value::as_str));
+    tokens
+        .into_iter()
+        .chain(injected)
+        .map(str::len)
+        .max()
+        .unwrap_or(0)
 }
 
 /// True when a string value of `fields`, at any depth, contains one of `tokens`.
@@ -1239,7 +1530,14 @@ pub mod tests {
 
     /// A plaintext of kind `oauth` with the given token object, obtained at 77.
     fn issued(token: Value) -> OauthPlaintext {
-        OauthPlaintext::from_parts(TokenKind::Issued, object(token), 77, None)
+        let room = Marks::of(&to_json(&token)).value_room();
+        OauthPlaintext::from_parts(TokenKind::Issued, object(token), 77, None, room)
+    }
+
+    /// The response of a token address that the node took: the object `response`.
+    fn answered(response: Value) -> TokenResponse {
+        let room = Marks::of(&to_json(&response)).value_room();
+        TokenResponse(Secret::new(response), room)
     }
 
     /// Public fields without a value, for the tests of other modules that need the type.
@@ -2080,11 +2378,11 @@ pub mod tests {
             "refresh_token": "1//old-refresh",
             "scope": "openid",
         }));
-        let response = TokenResponse(Secret::new(json!({
+        let response = answered(json!({
             "access_token": "ya29.new-access",
             "refresh_token": "1//rotated-refresh",
             "scope": "openid 1//rotated-refresh",
-        })));
+        }));
         let renewed = old.refreshed(&response, "", 78);
         assert_eq!(
             renewed.public_fields(&google, Some(&response)),
@@ -2145,16 +2443,30 @@ pub mod tests {
             .into_parts();
         assert_eq!(header.expose_secret(), "Bearer xoxb-token");
         assert_eq!(token.expose_secret(), "xoxb-token");
-        assert!(issued(json!({"token_type": "Bearer"}))
-            .credential(slack.inject_rule("slack.com").unwrap())
-            .is_none());
+        let unusable = |token: Value| {
+            issued(token)
+                .credential(slack.inject_rule("slack.com").unwrap())
+                .err()
+        };
+        assert_eq!(
+            unusable(json!({"token_type": "Bearer"})),
+            Some(Unusable::Invalid)
+        );
+        // A token of the longest length a node handles is a credential, and one byte more is
+        // not: the node makes no copy of it.
+        let longest = "t".repeat(limits::TOKEN_BYTES);
+        assert_eq!(unusable(json!({"access_token": longest})), None);
+        assert_eq!(
+            unusable(json!({"access_token": format!("{longest}t")})),
+            Some(Unusable::AboveBounds)
+        );
     }
 
     #[test]
     fn a_plaintext_keeps_its_kind_and_its_key_order() {
         // A token response becomes a plaintext of kind `oauth`, with `client_id` for a
         // dynamically registered client.
-        let response = TokenResponse(Secret::new(json!({"access_token": "ya29.long-access"})));
+        let response = answered(json!({"access_token": "ya29.long-access"}));
         let plaintext = response.into_plaintext(5, Some("dyn-client"));
         assert_eq!(plaintext.kind, TokenKind::Issued);
         assert_eq!(
@@ -2168,8 +2480,9 @@ pub mod tests {
             object(json!({"access_token": "ya29.old-access", "refresh_token": "1//old-refresh"})),
             1,
             None,
+            0,
         );
-        let response = TokenResponse(Secret::new(json!({"access_token": "ya29.new-access"})));
+        let response = answered(json!({"access_token": "ya29.new-access"}));
         let renewed = imported.refreshed(&response, "", 9);
         assert_eq!(renewed.kind, TokenKind::Imported);
         assert_eq!(TokenKind::Imported.kind(), Kind::OauthImported);
@@ -2190,8 +2503,342 @@ pub mod tests {
             (token.expose_secret().as_str(), hint),
             ("ya29.only-access", "access_token")
         );
-        for kind in [Kind::VaultPassword, Kind::VaultTotp, Kind::VaultCard] {
+        for kind in [
+            Kind::VaultPassword,
+            Kind::VaultTotp,
+            Kind::VaultCard,
+            Kind::VaultSecret,
+        ] {
             assert_eq!(TokenKind::of(kind), None);
         }
+    }
+
+    /// An opened record of kind `oauth` with the given plaintext.
+    fn opened(plaintext: &[u8]) -> OauthRecord {
+        OauthRecord {
+            kind: TokenKind::Issued,
+            plaintext: Secret::new(plaintext.to_vec()),
+        }
+    }
+
+    /// A token object with `count` arrays of one element beside its access token: many
+    /// values in a text of few bytes.
+    fn of_many_values(count: usize) -> Value {
+        json!({"access_token": "ya29.access", "more": vec![json!([0]); count]})
+    }
+
+    #[test]
+    fn a_plaintext_is_parsed_within_the_room_of_a_token_object() {
+        let plaintext = |token: Value| to_json(&json!({"token": token, "obtained_ms": 1}));
+        // The room of a parsed plaintext is the room of its text: for a text of 56 bytes with
+        // two objects and one comma, its bytes and a quarter, 512 bytes for each object, 448
+        // for the comma, and 1,024.
+        let small = plaintext(json!({"access_token": "ya29.access"}));
+        assert_eq!(small.len(), 56);
+        let parsed = opened(&small).parse().unwrap();
+        assert_eq!(parsed.room(), 56 + 14 + 2 * 512 + 448 + 1024);
+        // A plaintext that is no token object.
+        for text in [
+            &b"[]"[..],
+            b"{\"obtained_ms\":1}",
+            b"{\"token\":5}",
+            b"not json",
+        ] {
+            assert_eq!(opened(text).parse().err(), Some(Unusable::Invalid));
+        }
+        // A plaintext of many small values is parsed as long as its parsed form stays within
+        // the room of a token object, and is not parsed above it: 400 arrays in 1,700 bytes
+        // of text take more.
+        let within = plaintext(of_many_values(200));
+        let room = Marks::of(&within).value_room();
+        assert!(room <= TOKEN_OBJECT_ROOM_BYTES, "{room}");
+        assert_eq!(opened(&within).parse().unwrap().room(), room);
+        let above = plaintext(of_many_values(400));
+        assert!(above.len() < 2000, "{}", above.len());
+        assert!(Marks::of(&above).value_room() > TOKEN_OBJECT_ROOM_BYTES);
+        assert_eq!(opened(&above).parse().err(), Some(Unusable::AboveBounds));
+        // The room is judged before the text is parsed: a text above it that is no JSON text
+        // is above the bounds, not invalid.
+        let mut broken = above.clone();
+        broken.push(b'}');
+        assert_eq!(opened(&broken).parse().err(), Some(Unusable::AboveBounds));
+        // A long string is no structure: a plaintext of 60,000 bytes in one string is parsed.
+        let long = plaintext(json!({"access_token": "ya29.access", "icon": "i".repeat(60_000)}));
+        assert!(opened(&long).parse().is_ok());
+    }
+
+    #[test]
+    fn no_token_of_a_plaintext_is_longer_than_a_node_handles() {
+        let google = definition("google_workspace");
+        let slack = definition("slack");
+        let longest = "t".repeat(limits::TOKEN_BYTES);
+        let longer = format!("{longest}t");
+        let bounded =
+            |definition: &Definition, token: Value| issued(token).within_bounds(definition);
+        assert_eq!(
+            bounded(
+                &google,
+                json!({"access_token": longest, "refresh_token": longest, "id_token": longest})
+            ),
+            Ok(())
+        );
+        for key in TOKEN_KEYS {
+            let mut token = json!({"access_token": "ya29.access"});
+            token[key] = json!(longer);
+            assert_eq!(bounded(&google, token), Err(Unusable::AboveBounds), "{key}");
+        }
+        // The tokens of the token place of a definition, and the token its rule injects.
+        assert_eq!(
+            bounded(
+                &slack,
+                json!({"access_token": "xoxb", "authed_user": {"access_token": longer}})
+            ),
+            Err(Unusable::AboveBounds)
+        );
+        assert_eq!(
+            bounded(
+                &slack,
+                json!({"access_token": "xoxb", "authed_user": {"refresh_token": longer}})
+            ),
+            Err(Unusable::AboveBounds)
+        );
+        // Another string of the token object is no token: its length is not judged here.
+        assert_eq!(
+            bounded(
+                &google,
+                json!({"access_token": "ya29.access", "workspace_icon": "i".repeat(40_000)})
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_token_response_is_taken_within_the_bounds_of_a_node() {
+        let google = definition("google_workspace");
+        let judge = |response: &Value| {
+            judge_token_response(&google, 200, &Secret::new(to_json(response)))
+                .map(|response| response.1)
+        };
+        let unread = Err(TokenFailure {
+            status: 200,
+            error: ProviderError::NONE,
+        });
+        let longest = "t".repeat(limits::TOKEN_BYTES);
+        let longer = format!("{longest}t");
+        // The room of a response the node took is the room of its text.
+        let response = json!({"access_token": longest, "refresh_token": longest});
+        assert_eq!(
+            judge(&response),
+            Ok(Marks::of(&to_json(&response)).value_room())
+        );
+        // A token of one byte more: the response is not taken.
+        for key in TOKEN_KEYS {
+            let mut response = json!({"access_token": "ya29.access"});
+            response[key] = json!(longer);
+            assert_eq!(judge(&response), unread, "{key}");
+        }
+        // A response of more values than a token object may hold is not taken: its kept part
+        // would take more room than a token object may take. And a response whose parsed form
+        // would take more room than a node gives a response is not parsed.
+        assert!(judge(&of_many_values(200)).is_ok());
+        assert_eq!(judge(&of_many_values(400)), unread);
+        let many = of_many_values(2_000);
+        assert!(to_json(&many).len() < 10_000);
+        assert!(Marks::of(&to_json(&many)).value_room() > TOKEN_RESPONSE_ROOM_BYTES);
+        assert_eq!(judge(&many), unread);
+        // That holds also for a response of which the node would keep no more than a token
+        // object may take: 127 strings of 8,193 bytes, which a node does not keep, and 560
+        // further elements.
+        let mut elements = vec![json!("l".repeat(8193)); 127];
+        elements.extend(vec![json!(0); 560]);
+        let response = json!({"access_token": "ya29.access", "more": elements});
+        let kept = json!({"access_token": "ya29.access", "more": vec![json!(0); 560]});
+        assert!(to_json(&response).len() <= TOKEN_RESPONSE_LIMIT_BYTES);
+        assert!(Marks::of(&to_json(&response)).value_room() > TOKEN_RESPONSE_ROOM_BYTES);
+        assert!(Marks::of(&to_json(&kept)).value_room() <= TOKEN_OBJECT_ROOM_BYTES);
+        assert_eq!(judge(&response), unread);
+        // A long string that is no token is no reason of a failure: the response is taken
+        // without it, and its room is that of what the node keeps of it.
+        let response = json!({"access_token": "ya29.access", "workspace_icon": "i".repeat(40_000)});
+        assert_eq!(
+            judge(&response),
+            Ok(Marks::of(&to_json(&json!({"access_token": "ya29.access"}))).value_room())
+        );
+        // So is a response of the longest length a node reads that is one such string, with
+        // tokens of the longest length a node handles.
+        let frame = to_json(&json!({
+            "access_token": longest, "refresh_token": longest, "id_token": longest, "icon": "",
+        }))
+        .len();
+        let response = json!({
+            "access_token": longest, "refresh_token": longest, "id_token": longest,
+            "icon": "i".repeat(TOKEN_RESPONSE_LIMIT_BYTES - frame),
+        });
+        assert_eq!(to_json(&response).len(), TOKEN_RESPONSE_LIMIT_BYTES);
+        assert!(judge(&response).is_ok());
+        assert_eq!(TOKEN_RESPONSE_LIMIT_BYTES, 1_048_576);
+        assert_eq!(TOKEN_RESPONSE_ROOM_BYTES, 1_048_576 + 262_144 + 262_144);
+    }
+
+    #[test]
+    fn a_node_keeps_the_tokens_and_the_short_values_of_a_token_response() {
+        // What a node keeps of a response it takes, as JSON text: the text shows the order of
+        // the members as well.
+        let kept = |definition: &Definition, response: Value| {
+            judge_token_response(definition, 200, &Secret::new(to_json(&response)))
+                .map(|response| serde_json::to_string(response.0.expose_secret()).unwrap())
+                .map_err(|failure| failure.status)
+        };
+        let text = |value: Value| Ok(serde_json::to_string(&value).unwrap());
+        let google = definition("google_workspace");
+        let slack = definition("slack");
+        assert_eq!(TOKEN_RESPONSE_STRING_BYTES, 8192);
+        let short = "s".repeat(8192);
+        let long = "l".repeat(8193);
+        let token = "t".repeat(limits::TOKEN_BYTES);
+
+        // A token stays whatever its length within the longest token. A string that is no
+        // token stays up to 8,192 bytes and is left out above, at every depth, and so is a
+        // member whose name is longer. Every other value stays as it is, in its order.
+        assert_eq!(
+            kept(
+                &google,
+                json!({
+                    "access_token": token, "refresh_token": token, "id_token": token,
+                    "scope": short, "icon": long, "expires_in": 3599, "ok": true, "none": null,
+                    "owner": {
+                        "user": {"name": "Ada", "avatar_url": long, "access_token": long},
+                        "tags": ["a", long, 7, {"note": long, "kept": short}, [long, "b"]],
+                    },
+                    long.as_str(): "a member with a long name",
+                    "last": "z",
+                })
+            ),
+            text(json!({
+                "access_token": token, "refresh_token": token, "id_token": token,
+                "scope": short, "expires_in": 3599, "ok": true, "none": null,
+                "owner": {
+                    "user": {"name": "Ada"},
+                    "tags": ["a", 7, {"kept": short}, ["b"]],
+                },
+                "last": "z",
+            }))
+        );
+        // The tokens of the token place of a definition, and the token its rules inject, stay
+        // as well; another string of that place does not.
+        assert_eq!(
+            kept(
+                &slack,
+                json!({
+                    "ok": true, "access_token": long,
+                    "authed_user": {
+                        "access_token": long, "refresh_token": long, "id_token": long,
+                        "scope": short, "more": long,
+                    },
+                    "team": {"access_token": long, "name": "T"},
+                })
+            ),
+            text(json!({
+                "ok": true, "access_token": long,
+                "authed_user": {
+                    "access_token": long, "refresh_token": long, "id_token": long,
+                    "scope": short,
+                },
+                "team": {"name": "T"},
+            }))
+        );
+        // What a node makes public of a response does not change with what it leaves out: no
+        // public field is a string of more than 8,192 bytes.
+        let fields = |response: Value| {
+            let token: Value = serde_json::from_str(&kept(&google, response).unwrap()).unwrap();
+            public(&google, token)
+        };
+        let response = json!({
+            "access_token": "ya29.access", "refresh_token": "1//refresh", "scope": short,
+            "expires_in": 3599, "token_type": "Bearer",
+        });
+        let mut with_more = response.clone();
+        with_more["workspace_icon"] = json!("i".repeat(500_000));
+        assert_eq!(fields(with_more), fields(response.clone()));
+        assert_eq!(fields(response)["token"]["scope"], json!(short));
+        // A response of many strings a node keeps is not taken when they take more room than
+        // a token object may take: 40 strings of 8,192 bytes.
+        let mut many = json!({"access_token": "ya29.access"});
+        for index in 0..40 {
+            many[format!("value_{index}")] = json!(short);
+        }
+        assert_eq!(kept(&google, many), Err(200));
+    }
+
+    #[test]
+    fn a_node_creates_no_record_it_would_not_read() {
+        let grant = GrantView {
+            key_id: "0123456789abcdef".to_string(),
+            sign_pk: [1; 32],
+            log_pk: [2; 32],
+            custody: credential_enclave_protocol::keys::Custody::Enclave,
+            user_key: Secret::new([3; 32]),
+            revoke_serial: 0,
+        };
+        let sealed = |plaintext: &OauthPlaintext| {
+            plaintext.seal(&grant, &[4; 16], &[5; 12], "user-1", "google_workspace")
+        };
+        // The plaintext of a record is at most 65,536 bytes: a string of the token object
+        // that is no token fills it.
+        let token =
+            |filler: usize| json!({"access_token": "ya29.access", "icon": "i".repeat(filler)});
+        let frame = to_json(&json!({"token": token(0), "obtained_ms": 77})).len();
+        let of_bytes = |bytes: usize| issued(token(bytes - frame));
+        let record = sealed(&of_bytes(limits::RECORD_PLAINTEXT_BYTES)).unwrap();
+        assert_eq!(record.ct.len(), limits::RECORD_CT_CHARS);
+        assert!(Record::from_value(&serde_json::to_value(&record).unwrap()).is_ok());
+        assert!(sealed(&of_bytes(limits::RECORD_PLAINTEXT_BYTES + 1)).is_none());
+        // A plaintext whose parsed form takes more room than a token object may take: the
+        // rule by which a node refuses to parse the plaintext of a record.
+        assert!(sealed(&issued(of_many_values(200))).is_some());
+        assert!(sealed(&issued(of_many_values(400))).is_none());
+        // The merge of two token objects that each lie within the bounds can lie above them:
+        // the plaintext of a record of an earlier release with a long string, and a response
+        // with four strings of the longest length a node keeps.
+        let old = issued(
+            json!({"access_token": "ya29.old", "refresh_token": "1//refresh",
+            "old": "o".repeat(40_000)}),
+        );
+        let kept = "n".repeat(TOKEN_RESPONSE_STRING_BYTES);
+        let response = judge_token_response(
+            &definition("google_workspace"),
+            200,
+            &Secret::new(to_json(&json!({
+                "access_token": "ya29.new", "a": kept, "b": kept, "c": kept, "d": kept,
+            }))),
+        )
+        .unwrap();
+        assert!(sealed(&old).is_some());
+        assert!(sealed(&old.refreshed(&response, "", 78)).is_none());
+        // The same response on a record without that string gives a record.
+        let short = issued(json!({"access_token": "ya29.old", "refresh_token": "1//refresh"}));
+        assert!(sealed(&short.refreshed(&response, "", 78)).is_some());
+    }
+
+    #[test]
+    fn the_body_of_an_id_token_is_read_within_the_room_of_a_token_object() {
+        let google = definition("google_workspace");
+        let claims = |body: Value| {
+            let token = json!({"access_token": "ya29.long-access", "id_token": jwt(body)});
+            public(&google, token)["id_token_claims"].clone()
+        };
+        // The body of an id_token with 200 group identifiers is read.
+        let groups = vec![json!("0f8fad5b-d9cb-469f-a165-70867728950e"); 200];
+        assert_eq!(
+            claims(json!({"sub": "1234", "email": "a@example.com", "groups": groups})),
+            json!({"sub": "1234", "email": "a@example.com"})
+        );
+        // A body whose parsed form would take more room than a token object may take is not
+        // parsed, and gives no claim.
+        let many = vec![json!([0]); 400];
+        assert_eq!(
+            claims(json!({"sub": "1234", "email": "a@example.com", "more": many})),
+            json!({})
+        );
     }
 }

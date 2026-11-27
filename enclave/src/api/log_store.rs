@@ -9,7 +9,7 @@ use credential_enclave_protocol::ProtocolError;
 
 use super::responses::CredentialsStored;
 use super::{json_ok, respond, ApiError, JsonBody};
-use crate::log_store::Credentials;
+use crate::log_store::{self, Credentials};
 use crate::state::Node;
 
 pub async fn credentials(State(node): State<Arc<Node>>, request: Request) -> Response {
@@ -24,7 +24,7 @@ pub async fn credentials(State(node): State<Arc<Node>>, request: Request) -> Res
 /// where the node writes: that is the log store of the configuration, which the binding of
 /// the attestation names.
 async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
-    let body = JsonBody::read(request).await?;
+    let body = JsonBody::read(node, request).await?;
     let expires_ms = body.number("expires_ms")?;
     let credentials = Credentials::new(
         body.text("access_key_id")?,
@@ -39,7 +39,13 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
         )
     })?;
     node.log_store.set_credentials(credentials);
+    // With credentials the node can write its node document: it does so here when the document
+    // is due (protocol.md 7.7), so a node that received its log store and its credentials has
+    // the document in the store before a user key arrives. The outcome does not change the
+    // answer of this call: the sweep writes the document as well.
+    let node_document_ms = log_store::write_node_document(node).await;
     Ok(json_ok(&CredentialsStored {
         credentials_expires_ms: expires_ms,
+        node_document_ms,
     }))
 }

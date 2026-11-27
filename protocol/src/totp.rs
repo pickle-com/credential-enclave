@@ -48,11 +48,14 @@ pub fn totp(seed_base32: &str, time_ms: u64) -> Result<String, ProtocolError> {
     let mut mac = Hmac::<Sha1>::new_from_slice(&seed).map_err(|_| ProtocolError::RecordInvalid)?;
     mac.update(&counter.to_be_bytes());
     let digest = mac.finalize().into_bytes();
-    let offset = usize::from(digest[19] & 0x0f);
-    let binary = (u32::from(digest[offset]) & 0x7f) << 24
-        | u32::from(digest[offset + 1]) << 16
-        | u32::from(digest[offset + 2]) << 8
-        | u32::from(digest[offset + 3]);
+    // RFC 4226 section 5.3: the low four bits of the last of the twenty bytes say where four
+    // bytes are read, so the place is 15 at the most and the four bytes lie in the digest.
+    let offset = usize::from(digest.last().copied().unwrap_or(0) & 0x0f);
+    let four = digest
+        .get(offset..offset + 4)
+        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+        .unwrap_or_default();
+    let binary = u32::from_be_bytes(four) & 0x7fff_ffff;
     Ok(format!(
         "{:0width$}",
         binary % 10u32.pow(DIGITS),

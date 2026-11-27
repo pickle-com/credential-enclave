@@ -1,8 +1,9 @@
 //! The shutdown collection call (enclave.md section 9).
 //!
-//! A node keeps its state in memory, so the backend collects what must outlive the node before
-//! the enclave ends: it calls `close`, `log/entries` and `close/heads` of the node. The host
-//! program starts this by one request when it receives the termination signal:
+//! A node keeps its state in memory, so the backend hands on what must outlive the node before
+//! the enclave ends: it calls `close` of the node and moves its delegations to other nodes with
+//! `peer/export`. The host program starts this by one request when it receives the termination
+//! signal:
 //!
 //! ```text
 //! POST {CREDENTIAL_ENCLAVE_DRAIN_URL}
@@ -14,10 +15,10 @@
 //!
 //! The backend makes its calls to the node inside that request, through the inbound relay of
 //! this host program, and the host program waits for the response for a time that grows with
-//! the accounts of the node ([`response_timeout`]): the backend hands the delegations over and
-//! collects the final heads page by page, 1,000 accounts a page, so the collection of a node
-//! takes a time proportional to its pages. Without one of the three variables the host
-//! program ends the enclave without the call.
+//! the delegations of the node ([`response_timeout`]): the backend hands the delegations over
+//! page by page, 1,000 accounts a page, so the collection of a node takes a time proportional
+//! to its pages. Without one of the three variables the host program ends the enclave without
+//! the call.
 
 use std::future::Future;
 use std::io;
@@ -35,28 +36,34 @@ pub const URL_VARIABLE: &str = "CREDENTIAL_ENCLAVE_DRAIN_URL";
 pub const TOKEN_VARIABLE: &str = "CREDENTIAL_ENCLAVE_DRAIN_TOKEN";
 pub const POD_VARIABLE: &str = "CREDENTIAL_ENCLAVE_POD_NAME";
 
-/// The accounts of one page of the collection: `peer/export` and `close/heads` of the node
-/// page by 1,000 accounts (enclave.md 5.11 and 5.13).
+/// The accounts of one page of the collection: `peer/export` of the node pages by 1,000
+/// accounts (enclave.md 5.13).
 pub const ACCOUNTS_PER_PAGE: u64 = 1_000;
 /// The wait for the response of the backend, from the start of the connection, for a node
-/// without accounts: the base of [`response_timeout`].
+/// without delegations: the base of [`response_timeout`].
 pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(100);
-/// What the wait grows by for every page of accounts of the node: the pages of the two
-/// stages that go page by page (the handover of the delegations, measured at about 2 seconds
-/// a page, and the final heads, measured at about 1 second a page), with room.
+/// What the wait grows by for every page of delegations of the node: the handover goes page by
+/// page, and a page whose transfer has entries (a handover to another release) waits for the
+/// log store as well.
 pub const RESPONSE_TIMEOUT_PER_PAGE: Duration = Duration::from_secs(4);
-/// The longest wait. The `terminationGracePeriodSeconds` of the pod covers this wait twice
-/// (the subcommand of the pre-stop hook and the signal path) with a margin.
+/// The longest wait. The `terminationGracePeriodSeconds` of the pod covers this wait of the
+/// subcommand of the pre-stop hook and, after the termination signal, the wait for the calls
+/// in progress of the node, in which the call of the signal path runs (`calls`), with a
+/// margin. The call of the signal path ends before the limit of that wait: this wait is
+/// shorter than `calls::CALLS_WAIT`.
 pub const RESPONSE_TIMEOUT_MAX: Duration = Duration::from_secs(600);
+const _: () = assert!(RESPONSE_TIMEOUT_MAX.as_secs() < crate::calls::CALLS_WAIT.as_secs());
 /// Longest response body the host program reads.
 const REPLY_LIMIT_BYTES: usize = 1024 * 1024;
 
-/// The wait for the response of the backend for a node of `accounts` accounts (the
-/// `accounts` of its `health` call, `None` when the call gave none): the base plus
+/// The wait for the response of the backend for a node that holds `delegations` delegations
+/// (the `grants` of its `health` call, `None` when the call gave none): the base plus
 /// [`RESPONSE_TIMEOUT_PER_PAGE`] for every started page of [`ACCOUNTS_PER_PAGE`] accounts, at
-/// most [`RESPONSE_TIMEOUT_MAX`].
-pub fn response_timeout(accounts: Option<u64>) -> Duration {
-    let pages = accounts
+/// most [`RESPONSE_TIMEOUT_MAX`]. The delegations are what the collection hands over: a node
+/// that took its delegations from another node holds them before it created an entry for
+/// their accounts, so the `accounts` of `health` does not count them.
+pub fn response_timeout(delegations: Option<u64>) -> Duration {
+    let pages = delegations
         .unwrap_or(0)
         .div_ceil(ACCOUNTS_PER_PAGE)
         .min(u64::from(u32::MAX));
@@ -200,10 +207,10 @@ impl Drain {
     }
 
     /// Calls the backend and waits for its response, for at most [`response_timeout`] of the
-    /// accounts of the node in total. Returns the status of the response.
-    pub async fn call(&self, accounts: Option<u64>) -> Result<u16, &'static str> {
+    /// delegations of the node in total. Returns the status of the response.
+    pub async fn call(&self, delegations: Option<u64>) -> Result<u16, &'static str> {
         let target = (self.address.host.as_str(), self.address.port);
-        self.call_through(TcpStream::connect(target), response_timeout(accounts))
+        self.call_through(TcpStream::connect(target), response_timeout(delegations))
             .await
     }
 }
@@ -412,14 +419,14 @@ mod tests {
 
     #[test]
     fn the_wait_grows_with_the_pages_of_the_node_up_to_the_longest_wait() {
-        // No accounts, or no health answer: the base.
+        // No delegations, or no health answer: the base.
         assert_eq!(response_timeout(None), Duration::from_secs(100));
         assert_eq!(response_timeout(Some(0)), Duration::from_secs(100));
         // A started page counts as a page.
         assert_eq!(response_timeout(Some(1)), Duration::from_secs(104));
         assert_eq!(response_timeout(Some(1_000)), Duration::from_secs(104));
         assert_eq!(response_timeout(Some(1_001)), Duration::from_secs(108));
-        // The node of 2026-11-05 with 46,167 accounts: 47 pages.
+        // A node that holds 46,167 delegations: 47 pages.
         assert_eq!(response_timeout(Some(46_167)), Duration::from_secs(288));
         // 125 pages reach the longest wait, and more pages do not pass it.
         assert_eq!(response_timeout(Some(125_000)), RESPONSE_TIMEOUT_MAX);
@@ -428,9 +435,9 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn the_wait_for_the_response_ends_after_the_wait_of_the_accounts() {
+    async fn the_wait_for_the_response_ends_after_the_wait_of_the_delegations() {
         let drain = Drain::from_variables(&environment(&FULL)).unwrap().unwrap();
-        // The backend accepts the connection and never answers. A node of 2,500 accounts
+        // The backend accepts the connection and never answers. A node of 2,500 delegations
         // (three pages) gets the base and three pages.
         let (near, _far) = tokio::io::duplex(4096);
         let started = tokio::time::Instant::now();

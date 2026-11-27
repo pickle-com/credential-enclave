@@ -21,7 +21,7 @@ use webpki::{
 
 use crate::encoding::{b64u_decode, b64u_decode_array};
 use crate::envelope::is_usable_seal_key;
-use crate::keys::LogStoreId;
+use crate::keys::{LogStoreId, Role};
 use crate::limits;
 
 /// The AWS Nitro Enclaves Root-G1 certificate (DER): the trust anchor of Nitro attestation
@@ -178,14 +178,21 @@ pub struct NodeBinding {
     pub release: String,
     /// The log store the node writes its entries to before it acts, when it has one.
     pub log: Option<LogStoreId>,
+    /// The role of the node: the role the key `role` of the binding names, the delegation role
+    /// for a binding without that key.
+    pub role: Role,
 }
 
 /// Reads a binding document (protocol.md 4.1):
 /// `{"v":1,"sign":b64u(32 bytes),"seal":b64u(32 bytes),"release":"..."}` of at most 512 bytes,
-/// with the key `"log":{"bucket":"...","region":"..."}` when the node has a log store.
+/// with the key `"log":{"bucket":"...","region":"..."}` when the node has a log store, and the
+/// key `"role"` when the node has the reserve role (`reserve`) or the forward role (`forward`).
 /// A sealing key HPKE cannot seal to (a small-order point) is refused, so whatever is sealed
 /// for the keys of a binding this function returned can be sealed. A `log` that is not a bucket
-/// name and a region name is refused: a binding states its log store or none.
+/// name and a region name is refused: a binding states its log store or none. A `role` that is
+/// neither the string `reserve` nor the string `forward` is refused: it names no role this
+/// release knows. So is a binding with the role `forward` and a `log`: a node of the forward
+/// role has no log store.
 pub fn read_binding(binding: &[u8]) -> Result<NodeBinding, AttestationError> {
     binding_of(binding).ok_or(AttestationError::Malformed)
 }
@@ -210,11 +217,19 @@ fn binding_of(binding: &[u8]) -> Option<NodeBinding> {
             log.get("region")?.as_str()?,
         )?),
     };
+    let role = match value.get("role") {
+        None => Role::of_binding(None)?,
+        Some(role) => Role::of_binding(Some(role.as_str()?))?,
+    };
+    if role == Role::Forward && log.is_some() {
+        return None;
+    }
     Some(NodeBinding {
         sign_public,
         seal_public,
         release: value.get("release")?.as_str()?.to_string(),
         log,
+        role,
     })
 }
 
@@ -262,8 +277,9 @@ fn parse_nitro_document(
 }
 
 /// The certificates of an attestation document are not TLS certificates, and protocol.md 4.3
-/// names no extended key usage: every purpose is accepted. A malformed extension is not.
-struct AnyKeyPurpose;
+/// names no extended key usage: every purpose is accepted. A malformed extension is not. The
+/// certificate of a release proof is validated with the same rule (`release_proofs.rs`).
+pub(crate) struct AnyKeyPurpose;
 
 impl ExtendedKeyUsageValidator for AnyKeyPurpose {
     fn validate(&self, purposes: KeyPurposeIdIter<'_, '_>) -> Result<(), webpki::Error> {
@@ -288,12 +304,14 @@ fn ecdsa_der(raw: &[u8]) -> Option<Vec<u8>> {
     for half in raw.chunks(ECDSA_P384_SIGNATURE_BYTES / 2) {
         // A DER integer is the shortest two's complement form: no leading zero bytes, and one
         // zero byte in front of a value whose first bit is set.
+        // The digits from the first one that is not zero, or the last digit of a value of
+        // zero: one digit at the least.
         let start = half
             .iter()
             .position(|byte| *byte != 0)
-            .unwrap_or(half.len() - 1);
-        let digits = &half[start..];
-        let pad = digits[0] & 0x80 != 0;
+            .unwrap_or(half.len().saturating_sub(1));
+        let digits = half.get(start..)?;
+        let pad = digits.first()? & 0x80 != 0;
         body.push(0x02);
         body.push(u8::try_from(digits.len() + usize::from(pad)).ok()?);
         if pad {
@@ -418,15 +436,20 @@ impl<'a> CborReader<'a> {
         Ok(slice)
     }
 
+    /// The next byte.
+    fn byte(&mut self) -> Result<u8, Malformed> {
+        self.take(1)?.first().copied().ok_or(Malformed)
+    }
+
     /// Reads the head of the next item: its major type and its argument. An indefinite length
     /// is malformed here: [`CborReader::array`] and [`CborReader::map`] read the two items that
     /// may have one. A break outside of such a container is malformed as well.
     fn head(&mut self) -> Result<(u8, u64), Malformed> {
-        let initial = self.take(1)?[0];
+        let initial = self.byte()?;
         let major = initial >> 5;
         let argument = match initial & 0x1f {
             small @ 0..=23 => u64::from(small),
-            24 => u64::from(self.take(1)?[0]),
+            24 => u64::from(self.byte()?),
             25 => u64::from(u16::from_be_bytes(
                 self.take(2)?.try_into().map_err(|_| Malformed)?,
             )),
@@ -704,7 +727,7 @@ impl<'a> NitroPayload<'a> {
 mod tests {
     use super::*;
     use crate::encoding::{b64u, to_json};
-    use crate::keys::{binding, NodeKeys};
+    use crate::keys::{binding, forward_binding, NodeKeys};
     use ring::rand::SystemRandom;
     use ring::signature::{EcdsaKeyPair, ECDSA_P384_SHA384_FIXED_SIGNING};
     use serde_json::json;
@@ -1308,6 +1331,7 @@ mod tests {
                 seal_public: keys.seal_public(),
                 release: "v1.0.0".to_string(),
                 log: None,
+                role: Role::Delegation,
             })
         );
         assert_eq!(verify(&document, None), Ok(verified.clone()));
@@ -1809,8 +1833,49 @@ mod tests {
             |binding| binding["log"] = json!({"bucket": "character-credential-log-prod-1", "region": "us-west-2", "future": 1}),
         ));
         assert_eq!(stated.unwrap().log, Some(log));
+        // A binding states the reserve role or the forward role, or it is the binding of a
+        // node of the delegation role. A node of the reserve role has a log store, like one
+        // of the delegation role.
+        assert_eq!(read_binding(&value(|_| {})).unwrap().role, Role::Delegation);
+        let reserve = read_binding(&value(|binding| {
+            binding["role"] = json!("reserve");
+            binding["log"] =
+                json!({"bucket": "character-credential-log-prod-1", "region": "us-west-2"});
+        }))
+        .unwrap();
+        assert_eq!(reserve.role, Role::Reserve);
+        assert!(reserve.log.is_some());
+        assert_eq!(
+            read_binding(&value(|binding| binding["role"] = json!("reserve")))
+                .unwrap()
+                .role,
+            Role::Reserve
+        );
+        let forward = read_binding(&forward_binding(&keys, "v1.0.0")).unwrap();
+        assert_eq!((forward.role, forward.log), (Role::Forward, None));
+        assert_eq!(forward.seal_public, keys.seal_public());
+        assert_eq!(
+            read_binding(&value(|binding| binding["role"] = json!("forward")))
+                .unwrap()
+                .role,
+            Role::Forward
+        );
 
-        let changes: [fn(&mut serde_json::Value); 16] = [
+        let changes: [fn(&mut serde_json::Value); 24] = [
+            // A role this release does not know, and a role that is no string.
+            |binding| binding["role"] = json!("delegation"),
+            |binding| binding["role"] = json!("Forward"),
+            |binding| binding["role"] = json!("Reserve"),
+            |binding| binding["role"] = json!("witness"),
+            |binding| binding["role"] = json!(""),
+            |binding| binding["role"] = json!(null),
+            |binding| binding["role"] = json!(["forward"]),
+            // A node of the forward role has no log store.
+            |binding| {
+                binding["role"] = json!("forward");
+                binding["log"] =
+                    json!({"bucket": "character-credential-log-prod-1", "region": "us-west-2"});
+            },
             // A log store that is not a bucket name and a region name.
             |binding| binding["log"] = json!(null),
             |binding| binding["log"] = json!("character-credential-log-prod-1"),

@@ -10,8 +10,8 @@
 //! [`limits::FORWARD_BATCH_CONCURRENCY`] at a time. The response frame lists one result per
 //! request, in the order of the requests.
 
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Request, State};
@@ -20,9 +20,12 @@ use credential_enclave_protocol::{limits, ProtocolError};
 use hyper::body::Bytes;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use super::forward::{execute, prepare, read_frame, timeout_of, Prepared};
+use super::forward::{
+    credential_share, execute, longest_token, prepare, read_frame, search_turns, timeout_of,
+    usable, Framed, Prepared,
+};
 use super::responses::{forward_batch_frame, BatchResult, LogRef};
-use super::{record_of, respond, ApiError};
+use super::{above_bounds, narrowed, record_of, reserve, respond, Admission, ApiError};
 use crate::log_store::{self, join_all};
 use crate::oauth;
 use crate::state::{lock, Node};
@@ -67,12 +70,16 @@ fn split_bodies(requests: &[serde_json::Value], payload: &Bytes) -> Result<Vec<B
 
 async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
     // A batch call takes one forward slot: the slots count calls, not requests.
-    let _slot = node
-        .forward_slots
-        .acquire()
-        .await
-        .map_err(|_| ApiError::internal())?;
-    let (meta, payload, request_budget) = read_frame(node, request).await?;
+    let admission = Admission::begin();
+    let _slot = admission.slot(node).await?;
+    // The meta is parsed under the share of the request of the call, which the call holds
+    // to its end: the parsed requests, and what the call makes of each of them.
+    let Framed {
+        meta,
+        payload,
+        frame_budget: request_budget,
+        request_share: _request_share,
+    } = read_frame(node, request, &admission).await?;
     let user_id = meta.user_id()?;
     let record = record_of(&meta, "record")?;
     let context = meta.context()?;
@@ -81,9 +88,8 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
         .get("requests")
         .and_then(serde_json::Value::as_array)
         .filter(|requests| (1..=limits::FORWARD_BATCH_REQUESTS).contains(&requests.len()))
-        .ok_or_else(|| super::invalid("requests"))?
-        .clone();
-    let bodies = split_bodies(&requests, &payload)?;
+        .ok_or_else(|| super::invalid("requests"))?;
+    let bodies = split_bodies(requests, &payload)?;
     drop(payload);
     // Every request takes the share of the frame reservation its body occupies and gives it
     // back once it is on the wire (`execute`): the frame is not held while the responses are
@@ -95,6 +101,20 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
         .map(|body| request_budget.split(body.len()))
         .collect();
     drop(request_budget);
+    // What the call holds beside its bodies grows with the length of the credential of the
+    // record: the search of a response, and for every request the copies of the token it
+    // carries (`credential_share`). The call takes that share of the body budget before
+    // anything of it is recorded or sent, within the time of its admission: for the longest
+    // credential a record of this size can hold (and a node handles), since the credential
+    // is known only once the record is open, under the account lock, where a call does not
+    // wait.
+    let in_flight = requests.len().min(limits::FORWARD_BATCH_CONCURRENCY);
+    let credential_budget = admission
+        .budget(
+            node,
+            credential_share(longest_token(&record), requests.len(), in_flight),
+        )
+        .await?;
 
     // 1: the common front, once for the call.
     node.ensure_open()?;
@@ -107,7 +127,8 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
         let now_ms = node.now_ms();
         let grant = account.active(now_ms)?;
         let opened = oauth::open_record(&grant, user_id, &record)?;
-        let parsed = opened.parse()?;
+        let parsed = usable(opened.parse())?;
+        let parsed = parsed.as_ref().map_err(|unusable| *unusable);
         let definition = node
             .definitions
             .get(&record.provider)
@@ -117,7 +138,7 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
         let mut prepared: Vec<Prepared> = Vec::with_capacity(requests.len());
         for (index, (request, body)) in requests.iter().zip(&bodies).enumerate() {
             prepared.push(
-                prepare(request, body, &record, definition, &parsed, context)
+                prepare(request, body, &record, definition, parsed, context)
                     .map_err(|error| refused(error, index))?,
             );
         }
@@ -137,6 +158,19 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
         (prepared, places)
     };
     drop(bodies);
+    // The call holds no more than the share of the longest token of its requests. The checks
+    // of its responses run one at a time under that share (`SearchTurns`), which is free when
+    // the call has ended and none of them runs.
+    let token_bytes = prepared
+        .iter()
+        .map(|prepared| prepared.token_bytes)
+        .max()
+        .unwrap_or(0);
+    let turns = search_turns(narrowed(
+        credential_budget,
+        credential_share(token_bytes, prepared.len(), in_flight),
+    ));
+    let turns = &turns;
     node.log_counters
         .batch_calls
         .fetch_add(1, Ordering::Relaxed);
@@ -147,6 +181,12 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
     // 4: the requests leave only after the log store confirmed every entry that holds one of
     // their events.
     let logs: Vec<LogRef> = log_store::commit(node, user_id, &account, &places).await?;
+    // A record above what a node reads, for one request of the batch or for all: the entries
+    // of the call are confirmed, and the call ends here. No request of the batch is sent.
+    let mut sendable = Vec::with_capacity(prepared.len());
+    for prepared in prepared {
+        sendable.push(prepared.request.ok_or_else(above_bounds)?);
+    }
     // The grant is checked once more before any request leaves: a revoke the node accepted
     // while the entry was written leaves no request of this batch behind it (the entry stays
     // on the chain, and the record of its events is larger than the acts).
@@ -158,8 +198,8 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
     // body is not kept.
     let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
     let gate = Semaphore::new(limits::FORWARD_BATCH_CONCURRENCY);
-    let body_sum = Mutex::new(0usize);
-    let outcomes = join_all(prepared.into_iter().zip(shares).map(|(prepared, share)| {
+    let body_sum = AtomicUsize::new(0);
+    let outcomes = join_all(sendable.into_iter().zip(shares).map(|(request, share)| {
         let (gate, body_sum) = (&gate, &body_sum);
         async move {
             let Ok(_permit) = gate.acquire().await else {
@@ -169,20 +209,26 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
             if remaining.is_zero() {
                 return Err(ProtocolError::Timeout);
             }
+            let (outbound, token) = request;
             let (checked, budget) = execute(
                 node,
                 user_id,
-                prepared.outbound,
-                prepared.token,
+                outbound,
+                token,
                 remaining,
                 share,
+                turns.clone(),
             )
             .await?;
-            let mut sum = lock(body_sum);
-            if *sum + checked.body_len() > node.limits.body_bytes {
+            // The requests of one call run on its task, one at a time: the sum is read and
+            // raised in one step all the same.
+            let within = body_sum.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |sum| {
+                sum.checked_add(checked.body_len())
+                    .filter(|sum| *sum <= node.limits.body_bytes)
+            });
+            if within.is_err() {
                 return Err(ProtocolError::TooLarge);
             }
-            *sum += checked.body_len();
             Ok((checked, budget))
         }
     }))
@@ -206,7 +252,7 @@ async fn run(node: &Node, request: Request) -> Result<Response, ApiError> {
     }
     let budget = match budget {
         Some(budget) => budget,
-        None => super::forward::reserve(node, 0).await?,
+        None => reserve(node, 0).await?,
     };
     Ok(forward_batch_frame(results, budget))
 }

@@ -7,26 +7,32 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
-use axum::extract::Request;
+use axum::extract::{Request, State};
 use axum::http::header::CONTENT_LENGTH;
 use axum::http::{Method, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{on, MethodFilter, MethodRouter};
 use axum::Router;
 use credential_enclave_protocol::encoding::wipe_json;
+use credential_enclave_protocol::keys::Role;
 use credential_enclave_protocol::{is_valid_name, limits, ProtocolError};
 use hyper::body::Body as HttpBody;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use zeroize::Zeroizing;
 
-use crate::oauth::{ProviderError, Withheld};
+use crate::inbound;
+use crate::oauth::{ProviderError, Unusable, Withheld};
 use crate::platform::{Listener, PlatformError};
 use crate::providers::{ClientKind, Definition};
+use crate::room::Marks;
 use crate::state::{Node, OperatorConfig, ProviderCredentials};
-use crate::subset::Subset;
 use credential_enclave_protocol::record::Record;
+use credential_enclave_protocol::subset::Subset;
 
 mod attestation;
 mod close;
@@ -39,21 +45,216 @@ mod log_store;
 mod mail;
 mod messages;
 mod oauth;
-mod peer;
+pub(crate) mod peer;
 mod refresh;
 mod release;
 pub mod responses;
 mod revoke;
 mod status;
+mod vault;
+mod vault_handoff;
+mod vault_send;
 
+#[cfg(test)]
+pub(crate) use forward::credential_share;
 pub use responses::json_ok;
 use responses::{json_error, ErrorBody};
 
 /// Body limit of a call whose body is JSON: 1 MiB.
 const JSON_BODY_LIMIT_BYTES: usize = 1024 * 1024;
 
+/// The largest share of the body budget a call holds for its request
+/// (`Marks::request_share`): the share of the largest body, 64 MiB. A request whose share
+/// would be larger is `too_large`: it takes more room than a node gives one request, and
+/// the node does not parse it.
+pub(crate) const REQUEST_SHARE_LIMIT_BYTES: usize = limits::BODY_BYTES;
+
+/// The largest share of the command budget a call of a command (`attestation`, `messages`)
+/// holds for its request: 256 KiB. A command of an app and the nonce of an attestation are
+/// requests of a few kilobytes, whose shares are some tens of kibibytes. A request whose
+/// share would be larger is `too_large` and is not parsed.
+pub(crate) const COMMAND_SHARE_LIMIT_BYTES: usize = 256 * 1024;
+
+/// Longest time a call with a frame (`forward`, `forward/batch`, `vault/send`) waits to be
+/// admitted: for one of the places of the forward calls of the node, and for the shares of
+/// the body budget it takes before anything of it is recorded or sent (the share of the
+/// frame it reads, the share of its request, and the share of what it holds of its
+/// credential) (enclave.md section 8).
+#[cfg(not(test))]
+pub(crate) const ADMISSION_WAIT: Duration = Duration::from_secs(30);
+/// The tests of the node wait for a shorter time: a test that holds every place does not
+/// take 30 seconds.
+#[cfg(test)]
+pub(crate) const ADMISSION_WAIT: Duration = Duration::from_millis(400);
+
+/// Longest time a call with a JSON body waits to be admitted: for the shares it takes before
+/// anything of it is recorded or sent, the share of the body it reads and of its request
+/// (of the body budget, or of the command budget for a call of a command) and, for `refresh`
+/// and `oauth/complete`, the share of what the call holds of a token response (enclave.md
+/// section 8). The request of such a call is small, and its caller gives the call a few
+/// seconds: a call that is told within two seconds that the node has no room has done
+/// nothing, and its caller can ask another node before its own time limit ends the call.
+#[cfg(not(test))]
+pub(crate) const REQUEST_WAIT: Duration = Duration::from_secs(2);
+/// The tests of the node wait for a shorter time.
+#[cfg(test)]
+pub(crate) const REQUEST_WAIT: Duration = Duration::from_millis(200);
+
+/// The admission of a call: the shares of the body budget of the node it takes before
+/// anything of it is recorded or sent, and, for a call that takes one of the places of the
+/// forward calls of the node (`forward`, `forward/batch`, `vault/send`), that place. A call
+/// waits for them together for a bounded time, counted from the moment it began
+/// ([`ADMISSION_WAIT`] for a call with a frame, [`REQUEST_WAIT`] for a call with a JSON
+/// body), and ends with `capacity_unavailable` when it has not got them by then. It has read
+/// nothing of its body while it waits for the share of that body: a body enters memory only
+/// under its share of the budget. It has created no entry and sent nothing while it waits
+/// for any of them.
+///
+/// The limit is what bounds the time a connection is held by a call that does nothing yet.
+/// The node reads nothing from the connection of a call that waits, so it does not learn
+/// that the caller of such a call is gone (enclave.md section 8).
+pub(super) struct Admission {
+    until: tokio::time::Instant,
+}
+
+impl Admission {
+    /// The admission of a call with a frame that begins now.
+    pub(super) fn begin() -> Admission {
+        Admission {
+            until: tokio::time::Instant::now() + ADMISSION_WAIT,
+        }
+    }
+
+    /// The admission of a call with a JSON body that begins now.
+    pub(super) fn of_request() -> Admission {
+        Admission {
+            until: tokio::time::Instant::now() + REQUEST_WAIT,
+        }
+    }
+
+    /// One of the places of the forward calls of the node, held until it is dropped.
+    pub(super) async fn slot(&self, node: &Node) -> Result<OwnedSemaphorePermit, ApiError> {
+        let slot = node.forward_slots.clone().acquire_owned();
+        match tokio::time::timeout_at(self.until, slot).await {
+            Ok(Ok(slot)) => Ok(slot),
+            Ok(Err(_)) => Err(ApiError::internal()),
+            Err(_) => Err(ProtocolError::CapacityUnavailable.into()),
+        }
+    }
+
+    /// `bytes` of the body budget of the node.
+    pub(super) async fn budget(
+        &self,
+        node: &Node,
+        bytes: usize,
+    ) -> Result<OwnedSemaphorePermit, ApiError> {
+        self.share(&node.body_budget, bytes).await
+    }
+
+    /// `bytes` of `budget`, the body budget or the command budget of the node.
+    async fn share(
+        &self,
+        budget: &Arc<Semaphore>,
+        bytes: usize,
+    ) -> Result<OwnedSemaphorePermit, ApiError> {
+        match tokio::time::timeout_at(self.until, reserve_of(budget, bytes)).await {
+            Ok(reserved) => reserved,
+            Err(_) => Err(ProtocolError::CapacityUnavailable.into()),
+        }
+    }
+
+    /// `held` made a share of `bytes` of `budget`, the budget it was taken from: what it
+    /// lacks is taken within the time of the admission, and what it holds above `bytes` is
+    /// free.
+    async fn resized(
+        &self,
+        budget: &Arc<Semaphore>,
+        mut held: OwnedSemaphorePermit,
+        bytes: usize,
+    ) -> Result<OwnedSemaphorePermit, ApiError> {
+        let lacking = bytes.saturating_sub(held.num_permits());
+        if lacking > 0 {
+            held.merge(self.share(budget, lacking).await?);
+        }
+        Ok(narrowed(held, bytes))
+    }
+}
+
+/// Takes `bytes` of the body budget of the node, waiting for them.
+pub(super) async fn reserve(node: &Node, bytes: usize) -> Result<OwnedSemaphorePermit, ApiError> {
+    reserve_of(&node.body_budget, bytes).await
+}
+
+/// Takes `bytes` of `budget`, waiting for them.
+async fn reserve_of(
+    budget: &Arc<Semaphore>,
+    bytes: usize,
+) -> Result<OwnedSemaphorePermit, ApiError> {
+    let permits = u32::try_from(bytes).map_err(|_| ApiError::from(ProtocolError::TooLarge))?;
+    budget
+        .clone()
+        .acquire_many_owned(permits)
+        .await
+        .map_err(|_| ApiError::internal())
+}
+
+/// `budget` without what it holds above `needed` bytes of the body budget: those are free.
+pub(super) fn narrowed(mut budget: OwnedSemaphorePermit, needed: usize) -> OwnedSemaphorePermit {
+    let above = budget.num_permits().saturating_sub(needed);
+    drop(budget.split(above));
+    budget
+}
+
+/// The share of the body budget a call holds for a request of the bytes `text`, the JSON
+/// body of a call or the meta of a frame (`Marks::request_share`): a bound of the parsed
+/// request and of what the call makes of it. It is computed from the bytes before they are
+/// parsed. A request whose share is above [`REQUEST_SHARE_LIMIT_BYTES`] is `too_large`.
+pub(super) fn request_share_of(text: &[u8]) -> Result<usize, ApiError> {
+    request_share_within(text, REQUEST_SHARE_LIMIT_BYTES)
+}
+
+/// The share a call holds for a request of the bytes `text` (`Marks::request_share`), of the
+/// budget whose largest share of one request is `limit`. A request whose share is above
+/// `limit` is `too_large`.
+fn request_share_within(text: &[u8], limit: usize) -> Result<usize, ApiError> {
+    let share = Marks::of(text).request_share();
+    if share > limit {
+        return Err(ApiError::with_message(
+            ProtocolError::TooLarge,
+            "the request takes more room than a node gives one request",
+        ));
+    }
+    Ok(share)
+}
+
+/// The failure of a call whose record is above what a node reads
+/// (`crate::oauth::Unusable::AboveBounds`: the plaintext of a token record takes more room
+/// than a node gives one, or a token of it is longer than a node handles). The entry of the
+/// call is on the chain, and the log store confirmed it: what this answer says of the
+/// plaintext of the record has an entry. Nothing was sent.
+pub(super) fn above_bounds() -> ApiError {
+    ApiError::with_message(
+        ProtocolError::RecordInvalid,
+        "the plaintext of the record is above what a node reads; nothing was sent",
+    )
+}
+
+/// The length the head of a request declares for its body, when it declares one.
+fn declared_length(request: &Request) -> Option<u64> {
+    request
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
 type Route = (Method, &'static str, MethodRouter<Arc<Node>>);
 
+#[expect(
+    clippy::expect_used,
+    reason = "runs once at the start of the node, for the rows of the table of `routes`: every \
+              method of the table is GET or POST, and no input of a call reaches this place"
+)]
 fn route<H, T>(method: Method, path: &'static str, handler: H) -> Route
 where
     H: axum::handler::Handler<T, Arc<Node>>,
@@ -87,8 +288,10 @@ fn routes() -> Vec<Route> {
         route(Method::POST, "/v1/mail/read", mail::read),
         route(Method::POST, "/v1/mail/submit", mail::submit),
         route(Method::POST, "/v1/release", release::release),
+        route(Method::POST, "/v1/vault/store", vault::store),
+        route(Method::POST, "/v1/vault/handoff", vault_handoff::handoff),
+        route(Method::POST, "/v1/vault/send", vault_send::send),
         route(Method::POST, "/v1/close", close::close),
-        route(Method::POST, "/v1/close/heads", close::heads),
         route(Method::POST, "/v1/peer/export", peer::export),
         route(Method::POST, "/v1/peer/import", peer::import),
         route(Method::POST, "/v1/grants/prune", grants::prune),
@@ -110,11 +313,108 @@ pub fn route_list() -> Vec<(Method, &'static str)> {
         .collect()
 }
 
-/// The router of every call.
+/// Which nodes answer a call (enclave.md section 4). One node program runs in three roles,
+/// and a node answers the calls of its role.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Of {
+    /// A call a node of every role answers, also before it took a role: `health`, `config`,
+    /// `attestation` and `close`. None of them reads or changes a delegation, a record or the
+    /// log of an account.
+    EveryRole,
+    /// A call a node that holds delegations answers, of the delegation role and of the
+    /// reserve role: a call that puts a delegation in place, reads its state, hands it on or
+    /// ends it (`messages`, `status`, `peer/export`, `peer/import`, `grants/prune`), and the
+    /// call that gives the node the credentials of its log store. None of them opens a record
+    /// or calls a provider. A node of the forward role refuses it.
+    Holding,
+    /// A call that uses a credential: a call that opens or creates a record or calls a
+    /// provider. A node of the delegation role answers it, and no other node: a node of the
+    /// reserve role and a node of the forward role refuse it.
+    Use,
+    /// The call of the forward role: `vault/send`. Only a node that took the forward role
+    /// from its operator configuration answers it.
+    Forward,
+}
+
+/// Which nodes answer the call of `path`. The calls of every role, the calls of a node that
+/// holds delegations and the call of the forward role are named here. Every other call is a
+/// call that uses a credential, so a call that is added to the table of [`routes`] is one a
+/// node of the reserve role and a node of the forward role refuse until this function says
+/// otherwise.
+fn role_of(path: &str) -> Of {
+    match path {
+        "/v1/health" | "/v1/config" | "/v1/attestation" | "/v1/close" => Of::EveryRole,
+        "/v1/messages"
+        | "/v1/status"
+        | "/v1/peer/export"
+        | "/v1/peer/import"
+        | "/v1/grants/prune"
+        | "/v1/log-store/credentials" => Of::Holding,
+        "/v1/vault/send" => Of::Forward,
+        _ => Of::Use,
+    }
+}
+
+/// What a node of the forward role says to a call it does not answer.
+const FORWARD_ROLE_REFUSAL: &str =
+    "the node has the forward role: it holds no delegation and uses no credential";
+/// What a node of the reserve role says to a call that uses a credential.
+const RESERVE_ROLE_REFUSAL: &str =
+    "the node has the reserve role: it holds delegations and uses no credential";
+
+/// The role rule of a call (enclave.md section 4), checked before the handler of the call
+/// reads anything of the request.
+///
+/// A call of a node that holds delegations, and a call that uses a credential, give a node
+/// without a role the delegation role. A node of the forward role refuses both with
+/// `not_allowed`: the calls that put a user key into a node (`messages`, `peer/import`) and
+/// the calls that open a record are among them, so no call can make a node of the forward
+/// role hold a user key. A node of the reserve role refuses a call that uses a credential
+/// with `not_allowed`: no call makes such a node open a record, call a provider or create
+/// the event of a use, whatever its caller sends.
+fn admit(node: &Node, of: Of) -> Result<(), ApiError> {
+    let refused =
+        |message: &'static str| Err(ApiError::with_message(ProtocolError::NotAllowed, message));
+    match of {
+        Of::EveryRole => Ok(()),
+        Of::Holding => match node.role.settle(Role::Delegation) {
+            Role::Delegation | Role::Reserve => Ok(()),
+            Role::Forward => refused(FORWARD_ROLE_REFUSAL),
+        },
+        Of::Use => match node.role.settle(Role::Delegation) {
+            Role::Delegation => Ok(()),
+            Role::Reserve => refused(RESERVE_ROLE_REFUSAL),
+            Role::Forward => refused(FORWARD_ROLE_REFUSAL),
+        },
+        Of::Forward => match node.role.get() {
+            Some(Role::Forward) => Ok(()),
+            _ => refused("the call is a call of the forward role, and the node has not that role"),
+        },
+    }
+}
+
+/// The router of every call. Each call passes the role rule of its path ([`admit`]) before
+/// its handler runs. The rule is part of the route of a call: a path that is not defined and
+/// a method a path does not accept pass no rule and give a node no role. The handler of a
+/// call reads the body of its request under the time limit of the bytes of a body
+/// (`inbound_idle`, [`inbound::TimedBody`]).
 pub fn router(node: Arc<Node>) -> Router {
     let mut router = Router::new();
     for (_, path, handler) in routes() {
-        router = router.route(path, handler);
+        let of = role_of(path);
+        let rule = middleware::from_fn_with_state(
+            node.clone(),
+            move |State(node): State<Arc<Node>>, request: Request, next: Next| async move {
+                match admit(&node, of) {
+                    Ok(()) => {
+                        next.run(inbound::timed(request, node.limits.inbound_idle))
+                            .await
+                    }
+                    Err(refusal) => refusal.into_response(),
+                }
+            },
+        );
+        router = router.route(path, handler.route_layer(rule));
     }
     router
         .fallback(unknown_route)
@@ -144,13 +444,14 @@ async fn unknown_method() -> Response {
     .into_response()
 }
 
-/// Serves HTTP/1.1 on every connection of the listener. A call in progress runs to its end:
-/// nothing here cancels a connection. Two limits of section 8 of enclave.md bound the
-/// connections (`node.limits`): a connection accepted while `inbound_connections` are open is
-/// closed without a byte and counted in `inbound_refused` of `load` of health, and a
-/// connection that waits longer than `inbound_idle` for the head of its next request (before
-/// its first request, or idle between two requests) is closed. Both keep the descriptors of
-/// the node (`crate::descriptors`) for the writes to the log store and the provider requests.
+/// Serves HTTP/1.1 on every connection of the listener. Two limits of section 8 of enclave.md
+/// bound the connections (`node.limits`): a connection accepted while `inbound_connections`
+/// are open is closed without a byte and counted in `inbound_refused` of `load` of health,
+/// and a connection on which the node waits for its peer for longer than `inbound_idle` is
+/// closed ([`serve_connection`]). The first keeps the memory of the node for its calls and
+/// the descriptors of the node (`crate::descriptors`) for the writes to the log store and the
+/// provider requests. The second frees what a connection holds whose peer went away or
+/// stopped.
 pub async fn serve(listener: Listener, router: Router, node: Arc<Node>) {
     loop {
         let stream = match listener.accept().await {
@@ -164,21 +465,46 @@ pub async fn serve(listener: Listener, router: Router, node: Arc<Node>) {
             drop(stream);
             continue;
         };
-        let service = TowerToHyperService::new(router.clone());
+        let router = router.clone();
         let idle = node.limits.inbound_idle;
         tokio::spawn(async move {
             // The place of the connection is held until the connection ends.
             let _place = place;
-            // No `Date` header: it would be the only value a node takes from the system
-            // clock instead of its own clock.
-            let _ = hyper::server::conn::http1::Builder::new()
-                .auto_date_header(false)
-                .timer(TokioTimer::new())
-                .header_read_timeout(idle)
-                .serve_connection(TokioIo::new(stream), service)
-                .await;
+            serve_connection(stream, router, idle).await;
         });
     }
+}
+
+/// Serves HTTP/1.1 on one connection until it ends. A call in progress runs to its end
+/// unless its connection ends first, and a connection ends when its peer closed it, when it
+/// failed, or when the node waited for its peer for `idle`:
+///
+/// - for the head of a request, before the first request and between two requests;
+/// - for the next bytes of a request body (the router reads a body under that limit:
+///   [`inbound::TimedBody`]. The call ends with `invalid_request`, and the connection after
+///   its response);
+/// - for the peer to take bytes of a response ([`inbound::TimedStream`]).
+///
+/// The connection reads at most [`inbound::READ_BUFFER_BYTES`] ahead of what it has parsed
+/// and buffers at most as much of a response before it writes, so what a connection holds
+/// outside the bodies of its call has a bound (`inbound::CONNECTION_BYTES`).
+pub async fn serve_connection<S>(stream: S, router: Router, idle: std::time::Duration)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let service = TowerToHyperService::new(router);
+    // No `Date` header: it would be the only value a node takes from the system clock
+    // instead of its own clock.
+    let _ = hyper::server::conn::http1::Builder::new()
+        .auto_date_header(false)
+        .max_buf_size(inbound::READ_BUFFER_BYTES)
+        .timer(TokioTimer::new())
+        .header_read_timeout(idle)
+        .serve_connection(
+            TokioIo::new(inbound::TimedStream::new(stream, idle)),
+            service,
+        )
+        .await;
 }
 
 /// A failed call (rule E5 of the egress policy). The code is one of the closed list of
@@ -235,7 +561,7 @@ fn message_of(error: ProtocolError) -> &'static str {
         UnsupportedPolicy => "the policy is not empty",
         CustodyMismatch => "the custody of the grant is not the custody of this node",
         PeerUnverified => "the attestation of the peer does not verify against this node",
-        Internal => "the platform failed",
+        Internal => "the platform failed, or the account is halted on this node",
         NotConfigured => "the operator configuration is missing",
         Closing => "the node is closing",
         GrantRequired => "the account has no grant on this node",
@@ -281,9 +607,16 @@ impl From<Withheld> for ApiError {
     }
 }
 
+impl From<Unusable> for ApiError {
+    fn from(unusable: Unusable) -> Self {
+        ApiError::from(ProtocolError::from(unusable))
+    }
+}
+
 impl ApiError {
-    /// A failure of the platform under the node (random source, attestation device): the
-    /// code `internal`.
+    /// A failure of the platform under the node (random source, attestation device), and a
+    /// call for an account the node halted (`crate::state::Account::halt`): the code
+    /// `internal`. The call that ends with it has performed no act.
     pub fn internal() -> ApiError {
         ApiError::from(ProtocolError::Internal)
     }
@@ -334,13 +667,11 @@ pub fn respond(outcome: Result<Response, ApiError>) -> Response {
     outcome.unwrap_or_else(IntoResponse::into_response)
 }
 
-/// Reads a request body up to `limit` bytes. A longer body is `too_large`.
+/// Reads a request body up to `limit` bytes. A longer body is `too_large`. A body whose
+/// bytes stop arriving for the time limit of the bytes of a body (`inbound_idle`) is
+/// `invalid_request`, as a body that cannot be read is.
 pub async fn read_body(request: Request, limit: usize) -> Result<Vec<u8>, ApiError> {
-    let declared = request
-        .headers()
-        .get(CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok());
+    let declared = declared_length(&request);
     if declared.is_some_and(|length| length > limit as u64) {
         return Err(ProtocolError::TooLarge.into());
     }
@@ -350,11 +681,15 @@ pub async fn read_body(request: Request, limit: usize) -> Result<Vec<u8>, ApiErr
         let frame = std::future::poll_fn(|context| Pin::new(&mut body).poll_frame(context)).await;
         match frame {
             None => return Ok(collected),
-            Some(Err(_)) => {
+            Some(Err(error)) => {
+                let message = match inbound::is_body_idle(error) {
+                    true => "the request body did not arrive within the time limit",
+                    false => "the request body could not be read",
+                };
                 return Err(ApiError::with_message(
                     ProtocolError::InvalidRequest,
-                    "the request body could not be read",
-                ))
+                    message,
+                ));
             }
             Some(Ok(frame)) => {
                 if let Ok(data) = frame.into_data() {
@@ -368,35 +703,100 @@ pub async fn read_body(request: Request, limit: usize) -> Result<Vec<u8>, ApiErr
     }
 }
 
-/// A parsed JSON request body. Its strings are overwritten with zeros when it is dropped: a
-/// body can carry an authorization code or a client secret.
-pub struct JsonBody(serde_json::Value);
+/// A parsed JSON request: the JSON body of a call, or the meta of a frame. Its strings are
+/// overwritten with zeros when it is dropped: a body can carry an authorization code or a
+/// client secret.
+///
+/// The JSON body of a call holds, with its parsed form, the share the call took for it, of
+/// the body budget of the node ([`JsonBody::read`]) or, for a call of a command, of its
+/// command budget ([`JsonBody::read_command`]): the share is free when the body is dropped,
+/// at the end of its call.
+pub struct JsonBody {
+    value: serde_json::Value,
+    /// The share of the request. The call holds it as long as the body.
+    _share: Option<OwnedSemaphorePermit>,
+}
 
 impl Drop for JsonBody {
     fn drop(&mut self) {
-        wipe_json(&mut self.0);
+        wipe_json(&mut self.value);
     }
 }
 
 impl JsonBody {
-    /// Reads and parses the body of a call. The body is a JSON object.
-    pub async fn read(request: Request) -> Result<JsonBody, ApiError> {
-        let bytes = Zeroizing::new(read_body(request, JSON_BODY_LIMIT_BYTES).await?);
-        JsonBody::parse(&bytes)
+    /// Reads and parses the JSON body of a call that begins now ([`JsonBody::read_within`]).
+    pub async fn read(node: &Node, request: Request) -> Result<JsonBody, ApiError> {
+        JsonBody::read_within(node, request, &Admission::of_request()).await
+    }
+
+    /// Reads and parses the JSON body of a call. The body is a JSON object of at most 1 MiB.
+    ///
+    /// The body enters memory under the body budget of the node, like the frame of a
+    /// `forward` call. The call takes the share of the length its request declares (of the
+    /// limit when it declares none) before it reads a byte. With the bytes read, it makes
+    /// that share the share of its request (`Marks::request_share`: a bound of the parsed
+    /// body and of what the call makes of it, computed from the bytes), and parses the body
+    /// under it. It waits for both within the time of its `admission` and ends with
+    /// `capacity_unavailable` without them: it has parsed nothing, created no entry and sent
+    /// nothing. The share is held as long as the returned body.
+    pub(super) async fn read_within(
+        node: &Node,
+        request: Request,
+        admission: &Admission,
+    ) -> Result<JsonBody, ApiError> {
+        let budget = &node.body_budget;
+        JsonBody::read_under(budget, REQUEST_SHARE_LIMIT_BYTES, request, admission).await
+    }
+
+    /// Reads and parses the JSON body of a call of a command, `attestation` or `messages`,
+    /// which begins now. The rule is that of [`JsonBody::read_within`], with the command
+    /// budget of the node in the place of its body budget
+    /// (`crate::state::COMMAND_BUDGET_BYTES`): a grant and a revoke do not wait for the
+    /// bodies of the calls that use a credential. The share of one such request is at most
+    /// [`COMMAND_SHARE_LIMIT_BYTES`].
+    pub(super) async fn read_command(node: &Node, request: Request) -> Result<JsonBody, ApiError> {
+        let (budget, admission) = (&node.command_budget, Admission::of_request());
+        JsonBody::read_under(budget, COMMAND_SHARE_LIMIT_BYTES, request, &admission).await
+    }
+
+    /// Reads and parses a JSON body under a share of `budget`, whose largest share of one
+    /// request is `share_limit`. A body of more bytes than that share is not read: its share
+    /// would be larger.
+    async fn read_under(
+        budget: &Arc<Semaphore>,
+        share_limit: usize,
+        request: Request,
+        admission: &Admission,
+    ) -> Result<JsonBody, ApiError> {
+        let body_limit = JSON_BODY_LIMIT_BYTES.min(share_limit);
+        let declared = declared_length(&request);
+        if declared.is_some_and(|length| length > body_limit as u64) {
+            return Err(ProtocolError::TooLarge.into());
+        }
+        let reading = declared.map_or(body_limit, |length| length as usize);
+        let reading = admission.share(budget, reading).await?;
+        let bytes = Zeroizing::new(read_body(request, body_limit).await?);
+        let share = request_share_within(&bytes, share_limit)?;
+        let share = admission.resized(budget, reading, share).await?;
+        JsonBody::parsed(&bytes, Some(share))
     }
 
     /// Parses a JSON object.
+    #[cfg(test)]
     pub fn parse(bytes: &[u8]) -> Result<JsonBody, ApiError> {
+        JsonBody::parsed(bytes, None)
+    }
+
+    /// Parses a JSON object that the call holds under `share` of the body budget.
+    fn parsed(bytes: &[u8], share: Option<OwnedSemaphorePermit>) -> Result<JsonBody, ApiError> {
         let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| {
             ApiError::with_message(ProtocolError::InvalidRequest, "the body is not JSON")
         })?;
-        JsonBody::from_value(value)
-    }
-
-    /// Wraps a parsed JSON object.
-    pub fn from_value(value: serde_json::Value) -> Result<JsonBody, ApiError> {
-        let body = JsonBody(value);
-        if !body.0.is_object() {
+        let body = JsonBody {
+            value,
+            _share: share,
+        };
+        if !body.value.is_object() {
             return Err(ApiError::with_message(
                 ProtocolError::InvalidRequest,
                 "the body is not a JSON object",
@@ -405,14 +805,30 @@ impl JsonBody {
         Ok(body)
     }
 
+    /// Parses the meta of a frame (`crate::frame`): a JSON object. The call that read the
+    /// frame holds the share of the body budget of this request itself, beside the meta
+    /// ([`request_share_of`]): the meta is parsed under it.
+    pub(super) fn of_meta(meta: &[u8]) -> Result<JsonBody, ApiError> {
+        let value: serde_json::Value =
+            serde_json::from_slice(meta).map_err(|_| ProtocolError::InvalidRequest)?;
+        let body = JsonBody {
+            value,
+            _share: None,
+        };
+        if !body.value.is_object() {
+            return Err(ProtocolError::InvalidRequest.into());
+        }
+        Ok(body)
+    }
+
     /// The value of a key, when present and not `null`.
     pub fn get(&self, key: &str) -> Option<&serde_json::Value> {
-        self.0.get(key).filter(|value| !value.is_null())
+        self.value.get(key).filter(|value| !value.is_null())
     }
 
     /// The whole object.
     pub fn as_value(&self) -> &serde_json::Value {
-        &self.0
+        &self.value
     }
 
     /// A required string.
@@ -469,10 +885,10 @@ fn missing(key: &str) -> ApiError {
         "user_id" => "user_id is missing or invalid",
         "envelope" => "envelope is missing or invalid",
         "peer" => "peer is missing or invalid",
-        "endorsement" => "endorsement is missing or invalid",
         "after" => "after is missing or invalid",
         "nonce" => "nonce is missing or invalid",
         "record" => "record is missing or invalid",
+        "request" => "request is missing or invalid",
         "previous" => "previous is missing or invalid",
         "context" => "context is missing or invalid",
         "provider" => "provider is missing or invalid",
@@ -489,17 +905,29 @@ fn missing(key: &str) -> ApiError {
         "code" => "code is missing or invalid",
         "field" => "field is missing or invalid",
         "origin" => "origin is missing or invalid",
+        "seal_to" => "seal_to is invalid: base64url of an X25519 public key of 32 bytes",
+        "kind" => "kind is invalid: vault_secret or vault_password",
+        "name" => "name is missing or invalid",
+        "site" => "site is missing or invalid",
+        "sites" => "sites is missing or invalid",
+        "slots" => "slots is missing or invalid",
+        "value" => "value is missing or invalid",
         "method" => "method is missing or invalid",
         "url" => "url is missing or invalid",
         "headers" => "headers is missing or invalid",
         "timeout_ms" => "timeout_ms is missing or invalid",
+        "stream" => "stream is missing or invalid",
         "requests" => "requests is missing or invalid: 1 to 100 request objects",
         "body_bytes" => "body_bytes of the requests do not add up to the payload",
         "endpoint" => "endpoint is missing or invalid",
+        "role" => "role is invalid: a configuration names the role reserve or the role forward",
         "cursor" => "cursor is missing or invalid",
         "limit" => "limit is missing or invalid",
         "subset" => {
-            "subset is missing or invalid: pods 1 to 1024, pod below pods, copies at least 1"
+            "subset is missing or invalid: pods 1 to 1024, pod below pods, copies at least 1, \
+             groups, when present, one name per ordinal with at least skip plus copies \
+             different names, and span, when present, two integers below 4294967296, the \
+             first not above the last"
         }
         _ => "a field is missing or invalid",
     };
@@ -511,8 +939,9 @@ pub fn record_of(body: &JsonBody, key: &str) -> Result<Record, ApiError> {
     Ok(Record::from_value(body.object(key)?)?)
 }
 
-/// The optional `subset` of a call (enclave.md 5.13 and 5.15): `None` when the key is absent
-/// or null, `invalid_request` when its value is not a subset object within its bounds.
+/// The optional `subset` of a call (enclave.md 5.13 and 5.15, protocol.md 10.4): `None` when
+/// the key is absent or null, `invalid_request` when its value is not a subset object within
+/// its bounds.
 pub fn subset_of(body: &JsonBody) -> Result<Option<Subset>, ApiError> {
     match body.get("subset") {
         None => Ok(None),

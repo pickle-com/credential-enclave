@@ -11,6 +11,13 @@
 //! The configuration also names the log store of the node, when the environment names one:
 //! the bucket the node writes its log entries to, and the region of that bucket.
 //!
+//! That is the configuration of a node of the delegation role. The environment of a pod can
+//! name another role instead ([`Role`]). The configuration of a node of the reserve role names
+//! the role and the log store, and no client value: such a node holds delegations and calls no
+//! provider. The configuration of a node of the forward role is `{"role":"forward"}` and
+//! nothing else, because a node of the forward role holds no client value and has no log
+//! store.
+//!
 //! The client values are secrets of the operator. They are never part of a log line.
 
 use std::time::Duration;
@@ -32,6 +39,66 @@ pub const BASE_URL_VARIABLE: &str = "CHARACTER_API_BASE_URL";
 pub const LOG_BUCKET_VARIABLE: &str = "CREDENTIAL_ENCLAVE_LOG_BUCKET";
 /// The variable with the region of that bucket.
 pub const LOG_REGION_VARIABLE: &str = "CREDENTIAL_ENCLAVE_LOG_REGION";
+
+/// The variable that names the role of the node of the pod.
+pub const ROLE_VARIABLE: &str = "CREDENTIAL_ENCLAVE_ROLE";
+
+/// The role of the node of a pod (enclave.md section 9), as the environment of the pod names
+/// it. The host program gives its node the role with the operator configuration, and its
+/// egress relay connects to what a node of that role connects to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// The node holds the delegations of accounts and uses their credentials:
+    /// `CREDENTIAL_ENCLAVE_ROLE` is not set.
+    Delegation,
+    /// The node holds the delegations of accounts and uses no credential:
+    /// `CREDENTIAL_ENCLAVE_ROLE` is `reserve`.
+    Reserve,
+    /// The node sends the requests of secret uses: `CREDENTIAL_ENCLAVE_ROLE` is `forward`.
+    Forward,
+}
+
+impl Role {
+    /// Reads the role from the environment. A value other than `reserve` and `forward` is an
+    /// error: the host program starts no enclave whose role it cannot tell.
+    pub fn from_variables(variable: &dyn Fn(&str) -> Option<String>) -> Result<Role, String> {
+        match variable(ROLE_VARIABLE).as_deref() {
+            None => Ok(Role::Delegation),
+            Some("reserve") => Ok(Role::Reserve),
+            Some("forward") => Ok(Role::Forward),
+            Some(other) => Err(format!(
+                "{ROLE_VARIABLE} is {other:?}: the roles it names are reserve and forward, and a pod of the delegation role does not set it"
+            )),
+        }
+    }
+
+    /// The name of the role in a line of the log.
+    pub fn name(self) -> &'static str {
+        match self {
+            Role::Delegation => "delegation",
+            Role::Reserve => "reserve",
+            Role::Forward => "forward",
+        }
+    }
+}
+
+/// The body of `POST /v1/config` of a node of the forward role (enclave.md 5.1).
+pub fn forward_config() -> Vec<u8> {
+    json!({"role": "forward"}).to_string().into_bytes()
+}
+
+/// The body of `POST /v1/config` of a node of the reserve role (enclave.md 5.1): the role, and
+/// the log store when the environment names one. It carries no client value of a provider.
+pub fn reserve_config(log_store: Option<&LogStore>) -> Vec<u8> {
+    let body = match log_store {
+        Some(log_store) => json!({
+            "role": "reserve",
+            "log_store": {"bucket": log_store.bucket, "region": log_store.region},
+        }),
+        None => json!({"role": "reserve"}),
+    };
+    body.to_string().into_bytes()
+}
 
 /// The log store the environment names (enclave.md 5.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,9 +152,12 @@ impl LogStore {
         Ok(Some(LogStore { bucket, region }))
     }
 
-    /// The host the node writes to: `{bucket}.s3.{region}.amazonaws.com`.
+    /// The host the node writes to: the endpoint of Amazon S3 in the region of the log store,
+    /// `s3.{region}.amazonaws.com`. A node writes every bucket of its log store over
+    /// connections to this one host, with the bucket as the first part of the path
+    /// (protocol.md 7.6), so the name of the bucket is no part of the host.
     pub fn host(&self) -> String {
-        format!("{}.s3.{}.amazonaws.com", self.bucket, self.region)
+        format!("s3.{}.amazonaws.com", self.region)
     }
 }
 
@@ -227,10 +297,13 @@ pub fn operator_config(
             }),
         );
     }
-    let mut body = json!({ "providers": entries });
-    if let Some(log_store) = log_store {
-        body["log_store"] = json!({"bucket": log_store.bucket, "region": log_store.region});
-    }
+    let body = match log_store {
+        Some(log_store) => json!({
+            "providers": entries,
+            "log_store": {"bucket": log_store.bucket, "region": log_store.region},
+        }),
+        None => json!({ "providers": entries }),
+    };
     Ok(body.to_string().into_bytes())
 }
 
@@ -523,10 +596,7 @@ mod tests {
             ("CREDENTIAL_ENCLAVE_LOG_REGION", "us-west-2"),
         ]);
         let log_store = LogStore::from_variables(&variable).unwrap().unwrap();
-        assert_eq!(
-            log_store.host(),
-            "character-credential-log-dev-1.s3.us-west-2.amazonaws.com"
-        );
+        assert_eq!(log_store.host(), "s3.us-west-2.amazonaws.com");
         let body = operator_config(&names(&["slack"]), &variable, Some(&log_store)).unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
@@ -597,6 +667,69 @@ mod tests {
                 "{region}"
             );
         }
+    }
+
+    #[test]
+    fn the_role_of_a_pod_is_the_delegation_role_unless_its_environment_names_another() {
+        assert_eq!(
+            Role::from_variables(&environment(&[])),
+            Ok(Role::Delegation)
+        );
+        // An empty value is a missing value.
+        let empty = environment(&[("CREDENTIAL_ENCLAVE_ROLE", "")]);
+        assert_eq!(Role::from_variables(&empty), Ok(Role::Delegation));
+        let forward = environment(&[("CREDENTIAL_ENCLAVE_ROLE", "forward")]);
+        assert_eq!(Role::from_variables(&forward), Ok(Role::Forward));
+        let reserve = environment(&[("CREDENTIAL_ENCLAVE_ROLE", "reserve")]);
+        assert_eq!(Role::from_variables(&reserve), Ok(Role::Reserve));
+        for other in [
+            "Forward",
+            "FORWARD",
+            "Reserve",
+            "delegation",
+            "forward ",
+            " reserve",
+            "1",
+            "true",
+        ] {
+            let named = environment(&[("CREDENTIAL_ENCLAVE_ROLE", other)]);
+            let refused = Role::from_variables(&named).unwrap_err();
+            assert!(refused.contains("CREDENTIAL_ENCLAVE_ROLE"), "{refused}");
+        }
+        assert_eq!(
+            [Role::Delegation, Role::Reserve, Role::Forward].map(Role::name),
+            ["delegation", "reserve", "forward"]
+        );
+        // The configuration of a node of the forward role names its role and nothing else.
+        assert_eq!(forward_config(), b"{\"role\":\"forward\"}");
+    }
+
+    #[test]
+    fn the_configuration_of_the_reserve_role_names_the_role_and_the_log_store_and_no_provider() {
+        let variable = environment(&[
+            ("CHARACTER_API_BASE_URL", "https://api.example.test"),
+            ("GOOGLE_CLIENT_ID", "google-id"),
+            ("GOOGLE_CLIENT_SECRET", "google-secret"),
+            (
+                "CREDENTIAL_ENCLAVE_LOG_BUCKET",
+                "character-credential-log-dev-1",
+            ),
+            ("CREDENTIAL_ENCLAVE_LOG_REGION", "us-west-2"),
+        ]);
+        let log_store = LogStore::from_variables(&variable).unwrap().unwrap();
+        let body = reserve_config(Some(&log_store));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({
+                "role": "reserve",
+                "log_store": {"bucket": "character-credential-log-dev-1", "region": "us-west-2"},
+            })
+        );
+        // No client value of the environment is part of it.
+        let text = String::from_utf8(body).unwrap();
+        assert!(!text.contains("google") && !text.contains("providers"));
+        // A pod without a log store in its environment: the role alone.
+        assert_eq!(reserve_config(None), b"{\"role\":\"reserve\"}");
     }
 
     #[test]

@@ -10,20 +10,45 @@
 //! `docs/enclave.md`. The rules on what leaves a node are in `docs/egress-policy.md`.
 
 #![forbid(unsafe_code)]
+// The node program calls this crate with what its callers and a peer node sent. So:
+// No input ends the program. Its code (not the code of its tests) holds no `unwrap`, no
+// `expect`, no `panic!`, and no index or slice expression that can fail. A place that keeps
+// one of them says, where it stands, why no input reaches its failure
+// (`#[expect(clippy::.., reason = "..")]`).
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::get_unwrap
+    )
+)]
 // Rule E5 of the egress policy: the node writes no diagnostic output of its own making.
 #![deny(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
 
 pub mod app;
 pub mod attestation;
+pub mod certificate;
 pub mod encoding;
 pub mod envelope;
 pub mod keys;
 pub mod log;
 pub mod record;
 pub mod release;
+pub mod release_proofs;
+pub mod released;
 pub mod secret;
+pub mod secret_use;
 pub mod statement;
+pub mod subset;
 pub mod totp;
+pub mod vault_secret;
 
 use std::fmt;
 
@@ -62,6 +87,13 @@ pub mod purpose {
     pub const LOG_ENTRY_V2: &str = "pickle.secure.v2.log-entry\n";
     /// Prefix of the log chain hash of format 2: `SHA-256(prefix || prev || body_hash)`.
     pub const LOG_CHAIN_V2: &str = "pickle.secure.v2.log-chain\n";
+    /// HPKE info of a log entry of format 3.
+    pub const LOG_ENTRY_SEAL_V3: &str = "pickle.secure.v3.log-entry";
+    /// Signature context of a log entry of format 3.
+    pub const LOG_ENTRY_V3: &str = "pickle.secure.v3.log-entry\n";
+    /// Prefix of the nonce of a node document:
+    /// `SHA-256(prefix || the 32 bytes of the node signing public key)` (7.7).
+    pub const NODE_DOCUMENT: &str = "pickle.secure.v3.node-document\n";
     /// Signature context of a head.
     pub const HEAD: &str = "pickle.secure.v1.head\n";
     /// Signature context of the account key registration (verified by the backend).
@@ -70,6 +102,13 @@ pub mod purpose {
     pub const PEER_SEAL: &str = "pickle.secure.v1.peer";
     /// Signature context of a message between nodes.
     pub const PEER: &str = "pickle.secure.v1.peer\n";
+    /// HPKE info of the envelope of one use of a vault secret (10.5).
+    pub const SECRET_USE_SEAL: &str = "pickle.secure.v3.secret-use";
+    /// Signature context of one use of a vault secret (10.5).
+    pub const SECRET_USE: &str = "pickle.secure.v3.secret-use\n";
+    /// HPKE info of a vault value that `release` seals to a key its caller named (enclave.md
+    /// 5.9).
+    pub const RELEASE_SEAL: &str = "pickle.secure.v3.release";
 }
 
 /// The constants of protocol.md section 12 and the length limits of section 1.
@@ -87,12 +126,15 @@ pub mod limits {
     pub const TRANSFER_GRANTS: usize = 1_000;
     /// Most nodes that one grant is handed to by the node that holds it (10.1).
     pub const TRANSFER_PEERS: usize = 64;
-    /// Most events in one entry of format 2 (7.1). An open batch is closed before it would
-    /// hold more.
+    /// Most events in one entry of format 2 or 3 (7.1). An open batch is closed before it
+    /// would hold more.
     pub const ENTRY_EVENTS: usize = 128;
-    /// Most bytes of the plaintext (the JSON array of the events) of one entry of format 2
-    /// (7.1).
+    /// Most bytes of the plaintext (the JSON array of the events) of one entry of format 2 or
+    /// 3 (7.1).
     pub const ENTRY_PLAINTEXT_BYTES: usize = 1_048_576;
+    /// Most events of GET requests without a body that a node remembers for one account at
+    /// one time, so that an identical request shares one of them (7.2).
+    pub const MERGE_KEYS: usize = 8_192;
     /// Most requests in one `forward/batch` call (enclave.md 5.8b).
     pub const FORWARD_BATCH_REQUESTS: usize = 100;
     /// Requests of one `forward/batch` call that are in flight at the same time (enclave.md
@@ -104,6 +146,8 @@ pub mod limits {
     pub const PROVIDER_INFLIGHT: usize = 512;
     /// Idle HTTP/1.1 connections a node keeps to its log store (enclave.md 5.14).
     pub const LOG_STORE_IDLE_CONNECTIONS: usize = 32;
+    /// How long an idle connection to the log store is kept: 30 seconds.
+    pub const LOG_STORE_IDLE_MS: u64 = 30_000;
     /// Idle connections a node keeps to one provider host for one account (enclave.md 5.8
     /// step 8).
     pub const PROVIDER_IDLE_CONNECTIONS: usize = 8;
@@ -121,20 +165,84 @@ pub mod limits {
     pub const EVENT_ADDRESS_BYTES: usize = 8192;
     /// Longest binding document, in bytes (4.1).
     pub const BINDING_BYTES: usize = 512;
+    /// Longest token a node handles, in bytes (section 6): the strings `access_token`,
+    /// `refresh_token` and `id_token` of a token object, and the string a provider definition
+    /// injects. A token travels in the value of a request header, and a header value of that
+    /// length is above what servers commonly take.
+    pub const TOKEN_BYTES: usize = 16_384;
+    /// Longest plaintext of a record a node opens or creates, in bytes (section 6): four
+    /// times the longest token. That is the room of the three token strings of a token
+    /// response at their longest (`access_token`, `refresh_token`, `id_token`), and as much
+    /// as one of them for its other values.
+    pub const RECORD_PLAINTEXT_BYTES: usize = 4 * TOKEN_BYTES;
+    /// Longest `ct` of a record, in characters (section 6): the base64url text of the longest
+    /// plaintext and its 16-byte tag.
+    pub const RECORD_CT_CHARS: usize = (4 * (RECORD_PLAINTEXT_BYTES + 16)).div_ceil(3);
     /// How long the log store keeps an entry from the moment a node writes it: 365 days. Until
     /// then nobody can delete the object or shorten its retention (7.6).
     pub const LOG_RETENTION_DAYS: u64 = 365;
     /// The age at which the lifecycle rule of the log store removes an entry, and from which a
     /// reader treats an absent entry as expired: 400 days (7.4, 7.6).
     pub const LOG_EXPIRY_DAYS: u64 = 400;
-    /// Longest release statement, in bytes (10.3).
+    /// How long the log store keeps a version of a node document from the moment the node
+    /// writes it: 400 days (7.7).
+    pub const NODE_DOCUMENT_RETENTION_DAYS: u64 = 400;
+    /// The age of the latest confirmed write of its node document at which a node writes the
+    /// document again: 30 days (7.7).
+    pub const NODE_DOCUMENT_RENEW_DAYS: u64 = 30;
+    /// The age of the latest confirmed write of its node document up to which a node takes a
+    /// user key and writes an entry: 31 days (7.7). An entry written inside this time has a
+    /// retention that ends before the retention of that version of the document.
+    pub const NODE_DOCUMENT_VALID_DAYS: u64 = 31;
+    /// Longest release statement, in bytes (section 9).
     pub const RELEASE_STATEMENT_BYTES: usize = 16_384;
-    /// The notice period of a release: how old the entry of the transparency log must be, by
-    /// the clock of the giving node, before the statement it records counts (10.3).
-    pub const RELEASE_NOTICE_SECONDS: u64 = 0;
-    /// How far the time of an entry of the transparency log may lie after the clock of the
-    /// giving node: 300 seconds (10.3).
-    pub const RELEASE_ENTRY_AHEAD_SECONDS: u64 = 300;
+    /// Longest attestation of release proofs, in bytes of its JSON without white space
+    /// (section 9).
+    pub const RELEASE_ATTESTATION_BYTES: usize = 65_536;
+    /// Most arrays, objects and commas, counted together outside its strings, of a JSON text
+    /// that release proofs carry inside a string: the release statement, the payload of the
+    /// envelope and the body of the log entry (section 9). What a parsed text holds grows
+    /// with these marks and not with its length, so a node parses such a text into a value
+    /// only within this bound. The three texts of a release the build workflow attested have
+    /// 24, 32 and 13 of them.
+    pub const RELEASE_TEXT_MARKS: usize = 1_024;
+    /// Most hashes in the audit path of the inclusion proof of an entry of a transparency log
+    /// (section 9): 64, the height of a tree whose number of leaves fits 64 bits.
+    pub const RELEASE_PROOF_HASHES: usize = 64;
+    /// Longest `name` of a record of kind `vault_secret`, in characters (section 6).
+    pub const VAULT_SECRET_NAME_CHARS: usize = 64;
+    /// Most hosts in `sites` of a record of kind `vault_secret` (section 6).
+    pub const VAULT_SECRET_SITES: usize = 8;
+    /// Most slots in `slots` of a record of kind `vault_secret` (section 6).
+    pub const VAULT_SECRET_SLOTS: usize = 4;
+    /// Longest name inside a slot of a vault secret (the part after `header:`, `query:`,
+    /// `form:` or `json:`), in bytes (section 6).
+    pub const SLOT_NAME_BYTES: usize = 64;
+    /// Longest host of a site, in bytes (section 6).
+    pub const HOST_BYTES: usize = 253;
+    /// Longest label of the host of a site, in bytes (section 6).
+    pub const HOST_LABEL_BYTES: usize = 63;
+    /// Longest `value` that `vault/store` takes, in bytes (enclave.md 5.9b).
+    pub const VAULT_SECRET_VALUE_BYTES: usize = 12_000;
+    /// Longest plaintext of a record that `vault/store` creates, in bytes (section 6). The
+    /// `ct` of such a record is at most 16,384 characters long.
+    pub const VAULT_SECRET_PLAINTEXT_BYTES: usize = 12_272;
+    /// The lengths the device of an account pads the plaintext of a record of kind
+    /// `vault_secret` to, in bytes (section 6): the shortest of them the plaintext fits.
+    pub const VAULT_SECRET_PADDED_BYTES: [usize; 7] =
+        [256, 512, 1_024, 2_048, 4_096, 8_192, 12_272];
+    /// How long the envelope of one use of a vault secret can be used, from the node time of
+    /// the giving node at which it was made: 30 seconds (10.5).
+    pub const SECRET_USE_MS: u64 = 30_000;
+    /// Shortest value of a vault secret that is used in a request, in bytes (10.5). A shorter
+    /// value is not searched for in the response to the request, so no node sends one.
+    pub const SECRET_USE_VALUE_BYTES_MIN: usize = 8;
+    /// Longest value of a vault secret that is used in a request, in bytes (10.5).
+    pub const SECRET_USE_VALUE_BYTES_MAX: usize = 12_000;
+    /// Shortest placeholder of a request a vault secret is used in, in characters (10.5).
+    pub const PLACEHOLDER_CHARS_MIN: usize = 16;
+    /// Longest placeholder, in characters.
+    pub const PLACEHOLDER_CHARS_MAX: usize = 128;
 }
 
 /// The failure codes of protocol.md section 11. The variants and the codes correspond one to

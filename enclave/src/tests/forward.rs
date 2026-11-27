@@ -9,10 +9,12 @@ use credential_enclave_protocol::limits;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use super::mail_stand_in::until;
 use super::{provider_with_log_store, quiet_provider, quiet_provider_and_log_store};
+use crate::log_store;
 use crate::providers::Definitions;
 use crate::state::Limits;
-use crate::testing::{App, Harness, Reply};
+use crate::testing::{request_share, App, Harness, Reply};
 
 const PROFILE: &str = "https://gmail.googleapis.com/gmail/v1/users/me/profile";
 
@@ -95,8 +97,16 @@ async fn the_node_sets_the_credential_and_drops_the_headers_it_owns() {
         ["TE", "trailers"],
         ["Trailer", "x-checksum"],
         ["Expect", "100-continue"],
-        ["Accept", "application/json"],
+        ["Accept", "application/json; charset=UTF-8"],
         ["Accept-Encoding", "gzip"],
+        // The node asks for the whole of a response, in no other character encoding.
+        ["Range", "bytes=0-9"],
+        ["If-Range", "\"etag\""],
+        ["Accept-Charset", "utf-16"],
+        // A name with `_` is the name with `-` for some servers.
+        ["Accept_Encoding", "gzip"],
+        ["Content_Length", "5"],
+        ["If_Range", "\"etag\""],
         ["User-Agent", "python-httpx/0.28"],
         ["X-Goog-Api-Client", "gog/0.38.1"],
         ["X-Upload-Name", "보고서.pdf"],
@@ -249,7 +259,7 @@ async fn every_method_of_the_list_is_sent_and_no_other() {
         assert_eq!(seen.header("content-length"), expected, "{method}");
     }
     let sent = provider.requests().len();
-    let seq = harness.head_seq("user-1");
+    let seq = harness.last_seq("user-1");
     for method in ["HEAD", "OPTIONS", "CONNECT", "TRACE", "get", "QUERY"] {
         assert_eq!(
             failure(
@@ -262,7 +272,7 @@ async fn every_method_of_the_list_is_sent_and_no_other() {
         );
     }
     assert_eq!(provider.requests().len(), sent);
-    assert_eq!(harness.head_seq("user-1"), seq);
+    assert_eq!(harness.last_seq("user-1"), seq);
 }
 
 #[tokio::test]
@@ -319,7 +329,7 @@ async fn an_address_outside_the_definition_is_refused_before_anything_is_recorde
         (403, "not_allowed".to_string())
     );
     assert!(provider.requests().is_empty());
-    assert_eq!(harness.head_seq("user-1"), 1);
+    assert_eq!(harness.last_seq("user-1"), 1);
     assert_budget_is_free(&harness);
 }
 
@@ -375,7 +385,7 @@ async fn malformed_headers_and_arguments_are_refused() {
         "invalid_request"
     );
     assert!(provider.requests().is_empty());
-    assert_eq!(harness.head_seq("user-1"), 1);
+    assert_eq!(harness.last_seq("user-1"), 1);
 
     // The time limit is optional and the bounds are inclusive.
     for timeout_ms in [Value::Null, json!(1000), json!(120_000)] {
@@ -397,6 +407,9 @@ async fn a_header_that_overrides_the_method_is_refused() {
         "X-HTTP-Method",
         "X-Method-Override",
         "x-METHOD-override",
+        // A name with `_` is the name with `-` for some servers.
+        "X_HTTP_Method_Override",
+        "x-http_method",
     ] {
         for headers in [
             json!([[name, "DELETE"]]),
@@ -419,10 +432,55 @@ async fn a_header_that_overrides_the_method_is_refused() {
             }
         }
     }
+    // An `Accept` header that names another character encoding than UTF-8 asks the provider
+    // for a body the search of rule E4 cannot read: the call is refused as well.
+    for value in [
+        "text/plain; charset=utf-16",
+        "application/json;CHARSET=\"UTF-16LE\"",
+        "text/html, text/plain;q=0.5;charset = iso-2022-jp",
+        "text/plain; charset=utf-8, text/csv; charset=utf-7",
+        "text/plain; charset=utf-80",
+        "text/plain; charset",
+    ] {
+        assert_eq!(
+            failure(
+                harness
+                    .forward(
+                        meta(&app, &record, "GET", PROFILE, json!([["Accept", value]])),
+                        b""
+                    )
+                    .await
+            ),
+            (403, "not_allowed".to_string()),
+            "{value}"
+        );
+    }
     // Nothing was sent and no entry was created.
     assert!(provider.requests().is_empty());
-    assert_eq!(harness.head_seq("user-1"), 1);
+    assert_eq!(harness.last_seq("user-1"), 1);
     assert_budget_is_free(&harness);
+
+    // An `Accept` header that names UTF-8, in any spelling, is sent as it is.
+    for value in [
+        "application/json",
+        "text/plain; charset=utf-8",
+        "text/plain;charset=\"UTF8\", application/json; q=0.9; Charset=UTF-8",
+    ] {
+        let forwarded = harness
+            .forward(
+                meta(&app, &record, "POST", PROFILE, json!([["Accept", value]])),
+                b"{}",
+            )
+            .await
+            .unwrap();
+        assert_eq!(forwarded.status, 200, "{value}");
+        assert_eq!(
+            provider.requests().last().unwrap().header("accept"),
+            Some(value)
+        );
+    }
+    let provider = quiet_provider_and_log_store().await;
+    let (harness, app, record) = ready(&provider).await;
 
     // A header whose name is not one of the three is a header like any other.
     let headers = json!([["X-HTTP-Method-Overrides", "DELETE"]]);
@@ -474,7 +532,7 @@ async fn the_batch_address_of_microsoft_graph_is_refused() {
         );
     }
     assert!(provider.requests().is_empty());
-    assert_eq!(harness.head_seq("user-1"), 1);
+    assert_eq!(harness.last_seq("user-1"), 1);
     assert_budget_is_free(&harness);
 
     // The same request on its own address is sent, and its event names it.
@@ -545,7 +603,7 @@ async fn a_get_request_with_a_body_always_has_its_own_event() {
         b64u(&Sha256::digest(other))
     );
     // The grant, the first GET and the three requests with a body.
-    assert_eq!(harness.head_seq("user-1"), 5);
+    assert_eq!(harness.last_seq("user-1"), 5);
 
     // A GET without a body still shares the event of the first one, and a request with a
     // body opened no window for it.
@@ -553,7 +611,7 @@ async fn a_get_request_with_a_body_always_has_its_own_event() {
         get(b"").await.log,
         json!({"seq": 2, "index": 0, "created": false})
     );
-    assert_eq!(harness.head_seq("user-1"), 5);
+    assert_eq!(harness.last_seq("user-1"), 5);
     assert_eq!(provider.requests().len(), 5);
     let fresh = format!("{PROFILE}?fields=messagesTotal");
     let request = meta(&app, &record, "GET", &fresh, json!([]));
@@ -628,7 +686,7 @@ async fn an_event_carries_the_whole_path_and_the_whole_query() {
         (403, "not_allowed".to_string())
     );
     assert_eq!(provider.requests().len(), 2);
-    assert_eq!(harness.head_seq("user-1"), 3);
+    assert_eq!(harness.last_seq("user-1"), 3);
 }
 
 #[tokio::test]
@@ -713,7 +771,7 @@ async fn provider_answers_come_back_as_they_are() {
 
     // A compressed body is one the node cannot search: nothing of it is handed on. The
     // request went to the provider, and its entry is on the chain.
-    let before = harness.head_seq("user-1");
+    let before = harness.last_seq("user-1");
     let withheld = harness
         .forward(
             meta(&app, &record, "GET", &format!("{PROFILE}?n=2"), json!([])),
@@ -725,7 +783,7 @@ async fn provider_answers_come_back_as_they_are() {
     assert_eq!(withheld.0, 502);
     assert_eq!(withheld.1["code"], "response_withheld");
     assert!(withheld.1.get("log").is_none());
-    assert_eq!(harness.head_seq("user-1"), before + 1);
+    assert_eq!(harness.last_seq("user-1"), before + 1);
     assert_budget_is_free(&harness);
 
     // An authentication failure is the provider's answer, not a failure of the call.
@@ -814,13 +872,13 @@ async fn bodies_above_the_limit_are_too_large() {
     assert_eq!(forwarded.status, 200);
     assert_eq!(provider.requests().last().unwrap().body.len(), SMALL);
     let sent = provider.requests().len();
-    let seq = harness.head_seq("user-1");
+    let seq = harness.last_seq("user-1");
     assert_eq!(
         failure(harness.forward(post("n=5"), &vec![b'c'; SMALL + 1]).await),
         (413, "too_large".to_string())
     );
     assert_eq!(provider.requests().len(), sent);
-    assert_eq!(harness.head_seq("user-1"), seq);
+    assert_eq!(harness.last_seq("user-1"), seq);
     assert_budget_is_free(&harness);
 }
 
@@ -843,7 +901,7 @@ async fn a_provider_that_does_not_answer_ends_in_a_timeout() {
 
     // The request left the node, so its entry is on the chain and in the store.
     assert_eq!(provider.requests().len(), 1);
-    assert_eq!(harness.head_seq("user-1"), 2);
+    assert_eq!(harness.last_seq("user-1"), 2);
     let events = app.stored_events(&harness, &provider);
     assert_eq!(events.len(), 2);
     assert_eq!(events[1][0]["t"], "provider_request");
@@ -1042,7 +1100,7 @@ async fn a_response_that_reflects_the_credential_is_withheld() {
         .into_iter()
         .enumerate()
     {
-        let before = harness.head_seq("user-1");
+        let before = harness.last_seq("user-1");
         let outcome = harness
             .forward(
                 meta(
@@ -1067,7 +1125,7 @@ async fn a_response_that_reflects_the_credential_is_withheld() {
         );
         // The request went out, and its entry is on the chain.
         assert_eq!(provider.requests().len(), index + 1);
-        assert_eq!(harness.head_seq("user-1"), before + 1);
+        assert_eq!(harness.last_seq("user-1"), before + 1);
     }
     // A response without the credential comes back.
     let forwarded = harness
@@ -1090,10 +1148,12 @@ async fn a_response_that_reflects_the_credential_is_withheld() {
 /// The connections of the node to the host of `PROFILE`, in the order they were opened.
 #[tokio::test]
 async fn two_calls_whose_responses_have_no_length_do_not_wait_for_each_other() {
-    // Each response declares no length, so each reserves the whole body limit of 1,000 bytes.
-    // The budget holds two request frames and one such response but not two frames and two
-    // responses: a call must give its frame back before its response asks for its share, or
-    // the two calls hold their frames and wait for each other until the time limit.
+    // Each response declares no length, so each reserves the whole body limit. The budget
+    // holds two request frames, what the two calls hold of their requests and of their
+    // credential, and one such response, but not all of that and two responses: a call must
+    // give its frame back before its response asks for its share, or the two calls hold
+    // their frames and wait for each other until the time limit.
+    const LIMIT: usize = 32 * 1024;
     let provider = provider_with_log_store(|_| {
         Reply::Raw(
             b"HTTP/1.1 200 Status\r\ncontent-type: text/plain\r\ntransfer-encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n"
@@ -1112,23 +1172,42 @@ async fn two_calls_whose_responses_have_no_length_do_not_wait_for_each_other() {
         "https://gmail.googleapis.com/gmail/v1/users/me/messages",
         json!([]),
     );
-    let frame = crate::frame::encode_head(&first).len();
+    let frames = crate::frame::encode_head(&first).len() + crate::frame::encode_head(&second).len();
+    // What a call holds of its request, from the reading of its frame to its end.
+    let requests = request_share(&first) + request_share(&second);
+    // What a call holds of its credential once it knows the token, and what it takes before:
+    // the share of the longest token the record can hold. The budget has room for both calls
+    // to take that at the same time.
+    let held = crate::api::credential_share("ya29.injected".len(), 1, 1);
+    let longest = record["ct"].as_str().unwrap().len().div_ceil(4) * 3;
+    let taken = crate::api::credential_share(longest, 1, 1);
+    assert!(2 * (taken - held) + 2 <= LIMIT, "{taken} {held}");
     let harness = Harness::with(
         &provider,
         Definitions::embedded(),
         Limits {
-            body_bytes: 1_000,
-            body_budget_bytes: 2 * frame + 1_000 - 1,
+            body_bytes: LIMIT,
             ..Limits::default()
         },
     );
     harness.use_log_store().await;
     app.grant(&harness).await;
+    // The node is set up under its whole budget. The two calls run under what the test
+    // leaves of it.
+    let left = frames + requests + 2 * held + LIMIT - 1;
+    let rest = u32::try_from(harness.node.limits.body_budget_bytes - left).unwrap();
+    let rest = harness
+        .node
+        .body_budget
+        .clone()
+        .try_acquire_many_owned(rest)
+        .unwrap();
     let started = Instant::now();
     let (one, two) = tokio::join!(harness.forward(first, b""), harness.forward(second, b""));
     assert_eq!(one.unwrap().status, 200);
     assert_eq!(two.unwrap().status, 200);
     assert!(started.elapsed() < Duration::from_secs(2));
+    drop(rest);
     assert_budget_is_free(&harness);
 }
 
@@ -1334,6 +1413,80 @@ async fn requests_of_one_account_to_one_host_share_a_connection_and_accounts_do_
 }
 
 #[tokio::test]
+async fn an_idle_connection_ends_at_the_sweep_after_its_idle_time_without_a_further_call() {
+    // The stand-in keeps the connection of a provider request open, and closes the
+    // connection of a write to the log store after its answer.
+    let provider =
+        provider_with_log_store(|_| Reply::json(200, &json!({"ok": true})).keep_alive()).await;
+    let (harness, app, record) = ready(&provider).await;
+    let request = |query: &str| {
+        meta(
+            &app,
+            &record,
+            "GET",
+            &format!("{PROFILE}?{query}"),
+            json!([]),
+        )
+    };
+    let idle = || async {
+        harness.health().await["state"]["idle_connections"]["provider"]
+            .as_u64()
+            .unwrap()
+    };
+
+    // One request: its connection is idle afterwards, in the node and at the provider.
+    assert_eq!(
+        harness.forward(request("n=1"), b"").await.unwrap().status,
+        200
+    );
+    until("the connections of the writes ended", || {
+        provider.open_connections() == 1
+    })
+    .await;
+    assert_eq!(idle().await, 1);
+
+    // The account makes no further call. A sweep before the idle time passed leaves the
+    // connection, and the sweep after it ends the connection: the provider reads its end.
+    harness.node.clock.advance(limits::PROVIDER_IDLE_MS / 2);
+    log_store::sweep(&harness.node).await;
+    assert_eq!((idle().await, provider.open_connections()), (1, 1));
+    harness.node.clock.advance(limits::PROVIDER_IDLE_MS / 2);
+    log_store::sweep(&harness.node).await;
+    assert_eq!(idle().await, 0);
+    until("the idle connection ended", || {
+        provider.open_connections() == 0
+    })
+    .await;
+    assert_eq!(gmail_connections(&harness), 1);
+
+    // A connection its provider closed is no idle connection of the node, also before a
+    // call or a sweep looks at it.
+    assert_eq!(
+        harness.forward(request("n=2"), b"").await.unwrap().status,
+        200
+    );
+    until("the connections of the writes ended", || {
+        provider.open_connections() == 1
+    })
+    .await;
+    assert_eq!(idle().await, 1);
+    provider.close_idle_connections();
+    until("the node read the end of the connection", || {
+        harness.node.egress.provider_idle.idle_total() == 0
+    })
+    .await;
+    assert_eq!(idle().await, 0);
+    assert_eq!(provider.open_connections(), 0);
+    // The request after it opens a connection.
+    assert_eq!(
+        harness.forward(request("n=3"), b"").await.unwrap().status,
+        200
+    );
+    assert_eq!(gmail_connections(&harness), 3);
+    assert_budget_is_free(&harness);
+}
+
+#[tokio::test]
 async fn a_get_over_an_idle_connection_that_ends_without_a_response_is_sent_once_more() {
     // The stand-in keeps the connection after the first answer, closes it without a response
     // when the second request arrives over it, and answers every later request.
@@ -1367,7 +1520,7 @@ async fn a_get_over_an_idle_connection_that_ends_without_a_response_is_sent_once
     assert_eq!(provider.requests().len(), 3);
     // Both tries are the same request, which one event names.
     assert_eq!(forwarded.log["created"], true);
-    assert_eq!(harness.head_seq("user-1"), 3);
+    assert_eq!(harness.last_seq("user-1"), 3);
 
     // A POST over an idle connection that ends without a response is not sent again: whether
     // the provider received it is unknown.
@@ -1378,6 +1531,693 @@ async fn a_get_over_an_idle_connection_that_ends_without_a_response_is_sent_once
     );
     assert_eq!(gmail_connections(&harness), 2);
     assert_eq!(provider.requests().len(), 4);
-    assert_eq!(harness.head_seq("user-1"), 4);
+    assert_eq!(harness.last_seq("user-1"), 4);
+    assert_budget_is_free(&harness);
+}
+
+#[tokio::test]
+async fn a_call_that_is_not_admitted_within_the_limit_ends_and_holds_nothing() {
+    let provider = provider_with_log_store(|_| {
+        Reply::with_body(200, &[("content-type", "application/json")], b"{}")
+    })
+    .await;
+    let harness = Harness::with(
+        &provider,
+        Definitions::embedded(),
+        Limits {
+            forward_concurrency: 1,
+            ..Limits::default()
+        },
+    );
+    harness.use_log_store().await;
+    let app = App::new("user-1", 1);
+    app.grant(&harness).await;
+    let record = google_record(&app);
+    let call = || meta(&app, &record, "GET", PROFILE, json!([]));
+    let stored = provider.stored().len();
+    let requests = provider.requests().len();
+    let wait = crate::api::ADMISSION_WAIT;
+
+    // Another call holds the one place of the forward calls. A call that arrives waits for
+    // the place for the time of its admission, and then ends: it has read nothing of its
+    // frame, created no entry and sent nothing.
+    let place = harness.node.forward_slots.try_acquire().unwrap();
+    let started = Instant::now();
+    assert_eq!(
+        failure(harness.forward(call(), b"").await),
+        (503, "capacity_unavailable".to_string())
+    );
+    assert!(started.elapsed() >= wait, "{:?}", started.elapsed());
+    let batch = json!({
+        "user_id": app.user_id, "record": record, "context": "cli:gog",
+        "requests": [{"method": "GET", "url": PROFILE, "headers": [], "body_bytes": 0}],
+    });
+    let batched = harness.forward_batch(batch, b"").await;
+    assert_eq!(batched.err().map(|(status, _)| status), Some(503));
+    drop(place);
+
+    // The place is free, and the body budget is taken: the call has its place and waits for
+    // the share of its request frame, within the same time. It gives its place back.
+    let all = u32::try_from(harness.node.limits.body_budget_bytes).unwrap();
+    let budget = harness
+        .node
+        .body_budget
+        .clone()
+        .try_acquire_many_owned(all)
+        .unwrap();
+    let started = Instant::now();
+    assert_eq!(
+        failure(harness.forward(call(), b"").await),
+        (503, "capacity_unavailable".to_string())
+    );
+    assert!(started.elapsed() >= wait, "{:?}", started.elapsed());
+    assert_eq!(harness.node.forward_slots.available_permits(), 1);
+    assert_eq!(provider.stored().len(), stored);
+    assert_eq!(provider.requests().len(), requests);
+
+    // A call that is admitted within the time runs as before.
+    drop(budget);
+    assert_eq!(harness.forward(call(), b"").await.unwrap().status, 200);
+    assert_budget_is_free(&harness);
+}
+
+/// The meta of a call that asks for its response as a stream.
+fn stream_meta(app: &App, record: &Value, method: &str, url: &str) -> Value {
+    let mut request = meta(app, record, method, url, json!([]));
+    request["stream"] = json!(true);
+    request
+}
+
+/// Waits until every place of the forward calls of the node is free: the task of a stream
+/// frees the place of its call after the response body has ended.
+async fn places_are_free(harness: &Harness) {
+    for _ in 0..400 {
+        if harness.node.forward_slots.available_permits() == harness.node.limits.forward_concurrency
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("a place of the forward calls stayed taken");
+}
+
+#[tokio::test]
+async fn a_stream_hands_on_a_body_above_the_body_limit_in_parts() {
+    // The body limit of this node is 64 KiB, and the provider sends 5 MiB: with a declared
+    // length, and as a chunked body.
+    const SMALL: usize = 64 * 1024;
+    const BODY: usize = 5 * 1024 * 1024;
+    let body: Vec<u8> = (0..BODY).map(|index| (index % 251) as u8).collect();
+    let chunked = {
+        let mut response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        for chunk in body.chunks(100_000) {
+            response.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            response.extend_from_slice(chunk);
+            response.extend_from_slice(b"\r\n");
+        }
+        response.extend_from_slice(b"0\r\n\r\n");
+        response
+    };
+    let answers = std::sync::Mutex::new(vec![
+        Reply::with_body(200, &[("content-type", "application/octet-stream")], &body),
+        Reply::Raw(chunked),
+        Reply::with_body(200, &[], &body),
+        Reply::Raw(b"HTTP/1.1 204 No Content\r\n\r\n".to_vec()),
+    ]);
+    let provider = provider_with_log_store(move |_| answers.lock().unwrap().remove(0)).await;
+    let harness = Harness::with(
+        &provider,
+        Definitions::embedded(),
+        Limits {
+            body_bytes: SMALL,
+            ..Limits::default()
+        },
+    );
+    harness.use_log_store().await;
+    let app = App::new("user-1", 1);
+    app.grant(&harness).await;
+    let record = google_record(&app);
+
+    for query in ["n=1", "n=2"] {
+        let request = stream_meta(&app, &record, "POST", &format!("{PROFILE}?{query}"));
+        let streamed = harness.forward_stream(request, b"{}").await.unwrap();
+        assert_eq!(streamed.status, 200);
+        assert_eq!(streamed.end, json!({"complete": true}), "{query}");
+        assert_eq!(streamed.body().len(), BODY, "{query}");
+        assert!(streamed.body() == body, "{query}");
+        assert!(streamed.parts.len() > 1, "{query}");
+        // The head carries the headers of the provider and the place of the event of the
+        // request, as a frame does.
+        let typed = (
+            "content-type".to_string(),
+            "application/octet-stream".to_string(),
+        );
+        assert_eq!(streamed.headers.contains(&typed), query == "n=1");
+        assert_eq!(streamed.log["created"], true);
+    }
+    // The entry of the request was in the store before the request left.
+    assert_eq!(harness.last_seq("user-1"), 3);
+
+    // The same response without `stream` is a frame, and above the body limit.
+    assert_eq!(
+        failure(
+            harness
+                .forward(
+                    meta(&app, &record, "POST", &format!("{PROFILE}?n=3"), json!([])),
+                    b"{}"
+                )
+                .await
+        ),
+        (413, "too_large".to_string())
+    );
+
+    // A response without a body is a stream of no part.
+    let request = stream_meta(&app, &record, "POST", &format!("{PROFILE}?n=4"));
+    let streamed = harness.forward_stream(request, b"{}").await.unwrap();
+    assert_eq!(streamed.status, 204);
+    assert!(streamed.parts.is_empty());
+    assert_eq!(streamed.end, json!({"complete": true}));
+
+    places_are_free(&harness).await;
+    assert_budget_is_free(&harness);
+}
+
+#[tokio::test]
+async fn a_stream_that_reflects_the_credential_is_cut_in_front_of_it() {
+    let token = "ya29.injected";
+    let front = vec![b'x'; 700_000];
+    let mut reflecting = front.clone();
+    reflecting.extend_from_slice(b"{\"echo\":\"Bearer ");
+    reflecting.extend_from_slice(token.as_bytes());
+    reflecting.extend_from_slice(b"\"}");
+    reflecting.extend_from_slice(&vec![b'y'; 300_000]);
+    let hex: String = token.bytes().map(|byte| format!("{byte:02x}")).collect();
+    let escaped: String = hex.bytes().map(|byte| format!("%{byte:02X}")).collect();
+    let mut under_escapes = front.clone();
+    under_escapes.extend_from_slice(escaped.as_bytes());
+    let answers = std::sync::Mutex::new(vec![
+        // The credential in the body, as it is.
+        Reply::with_body(200, &[], &reflecting),
+        // Its hexadecimal form under percent escapes, at the end of the body.
+        Reply::with_body(200, &[], &under_escapes),
+        // The credential in a header: the head is withheld.
+        Reply::with_body(200, &[("x-echo", token)], b"{}"),
+        // A body under a content coding the node cannot search.
+        Reply::with_body(200, &[("content-encoding", "gzip")], b"\x1f\x8b"),
+        Reply::json(200, &json!({"ok": true})),
+    ]);
+    let provider = provider_with_log_store(move |_| answers.lock().unwrap().remove(0)).await;
+    let (harness, app, record) = ready(&provider).await;
+    let call = |query: &str| stream_meta(&app, &record, "POST", &format!("{PROFILE}?{query}"));
+
+    for query in ["n=1", "n=2"] {
+        let streamed = harness.forward_stream(call(query), b"{}").await.unwrap();
+        assert_eq!(streamed.status, 200);
+        assert_eq!(streamed.end["complete"], false, "{query}");
+        assert_eq!(streamed.end["code"], "response_withheld", "{query}");
+        assert_eq!(
+            streamed.end["message"],
+            "the provider response was withheld by the egress policy"
+        );
+        // What was handed on is a front part of the body that ends in front of the
+        // credential.
+        let handed_on = streamed.body();
+        assert!(
+            handed_on.len() <= front.len(),
+            "{query}: {}",
+            handed_on.len()
+        );
+        assert!(handed_on.iter().all(|byte| *byte == b'x'), "{query}");
+    }
+
+    // A head that is withheld is a failure of the call: no stream begins.
+    for query in ["n=3", "n=4"] {
+        let (status, body) = harness
+            .forward_stream(call(query), b"{}")
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (502, Some("response_withheld"))
+        );
+    }
+    // The entries of the four requests are on the chain: the requests went to the provider.
+    assert_eq!(harness.last_seq("user-1"), 5);
+    assert_eq!(provider.requests().len(), 4);
+
+    let streamed = harness.forward_stream(call("n=5"), b"{}").await.unwrap();
+    assert_eq!(streamed.body(), b"{\"ok\":true}");
+    assert_eq!(streamed.end, json!({"complete": true}));
+    places_are_free(&harness).await;
+    assert_budget_is_free(&harness);
+}
+
+#[tokio::test]
+async fn a_stream_ends_with_the_failure_of_a_body_that_does_not_arrive() {
+    let answers = std::sync::Mutex::new(vec![
+        // A body that ends before its declared length: the connection closes.
+        Reply::Raw(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nshort".to_vec()),
+        // A head, and then nothing.
+        Reply::KeepAlive(
+            Duration::ZERO,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\npart".to_vec(),
+        ),
+        // No answer at all.
+        Reply::Hang,
+    ]);
+    let provider = provider_with_log_store(move |_| answers.lock().unwrap().remove(0)).await;
+    let (harness, app, record) = ready(&provider).await;
+    let call = |query: &str| {
+        let mut request = stream_meta(&app, &record, "POST", &format!("{PROFILE}?{query}"));
+        request["timeout_ms"] = json!(1000);
+        request
+    };
+
+    let streamed = harness.forward_stream(call("n=1"), b"{}").await.unwrap();
+    assert_eq!(streamed.end["complete"], false);
+    assert_eq!(streamed.end["code"], "provider_unreachable");
+
+    // The time limit of the call reaches to the end of the body.
+    let started = Instant::now();
+    let streamed = harness.forward_stream(call("n=2"), b"{}").await.unwrap();
+    assert_eq!(streamed.end["complete"], false);
+    assert_eq!(streamed.end["code"], "timeout");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(1000) && elapsed < Duration::from_secs(4),
+        "{elapsed:?}"
+    );
+
+    // Before the head of the provider response the failure is the failure of the call.
+    let (status, body) = harness
+        .forward_stream(call("n=3"), b"{}")
+        .await
+        .err()
+        .unwrap();
+    assert_eq!((status, body["code"].as_str()), (504, Some("timeout")));
+    places_are_free(&harness).await;
+    assert_budget_is_free(&harness);
+}
+
+#[tokio::test]
+async fn a_stream_frees_what_it_holds_at_its_time_limit_whether_or_not_its_caller_reads() {
+    use crate::frame;
+    use axum::body::Body;
+    use axum::extract::Request;
+    use hyper::service::Service;
+    use hyper_util::service::TowerToHyperService;
+
+    // More bytes than the node keeps ready for a caller that does not read.
+    let body = vec![b'z'; 8 * 1024 * 1024];
+    let provider = provider_with_log_store(move |_| Reply::with_body(200, &[], &body)).await;
+    let (harness, app, record) = ready(&provider).await;
+    let mut request = stream_meta(&app, &record, "POST", PROFILE);
+    request["timeout_ms"] = json!(1000);
+    let mut bytes = frame::encode_head(&request);
+    bytes.extend_from_slice(b"{}");
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/forward")
+        .header("content-length", bytes.len())
+        .body(Body::from(bytes))
+        .unwrap();
+    let response = TowerToHyperService::new(crate::api::router(harness.node.clone()))
+        .call(request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let taken = harness.node.limits.forward_concurrency - 1;
+    assert_eq!(harness.node.forward_slots.available_permits(), taken);
+
+    // The caller holds the response and reads nothing of its body. At the time limit of the
+    // call the place of the call is free all the same.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    places_are_free(&harness).await;
+
+    // A caller that reads then gets the parts that were ready and the end record of the time
+    // limit.
+    let received = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let streamed = crate::testing::read_stream(&received);
+    assert_eq!(streamed.end["complete"], false);
+    assert_eq!(streamed.end["code"], "timeout");
+    assert!(streamed.body().len() < 8 * 1024 * 1024);
+
+    // A caller that goes away frees the place at once.
+    let mut request = stream_meta(&app, &record, "POST", &format!("{PROFILE}?n=2"));
+    request["timeout_ms"] = json!(30000);
+    let mut bytes = frame::encode_head(&request);
+    bytes.extend_from_slice(b"{}");
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/forward")
+        .header("content-length", bytes.len())
+        .body(Body::from(bytes))
+        .unwrap();
+    let response = TowerToHyperService::new(crate::api::router(harness.node.clone()))
+        .call(request)
+        .await
+        .unwrap();
+    assert_eq!(harness.node.forward_slots.available_permits(), taken);
+    drop(response);
+    places_are_free(&harness).await;
+    assert_budget_is_free(&harness);
+}
+
+#[tokio::test]
+async fn a_stream_holds_the_share_of_its_search_until_its_body_has_ended() {
+    use crate::frame;
+    use crate::provider_response::StreamCheck;
+    use axum::http::Method;
+
+    // The provider answers with the head and a part of the body, and then stays silent.
+    let provider = provider_with_log_store(|_| {
+        let head = b"HTTP/1.1 200 OK\r\ncontent-length: 1000\r\n\r\n".to_vec();
+        let part = b"0123456789".repeat(40);
+        Reply::Pieces(vec![(Duration::ZERO, [head, part].concat())], false)
+    })
+    .await;
+    let (harness, app, record) = ready(&provider).await;
+    let whole = harness.node.limits.body_budget_bytes;
+    // The frame of a call, and the share of the body budget of its request.
+    let frame_of = |query: &str| {
+        let mut request = stream_meta(&app, &record, "POST", &format!("{PROFILE}?{query}"));
+        request["timeout_ms"] = json!(30000);
+        let mut bytes = frame::encode_head(&request);
+        bytes.extend_from_slice(b"{}");
+        (bytes, request_share(&request))
+    };
+
+    // The response goes on. The share of the request frame is free: the request is on the
+    // wire. The call holds what the search of its response can hold for the token of the
+    // record, and no more: what it took for the longest token a record of that size can hold
+    // is free again. And it holds the share of its request until the stream has ended.
+    let (bytes, of_the_request) = frame_of("n=1");
+    let response = harness.respond(Method::POST, "/v1/forward", bytes).await;
+    assert_eq!(response.status().as_u16(), 200);
+    let of_the_search = StreamCheck::memory_bound("ya29.injected".len());
+    assert_eq!(
+        harness.node.body_budget.available_permits(),
+        whole - of_the_search - of_the_request
+    );
+    assert_eq!(harness.health().await["load"]["forward_calls"], 1);
+    // The caller goes away: the task of the stream frees the shares and the place.
+    drop(response);
+    places_are_free(&harness).await;
+    assert_budget_is_free(&harness);
+
+    // A call that asks for a stream and does not get the share of its search within the time
+    // of its admission ends: it created no entry and sent nothing, and it holds nothing. The
+    // body budget has room for its request frame and for the share of its request, and for
+    // nothing else.
+    let (stored, requests) = (provider.stored().len(), provider.requests().len());
+    let (bytes, of_the_request) = frame_of("n=2");
+    let taken = u32::try_from(whole - bytes.len() - of_the_request).unwrap();
+    let budget = harness
+        .node
+        .body_budget
+        .clone()
+        .try_acquire_many_owned(taken)
+        .unwrap();
+    let started = Instant::now();
+    let response = harness.respond(Method::POST, "/v1/forward", bytes).await;
+    assert_eq!(response.status().as_u16(), 503);
+    let failure = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let failure: Value = serde_json::from_slice(&failure).unwrap();
+    assert_eq!(failure["code"], "capacity_unavailable");
+    assert!(started.elapsed() >= crate::api::ADMISSION_WAIT);
+    assert_eq!(provider.stored().len(), stored);
+    assert_eq!(provider.requests().len(), requests);
+    drop(budget);
+    assert_budget_is_free(&harness);
+}
+
+#[tokio::test]
+async fn a_frame_holds_the_share_of_its_credential_until_its_response_is_checked() {
+    use crate::frame;
+    use axum::http::Method;
+
+    // The provider answers with the head and a part of the body, and then stays silent.
+    let provider = provider_with_log_store(|_| {
+        let head = b"HTTP/1.1 200 OK\r\ncontent-length: 1000\r\n\r\n".to_vec();
+        let part = b"0123456789".repeat(40);
+        Reply::Pieces(vec![(Duration::ZERO, [head, part].concat())], false)
+    })
+    .await;
+    let (harness, app, record) = ready(&provider).await;
+    let whole = harness.node.limits.body_budget_bytes;
+    // The frame of a call, and the share of the body budget of its request.
+    let frame_of = |query: &str| {
+        let url = format!("{PROFILE}?{query}");
+        let mut request = meta(&app, &record, "POST", &url, json!([]));
+        request["timeout_ms"] = json!(30000);
+        let mut bytes = frame::encode_head(&request);
+        bytes.extend_from_slice(b"{}");
+        (bytes, request_share(&request))
+    };
+
+    // The body of the response does not end, so the call waits for it. Its request is on the
+    // wire, and the share of the request frame is free. The call holds the share of the
+    // response body, by its declared length, the share of its request, and the share of its
+    // credential: what the search of the response can hold for the token of the record, and
+    // the copies of that token its request carries. What it took for the longest token a
+    // record of that size can hold is free again.
+    let of_the_credential = crate::api::credential_share("ya29.injected".len(), 1, 1);
+    let (bytes, of_the_request) = frame_of("n=1");
+    let left = whole - 1_000 - of_the_credential - of_the_request;
+    {
+        let call = harness.respond(Method::POST, "/v1/forward", bytes);
+        tokio::pin!(call);
+        let mut free = whole;
+        for _ in 0..4_000 {
+            tokio::select! {
+                _ = &mut call => panic!("the call ended before its response did"),
+                () = tokio::time::sleep(Duration::from_millis(5)) => {}
+            }
+            free = harness.node.body_budget.available_permits();
+            if free == left {
+                break;
+            }
+        }
+        assert_eq!(free, left);
+        assert_eq!(
+            harness.node.forward_slots.available_permits() + 1,
+            harness.node.limits.forward_concurrency
+        );
+        // The caller goes away here: the call ends and holds nothing.
+    }
+    places_are_free(&harness).await;
+    assert_budget_is_free(&harness);
+
+    // A call that does not get the share of its credential within the time of its admission
+    // ends: it created no entry and sent nothing, and it holds nothing. The body budget has
+    // room for its request frame and for the share of its request, and for nothing else.
+    let (stored, requests) = (provider.stored().len(), provider.requests().len());
+    let (bytes, of_the_request) = frame_of("n=2");
+    let taken = u32::try_from(whole - bytes.len() - of_the_request).unwrap();
+    let budget = harness
+        .node
+        .body_budget
+        .clone()
+        .try_acquire_many_owned(taken)
+        .unwrap();
+    let started = Instant::now();
+    let response = harness.respond(Method::POST, "/v1/forward", bytes).await;
+    assert_eq!(response.status().as_u16(), 503);
+    let failure = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let failure: Value = serde_json::from_slice(&failure).unwrap();
+    assert_eq!(failure["code"], "capacity_unavailable");
+    assert!(started.elapsed() >= crate::api::ADMISSION_WAIT);
+    assert_eq!(provider.stored().len(), stored);
+    assert_eq!(provider.requests().len(), requests);
+    drop(budget);
+    assert_budget_is_free(&harness);
+}
+
+#[test]
+fn the_shares_of_a_response_stay_with_its_check_until_the_check_has_ended() {
+    use crate::frame;
+    use axum::http::Method;
+
+    // A runtime with one thread for the work that runs off the threads that serve the calls.
+    // Of a forward call that work is the check of the response, and nothing else.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        // The response declares no length: its share is the body limit until the body has
+        // been read, and the length of the body from then on.
+        let provider = provider_with_log_store(|_| {
+            Reply::Raw(
+                b"HTTP/1.1 200 Status\r\ncontent-type: text/plain\r\ntransfer-encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n"
+                    .to_vec(),
+            )
+        })
+        .await;
+        let (harness, app, record) = ready(&provider).await;
+        let whole = harness.node.limits.body_budget_bytes;
+        let of_the_credential = crate::api::credential_share("ya29.injected".len(), 1, 1);
+        // The one thread is taken until the test lets go of it: the check of the response
+        // waits for it.
+        let (let_go, taken) = std::sync::mpsc::channel::<()>();
+        let holder = tokio::task::spawn_blocking(move || taken.recv().is_ok());
+        let request = meta(&app, &record, "GET", PROFILE, json!([]));
+        let of_the_request = request_share(&request);
+        let request = frame::encode_head(&request);
+        {
+            let call = harness.respond(Method::POST, "/v1/forward", request);
+            tokio::pin!(call);
+            // The body has been read: the call holds the share of its two bytes, the share
+            // of its credential and the share of its request, and waits for the check.
+            let read = whole - 2 - of_the_credential - of_the_request;
+            let mut free = whole;
+            for _ in 0..4_000 {
+                tokio::select! {
+                    _ = &mut call => panic!("the call ended before the check of its response ran"),
+                    () = tokio::time::sleep(Duration::from_millis(5)) => {}
+                }
+                free = harness.node.body_budget.available_permits();
+                if free == read {
+                    break;
+                }
+            }
+            assert_eq!(free, read);
+            // The caller goes away here, and the check has not run.
+        }
+        // The call is gone, and the share of its request with it. The body of the response
+        // is in memory for the check that is still to run, with the token it is searched
+        // for: the share of the body and the share of the credential are held, and nothing
+        // else.
+        let held = whole - harness.node.body_budget.available_permits();
+        assert_eq!(held, of_the_credential + 2);
+        // The check runs and ends, and the two shares are free.
+        let_go.send(()).unwrap();
+        assert!(holder.await.unwrap());
+        for _ in 0..4_000 {
+            if harness.node.body_budget.available_permits() == whole {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_budget_is_free(&harness);
+    });
+}
+
+#[test]
+fn the_share_of_a_stream_is_no_less_than_the_share_of_a_frame() {
+    use crate::provider_response::StreamCheck;
+
+    // Before the search of its body begins, a call that asks for a stream holds what a call
+    // that answers with a frame holds: the search of the head of the response, and the
+    // copies of the token its request carries. Its share, the bound of the search of its
+    // body, covers that for a token of every length.
+    for bytes in [0, 1, 8, 13, 200, 511, 512, 513, 2_000, 12_000, 786_432] {
+        let of_a_frame = crate::api::credential_share(bytes, 1, 1);
+        assert!(of_a_frame <= StreamCheck::memory_bound(bytes), "{bytes}");
+    }
+    // The share of a frame for a token of a common length and for a long one.
+    assert_eq!(crate::api::credential_share(200, 1, 1), 33_208);
+    assert_eq!(crate::api::credential_share(2_000, 1, 1), 210_976);
+}
+
+#[tokio::test]
+async fn the_stream_key_and_the_time_limit_of_a_stream_are_checked() {
+    let provider = quiet_provider_and_log_store().await;
+    let (harness, app, record) = ready(&provider).await;
+    let invalid = |outcome: Result<crate::testing::Streamed, (u16, Value)>| {
+        let (status, body) = outcome.err().unwrap();
+        (
+            status,
+            body["code"].as_str().unwrap_or_default().to_string(),
+        )
+    };
+    // `stream` is a boolean.
+    for value in [json!("true"), json!(1), json!([])] {
+        let mut request = stream_meta(&app, &record, "GET", PROFILE);
+        request["stream"] = value;
+        let (status, body) = harness.forward_stream(request, b"").await.err().unwrap();
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (400, Some("invalid_request"))
+        );
+        assert_eq!(body["message"], "stream is missing or invalid");
+    }
+    // The time limit of a stream reaches to 600,000 milliseconds, that of a frame to 120,000.
+    let mut request = stream_meta(&app, &record, "GET", PROFILE);
+    request["timeout_ms"] = json!(600_001);
+    assert_eq!(
+        invalid(harness.forward_stream(request, b"").await),
+        (400, "invalid_request".to_string())
+    );
+    let mut request = stream_meta(&app, &record, "GET", PROFILE);
+    request["timeout_ms"] = json!(600_000);
+    assert!(harness.forward_stream(request, b"").await.is_ok());
+    let mut request = meta(&app, &record, "GET", PROFILE, json!([]));
+    request["timeout_ms"] = json!(120_001);
+    assert_eq!(
+        failure(harness.forward(request, b"").await),
+        (400, "invalid_request".to_string())
+    );
+    // `"stream": false` and `"stream": null` are a frame.
+    for value in [json!(false), Value::Null] {
+        let mut request = meta(&app, &record, "GET", PROFILE, json!([]));
+        request["stream"] = value;
+        assert_eq!(harness.forward(request, b"").await.unwrap().status, 200);
+    }
+    places_are_free(&harness).await;
+    assert_budget_is_free(&harness);
+}
+
+#[tokio::test]
+async fn a_coded_response_is_withheld_whatever_its_connection_header_lists() {
+    let answers = std::sync::Mutex::new(vec![
+        // The header that names the coding is listed as a header of the connection: the node
+        // drops the headers of that list, and judges the coding before it does.
+        Reply::with_body(
+            200,
+            &[
+                ("connection", "content-encoding"),
+                ("content-encoding", "gzip"),
+            ],
+            b"\x1f\x8b",
+        ),
+        // An instance manipulation (RFC 3229): the body is not the representation.
+        Reply::with_body(226, &[("im", "gzip")], b"\x1f\x8b"),
+        Reply::with_body(200, &[("IM", "vcdiff")], b"delta"),
+        // `identity` is no coding.
+        Reply::with_body(200, &[("content-encoding", "identity")], b"{}"),
+    ]);
+    let provider = provider_with_log_store(move |_| answers.lock().unwrap().remove(0)).await;
+    let (harness, app, record) = ready(&provider).await;
+    let call = |query: &str| {
+        meta(
+            &app,
+            &record,
+            "POST",
+            &format!("{PROFILE}?{query}"),
+            json!([]),
+        )
+    };
+    for query in ["n=1", "n=2", "n=3"] {
+        assert_eq!(
+            failure(harness.forward(call(query), b"{}").await),
+            (502, "response_withheld".to_string()),
+            "{query}"
+        );
+    }
+    // The stream form judges the same head.
+    let streamed = harness
+        .forward_stream(stream_meta(&app, &record, "POST", PROFILE), b"{}")
+        .await
+        .unwrap();
+    assert_eq!(streamed.body(), b"{}");
     assert_budget_is_free(&harness);
 }

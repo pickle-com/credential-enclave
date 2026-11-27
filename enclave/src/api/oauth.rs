@@ -15,7 +15,9 @@ use credential_enclave_protocol::log::EntryKind;
 use credential_enclave_protocol::{limits, statement, ProtocolError};
 
 use super::responses::{Begin, Complete, Merged};
-use super::{invalid, json_ok, provider_credentials, record_of, respond, ApiError, JsonBody};
+use super::{
+    invalid, json_ok, provider_credentials, record_of, respond, Admission, ApiError, JsonBody,
+};
 use crate::log_store;
 use crate::oauth::{
     self, authorization_url, call_token_address, check_params, token_request, ClientId,
@@ -36,7 +38,7 @@ pub async fn begin(State(node): State<Arc<Node>>, request: Request) -> Response 
 }
 
 async fn run_begin(node: &Node, request: Request) -> Result<Response, ApiError> {
-    let body = JsonBody::read(request).await?;
+    let body = JsonBody::read(node, request).await?;
     let user_id = body.user_id()?;
     let provider = body.text("provider")?;
     let operator_state = body.text("operator_state")?;
@@ -140,7 +142,8 @@ pub async fn complete(State(node): State<Arc<Node>>, request: Request) -> Respon
 }
 
 async fn run_complete(node: &Node, request: Request) -> Result<Response, ApiError> {
-    let body = JsonBody::read(request).await?;
+    let admission = Admission::of_request();
+    let body = JsonBody::read_within(node, request, &admission).await?;
     let user_id = body.user_id()?;
     let state = body.text("state")?;
     let code = body.text("code")?;
@@ -151,6 +154,15 @@ async fn run_complete(node: &Node, request: Request) -> Result<Response, ApiErro
     // A node that cannot write to its log store ends the call before it uses the pending
     // authorization up: the same call passes once the node can write.
     node.log_store.ensure_ready(node.now_ms())?;
+
+    // What the call holds while it waits is under the body budget of the node: the response
+    // of the token address while it arrives, and then the record and the public fields it
+    // answers with, while the log store confirms its entry. The call takes that share
+    // within the time of its admission, before it uses the pending authorization up: a call
+    // that ends with `capacity_unavailable` here spent no code and called no provider.
+    let _token_share = admission
+        .budget(node, oauth::TOKEN_RESPONSE_SHARE_BYTES)
+        .await?;
 
     // 1: the pending authorization is found by its node_state and used once.
     let node_state = state.split('.').next().unwrap_or_default();
@@ -182,6 +194,11 @@ async fn run_complete(node: &Node, request: Request) -> Result<Response, ApiErro
             return Err(ProtocolError::KeyMismatch.into());
         }
     }
+
+    // The random values of the record are drawn before the code is spent: a failure of the
+    // random source ends the call with `internal` and nothing changed.
+    let id = node.random_public::<16>()?;
+    let nonce = node.random_public::<12>()?;
 
     // 3: the exchange runs outside the account lock.
     let request = token_request(
@@ -217,8 +234,6 @@ async fn run_complete(node: &Node, request: Request) -> Result<Response, ApiErro
         (definition.client == ClientKind::Dynamic).then_some(pending.client_id.as_str());
     let plaintext = response.into_plaintext(now_ms, dynamic_client);
     let public = plaintext.public_fields(definition, None)?;
-    let id = node.random_public::<16>()?;
-    let nonce = node.random_public::<12>()?;
     // The record and its event are created under the account lock.
     let (record, place) = {
         let mut account = lock(&account);
@@ -227,7 +242,13 @@ async fn run_complete(node: &Node, request: Request) -> Result<Response, ApiErro
         if grant.sign_pk != pending.sign_pk {
             return Err(ProtocolError::KeyMismatch.into());
         }
-        let record = plaintext.seal(&grant, &id, &nonce, user_id, &pending.provider);
+        // The token address answered, and its response is a token object a node would not
+        // read again from a record: no record is made of it, and no entry.
+        let record = plaintext
+            .seal(&grant, &id, &nonce, user_id, &pending.provider)
+            .ok_or_else(|| {
+                ApiError::provider(ProtocolError::ExchangeFailed, 200, ProviderError::NONE)
+            })?;
         let place = node.create_event(
             &mut account,
             user_id,
@@ -239,6 +260,9 @@ async fn run_complete(node: &Node, request: Request) -> Result<Response, ApiErro
         )?;
         (record, place)
     };
+    // The parsed token is not held while the call waits for the log store: what it answers
+    // with is the record and the public fields.
+    drop(plaintext);
     // The record leaves only after the log store confirmed the entry. When it does not, the
     // record is dropped here and the tokens with it: the connection is started again.
     let log = log_store::commit(node, user_id, &account, &[(place, true)])
@@ -271,8 +295,13 @@ pub async fn merge(State(node): State<Arc<Node>>, request: Request) -> Response 
 /// Moves the refresh token of the previous record into a new record that has none
 /// (protocol.md 8.3) and returns the new record encrypted again under its own `id`. No entry
 /// is created and no provider is called.
+///
+/// A record whose plaintext, or a token of it, is above what a node reads is
+/// `record_invalid`, and so is a merged token a node would not read again from a record: the
+/// call creates no entry, so it has none to make that judgement behind. It handles records
+/// of kind `oauth` alone, whose plaintext a node made of a token response.
 async fn run_merge(node: &Node, request: Request) -> Result<Response, ApiError> {
-    let body = JsonBody::read(request).await?;
+    let body = JsonBody::read(node, request).await?;
     let user_id = body.user_id()?;
     let record = record_of(&body, "record")?;
     let previous = record_of(&body, "previous")?;
@@ -294,18 +323,22 @@ async fn run_merge(node: &Node, request: Request) -> Result<Response, ApiError> 
         .definitions
         .get(&record.provider)
         .ok_or(ProtocolError::ProviderUnknown)?;
-    let merged = new
-        .parse()?
-        .with_refresh_token_of(&old.parse()?, &definition.token_container);
+    let new = new.parse()?;
+    let old = old.parse()?;
+    new.within_bounds(definition)?;
+    old.within_bounds(definition)?;
+    let merged = new.with_refresh_token_of(&old, &definition.token_container);
     let public = merged.public_fields(definition, None)?;
     let nonce = node.random_public::<12>()?;
-    let merged = merged.seal(
-        &grant,
-        &record.id_bytes()?,
-        &nonce,
-        user_id,
-        &record.provider,
-    );
+    let merged = merged
+        .seal(
+            &grant,
+            &record.id_bytes()?,
+            &nonce,
+            user_id,
+            &record.provider,
+        )
+        .ok_or(ProtocolError::RecordInvalid)?;
     Ok(json_ok(&Merged {
         record: merged,
         public,

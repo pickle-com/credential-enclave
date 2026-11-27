@@ -1,0 +1,3 @@
+# The published files are the bytes of the assets of a release: git converts no line end in
+# them.
+*.json -text

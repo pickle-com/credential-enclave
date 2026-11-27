@@ -158,10 +158,16 @@ pub struct PublicField {
     pub path: String,
     #[serde(rename = "type")]
     pub kind: FieldType,
-    /// Longest value of a `string` field, in bytes of UTF-8. Absent for the other types.
+    /// Longest value of a `string` field, in bytes of UTF-8: 1 to [`PUBLIC_STRING_BYTES`].
+    /// Absent for the other types.
     #[serde(default)]
     pub max: Option<usize>,
 }
+
+/// The largest `max` of a public field of type `string`: 8,192 bytes. A node keeps no string
+/// of a token response that is longer, unless it is a token (`crate::oauth`), so a public
+/// field with a larger limit would name values a node does not keep.
+pub const PUBLIC_STRING_BYTES: usize = 8192;
 
 /// The keys of a token object that hold a token. A definition cannot list them as public.
 pub const TOKEN_KEYS: [&str; 3] = ["access_token", "refresh_token", "id_token"];
@@ -208,7 +214,7 @@ impl ApiRule {
             path.starts_with(prefix.as_str())
                 && (prefix.ends_with('/')
                     || path.len() == prefix.len()
-                    || path.as_bytes()[prefix.len()] == b'/')
+                    || path.as_bytes().get(prefix.len()) == Some(&b'/'))
         })
     }
 
@@ -229,7 +235,7 @@ impl ApiRule {
             let lenient = lenient_path(&reading);
             let denied = self.denied.iter().any(|denied| {
                 lenient.starts_with(denied.as_bytes())
-                    && (lenient.len() == denied.len() || lenient[denied.len()] == b'/')
+                    && (lenient.len() == denied.len() || lenient.get(denied.len()) == Some(&b'/'))
             });
             if denied {
                 return true;
@@ -422,8 +428,8 @@ fn is_ip_literal(host: &str) -> bool {
 fn has_valid_escapes(text: &str) -> bool {
     let bytes = text.as_bytes();
     let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
+    while let Some(byte) = bytes.get(index) {
+        if *byte == b'%' {
             let valid = bytes.get(index + 1).is_some_and(u8::is_ascii_hexdigit)
                 && bytes.get(index + 2).is_some_and(u8::is_ascii_hexdigit);
             if !valid {
@@ -445,9 +451,9 @@ fn decode_escapes(bytes: &[u8]) -> Vec<u8> {
     let hex = |byte: Option<&u8>| byte.and_then(|byte| char::from(*byte).to_digit(16));
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
-    while index < bytes.len() {
+    while let Some(literal) = bytes.get(index).copied() {
         let escape = match (
-            bytes[index],
+            literal,
             hex(bytes.get(index + 1)),
             hex(bytes.get(index + 2)),
         ) {
@@ -460,7 +466,7 @@ fn decode_escapes(bytes: &[u8]) -> Vec<u8> {
                 index += 3;
             }
             None => {
-                decoded.push(bytes[index]);
+                decoded.push(literal);
                 index += 1;
             }
         }
@@ -472,12 +478,12 @@ fn decode_escapes(bytes: &[u8]) -> Vec<u8> {
 /// letters: the escape of `.`, of `/` or of `\` with its `%` encoded once more. A server that
 /// decodes a path twice reads a dot or a separator there.
 fn has_twice_encoded_separator(path: &str) -> bool {
-    path.as_bytes().windows(5).any(|window| {
-        window[..3] == *b"%25"
-            && matches!(
-                (window[3], window[4].to_ascii_lowercase()),
-                (b'2', b'e') | (b'2', b'f') | (b'5', b'c')
-            )
+    path.as_bytes().windows(5).any(|window| match window {
+        [b'%', b'2', b'5', high, low] => matches!(
+            (high, low.to_ascii_lowercase()),
+            (b'2', b'e') | (b'2', b'f') | (b'5', b'c')
+        ),
+        _ => false,
     })
 }
 
@@ -743,7 +749,9 @@ impl Definition {
                     vec![field.path.as_str()]
                 };
                 let valid_limit = match field.kind {
-                    FieldType::String => field.max.is_some_and(|max| max >= 1),
+                    FieldType::String => field
+                        .max
+                        .is_some_and(|max| (1..=PUBLIC_STRING_BYTES).contains(&max)),
                     FieldType::Integer | FieldType::Boolean => field.max.is_none(),
                 };
                 if segments.iter().any(|segment| segment.is_empty())
@@ -817,6 +825,11 @@ impl Definitions {
     ///
     /// Panics when the embedded file is invalid. A test of this module parses the embedded
     /// file, so a release build never carries an invalid one.
+    #[expect(
+        clippy::expect_used,
+        reason = "runs once at the start of the node, on a constant of the source that a test \
+                  of this module parses: no input of a call reaches this place"
+    )]
     pub fn embedded() -> Definitions {
         Definitions::parse(EMBEDDED).expect("the embedded provider definitions are valid")
     }
@@ -1387,6 +1400,7 @@ mod tests {
                 "/drive/v3/",
                 "/upload/drive/v3/",
                 "/download/drive/v3/",
+                "/drive/v2/",
             ],
             &["/oauth2/v3/userinfo"],
         ),
@@ -1451,7 +1465,7 @@ mod tests {
                 "/v1/databases/",
                 "/v1/data_sources/",
             ],
-            &["/v1/search"],
+            &["/v1/search", "/v1/comments"],
         ),
         (
             "x",
@@ -1474,16 +1488,23 @@ mod tests {
                 "/user",
                 "/users/",
                 "/repos/",
+                "/repositories/",
                 "/search/",
                 "/orgs/",
                 "/rate_limit",
             ],
-            &["/graphql"],
+            &["/", "/graphql"],
         ),
         ("github", "uploads.github.com", &["/repos/"], &[]),
         ("github", "github.com", &[], &[]),
         ("paysign", "new.paysign.co.kr", &[], &["/mcp"]),
         ("paysign_test", "newdev.paysign.co.kr", &[], &["/mcp"]),
+    ];
+
+    /// The hosts whose rule takes an encoded `/` in a path (enclave.md section 7).
+    const ENCODED_SLASH_HOSTS: [(&str, &str); 2] = [
+        ("google_workspace", "sheets.googleapis.com"),
+        ("github", "api.github.com"),
     ];
 
     #[test]
@@ -1504,13 +1525,24 @@ mod tests {
                 .find(|(name, suffix_host, _)| (*name, *suffix_host) == (*provider, *host))
                 .map_or(&[], |(_, _, suffixes)| suffixes);
             assert_eq!(rule.suffixes, suffixes, "{provider} {host}");
-            // One host takes an encoded `/` in a path: the values address of Google Sheets
-            // carries a range, which may hold the `/` of a tab name, as one segment.
+            // Two hosts take an encoded `/` in a path. The values address of Google Sheets
+            // carries a range, which may hold the `/` of a tab name, as one segment. The REST
+            // API of GitHub carries the name of a branch or of a tag, which may hold a `/`, as
+            // one segment.
             assert_eq!(
                 rule.encoded_slash,
-                (*provider, *host) == ("google_workspace", "sheets.googleapis.com"),
+                ENCODED_SLASH_HOSTS.contains(&(*provider, *host)),
                 "{provider} {host}"
             );
+            // A rule that takes an encoded `/` allows by prefix and by exact path alone: no
+            // path end is allowed whatever comes before it, and no refusal under a prefix has
+            // to hold against another spelling.
+            if rule.encoded_slash {
+                assert!(
+                    rule.suffixes.is_empty() && rule.denied.is_empty(),
+                    "{provider} {host}"
+                );
+            }
             // One rule denies a path under its prefix: the batch address of Microsoft Graph
             // carries up to 20 requests in its body.
             let denied: &[&str] = match (*provider, *host) {
@@ -1670,12 +1702,12 @@ mod tests {
                 "{address}"
             );
         }
-        // No other provider has a host that takes one.
+        // Of the other hosts of every provider, none takes one.
         let definitions = embedded();
         for name in definitions.names() {
             let definition = definitions.get(name).unwrap();
             for rule in &definition.api {
-                if (name, rule.host.as_str()) == ("google_workspace", "sheets.googleapis.com") {
+                if ENCODED_SLASH_HOSTS.contains(&(name, rule.host.as_str())) {
                     continue;
                 }
                 let path = match (
@@ -1695,6 +1727,270 @@ mod tests {
                     "{address}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn the_api_of_github_takes_the_name_of_a_branch_with_a_slash_as_one_segment() {
+        let github = embedded().get("github").unwrap().clone();
+        // The name of a branch or of a tag with a `/` in it, as the clients of GitHub send it,
+        // in both cases of the hex digits, under the prefix of a repository by its name and
+        // by its number. The path is sent as it was received.
+        for path in [
+            "/repos/o/r/git/refs/heads%2Ffeature%2Fx",
+            "/repos/o/r/git/refs/heads%2ffeature%2fx",
+            "/repos/o/r/branches/feature%2Fx",
+            "/repos/o/r/commits/feature%2Fx",
+            "/repos/o/r/compare/main...feature%2Fx",
+            "/repos/o/r/tarball/release%2F1.0",
+            "/repositories/15062869/git/refs/heads%2Ffeature%2Fx",
+            "/repositories/15062869/branches/feature%2Fx",
+        ] {
+            let address = format!("https://api.github.com{path}?per_page=1");
+            let target = github.check_address(&address).unwrap();
+            assert_eq!(target.host, "api.github.com");
+            assert_eq!(target.path, path);
+            assert_eq!(target.request_target, format!("{path}?per_page=1"));
+        }
+        // The root of the API, which states the scopes of a token in the head of its response,
+        // and a repository by its number: the address GitHub redirects the address of a
+        // renamed repository to.
+        for address in [
+            "https://api.github.com/",
+            "https://api.github.com/?per_page=1",
+            "https://API.github.com:443/",
+            "https://api.github.com/repositories/15062869",
+            "https://api.github.com/repositories/15062869/pulls?state=open",
+        ] {
+            assert!(github.check_address(address).is_ok(), "{address}");
+        }
+        let denied = [
+            // The root is one exact path.
+            "https://api.github.com",
+            "https://api.github.com?per_page=1",
+            "https://api.github.com//",
+            "https://api.github.com/%2F",
+            "https://api.github.com/.",
+            "https://api.github.com/%2e",
+            // The list of every public repository is not under the prefix of one repository.
+            "https://api.github.com/repositories",
+            "https://api.github.com/repositories?since=1",
+            "https://api.github.com/repositoriesx/1",
+            // Addresses outside the rule stay outside it.
+            "https://api.github.com/notifications",
+            "https://api.github.com/installation/repositories",
+            "https://api.github.com/app",
+            "https://api.github.com/gists",
+            "https://api.github.com/repos",
+            // An encoded `/` is no segment boundary for the prefix comparison: it does not
+            // put a path under a prefix, and it does not continue a prefix without a `/`.
+            "https://api.github.com/repos%2Fo%2Fr",
+            "https://api.github.com/repositories%2F1",
+            "https://api.github.com/user%2Fkeys",
+            "https://api.github.com/rate_limit%2Fx",
+            "https://api.github.com/%2Frepos/o/r",
+            "https://api.github.com/x%2F..%2Frepos/o/r",
+            // The decoded path has a dot segment: on a server that decodes before it resolves,
+            // the request would leave the prefix.
+            "https://api.github.com/repos/o/r/contents/..%2F..%2F..%2Fnotifications",
+            "https://api.github.com/repos/o/r/git/refs/heads%2F..%2F..%2F..%2F..%2F..%2Fuser",
+            "https://api.github.com/repos/..%2Fnotifications",
+            "https://api.github.com/repos/%2E%2E%2Fnotifications",
+            "https://api.github.com/repos/%2e%2e%2fnotifications",
+            "https://api.github.com/repos/o/r%2F.%2Fpulls",
+            "https://api.github.com/repos/o/r/branches/x%2F..",
+            "https://api.github.com/repos/o/r/branches/x%2F.",
+            "https://api.github.com/repos/o/r/branches/x%2F..;%2Fy",
+            "https://api.github.com/repos/o/r/branches/x%2F..;z%2Fy",
+            "https://api.github.com/repositories/1%2F..%2F..%2Fnotifications",
+            "https://api.github.com/users/x%2F..%2F..%2Fnotifications",
+            "https://api.github.com/search/code%2F..%2F..%2Fgists",
+            "https://api.github.com/orgs/o%2F..%2F..%2Fapp",
+            // The other refusals hold on this host as on every host.
+            "https://api.github.com/repos/o/r/branches/x%252Fy",
+            "https://api.github.com/repos/o/r/branches/x%252fy",
+            "https://api.github.com/repos/o/r/branches/%252e%252e%2Fy",
+            "https://api.github.com/repos/o/r/branches/x%5Cy",
+            "https://api.github.com/repos/o/r/branches/x%5cy",
+            "https://api.github.com/repos/o/r/branches/x\\y",
+            "https://api.github.com/repos/o//r/branches/x%2Fy",
+            "https://api.github.com/repos/o/r/branches/x%2Fy%2",
+            "https://api.github.com/repos/o/r/branches/x%2Fy%zz",
+            "https://api.github.com/repos/o/r/branches/x%2Fy#z",
+            // The other two hosts of the provider take no encoded `/`.
+            "https://uploads.github.com/repos/o/r/releases/1/assets%2Fx",
+            "https://github.com/o/r%2Fx.git/info/refs",
+            "https://github.com/o%2Fr/git-upload-pack",
+        ];
+        for address in denied {
+            assert_eq!(
+                github.check_address(address),
+                Err(ProtocolError::NotAllowed),
+                "{address}"
+            );
+        }
+    }
+
+    /// The path with its percent escapes decoded once, by a decoder of the test: what a
+    /// server reads that decodes a path before it resolves it.
+    fn decoded_once(path: &str) -> Vec<u8> {
+        let bytes = path.as_bytes();
+        let mut decoded = Vec::with_capacity(bytes.len());
+        let mut at = 0;
+        while at < bytes.len() {
+            let escape = bytes
+                .get(at + 1..at + 3)
+                .and_then(|digits| std::str::from_utf8(digits).ok())
+                .and_then(|digits| u8::from_str_radix(digits, 16).ok());
+            match (bytes[at], escape) {
+                (b'%', Some(byte)) => {
+                    decoded.push(byte);
+                    at += 3;
+                }
+                (byte, _) => {
+                    decoded.push(byte);
+                    at += 1;
+                }
+            }
+        }
+        decoded
+    }
+
+    #[test]
+    fn no_path_with_an_encoded_slash_leaves_the_rule_of_its_host() {
+        // Every path of up to three parts after a prefix, where a part is a name, a dot
+        // segment in one of its spellings, a path parameter or nothing, and the parts are
+        // joined by `/` or by an encoded `/`. For each of the two hosts that take an encoded
+        // `/`, and each front: a prefix of the rule, a prefix with its `/` encoded, a prefix
+        // behind an encoded `/`, and an exact path.
+        const PARTS: [&str; 9] = ["a", "..", ".", "%2e%2e", "%2E.", "..;x", ".;", ";x", ""];
+        const JOINTS: [&str; 3] = ["/", "%2F", "%2f"];
+        let mut tails: Vec<String> = vec![String::new()];
+        let mut level: Vec<String> = vec![String::new()];
+        for _ in 0..3 {
+            let mut next = Vec::new();
+            for tail in &level {
+                for joint in JOINTS {
+                    for part in PARTS {
+                        next.push(format!("{tail}{joint}{part}"));
+                    }
+                }
+            }
+            tails.extend(next.iter().cloned());
+            level = next;
+        }
+        assert_eq!(tails.len(), 1 + 27 + 729 + 19_683);
+
+        let definitions = embedded();
+        let mut accepted_with_an_encoded_slash = 0;
+        for (provider, host) in ENCODED_SLASH_HOSTS {
+            let definition = definitions.get(provider).unwrap();
+            let rule = definition
+                .api
+                .iter()
+                .find(|rule| rule.host == host)
+                .unwrap();
+            let mut fronts: Vec<String> = Vec::new();
+            for prefix in &rule.prefixes {
+                let bare = prefix.trim_end_matches('/');
+                fronts.push(bare.to_string());
+                fronts.push(format!("{bare}%2F"));
+                fronts.push(format!("/x%2F..%2F{}", bare.trim_start_matches('/')));
+                fronts.push(format!("/%2F{}", bare.trim_start_matches('/')));
+            }
+            fronts.extend(
+                rule.exact
+                    .iter()
+                    .map(|exact| exact.trim_end_matches('/').to_string()),
+            );
+            // True when `text` is an exact path of the rule, or under one of its prefixes at a
+            // segment boundary.
+            let inside = |text: &str| {
+                rule.exact.iter().any(|exact| exact == text)
+                    || rule.prefixes.iter().any(|prefix| {
+                        text.starts_with(prefix.as_str())
+                            && (prefix.ends_with('/')
+                                || text.len() == prefix.len()
+                                || text.as_bytes()[prefix.len()] == b'/')
+                    })
+            };
+            for front in &fronts {
+                for tail in &tails {
+                    let path = format!("{front}{tail}");
+                    if !path.starts_with('/') {
+                        continue;
+                    }
+                    let outcome = definition.check_address(&format!("https://{host}{path}"));
+                    // A front that reaches the name of a prefix through an encoded `/` is
+                    // under no prefix, whatever follows it.
+                    if front.contains("%2F") {
+                        assert_eq!(outcome, Err(ProtocolError::NotAllowed), "{path}");
+                    }
+                    let Ok(target) = outcome else {
+                        continue;
+                    };
+                    // What was accepted is sent as it was received, and as it was received it
+                    // is inside the rule: the comparison took no encoded `/` for a boundary.
+                    assert_eq!(target.path, path);
+                    assert!(inside(&path), "{path}");
+                    // On a server that decodes the path before it resolves it, the request
+                    // has no dot segment, also when the server leaves path parameters out,
+                    // and it is still inside the rule: the encoded `/` put it nowhere else.
+                    let decoded = decoded_once(&path);
+                    let mut segments = decoded.split(|byte| *byte == b'/');
+                    assert!(
+                        segments.all(|segment| {
+                            let name = segment.split(|byte| *byte == b';').next().unwrap();
+                            name != b"." && name != b".."
+                        }),
+                        "{path}"
+                    );
+                    assert!(inside(&String::from_utf8(decoded).unwrap()), "{path}");
+                    if path.contains("%2F") || path.contains("%2f") {
+                        accepted_with_an_encoded_slash += 1;
+                    }
+                }
+            }
+        }
+        // The walk reached paths with an encoded `/` that pass, on both hosts.
+        assert!(
+            accepted_with_an_encoded_slash > 1_000,
+            "{accepted_with_an_encoded_slash}"
+        );
+    }
+
+    #[test]
+    fn the_second_version_of_the_drive_api_is_reached_under_its_own_prefix() {
+        let google = google();
+        for address in [
+            "https://www.googleapis.com/drive/v2/files",
+            "https://www.googleapis.com/drive/v2/files?maxResults=10&q=trashed%3Dfalse",
+            "https://www.googleapis.com/drive/v2/files/abc/children",
+            "https://www.googleapis.com/drive/v2/about",
+        ] {
+            assert!(google.check_address(address).is_ok(), "{address}");
+        }
+        for address in [
+            // The prefix ends with `/`: the bare version is not under it, and neither is a
+            // name that begins with it.
+            "https://www.googleapis.com/drive/v2",
+            "https://www.googleapis.com/drive/v2beta/files",
+            "https://www.googleapis.com/drive/v20/files",
+            "https://www.googleapis.com/drive/v1/files",
+            "https://www.googleapis.com/drive/",
+            // The upload address of that version is not an address of the rule.
+            "https://www.googleapis.com/upload/drive/v2/files",
+            "https://www.googleapis.com/resumable/upload/drive/v2/files",
+            // The host takes no encoded `/`, and a dot segment does not leave the prefix.
+            "https://www.googleapis.com/drive/v2/files/abc%2Fdef",
+            "https://www.googleapis.com/drive/v2/../../oauth2/v4/token",
+            "https://www.googleapis.com/drive/v2/%2e%2e/v3/files",
+        ] {
+            assert_eq!(
+                google.check_address(address),
+                Err(ProtocolError::NotAllowed),
+                "{address}"
+            );
         }
     }
 
@@ -1868,6 +2164,11 @@ mod tests {
             ("notion", "https://api.notion.com/v1/pages"),
             ("notion", "https://api.notion.com/v1/blocks/abc/children"),
             ("notion", "https://api.notion.com/v1/search"),
+            (
+                "notion",
+                "https://api.notion.com/v1/comments?block_id=abc&page_size=100",
+            ),
+            ("notion", "https://api.notion.com/v1/comments"),
             ("x", "https://api.x.com/2/users/me?user.fields=username"),
             ("link", "https://api.link.com/spend_requests/lsrq_1"),
             ("link", "https://api.link.com/userinfo"),
@@ -1904,6 +2205,8 @@ mod tests {
             ("notion", "https://api.notion.com/v1/oauth/token"),
             ("notion", "https://api.notion.com/v1/blocks"),
             ("notion", "https://api.notion.com/v1/search/more"),
+            ("notion", "https://api.notion.com/v1/comments/abc"),
+            ("notion", "https://api.notion.com/v1/users/abc"),
             ("x", "https://api.x.com/2/oauth2/token"),
             ("x", "https://api.x.com/2/usersearch"),
             ("link", "https://login.link.com/auth/token"),
@@ -2056,9 +2359,14 @@ mod tests {
         assert!(claims(json!([{"path": "email", "type": "string", "max": 320}])).is_ok());
         // The form of v1.0.0: a bare path.
         assert!(public(json!(["scope"])).is_err());
-        // A string without a limit, a limit of zero, a limit on another type.
+        // A string without a limit, a limit of zero, a limit above the longest string a node
+        // keeps of a token response beside its tokens, a limit on another type.
         assert!(public(json!([{"path": "scope", "type": "string"}])).is_err());
         assert!(public(json!([{"path": "scope", "type": "string", "max": 0}])).is_err());
+        assert_eq!(PUBLIC_STRING_BYTES, 8192);
+        assert!(public(json!([{"path": "scope", "type": "string", "max": 8193}])).is_err());
+        assert!(claims(json!([{"path": "email", "type": "string", "max": 8193}])).is_err());
+        assert!(claims(json!([{"path": "email", "type": "string", "max": 8192}])).is_ok());
         assert!(public(json!([{"path": "expires_in", "type": "integer", "max": 5}])).is_err());
         assert!(public(json!([{"path": "ok", "type": "boolean", "max": 5}])).is_err());
         // An unknown type, an unknown key, an empty path or segment.

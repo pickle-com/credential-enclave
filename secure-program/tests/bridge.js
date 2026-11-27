@@ -15,6 +15,8 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
 const vm = require("node:vm");
 
 // ---- Bytes ----
@@ -309,49 +311,106 @@ function deriveAccountKeys(masterKey) {
 const DAY_MS = 86400000;
 const SEQ_DIGITS = 20;
 const TIME_DIGITS = 13;
+const RTIME_MAX = 9999999999999;
+
+// The buckets of format 3 per server target (docs/protocol.md 7.6): the number of buckets, and the
+// name of the log store (the bucket the binding of a node names) the bucket names are made from.
+const SHARDS = {
+  prod: { count: 1024, base: "character-credential-log-prod-1" },
+  dev: { count: 32, base: "character-credential-log-dev-1" },
+  alpha: { count: 32, base: "character-credential-log-alpha-1" },
+  local: { count: 4, base: "character-credential-log-local-1" },
+};
 
 function zeros(value, digits) {
   return String(value).padStart(digits, "0");
 }
 
-/** One enclave node of the model: its keys, its release and measurement, the chains it wrote for
- *  the accounts and the grants it holds. The node id is the b64u of its signing public key. */
+/** The name of the bucket of format 3 that holds the objects of owner in the log store of env. */
+function shardBucket(env, owner) {
+  const shards = SHARDS[env];
+  const index = sha("sha256", utf8(owner)).readUInt16BE(0) % shards.count;
+  const tail = shards.base + "-" + zeros(index, 4);
+  return sha("sha256", utf8(tail)).subarray(0, 4).toString("hex") + "-" + tail;
+}
+
+// The measurements of the lists of the program of this checkout (ACCEPTED_RELEASES and
+// PRERELEASE_BUILDS), read at the first use: the builds whose nodes write a chain of format 1 or
+// format 2.
+let listedBuilds = null;
+
+/** The format a node of the model writes when its fixture names none: the format of the element
+ *  of the lists of the program whose measurement the node has (a node of platform local: whose
+ *  release name it has), and format 3 for every other node. The name of a release decides
+ *  nothing for a nitro node: a node with the name of a listed release and another measurement
+ *  writes format 3. A node of a listed build writes a chain of format 2 in this model unless its
+ *  fixture names format 1 (a node of a release before v2.0.0: appendEntry1). */
+function formatOf(platform, release, measurement) {
+  if (listedBuilds === null) {
+    const source = fs.readFileSync(path.join(__dirname, "..", "secure-program.js"), "utf8");
+    listedBuilds = listedMeasurements(source).concat(listedMeasurements(source, "PRERELEASE_BUILDS"));
+  }
+  const listed = listedBuilds.some((build) => platform === "local"
+    ? build.release === release
+    : measurement !== undefined && build.pcr0 === measurement.pcr0 && build.pcr1 === measurement.pcr1 && build.pcr2 === measurement.pcr2);
+  return listed ? 2 : 3;
+}
+
+/** One enclave node of the model: its keys, its release and measurement, the entries it wrote for
+ *  the accounts and the grants it holds. The node id is the b64u of its signing public key. A node
+ *  that writes format 3 writes its node document as well; a node of a listed build writes a chain
+ *  of format 2 into the bucket its binding names (formatOf, unless the fixture names the format). */
 class Node {
   constructor(world, options) {
     this.world = world;
     this.release = options.release;
     this.measurement = options.measurement;
+    this.platform = options.platform || "nitro";
+    this.format = options.format || formatOf(this.platform, options.release, options.measurement);
+    this.role = options.role;
+    // Further members of the binding of this node (a member this program does not read).
+    this.bindingMore = options.bindingMore;
+    // Further members of the node document of this node (a member this program does not read).
+    this.documentMore = options.documentMore;
     // The log store the binding names: the store of the world unless the fixture names another
     // (or null for a binding without log).
     this.log = options.log === undefined ? { bucket: world.bucket, region: world.region } : options.log;
     // Whether the COSE signature of the attestation documents of this node is corrupted.
     this.brokenSignature = options.brokenSignature === true;
-    // Whether the backend names this node in the list of nodes of the account (GET /api/secure/nodes).
-    // A node that is not offered is one the account's node list does not hold (the delegation subset
-    // of a larger fleet, or a node this device has not synchronized with): its chain in the store is
-    // known to the program only through the node discovery listing or a traced transfer.
+    // Whether the backend names this node in the list of nodes of the account.
     this.offered = options.offered !== false;
     this.alive = true;
-    this.signSeed = crypto.randomBytes(32);
+    this.signSeed = options.signSeed || crypto.randomBytes(32);
     this.signPk = ed25519PublicKey(this.signSeed);
     this.sealSk = crypto.randomBytes(32);
     this.sealPk = x25519PublicKey(this.sealSk);
     this.id = b64u(this.signPk);
     this.chains = new Map();
+    this.last = new Map();
     this.grants = new Map();
     this.finalHeads = new Map();
     this.commands = [];
+    this.attestations = 0;
+    // Whether the node takes a grant (false: its reply is a failure the node signed).
+    this.refuses = null;
+    if (this.format === 3 && options.document !== false) this.writeDocument();
   }
 
   bindingObject() {
     const binding = { v: 1, sign: b64u(this.signPk), seal: b64u(this.sealPk), release: this.release };
     if (this.log !== null) binding.log = this.log;
-    return binding;
+    if (this.role !== undefined) binding.role = this.role;
+    return Object.assign(binding, this.bindingMore === undefined ? {} : this.bindingMore);
   }
 
-  /** The attestation response of this node for a request nonce (docs/protocol.md 4.2). */
-  attestation(nonce) {
-    const challenge = b64u(crypto.randomBytes(16));
+  /** The document of the platform over the binding of this node and nonce (bytes). */
+  platformDocument(nonce) {
+    if (this.platform === "local") {
+      return utf8(JSON.stringify({
+        v: 1, platform: "local", binding: b64u(utf8(JSON.stringify(this.bindingObject()))),
+        nonce: b64u(nonce), time_ms: this.world.now,
+      }));
+    }
     const pcrs = new Map();
     for (let index = 0; index < 16; index += 1) pcrs.set(index, Buffer.alloc(48));
     pcrs.set(0, Buffer.from(this.measurement.pcr0, "hex"));
@@ -366,21 +425,41 @@ class Node {
       ["cabundle", [this.world.nitro.root, this.world.nitro.intermediate]],
       ["public_key", null],
       ["user_data", utf8(JSON.stringify(this.bindingObject()))],
-      ["nonce", bytes(nonce)],
+      ["nonce", Buffer.from(nonce)],
     ]));
     const protectedHeader = cbor(new Map([[1, -35]]));
     const sigStructure = concat(
       Buffer.from([0x84]), cbor("Signature1"), cbor(protectedHeader), Buffer.from([0x40]), cbor(payload));
     const signature = ecdsaSignP384(this.world.nitro.privateKey, sigStructure);
     if (this.brokenSignature) signature[0] ^= 1;
-    const document = cbor([protectedHeader, new Map(), payload, signature]);
+    return cbor([protectedHeader, new Map(), payload, signature]);
+  }
+
+  /** The attestation response of this node for a request nonce (docs/protocol.md 4.2). */
+  attestation(nonce) {
+    this.attestations += 1;
+    const challenge = b64u(crypto.randomBytes(16));
     return {
-      v: 1, platform: "nitro", document: b64u(document), node: this.id, challenge: challenge,
-      release: this.release,
+      v: 1, platform: this.platform, document: b64u(this.platformDocument(bytes(nonce))), node: this.id,
+      challenge: challenge, release: this.release,
       challenge_statement: signedValue(this.signSeed, "pickle.secure.v1.challenge\n", {
         v: 1, type: "challenge", node: this.id, nonce: nonce, challenge: challenge, time_ms: this.world.now,
       }),
     };
+  }
+
+  /** The node document as the node writes it to the log store (docs/protocol.md 7.7). */
+  documentObject() {
+    const nonce = sha("sha256", concat(utf8("pickle.secure.v3.node-document\n"), this.signPk));
+    const object = {
+      v: 1, platform: this.platform, document: b64u(this.platformDocument(nonce)), node: this.id,
+      release: this.release,
+    };
+    return Object.assign(object, this.documentMore === undefined ? {} : this.documentMore);
+  }
+
+  writeDocument() {
+    this.world.putObject(shardBucket(this.world.serverTarget, this.id), "n3/" + this.id, JSON.stringify(this.documentObject()));
   }
 
   reply(fields) {
@@ -412,21 +491,30 @@ class Node {
     this.commands.push(command);
     const common = { user_id: command.user_id, challenge: command.challenge, key_id: keyId, time_ms: this.world.now };
     if (command.type === "grant") {
+      if (this.refuses !== null) {
+        return this.reply(Object.assign({ ok: false, code: this.refuses, type: "grant_reply", not_after_ms: 0 }, common));
+      }
       const notAfter = Math.min(command.not_after_ms, this.world.now + 30 * DAY_MS);
+      const held = this.grants.get(command.user_id);
+      // A node of format 3 writes no entry for a grant that renews the one it holds.
+      const renewal = this.format === 3 && held !== undefined && held.sign_pk === command.sign_pk &&
+        held.not_after_ms > this.world.now;
       this.grants.set(command.user_id, {
         sign_pk: command.sign_pk, log_pk: command.log_pk, key_id: keyId, custody: command.custody,
         not_after_ms: notAfter,
       });
-      this.appendEntry(command.user_id, "c", [
-        { t: "grant_accepted", time_ms: this.world.now, not_after_ms: notAfter, custody: command.custody },
-      ], { logPk: bytes(command.log_pk), keyId: keyId });
+      if (!renewal) {
+        this.write(command.user_id, "c", [
+          { t: "grant_accepted", time_ms: this.world.now, not_after_ms: notAfter, custody: command.custody },
+        ], { logPk: bytes(command.log_pk), keyId: keyId });
+      }
       return this.reply(Object.assign({ ok: true, type: "grant_reply", not_after_ms: notAfter }, common));
     }
     if (command.type === "revoke") {
       const grant = this.grants.get(command.user_id);
       this.grants.delete(command.user_id);
       if (grant !== undefined) {
-        this.appendEntry(command.user_id, "c", [{ t: "grant_revoked", time_ms: this.world.now }],
+        this.write(command.user_id, "c", [{ t: "grant_revoked", time_ms: this.world.now }],
           { logPk: bytes(grant.log_pk), keyId: grant.key_id });
       }
       return this.reply(Object.assign({ ok: true, type: "revoke_reply" }, common));
@@ -434,10 +522,53 @@ class Node {
     return failure("invalid_request");
   }
 
+  /** Writes one entry in the format of this node. */
+  write(user, kind, events, options) {
+    if (this.format === 1) return this.appendEntry1(user, kind, events, options);
+    return this.format === 3 ? this.appendEntry3(user, kind, events, options) : this.appendEntry(user, kind, events, options);
+  }
+
+  /** Writes an entry of the kind given for the account of the world, sealed to its key. */
+  record(kind, events, options) {
+    const keys = this.world.account.keys;
+    return this.write(this.world.userId, kind, events, Object.assign({ logPk: keys.logPk, keyId: keys.keyId }, options || {}));
+  }
+
+  /** Appends one entry of format 3 (docs/protocol.md 7.1 and 7.6) and writes its object to the
+   *  bucket of the account unless options.stored is false. options: logPk and keyId of the grant
+   *  the entry is sealed under, timeMs (the world time when absent), stored, seq (the seq of the
+   *  entry when the fixture writes a second entry under a seq), signSeed (another signing key:
+   *  an object the node did not sign), key (the name the object is written under). */
+  appendEntry3(user, kind, events, options) {
+    const last = this.last.get(user) || { seq: 0, bodyHash: Buffer.alloc(32) };
+    const seq = options.seq === undefined ? last.seq + 1 : options.seq;
+    const timeMs = options.timeMs === undefined ? this.world.now : options.timeMs;
+    const aad = utf8([this.id, user, options.keyId, String(seq)].join("\n"));
+    const sealed = hpkeSeal(
+      "chacha20poly1305", options.logPk, utf8("pickle.secure.v3.log-entry"), aad, utf8(JSON.stringify(events)));
+    const body = utf8(JSON.stringify({
+      v: 3, node: this.id, user_id: user, key_id: options.keyId, seq: seq, prev: b64u(last.bodyHash),
+      time_ms: timeMs, kind: kind, count: events.length, enc: b64u(sealed.enc), ct: b64u(sealed.ciphertext),
+    }));
+    const sig = ed25519Sign(options.signSeed || this.signSeed, concat(utf8("pickle.secure.v3.log-entry\n"), body));
+    const bodyHash = sha("sha256", body);
+    const label = kind === "c" ? events[0].t : String(events.length);
+    const key = options.key || "a3/" + user + "/" + kind + "/" + zeros(RTIME_MAX - timeMs, 13) + "." + this.id + "." +
+      seq + "." + label + "." + options.keyId + "." + b64u(bodyHash);
+    const entry = {
+      seq: seq, time_ms: timeMs, kind: kind, events: events, body: body, bodyHash: bodyHash, key: key,
+      object: JSON.stringify({ body: b64u(body), sig: b64u(sig) }),
+    };
+    if (options.seq === undefined) this.last.set(user, { seq: seq, bodyHash: bodyHash });
+    const chain = this.chains.get(user) || [];
+    chain.push(entry);
+    this.chains.set(user, chain);
+    if (options.stored !== false) this.world.putObject(shardBucket(this.world.serverTarget, user), key, entry.object);
+    return entry;
+  }
+
   /** Appends one entry of format 2 to the chain of user (docs/protocol.md 7.1) and writes its
-   *  object to the log store unless options.stored is false (a pending entry: the gap of a chain).
-   *  options: logPk and keyId of the grant the entry is sealed under, timeMs (the world time when
-   *  absent), stored, hpkeSeed. */
+   *  object to the bucket the binding names unless options.stored is false. */
   appendEntry(user, kind, events, options) {
     const chain = this.chains.get(user) || [];
     const seq = chain.length + 1;
@@ -463,11 +594,41 @@ class Node {
     };
     chain.push(entry);
     this.chains.set(user, chain);
-    if (options.stored !== false) this.world.putObject(entry.key, entry.object);
+    if (options.stored !== false) this.world.putObject(this.world.bucket, entry.key, entry.object);
     return entry;
   }
 
-  /** The signed head of the chain of user (docs/protocol.md 7.3). */
+  /** Appends one entry of format 1 to the chain of user (docs/protocol.md 7.1: the releases
+   *  before v2.0.0) and writes its object to the bucket the binding names unless options.stored
+   *  is false. An entry of format 1 holds one event, and its key names the seq and the entry
+   *  hash alone: neither the time nor the kind of the entry. A fixture names the format (format:
+   *  1); events holds the one event. */
+  appendEntry1(user, kind, events, options) {
+    const chain = this.chains.get(user) || [];
+    const seq = chain.length + 1;
+    const prev = seq === 1 ? Buffer.alloc(32) : chain[chain.length - 1].entryHash;
+    const timeMs = options.timeMs === undefined ? this.world.now : options.timeMs;
+    const aad = utf8([this.id, user, options.keyId, String(seq)].join("\n"));
+    const sealed = hpkeSeal(
+      "chacha20poly1305", options.logPk, utf8("pickle.secure.v1.log-entry"), aad, utf8(JSON.stringify(events[0])));
+    const body = utf8(JSON.stringify({
+      v: 1, node: this.id, user_id: user, key_id: options.keyId, seq: seq, prev: b64u(prev),
+      time_ms: timeMs, enc: b64u(sealed.enc), ct: b64u(sealed.ciphertext),
+    }));
+    const sig = ed25519Sign(this.signSeed, concat(utf8("pickle.secure.v1.log-entry\n"), body));
+    const entryHash = sha("sha256", body);
+    const entry = {
+      seq: seq, time_ms: timeMs, kind: kind, events: events, body: body, bodyHash: entryHash, entryHash: entryHash,
+      key: "v1/accounts/" + user + "/" + this.id + "/" + zeros(seq, SEQ_DIGITS) + "-" + b64u(entryHash),
+      object: JSON.stringify({ body: b64u(body), sig: b64u(sig) }),
+    };
+    chain.push(entry);
+    this.chains.set(user, chain);
+    if (options.stored !== false) this.world.putObject(this.world.bucket, entry.key, entry.object);
+    return entry;
+  }
+
+  /** The signed head of the chain of user (docs/protocol.md 7.3), as a node before v2.4.0 signs it. */
   head(user, nonce, final) {
     const chain = this.chains.get(user) || [];
     const last = chain.length === 0 ? null : chain[chain.length - 1];
@@ -478,14 +639,19 @@ class Node {
     });
   }
 
-  /** The orderly shutdown of the node: a final head per account, and the node is gone. */
+  /** The orderly shutdown of the node: a final head per account for a node before v2.4.0, and the
+   *  node is gone. */
   shutDown() {
-    for (const user of this.chains.keys()) this.finalHeads.set(user, this.head(user, "", true));
+    if (this.format !== 3) {
+      for (const user of this.chains.keys()) this.finalHeads.set(user, this.head(user, "", true));
+    }
     this.alive = false;
   }
 }
 
-/** The device, the backend of the operator, the log store and the nodes of one account. */
+/** The device, the backend of the operator, the log store and the nodes of one account. Time is
+ *  the time of the model: native.nowMs reads it, native.sleep waits on it, and run and settle move
+ *  it on when nothing else is left to happen. */
 class World {
   constructor(options) {
     const given = options || {};
@@ -493,7 +659,9 @@ class World {
     this.serverTarget = given.serverTarget || "prod";
     this.bucket = "character-credential-log-" + this.serverTarget + "-1";
     this.region = "us-west-2";
-    this.now = given.now || 1790000000000;
+    // (2026-12-13T00:00:00Z: twenty days after the time from which the backend keeps the
+    // document of every node that takes a transfer, LEGACY_TRANSFER_DOCUMENTS_FROM_MS.)
+    this.now = given.now || 1797120000000;
     this.nitro = makeNitroSigner();
     this.keychain = new Map();
     this.store = new Map();
@@ -501,25 +669,128 @@ class World {
     this.runtime = {};
     this.logs = [];
     this.reports = [];
+    this.outcomeReports = [];
+    this.syncReports = [];
+    this.securityStatuses = [];
     this.requests = [];
-    this.account = { key: null, keys: null };
+    // How often the program asked the bridge for the device (native.deviceInfo, a synchronous call).
+    this.deviceInfoCalls = 0;
+    // The account: its registered key, and what the backend says of the program it serves
+    // (servedProgram: the value of served_program_version in the answer of the account query;
+    // undefined for a backend that names none).
+    this.account = { key: null, keys: null, servedProgram: undefined };
     this.nodes = new Map();
-    this.objects = new Map();
+    this.buckets = new Map();
     this.versionCounter = 0;
     this.bridgeOpen = false;
-    // The shared ledger the backend keeps for the account (GET/PUT /api/secure/ledger): the sealed
-    // value as the program uploaded it, null while none was uploaded, and the count of uploads.
+    this.timers = [];
+    this.pageSize = 1000;
+    // The device: the build and what its user does.
+    this.device = {
+      platform: "ios", debug_build: false, locale: "en-US", sheets: false, securityStatus: false,
+      ownerAuth: true, ownerAuths: [], prompts: [], presented: [], promptAnswer: null, webAuth: null,
+      confirmations: false, confirmAnswer: true, confirmed: [],
+      // What the app knows of the delivery of the program itself (the bridge primitive
+      // programDelivery, in a build that has it): {verified, settled_ms, failed_ms,
+      // failed_status}, or a function that returns it. null: a build without the primitive.
+      delivery: null,
+    };
+    if (given.device) Object.assign(this.device, given.device);
+    // The backend: which routes it has, and the faults of a fixture (see fault).
+    this.routes = { grants: true, log: "on", outcomes: true, syncReport: true };
+    this.faults = [];
+    this.vault = { secrets: new Map(), logins: new Map(), created: 0 };
+    // The authorizations the nodes began (POST /api/secure/connections/begin), by node state.
+    this.connections = new Map();
+    // The shared ledger the backend keeps for the account (GET/PUT /api/secure/ledger).
     this.sharedLedger = null;
     this.ledgerUploads = 0;
+    // The attestation documents the backend kept of the nodes of releases before v2.4.0.
+    this.keptDocuments = new Map();
+    // The release proofs the backend holds, by release: it hands them out for the measurement
+    // their statement states when a request names its digest (GET /api/secure/release-proofs
+    // with the query measurement; routes.proofs false: a backend without that route). With
+    // proofsWrapped the answer holds them as its member release_proofs. measureProofs holds
+    // what the backend hands out for a digest in the place of that (by the digest of a
+    // measurement). attestationMore: further members of every attestation response (members
+    // this program does not read).
+    this.releaseProofs = new Map();
+    this.proofsWrapped = false;
+    this.measureProofs = new Map();
+    this.attestationMore = null;
+    this.routes.proofs = true;
   }
 
   get storeHost() {
     return this.bucket + ".s3." + this.region + ".amazonaws.com";
   }
 
+  get shardHost() {
+    return shardBucket(this.serverTarget, this.userId) + ".s3." + this.region + ".amazonaws.com";
+  }
+
+  // ---- The time of the model ----
+
+  /** A promise that resolves when the time of the model has moved on by ms. */
+  sleep(ms) {
+    return new Promise((resolve) => {
+      this.timers.push({ at: this.now + Math.max(0, Number(ms) || 0), resolve: resolve });
+    });
+  }
+
+  /** Lets everything that can happen without time passing happen. */
+  async drain() {
+    for (let turn = 0; turn < 3; turn += 1) await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  /** Moves the time on to the earliest timer and fires what is due. False when no timer waits. */
+  step() {
+    if (this.timers.length === 0) return false;
+    let earliest = this.timers[0].at;
+    for (const timer of this.timers) earliest = Math.min(earliest, timer.at);
+    this.now = Math.max(this.now, earliest);
+    const due = this.timers.filter((timer) => timer.at <= this.now);
+    this.timers = this.timers.filter((timer) => timer.at > this.now);
+    for (const timer of due) timer.resolve();
+    return true;
+  }
+
+  /** Runs the model until promise settles, moving the time on whenever nothing else can happen,
+   *  and returns its value (or throws its failure). */
+  async run(promise) {
+    const outcome = { settled: false, failed: false, value: undefined };
+    Promise.resolve(promise).then(
+      (value) => { outcome.settled = true; outcome.value = value; },
+      (error) => { outcome.settled = true; outcome.failed = true; outcome.value = error; });
+    for (let turn = 0; turn < 100000; turn += 1) {
+      await this.drain();
+      if (outcome.settled) break;
+      if (!this.step()) throw new Error("the model is idle and the promise has not settled");
+    }
+    if (!outcome.settled) throw new Error("the promise did not settle");
+    if (outcome.failed) throw outcome.value;
+    return outcome.value;
+  }
+
+  /** Lets the work nothing waits for go on for ms of the time of the model (reports, the timers of
+   *  requests that were answered). */
+  async settle(ms) {
+    const end = this.now + (ms === undefined ? 0 : ms);
+    for (let turn = 0; turn < 100000; turn += 1) {
+      await this.drain();
+      const next = this.timers.reduce((least, timer) => Math.min(least, timer.at), Infinity);
+      if (next > end) break;
+      this.step();
+    }
+    this.now = Math.max(this.now, end);
+    await this.drain();
+  }
+
   advance(ms) {
     this.now += ms;
   }
+
+  // ---- The account and the nodes ----
 
   /** A master key in the key store of the device and the registration of its keys on the account
    *  (the state of a device whose key state is present). */
@@ -528,6 +799,7 @@ class World {
     this.keychain.set("com.pickle.client.secure.master-key\n" + this.userId,
       { value: b64u(masterKey), synchronizable: true });
     const keys = deriveAccountKeys(masterKey);
+    keys.masterKey = masterKey;
     this.account.keys = keys;
     this.account.key = { sign_pk: b64u(keys.signPk), log_pk: b64u(keys.logPk), key_id: keys.keyId };
     return keys;
@@ -543,22 +815,93 @@ class World {
     return Array.from(this.nodes.values()).filter((node) => node.alive && node.offered);
   }
 
-  putObject(key, body) {
+  // ---- The log store ----
+
+  objectsOf(bucket) {
+    let objects = this.buckets.get(bucket);
+    if (objects === undefined) {
+      objects = new Map();
+      this.buckets.set(bucket, objects);
+    }
+    return objects;
+  }
+
+  /** The objects of the bucket of format 1 and format 2 (key -> versions). */
+  get objects() {
+    return this.objectsOf(this.bucket);
+  }
+
+  /** The objects of the bucket of format 3 of the account. */
+  get entries3() {
+    return this.objectsOf(shardBucket(this.serverTarget, this.userId));
+  }
+
+  putObject(bucket, key, body) {
     this.versionCounter += 1;
-    const versions = this.objects.get(key) || [];
+    const objects = this.objectsOf(bucket);
+    const versions = objects.get(key) || [];
     versions.unshift({ versionId: "v" + zeros(this.versionCounter, 6), body: body });
-    this.objects.set(key, versions);
+    objects.set(key, versions);
+  }
+
+  /** Puts a delete marker on a key (what a delete request leaves in a bucket with versions: the
+   *  versions under it stay). */
+  putDeleteMarker(bucket, key) {
+    this.versionCounter += 1;
+    const objects = this.objectsOf(bucket);
+    const versions = objects.get(key) || [];
+    versions.unshift({ versionId: "v" + zeros(this.versionCounter, 6), body: "", deleteMarker: true });
+    objects.set(key, versions);
+  }
+
+  /** A stored value of the program store as JSON (undefined when there is none). */
+  stored(key) {
+    const value = this.store.get(key);
+    return value === undefined ? undefined : JSON.parse(value);
   }
 
   /** The node ledger as the program stored it in the device copy (null when none). */
   ledger() {
-    const json = this.store.get("ledger");
-    return json === undefined ? null : JSON.parse(json);
+    const value = this.stored("ledger");
+    return value === undefined ? null : value;
+  }
+
+  // ---- The faults of a fixture ----
+
+  /** Adds a fault: {match, respond, times}. match is a string the request line must begin with
+   *  ("POST /api/secure/log/read", or "S3 " + host for a request to the store), or a function of
+   *  the request; respond is {status, body}, "hang" (the request is never answered), "transport"
+   *  (the request fails on the device), or a function of the request that returns one of these
+   *  (undefined: no fault). With delay_ms the answer comes that long after the request ({delay_ms}
+   *  alone delays the answer of the model, and with fail "transport" the request fails on the
+   *  device then). times bounds how often the fault applies. Returns the fault. */
+  fault(match, respond, times) {
+    const fault = { match: match, respond: respond, times: times === undefined ? Infinity : times, hits: 0 };
+    this.faults.push(fault);
+    return fault;
+  }
+
+  clearFaults() {
+    this.faults = [];
+  }
+
+  faultFor(line, request) {
+    for (const fault of this.faults) {
+      if (fault.times <= 0) continue;
+      const matches = typeof fault.match === "function" ? fault.match(line, request) : line.startsWith(fault.match);
+      if (!matches) continue;
+      const answer = typeof fault.respond === "function" ? fault.respond(request, line) : fault.respond;
+      if (answer === undefined) continue;
+      fault.times -= 1;
+      fault.hits += 1;
+      return answer;
+    }
+    return undefined;
   }
 
   // ---- The backend of the operator (native.http with path) ----
 
-  listingUrl(options) {
+  legacyListingUrl(options) {
     const prefix = "v1/accounts/" + this.userId + "/" + (options.node ? options.node + "/" : "");
     let query = "versions&prefix=" + encodeURIComponent(prefix);
     if (options.nodes) query += "&delimiter=" + encodeURIComponent("/");
@@ -575,11 +918,45 @@ class World {
       crypto.randomBytes(8).toString("hex");
   }
 
+  /** The presigned address of one listing page of format 3. */
+  readUrl(page) {
+    let query = "versions&prefix=" + encodeURIComponent("a3/" + this.userId + "/" + page.prefix + "/");
+    if (page.key_marker) query += "&key-marker=" + encodeURIComponent(page.key_marker);
+    if (page.version_id_marker) query += "&version-id-marker=" + encodeURIComponent(page.version_id_marker);
+    query += "&max-keys=1000&encoding-type=url&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=" +
+      crypto.randomBytes(8).toString("hex");
+    return "https://" + this.shardHost + "/?" + query;
+  }
+
+  /** The presigned address of the listing of the versions of the node document of a node. */
+  documentUrl(node) {
+    return "https://" + shardBucket(this.serverTarget, node) + ".s3." + this.region + ".amazonaws.com/?versions&prefix=" +
+      encodeURIComponent("n3/" + node) + "&max-keys=1000&encoding-type=url&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=" +
+      crypto.randomBytes(8).toString("hex");
+  }
+
+  /** The node the backend names for a connection of the account: one that holds a grant of it.
+   *  A request that names the program that asks (the query program) is answered with a node of
+   *  the nodes that serve calls; a request that names none comes from a device that runs an
+   *  earlier program, and is answered with a node listed for its revokes alone (revokeOnly)
+   *  when one holds a grant. */
+  namedNode(query) {
+    const holders = this.offeredNodes().filter((candidate) => candidate.grants.has(this.userId));
+    const guard = holders.find((candidate) => candidate.revokeOnly === true);
+    const pool = holders.find((candidate) => candidate.revokeOnly !== true);
+    return query !== null && query !== undefined && query.program !== undefined ? (pool || guard) : (guard || pool);
+  }
+
   api(method, path, query, bodyText) {
     const json = (status, value) => ({ status: status, headers: {}, body: JSON.stringify(value), bodyBase64: null });
     const body = typeof bodyText === "string" && bodyText !== "" ? JSON.parse(bodyText) : null;
+    const absent = () => json(404, { detail: "Not Found" });
     if (method === "GET" && path === "/api/secure/account") {
-      return json(200, { user_id: this.userId, key: this.account.key === null ? null : { key_id: this.account.key.key_id } });
+      const account = { user_id: this.userId, key: this.account.key === null ? null : { key_id: this.account.key.key_id } };
+      // The backend names the vault items with a name only for an account it turned them on for.
+      if (this.account.namedSecrets === true) account.named_secrets = true;
+      if (this.account.servedProgram !== undefined) account.served_program_version = this.account.servedProgram;
+      return json(200, account);
     }
     if (method === "PUT" && path === "/api/secure/account/key") {
       const signPk = bytes(body.sign_pk);
@@ -589,27 +966,67 @@ class World {
       this.account.key = { sign_pk: body.sign_pk, log_pk: body.log_pk, key_id: sha("sha256", signPk).subarray(0, 8).toString("hex") };
       return json(200, {});
     }
+    if (method === "GET" && path === "/api/secure/grants") {
+      if (!this.routes.grants) return absent();
+      return json(200, {
+        nodes: this.offeredNodes().map((node) => {
+          const grant = node.grants.get(this.userId);
+          const item = { node: node.id, not_after_ms: grant === undefined ? null : grant.not_after_ms };
+          // A node the backend lists for its revokes alone (node.revokeOnly: a node of an earlier
+          // release outside the nodes that serve calls, which holds a grant of the account).
+          if (node.revokeOnly === true) item.revoke_only = true;
+          return item;
+        }),
+      });
+    }
     if (method === "GET" && path === "/api/secure/nodes") {
       if (typeof query.nonce !== "string") return json(400, { code: "invalid_input" });
+      let nodes = this.offeredNodes();
+      if (typeof query.nodes === "string") {
+        const wanted = query.nodes.split(",");
+        nodes = wanted.map((id) => this.nodes.get(id)).filter((node) => node !== undefined && node.alive);
+      }
       return json(200, {
-        nodes: this.offeredNodes().map((node, index) => Object.assign(node.attestation(query.nonce), { pod: index })),
+        nodes: nodes.map((node, index) => {
+          const response = Object.assign(node.attestation(query.nonce), { pod: index });
+          if (typeof this.attestationMore === "function") Object.assign(response, this.attestationMore(node));
+          return response;
+        }),
       });
+    }
+    if (method === "GET" && path === "/api/secure/release-proofs") {
+      if (!this.routes.proofs) return absent();
+      const digest = typeof query.measurement === "string" ? query.measurement : "";
+      // The digest of the measurement a statement states: the base64url SHA-256 of its three
+      // PCR values in hexadecimal, one after another.
+      const held = new Map();
+      for (const proofs of this.releaseProofs.values()) {
+        try {
+          const stated = JSON.parse(Buffer.from(proofs.statement, "base64url").toString("utf8"));
+          held.set(b64u(sha("sha256", utf8(stated.pcr0 + stated.pcr1 + stated.pcr2))), proofs);
+        } catch (error) {
+          // (Proofs without a statement that reads are handed out for no measurement.)
+        }
+      }
+      const proofs = this.measureProofs.has(digest) ? this.measureProofs.get(digest) : held.get(digest);
+      if (proofs === undefined) return json(404, { detail: "release_proofs_not_found" });
+      return json(200, this.proofsWrapped ? { release_proofs: proofs } : proofs);
     }
     const nodeRoute = /^\/api\/secure\/nodes\/([A-Za-z0-9_-]{43})\/(messages|status)$/.exec(path);
     if (nodeRoute !== null && method === "POST") {
       const node = this.nodes.get(nodeRoute[1]);
       if (node === undefined || !node.alive) return json(404, { code: "node_not_found" });
       if (nodeRoute[2] === "messages") return json(200, { reply: node.handleMessage(body.envelope) });
-      return json(200, { head: node.head(this.userId, body.nonce, false) });
+      return json(200, node.format === 3 ? {} : { head: node.head(this.userId, body.nonce, false) });
     }
     if (method === "GET" && path === "/api/secure/log/nodes") {
       const nodes = [];
       for (const node of this.nodes.values()) {
+        if (node.format === 3) continue;
         const chain = node.chains.get(this.userId);
         if (chain === undefined && !node.finalHeads.has(this.userId)) continue;
         nodes.push({
-          node: node.id, release: node.release, live: node.alive,
-          max_seq: chain === undefined ? 0 : chain.length,
+          node: node.id, release: node.release, live: node.alive, max_seq: 0,
           final_head: node.finalHeads.get(this.userId) || null,
         });
       }
@@ -617,10 +1034,10 @@ class World {
     }
     if (method === "POST" && path === "/api/secure/log/store/listings") {
       return json(200, {
-        discovery: body.discovery ? { list_url: this.listingUrl({ nodes: true }) } : null,
+        discovery: body.discovery ? { list_url: this.legacyListingUrl({ nodes: true }) } : null,
         nodes: (body.nodes || []).map((target) => ({
           node: target.node,
-          list_url: this.listingUrl({
+          list_url: this.legacyListingUrl({
             node: target.node, keyMarker: target.key_marker, versionIdMarker: target.version_id_marker,
           }),
         })),
@@ -628,7 +1045,7 @@ class World {
     }
     if (method === "GET" && path === "/api/secure/log/store") {
       return json(200, {
-        list_url: this.listingUrl({
+        list_url: this.legacyListingUrl({
           nodes: query.nodes === "1", node: query.node || null, keyMarker: query.key_marker || null,
           versionIdMarker: query.version_id_marker || null,
         }),
@@ -641,8 +1058,83 @@ class World {
         })),
       });
     }
+    if (method === "POST" && /^\/api\/secure\/log\/(read|bodies|documents)$/.test(path)) {
+      if (this.routes.log === "absent") return absent();
+      // A backend that holds the store of format 3 closed answers the listings and the bodies
+      // with log_store_disabled. It answers the node documents all the same, from the node
+      // registry alone: it reads no store and gives no listing address.
+      const closed = this.routes.log === "disabled";
+      if (closed && !path.endsWith("/documents")) return json(409, { detail: "log_store_disabled" });
+      if (path.endsWith("/read")) {
+        const valid = Array.isArray(body.pages) && body.pages.length >= 1 && body.pages.length <= 8 &&
+          body.pages.every((page) => page.prefix === "c" || page.prefix === "u");
+        if (!valid) return json(400, { detail: "invalid_input" });
+        return json(200, {
+          store: { generation: 3, bucket: shardBucket(this.serverTarget, this.userId), region: this.region },
+          pages: body.pages.map((page) => ({ prefix: page.prefix, url: this.readUrl(page) })),
+          expires_ms: this.now + 300000,
+        });
+      }
+      if (path.endsWith("/bodies")) {
+        const prefix = "a3/" + this.userId + "/";
+        const valid = Array.isArray(body.keys) && body.keys.length >= 1 && body.keys.length <= 200 &&
+          body.keys.every((key) => typeof key === "string" && key.startsWith(prefix));
+        if (!valid) return json(400, { detail: "invalid_input" });
+        const entries = [];
+        const missing = [];
+        for (const key of body.keys) {
+          const hash = key.slice(key.lastIndexOf(".") + 1);
+          const version = (this.entries3.get(key) || []).find((item) => {
+            try {
+              return b64u(sha("sha256", bytes(JSON.parse(item.body).body))) === hash;
+            } catch (error) {
+              return false;
+            }
+          });
+          if (version === undefined) missing.push(key);
+          else entries.push(Object.assign({ key: key }, JSON.parse(version.body)));
+        }
+        return json(200, { entries: entries, missing: missing, unread: [] });
+      }
+      const valid = Array.isArray(body.nodes) && body.nodes.length >= 1 && body.nodes.length <= 64 &&
+        body.nodes.every((id) => typeof id === "string" && /^[A-Za-z0-9_-]{43}$/.test(id));
+      if (!valid) return json(400, { detail: "invalid_input" });
+      // The document of a node: the latest version of its object in the store that has the form
+      // of a node document, or else the attestation document the node registry kept of it.
+      const documents = [];
+      const missing = [];
+      for (const id of body.nodes) {
+        const versions = closed ? [] : this.objectsOf(shardBucket(this.serverTarget, id)).get("n3/" + id) || [];
+        const written = versions.map((version) => {
+          try {
+            const value = version.deleteMarker === true ? null : JSON.parse(version.body);
+            return value !== null && typeof value === "object" && value.node === id ? value : null;
+          } catch (error) {
+            return null;
+          }
+        }).find((value) => value !== null);
+        if (written !== undefined) documents.push({ node: id, origin: "log_store", document: written });
+        else if (this.keptDocuments.has(id)) documents.push({ node: id, origin: "node_registry", document: this.keptDocuments.get(id) });
+        else missing.push(id);
+      }
+      return json(200, {
+        documents: documents, missing: missing, unread: [],
+        listings: closed ? [] : body.nodes.map((id) => ({ node: id, url: this.documentUrl(id) })),
+        expires_ms: this.now + 300000,
+      });
+    }
     if (method === "POST" && path === "/api/secure/log/verified") {
       this.reports.push(body);
+      return json(200, {});
+    }
+    if (method === "POST" && path === "/api/secure/procedures/outcomes") {
+      if (!this.routes.outcomes) return absent();
+      this.outcomeReports.push(body);
+      return json(200, {});
+    }
+    if (method === "POST" && path === "/api/secure/sync/report") {
+      if (!this.routes.syncReport) return absent();
+      this.syncReports.push(body);
       return json(200, {});
     }
     if (path === "/api/secure/ledger") {
@@ -659,9 +1151,95 @@ class World {
         return json(200, {});
       }
     }
+    const secret = /^\/api\/secure\/vault\/secret(?:\/([A-Z][A-Z0-9_]{0,63}))?(\/binding)?$/.exec(path);
+    if (secret !== null) {
+      const name = secret[1];
+      if (name === undefined && method === "POST") {
+        this.vault.created += 1;
+        const made = "SECRET_" + this.vault.created;
+        this.vault.secrets.set(made, {
+          name: made, label: body.label, sites: body.sites, slots: body.slots, state: "empty", source: "device",
+        });
+        return json(200, { name: made, sites: body.sites, slots: body.slots });
+      }
+      const item = name === undefined ? undefined : this.vault.secrets.get(name);
+      if (item === undefined) return json(404, { code: "not_found" });
+      if (method === "GET" && secret[2] === undefined) return json(200, item);
+      if (method === "PUT" && secret[2] === undefined) {
+        item.record = body.record;
+        item.sites = body.sites;
+        item.slots = body.slots;
+        item.state = "ready";
+        return json(200, { name: name, state: "ready" });
+      }
+      if (method === "POST" && secret[2] !== undefined) {
+        item.sites = body.sites;
+        item.slots = body.slots;
+        if (body.record !== undefined) item.record = body.record;
+        return json(200, { name: name, sites: item.sites, slots: item.slots });
+      }
+      if (method === "DELETE" && secret[2] === undefined) {
+        this.vault.secrets.delete(name);
+        return json(200, {});
+      }
+    }
+    const login = /^\/api\/secure\/vault\/login\/([^/]+)\/passwords$/.exec(path);
+    if (login !== null && method === "GET") {
+      const kept = this.vault.logins.get(decodeURIComponent(login[1]));
+      return kept === undefined ? json(404, { code: "not_found" }) : json(200, kept);
+    }
+    if (method === "PUT" && (path === "/api/secure/vault/login" || path === "/api/secure/vault/card")) {
+      this.vault.lastSaved = body;
+      return json(200, { name: body.name });
+    }
+    if (method === "POST" && path === "/api/secure/connections/begin") {
+      // A node that holds the grant of the account states the authorization it began (8.2).
+      const node = this.namedNode(query);
+      if (node === undefined) return json(409, { code: "grant_required" });
+      const grant = node.grants.get(this.userId);
+      const nodeState = b64u(crypto.randomBytes(16));
+      const state = nodeState + ".operator";
+      const url = "https://provider.example/authorize?state=" + state;
+      this.connections.set(nodeState, { node: node, state: state, provider: body.target, completed: false });
+      return json(200, {
+        node: node.id, state: state, authorization_url: url, ephemeral_session: false,
+        statement: signedValue(node.signSeed, "pickle.secure.v1.statement\n", {
+          v: 1, type: "oauth_begin", node: node.id, user_id: this.userId, key_id: grant.key_id,
+          sign_pk: grant.sign_pk, provider: body.target, state: state,
+          url_sha256: b64u(sha("sha256", utf8(url))), time_ms: this.now,
+        }),
+      });
+    }
+    if (method === "PUT" && path === "/api/secure/connections/naver_mail/app-password") {
+      const node = this.namedNode(query);
+      if (node === undefined) return json(409, { code: "grant_required" });
+      const grant = node.grants.get(this.userId);
+      const identity = "user@naver.com";
+      return json(200, {
+        node: node.id, connection_id: "connection-mail", identity: identity,
+        statement: signedValue(node.signSeed, "pickle.secure.v1.statement\n", {
+          v: 1, type: "app_password_verified", node: node.id, user_id: this.userId, key_id: grant.key_id,
+          sign_pk: grant.sign_pk, provider: "naver_mail", record_id: body.record.id, identity: identity,
+          ciphertext_sha256: b64u(sha("sha256", utf8(body.record.ct))), time_ms: this.now,
+        }),
+      });
+    }
+    if (method === "GET" && path === "/api/secure/connections/completion") {
+      const kept = this.connections.get(query.state);
+      if (kept === undefined || !kept.completed) return json(404, { code: "not_found" });
+      const grant = kept.node.grants.get(this.userId);
+      return json(200, {
+        connection_id: "connection-1", provider: kept.provider,
+        statement: signedValue(kept.node.signSeed, "pickle.secure.v1.statement\n", {
+          v: 1, type: "oauth_complete", node: kept.node.id, user_id: this.userId, key_id: grant.key_id,
+          sign_pk: grant.sign_pk, provider: kept.provider, state: kept.state, record_id: "ARUgUDnTSlTyTpffFFUt0w",
+          time_ms: this.now,
+        }),
+      });
+    }
     if (method === "GET" && path === "/api/secure/sealing") return json(200, { items: [], more: false });
     if (method === "GET" && path === "/api/secure/transfers") return json(200, { transfers: [] });
-    return json(404, { code: "not_found" });
+    return absent();
   }
 
   // ---- The log store (native.http with url) ----
@@ -669,29 +1247,32 @@ class World {
   storeHttp(method, url) {
     const address = new URL(url);
     const text = (status, body) => ({ status: status, headers: {}, body: body, bodyBase64: null });
-    if (method !== "GET" || address.host !== this.storeHost) return text(403, "");
+    const bucket = address.host.split(".s3.")[0];
+    if (method !== "GET" || !address.host.endsWith(".s3." + this.region + ".amazonaws.com")) return text(403, "");
     if (address.pathname === "/" && address.searchParams.has("versions")) {
-      return text(200, this.listing(address.searchParams));
+      return text(200, this.listing(bucket, address.searchParams));
     }
     const key = decodeURIComponent(address.pathname.slice(1));
     const versionId = address.searchParams.get("versionId");
-    const version = (this.objects.get(key) || []).find((item) => item.versionId === versionId);
+    const version = (this.objectsOf(bucket).get(key) || []).find((item) => item.versionId === versionId);
     return version === undefined ? text(404, "") : text(200, version.body);
   }
 
-  listing(params) {
+  listing(bucket, params) {
     const prefix = params.get("prefix") || "";
     const delimiter = params.get("delimiter");
     const keyMarker = params.get("key-marker");
-    const keys = Array.from(this.objects.keys())
+    const objects = this.objectsOf(bucket);
+    const keys = Array.from(objects.keys())
       .filter((key) => key.startsWith(prefix) && (keyMarker === null || key > keyMarker))
       .sort();
     const parts = [
       "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
       "<ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
-      "<Name>" + this.bucket + "</Name><Prefix>" + encodeURIComponent(prefix) + "</Prefix>",
-      "<MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated><EncodingType>url</EncodingType>",
+      "<Name>" + bucket + "</Name><Prefix>" + encodeURIComponent(prefix) + "</Prefix>",
+      "<MaxKeys>1000</MaxKeys><EncodingType>url</EncodingType>",
     ];
+    let truncated = false;
     if (delimiter !== null) {
       const prefixes = new Set();
       for (const key of keys) {
@@ -703,26 +1284,73 @@ class World {
         parts.push("<CommonPrefixes><Prefix>" + encodeURIComponent(common) + "</Prefix></CommonPrefixes>");
       }
     } else {
+      // A page holds pageSize object versions at most and never splits the versions of one key.
+      let count = 0;
+      let last = null;
       for (const key of keys) {
-        const versions = this.objects.get(key);
+        const versions = objects.get(key);
+        if (count > 0 && count + versions.length > this.pageSize) {
+          truncated = true;
+          break;
+        }
+        count += versions.length;
+        last = { key: key, versionId: versions[versions.length - 1].versionId };
         versions.forEach((version, index) => {
+          const tag = version.deleteMarker === true ? "DeleteMarker" : "Version";
           parts.push(
-            "<Version><Key>" + encodeURIComponent(key) + "</Key><VersionId>" + version.versionId +
+            "<" + tag + "><Key>" + encodeURIComponent(key) + "</Key><VersionId>" + version.versionId +
             "</VersionId><IsLatest>" + (index === 0 ? "true" : "false") + "</IsLatest>" +
-            "<LastModified>2026-11-05T00:00:00.000Z</LastModified><Size>" + version.body.length + "</Size></Version>");
+            "<LastModified>2026-11-05T00:00:00.000Z</LastModified>" +
+            (version.deleteMarker === true ? "" : "<Size>" + version.body.length + "</Size>") + "</" + tag + ">");
         });
       }
+      if (truncated) {
+        parts.push("<NextKeyMarker>" + encodeURIComponent(last.key) + "</NextKeyMarker>" +
+          "<NextVersionIdMarker>" + last.versionId + "</NextVersionIdMarker>");
+      }
     }
+    parts.push("<IsTruncated>" + (truncated ? "true" : "false") + "</IsTruncated>");
     parts.push("</ListVersionsResult>");
     return parts.join("");
   }
 
+  /** One request of the program. The answer of a fault of the fixture comes first. */
   http(request) {
     this.requests.push(request);
     const method = request.method || "GET";
+    const line = typeof request.path === "string"
+      ? method + " " + request.path : "S3 " + new URL(request.url).host + new URL(request.url).pathname;
+    const fault = this.faultFor(line, request);
+    if (fault === "hang") return new Promise(() => {});
+    if (fault === "transport") return Promise.reject(new SecureError("transport", line));
+    if (fault !== undefined && typeof fault.delay_ms === "number") {
+      return this.sleep(fault.delay_ms).then(() => {
+        if (fault.fail === "transport") throw new SecureError("transport", line);
+        return this.answer(method, request, fault);
+      });
+    }
+    return Promise.resolve(this.answer(method, request, fault));
+  }
+
+  answer(method, request, fault) {
+    if (fault !== undefined && typeof fault.status === "number") {
+      return {
+        status: fault.status, headers: {}, bodyBase64: null,
+        body: typeof fault.body === "string" ? fault.body : JSON.stringify(fault.body === undefined ? {} : fault.body),
+      };
+    }
     if (typeof request.path === "string") return this.api(method, request.path, request.query || {}, request.body);
     if (typeof request.url === "string") return this.storeHttp(method, request.url);
     throw new SecureError("invalid_argument", "http: neither path nor url");
+  }
+
+  /** The requests the program sent whose line begins with prefix ("GET /api/secure/nodes", "S3 "). */
+  sent(prefix) {
+    return this.requests.filter((request) => {
+      const method = request.method || "GET";
+      const line = typeof request.path === "string" ? method + " " + request.path : "S3 " + new URL(request.url).host;
+      return line.startsWith(prefix);
+    });
   }
 }
 
@@ -736,11 +1364,14 @@ function keychainName(item) {
   return service + "\n" + String(item.account);
 }
 
-/** The global native of one runtime on world: every function of the four bridge tables that the
- *  flows of the tests reach, and a stub that fails with invalid_argument for the ones they do not
- *  (the hardware key of the device, RSA, the web authentication session, the owner authentication).
+/** The global native of one runtime on world: the functions of the bridge tables that the flows of
+ *  the tests reach, and a stub that fails with invalid_argument for the ones they do not (the
+ *  hardware key of the device, RSA). The functions a later build of the apps adds
+ *  (securityStatus, promptSecret, presentSecret, confirmDestinations, programDelivery) exist only
+ *  when the device of the world has them.
  *  While world.bridgeOpen is false (the top-level evaluation) every call fails with cancelled. */
 function makeNative(world) {
+  const device = world.device;
   const functions = {
     randomBytes: (n) => b64u(crypto.randomBytes(n)),
     sha256: (data) => b64u(sha("sha256", bytes(data))),
@@ -804,11 +1435,16 @@ function makeNative(world) {
     },
     keychainDelete: (item) => world.keychain.delete(keychainName(item)),
     nowMs: () => world.now,
-    deviceInfo: () => ({
-      platform: "ios", app_version: "1.1.0", app_build: "1", system_version: "26.0", model: "iPhone",
-      server_target: world.serverTarget, user_id: world.userId, program_origin: "server",
-      locale: "en-US", debug_build: false,
-    }),
+    deviceInfo: () => {
+      world.deviceInfoCalls += 1;
+      const info = {
+        platform: device.platform, app_version: "1.1.0", app_build: "1", system_version: "26.0", model: "iPhone",
+        server_target: world.serverTarget, user_id: world.userId, program_origin: "server",
+        locale: device.locale, debug_build: device.debug_build === true,
+      };
+      if (device.local_stack_build !== undefined) info.local_stack_build = device.local_stack_build;
+      return info;
+    },
     log: (message) => { world.logs.push(String(message)); },
     storeGet: (key) => { const value = world.store.get(String(key)); return value === undefined ? null : value; },
     storeSet: (key, value) => {
@@ -828,11 +1464,67 @@ function makeNative(world) {
     error: (code, message) => new SecureError(code, message),
   };
   const asyncFunctions = {
-    http: async (request) => world.http(request),
-    sleep: (ms) => new Promise((resolve) => setImmediate(resolve)),
+    http: (request) => world.http(request),
+    sleep: (ms) => world.sleep(Math.min(Math.max(0, Number(ms) || 0), 60000)),
+    webAuth: (args) => {
+      if (typeof device.webAuth !== "function") return Promise.reject(new SecureError("invalid_argument", "webAuth is not part of this fixture"));
+      return Promise.resolve(device.webAuth(args));
+    },
+    deviceOwnerAuth: (reason) => {
+      device.ownerAuths.push(String(reason));
+      return typeof device.ownerAuth === "function" ? Promise.resolve(device.ownerAuth(reason)) : Promise.resolve(device.ownerAuth);
+    },
   };
+  if (device.securityStatus) {
+    functions.securityStatus = (args) => {
+      const valid = args !== null && typeof args === "object" && ["ok", "pending", "attention"].indexOf(args.status) >= 0 &&
+        (args.reasons === undefined || (Array.isArray(args.reasons) && args.reasons.length <= 8 &&
+          args.reasons.every((reason) => /^[a-z0-9_]{1,64}$/.test(reason))));
+      if (!valid) throw new SecureError("invalid_argument", "securityStatus");
+      world.securityStatuses.push({ status: args.status, reasons: Array.from(args.reasons || []), at_ms: world.now });
+      return null;
+    };
+  }
+  if (device.sheets) {
+    const lines = (value) => Array.isArray(value) && value.length >= 1 && value.length <= 16 &&
+      value.every((line) => typeof line === "string" && line.length >= 1 && line.length <= 200);
+    asyncFunctions.promptSecret = (args) => {
+      const valid = args !== null && typeof args === "object" && typeof args.title === "string" &&
+        args.title.length >= 1 && args.title.length <= 120 && lines(args.destinations);
+      if (!valid) return Promise.reject(new SecureError("invalid_argument", "promptSecret"));
+      device.prompts.push(JSON.parse(JSON.stringify(args)));
+      const answer = typeof device.promptAnswer === "function" ? device.promptAnswer(args) : device.promptAnswer;
+      return Promise.resolve(answer === null ? null : { value: answer });
+    };
+    asyncFunctions.presentSecret = (args) => {
+      const valid = args !== null && typeof args === "object" && typeof args.title === "string" &&
+        args.title.length >= 1 && args.title.length <= 120 && typeof args.value === "string" &&
+        args.value.length >= 1 && args.value.length <= 16384 &&
+        (args.destinations === undefined || args.destinations === null || lines(args.destinations));
+      if (!valid) return Promise.reject(new SecureError("invalid_argument", "presentSecret"));
+      device.presented.push(JSON.parse(JSON.stringify(args)));
+      return Promise.resolve(null);
+    };
+  }
+  if (device.delivery !== null && device.delivery !== undefined) {
+    functions.programDelivery = () => {
+      const value = typeof world.device.delivery === "function" ? world.device.delivery() : world.device.delivery;
+      return value === null || typeof value !== "object" ? value : Object.assign({}, value);
+    };
+  }
+  if (device.confirmations) {
+    asyncFunctions.confirmDestinations = (args) => {
+      const valid = args !== null && typeof args === "object" && typeof args.title === "string" &&
+        args.title.length >= 1 && args.title.length <= 120 && Array.isArray(args.destinations) &&
+        args.destinations.length >= 1 && args.destinations.length <= 16 &&
+        args.destinations.every((line) => typeof line === "string" && line.length >= 1 && line.length <= 200);
+      if (!valid) return Promise.reject(new SecureError("invalid_argument", "confirmDestinations"));
+      device.confirmed.push(JSON.parse(JSON.stringify(args)));
+      const answer = typeof device.confirmAnswer === "function" ? device.confirmAnswer(args) : device.confirmAnswer;
+      return Promise.resolve(answer === true ? { confirmed: true } : null);
+    };
+  }
   const stubs = ["rsaVerify", "secureEnclaveP256Create", "secureEnclaveP256PublicKey", "secureEnclaveP256Sign"];
-  const asyncStubs = ["webAuth", "deviceOwnerAuth"];
   const native = {};
   const closed = (name) => new SecureError("cancelled", name + ": the bridge is not open");
   for (const name of Object.keys(functions)) {
@@ -853,11 +1545,6 @@ function makeNative(world) {
       throw new SecureError("invalid_argument", name + " is not part of the model");
     };
   }
-  for (const name of asyncStubs) {
-    native[name] = function () {
-      return Promise.reject(world.bridgeOpen ? new SecureError("invalid_argument", name + " is not part of the model") : closed(name));
-    };
-  }
   return Object.freeze(native);
 }
 
@@ -869,6 +1556,7 @@ function makeNative(world) {
 function loadProgram(source, world) {
   world.bridgeOpen = false;
   world.runtime = {};
+  world.timers = [];
   const native = makeNative(world);
   const context = vm.createContext({
     native: native, SecureError: SecureError, console: { log: (message) => native.log(message) },
@@ -882,16 +1570,21 @@ function loadProgram(source, world) {
   return program;
 }
 
-/** The measurements of ACCEPTED_RELEASES of a program source, in the order of the list, each with
- *  log_store (true when the element says so: the node writes the log entry to the log store). */
-function listedMeasurements(source) {
-  const start = source.indexOf("const ACCEPTED_RELEASES = [");
+/** The measurements of a list of a program source (ACCEPTED_RELEASES unless name gives another:
+ *  PRERELEASE_BUILDS), in the order of the list, each with the marks of the log of its nodes:
+ *  log_format (0 for an element that states none) and log_store (true when the element says so:
+ *  the node writes the log entry to the log store). */
+function listedMeasurements(source, name) {
+  const start = source.indexOf("const " + (name || "ACCEPTED_RELEASES") + " = [");
   const end = source.indexOf("];", start);
-  const pattern = /release: "([^"]+)",\s*pcr0: "([0-9a-f]{96})",\s*pcr1: "([0-9a-f]{96})",\s*pcr2: "([0-9a-f]{96})",(\s*log_store: true,)?/g;
+  const pattern = /release: "([^"]+)",\s*pcr0: "([0-9a-f]{96})",\s*pcr1: "([0-9a-f]{96})",\s*pcr2: "([0-9a-f]{96})",(\s*log_format: ([0-9]+),)?(\s*log_store: true,)?/g;
   const out = [];
   let match = pattern.exec(source.slice(start, end));
   while (match !== null) {
-    out.push({ release: match[1], pcr0: match[2], pcr1: match[3], pcr2: match[4], log_store: match[5] !== undefined });
+    out.push({
+      release: match[1], pcr0: match[2], pcr1: match[3], pcr2: match[4],
+      log_format: match[6] === undefined ? 0 : Number(match[6]), log_store: match[7] !== undefined,
+    });
     match = pattern.exec(source.slice(start, end));
   }
   return out;
@@ -912,8 +1605,11 @@ function randomMeasurement() {
   };
 }
 
-/** The source of a later program: the same program with one more accepted release and the version
- *  given (the program the operator serves once it lists the release). */
+/** The source of a program whose list holds one more measurement: the same program with one
+ *  more element at the end of ACCEPTED_RELEASES, without log_format (its nodes write format 3),
+ *  and with the version given when one is given. The list of the program is closed (a release
+ *  after its elements is accepted by its release proofs); a test uses such a source where it
+ *  needs a program that accepts a measurement without proofs. */
 function withListedRelease(source, release, measurement, version) {
   const start = source.indexOf("const ACCEPTED_RELEASES = [");
   const end = source.indexOf("  ];", start);
@@ -921,7 +1617,7 @@ function withListedRelease(source, release, measurement, version) {
     "\",\n      pcr1: \"" + measurement.pcr1 + "\",\n      pcr2: \"" + measurement.pcr2 +
     "\",\n      log_store: true,\n    },\n";
   const patched = source.slice(0, end) + element + source.slice(end);
-  return patched.replace(/^\s*const VERSION = \d+;/m, "  const VERSION = " + version + ";");
+  return version === undefined ? patched : patched.replace(/^\s*const VERSION = \d+;/m, "  const VERSION = " + version + ";");
 }
 
 module.exports = {
@@ -930,5 +1626,5 @@ module.exports = {
   aeadSeal, aeadOpen, hpkeSeal, hpkeOpen, hpkeDeriveKeyPair,
   cbor, SecureError, signedValue, deriveAccountKeys,
   Node, World, makeNative, loadProgram, listedMeasurements, declaredVersion, randomMeasurement,
-  withListedRelease, DAY_MS,
+  withListedRelease, formatOf, shardBucket, SHARDS, DAY_MS, RTIME_MAX,
 };
