@@ -220,5 +220,45 @@
       {"host": "uploads.github.com", "prefixes": ["/repos/"], "exact": []},
       {"host": "github.com", "prefixes": [], "exact": [], "suffixes": ["/info/refs", "/git-upload-pack", "/git-receive-pack"]}
     ]
+  },
+  "paysign": {
+    "client": "static",
+    "authorize": {"url": "https://new.paysign.co.kr/oauth/authorize.php", "fixed": [["resource", "https://new.paysign.co.kr/mcp"]], "allowed": ["scope"], "key_param": ""},
+    "scope_param": "scope",
+    "scope_delimiter": " ",
+    "pkce": "S256",
+    "token": {"url": "https://new.paysign.co.kr/oauth/token.php", "client_auth": "basic", "body": "form", "headers": [], "bearer": "", "fixed": [["resource", "https://new.paysign.co.kr/mcp"]], "ok_field": ""},
+    "token_container": "",
+    "revoke": {"url": "https://new.paysign.co.kr/oauth/revoke.php", "client_auth": "basic", "bearer": ""},
+    "inject": {"header": "Authorization", "prefix": "Bearer ", "paths": ["access_token"]},
+    "public": [
+      {"path": "scope", "type": "string", "max": 8192},
+      {"path": "expires_in", "type": "integer"},
+      {"path": "token_type", "type": "string", "max": 32}
+    ],
+    "id_token_claims": [],
+    "api": [
+      {"host": "new.paysign.co.kr", "prefixes": [], "exact": ["/mcp"]}
+    ]
+  },
+  "paysign_test": {
+    "client": "static",
+    "authorize": {"url": "https://newdev.paysign.co.kr/oauth/authorize.php", "fixed": [["resource", "https://newdev.paysign.co.kr/mcp"]], "allowed": ["scope"], "key_param": ""},
+    "scope_param": "scope",
+    "scope_delimiter": " ",
+    "pkce": "S256",
+    "token": {"url": "https://newdev.paysign.co.kr/oauth/token.php", "client_auth": "basic", "body": "form", "headers": [], "bearer": "", "fixed": [["resource", "https://newdev.paysign.co.kr/mcp"]], "ok_field": ""},
+    "token_container": "",
+    "revoke": {"url": "https://newdev.paysign.co.kr/oauth/revoke.php", "client_auth": "basic", "bearer": ""},
+    "inject": {"header": "Authorization", "prefix": "Bearer ", "paths": ["access_token"]},
+    "public": [
+      {"path": "scope", "type": "string", "max": 8192},
+      {"path": "expires_in", "type": "integer"},
+      {"path": "token_type", "type": "string", "max": 32}
+    ],
+    "id_token_claims": [],
+    "api": [
+      {"host": "newdev.paysign.co.kr", "prefixes": [], "exact": ["/mcp"]}
+    ]
   }
 }
