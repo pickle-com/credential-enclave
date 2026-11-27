@@ -22,7 +22,7 @@
 
   // ---- Constants ----
 
-  const VERSION = 42;
+  const VERSION = 43;
   const MASTER_KEY_SERVICE = "com.pickle.client.secure.master-key";
   const LEDGER_SERVICE = "com.pickle.client.secure.ledger";
   const LEDGER_STORE_KEY = "ledger";
@@ -251,6 +251,14 @@
       pcr0: "8835de060043c5aec2220f2ced2ab91e29c33a1875bda879621df8d59b5da5524394a6fec9eaec8e09ff159a9ac6ac65",
       pcr1: "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
       pcr2: "6ba116c4b0277f37dc8271a5913c7e06f9c5f66ccd684a667f0f7156adbcb14820fc89f2afd6baceea393f669a0633eb",
+      log_store: true,
+    },
+    // pickle-com/credential-enclave v2.3.2 (commit 65a8b5647935bef9d1ad22d88d0b62ab8c4c0fcf).
+    {
+      release: "v2.3.2",
+      pcr0: "65d92b75b11213e6b6ced11df3b30c195b832e70d812a6c85e213edf1c62a0eb36ecceec7508cc290d16b030fc99787d",
+      pcr1: "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
+      pcr2: "bab0fc020078d0879f2d43581e54f97749910e198e129b37fedecb83972201e32725c9119a92c19cfc82839b8affd150",
       log_store: true,
     },
   ];
@@ -1449,6 +1457,7 @@
     ["google_workspace", "Google"], ["microsoft", "Microsoft"], ["slack", "Slack"],
     ["notion", "Notion"], ["x", "X"], ["link", "Link"], ["granola", "Granola"],
     ["mercury", "Mercury"], ["naver_mail", "NAVER Mail"], ["github", "GitHub"],
+    ["paysign", "PaySign"], ["paysign_test", "PaySign"],
   ]);
 
   // For every service (a product inside a provider) of a provider request: the display name, the
@@ -1472,6 +1481,8 @@
     ["mercury", { name: "Mercury", short: "", image: "connection-icon-mercury", glyph: false }],
     ["naver_mail", { name: "NAVER Mail", short: "", image: "connection-icon-naver-mail", glyph: false }],
     ["github", { name: "GitHub", short: "", image: "connection-icon-github", glyph: false }],
+    ["paysign", { name: "PaySign", short: "", image: "connection-icon-paysign", glyph: false }],
+    ["paysign_test", { name: "PaySign", short: "", image: "connection-icon-paysign", glyph: false }],
   ]);
 
   /** The service id of a provider request: google_workspace is split by host and path into Gmail,
